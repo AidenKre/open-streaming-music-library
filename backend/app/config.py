@@ -7,6 +7,8 @@ class Settings(BaseSettings):
 
     music_library_dir: Path = Path("./music")
 
+    workspace_dir: Path = Path("./workspace")
+
     # Server settings
     debug: bool = True
     host: str = "0.0.0.0"
