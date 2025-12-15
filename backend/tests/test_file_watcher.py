@@ -1,81 +1,48 @@
 import pytest
+from app.services.file_watcher import FileWatcher
 from app.services import file_watcher
 from unittest.mock import patch, MagicMock, call
 from pathlib import Path
 import time
 import os
 
-# Reset module state between tests
-@pytest.fixture(autouse=True)
-def reset_file_watcher_state():
-    """Reset file watcher state before each test"""
-    file_watcher.processed.clear()
-    if file_watcher.observer is not None:
-        try:
-            file_watcher.observer.stop()
-            file_watcher.observer.join(timeout=1)
-        except:
-            pass
-    file_watcher.observer = None
-    yield
-    # Cleanup after test
-    if file_watcher.observer is not None:
-        try:
-            file_watcher.observer.stop()
-            file_watcher.observer.join(timeout=1)
-        except:
-            pass
-    file_watcher.observer = None
-    file_watcher.processed.clear()
-
 # ========== Refactored Existing Tests ==========
 
-def test_start_file_watcher_is_idempotent(tmp_path, monkeypatch):
+def test_start_file_watcher_is_idempotent(tmp_path):
     """Test that calling start_file_watcher multiple times is safe"""
-    # Patch the import_dir attribute on the settings object
-    original_import_dir = file_watcher.settings.import_dir
-    monkeypatch.setattr(file_watcher.settings, "import_dir", tmp_path)
+    watcher = FileWatcher(tmp_path)
     
-    try:
-        # First call should start the watcher
-        file_watcher.start_file_watcher()
-        first_observer = file_watcher.observer
-        
-        # Second call should be safe (idempotent)
-        file_watcher.start_file_watcher()
-        second_observer = file_watcher.observer
-        
-        # Should reuse the same observer if it's still alive
-        assert first_observer is second_observer
-        
-        # Cleanup
-        file_watcher.stop_file_watcher()
-    finally:
-        # Restore original value
-        monkeypatch.setattr(file_watcher.settings, "import_dir", original_import_dir)
+    # First call should start the watcher
+    watcher.start_file_watcher()
+    first_observer = watcher.observer
+    
+    # Second call should be safe (idempotent)
+    watcher.start_file_watcher()
+    second_observer = watcher.observer
+    
+    # Should reuse the same observer if it's still alive
+    assert first_observer is second_observer
+    
+    # Cleanup
+    watcher.stop_file_watcher()
 
-def test_stop_file_watcher_is_safe_when_not_started():
+def test_stop_file_watcher_is_safe_when_not_started(tmp_path):
     """Test that stop_file_watcher can be called safely even if not started"""
+    watcher = FileWatcher(tmp_path)
     # Should not raise an exception
-    file_watcher.stop_file_watcher()
-    assert file_watcher.observer is None
+    watcher.stop_file_watcher()
+    assert watcher.observer is None
 
-def test_stop_file_watcher_stops_running_watcher(tmp_path, monkeypatch):
+def test_stop_file_watcher_stops_running_watcher(tmp_path):
     """Test that stop_file_watcher properly stops a running watcher"""
-    # Patch the import_dir attribute on the settings object
-    original_import_dir = file_watcher.settings.import_dir
-    monkeypatch.setattr(file_watcher.settings, "import_dir", tmp_path)
+    watcher = FileWatcher(tmp_path)
     
-    try:
-        file_watcher.start_file_watcher()
-        assert file_watcher.observer is not None
-        
-        file_watcher.stop_file_watcher()
-        # After stop, observer should be None
-        assert file_watcher.observer is None
-    finally:
-        # Restore original value
-        monkeypatch.setattr(file_watcher.settings, "import_dir", original_import_dir)
+    watcher.start_file_watcher()
+    assert watcher.observer is not None
+    
+    watcher.stop_file_watcher()
+    # After stop, observer should be None
+    assert watcher.observer is None
 
 def test_can_open_empty_file_for_read(tmp_path):
     test_file = tmp_path / "test.txt"
@@ -286,49 +253,49 @@ def test_process_file_after_stable_does_not_call_handle_new_file_when_not_ready(
 
 # ========== New Tests for FileWatcher.on_created ==========
 
-def test_file_watcher_on_created_ignores_directories():
+def test_file_watcher_on_created_ignores_directories(tmp_path):
     """Test that FileWatcher.on_created ignores directory events"""
-    watcher = file_watcher.FileWatcher()
+    watcher = FileWatcher(tmp_path)
     event = MagicMock()
     event.is_directory = True
     event.src_path = "/some/directory"
     
-    initial_processed_count = len(file_watcher.processed)
+    initial_processed_count = len(watcher.processed)
     
     watcher.on_created(event)
     
     # Should not add to processed set
-    assert len(file_watcher.processed) == initial_processed_count
-    assert "/some/directory" not in file_watcher.processed
+    assert len(watcher.processed) == initial_processed_count
+    assert "/some/directory" not in watcher.processed
 
-def test_file_watcher_on_created_ignores_already_processed_files():
+def test_file_watcher_on_created_ignores_already_processed_files(tmp_path):
     """Test that FileWatcher.on_created ignores files already in processed set"""
-    watcher = file_watcher.FileWatcher()
+    watcher = FileWatcher(tmp_path)
     event = MagicMock()
     event.is_directory = False
     event.src_path = "/some/file.txt"
     
     # Add to processed set first
-    file_watcher.processed.add("/some/file.txt")
-    initial_processed_count = len(file_watcher.processed)
+    watcher.processed.add("/some/file.txt")
+    initial_processed_count = len(watcher.processed)
     
     watcher.on_created(event)
     
     # Should not add again
-    assert len(file_watcher.processed) == initial_processed_count
+    assert len(watcher.processed) == initial_processed_count
 
-def test_file_watcher_on_created_submits_processing_for_new_file():
+def test_file_watcher_on_created_submits_processing_for_new_file(tmp_path):
     """Test that FileWatcher.on_created submits processing for new files"""
-    watcher = file_watcher.FileWatcher()
+    watcher = FileWatcher(tmp_path)
     event = MagicMock()
     event.is_directory = False
     event.src_path = "/some/new_file.txt"
     
-    with patch("app.services.file_watcher.executor.submit") as mock_submit:
+    with patch.object(watcher.executor, "submit") as mock_submit:
         watcher.on_created(event)
         
         # Should add to processed set
-        assert "/some/new_file.txt" in file_watcher.processed
+        assert "/some/new_file.txt" in watcher.processed
         
         # Should submit processing
         mock_submit.assert_called_once()
