@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from app.config import settings
-from app.services.file_watcher import start_file_watcher, stop_file_watcher
+from app.services.file_watcher import FileWatcher
 
 app = FastAPI()
 

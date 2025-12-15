@@ -40,6 +40,7 @@ def process_file_after_stable(path: Path):
     if not wait_until_ready(path):
         return False
     handle_new_file(path)
+    return True
 
 def wait_until_ready(path: Path):
     if not wait_until_stable(path):
