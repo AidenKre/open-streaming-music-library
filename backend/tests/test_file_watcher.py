@@ -1,287 +1,233 @@
-import threading
+from __future__ import annotations
+
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from app.services import file_watcher
+import pytest
+
+import app.services.file_watcher as file_watcher
 from app.services.file_watcher import FileWatcher
 
 
-def _start_appending(path, *, stop_event: threading.Event, interval_s: float = 0.01):
-    """
-    Background writer used for wait/stability tests.
-    Continually appends to the file to ensure size changes between checks.
-    """
-    while not stop_event.is_set():
-        with open(path, "ab") as f:
-            f.write(b"x")
-        time.sleep(interval_s)
+class TestFileWatcherLifecycle:
+    def test_start_file_watcher__already_running__is_idempotent(self, tmp_path: Path):
+        watcher = FileWatcher(tmp_path, lambda path: True)
+
+        observer = MagicMock()
+        observer.is_alive.return_value = True
+
+        with patch("app.services.file_watcher.Observer", return_value=observer) as Observer:
+            watcher.start_file_watcher()
+            watcher.start_file_watcher()
+
+        Observer.assert_called_once()
+        observer.schedule.assert_called_once()
+        observer.start.assert_called_once()
+
+    def test_start_file_watcher__existing_observer_dead__recreates_observer(self, tmp_path: Path):
+        watcher = FileWatcher(tmp_path, lambda path: True)
+
+        dead_observer = MagicMock()
+        dead_observer.is_alive.return_value = False
+        watcher.observer = dead_observer
+
+        new_observer = MagicMock()
+        new_observer.is_alive.return_value = True
+
+        with patch("app.services.file_watcher.Observer", return_value=new_observer):
+            watcher.start_file_watcher()
+
+        assert watcher.observer is new_observer
+        new_observer.schedule.assert_called_once()
+        new_observer.start.assert_called_once()
+
+    def test_stop_file_watcher__not_started__is_noop(self, tmp_path: Path):
+        watcher = FileWatcher(tmp_path, lambda path: True)
+        watcher.stop_file_watcher()
+        assert watcher.observer is None
+
+    def test_stop_file_watcher__started__stops_and_clears_observer(self, tmp_path: Path):
+        watcher = FileWatcher(tmp_path, lambda path: True)
+        observer = MagicMock()
+        watcher.observer = observer
+
+        watcher.stop_file_watcher()
+
+        observer.stop.assert_called_once()
+        observer.join.assert_called_once()
+        assert watcher.observer is None
 
 
-def _delete_after_delay(path, *, delay_s: float = 0.02):
-    time.sleep(delay_s)
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+class TestCanOpenForRead:
+    @pytest.mark.parametrize("content", [b"", b"hello"])
+    def test_can_open_for_read__existing_file__returns_true(self, tmp_path: Path, content: bytes):
+        path = tmp_path / "file.bin"
+        path.write_bytes(content)
+        assert file_watcher.can_open_for_read(path) is True
+
+    def test_can_open_for_read__missing_path__returns_false(self, tmp_path: Path):
+        assert file_watcher.can_open_for_read(tmp_path / "missing.bin") is False
+
+    def test_can_open_for_read__directory__returns_false(self, tmp_path: Path):
+        d = tmp_path / "dir"
+        d.mkdir()
+        assert file_watcher.can_open_for_read(d) is False
+
+    def test_can_open_for_read__open_raises__returns_false(self, tmp_path: Path):
+        path = tmp_path / "file.bin"
+        path.write_bytes(b"x")
+
+        with patch("app.services.file_watcher.open", side_effect=PermissionError):
+            assert file_watcher.can_open_for_read(path) is False
 
 
-def test_start_file_watcher_is_idempotent(tmp_path):
-    """Calling start twice should not create/schedule/start multiple observers."""
-    watcher = FileWatcher(tmp_path)
+class TestWaitUntilStable:
+    def test_wait_until_stable__stable_file__returns_true(self, tmp_path: Path):
+        path = tmp_path / "stable.txt"
+        path.write_text("stable")
+        assert file_watcher.wait_until_stable(path, timeout=0.2, interval=0.01) is True
 
-    observer = MagicMock()
-    observer.is_alive.return_value = True
+    def test_wait_until_stable__file_keeps_changing_until_timeout__returns_false(self, tmp_path: Path):
+        path = tmp_path / "changing.bin"
+        path.write_bytes(b"initial")
 
-    with patch("app.services.file_watcher.Observer", return_value=observer) as Observer:
-        watcher.start_file_watcher()
-        watcher.start_file_watcher()
+        real_sleep = time.sleep
 
-    Observer.assert_called_once()
-    observer.schedule.assert_called_once()
-    observer.start.assert_called_once()
+        def mutate_on_sleep(seconds: float):
+            with open(path, "ab") as f:
+                f.write(b"x")
+            real_sleep(min(seconds, 0.001))
+
+        with patch("app.services.file_watcher.time.sleep", side_effect=mutate_on_sleep):
+            assert file_watcher.wait_until_stable(path, timeout=0.05, interval=0.01) is False
+
+    def test_wait_until_stable__missing_file__returns_false(self, tmp_path: Path):
+        assert file_watcher.wait_until_stable(tmp_path / "missing.txt", timeout=0.05, interval=0.01) is False
+
+    def test_wait_until_stable__directory__returns_false(self, tmp_path: Path):
+        d = tmp_path / "dir"
+        d.mkdir()
+        assert file_watcher.wait_until_stable(d, timeout=0.05, interval=0.01) is False
+
+    def test_wait_until_stable__file_deleted_during_check__returns_false(self, tmp_path: Path):
+        path = tmp_path / "maybe_deleted.txt"
+        path.write_text("content")
+
+        real_sleep = time.sleep
+        deleted = False
+
+        def delete_on_sleep(seconds: float):
+            nonlocal deleted
+            if not deleted:
+                deleted = True
+                path.unlink(missing_ok=True)
+            real_sleep(min(seconds, 0.001))
+
+        with patch("app.services.file_watcher.time.sleep", side_effect=delete_on_sleep):
+            assert file_watcher.wait_until_stable(path, timeout=0.2, interval=0.01) is False
+
+    def test_wait_until_stable__permission_error_on_stat__returns_false(self, tmp_path: Path):
+        path = tmp_path / "file.bin"
+        path.write_bytes(b"x")
+
+        with patch("app.services.file_watcher.os.path.getsize", side_effect=PermissionError):
+            assert file_watcher.wait_until_stable(path, timeout=0.2, interval=0.01) is False
 
 
-def test_start_file_watcher_recreates_observer_if_dead(tmp_path):
-    """If an existing observer is not alive, start should create a new one."""
-    watcher = FileWatcher(tmp_path)
+class TestWaitUntilReady:
+    def test_wait_until_ready__stable_and_readable__returns_true(self, tmp_path: Path):
+        path = tmp_path / "file.bin"
+        path.write_bytes(b"x")
 
-    dead_observer = MagicMock()
-    dead_observer.is_alive.return_value = False
-    watcher.observer = dead_observer
+        with patch("app.services.file_watcher.wait_until_stable", return_value=True), patch(
+            "app.services.file_watcher.can_open_for_read", return_value=True
+        ):
+            assert file_watcher.wait_until_ready(path) is True
 
-    new_observer = MagicMock()
-    new_observer.is_alive.return_value = True
+    def test_wait_until_ready__not_stable__returns_false(self, tmp_path: Path):
+        path = tmp_path / "file.bin"
+        path.write_bytes(b"x")
 
-    with patch("app.services.file_watcher.Observer", return_value=new_observer):
-        watcher.start_file_watcher()
+        with patch("app.services.file_watcher.wait_until_stable", return_value=False):
+            assert file_watcher.wait_until_ready(path) is False
 
-    assert watcher.observer is new_observer
+    def test_wait_until_ready__stable_but_not_readable__returns_false(self, tmp_path: Path):
+        path = tmp_path / "file.bin"
+        path.write_bytes(b"x")
 
-def test_stop_file_watcher_is_safe_when_not_started(tmp_path):
-    """Test that stop_file_watcher can be called safely even if not started"""
-    watcher = FileWatcher(tmp_path)
-    # Should not raise an exception
-    watcher.stop_file_watcher()
-    assert watcher.observer is None
+        with patch("app.services.file_watcher.wait_until_stable", return_value=True), patch(
+            "app.services.file_watcher.can_open_for_read", return_value=False
+        ):
+            assert file_watcher.wait_until_ready(path) is False
 
-def test_stop_file_watcher_stops_running_watcher(tmp_path):
-    """stop should stop/join and then clear observer reference."""
-    watcher = FileWatcher(tmp_path)
 
-    observer = MagicMock()
-    watcher.observer = observer
+class TestProcessFileAfterStable:
+    def test_process_file_after_stable__ready__calls_callback_and_returns_true(self, tmp_path: Path):
+        path = tmp_path / "ready.bin"
+        path.write_bytes(b"x")
 
-    watcher.stop_file_watcher()
+        on_file = MagicMock(return_value=True)
+        watcher = FileWatcher(tmp_path, on_file)
 
-    observer.stop.assert_called_once()
-    observer.join.assert_called_once()
-    assert watcher.observer is None
+        with patch("app.services.file_watcher.wait_until_ready", return_value=True):
+            assert watcher.process_file_after_stable(path) is True
 
-def test_can_open_empty_file_for_read(tmp_path):
-    test_file = tmp_path / "test.txt"
-    test_file.touch()
-    assert file_watcher.can_open_for_read(str(test_file))
+        on_file.assert_called_once_with(path)
 
-def test_can_open_nonempty_file_for_read(tmp_path):
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("test")
-    assert file_watcher.can_open_for_read(str(test_file))
+    def test_process_file_after_stable__not_ready__does_not_call_callback_and_returns_false(self, tmp_path: Path):
+        path = tmp_path / "not_ready.bin"
+        path.write_bytes(b"x")
 
-def test_cannot_open_deleted_file_for_read(tmp_path):
-    test_file = tmp_path / "test.txt"
-    test_file.touch()
-    test_file.unlink()
-    assert not file_watcher.can_open_for_read(str(test_file))
+        on_file = MagicMock(return_value=True)
+        watcher = FileWatcher(tmp_path, on_file)
 
-def test_cannot_open_directory_for_read(tmp_path):
-    test_dir = tmp_path / "test/directory"
-    test_dir.mkdir(parents=True)
-    assert not file_watcher.can_open_for_read(str(test_dir))
+        with patch("app.services.file_watcher.wait_until_ready", return_value=False):
+            assert watcher.process_file_after_stable(path) is False
 
-def test_cannot_open_file_that_does_not_exist_for_read(tmp_path):
-    assert not file_watcher.can_open_for_read(str(tmp_path / "this/file/does/not/exist.txt"))
+        on_file.assert_not_called()
 
-# ========== wait_until_stable (behavior-focused) ==========
 
-def test_wait_until_stable_returns_true_for_stable_file(tmp_path):
-    """A file that isn't being written to should become stable quickly."""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("stable content")
-    assert file_watcher.wait_until_stable(str(test_file), timeout=0.5, interval=0.01)
+class TestOnCreated:
+    def test_on_created__directory_event__ignored(self, tmp_path: Path):
+        watcher = FileWatcher(tmp_path, lambda path: True)
+        event = MagicMock()
+        event.is_directory = True
+        event.src_path = "/some/directory"
 
-def test_wait_until_stable_returns_false_while_file_is_still_being_written(tmp_path):
-    """If the file keeps changing until the timeout, it should return False."""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("initial")
+        with patch.object(watcher.executor, "submit") as submit:
+            watcher.on_created(event)
 
-    # Make the test deterministic: mutate the file between every stability poll.
-    real_sleep = time.sleep
+        submit.assert_not_called()
+        assert watcher.processed == set()
 
-    def mutate_on_sleep(seconds):
-        with open(test_file, "ab") as f:
-            f.write(b"x")
-        real_sleep(min(seconds, 0.005))
+    def test_on_created__already_processed_path__ignored(self, tmp_path: Path):
+        watcher = FileWatcher(tmp_path, lambda path: True)
+        already = Path("/some/file.txt")
+        watcher.processed.add(already)
 
-    with patch("app.services.file_watcher.time.sleep", side_effect=mutate_on_sleep):
-        assert not file_watcher.wait_until_stable(str(test_file), timeout=0.05, interval=0.01)
+        event = MagicMock()
+        event.is_directory = False
+        event.src_path = str(already)
 
-def test_wait_until_stable_returns_false_for_file_that_does_not_exist(tmp_path):
-    """Test that wait_until_stable returns False for non-existent file"""
-    assert not file_watcher.wait_until_stable(
-        str(tmp_path / "this/file/does/not/exist.txt"), timeout=0.1, interval=0.01
-    )
+        with patch.object(watcher.executor, "submit") as submit:
+            watcher.on_created(event)
 
-def test_wait_until_stable_returns_false_for_directory(tmp_path):
-    """Test that wait_until_stable returns False for directory"""
-    test_dir = tmp_path / "test/directory"
-    test_dir.mkdir(parents=True)
-    assert not file_watcher.wait_until_stable(str(test_dir), timeout=0.1, interval=0.01)
+        submit.assert_not_called()
+        assert watcher.processed == {already}
 
-def test_wait_until_stable_returns_false_when_file_disappears_during_check(tmp_path):
-    """Test that wait_until_stable returns False if file disappears during check"""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("content")
+    def test_on_created__new_file__scheduled_and_marked_processed(self, tmp_path: Path):
+        watcher = FileWatcher(tmp_path, lambda path: True)
 
-    real_sleep = time.sleep
-    deleted = False
+        event = MagicMock()
+        event.is_directory = False
+        event.src_path = "/some/new_file.txt"
+        expected_path = Path(event.src_path)
 
-    def delete_on_sleep(seconds):
-        nonlocal deleted
-        if not deleted:
-            deleted = True
-            test_file.unlink()
-        real_sleep(min(seconds, 0.005))
+        with patch.object(watcher.executor, "submit") as submit:
+            watcher.on_created(event)
 
-    with patch("app.services.file_watcher.time.sleep", side_effect=delete_on_sleep):
-        assert not file_watcher.wait_until_stable(str(test_file), timeout=0.2, interval=0.01)
-
-# ========== New Tests for wait_until_ready ==========
-
-def test_wait_until_ready_returns_true_for_ready_file(tmp_path):
-    """Test that wait_until_ready returns True for a stable, readable file"""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("ready content")
-
-    # Speed up the stability check without changing the underlying behavior.
-    real_wait_until_stable = file_watcher.wait_until_stable
-
-    def fast_wait_until_stable(path):
-        return real_wait_until_stable(path, timeout=0.2, interval=0.01)
-
-    with patch("app.services.file_watcher.wait_until_stable", side_effect=fast_wait_until_stable):
-        assert file_watcher.wait_until_ready(str(test_file))
-
-def test_wait_until_ready_returns_false_when_file_not_stable(tmp_path):
-    """Test that wait_until_ready returns False when file doesn't stabilize"""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("initial")
-
-    # Composition test: if stability check says "not stable", readiness should be False.
-    with patch("app.services.file_watcher.wait_until_stable", return_value=False):
-        assert not file_watcher.wait_until_ready(str(test_file))
-
-def test_wait_until_ready_returns_false_when_file_cannot_be_opened(tmp_path):
-    """Test that wait_until_ready returns False when file can't be opened for read"""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("content")
-    
-    # Mock can_open_for_read to return False
-    with patch("app.services.file_watcher.can_open_for_read", return_value=False):
-        real_wait_until_stable = file_watcher.wait_until_stable
-
-        def fast_wait_until_stable(path):
-            return real_wait_until_stable(path, timeout=0.2, interval=0.01)
-
-        with patch("app.services.file_watcher.wait_until_stable", side_effect=fast_wait_until_stable):
-            assert not file_watcher.wait_until_ready(str(test_file))
-
-def test_wait_until_ready_returns_false_for_nonexistent_file(tmp_path):
-    """Test that wait_until_ready returns False for non-existent file"""
-    real_wait_until_stable = file_watcher.wait_until_stable
-
-    def fast_wait_until_stable(path):
-        return real_wait_until_stable(path, timeout=0.2, interval=0.01)
-
-    with patch("app.services.file_watcher.wait_until_stable", side_effect=fast_wait_until_stable):
-        assert not file_watcher.wait_until_ready(str(tmp_path / "nonexistent.txt"))
-
-def test_process_file_after_stable_calls_handle_new_file_when_ready(tmp_path):
-    """Test that process_file_after_stable calls handle_new_file when file is ready"""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("ready content")
-
-    # Exercise the real wait_until_ready (but make it fast).
-    real_wait_until_stable = file_watcher.wait_until_stable
-
-    def fast_wait_until_stable(path):
-        return real_wait_until_stable(path, timeout=0.2, interval=0.01)
-
-    with patch("app.services.file_watcher.wait_until_stable", side_effect=fast_wait_until_stable):
-        with patch("app.services.file_watcher.handle_new_file") as mock_handle:
-            result = file_watcher.process_file_after_stable(str(test_file))
-
-    mock_handle.assert_called_once_with(str(test_file))
-    assert result is True
-
-def test_process_file_after_stable_does_not_call_handle_new_file_when_not_ready(tmp_path):
-    """Test that process_file_after_stable doesn't call handle_new_file when file isn't ready"""
-    test_file = tmp_path / "test.txt"
-    test_file.write_text("initial")
-    
-    # Exercise the real wait_until_ready, but force the stability check to fail.
-    with patch("app.services.file_watcher.wait_until_stable", return_value=False):
-        with patch("app.services.file_watcher.handle_new_file") as mock_handle:
-            result = file_watcher.process_file_after_stable(str(test_file))
-
-    mock_handle.assert_not_called()
-    assert result is False
-
-# ========== New Tests for FileWatcher.on_created ==========
-
-def test_file_watcher_on_created_ignores_directories(tmp_path):
-    """Test that FileWatcher.on_created ignores directory events"""
-    watcher = FileWatcher(tmp_path)
-    event = MagicMock()
-    event.is_directory = True
-    event.src_path = "/some/directory"
-    
-    initial_processed_count = len(watcher.processed)
-    
-    watcher.on_created(event)
-    
-    # Should not add to processed set
-    assert len(watcher.processed) == initial_processed_count
-    assert "/some/directory" not in watcher.processed
-
-def test_file_watcher_on_created_ignores_already_processed_files(tmp_path):
-    """Test that FileWatcher.on_created ignores files already in processed set"""
-    watcher = FileWatcher(tmp_path)
-    event = MagicMock()
-    event.is_directory = False
-    event.src_path = "/some/file.txt"
-    
-    # Add to processed set first
-    watcher.processed.add("/some/file.txt")
-    initial_processed_count = len(watcher.processed)
-    
-    watcher.on_created(event)
-    
-    # Should not add again
-    assert len(watcher.processed) == initial_processed_count
-
-def test_file_watcher_on_created_submits_processing_for_new_file(tmp_path):
-    """Test that FileWatcher.on_created submits processing for new files"""
-    watcher = FileWatcher(tmp_path)
-    event = MagicMock()
-    event.is_directory = False
-    event.src_path = "/some/new_file.txt"
-    
-    with patch.object(watcher.executor, "submit") as mock_submit:
-        watcher.on_created(event)
-        
-        # Should add to processed set
-        assert "/some/new_file.txt" in watcher.processed
-        
-        # Should submit processing (we don't care which callable, only that it's scheduled for this path)
-        mock_submit.assert_called_once()
-        assert mock_submit.call_args[0][1] == "/some/new_file.txt"
+        assert expected_path in watcher.processed
+        submit.assert_called_once()
+        assert submit.call_args[0][0] == watcher.process_file_after_stable
+        assert submit.call_args[0][1] == expected_path

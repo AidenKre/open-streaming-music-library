@@ -3,23 +3,28 @@ from watchdog.events import FileSystemEventHandler
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time, os
+from typing import Callable
 
 class FileWatcher(FileSystemEventHandler):
 
-    def __init__(self, import_dir: Path):
+    def __init__(self, import_dir: Path, on_file: Callable[[Path], bool]):
         self.import_dir = import_dir
+        self.on_file = on_file
         self.observer = None
         self.executor = ThreadPoolExecutor(max_workers=4)
-        self.processed = set()
+        # Track already-seen paths to avoid double-processing duplicate FS events.
+        self.processed: set[Path] = set()
 
     def on_created(self, event):
         if event.is_directory:
             return
-        if event.src_path in self.processed:
+
+        path = Path(event.src_path)
+        if path in self.processed:
             return
 
-        self.processed.add(event.src_path)
-        self.executor.submit(process_file_after_stable, event.src_path)
+        self.processed.add(path)
+        self.executor.submit(self.process_file_after_stable, path)
 
     def start_file_watcher(self):
         if self.observer is None or not self.observer.is_alive():
@@ -35,24 +40,28 @@ class FileWatcher(FileSystemEventHandler):
             self.observer = None
             print("File watcher stopped")
 
-def process_file_after_stable(path: Path):
-    print(f"Processing file {path} after stable")
-    if not wait_until_ready(path):
-        return False
-    handle_new_file(path)
-    return True
+    def handle_new_file(self, path: Path):
+        print(f"Handling new file {path}")
+        self.on_file(path)
 
-def wait_until_ready(path: Path):
+    def process_file_after_stable(self, path: Path) -> bool:
+        print(f"Processing file {path} after stable")
+        if not wait_until_ready(path):
+            return False
+        self.handle_new_file(path)
+        return True
+
+def wait_until_ready(path: Path) -> bool:
     if not wait_until_stable(path):
         return False
     return can_open_for_read(path)
 
-def wait_until_stable(path: str, timeout: int = 60, interval: int = 0.2):
+def wait_until_stable(path: str | Path, timeout: int = 60, interval: float = 0.2) -> bool:
     start_time = time.time()
 
     print(f"Starting stable check for {path}")
 
-    if  os.path.isdir(path):
+    if os.path.isdir(path):
         return False
 
     last_size = -1
@@ -60,16 +69,19 @@ def wait_until_stable(path: str, timeout: int = 60, interval: int = 0.2):
     while time.time() - start_time < timeout:
         if not os.path.exists(path):
             return False
-        try: 
+        try:
             current_size = os.path.getsize(path)
             current_mtime = os.path.getmtime(path)
         except FileNotFoundError:
+            return False
+        except OSError:
+            # Permission errors / transient filesystem issues should be treated as "not stable yet".
             return False
     
         if current_size == last_size and current_mtime == last_mtime:
             print(f"File {path} is stable")
             return True
-           
+        
         last_size = current_size
         last_mtime = current_mtime
         time.sleep(interval)
@@ -87,6 +99,3 @@ def can_open_for_read(path: Path):
             return True
     except Exception:
         return False
-
-def handle_new_file(path: Path):
-    print(f"Handling new file {path}")

@@ -1,193 +1,373 @@
-import app.services.ingestion as ingestion
-from app.core.media_types import AUDIO_EXTENSIONS, ARCHIVE_EXTENSIONS
-from pathlib import Path
+from __future__ import annotations
+
+import json
+import subprocess
 import zipfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-# TODO: Make tests for ingestion...
+import pytest
 
-"""
-Test does_music_pass_quick_check()
-
-Things to test...
-- Returns True when...
-A valid music file is provided (correct header, magic number ,etc. things that are checked by ffprobe)
-
--Returns False when...
-- An invalid music file is provided (incorrect header, magic number, etc.) probablly need to manip data to make it invalid
-"""
-@patch("subprocess.run")
-def test_quick_check_valid(mock_run):
-    mock_run.return_value = 0
-    valid_file = Path("test/data/valid_music.mp3")
-    assert ingestion.does_music_pass_quick_check(valid_file)
-
-@patch("subprocess.run")
-def test_quick_check_invalid(mock_run):
-    mock_run.return_value = 1
-    invalid_file = Path("test/data/invalid_music.mp3")
-    assert not ingestion.does_music_pass_quick_check(invalid_file)
+import app.services.ingestion as ingestion
+from app.core.media_types import ARCHIVE_EXTENSIONS, AUDIO_EXTENSIONS
 
 
+class TestDoesMusicPassQuickCheck:
+    def test_does_music_pass_quick_check__audio_stream_present__returns_true(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout=json.dumps({"streams": [{"codec_type": "audio"}]}),
+                stderr="",
+            )
 
-""" 
-Test is_music_file()
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is True
 
-Things to test...
-- Returns True when...
-The file ends with a supported music file extension
+    def test_does_music_pass_quick_check__ffprobe_nonzero_exit__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=1,
+                stdout="",
+                stderr="error",
+            )
 
--Returns False when...
-The file does not end with a supported music file extension
-"""
-def test_is_music_file_valid():
-    for extension in AUDIO_EXTENSIONS:  
-        valid_file = Path(f"test/data/valid_music{extension}")
-        assert ingestion.is_music_file(valid_file)
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
-def test_is_music_file_invalid():
-    for extension in AUDIO_EXTENSIONS:
-        invalid_file = Path(f"test/data/invalid_music{extension + "invalid"}")
-        assert not ingestion.is_music_file(invalid_file)
+    def test_does_music_pass_quick_check__no_audio_streams__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout=json.dumps({"streams": [{"codec_type": "video"}]}),
+                stderr="",
+            )
 
-""" 
-Test is_archive()
+            assert ingestion.does_music_pass_quick_check(Path("video_only.mp4")) is False
 
-Things to test...
-- Returns True when...
-The file ends with a supported archive file extension
+    def test_does_music_pass_quick_check__ffprobe_missing__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run", side_effect=FileNotFoundError):
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
--Returns False when...
-The file does not end with a supported archive file extension
-"""
-def test_is_archive_valid():
-    for extension in ARCHIVE_EXTENSIONS:
-        assert ingestion.is_archive(f"test/data/valid_archive{extension}")
+    def test_does_music_pass_quick_check__invalid_json__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout="not-json",
+                stderr="",
+            )
 
-def test_is_archive_invalid():
-    for extension in ARCHIVE_EXTENSIONS:
-        assert not ingestion.is_archive(f"test/data/invalid_archive{extension + "invalid"}")
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
+    def test_does_music_pass_quick_check__json_not_an_object__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout=json.dumps(["streams"]),
+                stderr="",
+            )
 
-""" 
-Test extract_archive()
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
-Things to test...
-- Returns the directory path to the extracted archive when the archive is extracted successfully and that the directory path is in the temp directory
-Check that the directory path returned contains the files in the archive
-Check that calling extract_archive() on the same archive multiple times returns different directory paths (that all contain the files in the archive)
+    def test_does_music_pass_quick_check__json_missing_streams_key__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout=json.dumps({"not_streams": []}),
+                stderr="",
+            )
 
--Returns None when...
-The archive is not a valid archive file (incorrect header, magic number, etc.) probablly need to manip data to make it invalid
-The archive extraction fails (permissions error, etc.)
-"""
-def test_extract_archive_returns_input_path(tmp_path):
-    archive_path = Path(tmp_path / "valid_archive.zip")
-    extract_dir_path = tmp_path / "extracted_dir"
-    with zipfile.ZipFile(archive_path, "w") as z:
-        z.writestr("valid_music.mp3", "hello")
-    assert ingestion.extract_archive(archive_path, extract_dir_path) == archive_path
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
-def test_extract_archive_returns_fresh_directory_path(tmp_path):
-    archive_path = Path(tmp_path / "valid_archive.zip")
-    extract_dir_path = tmp_path / "extracted_dir"
-    with zipfile.ZipFile(archive_path, "w") as z:
-        z.writestr("valid_music.mp3", "hello")
-    first_extracted_dir = ingestion.extract_archive(archive_path, extract_dir_path)
-    second_extracted_dir = ingestion.extract_archive(archive_path, extract_dir_path)
-    assert first_extracted_dir != second_extracted_dir
-    assert first_extracted_dir.exists()
-    assert first_extracted_dir.is_dir()
-    assert second_extracted_dir.exists()
-    assert second_extracted_dir.is_dir()
-    assert (first_extracted_dir / "valid_music.mp3").exists()
-    assert (second_extracted_dir / "valid_music.mp3").exists()
+    def test_does_music_pass_quick_check__streams_is_none__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout=json.dumps({"streams": None}),
+                stderr="",
+            )
 
-def test_extract_archive_extracts_all_files(tmp_path):
-    archive_path = Path(tmp_path / "valid_archive.zip")
-    extract_dir_path = tmp_path / "extracted_dir"
-    with zipfile.ZipFile(archive_path, "w") as z:
-        z.writestr("valid_music.mp3", "hello")
-        z.writestr("dir1/valid_music.mp3", "world")
-        z.writestr("dir1/dir2/valid_music.mp3", "foo")
-    ingestion.extract_archive(archive_path, extract_dir_path)
-    assert extract_dir_path.exists()
-    assert extract_dir_path.is_dir()
-    assert (extract_dir_path / "valid_music.mp3").exists()
-    assert (extract_dir_path / "dir1" / "valid_music.mp3").exists()
-    assert (extract_dir_path / "dir1" / "dir2" / "valid_music.mp3").exists()
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
-def test_extract_invalid_archive_returns_none(tmp_path):
-    bad_archive = Path(tmp_path / "invalid_archive.zip")
-    bad_archive.write_bytes(b"invalid")
-    extract_dir_path = tmp_path / "extracted_dir"
-    assert ingestion.extract_archive(bad_archive, extract_dir_path) is None
+    def test_does_music_pass_quick_check__streams_empty__returns_false(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout=json.dumps({"streams": []}),
+                stderr="",
+            )
 
-def test_extract_corrupted_archive_returns_none(tmp_path):
-    corrupted_archive = Path(tmp_path / "corrupted_archive.zip")
-    
-    with zipfile.ZipFile(corrupted_archive, "w") as z:
-        z.writestr("valid_music.mp3", "hello")
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
-    data = corrupted_archive.read_bytes()
-    corrupted_archive.write_bytes(data[:10])
+    def test_does_music_pass_quick_check__non_dict_stream_entries_ignored__still_finds_audio(self):
+        with patch("app.services.ingestion.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["ffprobe"],
+                returncode=0,
+                stdout=json.dumps({"streams": [None, 123, {"codec_type": "audio"}]}),
+                stderr="",
+            )
 
-    extract_dir_path = tmp_path / "extracted_dir"
-    assert ingestion.extract_archive(corrupted_archive, extract_dir_path) is None
+            assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is True
 
 
+class TestIsMusicFile:
+    @pytest.mark.parametrize("ext", sorted(AUDIO_EXTENSIONS))
+    def test_is_music_file__supported_extension__returns_true(self, ext: str):
+        assert ingestion.is_music_file(Path(f"song{ext}")) is True
+
+    @pytest.mark.parametrize("ext", sorted(AUDIO_EXTENSIONS))
+    def test_is_music_file__supported_extension_uppercase__returns_true(self, ext: str):
+        assert ingestion.is_music_file(Path(f"song{ext.upper()}")) is True
+
+    def test_is_music_file__no_extension__returns_false(self):
+        assert ingestion.is_music_file(Path("song")) is False
+
+    def test_is_music_file__unsupported_extension__returns_false(self):
+        assert ingestion.is_music_file(Path("song.txt")) is False
 
 
+class TestIsArchive:
+    @pytest.mark.parametrize("ext", sorted(ARCHIVE_EXTENSIONS, key=len))
+    def test_is_archive__supported_extension__returns_true(self, ext: str):
+        assert ingestion.is_archive(Path(f"archive{ext}")) is True
+
+    def test_is_archive__supported_extension_with_extra_dots__returns_true(self):
+        assert ingestion.is_archive(Path("my.album.v1.zip")) is True
+        assert ingestion.is_archive(Path("backup.2025.12.tar.gz")) is True
+
+    def test_is_archive__no_extension__returns_false(self):
+        assert ingestion.is_archive(Path("archive")) is False
+
+    def test_is_archive__unsupported_extension__returns_false(self):
+        assert ingestion.is_archive(Path("archive.gz")) is False
 
 
-"""
-Test ingest_file()
+class TestExtractArchive:
+    def test_extract_archive__valid_zip__extracts_files_under_base_dir(self, tmp_path: Path):
+        archive_path = tmp_path / "valid.zip"
+        base_dir = tmp_path / "extract_base"
 
-Things to test...
-Calls organizer.organize_file() for a valid music file
-Calls organizer.organize_file() for each valid music file in an archive
-    - Ensure archive has at least: one invalid music file, one non-music file
-    - Ensure archive has multiple valid music files
-    - Ensure that archive has a nested directory structure that leads to a valid music file
-Does not call organizer.organize_file() for an invalid music file (incorrect header, magic number, etc.) probablly need to manip data to make it invalid
-Does not call organizer.organize_file() for a non-music file (not a valid music file extension)
-"""
+        expected = {
+            Path("a.mp3"): b"hello",
+            Path("dir1/b.mp3"): b"world",
+            Path("dir1/dir2/c.mp3"): b"foo",
+        }
 
-def test_ingest_file_valid_music_file():
-    with patch("app.services.organizer.organize_file") as mock_organize_file:
-        with patch("app.services.ingestion.is_music_file", return_value=True):
-            with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
-                    valid_file = Path("test/data/valid_music.mp3")
-                    assert ingestion.ingest_file(valid_file) is True
-                    mock_organize_file.assert_called_once_with(valid_file)
+        with zipfile.ZipFile(archive_path, "w") as z:
+            for rel, content in expected.items():
+                z.writestr(rel.as_posix(), content)
 
-def test_ingest_file_invalid_music_file():
-    with patch("app.services.organizer.organize_file") as mock_organize_file:
-        with patch("app.services.ingestion.is_music_file", return_value=True):
-            with patch("app.services.ingestion.does_music_pass_quick_check", return_value=False):
-                invalid_file = Path("test/data/invalid_music.mp3")
-                assert ingestion.ingest_file(invalid_file) is False
-                mock_organize_file.assert_not_called()
+        extract_dir = ingestion.extract_archive(archive_path, base_dir)
+        assert extract_dir is not None
+        assert extract_dir.is_dir()
+        assert extract_dir.resolve().is_relative_to(base_dir.resolve())
 
-def test_ingest_file_non_music_file():
-    with patch("app.services.organizer.organize_file") as mock_organize_file:
-        with patch("app.services.ingestion.is_music_file", return_value=False):
-            non_music_file = Path("test/data/non_music_file.txt")
-            assert ingestion.ingest_file(non_music_file) is False
-            mock_organize_file.assert_not_called()
+        for rel, content in expected.items():
+            extracted = extract_dir / rel
+            assert extracted.is_file()
+            assert extracted.read_bytes() == content
+
+    def test_extract_archive__called_twice__returns_different_directories(self, tmp_path: Path):
+        archive_path = tmp_path / "valid.zip"
+        base_dir = tmp_path / "extract_base"
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("song.mp3", "hello")
+
+        first = ingestion.extract_archive(archive_path, base_dir)
+        second = ingestion.extract_archive(archive_path, base_dir)
+
+        assert first is not None
+        assert second is not None
+        assert first != second
+
+        assert (first / "song.mp3").exists()
+        assert (second / "song.mp3").exists()
+
+    def test_extract_archive__invalid_archive__returns_none_and_cleans_up(self, tmp_path: Path):
+        archive_path = tmp_path / "invalid.zip"
+        archive_path.write_bytes(b"not a zip")
+        base_dir = tmp_path / "extract_base"
+
+        assert ingestion.extract_archive(archive_path, base_dir) is None
+
+        if base_dir.exists():
+            assert list(base_dir.iterdir()) == []
+
+    def test_extract_archive__corrupted_archive__returns_none_and_cleans_up(self, tmp_path: Path):
+        archive_path = tmp_path / "corrupted.zip"
+        base_dir = tmp_path / "extract_base"
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("song.mp3", "hello")
+
+        data = archive_path.read_bytes()
+        archive_path.write_bytes(data[:10])  # truncate
+
+        assert ingestion.extract_archive(archive_path, base_dir) is None
+
+        if base_dir.exists():
+            assert list(base_dir.iterdir()) == []
+
+    def test_extract_archive__path_traversal_entry__returns_none_and_does_not_write_outside(self, tmp_path: Path):
+        archive_path = tmp_path / "traversal.zip"
+        base_dir = tmp_path / "extract_base"
+        outside_target = tmp_path / "evil.txt"
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("../evil.txt", "pwned")
+            z.writestr("ok.mp3", "safe")
+
+        assert ingestion.extract_archive(archive_path, base_dir) is None
+
+        assert outside_target.exists() is False
+        if base_dir.exists():
+            assert list(base_dir.iterdir()) == []
 
 
-def test_ingest_file_complex_archive(tmp_path):
-    with patch("app.services.organizer.organize_file") as mock_organize_file:
-        with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
-            archive_path = Path(tmp_path / "complex_archive.zip")
-            with zipfile.ZipFile(archive_path, "w") as z:
-                z.writestr("valid_music.mp3", "hello")
-                z.writestr("dir1/valid_music.mp3", "world")
-                z.writestr("dir1/dir2/valid_music.mp3", "foo")
-                z.writestr("invalid_file.txt", "invalid")
-            ingestion.ingest_file(archive_path)
-            mock_organize_file.assert_called_once_with(archive_path)
-            mock_organize_file.assert_called_with(Path(archive_path / "valid_music.mp3"))
-            mock_organize_file.assert_called_with(Path(archive_path / "dir1" / "valid_music.mp3"))
-            mock_organize_file.assert_called_with(Path(archive_path / "dir1" / "dir2" / "valid_music.mp3"))
-            mock_organize_file.assert_not_called_with(Path(archive_path / "invalid_file.txt"))
+class TestIngestionServiceIngestFile:
+    def test_ingest_file__valid_music_file__organizes_and_returns_true(self, tmp_path: Path):
+        music_path = tmp_path / "song.mp3"
+        music_path.write_bytes(b"fake")
+
+        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
+        svc = ingestion.IngestionService(ctx)
+
+        with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True), patch(
+            "app.services.ingestion.organize_file"
+        ) as organize:
+            assert svc.ingest_file(music_path) is True
+            organize.assert_called_once_with(music_path)
+
+    def test_ingest_file__unsupported_extension__returns_false_and_does_not_organize(self, tmp_path: Path):
+        path = tmp_path / "note.txt"
+        path.write_text("hello")
+
+        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
+        svc = ingestion.IngestionService(ctx)
+
+        quick_check = MagicMock(return_value=True)
+
+        with patch("app.services.ingestion.does_music_pass_quick_check", quick_check), patch(
+            "app.services.ingestion.organize_file"
+        ) as organize:
+            assert svc.ingest_file(path) is False
+
+            organize.assert_not_called()
+            quick_check.assert_not_called()
+
+    def test_ingest_file__music_file_fails_quick_check__returns_false_and_does_not_organize(self, tmp_path: Path):
+        music_path = tmp_path / "song.mp3"
+        music_path.write_bytes(b"fake")
+
+        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
+        svc = ingestion.IngestionService(ctx)
+
+        with patch("app.services.ingestion.does_music_pass_quick_check", return_value=False), patch(
+            "app.services.ingestion.organize_file"
+        ) as organize:
+            assert svc.ingest_file(music_path) is False
+            organize.assert_not_called()
+
+    def test_ingest_file__invalid_archive__returns_false_and_does_not_organize(self, tmp_path: Path):
+        archive_path = tmp_path / "bad.zip"
+        archive_path.write_bytes(b"not a zip")
+
+        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
+        svc = ingestion.IngestionService(ctx)
+
+        with patch("app.services.ingestion.organize_file") as organize:
+            assert svc.ingest_file(archive_path) is False
+            organize.assert_not_called()
+
+    def test_ingest_file__archive_with_music_and_non_music__organizes_only_music(self, tmp_path: Path):
+        archive_path = tmp_path / "complex.zip"
+        workspace_dir = tmp_path / "workspace"
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("valid_music.mp3", "hello")
+            z.writestr("dir1/valid_music.mp3", "world")
+            z.writestr("dir1/dir2/valid_music.mp3", "foo")
+            z.writestr("not_music.txt", "nope")
+
+        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
+        svc = ingestion.IngestionService(ctx)
+
+        with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True), patch(
+            "app.services.ingestion.organize_file"
+        ) as organize:
+            assert svc.ingest_file(archive_path) is True
+
+        extracted_music = {
+            p
+            for p in workspace_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+        }
+        called_paths = {call.args[0] for call in organize.call_args_list}
+        assert called_paths == extracted_music
+
+    def test_ingest_file__archive_name_with_extra_dots__still_detected_as_archive(self, tmp_path: Path):
+        archive_path = tmp_path / "my.album.v1.zip"
+        workspace_dir = tmp_path / "workspace"
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("song.mp3", "hello")
+
+        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
+        svc = ingestion.IngestionService(ctx)
+
+        with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True), patch(
+            "app.services.ingestion.organize_file"
+        ) as organize:
+            assert svc.ingest_file(archive_path) is True
+
+        assert any(call.args[0].suffix.lower() in AUDIO_EXTENSIONS for call in organize.call_args_list)
+
+    def test_ingest_file__archive_music_fails_quick_check__skips_bad_tracks(self, tmp_path: Path):
+        archive_path = tmp_path / "mix.zip"
+        workspace_dir = tmp_path / "workspace"
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("good.mp3", "good")
+            z.writestr("bad.mp3", "bad")
+
+        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
+        svc = ingestion.IngestionService(ctx)
+
+        def quick_check_side_effect(p: Path) -> bool:
+            return p.name != "bad.mp3"
+
+        with patch(
+            "app.services.ingestion.does_music_pass_quick_check", side_effect=quick_check_side_effect
+        ), patch("app.services.ingestion.organize_file") as organize:
+            assert svc.ingest_file(archive_path) is True
+
+        called_paths = {call.args[0].name for call in organize.call_args_list}
+        assert called_paths == {"good.mp3"}
+
+    def test_ingest_file__archive_with_no_music_files__returns_true_and_organizes_nothing(self, tmp_path: Path):
+        archive_path = tmp_path / "no_music.zip"
+        workspace_dir = tmp_path / "workspace"
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("readme.txt", "no songs here")
+
+        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
+        svc = ingestion.IngestionService(ctx)
+
+        quick_check = MagicMock(return_value=True)
+        with patch("app.services.ingestion.does_music_pass_quick_check", quick_check), patch(
+            "app.services.ingestion.organize_file"
+        ) as organize:
+            assert svc.ingest_file(archive_path) is True
+
+        organize.assert_not_called()
+        quick_check.assert_not_called()
+
