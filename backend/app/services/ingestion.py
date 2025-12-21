@@ -1,6 +1,6 @@
 from pathlib import Path
 from app.core.media_types import AUDIO_EXTENSIONS, ARCHIVE_EXTENSIONS
-from app.services.organizer import organize_file
+from .organizer import organize_file
 from dataclasses import dataclass
 import libarchive
 import shutil
