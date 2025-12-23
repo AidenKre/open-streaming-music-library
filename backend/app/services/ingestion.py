@@ -1,7 +1,7 @@
 from pathlib import Path
 from app.core.media_types import AUDIO_EXTENSIONS, ARCHIVE_EXTENSIONS
-from .organizer import organize_file
 from dataclasses import dataclass
+from typing import Callable
 import libarchive
 import shutil
 import subprocess
@@ -12,8 +12,9 @@ class IngestionContext:
     workspace_dir: Path
 
 class IngestionService:
-    def __init__(self, ctx: IngestionContext):
+    def __init__(self, ctx: IngestionContext, organize_function: Callable[[Path], bool]):
         self.ctx = ctx
+        self.organize_function = organize_function
 
     def ingest_file(self, file_path: Path) -> bool:
         if is_archive(file_path):
@@ -32,7 +33,7 @@ class IngestionService:
                 if not does_music_pass_quick_check(path):
                     continue
 
-                organize_file(path)
+                self.organize_function(path)
             return True
 
         if not is_music_file(file_path):
@@ -40,7 +41,7 @@ class IngestionService:
         if not does_music_pass_quick_check(file_path):
             return False
         
-        organize_file(file_path)
+        self.organize_function(file_path)
         return True
         
 def is_music_file(file_path: Path) -> bool:
