@@ -6,8 +6,6 @@ from app.services.metadata import get_track_metadata
 from typing import Callable
 from app.models.track import Track
 
-# TODO: implement organizer
-
 # TODO: implement copy_file
 # TODO: do not assume that move destination is on the same filesystem as the source aka atomic rename for moving
 
@@ -24,7 +22,7 @@ class OrganizerContext:
     add_to_database: Callable[[Track], bool]
 
     def __post_init__(self):
-        if not self.should_organize_files and self.should_copy_files:        
+        if not self.should_organize_files and self.should_copy_files:
             raise ValueError(
                 "If files are not being organized (should_organize_files is False), "
                 "then files remain in their existing location. Therefore, should_copy_files must be False."
