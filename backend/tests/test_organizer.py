@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from operator import add
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,11 +37,21 @@ class TestMoveFile:
     
 class TestOrganizer:
     def _create_organizing_moving_organizer(self, music_dir: Path):
-        ctx = organizer.OrganizerContext(music_library_dir=music_dir, should_organize_files=True, should_copy_files=False)
+        ctx = organizer.OrganizerContext(
+            music_library_dir=music_dir,
+            should_organize_files=True,
+            should_copy_files=False,
+            add_to_database=lambda x: True,
+        )
         return organizer.Organizer(ctx)
     
     def _create_nonorganizing_organizer(self, music_dir: Path):
-        ctx = organizer.OrganizerContext(music_library_dir=music_dir, should_organize_files=False, should_copy_files=False)
+        ctx = organizer.OrganizerContext(
+            music_library_dir=music_dir,
+            should_organize_files=False,
+            should_copy_files=False,
+            add_to_database=lambda x: True,
+        )
         return organizer.Organizer(ctx)
     
     def test_organize_file__organizing_moving_source_does_not_exist__does_not_organize(self, tmp_path: Path):
@@ -62,8 +73,8 @@ class TestOrganizer:
         file_path.touch()
         file_path.write_bytes(b"dataaaaa")
 
-        with patch("app.services.metadata.get_track_metadata") as get_track_metadata:
-            with patch.object(TrackMetaData, "is_empty", return_value=False):
+        with patch("app.services.organizer.get_track_metadata") as get_track_metadata:
+            with patch.object(TrackMetaData, "is_empty", return_value=True):
                 trackmetadata = TrackMetaData()
                 get_track_metadata.return_value = trackmetadata
 
@@ -94,7 +105,7 @@ class TestOrganizer:
         file_path.touch()
         file_path.write_bytes(b"dataaaaaaaaaa")
 
-        with patch("app.services.metadata.get_track_metadata") as get_track_metadata:
+        with patch("app.services.organizer.get_track_metadata") as get_track_metadata:
             trackmetadata = TrackMetaData(**trackmeta_kwargs)
             get_track_metadata.return_value = trackmetadata
 
