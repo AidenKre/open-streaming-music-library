@@ -77,6 +77,8 @@ class TestGetTrackMetadata:
             assert track_metadata.year == 2021
             assert track_metadata.track_number == 1
             assert track_metadata.genre == "Electronic"
+
+            assert track_metadata.codec == "aac"
             assert track_metadata.duration == 181.0
             assert track_metadata.bitrate_kbps == 256.0  # 256000 / 1000
             assert track_metadata.sample_rate_hz == 44100

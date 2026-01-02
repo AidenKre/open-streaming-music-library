@@ -5,6 +5,7 @@ from app.models.track_meta_data import TrackMetaData
 
 def get_track_metadata(file_path: Path) -> TrackMetaData | None:
     json_data = ffprobe_for_metadata(file_path)
+    print(json_data)
     if json_data is None:
         return None
     metadata = build_track_metadata(json_data)
@@ -71,6 +72,11 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
 
     metadata = TrackMetaData()
 
+    codec = audio_stream.get("codec_name", None)
+    if codec != None:
+        codec = str(codec)
+    
+    metadata.codec = codec
     metadata.duration = float(audio_stream.get("duration", 0.0))
     metadata.bitrate_kbps = float(audio_stream.get("bit_rate", 0.0)) / 1000.0
     metadata.sample_rate_hz = int(audio_stream.get("sample_rate", 0))

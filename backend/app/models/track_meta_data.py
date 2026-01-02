@@ -14,6 +14,7 @@ class TrackMetaData(BaseModel):
     track_number: int | None = None
     disc_number: int | None = None
 
+    codec: str | None = None
     duration: float = 0.0
     bitrate_kbps: float = 0.0
     sample_rate_hz: int = 0
@@ -23,7 +24,8 @@ class TrackMetaData(BaseModel):
 
     def is_empty(self) -> bool:
         return (
-            self.duration == 0.0
+            self.codec == None
+            and self.duration == 0.0
             and self.bitrate_kbps == 0.0
             and self.sample_rate_hz == 0
             and self.channels == 0
