@@ -8,13 +8,15 @@ import subprocess
 import json
 
 @dataclass(frozen=True)
-class IngestionContext:
+class IngestorContext:
     workspace_dir: Path
+    organize_function: Callable[[Path], bool]
 
-class IngestionService:
-    def __init__(self, ctx: IngestionContext, organize_function: Callable[[Path], bool]):
+# TODO: make organize_function actually be called from context, rather than lazily patching
+class Ingestor:
+    def __init__(self, ctx: IngestorContext):
         self.ctx = ctx
-        self.organize_function = organize_function
+        self.organize_function = ctx.organize_function
 
     def ingest_file(self, file_path: Path) -> bool:
         if is_archive(file_path):
@@ -146,11 +148,3 @@ def extract_archive(archive_path: Path, base_dir: Path) -> Path | None:
         shutil.rmtree(extract_dir, ignore_errors=True)
         print(f"Error extracting archive: {e}")
         return None
-
-if __name__ == "__main__":
-    good_song = Path("/Volumes/Acasis/Musix/temp.m4a")
-    bad_song = Path("/Volumes/Acasis/Musix/bad_temp.m4a")
-    movie = Path("/Volumes/Acasis/Movies/Blackened.Mantle.2023.Kurosawa.Edition.HQ.1080p.mp4")
-    print(does_music_pass_quick_check(good_song))
-    print(does_music_pass_quick_check(bad_song))
-    print(does_music_pass_quick_check(movie))

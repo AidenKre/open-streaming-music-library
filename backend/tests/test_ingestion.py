@@ -237,9 +237,11 @@ class TestIngestionServiceIngestFile:
         music_path = tmp_path / "song.mp3"
         music_path.write_bytes(b"fake")
 
-        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=tmp_path / "workspace", organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
             assert svc.ingest_file(music_path) is True
@@ -249,9 +251,11 @@ class TestIngestionServiceIngestFile:
         path = tmp_path / "note.txt"
         path.write_text("hello")
 
-        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=tmp_path / "workspace", organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         quick_check = MagicMock(return_value=True)
 
@@ -265,9 +269,11 @@ class TestIngestionServiceIngestFile:
         music_path = tmp_path / "song.mp3"
         music_path.write_bytes(b"fake")
 
-        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=tmp_path / "workspace", organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=False):
             assert svc.ingest_file(music_path) is False
@@ -277,9 +283,11 @@ class TestIngestionServiceIngestFile:
         archive_path = tmp_path / "bad.zip"
         archive_path.write_bytes(b"not a zip")
 
-        ctx = ingestion.IngestionContext(workspace_dir=tmp_path / "workspace")
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=tmp_path / "workspace", organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         assert svc.ingest_file(archive_path) is False
         organize_function.assert_not_called()
@@ -294,9 +302,11 @@ class TestIngestionServiceIngestFile:
             z.writestr("dir1/dir2/valid_music.mp3", "foo")
             z.writestr("not_music.txt", "nope")
 
-        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=workspace_dir, organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
             assert svc.ingest_file(archive_path) is True
@@ -316,9 +326,11 @@ class TestIngestionServiceIngestFile:
         with zipfile.ZipFile(archive_path, "w") as z:
             z.writestr("song.mp3", "hello")
 
-        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=workspace_dir, organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
             assert svc.ingest_file(archive_path) is True
@@ -333,9 +345,11 @@ class TestIngestionServiceIngestFile:
             z.writestr("good.mp3", "good")
             z.writestr("bad.mp3", "bad")
 
-        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=workspace_dir, organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         def quick_check_side_effect(p: Path) -> bool:
             return p.name != "bad.mp3"
@@ -355,9 +369,11 @@ class TestIngestionServiceIngestFile:
         with zipfile.ZipFile(archive_path, "w") as z:
             z.writestr("readme.txt", "no songs here")
 
-        ctx = ingestion.IngestionContext(workspace_dir=workspace_dir)
         organize_function = MagicMock()
-        svc = ingestion.IngestionService(ctx, organize_function=organize_function)
+        ctx = ingestion.IngestorContext(
+            workspace_dir=workspace_dir, organize_function=organize_function
+        )
+        svc = ingestion.Ingestor(ctx)
 
         quick_check = MagicMock(return_value=True)
         with patch("app.services.ingestion.does_music_pass_quick_check", quick_check):
