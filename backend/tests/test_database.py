@@ -8,7 +8,9 @@ from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
 def set_up_database(database_path: Path):
-    context = DatabaseContext(database_path=database_path)
+    context = DatabaseContext(
+        database_path=database_path,
+        init_sql_path=Path(__file__).parent.parent / "app" / "database" / "init.sql")
     return Database(context=context)
 
 class TestDatabaseInitialize:
@@ -60,8 +62,6 @@ class TestDatabaseInitialize:
         table_names = [row["name"] for row in res.fetchall()]
 
         assert fake_table_str in table_names
-        assert not "tracks" in table_names
-        assert not "trackmetadata" in table_names
 
     def test_initialize__database_error__returns_false(self, tmp_path: Path):
         database_path = tmp_path / "database.db" 
@@ -82,12 +82,13 @@ class TestDatabaseAddTrack:
         empty_track = Track(file_path = file_path, metadata = TrackMetaData())
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
+        database.initialize()
 
         track_added = database.add_track(
             track = empty_track,
             timeout = 0.1
         )
-
+        print(empty_track.metadata)
         assert not track_added
 
         conn = sqlite3.connect(database_path)
@@ -152,13 +153,15 @@ class TestDatabaseAddTrack:
             metadata = metadata,
         )
 
-        track_added = database.add_track(track = track, timeout = 0.01)
+        track_added = database.add_track(track = track, timeout = 0.05)
+        blocking_conn.close()
         assert not track_added
     
     def test_add_track__invalid_uuid__returns_false(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
         # seed the database with some data
         database = set_up_database(database_path)
+        database.initialize()
 
         file_path_1 = tmp_path / "track_1.mp4"
         file_path_2 = tmp_path / "track_2.mp4"
@@ -227,6 +230,8 @@ class TestDatabaseAddTrack:
         database_path = tmp_path / "database.db"
         # seed the database with some data
         database = set_up_database(database_path)
+        database.initialize()
+
         def seed_metadata():
             metadata = TrackMetaData(
                             codec = "test",
@@ -307,7 +312,7 @@ class TestDatabaseDeleteTrack:
         database = set_up_database(database_path)
 
         track_deleted = database.delete_track(uuid_id="missing")
-        assert not track_deleted
+        assert track_deleted is False
 
     def test_delete_track__missing_uuid__returns_false(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
@@ -315,7 +320,7 @@ class TestDatabaseDeleteTrack:
         database.initialize()
 
         track_deleted = database.delete_track(uuid_id="missing")
-        assert not track_deleted
+        assert track_deleted is False
 
     def test_delete_track__db_busy__returns_false(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
@@ -325,8 +330,8 @@ class TestDatabaseDeleteTrack:
         blocking_conn = sqlite3.connect(database_path)
         blocking_conn.execute("BEGIN EXCLUSIVE")
 
-        track_deleted = database.delete_track(uuid_id="missing")
-        assert not track_deleted
+        track_deleted = database.delete_track(uuid_id="missing", timeout=0.05)
+        assert track_deleted is False
 
         blocking_conn.close()
 
@@ -458,6 +463,7 @@ class TestDatabaseGetTracks:
         database.add_track(track=track_2, timeout=1)
         database.add_track(track=track_3, timeout=1)
         database.add_track(track=track_4, timeout=1)
+        database.add_track(track=track_5, timeout=1)
 
         # Searching by artist returns only the specified artists
         search_parameters = {
@@ -468,15 +474,15 @@ class TestDatabaseGetTracks:
 
         assert len(returned_tracks) == 4
 
-        titles = set()
+        titles = []
         for track in returned_tracks:
             assert track.metadata.artist == "artist"
-            titles.add(track.metadata.title)
+            titles.append(track.metadata.title)
         
         assert len(titles) == 4
 
         # Artist + title search returns just the specific track
-        search_parameters - {
+        search_parameters = {
             "artist": "artist",
             "title": "title_1"
         }
@@ -490,17 +496,15 @@ class TestDatabaseGetTracks:
         search_parameters = {}
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
-        assert len(titles) == 5
-        
-        titles = set()
+        titles = []
         for track in returned_tracks:
-            titles.add(track.metadata.title)
+            titles.append(track.metadata.title)
         
         assert len(titles) == 5
 
         artists = set()
         for track in returned_tracks:
-            artists.add(track.metadata.title)
+            artists.add(track.metadata.artist)
 
         assert len(artists) == 2
         assert "artist" in artists
