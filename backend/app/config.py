@@ -4,10 +4,8 @@ from pathlib import Path
 class Settings(BaseSettings):
     # Project directories
     import_dir: Path = Path("./import")
-
     music_library_dir: Path = Path("./music")
-
-    workspace_dir: Path = Path("./workspace")
+    app_data_dir: Path = Path("./data")
 
     # Server settings
     debug: bool = True

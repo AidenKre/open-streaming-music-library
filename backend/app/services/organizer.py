@@ -8,6 +8,7 @@ from app.models.track import Track
 
 # TODO: implement copy_file
 # TODO: do not assume that move destination is on the same filesystem as the source aka atomic rename for moving
+# TODO: organization priority should be Album Artist/ Album first if it exists, then Artist / Album
 
 # For now, organization is as follows:
 # If a song has an artist it will go somewhere in music_library_dir / artist

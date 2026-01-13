@@ -3,9 +3,11 @@ import subprocess
 import json
 from app.models.track_meta_data import TrackMetaData
 
+# TODO: Handle non printable characters in metadata (remember the UniBe@t thingy where there were windows /r/n invisible characters...)
+# TODO: possible search database to see if artist/album already exists? and match capitalization? might be confusing...
+
 def get_track_metadata(file_path: Path) -> TrackMetaData | None:
     json_data = ffprobe_for_metadata(file_path)
-    print(json_data)
     if json_data is None:
         return None
     metadata = build_track_metadata(json_data)

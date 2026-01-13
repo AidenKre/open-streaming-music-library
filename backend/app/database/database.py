@@ -38,6 +38,7 @@ class DatabaseContext:
 class Database:
     def __init__(self, context: DatabaseContext):
         self.context = context
+
     def connect_to_database(self, timeout: float = 5) -> sqlite3.Connection:
         database_path = self.context.database_path
         conn = None
@@ -49,17 +50,23 @@ class Database:
             return conn
         
         except Exception as e:
-            print(f"Error connecting to the sqlite database. database path: {database_path}. Exception: {e}")
+            print(f"Error connecting to the sqlite database. database path: {database_path} Exception: {e}")
             return None
         
     def initialize(self) -> bool:
+        # TODO: Create database migration logic when I actually need to migrate a database
+        if self.context.database_path.exists():
+            print("Database already exists, so skipping")
+            return True
         conn = None
         try:
             conn = self.connect_to_database()
-        except Exception:
+        except Exception as e:
+            print(e)
             return False
 
         if not conn:
+            print("Unable to connect to the database, connect_to_database returned false")
             return False
 
         with open(self.context.init_sql_path, 'r') as f:
