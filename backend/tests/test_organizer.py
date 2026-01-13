@@ -90,11 +90,13 @@ class TestOrganizer:
             ({"duration": 1.0, "artist": "artist", "album": "album"}, "artist/album"),
             ({"duration": 1.0, "artist": "artist"}, "artist"),
             ({"duration": 1.0}, ""),
+            ({"duration": 1.0, "artist": "artist", "album": "album", "album_artist": "album_artist"}, "album_artist/album"),
         ],
         ids=[
             "album-and-artist",
             "artist-only",
             "no-artist-or-album",
+            "album-artist"
         ]
     )
     def test_organize_file__organizing_moving_various_scenarios(self, tmp_path: Path, trackmeta_kwargs, expected_subdir):

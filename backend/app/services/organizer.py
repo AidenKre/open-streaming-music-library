@@ -5,10 +5,11 @@ from app.models.track import Track
 from app.services.metadata import get_track_metadata
 from typing import Callable
 from app.models.track import Track
+from app.models import track
+from app.models.track_meta_data import TrackMetaData
 
 # TODO: implement copy_file
 # TODO: do not assume that move destination is on the same filesystem as the source aka atomic rename for moving
-# TODO: organization priority should be Album Artist/ Album first if it exists, then Artist / Album
 
 # For now, organization is as follows:
 # If a song has an artist it will go somewhere in music_library_dir / artist
@@ -48,12 +49,7 @@ class Organizer:
             print(f"{file_path} does not result in a TrackMetaData")
             return False
         
-        destination_dir = self.ctx.music_library_dir
-
-        if trackmetadata.artist:
-            destination_dir = destination_dir / trackmetadata.artist
-            if trackmetadata.album:
-                destination_dir = destination_dir / trackmetadata.album
+        destination_dir = create_destination_dir(trackmetadata=trackmetadata, root_dir=self.ctx.music_library_dir)
 
         destination_dir.mkdir(parents=True, exist_ok=True)
 
@@ -97,3 +93,17 @@ def move_file(file_path: Path, destination_path: Path) -> bool:
     except (PermissionError, FileExistsError, OSError) as e:
         print(f"Exception trying to move {file_path} to {destination_path}: {e}")
         return False
+
+def create_destination_dir(trackmetadata: TrackMetaData, root_dir: Path) -> Path:
+    destination_dir = root_dir
+    
+    if trackmetadata.album_artist:
+        destination_dir /= trackmetadata.album_artist
+    elif trackmetadata.artist:
+        destination_dir /= trackmetadata.artist
+    
+    if trackmetadata.album_artist or trackmetadata.artist:
+        if trackmetadata.album:
+            destination_dir /= trackmetadata.album
+    
+    return destination_dir
