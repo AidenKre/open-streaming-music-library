@@ -1,17 +1,43 @@
-from re import search
-from typing import Any
-from app.database.database import Database, DatabaseContext
-from pathlib import Path
 import sqlite3
+import pytest
+from pathlib import Path
+from typing import List
 from unittest.mock import patch
+
+from app.database.database import Database, DatabaseContext
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
+
 
 def set_up_database(database_path: Path):
     context = DatabaseContext(
         database_path=database_path,
-        init_sql_path=Path(__file__).parent.parent / "app" / "database" / "init.sql")
+        init_sql_path=Path(__file__).parent.parent / "app" / "database" / "init.sql",
+    )
     return Database(context=context)
+
+
+def seed_metadata():
+    metadata = TrackMetaData(
+        codec="test",
+        duration=2.0,
+        bitrate_kbps=320.0,
+        sample_rate_hz=44,
+        channels=2,
+    )
+    return metadata
+
+
+def create_track(path, title, artist):
+    metadata = seed_metadata()
+
+    metadata.title = title
+    metadata.artist = artist
+
+    track = Track(file_path=path, metadata=metadata)
+
+    return track
+
 
 class TestDatabaseInitialize:
     def test_initialize__database_does_not_exist__gets_created(self, tmp_path: Path):
@@ -22,7 +48,7 @@ class TestDatabaseInitialize:
         assert result
 
         assert database_path.exists()
-        
+
         conn = sqlite3.connect(database_path)
 
         conn.row_factory = sqlite3.Row
@@ -64,7 +90,7 @@ class TestDatabaseInitialize:
         assert fake_table_str in table_names
 
     def test_initialize__database_error__returns_false(self, tmp_path: Path):
-        database_path = tmp_path / "database.db" 
+        database_path = tmp_path / "database.db"
 
         with patch("app.database.database.sqlite3") as sqlite:
             sqlite.connect.side_effect = Exception("Database error!")
@@ -79,15 +105,12 @@ class TestDatabaseInitialize:
 class TestDatabaseAddTrack:
     def test_add_track__empty__returns_false(self, tmp_path: Path):
         file_path = tmp_path / "fake_track"
-        empty_track = Track(file_path = file_path, metadata = TrackMetaData())
+        empty_track = Track(file_path=file_path, metadata=TrackMetaData())
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
 
-        track_added = database.add_track(
-            track = empty_track,
-            timeout = 0.1
-        )
+        track_added = database.add_track(track=empty_track, timeout=0.1)
         print(empty_track.metadata)
         assert not track_added
 
@@ -95,7 +118,9 @@ class TestDatabaseAddTrack:
 
         cur = conn.cursor()
 
-        res = cur.execute("SELECT * FROM tracks WHERE file_path = ?;", (str(file_path),))
+        res = cur.execute(
+            "SELECT * FROM tracks WHERE file_path = ?;", (str(file_path),)
+        )
 
         found_tracks = res.fetchall()
         assert len(found_tracks) == 0
@@ -103,22 +128,22 @@ class TestDatabaseAddTrack:
     def test_add_track__db_not_initialized__returns_false(self, tmp_path: Path):
         file_path = tmp_path / "track.mp3"
         metadata = TrackMetaData(
-            codec = "test",
-            duration = 2.0,
-            bitrate_kbps = 320.0,
-            sample_rate_hz = 44,
-            channels = 2
+            codec="test",
+            duration=2.0,
+            bitrate_kbps=320.0,
+            sample_rate_hz=44,
+            channels=2,
         )
 
         track = Track(
-            file_path = file_path,
-            metadata = metadata,
+            file_path=file_path,
+            metadata=metadata,
         )
 
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
-        track_added = database.add_track(track = track, timeout = 5)
+        track_added = database.add_track(track=track, timeout=5)
         assert not track_added
 
         conn = sqlite3.connect(database_path)
@@ -138,25 +163,25 @@ class TestDatabaseAddTrack:
 
         blocking_conn = sqlite3.connect(database_path)
         blocking_conn.execute("BEGIN EXCLUSIVE")
-        
+
         file_path = tmp_path / "track.mp3"
         metadata = TrackMetaData(
-                    codec = "test",
-                    duration = 2.0,
-                    bitrate_kbps = 320.0,
-                    sample_rate_hz = 44,
-                    channels = 2
-                )
-
-        track = Track(
-            file_path = file_path,
-            metadata = metadata,
+            codec="test",
+            duration=2.0,
+            bitrate_kbps=320.0,
+            sample_rate_hz=44,
+            channels=2,
         )
 
-        track_added = database.add_track(track = track, timeout = 0.05)
+        track = Track(
+            file_path=file_path,
+            metadata=metadata,
+        )
+
+        track_added = database.add_track(track=track, timeout=0.05)
         blocking_conn.close()
         assert not track_added
-    
+
     def test_add_track__invalid_uuid__returns_false(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
         # seed the database with some data
@@ -167,27 +192,27 @@ class TestDatabaseAddTrack:
         file_path_2 = tmp_path / "track_2.mp4"
 
         metadata = TrackMetaData(
-                            codec = "test",
-                            duration = 2.0,
-                            bitrate_kbps = 320.0,
-                            sample_rate_hz = 44,
-                            channels = 2
-                        )
+            codec="test",
+            duration=2.0,
+            bitrate_kbps=320.0,
+            sample_rate_hz=44,
+            channels=2,
+        )
 
         track_1 = Track(
-            uuid_id = "a",
-            file_path = file_path_1,
-            metadata = metadata,
+            uuid_id="a",
+            file_path=file_path_1,
+            metadata=metadata,
         )
 
         track_2 = Track(
-            uuid_id = "a",
-            file_path = file_path_2,
-            metadata = metadata,
+            uuid_id="a",
+            file_path=file_path_2,
+            metadata=metadata,
         )
 
-        track_1_added = database.add_track(track = track_1, timeout = 1)
-        track_2_added = database.add_track(track = track_2, timeout = 1)
+        track_1_added = database.add_track(track=track_1, timeout=1)
+        track_2_added = database.add_track(track=track_2, timeout=1)
 
         assert track_1_added
         assert not track_2_added
@@ -196,32 +221,32 @@ class TestDatabaseAddTrack:
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
         database.initialize()
-        
+
         file_path_1 = tmp_path / "track_1.mp4"
         file_path_2 = tmp_path / "track_2.mp4"
 
         metadata = TrackMetaData(
-                            codec = "test",
-                            duration = 2.0,
-                            bitrate_kbps = 320.0,
-                            sample_rate_hz = 44,
-                            channels = 2
-                        )
+            codec="test",
+            duration=2.0,
+            bitrate_kbps=320.0,
+            sample_rate_hz=44,
+            channels=2,
+        )
 
         track_1 = Track(
-            file_hash = "a",
-            file_path = file_path_1,
-            metadata = metadata,
+            file_hash="a",
+            file_path=file_path_1,
+            metadata=metadata,
         )
 
         track_2 = Track(
-            file_hash = "a",
-            file_path = file_path_2,
-            metadata = metadata,
+            file_hash="a",
+            file_path=file_path_2,
+            metadata=metadata,
         )
 
-        track_1_added = database.add_track(track = track_1, timeout = 1)
-        track_2_added = database.add_track(track = track_2, timeout = 1)
+        track_1_added = database.add_track(track=track_1, timeout=1)
+        track_2_added = database.add_track(track=track_2, timeout=1)
 
         assert track_1_added
         assert not track_2_added
@@ -232,29 +257,6 @@ class TestDatabaseAddTrack:
         database = set_up_database(database_path)
         database.initialize()
 
-        def seed_metadata():
-            metadata = TrackMetaData(
-                            codec = "test",
-                            duration = 2.0,
-                            bitrate_kbps = 320.0,
-                            sample_rate_hz = 44,
-                            channels = 2
-                        )
-            return metadata
-
-        def create_track(path, title, artist):
-            metadata = seed_metadata()
-
-            metadata.title = title
-            metadata.artist = artist
-
-            track = Track(
-                file_path = path,
-                metadata = metadata
-            )
-            
-            return track
-
         def execute_query(query: str):
             conn = sqlite3.connect(database_path)
             cur = conn.cursor()
@@ -262,7 +264,7 @@ class TestDatabaseAddTrack:
             tracks = res.fetchall()
             conn.close()
             return tracks
-        
+
         track_1_path = tmp_path / "track_1.mp3"
         track_2_path = tmp_path / "track_2.mp3"
         track_3_path = tmp_path / "track_3.mp3"
@@ -290,21 +292,21 @@ class TestDatabaseAddTrack:
         query_result = execute_query("SELECT file_path FROM tracks;")
         assert len(query_result) == 4
 
-        assert set(query_result) == set([
-            (str(track_1_path),),
-            (str(track_2_path),),
-            (str(track_3_path),),
-            (str(track_4_path),)
-        ])
+        assert set(query_result) == set(
+            [
+                (str(track_1_path),),
+                (str(track_2_path),),
+                (str(track_3_path),),
+                (str(track_4_path),),
+            ]
+        )
 
         query_result = execute_query("SELECT title FROM trackmetadata;")
         assert len(query_result) == 4
-        assert set(query_result) == set([
-            ("title_1",), 
-            ("title_2",), 
-            ("title_3",), 
-            ("title_4",)
-        ])
+        assert set(query_result) == set(
+            [("title_1",), ("title_2",), ("title_3",), ("title_4",)]
+        )
+
 
 class TestDatabaseDeleteTrack:
     def test_delete_track__db_not_initialized__returns_false(self, tmp_path: Path):
@@ -335,7 +337,9 @@ class TestDatabaseDeleteTrack:
 
         blocking_conn.close()
 
-    def test_delete_track__valid_uuid__deletes_tracks_and_trackmetadata(self, tmp_path: Path):
+    def test_delete_track__valid_uuid__deletes_tracks_and_trackmetadata(
+        self, tmp_path: Path
+    ):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
         database.initialize()
@@ -372,20 +376,23 @@ class TestDatabaseDeleteTrack:
         track_deleted = database.delete_track(uuid_id=uuid_id)
         assert track_deleted
 
-        query_result = execute_query("SELECT uuid_id FROM tracks WHERE uuid_id = ?;", (uuid_id,))
+        query_result = execute_query(
+            "SELECT uuid_id FROM tracks WHERE uuid_id = ?;", (uuid_id,)
+        )
         assert len(query_result) == 0
 
-        query_result = execute_query("SELECT uuid_id FROM trackmetadata WHERE uuid_id = ?;", (uuid_id,))
+        query_result = execute_query(
+            "SELECT uuid_id FROM trackmetadata WHERE uuid_id = ?;", (uuid_id,)
+        )
         assert len(query_result) == 0
+
 
 class TestDatabaseGetTracks:
     def test_get_tracks__db_not_initialized__returns_empty_list(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
-        search_parameters = {
-            "title": "test"
-        }
+        search_parameters = {"title": "test"}
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
         assert len(returned_tracks) == 0
@@ -394,58 +401,32 @@ class TestDatabaseGetTracks:
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
-        database.initialize()
+        assert database.initialize()
 
-        search_parameters = {
-            "title": "tests"
-        }
+        search_parameters = {"title": "tests"}
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
         assert len(returned_tracks) == 0
-    
+
     def test_get_tracks__invalid_columns__throws_error(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
-        database.initialize()
+        assert database.initialize()
 
-        search_parameters = {
-            "invalid_column": "test"
-        }
+        search_parameters = {"invalid_column": "test"}
+        with pytest.raises(ValueError):
+            database.get_tracks(search_parameters=search_parameters)
 
-        try:
-            returned_tracks = database.get_tracks(search_parameters=search_parameters)
-        except Exception:
-            assert True
-        
+        order_parameters = {"invalid_column": "test"}
+        with pytest.raises(ValueError):
+            database.get_tracks(order_parameters=order_parameters)
+
     def test_get_tracks__valid_search__returns_results(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
-        database.initialize()
-
-        def seed_metadata():
-            metadata = TrackMetaData(
-                            codec = "test",
-                            duration = 2.0,
-                            bitrate_kbps = 320.0,
-                            sample_rate_hz = 44,
-                            channels = 2
-                        )
-            return metadata
-
-        def create_track(path, title, artist):
-            metadata = seed_metadata()
-
-            metadata.title = title
-            metadata.artist = artist
-
-            track = Track(
-                file_path = path,
-                metadata = metadata
-            )
-            
-            return track
+        assert database.initialize()
 
         track_1_path = tmp_path / "track_1.mp3"
         track_2_path = tmp_path / "track_2.mp3"
@@ -459,16 +440,14 @@ class TestDatabaseGetTracks:
         track_4 = create_track(track_4_path, "title_4", "artist")
         track_5 = create_track(track_5_path, "title_5", "different_artist")
 
-        database.add_track(track=track_1, timeout=1)
-        database.add_track(track=track_2, timeout=1)
-        database.add_track(track=track_3, timeout=1)
-        database.add_track(track=track_4, timeout=1)
-        database.add_track(track=track_5, timeout=1)
+        assert database.add_track(track=track_1, timeout=1)
+        assert database.add_track(track=track_2, timeout=1)
+        assert database.add_track(track=track_3, timeout=1)
+        assert database.add_track(track=track_4, timeout=1)
+        assert database.add_track(track=track_5, timeout=1)
 
         # Searching by artist returns only the specified artists
-        search_parameters = {
-            "artist": "artist"
-        }
+        search_parameters = {"artist": "artist"}
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
@@ -478,14 +457,11 @@ class TestDatabaseGetTracks:
         for track in returned_tracks:
             assert track.metadata.artist == "artist"
             titles.append(track.metadata.title)
-        
+
         assert len(titles) == 4
 
         # Artist + title search returns just the specific track
-        search_parameters = {
-            "artist": "artist",
-            "title": "title_1"
-        }
+        search_parameters = {"artist": "artist", "title": "title_1"}
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
         assert len(returned_tracks) == 1
@@ -499,7 +475,7 @@ class TestDatabaseGetTracks:
         titles = []
         for track in returned_tracks:
             titles.append(track.metadata.title)
-        
+
         assert len(titles) == 5
 
         artists = set()
@@ -509,3 +485,57 @@ class TestDatabaseGetTracks:
         assert len(artists) == 2
         assert "artist" in artists
         assert "different_artist" in artists
+
+    def test_get_tracks__order_by__returns_ordered_results(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+
+        assert database.initialize()
+
+        for i in range(5):
+            track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist")
+            assert database.add_track(track=track, timeout=1)
+
+        order_by_asc = {"title": "ASC"}
+
+        returned_tracks = database.get_tracks(order_parameters=order_by_asc)
+        assert returned_tracks
+        assert len(returned_tracks) == 5
+
+        returned_titles = [
+            t.metadata.title for t in returned_tracks if t.metadata.title
+        ]
+        assert sorted(returned_titles) == returned_titles
+
+        order_by_desc = {"title": "DESC"}
+
+        returned_tracks = database.get_tracks(order_parameters=order_by_desc)
+        assert returned_tracks
+        assert len(returned_tracks) == 5
+
+        returned_titles = [
+            t.metadata.title for t in returned_tracks if t.metadata.title
+        ]
+        assert sorted(returned_titles, reverse=True) == returned_titles
+
+    def test_get_tracks__limit_offset__works(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+
+        assert database.initialize()
+
+        expected_tracks: List[Track] = []
+        for i in range(5):
+            track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist")
+            assert database.add_track(track=track, timeout=1)
+            expected_tracks.append(track)
+
+        returned_tracks: List[Track] = []
+        for i in range(5):
+            returned_track = database.get_tracks(limit=1, offset=i)
+            assert len(returned_track) == 1
+            returned_tracks.append(returned_track[0])
+
+        assert len(returned_tracks) == len(expected_tracks)
+        for track in expected_tracks:
+            assert track in returned_tracks

@@ -1,13 +1,15 @@
-from pathlib import Path
-from typing import List
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
 # TODO: refactor try blocks to not be so atomic
 # TODO: actually catch real sqlite excpetions from the try blocks
 # TODO: use finally for the try blocks
+# TODO: do not let connect_to_database return None. raising and expection is probably fine, since consumers of the function should be try catching
 
 ALLOWED_COLUMNS = [
     "track_id",
@@ -40,7 +42,7 @@ class Database:
     def __init__(self, context: DatabaseContext):
         self.context = context
 
-    def connect_to_database(self, timeout: float = 5) -> sqlite3.Connection:
+    def connect_to_database(self, timeout: float = 5) -> sqlite3.Connection | None:
         database_path = self.context.database_path
         conn = None
         try:
@@ -171,6 +173,8 @@ class Database:
 
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
         conn = self.connect_to_database(timeout=timeout)
+        if not conn:
+            return False
         tracks_cursor = conn.cursor()
         trackmetadata_cursor = conn.cursor()
 
@@ -213,20 +217,34 @@ class Database:
             conn.close
             return False
 
-    # TODO: all of searching needs to be redone.
+    # TODO: searching needs some refactor
+    # I am not sure what should change, but search_parameters is a weird way
+    # of searching.
     def get_tracks(
         self,
-        search_parameters: dict,
+        search_parameters: dict[str, str] = {},
+        order_parameters: dict[str, str] = {},
         timeout: float = 5,
         limit: int = 100,
         offset: int = 0,
     ) -> List[Track]:
         allowed_columns = set(ALLOWED_COLUMNS)
-        input_columns = set(search_parameters.keys())
-        invalid_columns = input_columns - allowed_columns
-        if invalid_columns:
-            print(f"columns {invalid_columns} are not allowed as a search parameter")
-            return []
+        search_columns = set(search_parameters.keys())
+        order_columns = set(order_parameters.keys())
+        invalid_search_columns = search_columns - allowed_columns
+        invalid_order_columns = order_columns - allowed_columns
+
+        if invalid_search_columns:
+            print(
+                f"columns {invalid_search_columns} are not allowed as a search parameter"
+            )
+            raise ValueError
+
+        if invalid_order_columns:
+            print(
+                f"columns {invalid_order_columns} are not allowed as a search parameter"
+            )
+            raise ValueError
 
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
@@ -244,21 +262,35 @@ class Database:
             "JOIN tracks AS t ON "
             " tm.uuid_id = t.uuid_id"
         )
-        clauses = []
-        values = []
+        search_clauses = []
+        search_values = []
 
         for key, value in search_parameters.items():
             if value is None:
-                clauses.append(f'tm."{key}" IS NULL')
+                search_clauses.append(f'tm."{key}" IS NULL')
             else:
-                clauses.append(f'tm."{key}" = ?')
-                values.append(value)
+                search_clauses.append(f'tm."{key}" = ?')
+                search_values.append(value)
 
-        if clauses:
-            search_query += " WHERE " + " AND ".join(clauses)
+        if search_clauses:
+            search_query += " WHERE " + " AND ".join(search_clauses)
+
+        order_clauses = []
+
+        for key, value in order_parameters.items():
+            value = value.strip().upper()
+            if value not in ["ASC", "DESC"]:
+                print(f"{key} has a non allowed ordering: {value}, applying ASC")
+            else:
+                order_clauses.append(f'tm."{key}" {value.upper()}')
+
+        if order_clauses:
+            search_query += " ORDER BY " + " , ".join(order_clauses)
+
+        search_query += " LIMIT " + str(limit) + " OFFSET " + str(offset)
 
         try:
-            rows = search_cursor.execute(search_query, tuple(values)).fetchall()
+            rows = search_cursor.execute(search_query, tuple(search_values)).fetchall()
         except Exception as e:
             print(
                 f"Failed to search database. search_parameters: {search_parameters}. Exception: {e}"
