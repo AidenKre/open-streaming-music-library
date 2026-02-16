@@ -1,9 +1,8 @@
 from __future__ import annotations
-from curses import meta
 from pydantic import BaseModel
-from pathlib import Path
 from .track import Track
 from .track_meta_data import TrackMetaData
+
 
 class ClientTrack(BaseModel):
     uuid_id: str
@@ -17,5 +16,5 @@ class ClientTrack(BaseModel):
             uuid_id=track.uuid_id,
             metadata=track.metadata,
             created_at=track.created_at,
-            last_updated=track.last_updated
+            last_updated=track.last_updated,
         )
