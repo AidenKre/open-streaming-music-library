@@ -55,10 +55,10 @@ def ffprobe_for_metadata(file_path: Path) -> dict | None:
 
 
 def build_track_metadata(json_data: dict) -> TrackMetaData | None:
-    if json_data is None:
-        return None
-    format_tags = json_data.get("format", {}).get("tags", {})
-    streams = json_data.get("streams", [])
+    raw_format_tags = json_data.get("format", {}).get("tags", {})
+    format_tags = {k.lower(): v for k, v in raw_format_tags.items()}
+    raw_streams = json_data.get("streams", [])
+    streams = {k.lower(): v for k, v in raw_streams.items()}
 
     audio_stream = None
     has_album_art = False
@@ -148,4 +148,3 @@ def _parse_track_number(track_val: object) -> int | None:
         return int(track_val.split("/")[0])
     except (ValueError, TypeError):
         return None
-
