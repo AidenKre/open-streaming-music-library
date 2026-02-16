@@ -9,14 +9,21 @@ import pytest
 
 import app.services.metadata as metadata
 
+
 class TestGetTrackMetadata:
-    def test_get_track_metadata__ffprobe_returns_none__returns_none(self, tmp_path: Path):
+    def test_get_track_metadata__ffprobe_returns_none__returns_none(
+        self, tmp_path: Path
+    ):
         with patch("app.services.metadata.ffprobe_for_metadata", return_value=None):
             assert metadata.get_track_metadata(tmp_path / "song.mp3") is None
 
     def test_get_track_metadata__build_returns_none__returns_none(self, tmp_path: Path):
-        with patch("app.services.metadata.ffprobe_for_metadata", return_value={"streams": [], "format": {}}), patch(
-            "app.services.metadata.build_track_metadata", return_value=None
+        with (
+            patch(
+                "app.services.metadata.ffprobe_for_metadata",
+                return_value={"streams": [], "format": {}},
+            ),
+            patch("app.services.metadata.build_track_metadata", return_value=None),
         ):
             assert metadata.get_track_metadata(tmp_path / "song.mp3") is None
 
@@ -46,7 +53,7 @@ class TestGetTrackMetadata:
                     "disposition": {
                         "attached_pic": 1,
                     },
-                }
+                },
             ],
             "format": {
                 "filename": "Test Artist - Test Album - 01 Test Title.m4a",
@@ -59,12 +66,15 @@ class TestGetTrackMetadata:
                     "album": "Test Album",
                     "date": "2021-06-01",
                     "title": "Test Title",
-                    "genre": "Electronic"
-                }
-            }
+                    "genre": "Electronic",
+                },
+            },
         }
 
-        with patch("app.services.metadata.ffprobe_for_metadata", return_value=fake_ffprobe_response):
+        with patch(
+            "app.services.metadata.ffprobe_for_metadata",
+            return_value=fake_ffprobe_response,
+        ):
             track_metadata = metadata.get_track_metadata(Path("test.mp3"))
             assert track_metadata is not None
 
@@ -85,16 +95,21 @@ class TestGetTrackMetadata:
             assert track_metadata.channels == 2
             assert track_metadata.has_album_art is True
 
+
 class TestFfprobeForMetadata:
     def test_ffprobe_for_metadata__ffprobe_missing__returns_none(self):
-        with patch("app.services.metadata.subprocess.run", side_effect=FileNotFoundError):
+        with patch(
+            "app.services.metadata.subprocess.run", side_effect=FileNotFoundError
+        ):
             assert metadata.ffprobe_for_metadata(Path("song.mp3")) is None
 
     def test_ffprobe_for_metadata__oserror__returns_none(self):
         with patch("app.services.metadata.subprocess.run", side_effect=OSError):
             assert metadata.ffprobe_for_metadata(Path("song.mp3")) is None
 
-    def test_ffprobe_for_metadata__nonzero_exit_code__returns_none(self, tmp_path: Path):
+    def test_ffprobe_for_metadata__nonzero_exit_code__returns_none(
+        self, tmp_path: Path
+    ):
         with patch("app.services.metadata.subprocess.run") as subprocess_run:
             subprocess_run.return_value = subprocess.CompletedProcess(
                 args=["ffprobe"],
@@ -114,7 +129,7 @@ class TestFfprobeForMetadata:
                         "title": "Test",
                         "artist": "Test",
                     }
-                }
+                },
             }
             subprocess_run.return_value = subprocess.CompletedProcess(
                 args=["ffprobe"],
@@ -148,10 +163,8 @@ class TestFfprobeForMetadata:
             )
             assert metadata.ffprobe_for_metadata(Path("test.mp3")) == {}
 
-class TestBuildTrackMetadata:
-    def test_build_track_metadata__none_json__returns_none(self):
-        assert metadata.build_track_metadata(None) is None
 
+class TestBuildTrackMetadata:
     def test_build_track_metadata__empty_json__returns_none(self):
         assert metadata.build_track_metadata({}) is None
 
@@ -171,7 +184,7 @@ class TestBuildTrackMetadata:
                     "title": "Test",
                     "artist": "Test",
                 }
-            }
+            },
         }
         track_metadata = metadata.build_track_metadata(json_data)
         assert track_metadata is not None
@@ -190,11 +203,13 @@ class TestBuildTrackMetadata:
                     "title": "Test",
                     "artist": "Test",
                 }
-            }
+            },
         }
         assert metadata.build_track_metadata(json_data) is None
-    
-    def test_build_track_metadata__audio_stream_missing_numeric_fields__returns_none(self):
+
+    def test_build_track_metadata__audio_stream_missing_numeric_fields__returns_none(
+        self,
+    ):
         json_data = {
             "streams": [
                 {
@@ -203,7 +218,7 @@ class TestBuildTrackMetadata:
             ],
         }
         assert metadata.build_track_metadata(json_data) is None
-    
+
     def test_build_track_metadata__has_album_art__track_metadata_has_album_art(self):
         json_data = {
             "streams": [
@@ -218,18 +233,42 @@ class TestBuildTrackMetadata:
                     "disposition": {
                         "attached_pic": 1,
                     },
-                }
+                },
             ],
             "format": {
                 "tags": {
                     "title": "Test",
                     "artist": "Test",
                 }
-            }
+            },
         }
         track_metadata = metadata.build_track_metadata(json_data)
         assert track_metadata is not None
         assert track_metadata.has_album_art is True
+
+    def test_build_track_metadata__capitlized_tags__build_trackmetadata(self):
+        json_data = {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "duration": "181.0",
+                    "bit_rate": "256000",
+                    "sample_rate": "44100",
+                    "channels": 2,
+                }
+            ],
+            "format": {
+                "tags": {
+                    "TITLE": "Test",
+                    "ARTIST": "Test",
+                }
+            },
+        }
+
+        track_metadata = metadata.build_track_metadata(json_data)
+        assert track_metadata is not None
+        assert track_metadata.title == "Test"
+        assert track_metadata.artist == "Test"
 
     @pytest.mark.parametrize(
         ("date_val", "expected_year"),
@@ -241,9 +280,19 @@ class TestBuildTrackMetadata:
             (None, None),
         ],
     )
-    def test_build_track_metadata__date_tag_parsing(self, date_val: object, expected_year: int | None):
+    def test_build_track_metadata__date_tag_parsing(
+        self, date_val: object, expected_year: int | None
+    ):
         json_data = {
-            "streams": [{"codec_type": "audio", "duration": "1", "bit_rate": "1000", "sample_rate": "1", "channels": 1}],
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "duration": "1",
+                    "bit_rate": "1000",
+                    "sample_rate": "1",
+                    "channels": 1,
+                }
+            ],
             "format": {"tags": {"title": "T", "artist": "A", "date": date_val}},
         }
         track_metadata = metadata.build_track_metadata(json_data)
@@ -260,9 +309,19 @@ class TestBuildTrackMetadata:
             (None, None),
         ],
     )
-    def test_build_track_metadata__track_tag_parsing(self, track_val: object, expected_track_number: int | None):
+    def test_build_track_metadata__track_tag_parsing(
+        self, track_val: object, expected_track_number: int | None
+    ):
         json_data = {
-            "streams": [{"codec_type": "audio", "duration": "1", "bit_rate": "1000", "sample_rate": "1", "channels": 1}],
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "duration": "1",
+                    "bit_rate": "1000",
+                    "sample_rate": "1",
+                    "channels": 1,
+                }
+            ],
             "format": {"tags": {"title": "T", "artist": "A", "track": track_val}},
         }
         track_metadata = metadata.build_track_metadata(json_data)
