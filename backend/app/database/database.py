@@ -381,64 +381,23 @@ class Database:
 
         conn.row_factory = sqlite3.Row
 
-        artist_query = (
-            "SELECT DISTINCT artist FROM trackmetadata "
-            "WHERE (album_artist IS NULL OR album_artist IS '') "
-            "AND (artist IS NOT NULL AND artist IS NOT '') "
-            "ORDER BY artist ASC "
+        query = (
+            "WITH candidates(value) AS ( "
+            " SELECT DISTINCT artist FROM trackmetadata "
+            " WHERE (album_artist IS NULL OR album_artist IS '') "
+            " AND (artist IS NOT NULL AND artist <> '') "
+            " UNION "
+            " SELECT DISTINCT album_artist FROM trackmetadata "
+            " WHERE album_artist IS NOT NULL AND album_artist <> '' "
+            ") "
+            "SELECT DISTINCT value FROM candidates "
+            "ORDER BY value ASC "
             "LIMIT ? OFFSET ?"
         )
-        artist_count_query = (
-            "SELECT COUNT(DISTINCT artist) FROM trackmetadata "
-            "WHERE (album_artist IS NULL OR album_artist IS '') "
-            "AND (artist IS NOT NULL AND artist IS NOT '') "
-        )
-
-        artist_cursor = conn.cursor()
-        artist_count_cursor = conn.cursor()
 
         try:
-            limit_offset_tupple = (limit, offset)
-            artist_rows = artist_cursor.execute(
-                artist_query, limit_offset_tupple
-            ).fetchall()
-            artist_count = int(
-                artist_count_cursor.execute(artist_count_query).fetchone()[0]
-            )
-        except Exception as e:
-            print(f"Error executing distinct artist query: {e}")
-            conn.close()
-            return None
-
-        found_artists = []
-
-        for row in artist_rows:
-            artist = row["artist"]
-            artist_s = str(artist)
-            found_artists.append(artist_s)
-
-        remaining_limit = limit - len(artist_rows)
-        new_offset = offset - artist_count
-
-        if remaining_limit <= 0:
-            return found_artists
-
-        if new_offset < 0:
-            new_offset = 0
-
-        album_artist_query = (
-            "SELECT DISTINCT album_artist FROM trackmetadata "
-            "WHERE album_artist IS NOT NULL AND album_artist IS NOT '' "
-            "ORDER BY album_artist ASC "
-            "LIMIT ? OFFSET ?"
-        )
-        album_artist_cursor = conn.cursor()
-
-        new_limit_offset_tupple = (remaining_limit, new_offset)
-        try:
-            album_artist_rows = album_artist_cursor.execute(
-                album_artist_query, new_limit_offset_tupple
-            ).fetchall()
+            cursor = conn.cursor()
+            rows = cursor.execute(query, (limit, offset)).fetchall()
         except Exception as e:
             print(f"Error executing distinct artist query: {e}")
             conn.close()
@@ -446,12 +405,7 @@ class Database:
         finally:
             conn.close()
 
-        for row in album_artist_rows:
-            album_artist = row["album_artist"]
-            album_artist_s = str(album_artist)
-            found_artists.append(album_artist_s)
-
-        return found_artists
+        return [str(row["value"]) for row in rows if row]
 
     def get_artists_count(self, timeout: float = 5) -> int | None:
         conn = self.connect_to_database(timeout=timeout)

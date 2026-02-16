@@ -714,6 +714,25 @@ class TestGetArtists:
         assert returned_artists is not None
         assert sorted(expected_artists) == sorted(returned_artists)
 
+    def test_get_artist__no_duplicate_artists(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        album_artist = "artist"
+        artist = "artist"
+
+        track_1 = create_track(tmp_path / "track_1.mp3", "track_1", artist)
+        track_2 = create_track(
+            tmp_path / "track_2.mp3", "track_2", artist, album_artist
+        )
+
+        assert database.add_track(track=track_1)
+        assert database.add_track(track=track_2)
+
+        returned_artist = database.get_artists()
+        assert returned_artist
+        assert returned_artist == ["artist"]
+
     def test_get_artists__limit_offset__works(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
         assert database.initialize()
