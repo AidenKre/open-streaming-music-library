@@ -1,7 +1,7 @@
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Any
+from typing import Any, List
 
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
