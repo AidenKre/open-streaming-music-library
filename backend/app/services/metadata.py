@@ -1,10 +1,12 @@
-from pathlib import Path
-import subprocess
 import json
+import subprocess
+from pathlib import Path
+
 from app.models.track_meta_data import TrackMetaData
 
 # TODO: Handle non printable characters in metadata (remember the UniBe@t thingy where there were windows /r/n invisible characters...)
 # TODO: possible search database to see if artist/album already exists? and match capitalization? might be confusing...
+
 
 def get_track_metadata(file_path: Path) -> TrackMetaData | None:
     json_data = ffprobe_for_metadata(file_path)
@@ -16,19 +18,20 @@ def get_track_metadata(file_path: Path) -> TrackMetaData | None:
     if metadata.is_empty():
         return None
     return metadata
-    
-    
+
 
 def ffprobe_for_metadata(file_path: Path) -> dict | None:
     try:
         completed_process = subprocess.run(
             [
                 "ffprobe",
-                "-v", "error",
+                "-v",
+                "error",
                 "-hide_banner",
                 "-show_streams",
                 "-show_format",
-                "-of", "json",
+                "-of",
+                "json",
                 str(file_path),
             ],
             stdout=subprocess.PIPE,
@@ -49,6 +52,7 @@ def ffprobe_for_metadata(file_path: Path) -> dict | None:
         return json.loads(completed_process.stdout or "{}")
     except json.JSONDecodeError:
         return None
+
 
 def build_track_metadata(json_data: dict) -> TrackMetaData | None:
     if json_data is None:
@@ -75,9 +79,9 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
     metadata = TrackMetaData()
 
     codec = audio_stream.get("codec_name", None)
-    if codec != None:
+    if codec:
         codec = str(codec)
-    
+
     metadata.codec = codec
     metadata.duration = float(audio_stream.get("duration", 0.0))
     metadata.bitrate_kbps = float(audio_stream.get("bit_rate", 0.0)) / 1000.0
@@ -98,7 +102,11 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
     metadata.year = _parse_year(date_val)
 
     metadata.genre = format_tags.get("genre")
-    metadata.track_number = _parse_track_number(format_tags.get("track")) if "track" in format_tags else None
+    metadata.track_number = (
+        _parse_track_number(format_tags.get("track"))
+        if "track" in format_tags
+        else None
+    )
     metadata.disc_number = format_tags.get("disc") if "disc" in format_tags else None
 
     return metadata
@@ -140,3 +148,4 @@ def _parse_track_number(track_val: object) -> int | None:
         return int(track_val.split("/")[0])
     except (ValueError, TypeError):
         return None
+
