@@ -5,8 +5,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Set
 
-from fastapi import params
-from httpx import get
 import pytest
 from fastapi.testclient import TestClient
 
@@ -168,7 +166,7 @@ class TestGetTracks:
 
     def test_tracks__bad_limit_offset__fails(self, client):
         # Ensure that database is populated so no other codes return
-        tracks = add_tracks_to_client(client=client, amount_to_add=5)
+        tracks = add_tracks_to_client(client=client, amount_to_add=5)  # noqa: F841
 
         # Bad limit tests
         r = client.get("/tracks?limit=0")
@@ -194,7 +192,8 @@ class TestGetTracks:
 
 class TestGetTracksStream:
     def test_tracks_stream__invalid_uuid__fails(self, client):
-        tracks = add_tracks_to_client(client=client, amount_to_add=5)
+        tracks = add_tracks_to_client(client=client, amount_to_add=5)  # noqa: F841
+
         r = client.get("/tracks/fake_uuid/stream")
         assert r.status_code == 404, r.text
 
@@ -331,7 +330,7 @@ class TestGetArtists:
 
     def test_artists__bad_limit_offset__fails(self, client):
         # Add tracks to database so no other errors get thrown
-        tracks = add_tracks_to_client(client=client, amount_to_add=5)
+        tracks = add_tracks_to_client(client=client, amount_to_add=5)  # noqa: F841
 
         # Bad limit tests
         r = client.get("/artists?limit=0")

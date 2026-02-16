@@ -3,13 +3,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.database import Database, DatabaseContext
 from app.models import ClientTrack, GetArtistsResponse, GetTracksResponse, Track
-from app.models.api_return_models import GetArtistsResponse
 from app.services import (
     FileWatcher,
     Ingestor,
