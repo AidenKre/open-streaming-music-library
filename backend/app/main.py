@@ -159,8 +159,9 @@ def get_tracks(
 def stream_track(uuid_id: str, request: Request):
     CHUNK_SIZE = 1024 * 1024
     search_parameters = {"uuid_id": uuid_id}
-    track_list: List[Track] = []
-    track_list = app.state.database.get_tracks(search_parameters=search_parameters)
+    track_list: List[Track] = app.state.database.get_tracks(
+        search_parameters=search_parameters
+    )
     if len(track_list) <= 0:
         raise HTTPException(
             status_code=404, detail=f"Could not find track with uuid: {uuid_id}"
@@ -191,7 +192,7 @@ def stream_track(uuid_id: str, request: Request):
     try:
         units, rng = range_header.split("=")
         if units.strip().lower() != "bytes":
-            return HTTPException(
+            raise HTTPException(
                 status_code=422,
                 detail=f"range must be in bytes. Instead {units} was used",
             )
@@ -200,7 +201,7 @@ def stream_track(uuid_id: str, request: Request):
         start = int(start_s) if start_s else 0
         end = int(end_s) if end_s else file_size - 1
     except Exception:
-        return HTTPException(
+        raise HTTPException(
             status_code=416, detail=f"Invalid Range Header: {range_header}"
         )
 
@@ -223,6 +224,7 @@ def stream_track(uuid_id: str, request: Request):
     return StreamingResponse(
         iter_range(),
         status_code=206,
+        media_type=f"audio/{track.metadata.codec}",
         headers={
             "Accept-ranges": "bytes",
             "Content-range": f"bytes {start}-{end}/{file_size}",

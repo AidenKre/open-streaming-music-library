@@ -29,18 +29,18 @@ CREATE TABLE IF NOT EXISTS trackmetadata (
     FOREIGN KEY ("uuid_id") REFERENCES tracks("uuid_id")
 );
 
-CREATE INDEX idx_title ON trackmetadata("title");
-CREATE INDEX idx_artist ON trackmetadata("artist");
-CREATE INDEX idx_album ON trackmetadata("album");
-CREATE INDEX idx_album_artist ON trackmetadata("album_artist");
-CREATE INDEX idx_year ON trackmetadata("year");
-CREATE INDEX idx_date ON trackmetadata("date");
-CREATE INDEX idx_genre ON trackmetadata("genre");
-CREATE INDEX idx_track_number ON trackmetadata("track_number");
-CREATE INDEX idx_disc_number ON trackmetadata("disc_number");
-CREATE INDEX idx_codec ON trackmetadata("codec");
-CREATE INDEX idx_duration ON trackmetadata("duration");
-CREATE INDEX idx_bitrate_kbps ON trackmetadata("bitrate_kbps");
-CREATE INDEX idx_sample_rate_hz ON trackmetadata("sample_rate_hz");
-CREATE INDEX idx_channels ON trackmetadata("channels");
-CREATE INDEX idx_has_album_art ON trackmetadata("has_album_art");
+CREATE INDEX IF NOT EXISTS idx_title ON trackmetadata("title");
+CREATE INDEX IF NOT EXISTS idx_artist ON trackmetadata("artist");
+CREATE INDEX IF NOT EXISTS idx_album ON trackmetadata("album");
+CREATE INDEX IF NOT EXISTS idx_album_artist ON trackmetadata("album_artist");
+CREATE INDEX IF NOT EXISTS idx_year ON trackmetadata("year");
+CREATE INDEX IF NOT EXISTS idx_date ON trackmetadata("date");
+CREATE INDEX IF NOT EXISTS idx_genre ON trackmetadata("genre");
+CREATE INDEX IF NOT EXISTS idx_track_number ON trackmetadata("track_number");
+CREATE INDEX IF NOT EXISTS idx_disc_number ON trackmetadata("disc_number");
+CREATE INDEX IF NOT EXISTS idx_codec ON trackmetadata("codec");
+CREATE INDEX IF NOT EXISTS idx_duration ON trackmetadata("duration");
+CREATE INDEX IF NOT EXISTS idx_bitrate_kbps ON trackmetadata("bitrate_kbps");
+CREATE INDEX IF NOT EXISTS idx_sample_rate_hz ON trackmetadata("sample_rate_hz");
+CREATE INDEX IF NOT EXISTS idx_channels ON trackmetadata("channels");
+CREATE INDEX IF NOT EXISTS idx_has_album_art ON trackmetadata("has_album_art");
