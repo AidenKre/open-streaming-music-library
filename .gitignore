@@ -3,3 +3,31 @@
 __pycache__/
 .vscode/
 .DS_store
+# Flutter/Dart
+frontend/.dart_tool/
+frontend/.packages
+frontend/.pub/
+frontend/build/
+frontend/.flutter-plugins
+frontend/.flutter-plugins-dependencies
+frontend/.metadata
+
+# Generated files
+frontend/**/*.g.dart
+frontend/**/*.freezed.dart
+
+# IDE
+frontend/.idea/
+frontend/*.iml
+
+# iOS
+frontend/ios/Pods/
+frontend/ios/.symlinks/
+frontend/ios/Flutter/Flutter.framework
+frontend/ios/Flutter/Flutter.podspec
+
+# Android
+frontend/android/.gradle/
+frontend/android/local.properties
+frontend/android/key.properties
+frontend/android/*.jks
