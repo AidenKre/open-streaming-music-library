@@ -3,23 +3,23 @@ import 'package:drift/drift.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
-import 'package:frontend/model/database/database.dart';
+import 'package:frontend/database/database.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
 
 Map<String, dynamic> _trackJson(String uuid) => {
-      'uuid_id': uuid,
-      'created_at': 1000,
-      'last_updated': 2000,
-    };
+  'uuid_id': uuid,
+  'created_at': 1000,
+  'last_updated': 2000,
+};
 
 Response _tracksResponse(List<String> uuids, {String? nextCursor}) => Response(
-      jsonEncode({
-        'data': uuids.map(_trackJson).toList(),
-        'nextCursor': nextCursor,
-      }),
-      200,
-    );
+  jsonEncode({
+    'data': uuids.map(_trackJson).toList(),
+    'nextCursor': nextCursor,
+  }),
+  200,
+);
 
 void main() {
   group('TracksApi', () {
@@ -42,25 +42,31 @@ void main() {
       expect((result[1] as TracksCompanion).uuidId, const Value('uuid-2'));
     });
 
-    test('getInitialItems stores nextCursor for subsequent page request', () async {
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async => _tracksResponse(['uuid-1'], nextCursor: 'next-cursor')),
-      );
-      await api.getInitialItems();
+    test(
+      'getInitialItems stores nextCursor for subsequent page request',
+      () async {
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient(
+            (req) async =>
+                _tracksResponse(['uuid-1'], nextCursor: 'next-cursor'),
+          ),
+        );
+        await api.getInitialItems();
 
-      Uri? captured;
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async {
-          captured = req.url;
-          return _tracksResponse([]);
-        }),
-      );
-      await api.getNextItems();
+        Uri? captured;
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            captured = req.url;
+            return _tracksResponse([]);
+          }),
+        );
+        await api.getNextItems();
 
-      expect(captured?.queryParameters['cursor'], 'next-cursor');
-    });
+        expect(captured?.queryParameters['cursor'], 'next-cursor');
+      },
+    );
 
     test('getNextItems returns empty list when no cursor is set', () async {
       final result = await api.getNextItems();
@@ -71,7 +77,8 @@ void main() {
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient(
-          (req) async => _tracksResponse(['uuid-1', 'uuid-2'], nextCursor: 'c1'),
+          (req) async =>
+              _tracksResponse(['uuid-1', 'uuid-2'], nextCursor: 'c1'),
         ),
       );
       await api.getInitialItems();
@@ -90,7 +97,8 @@ void main() {
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient(
-          (req) async => _tracksResponse(['uuid-1', 'uuid-2'], nextCursor: 'c1'),
+          (req) async =>
+              _tracksResponse(['uuid-1', 'uuid-2'], nextCursor: 'c1'),
         ),
       );
       await api.getInitialItems();
@@ -124,3 +132,4 @@ void main() {
     });
   });
 }
+

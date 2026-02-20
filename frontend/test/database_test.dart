@@ -1,7 +1,7 @@
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/model/database/database.dart';
+import 'package:frontend/database/database.dart';
 
 void main() {
   late AppDatabase db;
@@ -177,3 +177,4 @@ void main() {
     });
   });
 }
+

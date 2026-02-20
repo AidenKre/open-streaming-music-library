@@ -1,6 +1,6 @@
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/pagination.dart';
-import 'package:frontend/model/database/database.dart';
+import 'package:frontend/database/database.dart';
 
 class TracksApi extends IPaginatingListApi {
   final ApiClient _apiClient = ApiClient.instance;
