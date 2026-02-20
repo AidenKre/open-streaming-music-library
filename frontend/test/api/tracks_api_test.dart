@@ -1,16 +1,24 @@
 import 'dart:convert';
-import 'package:drift/drift.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
-import 'package:frontend/database/database.dart';
+import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
+
+Map<String, dynamic> _minimalMetadataJson() => {
+  'duration': 0.0,
+  'bitrate_kbps': 0.0,
+  'sample_rate_hz': 0,
+  'channels': 0,
+  'has_album_art': false,
+};
 
 Map<String, dynamic> _trackJson(String uuid) => {
   'uuid_id': uuid,
   'created_at': 1000,
   'last_updated': 2000,
+  'metadata': _minimalMetadataJson(),
 };
 
 Response _tracksResponse(List<String> uuids, {String? nextCursor}) => Response(
@@ -29,7 +37,7 @@ void main() {
       api = TracksApi();
     });
 
-    test('getInitialItems returns TracksCompanion list', () async {
+    test('getInitialItems returns ClientTrackDto list', () async {
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async => _tracksResponse(['uuid-1', 'uuid-2'])),
@@ -38,8 +46,8 @@ void main() {
       final result = await api.getInitialItems();
 
       expect(result.length, 2);
-      expect((result[0] as TracksCompanion).uuidId, const Value('uuid-1'));
-      expect((result[1] as TracksCompanion).uuidId, const Value('uuid-2'));
+      expect((result[0] as ClientTrackDto).uuidId, 'uuid-1');
+      expect((result[1] as ClientTrackDto).uuidId, 'uuid-2');
     });
 
     test(
@@ -90,7 +98,7 @@ void main() {
       final newItems = await api.getNextItems();
 
       expect(newItems.length, 1);
-      expect((newItems[0] as TracksCompanion).uuidId, const Value('uuid-3'));
+      expect((newItems[0] as ClientTrackDto).uuidId, 'uuid-3');
     });
 
     test('getGottenItems accumulates tracks across pages', () async {
@@ -112,19 +120,29 @@ void main() {
       expect(api.getGottenItems().length, 3);
     });
 
-    test('convertToTrackCompanion maps all fields correctly', () {
+    test('convertToDtos maps all fields correctly', () {
       final jsonList = [
-        {'uuid_id': 'a-1', 'created_at': 100, 'last_updated': 200},
-        {'uuid_id': 'b-2', 'created_at': 300, 'last_updated': 400},
+        {
+          'uuid_id': 'a-1',
+          'created_at': 100,
+          'last_updated': 200,
+          'metadata': _minimalMetadataJson(),
+        },
+        {
+          'uuid_id': 'b-2',
+          'created_at': 300,
+          'last_updated': 400,
+          'metadata': _minimalMetadataJson(),
+        },
       ];
 
-      final companions = api.convertToTrackCompanion(jsonList);
+      final dtos = api.convertToDtos(jsonList);
 
-      expect(companions.length, 2);
-      expect(companions[0].uuidId, const Value('a-1'));
-      expect(companions[0].createdAt, const Value(100));
-      expect(companions[0].lastUpdated, const Value(200));
-      expect(companions[1].uuidId, const Value('b-2'));
+      expect(dtos.length, 2);
+      expect(dtos[0].uuidId, 'a-1');
+      expect(dtos[0].createdAt, 100);
+      expect(dtos[0].lastUpdated, 200);
+      expect(dtos[1].uuidId, 'b-2');
     });
 
     test('getGottenItems returns empty list before any fetch', () {
@@ -132,4 +150,3 @@ void main() {
     });
   });
 }
-

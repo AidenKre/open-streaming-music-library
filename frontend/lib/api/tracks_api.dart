@@ -1,12 +1,13 @@
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/pagination.dart';
-import 'package:frontend/database/database.dart';
+import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/models/dto/get_tracks_response_dto.dart';
 
 class TracksApi extends IPaginatingListApi {
   final ApiClient _apiClient = ApiClient.instance;
   final String _endpoint = 'tracks';
   String? _nextCursor;
-  List<TracksCompanion> _tracks = [];
+  List<ClientTrackDto> _tracks = [];
 
   @override
   Future<List<dynamic>> getInitialItems() async {
@@ -15,11 +16,9 @@ class TracksApi extends IPaginatingListApi {
       _endpoint,
     ], query: query);
 
-    List<Map<String, dynamic>> jsonTracks = List<Map<String, dynamic>>.from(
-      jsonObj["data"],
-    );
-    _tracks = convertToTrackCompanion(jsonTracks);
-    _nextCursor = jsonObj["nextCursor"] as String?;
+    final response = GetTracksResponseDto.fromJson(jsonObj);
+    _tracks = response.data;
+    _nextCursor = response.nextCursor;
 
     return _tracks;
   }
@@ -31,15 +30,14 @@ class TracksApi extends IPaginatingListApi {
     final Map<String, dynamic> jsonObj = await _apiClient.getJson([
       _endpoint,
     ], query: query);
-    List<Map<String, dynamic>> jsonTracks = List<Map<String, dynamic>>.from(
-      jsonObj["data"],
-    );
-    _nextCursor = jsonObj["nextCursor"] as String?;
 
-    final existingTracks = _tracks.map((track) => track.uuidId).toSet();
-    final newTracks = convertToTrackCompanion(
-      jsonTracks,
-    ).where((item) => !existingTracks.contains(item.uuidId)).toList();
+    final response = GetTracksResponseDto.fromJson(jsonObj);
+    _nextCursor = response.nextCursor;
+
+    final existingIds = _tracks.map((t) => t.uuidId).toSet();
+    final newTracks = response.data
+        .where((t) => !existingIds.contains(t.uuidId))
+        .toList();
 
     _tracks.addAll(newTracks);
     return newTracks;
@@ -50,13 +48,7 @@ class TracksApi extends IPaginatingListApi {
     return _tracks;
   }
 
-  List<TracksCompanion> convertToTrackCompanion(
-    List<Map<String, dynamic>> trackJsonList,
-  ) {
-    List<TracksCompanion> trackCompanions = [];
-    for (Map<String, dynamic> trackJson in trackJsonList) {
-      trackCompanions.add(tracksCompanionFromJson(trackJson));
-    }
-    return trackCompanions;
+  List<ClientTrackDto> convertToDtos(List<Map<String, dynamic>> trackJsonList) {
+    return trackJsonList.map(ClientTrackDto.fromJson).toList();
   }
 }

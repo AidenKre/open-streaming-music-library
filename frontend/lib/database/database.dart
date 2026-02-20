@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
+import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -55,36 +56,34 @@ LazyDatabase openAppDatabase() {
   });
 }
 
-TracksCompanion tracksCompanionFromJson(Map<String, dynamic> json) {
+TracksCompanion tracksCompanionFromDto(ClientTrackDto dto) {
   return TracksCompanion(
-    uuidId: Value(json['uuid_id'] as String),
-    createdAt: Value((json['created_at'] as num).toInt()),
-    lastUpdated: Value((json['last_updated'] as num).toInt()),
+    uuidId: Value(dto.uuidId),
+    createdAt: Value(dto.createdAt),
+    lastUpdated: Value(dto.lastUpdated),
     filePath: Value.absent(),
   );
 }
 
-TrackmetadataCompanion trackmetadataCompanionFromJson(
-  String uuidId,
-  Map<String, dynamic> json,
-) {
+TrackmetadataCompanion trackmetadataCompanionFromDto(ClientTrackDto dto) {
+  final meta = dto.metadata;
   return TrackmetadataCompanion(
-    uuidId: Value(uuidId),
-    title: Value(json['title'] as String?),
-    artist: Value(json['artist'] as String?),
-    album: Value(json['album'] as String?),
-    albumArtist: Value(json['album_artist'] as String?),
-    year: Value((json['year'] as num?)?.toInt()),
-    date: Value(json['date'] as String?),
-    genre: Value(json['genre'] as String?),
-    trackNumber: Value((json['track_number'] as num?)?.toInt()),
-    discNumber: Value((json['disc_number'] as num?)?.toInt()),
-    codec: Value(json['codec'] as String?),
-    duration: Value((json['duration'] as num).toDouble()),
-    bitrateKbps: Value((json['bitrate_kbps'] as num).toDouble()),
-    sampleRateHz: Value((json['sample_rate_hz'] as num).toInt()),
-    channels: Value((json['channels'] as num).toInt()),
-    hasAlbumArt: Value(json['has_album_art'] as bool? ?? false),
+    uuidId: Value(dto.uuidId),
+    title: Value(meta.title),
+    artist: Value(meta.artist),
+    album: Value(meta.album),
+    albumArtist: Value(meta.albumArtist),
+    year: Value(meta.year),
+    date: Value(meta.date),
+    genre: Value(meta.genre),
+    trackNumber: Value(meta.trackNumber),
+    discNumber: Value(meta.discNumber),
+    codec: Value(meta.codec),
+    duration: Value(meta.duration),
+    bitrateKbps: Value(meta.bitrateKbps),
+    sampleRateHz: Value(meta.sampleRateHz),
+    channels: Value(meta.channels),
+    hasAlbumArt: Value(meta.hasAlbumArt),
   );
 }
 
