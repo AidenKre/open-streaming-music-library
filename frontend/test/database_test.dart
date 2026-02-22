@@ -163,4 +163,146 @@ void main() {
       expect(metas.first.hasAlbumArt, true);
     });
   });
+
+  Future<void> insertTrack(
+    AppDatabase db, {
+    required String uuid,
+    String? title,
+    String? artist,
+    String? album,
+    String? albumArtist,
+    int? trackNumber,
+  }) async {
+    final dto = ClientTrackDto.fromJson({
+      'uuid_id': uuid,
+      'created_at': 1700000000,
+      'last_updated': 1700001000,
+      'metadata': {
+        if (title != null) 'title': title,
+        if (artist != null) 'artist': artist,
+        if (album != null) 'album': album,
+        if (albumArtist != null) 'album_artist': albumArtist,
+        if (trackNumber != null) 'track_number': trackNumber,
+        'duration': 180.0,
+        'bitrate_kbps': 256.0,
+        'sample_rate_hz': 44100,
+        'channels': 2,
+        'has_album_art': false,
+      },
+    });
+    await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+    await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
+  }
+
+  group('getTrackPage', () {
+    test('returns tracks joined with metadata', () async {
+      await insertTrack(db, uuid: 'a', title: 'Song A', artist: 'Artist A', album: 'Album A');
+      final results = await db.getTrackPage(limit: 100, offset: 0);
+      expect(results.length, 1);
+      final track = results.first.readTable(db.tracks);
+      final meta = results.first.readTable(db.trackmetadata);
+      expect(track.uuidId, 'a');
+      expect(meta.title, 'Song A');
+    });
+
+    test('returns tracks sorted artist -> album -> trackNumber', () async {
+      await insertTrack(db, uuid: '1', artist: 'B Artist', album: 'A Album', trackNumber: 2);
+      await insertTrack(db, uuid: '2', artist: 'A Artist', album: 'B Album', trackNumber: 1);
+      await insertTrack(db, uuid: '3', artist: 'A Artist', album: 'A Album', trackNumber: 2);
+      await insertTrack(db, uuid: '4', artist: 'A Artist', album: 'A Album', trackNumber: 1);
+
+      final results = await db.getTrackPage(limit: 100, offset: 0);
+      final uuids = results.map((r) => r.readTable(db.tracks).uuidId).toList();
+      expect(uuids, ['4', '3', '2', '1']);
+    });
+
+    test('offset skips correct rows', () async {
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
+      await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
+
+      final results = await db.getTrackPage(limit: 100, offset: 1);
+      expect(results.length, 2);
+      expect(results.first.readTable(db.tracks).uuidId, '2');
+    });
+
+    test('limit caps result count', () async {
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
+      await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
+
+      final results = await db.getTrackPage(limit: 2, offset: 0);
+      expect(results.length, 2);
+    });
+  });
+
+  group('getAlbumTrackPage', () {
+    test('returns only tracks for matching artist + album', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Album A', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'Album B', trackNumber: 1);
+
+      final results = await db.getAlbumTrackPage(
+        artist: 'Artist A',
+        album: 'Album A',
+        limit: 100,
+        offset: 0,
+      );
+      expect(results.length, 1);
+      expect(results.first.readTable(db.tracks).uuidId, '1');
+    });
+
+    test('uses albumArtist when present', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Different Artist',
+        albumArtist: 'Album Artist',
+        album: 'My Album',
+        trackNumber: 1,
+      );
+
+      final results = await db.getAlbumTrackPage(
+        artist: 'Album Artist',
+        album: 'My Album',
+        limit: 100,
+        offset: 0,
+      );
+      expect(results.length, 1);
+      expect(results.first.readTable(db.tracks).uuidId, '1');
+    });
+
+    test('falls back to artist when albumArtist is null', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Solo Artist',
+        album: 'My Album',
+        trackNumber: 1,
+      );
+
+      final results = await db.getAlbumTrackPage(
+        artist: 'Solo Artist',
+        album: 'My Album',
+        limit: 100,
+        offset: 0,
+      );
+      expect(results.length, 1);
+      expect(results.first.readTable(db.tracks).uuidId, '1');
+    });
+
+    test('returns tracks sorted by trackNumber ASC', () async {
+      await insertTrack(db, uuid: '3', artist: 'Artist', album: 'Album', trackNumber: 3);
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Album', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album', trackNumber: 2);
+
+      final results = await db.getAlbumTrackPage(
+        artist: 'Artist',
+        album: 'Album',
+        limit: 100,
+        offset: 0,
+      );
+      final uuids = results.map((r) => r.readTable(db.tracks).uuidId).toList();
+      expect(uuids, ['1', '2', '3']);
+    });
+  });
 }

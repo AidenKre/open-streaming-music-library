@@ -46,6 +46,41 @@ class AppDatabase extends _$AppDatabase {
 
   @override
   int get schemaVersion => 1;
+
+  Future<List<TypedResult>> getTrackPage({
+    required int limit,
+    required int offset,
+  }) {
+    return (select(trackmetadata).join([
+      innerJoin(tracks, tracks.uuidId.equalsExp(trackmetadata.uuidId)),
+    ])
+      ..orderBy([
+        OrderingTerm.asc(trackmetadata.artist),
+        OrderingTerm.asc(trackmetadata.album),
+        OrderingTerm.asc(trackmetadata.trackNumber),
+      ])
+      ..limit(limit, offset: offset))
+    .get();
+  }
+
+  Future<List<TypedResult>> getAlbumTrackPage({
+    required String artist,
+    required String album,
+    required int limit,
+    required int offset,
+  }) {
+    return (select(trackmetadata).join([
+      innerJoin(tracks, tracks.uuidId.equalsExp(trackmetadata.uuidId)),
+    ])
+      ..where(
+        (trackmetadata.albumArtist.equals(artist) |
+         (trackmetadata.albumArtist.isNull() & trackmetadata.artist.equals(artist))) &
+         trackmetadata.album.equals(album),
+      )
+      ..orderBy([OrderingTerm.asc(trackmetadata.trackNumber)])
+      ..limit(limit, offset: offset))
+    .get();
+  }
 }
 
 LazyDatabase openAppDatabase() {
