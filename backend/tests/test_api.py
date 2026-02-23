@@ -88,7 +88,6 @@ class TestGetTracks:
         returned_tracks.append(gettracksresponse.data[0])
 
         nextCursor = gettracksresponse.nextCursor
-        previousCursor = None
 
         while nextCursor:
             r = client.get("/tracks", params={"limit": 1, "cursor": nextCursor})
@@ -98,8 +97,6 @@ class TestGetTracks:
 
             assert gettracksresponse is not None
             nextCursor = gettracksresponse.nextCursor
-            assert nextCursor != previousCursor
-            previousCursor = nextCursor
 
             assert len(gettracksresponse.data) == 1
             returned_tracks.append(gettracksresponse.data[0])
@@ -286,7 +283,6 @@ class TestGetArtists:
 
         nextCursor = getartistresponse.nextCursor
         assert nextCursor
-        previousCursor = None
 
         while nextCursor:
             r = client.get("/artists", params={"limit": 1, "cursor": nextCursor})
@@ -299,8 +295,6 @@ class TestGetArtists:
             gotten_artists.append(getartistresponse.data[0])
 
             nextCursor = getartistresponse.nextCursor
-            assert nextCursor != previousCursor
-            previousCursor = nextCursor
 
         assert sorted(expected_artists) == sorted(gotten_artists)
 

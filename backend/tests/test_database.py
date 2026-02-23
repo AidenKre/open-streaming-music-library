@@ -6,7 +6,12 @@ from unittest.mock import patch
 
 import pytest
 
-from app.database.database import Database, DatabaseContext
+from app.database.database import (
+    Database,
+    DatabaseContext,
+    SearchParameter,
+    OrderParameter,
+)
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -396,7 +401,9 @@ class TestDatabaseGetTracks:
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
-        search_parameters = {"title": "test"}
+        search_parameters = [
+            SearchParameter(column="title", operator="=", value="test")
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
         assert len(returned_tracks) == 0
@@ -407,7 +414,9 @@ class TestDatabaseGetTracks:
 
         assert database.initialize()
 
-        search_parameters = {"title": "tests"}
+        search_parameters = [
+            SearchParameter(column="title", operator="=", value="test")
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
         assert len(returned_tracks) == 0
@@ -418,12 +427,14 @@ class TestDatabaseGetTracks:
 
         assert database.initialize()
 
-        search_parameters = {"invalid_column": "test"}
         with pytest.raises(ValueError):
+            search_parameters = [
+                SearchParameter(column="invalid_column", operator="=", value="test")
+            ]
             database.get_tracks(search_parameters=search_parameters)
 
-        order_parameters = {"invalid_column": "test"}
         with pytest.raises(ValueError):
+            order_parameters = [OrderParameter(column="invalid_column")]
             database.get_tracks(order_parameters=order_parameters)
 
     def test_get_tracks__valid_search__returns_results(self, tmp_path: Path):
@@ -451,7 +462,9 @@ class TestDatabaseGetTracks:
         assert database.add_track(track=track_5, timeout=1)
 
         # Searching by artist returns only the specified artists
-        search_parameters = {"artist": "artist"}
+        search_parameters = [
+            SearchParameter(column="artist", operator="=", value="artist")
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
@@ -465,7 +478,10 @@ class TestDatabaseGetTracks:
         assert len(titles) == 4
 
         # Artist + title search returns just the specific track
-        search_parameters = {"artist": "artist", "title": "title_1"}
+        search_parameters = [
+            SearchParameter(column="artist", operator="=", value="artist"),
+            SearchParameter(column="title", operator="=", value="title_1"),
+        ]
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
         assert len(returned_tracks) == 1
@@ -473,7 +489,7 @@ class TestDatabaseGetTracks:
         assert returned_tracks[0].metadata.title == "title_1"
 
         # Empty search returns all tracks
-        search_parameters = {}
+        search_parameters = []
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
         titles = []
@@ -500,7 +516,7 @@ class TestDatabaseGetTracks:
             track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist")
             assert database.add_track(track=track, timeout=1)
 
-        order_by_asc = {"title": "ASC"}
+        order_by_asc = [OrderParameter(column="title", isAscending=True)]
 
         returned_tracks = database.get_tracks(order_parameters=order_by_asc)
         assert returned_tracks
@@ -511,7 +527,7 @@ class TestDatabaseGetTracks:
         ]
         assert sorted(returned_titles) == returned_titles
 
-        order_by_desc = {"title": "DESC"}
+        order_by_desc = [OrderParameter(column="title", isAscending=False)]
 
         returned_tracks = database.get_tracks(order_parameters=order_by_desc)
         assert returned_tracks
@@ -587,12 +603,16 @@ class TestDatabaseGetTracks:
             assert database.add_track(track=track, timeout=1)
             expected_tracks.append(track)
 
-        search_parameter = {"created_at": now - 1}
+        search_parameter = [
+            SearchParameter(column="created_at", operator=">", value=str(now - 1))
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameter)
         assert len(returned_tracks) == 5
 
-        search_parameter = {"created_at": now + 1}
+        search_parameter = [
+            SearchParameter(column="created_at", operator=">", value=str(now + 1))
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameter)
         assert len(returned_tracks) == 0
@@ -617,6 +637,35 @@ class TestGetTracksCount:
             assert database.add_track(track=track, timeout=1)
 
         assert database.get_tracks_count() == 5
+
+    def test_get_tracks_count__search_parameters__filter_count(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+
+        assert database.initialize()
+
+        for i in range(5):
+            track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist_1")
+            assert database.add_track(track=track, timeout=1)
+
+        for i in range(5):
+            track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist_2")
+            assert database.add_track(track=track, timeout=1)
+
+        expected_count = 5
+        search_parameters: List[SearchParameter] = [
+            SearchParameter(column="artist", operator="=", value="artist_1")
+        ]
+
+        returned_count = database.get_tracks_count(search_parameters=search_parameters)
+        assert returned_count == expected_count
+
+        search_parameters: List[SearchParameter] = [
+            SearchParameter(column="artist", operator="=", value="artist_2")
+        ]
+
+        returned_count = database.get_tracks_count(search_parameters=search_parameters)
+        assert returned_count == expected_count
 
 
 class TestGetArtists:

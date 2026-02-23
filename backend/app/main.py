@@ -1,14 +1,21 @@
 import json
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.database import Database, DatabaseContext
-from app.models import ClientTrack, GetArtistsResponse, GetTracksResponse, Track
+from app.database import Database, DatabaseContext, OrderParameter, SearchParameter
+from app.models import (
+    ClientTrack,
+    GetArtistsResponse,
+    GetTracksResponse,
+    Track,
+    track_meta_data,
+)
 from app.services import (
     FileWatcher,
     Ingestor,
@@ -26,6 +33,7 @@ async def lifespan(app: FastAPI):
 
 
 # TODO: Implement locking so that only one uvicorn worker runs startup sequence. Use fasteners with a locking file.
+# TODO: Dependency inject depends on get_database into api endpoints (and make the new function needed for this)
 app = FastAPI(lifespan=lifespan)
 
 
@@ -89,16 +97,24 @@ def get_tracks(
     offset: int = Query(0, ge=0),
     newer_than: Optional[int] = None,
 ):
-    total_track_count = app.state.database.get_tracks_count()
-    if total_track_count is None:
-        raise HTTPException(
-            status_code=500, detail="Could not find a total track count"
-        )
+    database: Database = cast(Database, app.state.database)
+
+    search_parameters: List[SearchParameter]
+    order_parameters: List[OrderParameter]
     if not cursor:
-        order_parameters = {"artist": "ASC", "album": "ASC", "track_number": "ASC"}
-        search_parameters = {}
+        order_parameters = [
+            OrderParameter(column="artist", isAscending=True),
+            OrderParameter(column="album", isAscending=True),
+            OrderParameter(column="disc_number", isAscending=True),
+            OrderParameter(column="track_number", isAscending=True),
+        ]
+        search_parameters = []
         if newer_than:
-            search_parameters["last_updated"] = newer_than
+            search_parameters = [
+                SearchParameter(
+                    column="last_updated", operator=">", value=str(newer_than)
+                )
+            ]
     else:
         try:
             decoded = json.loads(cursor)
@@ -111,28 +127,38 @@ def get_tracks(
                 status_code=400, detail="Cursor did not decode to a dict"
             )
 
-        cursor_dict: Dict[str, Any] = decoded
+        cursor_dict: Dict[str, List[Any]] = decoded
 
         if not cursor_dict:
             raise HTTPException(
                 status_code=400, detail="Cursor could not be decoded for json"
             )
 
-        if total_track_count == 0 or offset >= total_track_count:
-            return GetTracksResponse(data=[], nextCursor=None)
-
-        valid_cursor_keys = ["order_parameters", "search_parameters", "limit", "offset"]
+        valid_cursor_keys = ["order_parameters", "search_parameters"]
         valid_cursor_keys = sorted(valid_cursor_keys)
         if sorted(cursor_dict.keys()) != valid_cursor_keys:
             raise HTTPException(
                 status_code=400, detail="Invalid dictionary keys for the cursor_dict"
             )
-        order_parameters = cursor_dict["order_parameters"]
-        search_parameters = cursor_dict["search_parameters"]
-        limit = cursor_dict["limit"]
-        offset = cursor_dict["offset"]
 
-    gotten_tracks = app.state.database.get_tracks(
+        order_parameters = [
+            OrderParameter(**item) for item in cursor_dict["order_parameters"]
+        ]
+        search_parameters = [
+            SearchParameter(**item) for item in cursor_dict["search_parameters"]
+        ]
+
+    remaining_track_count = database.get_tracks_count(
+        search_parameters=search_parameters
+    )
+    if remaining_track_count is None:
+        raise HTTPException(
+            status_code=500, detail="Unable to get count of remaining tracks"
+        )
+    if remaining_track_count == 0 or offset >= remaining_track_count:
+        return GetTracksResponse(data=[], nextCursor=None)
+
+    gotten_tracks = database.get_tracks(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
         limit=limit,
@@ -140,17 +166,68 @@ def get_tracks(
     )
 
     client_track_list = [ClientTrack.from_track(track=track) for track in gotten_tracks]
-    if offset + limit >= total_track_count:
+    if len(client_track_list) == remaining_track_count:
         nextCursor = None
     else:
+        last_track: ClientTrack = client_track_list[-1]
+        new_search_parameters: List[SearchParameter] = []
+        for param in search_parameters:
+            # TODO: Fix this shit code... I am lazy
+            if param.column == "artist" and param.operator == ">":
+                continue
+            elif param.column == "album" and param.operator == ">":
+                continue
+            elif param.column == "disc_number" and param.operator == ">":
+                continue
+            elif param.column == "track_number" and param.operator == ">":
+                continue
+
+            new_param = param
+
+            new_search_parameters.append(new_param)
+
+        cursor_filters = []
+        if last_track.metadata.artist:
+            cursor_filters.append(
+                SearchParameter(
+                    column="artist", operator=">", value=last_track.metadata.artist
+                )
+            )
+
+        if last_track.metadata.album:
+            cursor_filters.append(
+                SearchParameter(
+                    column="album", operator=">", value=last_track.metadata.album
+                )
+            )
+
+        if last_track.metadata.disc_number:
+            cursor_filters.append(
+                SearchParameter(
+                    column="disc_number",
+                    operator=">",
+                    value=str(last_track.metadata.disc_number),
+                )
+            )
+
+        if last_track.metadata.track_number:
+            cursor_filters.append(
+                SearchParameter(
+                    column="track_number",
+                    operator=">",
+                    value=str(last_track.metadata.track_number),
+                )
+            )
+
+        new_search_parameters.extend(cursor_filters)
+
         nextCursor = json.dumps(
             {
-                "order_parameters": order_parameters,
-                "search_parameters": search_parameters,
-                "limit": limit,
-                "offset": offset + limit,
+                "order_parameters": [asdict(param) for param in order_parameters],
+                "search_parameters": [asdict(param) for param in new_search_parameters],
             }
         )
+        print(nextCursor)
 
     return GetTracksResponse(data=client_track_list, nextCursor=nextCursor)
 
@@ -158,7 +235,7 @@ def get_tracks(
 @app.get("/tracks/{uuid_id}/stream")
 def stream_track(uuid_id: str, request: Request):
     CHUNK_SIZE = 1024 * 1024
-    search_parameters = {"uuid_id": uuid_id}
+    search_parameters = [SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
     track_list: List[Track] = app.state.database.get_tracks(
         search_parameters=search_parameters
     )

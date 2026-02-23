@@ -1,7 +1,7 @@
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
+from typing import List, Optional
 
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
@@ -32,11 +32,48 @@ ALLOWED_METADATA_COLUMNS = [
 
 ALLOWED_TRACK_COLUMNS = ["created_at", "last_updated"]
 
+ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
+
+
+def alias_map(column: str) -> str:
+    if column in ALLOWED_METADATA_COLUMNS:
+        return "tm"
+    else:
+        return "t"
+
 
 @dataclass(frozen=True)
 class DatabaseContext:
     database_path: Path
     init_sql_path: Path
+
+
+@dataclass(frozen=True)
+class SearchParameter:
+    column: str
+    operator: str
+    value: Optional[str]
+
+    def __post_init__(self):
+        if self.operator not in ALLOWED_OPERATORS:
+            raise ValueError("operator must be in ALLOWED_OPERATORS")
+
+        if self.column not in set(ALLOWED_TRACK_COLUMNS + ALLOWED_METADATA_COLUMNS):
+            raise ValueError(
+                "column must be in ALLOWED_TRACK_COLUMNS or ALLOWED_METADATA_COLUMNS"
+            )
+
+
+@dataclass(frozen=True)
+class OrderParameter:
+    column: str
+    isAscending: bool = True
+
+    def __post_init__(self):
+        if self.column not in set(ALLOWED_TRACK_COLUMNS + ALLOWED_METADATA_COLUMNS):
+            raise ValueError(
+                "column must be in ALLOWED_TRACK_COLUMNS or ALLOWED_METADATA_COLUMNS"
+            )
 
 
 class Database:
@@ -223,8 +260,8 @@ class Database:
     # TODO: searching needs some refactor. Specifically, using dicts for the searching is bad.
     def get_tracks(
         self,
-        search_parameters: dict[str, Any] = {},
-        order_parameters: dict[str, str] = {},
+        search_parameters: List[SearchParameter] = [],
+        order_parameters: List[OrderParameter] = [],
         timeout: float = 5,
         limit: int = 100,
         offset: int = 0,
@@ -234,9 +271,10 @@ class Database:
                 f"Limit {limit} or Offset {offset} was set incorrectly for database.get_tracks"
             )
             raise ValueError
+
         allowed_columns = set(ALLOWED_TRACK_COLUMNS + ALLOWED_METADATA_COLUMNS)
-        search_columns = set(search_parameters.keys())
-        order_columns = set(order_parameters.keys())
+        search_columns = set([param.column for param in search_parameters])
+        order_columns = set([order.column for order in order_parameters])
         invalid_search_columns = search_columns - allowed_columns
         invalid_order_columns = order_columns - allowed_columns
 
@@ -258,13 +296,6 @@ class Database:
         conn.row_factory = sqlite3.Row
         search_cursor = conn.cursor()
 
-        # Used so that created_at and last_updated are searched/ordered correctly
-        def alias_map(column: str) -> tuple[str, str]:
-            if column in ALLOWED_METADATA_COLUMNS:
-                return "tm", "="
-            else:
-                return "t", ">"
-
         search_query = (
             "SELECT "
             'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, tm."year", '
@@ -278,12 +309,15 @@ class Database:
         search_clauses = []
         search_values = []
 
-        for key, value in search_parameters.items():
-            alias, operator = alias_map(key)
+        for param in search_parameters:
+            column = param.column
+            value = param.value
+            operator = param.operator
+            alias = alias_map(column)
             if value is None:
-                search_clauses.append(f'{alias}."{key}" IS NULL')
+                search_clauses.append(f'{alias}."{column}" IS NULL')
             else:
-                search_clauses.append(f'{alias}."{key}" {operator} ?')
+                search_clauses.append(f'{alias}."{column}" {operator} ?')
                 search_values.append(value)
 
         if search_clauses:
@@ -291,13 +325,11 @@ class Database:
 
         order_clauses = []
 
-        for key, value in order_parameters.items():
-            alias, _ = alias_map(key)
-            value = value.strip().upper()
-            if value not in ["ASC", "DESC"]:
-                print(f"{key} has a non allowed ordering: {value}, applying ASC")
-            else:
-                order_clauses.append(f'{alias}."{key}" {value.upper()}')
+        for order in order_parameters:
+            column = order.column
+            value = "ASC" if order.isAscending else "DESC"
+            alias = alias_map(column)
+            order_clauses.append(f'{alias}."{column}" {value.upper()}')
 
         if order_clauses:
             search_query += " ORDER BY " + " , ".join(order_clauses)
@@ -348,24 +380,49 @@ class Database:
 
         return tracks
 
-    def get_tracks_count(self, timeout: float = 5) -> int | None:
+    def get_tracks_count(
+        self, search_parameters: List[SearchParameter] = [], timeout: float = 5
+    ) -> int | None:
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
             return None
 
-        search_query = "SELECT COUNT(*) FROM tracks"
+        search_query = (
+            "SELECT COUNT(*) FROM tracks as t "
+            "JOIN trackmetadata AS tm ON "
+            " t.uuid_id = tm.uuid_id"
+        )
+
+        search_clauses = []
+        search_values = []
+
+        for param in search_parameters:
+            column = param.column
+            value = param.value
+            operator = param.operator
+            alias = alias_map(column)
+            if value is None:
+                search_clauses.append(f'{alias}."{column}" IS NULL')
+            else:
+                search_clauses.append(f'{alias}."{column}" {operator} ?')
+                search_values.append(value)
+
+        if search_clauses:
+            search_query += " WHERE " + " AND ".join(search_clauses)
+
         cursor = conn.cursor()
         try:
-            cursor.execute(search_query)
+            count = int(
+                cursor.execute(search_query, tuple(search_values)).fetchone()[0]
+            )
         except Exception as e:
             print(f"Failed to get count from database whil executing query: {e}")
             conn.close()
             return None
+        finally:
+            conn.close()
 
-        row = cursor.fetchone()
-        count = row[0]
-        conn.close()
-        return int(count)
+        return count
 
     def get_artists(
         self, limit: int = 100, offset: int = 0, timeout: float = 5
