@@ -1,2 +1,8 @@
-from .database import Database, DatabaseContext, SearchParameter, OrderParameter
+from .database import (
+    Database,
+    DatabaseContext,
+    OrderParameter,
+    RowFilterParameter,
+    SearchParameter,
+)
 

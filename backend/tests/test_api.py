@@ -3,7 +3,7 @@ import json
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set, Dict
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,13 +32,29 @@ def client(tmp_path, monkeypatch):
 
 
 # Tests assume that each track has a unique artist and album
-def add_tracks_to_client(client, amount_to_add: int = 1) -> List[Track]:
+def add_tracks_to_client(
+    client,
+    amount_to_add: int = 1,
+    artist: Optional[str] = None,
+    album: Optional[str] = None,
+) -> List[Track]:
     tracks = []
     for i in range(amount_to_add):
         metadata = TrackMetaData(
-            title=f"song_{i}", album=f"album_{i}", artist=f"artist_{i}", duration=1.0
+            title=f"song_{i}",
+            album=f"album_{i}",
+            artist=f"artist_{i}",
+            track_number=i,
+            duration=1.0,
         )
+        if artist:
+            metadata.artist = artist
+
+        if album:
+            metadata.album = album
+
         track = Track(file_path=Path(f"path_{i}"), metadata=metadata)
+
         tracks.append(track)
 
     for track in tracks:
@@ -71,8 +87,18 @@ class TestGetTracks:
         r = client.get(f"/tracks?cursor={json.dumps(bad_cursor)}")
         assert r.status_code == 400, r.text
 
-    def test_tracks__cursor_logic__works(self, client):
-        tracks = add_tracks_to_client(client=client, amount_to_add=10)
+    def test_tracks__full_library_cursor_logic__works(self, client):
+        tracks = []
+
+        for i in range(5):
+            tracks.extend(
+                add_tracks_to_client(
+                    client=client,
+                    amount_to_add=5,
+                    artist=f"artist_{i}",
+                    album=f"album_{i}",
+                )
+            )
 
         returned_tracks = []
 
@@ -105,6 +131,58 @@ class TestGetTracks:
         assert sorted(t.uuid_id for t in returned_tracks) == sorted(
             t.uuid_id for t in tracks
         )
+
+    def test_tracks__artist_album_cursor_logic__works(self, client):
+        # Random tracks
+        add_tracks_to_client(client=client, amount_to_add=10)
+
+        artist = "some random artist"
+        albums = [f"album_{i}" for i in range(2)]
+
+        for album in albums:
+            tracks = add_tracks_to_client(
+                client=client, amount_to_add=5, artist=artist, album=album
+            )
+
+            returned_tracks = []
+
+            r = client.get(
+                "/tracks", params={"limit": 1, "artist": artist, "album": album}
+            )
+            assert r.status_code == 200, r.text
+
+            gettracksresponse = GetTracksResponse.model_validate(r.json())
+
+            assert gettracksresponse is not None
+            assert gettracksresponse.nextCursor is not None
+            assert len(gettracksresponse.data) == 1
+
+            returned_tracks.append(gettracksresponse.data[0])
+
+            nextCursor = gettracksresponse.nextCursor
+
+            while nextCursor:
+                r = client.get(
+                    "/tracks",
+                    params={
+                        "limit": 1,
+                        "cursor": nextCursor,
+                    },
+                )
+                assert r.status_code == 200, r.text
+
+                gettracksresponse = GetTracksResponse.model_validate(r.json())
+
+                assert gettracksresponse is not None
+                nextCursor = gettracksresponse.nextCursor
+
+                assert len(gettracksresponse.data) == 1
+                returned_tracks.append(gettracksresponse.data[0])
+
+            assert len(returned_tracks) == len(tracks)
+            assert sorted(t.uuid_id for t in returned_tracks) == sorted(
+                t.uuid_id for t in tracks
+            )
 
     def test_tracks__newer_than__works(self, client):
         metadata = TrackMetaData(duration=1.0)

@@ -12,7 +12,6 @@ from app.models.track_meta_data import TrackMetaData
 # TODO: do not let connect_to_database return None. raising and expection is probably fine, since consumers of the function should be try catching
 
 ALLOWED_METADATA_COLUMNS = [
-    "uuid_id",
     "title",
     "artist",
     "album",
@@ -30,16 +29,9 @@ ALLOWED_METADATA_COLUMNS = [
     "has_album_art",
 ]
 
-ALLOWED_TRACK_COLUMNS = ["created_at", "last_updated"]
+ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
 
 ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
-
-
-def alias_map(column: str) -> str:
-    if column in ALLOWED_METADATA_COLUMNS:
-        return "tm"
-    else:
-        return "t"
 
 
 @dataclass(frozen=True)
@@ -68,6 +60,18 @@ class SearchParameter:
 class OrderParameter:
     column: str
     isAscending: bool = True
+
+    def __post_init__(self):
+        if self.column not in set(ALLOWED_TRACK_COLUMNS + ALLOWED_METADATA_COLUMNS):
+            raise ValueError(
+                "column must be in ALLOWED_TRACK_COLUMNS or ALLOWED_METADATA_COLUMNS"
+            )
+
+
+@dataclass(frozen=True)
+class RowFilterParameter:
+    column: str
+    value: Optional[str]
 
     def __post_init__(self):
         if self.column not in set(ALLOWED_TRACK_COLUMNS + ALLOWED_METADATA_COLUMNS):
@@ -262,6 +266,7 @@ class Database:
         self,
         search_parameters: List[SearchParameter] = [],
         order_parameters: List[OrderParameter] = [],
+        row_filter_parameters: List[RowFilterParameter] = [],
         timeout: float = 5,
         limit: int = 100,
         offset: int = 0,
@@ -319,6 +324,15 @@ class Database:
             else:
                 search_clauses.append(f'{alias}."{column}" {operator} ?')
                 search_values.append(value)
+
+        if row_filter_parameters and order_parameters:
+            cursor_constraints, cursor_values = filter_for_cursor(
+                row_filter_parameters, order_parameters
+            )
+            if cursor_constraints:
+                cursor_clause = "(" + " OR ".join(cursor_constraints) + ")"
+                search_clauses.append(cursor_clause)
+                search_values.extend(cursor_values)
 
         if search_clauses:
             search_query += " WHERE " + " AND ".join(search_clauses)
@@ -381,7 +395,11 @@ class Database:
         return tracks
 
     def get_tracks_count(
-        self, search_parameters: List[SearchParameter] = [], timeout: float = 5
+        self,
+        search_parameters: List[SearchParameter] = [],
+        order_parameters: List[OrderParameter] = [],
+        row_filter_parameters: List[RowFilterParameter] = [],
+        timeout: float = 5,
     ) -> int | None:
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
@@ -406,6 +424,15 @@ class Database:
             else:
                 search_clauses.append(f'{alias}."{column}" {operator} ?')
                 search_values.append(value)
+
+        if row_filter_parameters and order_parameters:
+            cursor_constraints, cursor_values = filter_for_cursor(
+                row_filter_parameters, order_parameters
+            )
+            if cursor_constraints:
+                cursor_clause = "(" + " OR ".join(cursor_constraints) + ")"
+                search_clauses.append(cursor_clause)
+                search_values.extend(cursor_values)
 
         if search_clauses:
             search_query += " WHERE " + " AND ".join(search_clauses)
@@ -577,3 +604,76 @@ class Database:
             conn.close()
 
         return album_count
+
+
+def alias_map(column: str) -> str:
+    if column in ALLOWED_METADATA_COLUMNS:
+        return "tm"
+    else:
+        return "t"
+
+
+def filter_for_cursor(
+    row_filter_list: List[RowFilterParameter],
+    order_parameters: List[OrderParameter],
+) -> tuple[List[str], List[str]]:
+    columns = [param.column for param in row_filter_list]
+    allowed_columns = set(ALLOWED_TRACK_COLUMNS + ALLOWED_METADATA_COLUMNS)
+    input_columns = set(columns)
+    invalid_search_columns = input_columns - allowed_columns
+
+    if invalid_search_columns:
+        raise ValueError("Invalid columns input to filter for cursor")
+
+    if len(set(columns)) != len(columns):
+        raise ValueError("Filtering by row requires all unique columns")
+
+    order_columns = [op.column for op in order_parameters]
+    if columns != order_columns:
+        raise ValueError(
+            "row_filter_parameters columns must match order_parameters columns"
+        )
+
+    constraints: List[str] = []
+    values: List[str] = []
+
+    for depth in range(len(row_filter_list)):
+        equality_parts: List[str] = []
+        equality_values: List[str] = []
+
+        for i in range(depth):
+            alias = alias_map(row_filter_list[i].column)
+            col = row_filter_list[i].column
+            value = row_filter_list[i].value
+            if value is None:
+                equality_parts.append(f'{alias}."{col}" IS NULL')
+            else:
+                equality_parts.append(f'{alias}."{col}" = ?')
+                equality_values.append(value)
+
+        alias = alias_map(row_filter_list[depth].column)
+        col = row_filter_list[depth].column
+        cursor_value = row_filter_list[depth].value
+
+        if cursor_value is None:
+            # NULL: for ASC, any non-null value comes after NULL; for DESC, nothing is less than NULL
+            if order_parameters[depth].isAscending:
+                final_part = f'{alias}."{col}" IS NOT NULL'
+            else:
+                # Skip this depth entirely — no rows can be "less than" NULL
+                continue
+            all_parts = equality_parts + [final_part]
+            all_values = equality_values
+        else:
+            op = ">" if order_parameters[depth].isAscending else "<"
+            final_part = f'{alias}."{col}" {op} ?'
+            all_parts = equality_parts + [final_part]
+            all_values = equality_values + [cursor_value]
+
+        if len(all_parts) == 1:
+            constraints.append(all_parts[0])
+        else:
+            constraints.append("(" + " AND ".join(all_parts) + ")")
+        values.extend(all_values)
+
+    return (constraints, values)

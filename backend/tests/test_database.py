@@ -1,3 +1,4 @@
+from os import path
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,8 +8,10 @@ from unittest.mock import patch
 import pytest
 
 from app.database.database import (
+    ALLOWED_METADATA_COLUMNS,
     Database,
     DatabaseContext,
+    RowFilterParameter,
     SearchParameter,
     OrderParameter,
 )
@@ -589,7 +592,7 @@ class TestDatabaseGetTracks:
         assert returned_artists is not None
         assert len(returned_artists) == 0
 
-    def test_get_tracks__track_search_parameter__works(self, tmp_path: Path):
+    def test_get_tracks__track_search_parameters__work(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
@@ -616,6 +619,67 @@ class TestDatabaseGetTracks:
 
         returned_tracks = database.get_tracks(search_parameters=search_parameter)
         assert len(returned_tracks) == 0
+
+    def test_get_tracks__row_filter_parameters__work(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+
+        assert database.initialize()
+
+        for i in range(2):
+            artist = f"artist_{i}"
+            for j in range(2):
+                album = f"album_{i}"
+                for k in range(3):
+                    title = f"song_{i}_{j}_{k}"
+                    file_path = tmp_path / (title + ".mp3")
+                    track = create_track(path=file_path, title=title, artist=artist)
+                    track.metadata.album = album
+                    assert database.add_track(track=track)
+
+        columns: List[str] = [
+            "artist",
+            "album",
+            "disc_number",
+            "track_number",
+            "uuid_id",
+        ]
+
+        order_parameters: List[OrderParameter] = []
+        for column in columns:
+            order_parameters.append(OrderParameter(column=column, isAscending=True))
+
+        returned_tracks = database.get_tracks(
+            order_parameters=order_parameters, limit=4
+        )
+
+        all_returned_uuids = set()
+        all_returned_uuids.update([track.uuid_id for track in returned_tracks])
+
+        last_track = returned_tracks[-1]
+        row_filter_parameters: List[RowFilterParameter] = []
+        for column in columns:
+            if column in ALLOWED_METADATA_COLUMNS:
+                param = RowFilterParameter(
+                    column=column, value=str(getattr(last_track.metadata, column))
+                )
+            else:
+                param = RowFilterParameter(
+                    column=column, value=str(getattr(last_track, column))
+                )
+
+            row_filter_parameters.append(param)
+
+        returned_tracks = database.get_tracks(
+            order_parameters=order_parameters,
+            row_filter_parameters=row_filter_parameters,
+        )
+
+        for track in returned_tracks:
+            assert track.uuid_id not in all_returned_uuids
+
+        returned_uuids = [track.uuid_id for track in returned_tracks]
+        assert len(returned_uuids) == len(set(returned_uuids))
 
 
 class TestGetTracksCount:
