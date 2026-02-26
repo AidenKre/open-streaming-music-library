@@ -47,39 +47,153 @@ class AppDatabase extends _$AppDatabase {
   @override
   int get schemaVersion => 1;
 
-  Future<List<TypedResult>> getTrackPage({
+  // Sort-key cursor pagination for all tracks.
+  // This cursor logic is linked to the backend's filter_for_cursor()
+  // in backend/app/database/database.py — keep them in sync.
+  Future<List<QueryRow>> getTrackPage({
     required int limit,
-    required int offset,
+    String? cursorArtist,
+    String? cursorAlbum,
+    int? cursorTrackNumber,
+    String? cursorUuidId,
   }) {
-    return (select(trackmetadata).join([
-      innerJoin(tracks, tracks.uuidId.equalsExp(trackmetadata.uuidId)),
-    ])
-      ..orderBy([
-        OrderingTerm.asc(trackmetadata.artist),
-        OrderingTerm.asc(trackmetadata.album),
-        OrderingTerm.asc(trackmetadata.trackNumber),
-      ])
-      ..limit(limit, offset: offset))
-    .get();
+    final vars = <Variable>[];
+    var cursorClause = '';
+
+    if (cursorUuidId != null) {
+      final parts = <String>[];
+
+      // depth 0: artist
+      if (cursorArtist == null) {
+        parts.add('tm.artist IS NOT NULL');
+      } else {
+        parts.add('tm.artist > ?');
+        vars.add(Variable.withString(cursorArtist));
+      }
+
+      // depth 1: artist =, album >
+      if (cursorArtist == null) {
+        // artist IS NULL AND album > ? (or IS NOT NULL if album is null)
+        if (cursorAlbum == null) {
+          parts.add('(tm.artist IS NULL AND tm.album IS NOT NULL)');
+        } else {
+          parts.add('(tm.artist IS NULL AND tm.album > ?)');
+          vars.add(Variable.withString(cursorAlbum));
+        }
+      } else {
+        if (cursorAlbum == null) {
+          parts.add('(tm.artist = ? AND tm.album IS NOT NULL)');
+          vars.add(Variable.withString(cursorArtist));
+        } else {
+          parts.add('(tm.artist = ? AND tm.album > ?)');
+          vars.add(Variable.withString(cursorArtist));
+          vars.add(Variable.withString(cursorAlbum));
+        }
+      }
+
+      // depth 2: artist =, album =, trackNumber >
+      final eqArtist =
+          cursorArtist == null ? 'tm.artist IS NULL' : 'tm.artist = ?';
+      final eqAlbum =
+          cursorAlbum == null ? 'tm.album IS NULL' : 'tm.album = ?';
+
+      if (cursorTrackNumber == null) {
+        parts.add('($eqArtist AND $eqAlbum AND tm.track_number IS NOT NULL)');
+      } else {
+        parts.add('($eqArtist AND $eqAlbum AND tm.track_number > ?)');
+      }
+      if (cursorArtist != null) vars.add(Variable.withString(cursorArtist));
+      if (cursorAlbum != null) vars.add(Variable.withString(cursorAlbum));
+      if (cursorTrackNumber != null) vars.add(Variable.withInt(cursorTrackNumber));
+
+      // depth 3: artist =, album =, trackNumber =, uuidId >
+      final eqTrackNumber = cursorTrackNumber == null
+          ? 'tm.track_number IS NULL'
+          : 'tm.track_number = ?';
+      parts.add('($eqArtist AND $eqAlbum AND $eqTrackNumber AND t.uuid_id > ?)');
+      if (cursorArtist != null) vars.add(Variable.withString(cursorArtist));
+      if (cursorAlbum != null) vars.add(Variable.withString(cursorAlbum));
+      if (cursorTrackNumber != null) vars.add(Variable.withInt(cursorTrackNumber));
+      vars.add(Variable.withString(cursorUuidId));
+
+      cursorClause = 'WHERE (${parts.join(' OR ')})';
+    }
+
+    vars.add(Variable.withInt(limit));
+
+    return customSelect(
+      'SELECT tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
+      'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
+      'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
+      'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated '
+      'FROM trackmetadata AS tm '
+      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
+      '$cursorClause '
+      'ORDER BY tm.artist ASC, tm.album ASC, tm.track_number ASC, t.uuid_id ASC '
+      'LIMIT ?',
+      variables: vars,
+      readsFrom: {trackmetadata, tracks},
+    ).get();
   }
 
-  Future<List<TypedResult>> getAlbumTrackPage({
+  // Sort-key cursor pagination for album tracks.
+  // This cursor logic is linked to the backend's filter_for_cursor()
+  // in backend/app/database/database.py — keep them in sync.
+  Future<List<QueryRow>> getAlbumTrackPage({
     required String artist,
     required String album,
     required int limit,
-    required int offset,
+    int? cursorTrackNumber,
+    String? cursorUuidId,
   }) {
-    return (select(trackmetadata).join([
-      innerJoin(tracks, tracks.uuidId.equalsExp(trackmetadata.uuidId)),
-    ])
-      ..where(
-        (trackmetadata.albumArtist.equals(artist) |
-         (trackmetadata.albumArtist.isNull() & trackmetadata.artist.equals(artist))) &
-         trackmetadata.album.equals(album),
-      )
-      ..orderBy([OrderingTerm.asc(trackmetadata.trackNumber)])
-      ..limit(limit, offset: offset))
-    .get();
+    final vars = <Variable>[];
+    var cursorClause = '';
+
+    // Artist/album filter (same as backend artist_album_filter_clause)
+    vars.add(Variable.withString(artist.toLowerCase()));
+    vars.add(Variable.withString(artist.toLowerCase()));
+    vars.add(Variable.withString(album));
+
+    if (cursorUuidId != null) {
+      final parts = <String>[];
+
+      // depth 0: trackNumber >
+      if (cursorTrackNumber == null) {
+        parts.add('tm.track_number IS NOT NULL');
+      } else {
+        parts.add('tm.track_number > ?');
+        vars.add(Variable.withInt(cursorTrackNumber));
+      }
+
+      // depth 1: trackNumber =, uuidId >
+      final eqTrackNumber = cursorTrackNumber == null
+          ? 'tm.track_number IS NULL'
+          : 'tm.track_number = ?';
+      parts.add('($eqTrackNumber AND t.uuid_id > ?)');
+      if (cursorTrackNumber != null) vars.add(Variable.withInt(cursorTrackNumber));
+      vars.add(Variable.withString(cursorUuidId));
+
+      cursorClause = 'AND (${parts.join(' OR ')})';
+    }
+
+    vars.add(Variable.withInt(limit));
+
+    return customSelect(
+      'SELECT tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
+      'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
+      'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
+      'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated '
+      'FROM trackmetadata AS tm '
+      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
+      'WHERE ((LOWER(tm.album_artist) = ? ) '
+      '  OR (tm.album_artist IS NULL AND LOWER(tm.artist) = ?)) '
+      '  AND tm.album = ? '
+      '$cursorClause '
+      'ORDER BY tm.track_number ASC, t.uuid_id ASC '
+      'LIMIT ?',
+      variables: vars,
+      readsFrom: {trackmetadata, tracks},
+    ).get();
   }
 }
 
@@ -121,4 +235,3 @@ TrackmetadataCompanion trackmetadataCompanionFromDto(ClientTrackDto dto) {
     hasAlbumArt: Value(meta.hasAlbumArt),
   );
 }
-

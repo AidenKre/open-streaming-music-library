@@ -72,11 +72,11 @@ void main() {
       expect(page.nextCursor, isNull);
     });
 
-    test('nextCursor has offset pageSize when exactly pageSize items returned', () async {
+    test('nextCursor contains last item sort keys when page is full', () async {
       for (var i = 0; i < TrackRepository.pageSize; i++) {
         await insertTrack(
           db,
-          uuid: 'track-$i',
+          uuid: 'track-${i.toString().padLeft(4, '0')}',
           artist: 'Artist',
           album: 'Album',
           trackNumber: i + 1,
@@ -86,15 +86,27 @@ void main() {
       final page = await repo.getAllTracks();
       expect(page.items.length, TrackRepository.pageSize);
       expect(page.nextCursor, isA<AllTracksCursor>());
-      expect((page.nextCursor as AllTracksCursor).offset, TrackRepository.pageSize);
+      final cursor = page.nextCursor as AllTracksCursor;
+      final lastItem = page.items.last;
+      expect(cursor.artist, lastItem.artist);
+      expect(cursor.album, lastItem.album);
+      expect(cursor.trackNumber, lastItem.trackNumber);
+      expect(cursor.uuidId, lastItem.uuidId);
     });
 
-    test('cursor with non-zero offset returns correct next page', () async {
+    test('cursor pagination returns correct next page', () async {
       await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
       await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
       await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
 
-      final page = await repo.getAllTracks(cursor: const AllTracksCursor(1));
+      final page = await repo.getAllTracks(
+        cursor: const AllTracksCursor(
+          artist: 'A',
+          album: 'A',
+          trackNumber: 1,
+          uuidId: '1',
+        ),
+      );
       final uuids = page.items.map((t) => t.uuidId).toList();
       expect(uuids, ['2', '3']);
     });
@@ -176,7 +188,7 @@ void main() {
       expect(uuids, ['1', '2', '3']);
     });
 
-    test('cursor pagination works correctly', () async {
+    test('cursor pagination returns correct next page', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Album', trackNumber: 1);
       await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album', trackNumber: 2);
       await insertTrack(db, uuid: '3', artist: 'Artist', album: 'Album', trackNumber: 3);
@@ -184,7 +196,7 @@ void main() {
       final page = await repo.getAlbumTracks(
         artist: 'Artist',
         album: 'Album',
-        cursor: const AlbumTracksCursor(artist: 'Artist', album: 'Album', offset: 1),
+        cursor: const AlbumTracksCursor(trackNumber: 1, uuidId: '1'),
       );
       final uuids = page.items.map((t) => t.uuidId).toList();
       expect(uuids, ['2', '3']);

@@ -197,33 +197,70 @@ void main() {
   group('getTrackPage', () {
     test('returns tracks joined with metadata', () async {
       await insertTrack(db, uuid: 'a', title: 'Song A', artist: 'Artist A', album: 'Album A');
-      final results = await db.getTrackPage(limit: 100, offset: 0);
+      final results = await db.getTrackPage(limit: 100);
       expect(results.length, 1);
-      final track = results.first.readTable(db.tracks);
-      final meta = results.first.readTable(db.trackmetadata);
-      expect(track.uuidId, 'a');
-      expect(meta.title, 'Song A');
+      expect(results.first.read<String>('uuid_id'), 'a');
+      expect(results.first.read<String>('title'), 'Song A');
     });
 
-    test('returns tracks sorted artist -> album -> trackNumber', () async {
+    test('returns tracks sorted artist -> album -> trackNumber -> uuidId', () async {
       await insertTrack(db, uuid: '1', artist: 'B Artist', album: 'A Album', trackNumber: 2);
       await insertTrack(db, uuid: '2', artist: 'A Artist', album: 'B Album', trackNumber: 1);
       await insertTrack(db, uuid: '3', artist: 'A Artist', album: 'A Album', trackNumber: 2);
       await insertTrack(db, uuid: '4', artist: 'A Artist', album: 'A Album', trackNumber: 1);
 
-      final results = await db.getTrackPage(limit: 100, offset: 0);
-      final uuids = results.map((r) => r.readTable(db.tracks).uuidId).toList();
+      final results = await db.getTrackPage(limit: 100);
+      final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
       expect(uuids, ['4', '3', '2', '1']);
     });
 
-    test('offset skips correct rows', () async {
+    test('cursor skips rows before cursor position', () async {
       await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
       await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
       await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
 
-      final results = await db.getTrackPage(limit: 100, offset: 1);
+      // Cursor at track 1 — should return tracks 2 and 3
+      final results = await db.getTrackPage(
+        limit: 100,
+        cursorArtist: 'A',
+        cursorAlbum: 'A',
+        cursorTrackNumber: 1,
+        cursorUuidId: '1',
+      );
       expect(results.length, 2);
-      expect(results.first.readTable(db.tracks).uuidId, '2');
+      expect(results.first.read<String>('uuid_id'), '2');
+    });
+
+    test('cursor works across different artists', () async {
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'B', album: 'A', trackNumber: 1);
+      await insertTrack(db, uuid: '3', artist: 'C', album: 'A', trackNumber: 1);
+
+      // Cursor at artist A — should return B and C
+      final results = await db.getTrackPage(
+        limit: 100,
+        cursorArtist: 'A',
+        cursorAlbum: 'A',
+        cursorTrackNumber: 1,
+        cursorUuidId: '1',
+      );
+      expect(results.length, 2);
+      final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
+      expect(uuids, ['2', '3']);
+    });
+
+    test('cursor handles null sort key values', () async {
+      await insertTrack(db, uuid: '1', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 1);
+
+      // Cursor at null artist — non-null artists come after
+      final results = await db.getTrackPage(
+        limit: 100,
+        cursorTrackNumber: 1,
+        cursorUuidId: '1',
+      );
+      expect(results.length, 1);
+      expect(results.first.read<String>('uuid_id'), '2');
     });
 
     test('limit caps result count', () async {
@@ -231,7 +268,7 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
       await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
 
-      final results = await db.getTrackPage(limit: 2, offset: 0);
+      final results = await db.getTrackPage(limit: 2);
       expect(results.length, 2);
     });
   });
@@ -245,10 +282,9 @@ void main() {
         artist: 'Artist A',
         album: 'Album A',
         limit: 100,
-        offset: 0,
       );
       expect(results.length, 1);
-      expect(results.first.readTable(db.tracks).uuidId, '1');
+      expect(results.first.read<String>('uuid_id'), '1');
     });
 
     test('uses albumArtist when present', () async {
@@ -265,10 +301,9 @@ void main() {
         artist: 'Album Artist',
         album: 'My Album',
         limit: 100,
-        offset: 0,
       );
       expect(results.length, 1);
-      expect(results.first.readTable(db.tracks).uuidId, '1');
+      expect(results.first.read<String>('uuid_id'), '1');
     });
 
     test('falls back to artist when albumArtist is null', () async {
@@ -284,10 +319,9 @@ void main() {
         artist: 'Solo Artist',
         album: 'My Album',
         limit: 100,
-        offset: 0,
       );
       expect(results.length, 1);
-      expect(results.first.readTable(db.tracks).uuidId, '1');
+      expect(results.first.read<String>('uuid_id'), '1');
     });
 
     test('returns tracks sorted by trackNumber ASC', () async {
@@ -299,10 +333,26 @@ void main() {
         artist: 'Artist',
         album: 'Album',
         limit: 100,
-        offset: 0,
       );
-      final uuids = results.map((r) => r.readTable(db.tracks).uuidId).toList();
+      final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
       expect(uuids, ['1', '2', '3']);
+    });
+
+    test('cursor skips rows before cursor position', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Album', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album', trackNumber: 2);
+      await insertTrack(db, uuid: '3', artist: 'Artist', album: 'Album', trackNumber: 3);
+
+      final results = await db.getAlbumTrackPage(
+        artist: 'Artist',
+        album: 'Album',
+        limit: 100,
+        cursorTrackNumber: 1,
+        cursorUuidId: '1',
+      );
+      expect(results.length, 2);
+      final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
+      expect(uuids, ['2', '3']);
     });
   });
 }

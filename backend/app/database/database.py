@@ -631,6 +631,9 @@ def alias_map(column: str) -> str:
         return "t"
 
 
+# Sort-key cursor pagination logic.
+# This cursor logic is linked to the frontend's getTrackPage() / getAlbumTrackPage()
+# in frontend/lib/database/database.dart — keep them in sync.
 def filter_for_cursor(
     row_filter_list: List[RowFilterParameter],
     order_parameters: List[OrderParameter],
