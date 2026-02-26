@@ -681,6 +681,101 @@ class TestDatabaseGetTracks:
         returned_uuids = [track.uuid_id for track in returned_tracks]
         assert len(returned_uuids) == len(set(returned_uuids))
 
+    def test_get_tracks__artist_filter__returns_matching_tracks(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        # album=None means filter for IS NULL, so tracks here have no album
+        track_a = create_track(tmp_path / "a.mp3", "song_a", "ArtistA")
+        track_b = create_track(tmp_path / "b.mp3", "song_b", "ArtistB")
+        assert database.add_track(track=track_a)
+        assert database.add_track(track=track_b)
+
+        results = database.get_tracks(artist="ArtistA")
+        assert len(results) == 1
+        assert results[0].metadata.title == "song_a"
+
+    def test_get_tracks__artist_and_album_filter__returns_matching_tracks(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track_a = create_track(tmp_path / "a.mp3", "song_a", "Artist")
+        track_a.metadata.album = "Album1"
+        track_b = create_track(tmp_path / "b.mp3", "song_b", "Artist")
+        track_b.metadata.album = "Album2"
+        track_c = create_track(tmp_path / "c.mp3", "song_c", "Other")
+        track_c.metadata.album = "Album1"
+        assert database.add_track(track=track_a)
+        assert database.add_track(track=track_b)
+        assert database.add_track(track=track_c)
+
+        results = database.get_tracks(artist="Artist", album="Album1")
+        assert len(results) == 1
+        assert results[0].metadata.title == "song_a"
+
+    def test_get_tracks__artist_with_null_album__returns_tracks_without_album(
+        self, tmp_path
+    ):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track_with_album = create_track(tmp_path / "a.mp3", "song_a", "Artist")
+        track_with_album.metadata.album = "SomeAlbum"
+        track_no_album = create_track(tmp_path / "b.mp3", "song_b", "Artist")
+        assert database.add_track(track=track_with_album)
+        assert database.add_track(track=track_no_album)
+
+        results = database.get_tracks(artist="Artist", album=None)
+        assert len(results) == 1
+        assert results[0].metadata.title == "song_b"
+
+    def test_get_tracks__album_without_artist__raises_value_error(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        with pytest.raises(ValueError):
+            database.get_tracks(album="SomeAlbum")
+
+    def test_get_tracks__album_artist_filter__uses_album_artist(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track_aa = create_track(
+            tmp_path / "a.mp3", "song_a", "feat_artist", "MainArtist"
+        )
+        track_aa.metadata.album = "TheAlbum"
+        track_plain = create_track(tmp_path / "b.mp3", "song_b", "MainArtist")
+        track_plain.metadata.album = "TheAlbum"
+        track_other = create_track(tmp_path / "c.mp3", "song_c", "Other")
+        track_other.metadata.album = "TheAlbum"
+        assert database.add_track(track=track_aa)
+        assert database.add_track(track=track_plain)
+        assert database.add_track(track=track_other)
+
+        results = database.get_tracks(artist="MainArtist", album="TheAlbum")
+        assert len(results) == 2
+        titles = {r.metadata.title for r in results}
+        assert titles == {"song_a", "song_b"}
+
+    def test_get_tracks__album_artist_excludes_plain_artist(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track = create_track(
+            tmp_path / "a.mp3", "song_a", "feat_artist", "MainArtist"
+        )
+        track.metadata.album = "TheAlbum"
+        assert database.add_track(track=track)
+
+        results = database.get_tracks(artist="feat_artist")
+        assert len(results) == 0
+
 
 class TestGetTracksCount:
     def test_get_tracks_count__empty_db__returns_0(self, tmp_path):

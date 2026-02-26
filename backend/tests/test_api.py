@@ -239,6 +239,66 @@ class TestGetTracks:
             t.uuid_id for t in tracks
         )
 
+    def test_tracks__artist_album_filter_with_album_artist__works(self, client):
+        album_artist = "MainArtist"
+        feat_artist = "feat_artist"
+        album = "TheAlbum"
+
+        # Track with album_artist — should be found when querying MainArtist
+        metadata_aa = TrackMetaData(
+            title="song_aa",
+            artist=feat_artist,
+            album_artist=album_artist,
+            album=album,
+            duration=1.0,
+        )
+        track_aa = Track(file_path=Path("aa.mp3"), metadata=metadata_aa)
+        assert client.app.state.database.add_track(track_aa)
+
+        # Track with plain artist — should also be found when querying MainArtist
+        metadata_plain = TrackMetaData(
+            title="song_plain",
+            artist=album_artist,
+            album=album,
+            duration=1.0,
+        )
+        track_plain = Track(file_path=Path("plain.mp3"), metadata=metadata_plain)
+        assert client.app.state.database.add_track(track_plain)
+
+        # Track that should NOT match
+        metadata_other = TrackMetaData(
+            title="song_other",
+            artist="OtherArtist",
+            album=album,
+            duration=1.0,
+        )
+        track_other = Track(file_path=Path("other.mp3"), metadata=metadata_other)
+        assert client.app.state.database.add_track(track_other)
+
+        # MainArtist + TheAlbum returns both album_artist and plain artist tracks
+        r = client.get("/tracks", params={"artist": album_artist, "album": album})
+        assert r.status_code == 200, r.text
+
+        response = GetTracksResponse.model_validate(r.json())
+        assert len(response.data) == 2
+        titles = {t.metadata.title for t in response.data}
+        assert titles == {"song_aa", "song_plain"}
+
+        # feat_artist should NOT return the album_artist track
+        r = client.get("/tracks", params={"artist": feat_artist, "album": album})
+        assert r.status_code == 200, r.text
+
+        response = GetTracksResponse.model_validate(r.json())
+        assert len(response.data) == 0
+
+        # OtherArtist should only return their own track
+        r = client.get("/tracks", params={"artist": "OtherArtist", "album": album})
+        assert r.status_code == 200, r.text
+
+        response = GetTracksResponse.model_validate(r.json())
+        assert len(response.data) == 1
+        assert response.data[0].metadata.title == "song_other"
+
     def test_tracks__bad_limit_offset__fails(self, client):
         # Ensure that database is populated so no other codes return
         tracks = add_tracks_to_client(client=client, amount_to_add=5)  # noqa: F841

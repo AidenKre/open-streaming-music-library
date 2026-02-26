@@ -120,15 +120,6 @@ def get_tracks(
                 )
             )
 
-        if artist:
-            search_parameters.append(
-                SearchParameter(column="artist", operator="=", value=artist)
-            )
-
-        if album:
-            search_parameters.append(
-                SearchParameter(column="album", operator="=", value=album)
-            )
     else:
         try:
             decoded = json.loads(cursor)
@@ -169,6 +160,8 @@ def get_tracks(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
+        artist=artist,
+        album=album,
     )
     if remaining_track_count is None:
         raise HTTPException(
@@ -181,6 +174,8 @@ def get_tracks(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
+        artist=artist,
+        album=album,
         limit=limit,
         offset=offset,
     )

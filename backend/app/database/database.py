@@ -267,10 +267,15 @@ class Database:
         search_parameters: List[SearchParameter] = [],
         order_parameters: List[OrderParameter] = [],
         row_filter_parameters: List[RowFilterParameter] = [],
+        artist: Optional[str] = None,
+        album: Optional[str] = None,
         timeout: float = 5,
         limit: int = 100,
         offset: int = 0,
     ) -> List[Track]:
+        if album is not None and artist is None:
+            raise ValueError("Cannot filter by album without artist")
+
         if limit <= 0 or limit > 1000 or offset < 0:
             print(
                 f"Limit {limit} or Offset {offset} was set incorrectly for database.get_tracks"
@@ -325,13 +330,17 @@ class Database:
                 search_clauses.append(f'{alias}."{column}" {operator} ?')
                 search_values.append(value)
 
+        if artist is not None:
+            aa_clause, aa_values = artist_album_filter_clause(artist, album)
+            search_clauses.append("(" + aa_clause + ")")
+            search_values.extend(aa_values)
+
         if row_filter_parameters and order_parameters:
-            cursor_constraints, cursor_values = filter_for_cursor(
+            cursor_clause, cursor_values = filter_for_cursor(
                 row_filter_parameters, order_parameters
             )
-            if cursor_constraints:
-                cursor_clause = "(" + " OR ".join(cursor_constraints) + ")"
-                search_clauses.append(cursor_clause)
+            if cursor_clause:
+                search_clauses.append("(" + cursor_clause + ")")
                 search_values.extend(cursor_values)
 
         if search_clauses:
@@ -399,8 +408,13 @@ class Database:
         search_parameters: List[SearchParameter] = [],
         order_parameters: List[OrderParameter] = [],
         row_filter_parameters: List[RowFilterParameter] = [],
+        artist: Optional[str] = None,
+        album: Optional[str] = None,
         timeout: float = 5,
     ) -> int | None:
+        if album is not None and artist is None:
+            raise ValueError("Cannot filter by album without artist")
+
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
             return None
@@ -425,13 +439,17 @@ class Database:
                 search_clauses.append(f'{alias}."{column}" {operator} ?')
                 search_values.append(value)
 
+        if artist is not None:
+            aa_clause, aa_values = artist_album_filter_clause(artist, album)
+            search_clauses.append("(" + aa_clause + ")")
+            search_values.extend(aa_values)
+
         if row_filter_parameters and order_parameters:
-            cursor_constraints, cursor_values = filter_for_cursor(
+            cursor_clause, cursor_values = filter_for_cursor(
                 row_filter_parameters, order_parameters
             )
-            if cursor_constraints:
-                cursor_clause = "(" + " OR ".join(cursor_constraints) + ")"
-                search_clauses.append(cursor_clause)
+            if cursor_clause:
+                search_clauses.append("(" + cursor_clause + ")")
                 search_values.extend(cursor_values)
 
         if search_clauses:
@@ -616,7 +634,7 @@ def alias_map(column: str) -> str:
 def filter_for_cursor(
     row_filter_list: List[RowFilterParameter],
     order_parameters: List[OrderParameter],
-) -> tuple[List[str], List[str]]:
+) -> tuple[str, List[str]]:
     columns = [param.column for param in row_filter_list]
     allowed_columns = set(ALLOWED_TRACK_COLUMNS + ALLOWED_METADATA_COLUMNS)
     input_columns = set(columns)
@@ -676,4 +694,25 @@ def filter_for_cursor(
             constraints.append("(" + " AND ".join(all_parts) + ")")
         values.extend(all_values)
 
-    return (constraints, values)
+    if not constraints:
+        return ("", values)
+
+    return (" OR ".join(constraints), values)
+
+
+def artist_album_filter_clause(
+    artist: str, album: Optional[str]
+) -> tuple[str, List[str]]:
+    artist_clause = (
+        '((tm."artist" LIKE ? AND (tm."album_artist" IS NULL OR tm."album_artist" = \'\'))'
+        ' OR tm."album_artist" LIKE ?)'
+    )
+    values = [artist, artist]
+
+    if album is None:
+        album_clause = 'tm."album" IS NULL'
+    else:
+        album_clause = 'tm."album" LIKE ?'
+        values.append(album)
+
+    return (artist_clause + " AND " + album_clause, values)
