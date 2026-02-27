@@ -220,6 +220,42 @@ class TestGetTracks:
         assert gettracksresponse.nextCursor is None
         assert len(gettracksresponse.data) == 0
 
+    def test_tracks__older_than__works(self, client):
+        metadata = TrackMetaData(duration=1.0)
+
+        now = int(datetime.now(UTC).timestamp())
+        track = Track(
+            metadata=metadata,
+            file_path=Path("whatever.mp3"),
+            created_at=now,
+            last_updated=now,
+        )
+
+        track_added = client.app.state.database.add_track(track)
+        assert track_added
+
+        r = client.get(f"/tracks?older_than={now + 1}")
+
+        assert r.status_code == 200, r.text
+
+        gettracksresponse = GetTracksResponse.model_validate(r.json())
+
+        assert gettracksresponse
+        assert gettracksresponse.nextCursor is None
+        assert gettracksresponse.data
+        assert len(gettracksresponse.data) == 1
+        assert gettracksresponse.data[0].uuid_id == track.uuid_id
+
+        r = client.get(f"/tracks?older_than={now - 1}")
+
+        assert r.status_code == 200, r.text
+
+        gettracksresponse = GetTracksResponse.model_validate(r.json())
+
+        assert gettracksresponse
+        assert gettracksresponse.nextCursor is None
+        assert len(gettracksresponse.data) == 0
+
     def test_tracks__limit_offset__works(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=5)
 

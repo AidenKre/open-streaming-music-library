@@ -8,7 +8,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.database import Database, DatabaseContext, OrderParameter, RowFilterParameter, SearchParameter
+from app.database import (
+    Database,
+    DatabaseContext,
+    OrderParameter,
+    RowFilterParameter,
+    SearchParameter,
+)
 from app.models import (
     ClientTrack,
     GetArtistsResponse,
@@ -98,6 +104,7 @@ def get_tracks(
     artist: Optional[str] = None,
     album: Optional[str] = None,
     newer_than: Optional[int] = None,
+    older_than: Optional[int] = None,
 ):
     database: Database = cast(Database, app.state.database)
 
@@ -117,6 +124,12 @@ def get_tracks(
             search_parameters.append(
                 SearchParameter(
                     column="last_updated", operator=">", value=str(newer_than)
+                )
+            )
+        if older_than:
+            search_parameters.append(
+                SearchParameter(
+                    column="last_updated", operator="<=", value=str(older_than)
                 )
             )
 
@@ -139,7 +152,11 @@ def get_tracks(
                 status_code=400, detail="Cursor could not be decoded for json"
             )
 
-        valid_cursor_keys = ["order_parameters", "row_filter_parameters", "search_parameters"]
+        valid_cursor_keys = [
+            "order_parameters",
+            "row_filter_parameters",
+            "search_parameters",
+        ]
         valid_cursor_keys = sorted(valid_cursor_keys)
         if sorted(cursor_dict.keys()) != valid_cursor_keys:
             raise HTTPException(
@@ -201,7 +218,9 @@ def get_tracks(
         nextCursor = json.dumps(
             {
                 "order_parameters": [asdict(param) for param in order_parameters],
-                "row_filter_parameters": [asdict(param) for param in new_row_filter_parameters],
+                "row_filter_parameters": [
+                    asdict(param) for param in new_row_filter_parameters
+                ],
                 "search_parameters": [asdict(param) for param in search_parameters],
             }
         )
