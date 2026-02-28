@@ -543,12 +543,17 @@ class Database:
 
         return artist_count
 
-    def get_artist_albums(
-        self, artist: str, limit: int = 100, offset: int = 0, timeout: float = 5
+    def get_albums(
+        self,
+        artist: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+        order_by: str = "year",
+        timeout: float = 5,
     ) -> List[str] | None:
         if limit <= 0 or limit > 1000 or offset < 0:
             print(
-                f"Limit {limit} or Offset {offset} was set incorrectly for database.get_artists"
+                f"Limit {limit} or Offset {offset} was set incorrectly for database.get_albums"
             )
             raise ValueError
 
@@ -558,30 +563,48 @@ class Database:
 
         conn.row_factory = sqlite3.Row
 
-        query = (
-            "WITH candidates(value, year_n, row_order) AS ( "
-            ' SELECT album, "year", rowid FROM trackmetadata '
-            " WHERE artist LIKE ? "
-            " AND (album IS NOT NULL AND album IS NOT '') "
-            " AND (album_artist IS NULL OR album_artist IS '') "
-            " UNION ALL "
-            ' SELECT album, "year", rowid FROM trackmetadata '
-            " WHERE album_artist LIKE ? "
-            " AND (album IS NOT NULL AND album IS NOT '') "
-            ") "
-            "SELECT value, MIN(row_order) FROM candidates "
-            "GROUP BY LOWER(value) "
-            "ORDER BY MIN(year_n) ASC "
-            "LIMIT ? OFFSET ?"
+        order_clause = (
+            "ORDER BY LOWER(value) ASC"
+            if order_by == "alphabetical"
+            else "ORDER BY MIN(year_n) ASC"
         )
 
-        parameters = (artist, artist, limit, offset)
+        if artist is not None:
+            query = (
+                "WITH candidates(value, year_n, row_order) AS ( "
+                ' SELECT album, "year", rowid FROM trackmetadata '
+                " WHERE artist LIKE ? "
+                " AND (album IS NOT NULL AND album IS NOT '') "
+                " AND (album_artist IS NULL OR album_artist IS '') "
+                " UNION ALL "
+                ' SELECT album, "year", rowid FROM trackmetadata '
+                " WHERE album_artist LIKE ? "
+                " AND (album IS NOT NULL AND album IS NOT '') "
+                ") "
+                "SELECT value, MIN(row_order) FROM candidates "
+                "GROUP BY LOWER(value) "
+                f"{order_clause} "
+                "LIMIT ? OFFSET ?"
+            )
+            parameters = (artist, artist, limit, offset)
+        else:
+            query = (
+                "WITH candidates(value, year_n, row_order) AS ( "
+                ' SELECT album, "year", rowid FROM trackmetadata '
+                " WHERE (album IS NOT NULL AND album IS NOT '') "
+                ") "
+                "SELECT value, MIN(row_order) FROM candidates "
+                "GROUP BY LOWER(value) "
+                f"{order_clause} "
+                "LIMIT ? OFFSET ?"
+            )
+            parameters = (limit, offset)
 
         try:
             cursor = conn.cursor()
             album_rows = cursor.execute(query, parameters).fetchall()
         except Exception as e:
-            print(f"Failed to retrieve artists albums: {e}")
+            print(f"Failed to retrieve albums: {e}")
             conn.close()
             return None
         finally:
@@ -589,33 +612,47 @@ class Database:
 
         return [row["value"] for row in album_rows]
 
-    def get_artist_albums_count(self, artist: str, timeout: float = 5) -> int | None:
+    def get_albums_count(
+        self, artist: Optional[str] = None, timeout: float = 5
+    ) -> int | None:
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
             print("Unable to connect to database")
             return None
 
-        query = (
-            "WITH candidates(value) AS ( "
-            " SELECT album FROM trackmetadata "
-            " WHERE artist LIKE ? "
-            " AND (album IS NOT NULL AND album IS NOT '') "
-            " AND (album_artist IS NULL OR album_artist IS '') "
-            " UNION ALL "
-            " SELECT album FROM trackmetadata "
-            " WHERE album_artist LIKE ? "
-            " AND (album IS NOT NULL AND album IS NOT '') "
-            ") "
-            "SELECT COUNT(*) FROM candidates"
-        )
-
-        parameters = (artist, artist)
+        if artist is not None:
+            query = (
+                "WITH candidates(value) AS ( "
+                " SELECT album FROM trackmetadata "
+                " WHERE artist LIKE ? "
+                " AND (album IS NOT NULL AND album IS NOT '') "
+                " AND (album_artist IS NULL OR album_artist IS '') "
+                " UNION ALL "
+                " SELECT album FROM trackmetadata "
+                " WHERE album_artist LIKE ? "
+                " AND (album IS NOT NULL AND album IS NOT '') "
+                ") "
+                "SELECT COUNT(*) FROM ("
+                " SELECT value FROM candidates"
+                " GROUP BY LOWER(value)"
+                ")"
+            )
+            parameters = (artist, artist)
+        else:
+            query = (
+                "SELECT COUNT(*) FROM ("
+                " SELECT album FROM trackmetadata "
+                " WHERE (album IS NOT NULL AND album IS NOT '') "
+                " GROUP BY LOWER(album)"
+                ")"
+            )
+            parameters = ()
 
         try:
             cursor = conn.cursor()
             album_count = int(cursor.execute(query, parameters).fetchone()[0])
         except Exception as e:
-            print(f"Failed to retrive album counts for {artist}: {e}")
+            print(f"Failed to retrieve album counts: {e}")
             conn.close()
             return None
         finally:

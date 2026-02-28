@@ -1,6 +1,8 @@
 import json
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from os import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -151,20 +153,22 @@ def get_tracks(
                 status_code=400, detail="Cursor did not decode to a dict"
             )
 
-        cursor_dict: Dict[str, List[Any]] = decoded
+        cursor_dict: Dict[str, Any] = decoded
 
         if not cursor_dict:
             raise HTTPException(
                 status_code=400, detail="Cursor could not be decoded for json"
             )
 
-        valid_cursor_keys = sorted([
-            "order_parameters",
-            "row_filter_parameters",
-            "search_parameters",
-            "artist",
-            "album",
-        ])
+        valid_cursor_keys = sorted(
+            [
+                "order_parameters",
+                "row_filter_parameters",
+                "search_parameters",
+                "artist",
+                "album",
+            ]
+        )
         if sorted(cursor_dict.keys()) != valid_cursor_keys:
             raise HTTPException(
                 status_code=400, detail="Invalid dictionary keys for the cursor_dict"
@@ -358,14 +362,15 @@ def get_artists(
     return GetArtistsResponse(data=returned_artists, nextCursor=nextCursor)
 
 
-@app.get("/artists/{artist}/albums", response_model=GetArtistsResponse)
-def get_artist_album(
-    artist: str,
+@app.get("/albums", response_model=GetArtistsResponse)
+def get_albums(
+    artist: Optional[str] = Query(None),
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     cursor: Optional[str] = None,
 ):
-    album_count = app.state.database.get_artist_albums_count(artist=artist)
+    database: Database = cast(Database, app.state.database)
+    album_count = database.get_albums_count(artist=artist)
     if album_count is None:
         raise HTTPException(status_code=500, detail="Unable to get count")
 
@@ -380,9 +385,15 @@ def get_artist_album(
     if offset >= album_count or album_count == 0:
         return GetArtistsResponse(data=[], nextCursor=None)
 
-    returned_albums: List[str] = app.state.database.get_artist_albums(
-        artist=artist, limit=limit, offset=offset
+    order_by = "year" if artist is not None else "alphabetical"
+    returned_albums: List[str] | None = database.get_albums(
+        artist=artist, limit=limit, offset=offset, order_by=order_by
     )
+
+    if returned_albums is None:
+        raise HTTPException(
+            status_code=500, detail="Unable to fetch albums from the backends database"
+        )
 
     if limit + offset >= album_count:
         nextCursor = None
