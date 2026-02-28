@@ -40,6 +40,194 @@ class Trackmetadata extends Table {
   Set<Column> get primaryKey => {uuidId};
 }
 
+// Column allowlists (mirrors backend database.py)
+const allowedMetadataColumns = {
+  'title',
+  'artist',
+  'album',
+  'album_artist',
+  'year',
+  'date',
+  'genre',
+  'track_number',
+  'disc_number',
+  'codec',
+  'duration',
+  'bitrate_kbps',
+  'sample_rate_hz',
+  'channels',
+  'has_album_art',
+};
+
+const allowedTrackColumns = {'uuid_id', 'created_at', 'last_updated'};
+
+const allowedOperators = {'=', '>=', '<=', '<', '>'};
+
+class SearchParameter {
+  final String column;
+  final String operator;
+  final Object? value;
+
+  SearchParameter({required this.column, required this.operator, this.value}) {
+    if (!allowedOperators.contains(operator)) {
+      throw ArgumentError('operator must be in allowedOperators');
+    }
+    if (!allowedMetadataColumns.contains(column) &&
+        !allowedTrackColumns.contains(column)) {
+      throw ArgumentError(
+        'column must be in allowedMetadataColumns or allowedTrackColumns',
+      );
+    }
+  }
+}
+
+class OrderParameter {
+  final String column;
+  final bool isAscending;
+
+  OrderParameter({required this.column, this.isAscending = true}) {
+    if (!allowedMetadataColumns.contains(column) &&
+        !allowedTrackColumns.contains(column)) {
+      throw ArgumentError(
+        'column must be in allowedMetadataColumns or allowedTrackColumns',
+      );
+    }
+  }
+}
+
+class RowFilterParameter {
+  final String column;
+  final Object? value;
+
+  RowFilterParameter({required this.column, this.value}) {
+    if (!allowedMetadataColumns.contains(column) &&
+        !allowedTrackColumns.contains(column)) {
+      throw ArgumentError(
+        'column must be in allowedMetadataColumns or allowedTrackColumns',
+      );
+    }
+  }
+}
+
+String aliasMap(String column) {
+  return allowedMetadataColumns.contains(column) ? 'tm' : 't';
+}
+
+// Converts a Dart value to a Drift Variable. Supports String, int, double.
+// Booleans are stored as integers in SQLite — pass 1/0 instead of true/false.
+Variable _variableFrom(Object value) {
+  if (value is String) return Variable.withString(value);
+  if (value is int) return Variable.withInt(value);
+  if (value is double) return Variable.withReal(value);
+  throw ArgumentError('Unsupported variable type: ${value.runtimeType}');
+}
+
+(String, List<Variable>) filterForCursor(
+  List<RowFilterParameter> rowFilters,
+  List<OrderParameter> orderParams,
+) {
+  final columns = rowFilters.map((r) => r.column).toList();
+  final orderColumns = orderParams.map((o) => o.column).toList();
+
+  if (columns.length != columns.toSet().length) {
+    throw ArgumentError('Filtering by row requires all unique columns');
+  }
+  if (!_listEquals(columns, orderColumns)) {
+    throw ArgumentError(
+      'row_filter_parameters columns must match order_parameters columns',
+    );
+  }
+
+  final constraints = <String>[];
+  final values = <Variable>[];
+
+  for (var depth = 0; depth < rowFilters.length; depth++) {
+    final equalityParts = <String>[];
+    final equalityValues = <Variable>[];
+
+    for (var i = 0; i < depth; i++) {
+      final alias = aliasMap(rowFilters[i].column);
+      final col = rowFilters[i].column;
+      final v = rowFilters[i].value;
+      if (v == null) {
+        equalityParts.add('$alias."$col" IS NULL');
+      } else {
+        equalityParts.add('$alias."$col" = ?');
+        equalityValues.add(_variableFrom(v));
+      }
+    }
+
+    final alias = aliasMap(rowFilters[depth].column);
+    final col = rowFilters[depth].column;
+    final cursorValue = rowFilters[depth].value;
+
+    if (cursorValue == null) {
+      if (orderParams[depth].isAscending) {
+        final allParts = [...equalityParts, '$alias."$col" IS NOT NULL'];
+        if (allParts.length == 1) {
+          constraints.add(allParts[0]);
+        } else {
+          constraints.add('(${allParts.join(' AND ')})');
+        }
+        values.addAll(equalityValues);
+      }
+      // DESC with null cursor: skip (nothing is less than NULL)
+      continue;
+    }
+
+    final op = orderParams[depth].isAscending ? '>' : '<';
+    final finalPart = '$alias."$col" $op ?';
+    final allParts = [...equalityParts, finalPart];
+    final allValues = [...equalityValues, _variableFrom(cursorValue)];
+
+    if (allParts.length == 1) {
+      constraints.add(allParts[0]);
+    } else {
+      constraints.add('(${allParts.join(' AND ')})');
+    }
+    values.addAll(allValues);
+  }
+
+  if (constraints.isEmpty) return ('', values);
+  return (constraints.join(' OR '), values);
+}
+
+(String, List<Variable>) artistAlbumFilterClause(String artist, String? album) {
+  final artistLower = artist.toLowerCase();
+  final values = <Variable>[
+    Variable.withString(artistLower),
+    Variable.withString(artistLower),
+  ];
+
+  final artistClause =
+      '((LOWER(tm.album_artist) = ?)'
+      ' OR (tm.album_artist IS NULL AND LOWER(tm.artist) = ?))';
+
+  final String albumClause;
+  if (album == null) {
+    albumClause = 'tm.album IS NULL';
+  } else {
+    albumClause = 'tm.album = ?';
+    values.add(Variable.withString(album));
+  }
+
+  return ('$artistClause AND $albumClause', values);
+}
+
+bool _listEquals(List<String> a, List<String> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+const _selectColumns =
+    'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
+    'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
+    'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
+    'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated';
+
 @DriftDatabase(tables: [Tracks, Trackmetadata])
 class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
@@ -47,153 +235,224 @@ class AppDatabase extends _$AppDatabase {
   @override
   int get schemaVersion => 1;
 
-  // Sort-key cursor pagination for all tracks.
-  // This cursor logic is linked to the backend's filter_for_cursor()
-  // in backend/app/database/database.py — keep them in sync.
-  Future<List<QueryRow>> getTrackPage({
-    required int limit,
-    String? cursorArtist,
-    String? cursorAlbum,
-    int? cursorTrackNumber,
-    String? cursorUuidId,
+  (String, List<Variable>) _buildTrackQuery({
+    List<SearchParameter> searchParams = const [],
+    List<OrderParameter> orderBy = const [],
+    List<RowFilterParameter> cursorFilters = const [],
+    String? artist,
+    String? album,
+    int? limit,
   }) {
-    final vars = <Variable>[];
-    var cursorClause = '';
-
-    if (cursorUuidId != null) {
-      final parts = <String>[];
-
-      // depth 0: artist
-      if (cursorArtist == null) {
-        parts.add('tm.artist IS NOT NULL');
-      } else {
-        parts.add('tm.artist > ?');
-        vars.add(Variable.withString(cursorArtist));
-      }
-
-      // depth 1: artist =, album >
-      if (cursorArtist == null) {
-        // artist IS NULL AND album > ? (or IS NOT NULL if album is null)
-        if (cursorAlbum == null) {
-          parts.add('(tm.artist IS NULL AND tm.album IS NOT NULL)');
-        } else {
-          parts.add('(tm.artist IS NULL AND tm.album > ?)');
-          vars.add(Variable.withString(cursorAlbum));
-        }
-      } else {
-        if (cursorAlbum == null) {
-          parts.add('(tm.artist = ? AND tm.album IS NOT NULL)');
-          vars.add(Variable.withString(cursorArtist));
-        } else {
-          parts.add('(tm.artist = ? AND tm.album > ?)');
-          vars.add(Variable.withString(cursorArtist));
-          vars.add(Variable.withString(cursorAlbum));
-        }
-      }
-
-      // depth 2: artist =, album =, trackNumber >
-      final eqArtist =
-          cursorArtist == null ? 'tm.artist IS NULL' : 'tm.artist = ?';
-      final eqAlbum =
-          cursorAlbum == null ? 'tm.album IS NULL' : 'tm.album = ?';
-
-      if (cursorTrackNumber == null) {
-        parts.add('($eqArtist AND $eqAlbum AND tm.track_number IS NOT NULL)');
-      } else {
-        parts.add('($eqArtist AND $eqAlbum AND tm.track_number > ?)');
-      }
-      if (cursorArtist != null) vars.add(Variable.withString(cursorArtist));
-      if (cursorAlbum != null) vars.add(Variable.withString(cursorAlbum));
-      if (cursorTrackNumber != null) vars.add(Variable.withInt(cursorTrackNumber));
-
-      // depth 3: artist =, album =, trackNumber =, uuidId >
-      final eqTrackNumber = cursorTrackNumber == null
-          ? 'tm.track_number IS NULL'
-          : 'tm.track_number = ?';
-      parts.add('($eqArtist AND $eqAlbum AND $eqTrackNumber AND t.uuid_id > ?)');
-      if (cursorArtist != null) vars.add(Variable.withString(cursorArtist));
-      if (cursorAlbum != null) vars.add(Variable.withString(cursorAlbum));
-      if (cursorTrackNumber != null) vars.add(Variable.withInt(cursorTrackNumber));
-      vars.add(Variable.withString(cursorUuidId));
-
-      cursorClause = 'WHERE (${parts.join(' OR ')})';
+    if (album != null && artist == null) {
+      throw ArgumentError('Cannot filter by album without artist');
     }
 
-    vars.add(Variable.withInt(limit));
+    final vars = <Variable>[];
+    final whereClauses = <String>[];
 
+    // Search parameters
+    for (final param in searchParams) {
+      final alias = aliasMap(param.column);
+      if (param.value == null) {
+        whereClauses.add('$alias."${param.column}" IS NULL');
+      } else {
+        whereClauses.add('$alias."${param.column}" ${param.operator} ?');
+        vars.add(_variableFrom(param.value!));
+      }
+    }
+
+    // Artist/album filter
+    if (artist != null) {
+      final (aaClause, aaVars) = artistAlbumFilterClause(artist, album);
+      whereClauses.add('($aaClause)');
+      vars.addAll(aaVars);
+    }
+
+    // Cursor filter
+    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
+      final (cursorClause, cursorVars) = filterForCursor(
+        cursorFilters,
+        orderBy,
+      );
+      if (cursorClause.isNotEmpty) {
+        whereClauses.add('($cursorClause)');
+        vars.addAll(cursorVars);
+      }
+    }
+
+    var sql =
+        'SELECT $_selectColumns '
+        'FROM trackmetadata AS tm '
+        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id';
+
+    if (whereClauses.isNotEmpty) {
+      sql += ' WHERE ${whereClauses.join(' AND ')}';
+    }
+
+    if (orderBy.isNotEmpty) {
+      final orderParts = orderBy.map((o) {
+        final alias = aliasMap(o.column);
+        final dir = o.isAscending ? 'ASC' : 'DESC';
+        return '$alias."${o.column}" $dir';
+      });
+      sql += ' ORDER BY ${orderParts.join(', ')}';
+    }
+
+    if (limit != null) {
+      sql += ' LIMIT ?';
+      vars.add(Variable.withInt(limit));
+    }
+
+    return (sql, vars);
+  }
+
+  Future<List<QueryRow>> getTracks({
+    List<SearchParameter> searchParams = const [],
+    List<OrderParameter> orderBy = const [],
+    List<RowFilterParameter> cursorFilters = const [],
+    String? artist,
+    String? album,
+    int? limit,
+  }) {
+    final (sql, vars) = _buildTrackQuery(
+      searchParams: searchParams,
+      orderBy: orderBy,
+      cursorFilters: cursorFilters,
+      artist: artist,
+      album: album,
+      limit: limit,
+    );
     return customSelect(
-      'SELECT tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
-      'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
-      'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
-      'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated '
-      'FROM trackmetadata AS tm '
-      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
-      '$cursorClause '
-      'ORDER BY tm.artist ASC, tm.album ASC, tm.track_number ASC, t.uuid_id ASC '
-      'LIMIT ?',
+      sql,
       variables: vars,
       readsFrom: {trackmetadata, tracks},
     ).get();
   }
 
-  // Sort-key cursor pagination for album tracks.
-  // This cursor logic is linked to the backend's filter_for_cursor()
-  // in backend/app/database/database.py — keep them in sync.
-  Future<List<QueryRow>> getAlbumTrackPage({
-    required String artist,
-    required String album,
-    required int limit,
-    int? cursorTrackNumber,
-    String? cursorUuidId,
+  /// Watches the count of tracks at or before [cursorFilters] position.
+  /// When cursorFilters is empty, counts all matching tracks.
+  Stream<int> watchTrackCount({
+    List<OrderParameter> orderBy = const [],
+    List<RowFilterParameter> cursorFilters = const [],
+    String? artist,
+    String? album,
   }) {
-    final vars = <Variable>[];
-    var cursorClause = '';
-
-    // Artist/album filter (same as backend artist_album_filter_clause)
-    vars.add(Variable.withString(artist.toLowerCase()));
-    vars.add(Variable.withString(artist.toLowerCase()));
-    vars.add(Variable.withString(album));
-
-    if (cursorUuidId != null) {
-      final parts = <String>[];
-
-      // depth 0: trackNumber >
-      if (cursorTrackNumber == null) {
-        parts.add('tm.track_number IS NOT NULL');
-      } else {
-        parts.add('tm.track_number > ?');
-        vars.add(Variable.withInt(cursorTrackNumber));
-      }
-
-      // depth 1: trackNumber =, uuidId >
-      final eqTrackNumber = cursorTrackNumber == null
-          ? 'tm.track_number IS NULL'
-          : 'tm.track_number = ?';
-      parts.add('($eqTrackNumber AND t.uuid_id > ?)');
-      if (cursorTrackNumber != null) vars.add(Variable.withInt(cursorTrackNumber));
-      vars.add(Variable.withString(cursorUuidId));
-
-      cursorClause = 'AND (${parts.join(' OR ')})';
+    if (album != null && artist == null) {
+      throw ArgumentError('Cannot filter by album without artist');
     }
 
-    vars.add(Variable.withInt(limit));
+    final vars = <Variable>[];
+    final whereClauses = <String>[];
+
+    // Artist/album filter
+    if (artist != null) {
+      final (aaClause, aaVars) = artistAlbumFilterClause(artist, album);
+      whereClauses.add('($aaClause)');
+      vars.addAll(aaVars);
+    }
+
+    // Inverse cursor: count rows at or before the cursor position
+    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
+      final (cursorClause, cursorVars) = filterForCursor(
+        cursorFilters,
+        orderBy,
+      );
+      if (cursorClause.isNotEmpty) {
+        whereClauses.add('NOT ($cursorClause)');
+        vars.addAll(cursorVars);
+      }
+    }
+
+    var sql =
+        'SELECT COUNT(*) AS c '
+        'FROM trackmetadata AS tm '
+        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id';
+
+    if (whereClauses.isNotEmpty) {
+      sql += ' WHERE ${whereClauses.join(' AND ')}';
+    }
 
     return customSelect(
-      'SELECT tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
-      'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
-      'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
-      'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated '
-      'FROM trackmetadata AS tm '
-      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
-      'WHERE ((LOWER(tm.album_artist) = ? ) '
-      '  OR (tm.album_artist IS NULL AND LOWER(tm.artist) = ?)) '
-      '  AND tm.album = ? '
-      '$cursorClause '
-      'ORDER BY tm.track_number ASC, t.uuid_id ASC '
-      'LIMIT ?',
+      sql,
       variables: vars,
       readsFrom: {trackmetadata, tracks},
+    ).watch().map((rows) => rows.first.read<int>('c'));
+  }
+
+  // Mirrors backend: database.py get_artists()
+  Future<List<String>> getArtists({int? limit, int? offset}) async {
+    String query =
+        ("WITH candidates(value, row_order) AS ( "
+        " SELECT artist, rowid FROM trackmetadata "
+        " WHERE (album_artist IS NULL OR album_artist IS '') "
+        " AND (artist IS NOT NULL AND artist <> '') "
+        " UNION ALL "
+        " SELECT album_artist, rowid FROM trackmetadata "
+        " WHERE album_artist IS NOT NULL AND album_artist <> '' "
+        ") "
+        "SELECT value, MIN(row_order) FROM candidates "
+        "GROUP BY LOWER(value) "
+        "ORDER BY LOWER(value) ASC ");
+    
+    List<Variable<Object>> vars = [];
+    if (limit != null) {
+      query += "LIMIT ? ";
+      vars.add(Variable.withInt(limit));
+      if (offset != null) {
+        query += "OFFSET ? ";
+        vars.add(Variable.withInt(offset));
+      }
+    }
+
+    final rows = await customSelect(
+      query,
+      variables: vars,
+      readsFrom: {trackmetadata},
     ).get();
+    return rows.map((r) => r.read<String>('value')).toList();
+  }
+
+  // Mirrors backend: database.py get_artist_albums()
+  Future<List<String>> getArtistAlbums({
+    required String artist,
+    int? limit,
+    int? offset,
+  }) async {
+    String query =
+        ("WITH candidates(value, year_n, row_order) AS ( "
+        ' SELECT album, "year", rowid FROM trackmetadata '
+        " WHERE artist LIKE ? "
+        " AND (album IS NOT NULL AND album IS NOT '') "
+        " AND (album_artist IS NULL OR album_artist IS '') "
+        " UNION ALL "
+        ' SELECT album, "year", rowid FROM trackmetadata '
+        " WHERE album_artist LIKE ? "
+        " AND (album IS NOT NULL AND album IS NOT '') "
+        ") "
+        "SELECT value, MIN(row_order) FROM candidates "
+        "GROUP BY LOWER(value) "
+        "ORDER BY MIN(year_n) ASC ");
+
+    List<Variable<Object>> vars = [
+      Variable.withString(artist),
+      Variable.withString(artist),
+    ];
+
+    if (limit != null) {
+      query += "LIMIT ? ";
+      vars.add(Variable.withInt(limit));
+      if (offset != null) {
+        query += "OFFSET ? ";
+        vars.add(Variable.withInt(offset));
+      }
+    }
+
+    final rows = await customSelect(
+      query,
+      variables: vars,
+      readsFrom: {trackmetadata},
+    ).get();
+    return rows.map((r) => r.read<String>('value')).toList();
   }
 }
 

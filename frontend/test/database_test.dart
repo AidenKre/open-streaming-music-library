@@ -172,6 +172,7 @@ void main() {
     String? album,
     String? albumArtist,
     int? trackNumber,
+    int? year,
   }) async {
     final dto = ClientTrackDto.fromJson({
       'uuid_id': uuid,
@@ -183,6 +184,7 @@ void main() {
         if (album != null) 'album': album,
         if (albumArtist != null) 'album_artist': albumArtist,
         if (trackNumber != null) 'track_number': trackNumber,
+        if (year != null) 'year': year,
         'duration': 180.0,
         'bitrate_kbps': 256.0,
         'sample_rate_hz': 44100,
@@ -194,10 +196,24 @@ void main() {
     await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
   }
 
-  group('getTrackPage', () {
+  // Standard all-tracks sort order: artist, album, track_number, uuid_id
+  final allTracksOrder = [
+    OrderParameter(column: 'artist'),
+    OrderParameter(column: 'album'),
+    OrderParameter(column: 'track_number'),
+    OrderParameter(column: 'uuid_id'),
+  ];
+
+  // Album sort order: track_number, uuid_id
+  final albumOrder = [
+    OrderParameter(column: 'track_number'),
+    OrderParameter(column: 'uuid_id'),
+  ];
+
+  group('getTracks', () {
     test('returns tracks joined with metadata', () async {
       await insertTrack(db, uuid: 'a', title: 'Song A', artist: 'Artist A', album: 'Album A');
-      final results = await db.getTrackPage(limit: 100);
+      final results = await db.getTracks(orderBy: allTracksOrder, limit: 100);
       expect(results.length, 1);
       expect(results.first.read<String>('uuid_id'), 'a');
       expect(results.first.read<String>('title'), 'Song A');
@@ -209,7 +225,7 @@ void main() {
       await insertTrack(db, uuid: '3', artist: 'A Artist', album: 'A Album', trackNumber: 2);
       await insertTrack(db, uuid: '4', artist: 'A Artist', album: 'A Album', trackNumber: 1);
 
-      final results = await db.getTrackPage(limit: 100);
+      final results = await db.getTracks(orderBy: allTracksOrder, limit: 100);
       final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
       expect(uuids, ['4', '3', '2', '1']);
     });
@@ -219,13 +235,15 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
       await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
 
-      // Cursor at track 1 — should return tracks 2 and 3
-      final results = await db.getTrackPage(
+      final results = await db.getTracks(
+        orderBy: allTracksOrder,
+        cursorFilters: [
+          RowFilterParameter(column: 'artist', value: 'A'),
+          RowFilterParameter(column: 'album', value: 'A'),
+          RowFilterParameter(column: 'track_number', value: 1),
+          RowFilterParameter(column: 'uuid_id', value: '1'),
+        ],
         limit: 100,
-        cursorArtist: 'A',
-        cursorAlbum: 'A',
-        cursorTrackNumber: 1,
-        cursorUuidId: '1',
       );
       expect(results.length, 2);
       expect(results.first.read<String>('uuid_id'), '2');
@@ -236,13 +254,15 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'B', album: 'A', trackNumber: 1);
       await insertTrack(db, uuid: '3', artist: 'C', album: 'A', trackNumber: 1);
 
-      // Cursor at artist A — should return B and C
-      final results = await db.getTrackPage(
+      final results = await db.getTracks(
+        orderBy: allTracksOrder,
+        cursorFilters: [
+          RowFilterParameter(column: 'artist', value: 'A'),
+          RowFilterParameter(column: 'album', value: 'A'),
+          RowFilterParameter(column: 'track_number', value: 1),
+          RowFilterParameter(column: 'uuid_id', value: '1'),
+        ],
         limit: 100,
-        cursorArtist: 'A',
-        cursorAlbum: 'A',
-        cursorTrackNumber: 1,
-        cursorUuidId: '1',
       );
       expect(results.length, 2);
       final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
@@ -253,11 +273,15 @@ void main() {
       await insertTrack(db, uuid: '1', trackNumber: 1);
       await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 1);
 
-      // Cursor at null artist — non-null artists come after
-      final results = await db.getTrackPage(
+      final results = await db.getTracks(
+        orderBy: allTracksOrder,
+        cursorFilters: [
+          RowFilterParameter(column: 'artist', value: null),
+          RowFilterParameter(column: 'album', value: null),
+          RowFilterParameter(column: 'track_number', value: 1),
+          RowFilterParameter(column: 'uuid_id', value: '1'),
+        ],
         limit: 100,
-        cursorTrackNumber: 1,
-        cursorUuidId: '1',
       );
       expect(results.length, 1);
       expect(results.first.read<String>('uuid_id'), '2');
@@ -268,19 +292,18 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
       await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
 
-      final results = await db.getTrackPage(limit: 2);
+      final results = await db.getTracks(orderBy: allTracksOrder, limit: 2);
       expect(results.length, 2);
     });
-  });
 
-  group('getAlbumTrackPage', () {
     test('returns only tracks for matching artist + album', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Album A', trackNumber: 1);
       await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'Album B', trackNumber: 1);
 
-      final results = await db.getAlbumTrackPage(
+      final results = await db.getTracks(
         artist: 'Artist A',
         album: 'Album A',
+        orderBy: albumOrder,
         limit: 100,
       );
       expect(results.length, 1);
@@ -297,9 +320,10 @@ void main() {
         trackNumber: 1,
       );
 
-      final results = await db.getAlbumTrackPage(
+      final results = await db.getTracks(
         artist: 'Album Artist',
         album: 'My Album',
+        orderBy: albumOrder,
         limit: 100,
       );
       expect(results.length, 1);
@@ -315,44 +339,268 @@ void main() {
         trackNumber: 1,
       );
 
-      final results = await db.getAlbumTrackPage(
+      final results = await db.getTracks(
         artist: 'Solo Artist',
         album: 'My Album',
+        orderBy: albumOrder,
         limit: 100,
       );
       expect(results.length, 1);
       expect(results.first.read<String>('uuid_id'), '1');
     });
 
-    test('returns tracks sorted by trackNumber ASC', () async {
+    test('orders album tracks by trackNumber ASC', () async {
       await insertTrack(db, uuid: '3', artist: 'Artist', album: 'Album', trackNumber: 3);
       await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Album', trackNumber: 1);
       await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album', trackNumber: 2);
 
-      final results = await db.getAlbumTrackPage(
+      final results = await db.getTracks(
         artist: 'Artist',
         album: 'Album',
+        orderBy: albumOrder,
         limit: 100,
       );
       final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
       expect(uuids, ['1', '2', '3']);
     });
 
-    test('cursor skips rows before cursor position', () async {
+    test('artist-only filtering returns tracks with null album', () async {
+      await insertTrack(db, uuid: '1', artist: 'X', album: null, trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'X', album: 'Some Album', trackNumber: 1);
+      await insertTrack(db, uuid: '3', artist: 'Y', album: null, trackNumber: 1);
+
+      final results = await db.getTracks(
+        artist: 'X',
+        orderBy: allTracksOrder,
+        limit: 100,
+      );
+      expect(results.length, 1);
+      expect(results.first.read<String>('uuid_id'), '1');
+    });
+
+    test('throws when album is provided without artist', () async {
+      expect(
+        () => db.getTracks(album: 'Album A', orderBy: albumOrder, limit: 100),
+        throwsArgumentError,
+      );
+    });
+
+    test('cursor pagination within album', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Album', trackNumber: 1);
       await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album', trackNumber: 2);
       await insertTrack(db, uuid: '3', artist: 'Artist', album: 'Album', trackNumber: 3);
 
-      final results = await db.getAlbumTrackPage(
+      final results = await db.getTracks(
         artist: 'Artist',
         album: 'Album',
+        orderBy: albumOrder,
+        cursorFilters: [
+          RowFilterParameter(column: 'track_number', value: 1),
+          RowFilterParameter(column: 'uuid_id', value: '1'),
+        ],
         limit: 100,
-        cursorTrackNumber: 1,
-        cursorUuidId: '1',
       );
       expect(results.length, 2);
       final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
       expect(uuids, ['2', '3']);
+    });
+  });
+
+  group('watchTrackCount', () {
+    test('emits count of all tracks when no cursor', () async {
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'B', album: 'B', trackNumber: 1);
+
+      final count = await db.watchTrackCount().first;
+      expect(count, 2);
+    });
+
+    test('emits count of tracks at or before cursor position', () async {
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
+      await insertTrack(db, uuid: '3', artist: 'B', album: 'B', trackNumber: 1);
+
+      // Cursor after track '2' — NOT(after '2') means tracks at or before '2'
+      final count = await db
+          .watchTrackCount(
+            orderBy: allTracksOrder,
+            cursorFilters: [
+              RowFilterParameter(column: 'artist', value: 'A'),
+              RowFilterParameter(column: 'album', value: 'A'),
+              RowFilterParameter(column: 'track_number', value: 2),
+              RowFilterParameter(column: 'uuid_id', value: '2'),
+            ],
+          )
+          .first;
+      expect(count, 2);
+    });
+
+    test('emits updated count when new track inserted before cursor', () async {
+      await insertTrack(db, uuid: '2', artist: 'B', album: 'B', trackNumber: 1);
+
+      final stream = db.watchTrackCount(
+        orderBy: allTracksOrder,
+        cursorFilters: [
+          RowFilterParameter(column: 'artist', value: 'B'),
+          RowFilterParameter(column: 'album', value: 'B'),
+          RowFilterParameter(column: 'track_number', value: 1),
+          RowFilterParameter(column: 'uuid_id', value: '2'),
+        ],
+      );
+
+      // First emission: 1 track (the cursor track itself)
+      expect(await stream.first, 1);
+
+      // Insert a track that sorts before the cursor
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
+
+      // Next emission should be 2
+      expect(await stream.first, 2);
+    });
+
+    test('returns 0 when no tracks match', () async {
+      final count = await db.watchTrackCount().first;
+      expect(count, 0);
+    });
+
+    test('respects artist/album filter', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Album A', trackNumber: 1);
+      await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'Album B', trackNumber: 1);
+
+      final count = await db
+          .watchTrackCount(artist: 'Artist A', album: 'Album A')
+          .first;
+      expect(count, 1);
+    });
+  });
+
+  group('getArtists', () {
+    test('returns distinct artists sorted alphabetically', () async {
+      await insertTrack(db, uuid: '1', artist: 'Charlie');
+      await insertTrack(db, uuid: '2', artist: 'Alice');
+      await insertTrack(db, uuid: '3', artist: 'Bob');
+
+      final artists = await db.getArtists();
+      expect(artists, ['Alice', 'Bob', 'Charlie']);
+    });
+
+    test('deduplicates by case-insensitive match', () async {
+      await insertTrack(db, uuid: '1', artist: 'alice');
+      await insertTrack(db, uuid: '2', artist: 'Alice');
+      await insertTrack(db, uuid: '3', artist: 'ALICE');
+
+      final artists = await db.getArtists();
+      expect(artists.length, 1);
+      // Should return one of the casing variants
+      expect(artists.first.toLowerCase(), 'alice');
+    });
+
+    test('prefers albumArtist over artist when albumArtist is set', () async {
+      await insertTrack(db, uuid: '1', artist: 'Track Artist', albumArtist: 'Album Artist');
+
+      final artists = await db.getArtists();
+      expect(artists, ['Album Artist']);
+    });
+
+    test('falls back to artist when albumArtist is null', () async {
+      await insertTrack(db, uuid: '1', artist: 'Solo Artist');
+
+      final artists = await db.getArtists();
+      expect(artists, ['Solo Artist']);
+    });
+
+    test('excludes tracks with no artist and no albumArtist', () async {
+      await insertTrack(db, uuid: '1');
+
+      final artists = await db.getArtists();
+      expect(artists, isEmpty);
+    });
+
+    test('respects limit', () async {
+      await insertTrack(db, uuid: '1', artist: 'A');
+      await insertTrack(db, uuid: '2', artist: 'B');
+      await insertTrack(db, uuid: '3', artist: 'C');
+
+      final artists = await db.getArtists(limit: 2);
+      expect(artists.length, 2);
+      expect(artists, ['A', 'B']);
+    });
+
+    test('respects limit and offset', () async {
+      await insertTrack(db, uuid: '1', artist: 'A');
+      await insertTrack(db, uuid: '2', artist: 'B');
+      await insertTrack(db, uuid: '3', artist: 'C');
+
+      final artists = await db.getArtists(limit: 2, offset: 1);
+      expect(artists, ['B', 'C']);
+    });
+  });
+
+  group('getArtistAlbums', () {
+    test('returns albums for an artist', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Album A', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album B', year: 2021);
+
+      final albums = await db.getArtistAlbums(artist: 'Artist');
+      expect(albums, ['Album A', 'Album B']);
+    });
+
+    test('orders albums by year ascending', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Newer', year: 2023);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Older', year: 2019);
+
+      final albums = await db.getArtistAlbums(artist: 'Artist');
+      expect(albums, ['Older', 'Newer']);
+    });
+
+    test('matches by albumArtist', () async {
+      await insertTrack(db, uuid: '1', artist: 'Feat Artist', albumArtist: 'Main Artist', album: 'Collab Album', year: 2020);
+
+      final albums = await db.getArtistAlbums(artist: 'Main Artist');
+      expect(albums, ['Collab Album']);
+    });
+
+    test('excludes tracks with null or empty album', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: null);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Real Album', year: 2020);
+
+      final albums = await db.getArtistAlbums(artist: 'Artist');
+      expect(albums, ['Real Album']);
+    });
+
+    test('deduplicates albums by case-insensitive match', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'my album', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'My Album', year: 2020);
+
+      final albums = await db.getArtistAlbums(artist: 'Artist');
+      expect(albums.length, 1);
+    });
+
+    test('does not return albums from other artists', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Album A', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'Album B', year: 2020);
+
+      final albums = await db.getArtistAlbums(artist: 'Artist A');
+      expect(albums, ['Album A']);
+    });
+
+    test('respects limit', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'A', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'B', year: 2021);
+      await insertTrack(db, uuid: '3', artist: 'Artist', album: 'C', year: 2022);
+
+      final albums = await db.getArtistAlbums(artist: 'Artist', limit: 2);
+      expect(albums.length, 2);
+      expect(albums, ['A', 'B']);
+    });
+
+    test('respects limit and offset', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'A', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'B', year: 2021);
+      await insertTrack(db, uuid: '3', artist: 'Artist', album: 'C', year: 2022);
+
+      final albums = await db.getArtistAlbums(artist: 'Artist', limit: 2, offset: 1);
+      expect(albums, ['B', 'C']);
     });
   });
 }

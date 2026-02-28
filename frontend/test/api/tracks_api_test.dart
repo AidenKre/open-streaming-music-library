@@ -93,6 +93,40 @@ void main() {
       expect(captured?.queryParameters.containsKey('cursor'), false);
       expect(captured?.queryParameters.containsKey('newer_than'), false);
       expect(captured?.queryParameters.containsKey('older_than'), false);
+      expect(captured?.queryParameters.containsKey('artist'), false);
+      expect(captured?.queryParameters.containsKey('album'), false);
+    });
+
+    test('sends artist and album as query params', () async {
+      Uri? captured;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          captured = req.url;
+          return _tracksResponse([]);
+        }),
+      );
+
+      await api.getTracksPage(artist: 'some-artist', album: 'some-album');
+
+      expect(captured?.queryParameters['artist'], 'some-artist');
+      expect(captured?.queryParameters['album'], 'some-album');
+    });
+
+    test('sends artist without album as query param', () async {
+      Uri? captured;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          captured = req.url;
+          return _tracksResponse([]);
+        }),
+      );
+
+      await api.getTracksPage(artist: 'some-artist');
+
+      expect(captured?.queryParameters['artist'], 'some-artist');
+      expect(captured?.queryParameters.containsKey('album'), false);
     });
 
     test('returns null nextCursor when not present in response', () async {

@@ -10,6 +10,8 @@ class TracksApi {
     String? cursor,
     int? newerThan,
     int? olderThan,
+    String? artist,
+    String? album,
     int limit = 500,
   }) async {
     final query = <String, String>{
@@ -17,6 +19,8 @@ class TracksApi {
       if (cursor != null) 'cursor': cursor,
       if (newerThan != null) 'newer_than': newerThan.toString(),
       if (olderThan != null) 'older_than': olderThan.toString(),
+      if (artist != null) 'artist': artist,
+      if (album != null) 'album': album,
     };
 
     final json = await _apiClient.getJson(['tracks'], query: query);
