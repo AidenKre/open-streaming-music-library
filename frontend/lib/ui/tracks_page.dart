@@ -13,10 +13,10 @@ class TracksPage extends ConsumerStatefulWidget {
   const TracksPage({super.key, this.artist, this.album});
 
   @override
-  ConsumerState<TracksPage> createState() => _TracksPageState();
+  ConsumerState<TracksPage> createState() => TracksPageState();
 }
 
-class _TracksPageState extends ConsumerState<TracksPage> {
+class TracksPageState extends ConsumerState<TracksPage> {
   static const _pageSize = 50;
 
   final _scrollController = ScrollController();
@@ -37,14 +37,17 @@ class _TracksPageState extends ConsumerState<TracksPage> {
   @override
   void initState() {
     super.initState();
-
-    ref.read(trackSyncProvider.notifier).sync(
-      artist: widget.artist,
-      album: widget.album,
-    );
-
+    sync();
     _scrollController.addListener(_onScroll);
     _loadMore();
+  }
+
+  void sync() {
+    Future.microtask(
+      () => ref
+          .read(trackSyncProvider.notifier)
+          .sync(artist: widget.artist, album: widget.album),
+    );
   }
 
   @override
@@ -56,15 +59,17 @@ class _TracksPageState extends ConsumerState<TracksPage> {
 
   void _startWatching() {
     _watchSub?.cancel();
-    if (_tracks.isEmpty) return;
 
     final db = ref.read(databaseProvider);
 
-    // If all tracks are loaded, count everything (any new track is relevant).
-    // Otherwise, count only tracks at or before the last loaded position.
-    final cursorFilters =
-        _hasMore ? _buildCursorFromLast(_tracks.last) : <RowFilterParameter>[];
-    final orderBy = _hasMore ? _orderParams : <OrderParameter>[];
+    // If all tracks are loaded, or there is no loaded cursor row yet, count
+    // everything. Otherwise, count only tracks at or before the last loaded
+    // position.
+    final useCursor = _hasMore && _tracks.isNotEmpty;
+    final cursorFilters = useCursor
+        ? _buildCursorFromLast(_tracks.last)
+        : <RowFilterParameter>[];
+    final orderBy = useCursor ? _orderParams : <OrderParameter>[];
 
     _watchSub = db
         .watchTrackCount(

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
@@ -35,17 +36,24 @@ class ApiClient {
     Map<String, String>? headers,
   }) async {
     final baseUri = Uri.parse(baseUrl);
+    final basePath = baseUri.pathSegments.where((s) => s.isNotEmpty).toList();
     final uri = baseUri.replace(
-      pathSegments: [...baseUri.pathSegments, ...pathSegments],
-      queryParameters: query,
+      pathSegments: [...basePath, ...pathSegments],
+      queryParameters: query?.isNotEmpty == true ? query : null,
     );
 
-    final response = await _http.get(
-      uri,
-      headers: {'Accept': 'application/json', ...?headers},
-    );
-
-    return _handleResponse(response);
+    developer.log('GET $uri', name: 'ApiClient');
+    try {
+      final response = await _http.get(
+        uri,
+        headers: {'Accept': 'application/json', ...?headers},
+      );
+      developer.log('${response.statusCode} ${response.body.length}B', name: 'ApiClient');
+      return _handleResponse(response);
+    } catch (e) {
+      developer.log('ERROR: $e', name: 'ApiClient');
+      rethrow;
+    }
   }
 
   Map<String, dynamic> _handleResponse(http.Response response) {
@@ -55,6 +63,19 @@ class ApiClient {
     }
 
     throw ApiException(response.statusCode, response.body);
+  }
+
+  /// Returns null if healthy, or an error message string.
+  Future<String?> healthCheck() async {
+    try {
+      final data = await getJson([]);
+      if (data['message'] == 'Healthy') return null;
+      return 'Unexpected response from server';
+    } on ApiException catch (e) {
+      return 'Server error: ${e.statusCode}';
+    } catch (e) {
+      return 'Could not reach server: $e';
+    }
   }
 
   void close() {

@@ -393,7 +393,7 @@ class AppDatabase extends _$AppDatabase {
         "SELECT value, MIN(row_order) FROM candidates "
         "GROUP BY LOWER(value) "
         "ORDER BY LOWER(value) ASC ");
-    
+
     List<Variable<Object>> vars = [];
     if (limit != null) {
       query += "LIMIT ? ";
@@ -412,31 +412,70 @@ class AppDatabase extends _$AppDatabase {
     return rows.map((r) => r.read<String>('value')).toList();
   }
 
+  Stream<int> watchArtistCount() {
+    String sql =
+        "WITH candidates(value) AS ( "
+        " SELECT artist FROM trackmetadata "
+        " WHERE (album_artist IS NULL OR album_artist IS '') "
+        " AND (artist IS NOT NULL AND artist <> '') "
+        " UNION ALL "
+        " SELECT album_artist FROM trackmetadata "
+        " WHERE album_artist IS NOT NULL AND album_artist <> '' "
+        ") "
+        "SELECT COUNT(*) AS c FROM ( "
+        " SELECT value FROM candidates "
+        " GROUP BY LOWER(value) "
+        ") ";
+    return customSelect(
+      sql,
+      readsFrom: {trackmetadata},
+    ).watch().map((rows) => rows.first.read<int>('c'));
+  }
+
   // Mirrors backend: database.py get_artist_albums()
-  Future<List<String>> getArtistAlbums({
-    required String artist,
+  Future<List<String>> getAlbums({
+    String? artist,
     int? limit,
     int? offset,
+    String orderBy = "year",
   }) async {
-    String query =
-        ("WITH candidates(value, year_n, row_order) AS ( "
-        ' SELECT album, "year", rowid FROM trackmetadata '
-        " WHERE artist LIKE ? "
-        " AND (album IS NOT NULL AND album IS NOT '') "
-        " AND (album_artist IS NULL OR album_artist IS '') "
-        " UNION ALL "
-        ' SELECT album, "year", rowid FROM trackmetadata '
-        " WHERE album_artist LIKE ? "
-        " AND (album IS NOT NULL AND album IS NOT '') "
-        ") "
-        "SELECT value, MIN(row_order) FROM candidates "
-        "GROUP BY LOWER(value) "
-        "ORDER BY MIN(year_n) ASC ");
+    late final String orderClause;
+    if (orderBy == "alphabetical") {
+      orderClause = "ORDER BY LOWER(value) ASC ";
+    } else {
+      orderClause = "ORDER BY MIN(year_n) ASC ";
+    }
 
-    List<Variable<Object>> vars = [
-      Variable.withString(artist),
-      Variable.withString(artist),
-    ];
+    String query;
+
+    List<Variable<Object>> vars = [];
+
+    if (artist != null) {
+      query =
+          ("WITH candidates(value, year_n, row_order) AS ( "
+          ' SELECT album, "year", rowid FROM trackmetadata '
+          " WHERE artist LIKE ? "
+          " AND (album IS NOT NULL AND album IS NOT '') "
+          " AND (album_artist IS NULL OR album_artist IS '') "
+          " UNION ALL "
+          ' SELECT album, "year", rowid FROM trackmetadata '
+          " WHERE album_artist LIKE ? "
+          " AND (album IS NOT NULL AND album IS NOT '') "
+          ") "
+          "SELECT value, MIN(row_order) FROM candidates "
+          "GROUP BY LOWER(value) ");
+      vars.addAll([Variable.withString(artist), Variable.withString(artist)]);
+    } else {
+      query =
+          ("WITH candidates(value, year_n, row_order) AS ( "
+          ' SELECT album, "year", rowid FROM trackmetadata '
+          " WHERE (album IS NOT NULL AND album IS NOT '') "
+          ") "
+          "SELECT value, MIN(row_order) FROM candidates "
+          "GROUP BY LOWER(value) ");
+    }
+
+    query += orderClause;
 
     if (limit != null) {
       query += "LIMIT ? ";
@@ -453,6 +492,41 @@ class AppDatabase extends _$AppDatabase {
       readsFrom: {trackmetadata},
     ).get();
     return rows.map((r) => r.read<String>('value')).toList();
+  }
+
+  Stream<int> watchAlbumsCount({String? artist}) {
+    String query;
+    List<Variable<Object>> vars = [];
+    if (artist != null) {
+      query =
+          ("WITH candidates(value) AS ( "
+          " SELECT album FROM trackmetadata "
+          " WHERE artist LIKE ? "
+          " AND (album IS NOT NULL AND album IS NOT '') "
+          " AND (album_artist IS NULL OR album_artist IS '') "
+          " UNION ALL "
+          " SELECT album FROM trackmetadata "
+          " WHERE album_artist LIKE ? "
+          " AND (album IS NOT NULL AND album IS NOT '') "
+          ") "
+          "SELECT COUNT(*) AS c FROM ("
+          " SELECT value FROM candidates"
+          " GROUP BY LOWER(value)"
+          ")");
+      vars.addAll([Variable.withString(artist), Variable.withString(artist)]);
+    } else {
+      query =
+          ("SELECT COUNT(*) AS c FROM ("
+          " SELECT album FROM trackmetadata "
+          " WHERE (album IS NOT NULL AND album IS NOT '') "
+          " GROUP BY LOWER(album)"
+          ")");
+    }
+    return customSelect(
+      query,
+      variables: vars,
+      readsFrom: {trackmetadata},
+    ).watch().map((rows) => rows.first.read<int>('c'));
   }
 }
 

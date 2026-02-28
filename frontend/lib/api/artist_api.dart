@@ -1,3 +1,7 @@
+// Note that this class is not useful anymore, since we are offline first
+// and just sync all metadata locally. No point querying the API for something
+// we can just query the local db for.
+
 import 'package:frontend/api/pagination.dart';
 
 import './api_client.dart';
