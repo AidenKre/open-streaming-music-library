@@ -1,6 +1,6 @@
-from os import path
 import sqlite3
 from datetime import UTC, datetime
+from os import path
 from pathlib import Path
 from typing import List
 from unittest.mock import patch
@@ -11,9 +11,9 @@ from app.database.database import (
     ALLOWED_METADATA_COLUMNS,
     Database,
     DatabaseContext,
+    OrderParameter,
     RowFilterParameter,
     SearchParameter,
-    OrderParameter,
 )
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
@@ -696,7 +696,9 @@ class TestDatabaseGetTracks:
         assert len(results) == 1
         assert results[0].metadata.title == "song_a"
 
-    def test_get_tracks__artist_and_album_filter__returns_matching_tracks(self, tmp_path):
+    def test_get_tracks__artist_and_album_filter__returns_matching_tracks(
+        self, tmp_path
+    ):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
         database.initialize()
@@ -767,9 +769,7 @@ class TestDatabaseGetTracks:
         database = set_up_database(database_path)
         database.initialize()
 
-        track = create_track(
-            tmp_path / "a.mp3", "song_a", "feat_artist", "MainArtist"
-        )
+        track = create_track(tmp_path / "a.mp3", "song_a", "feat_artist", "MainArtist")
         track.metadata.album = "TheAlbum"
         assert database.add_track(track=track)
 

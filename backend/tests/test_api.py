@@ -133,8 +133,10 @@ class TestGetTracks:
         )
 
     def test_tracks__artist_album_cursor_logic__works(self, client):
-        # Random tracks
+        # Random tracks that sort BEFORE the target artist
         add_tracks_to_client(client=client, amount_to_add=10)
+        # Tracks from an artist that sorts AFTER the target artist
+        add_tracks_to_client(client=client, amount_to_add=5, artist="zzz_artist", album="zzz_album")
 
         artist = "some random artist"
         albums = [f"album_{i}" for i in range(2)]

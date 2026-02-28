@@ -50,6 +50,12 @@ def startup_event():
     app.state.ingestor = None
     app.state.file_watcher = None
 
+    settings.app_data_dir.mkdir(parents=True, exist_ok=True)
+    settings.music_library_dir.mkdir(parents=True, exist_ok=True)
+    settings.import_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"app data dir: {settings.app_data_dir}")
+
     # Set up database
     database_path = settings.app_data_dir / "database" / "database.db"
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,12 +158,13 @@ def get_tracks(
                 status_code=400, detail="Cursor could not be decoded for json"
             )
 
-        valid_cursor_keys = [
+        valid_cursor_keys = sorted([
             "order_parameters",
             "row_filter_parameters",
             "search_parameters",
-        ]
-        valid_cursor_keys = sorted(valid_cursor_keys)
+            "artist",
+            "album",
+        ])
         if sorted(cursor_dict.keys()) != valid_cursor_keys:
             raise HTTPException(
                 status_code=400, detail="Invalid dictionary keys for the cursor_dict"
@@ -172,6 +179,8 @@ def get_tracks(
         row_filter_parameters = [
             RowFilterParameter(**item) for item in cursor_dict["row_filter_parameters"]
         ]
+        artist = cursor_dict["artist"]
+        album = cursor_dict["album"]
 
     remaining_track_count = database.get_tracks_count(
         search_parameters=search_parameters,
@@ -206,6 +215,9 @@ def get_tracks(
         new_row_filter_parameters: List[RowFilterParameter] = []
         for order_param in order_parameters:
             col = order_param.column
+            # Linked to allowed track columns in database.py.
+            # probably should move these constants to their own
+            # file or something
             if col in ["uuid_id", "created_at", "last_updated"]:
                 raw_value = getattr(last_track, col)
             else:
@@ -222,6 +234,8 @@ def get_tracks(
                     asdict(param) for param in new_row_filter_parameters
                 ],
                 "search_parameters": [asdict(param) for param in search_parameters],
+                "artist": artist,
+                "album": album,
             }
         )
 
@@ -379,4 +393,4 @@ def get_artist_album(
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello, World!"}
+    return {"message": "Healthy"}
