@@ -36,7 +36,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     return const TrackSyncState();
   }
 
-  Future<void> sync() async {
+  Future<void> sync({String? artist, String? album}) async {
     final current = state.value;
     if (current != null && current.isSyncing) return;
 
@@ -54,6 +54,8 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       var response = await api.getTracksPage(
         newerThan: lastFetchTime,
         olderThan: now,
+        artist: artist,
+        album: album,
       );
       await _upsertTracks(db, response.data);
 
