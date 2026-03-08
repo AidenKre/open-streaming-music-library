@@ -252,6 +252,18 @@ def get_tracks(
     return GetTracksResponse(data=client_track_list, nextCursor=nextCursor)
 
 
+_CODEC_MIME: dict[str, str] = {
+    "aac": "audio/mp4",
+    "alac": "audio/mp4",
+    "mp3": "audio/mpeg",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+    "pcm_s16le": "audio/wav",
+    "pcm_s24le": "audio/wav",
+    "pcm_f32le": "audio/wav",
+}
+
+
 @app.get("/tracks/{uuid_id}/stream")
 def stream_track(uuid_id: str, request: Request):
     CHUNK_SIZE = 1024 * 1024
@@ -282,7 +294,7 @@ def stream_track(uuid_id: str, request: Request):
 
         return StreamingResponse(
             iterfile(),
-            media_type=f"audio/{track.metadata.codec}",
+            media_type=_CODEC_MIME.get(track.metadata.codec or "", f"audio/{track.metadata.codec}"),
             headers={"Accept-ranges": "bytes", "Content-length": str(file_size)},
         )
 
@@ -321,7 +333,7 @@ def stream_track(uuid_id: str, request: Request):
     return StreamingResponse(
         iter_range(),
         status_code=206,
-        media_type=f"audio/{track.metadata.codec}",
+        media_type=_CODEC_MIME.get(track.metadata.codec or "", f"audio/{track.metadata.codec}"),
         headers={
             "Accept-ranges": "bytes",
             "Content-range": f"bytes {start}-{end}/{file_size}",

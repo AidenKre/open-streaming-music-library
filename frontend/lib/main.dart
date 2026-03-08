@@ -4,6 +4,7 @@ import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/ui/widgets/mini_player.dart';
 
 void main() => runApp(ProviderScope(child: Frontend()));
 
@@ -68,24 +69,31 @@ class _AppShellState extends ConsumerState<AppShell> {
         }
       },
       child: Scaffold(
-        body: IndexedStack(
-          index: _tabIndex,
+        body: Column(
           children: [
-            _buildTabNavigator(
-              0,
-              () => ArtistsPage(onDisconnect: widget.onDisconnect),
-            ),
-            _buildTabNavigator(
-              1,
-              () => AlbumsPage(onDisconnect: widget.onDisconnect),
-            ),
-            _buildTabNavigator(
-              2,
-              () => TracksPage(
-                key: _tracksKey,
-                onDisconnect: widget.onDisconnect,
+            Expanded(
+              child: IndexedStack(
+                index: _tabIndex,
+                children: [
+                  _buildTabNavigator(
+                    0,
+                    () => ArtistsPage(onDisconnect: widget.onDisconnect),
+                  ),
+                  _buildTabNavigator(
+                    1,
+                    () => AlbumsPage(onDisconnect: widget.onDisconnect),
+                  ),
+                  _buildTabNavigator(
+                    2,
+                    () => TracksPage(
+                      key: _tracksKey,
+                      onDisconnect: widget.onDisconnect,
+                    ),
+                  ),
+                ],
               ),
             ),
+            const MiniPlayer(),
           ],
         ),
         bottomNavigationBar: BottomNavigationBar(

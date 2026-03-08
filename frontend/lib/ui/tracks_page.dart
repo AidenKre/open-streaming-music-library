@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/providers/audio_provider.dart';
 import 'package:frontend/providers/providers.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
@@ -166,6 +167,7 @@ class TracksPageState extends ConsumerState<TracksPage> {
               }
               final track = _tracks[index];
               return ListTile(
+                onTap: () => ref.read(audioProvider.notifier).play(track),
                 title: Text(track.title ?? 'Unknown Title'),
                 subtitle: Text(
                   [

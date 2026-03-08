@@ -22,8 +22,7 @@ class ArtistCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             // TODO: Fetch artist art from API
-            AspectRatio(
-              aspectRatio: 1,
+            Expanded(
               child: Container(
                 color: colorScheme.secondaryContainer,
                 child: Icon(
@@ -34,7 +33,7 @@ class ArtistCard extends StatelessWidget {
               ),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+              padding: const EdgeInsets.all(8),
               child: Text(
                 artistName,
                 style: theme.textTheme.titleSmall,
