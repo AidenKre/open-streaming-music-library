@@ -549,6 +549,76 @@ class AppDatabase extends _$AppDatabase {
 
   /// Watches the count of tracks at or before [cursorFilters] position.
   /// When cursorFilters is empty, counts all matching tracks.
+  Future<List<String>> getTrackUuids({
+    List<OrderParameter> orderBy = const [],
+    String? artist,
+    String? album,
+  }) async {
+    if (album != null && artist == null) {
+      throw ArgumentError('Cannot filter by album without artist');
+    }
+
+    final vars = <Variable>[];
+    final whereClauses = <String>[];
+
+    if (artist != null) {
+      final (aaClause, aaVars) = artistAlbumFilterClause(artist, album);
+      whereClauses.add('($aaClause)');
+      vars.addAll(aaVars);
+    }
+
+    var sql =
+        'SELECT tm.uuid_id '
+        'FROM trackmetadata AS tm '
+        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id';
+
+    if (whereClauses.isNotEmpty) {
+      sql += ' WHERE ${whereClauses.join(' AND ')}';
+    }
+
+    if (orderBy.isNotEmpty) {
+      final orderParts = orderBy.map((o) {
+        final alias = aliasMap(o.column);
+        final dir = o.isAscending ? 'ASC' : 'DESC';
+        return '$alias."${o.column}" $dir';
+      });
+      sql += ' ORDER BY ${orderParts.join(', ')}';
+    }
+
+    final rows = await customSelect(
+      sql,
+      variables: vars,
+      readsFrom: {trackmetadata, tracks},
+    ).get();
+    return rows.map((r) => r.read<String>('uuid_id')).toList();
+  }
+
+  Future<List<QueryRow>> getTrackByUuid(String uuid) {
+    return getTracks(
+      searchParams: [SearchParameter(column: 'uuid_id', operator: '=', value: uuid)],
+      limit: 1,
+    );
+  }
+
+  Future<List<QueryRow>> getTracksByUuids(List<String> uuids) {
+    if (uuids.isEmpty) return Future.value([]);
+
+    final placeholders = List.filled(uuids.length, '?').join(', ');
+    final vars = uuids.map((u) => Variable.withString(u)).toList();
+
+    final sql =
+        'SELECT $_selectColumns '
+        'FROM trackmetadata AS tm '
+        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
+        'WHERE tm.uuid_id IN ($placeholders)';
+
+    return customSelect(
+      sql,
+      variables: vars,
+      readsFrom: {trackmetadata, tracks},
+    ).get();
+  }
+
   Stream<int> watchTrackCount({
     List<OrderParameter> orderBy = const [],
     List<RowFilterParameter> cursorFilters = const [],

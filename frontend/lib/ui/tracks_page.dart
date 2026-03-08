@@ -6,6 +6,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
   final String? artist;
@@ -166,16 +167,12 @@ class TracksPageState extends ConsumerState<TracksPage> {
                 );
               }
               final track = _tracks[index];
-              return ListTile(
-                onTap: () => ref.read(audioProvider.notifier).play(track),
-                title: Text(track.title ?? 'Unknown Title'),
-                subtitle: Text(
-                  [
-                    track.artist ?? 'Unknown Artist',
-                    track.album,
-                  ].where((s) => s != null).join(' — '),
+              return TrackTile(
+                track: track,
+                onTap: () => ref.read(audioProvider.notifier).playFromQueue(
+                  QueueContext(artist: widget.artist, album: widget.album, orderParams: _orderParams),
+                  track,
                 ),
-                trailing: Text(track.formattedDuration),
               );
             },
           ),

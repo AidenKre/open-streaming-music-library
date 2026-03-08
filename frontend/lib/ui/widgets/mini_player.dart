@@ -20,6 +20,8 @@ class MiniPlayer extends ConsumerWidget {
     final status = ref.watch(audioStatusProvider);
     final position = ref.watch(audioPositionProvider);
     final duration = ref.watch(audioDurationProvider);
+    final shuffleOn = ref.watch(shuffleProvider);
+    final repeatMode = ref.watch(repeatModeProvider);
     final colors = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
@@ -92,8 +94,16 @@ class MiniPlayer extends ConsumerWidget {
               ),
             ),
             IconButton(
+              icon: Icon(
+                Icons.shuffle,
+                color: shuffleOn ? colors.primary : null,
+                size: 20,
+              ),
+              onPressed: () => ref.read(audioProvider.notifier).toggleShuffle(),
+            ),
+            IconButton(
               icon: const Icon(Icons.skip_previous),
-              onPressed: null,
+              onPressed: () => ref.read(audioProvider.notifier).skipPrevious(),
             ),
             IconButton(
               icon: Icon(
@@ -112,7 +122,15 @@ class MiniPlayer extends ConsumerWidget {
             ),
             IconButton(
               icon: const Icon(Icons.skip_next),
-              onPressed: null,
+              onPressed: () => ref.read(audioProvider.notifier).skipNext(),
+            ),
+            IconButton(
+              icon: Icon(
+                repeatMode == QueueRepeatMode.one ? Icons.repeat_one : Icons.repeat,
+                color: repeatMode != QueueRepeatMode.off ? colors.primary : null,
+                size: 20,
+              ),
+              onPressed: () => ref.read(audioProvider.notifier).cycleQueueRepeatMode(),
             ),
           ],
         ),
