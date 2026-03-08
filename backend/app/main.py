@@ -446,25 +446,25 @@ def get_albums(
     if not cursor:
         if artist is not None:
             order_parameters = [
-                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
                 AlbumOrderParameter(
-                    column="year", isAscending=True, nullsLast=True
+                    column="year", isAscending=False, nullsLast=True
                 ),
+                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
                 AlbumOrderParameter(
                     column="album", isAscending=True, nullsLast=True
                 ),
             ]
         else:
             order_parameters = [
-                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
-                AlbumOrderParameter(
-                    column="album", isAscending=True, nullsLast=True
-                ),
                 AlbumOrderParameter(
                     column="artist", isAscending=True, nullsLast=True
                 ),
                 AlbumOrderParameter(
-                    column="year", isAscending=True, nullsLast=True
+                    column="year", isAscending=False, nullsLast=True
+                ),
+                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
+                AlbumOrderParameter(
+                    column="album", isAscending=True, nullsLast=True
                 ),
             ]
         row_filter_parameters = []

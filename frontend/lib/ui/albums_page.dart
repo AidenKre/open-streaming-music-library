@@ -27,10 +27,10 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
   StreamSubscription<int>? _watchSub;
 
   List<AlbumOrderParameter> get _orderParams => [
-    AlbumOrderParameter(column: 'is_single_grouping'),
     AlbumOrderParameter(column: 'artist'),
+    AlbumOrderParameter(column: 'year', isAscending: false, nullsLast: true),
+    AlbumOrderParameter(column: 'is_single_grouping'),
     AlbumOrderParameter(column: 'album', nullsLast: true),
-    AlbumOrderParameter(column: 'year'),
   ];
 
   @override
@@ -117,13 +117,13 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
 
   List<AlbumRowFilterParameter> _buildCursorFromLast(AlbumUI last) {
     return [
+      AlbumRowFilterParameter(column: 'artist', value: last.artist),
+      AlbumRowFilterParameter(column: 'year', value: last.year),
       AlbumRowFilterParameter(
         column: 'is_single_grouping',
         value: last.isSingleGrouping ? 1 : 0,
       ),
-      AlbumRowFilterParameter(column: 'artist', value: last.artist),
       AlbumRowFilterParameter(column: 'album', value: last.title),
-      AlbumRowFilterParameter(column: 'year', value: last.year),
     ];
   }
 

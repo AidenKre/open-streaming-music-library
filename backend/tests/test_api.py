@@ -813,13 +813,14 @@ class TestGetAlbums:
 
         assert sorted(all_albums) == sorted(gotten_album_names)
 
-    def test_albums__no_artist__returns_alphabetical_order(self, client, tmp_path):
+    def test_albums__no_artist__returns_artist_then_album_order(self, client, tmp_path):
+        # Same artist for all albums so we test album sub-sorting
         albums_to_insert = ["Zebra", "apple", "Mango", "banana"]
         for i, album in enumerate(albums_to_insert):
             title = f"song_{i}"
             file_path = tmp_path / title
             metadata = TrackMetaData(
-                title=title, artist=f"artist_{i}", album=album, duration=1.0
+                title=title, artist="same_artist", album=album, duration=1.0
             )
             track = Track(file_path=file_path, metadata=metadata)
             assert client.app.state.database.add_track(track=track)
@@ -849,7 +850,7 @@ class TestGetAlbums:
 
         response = GetAlbumsResponse.model_validate(r.json())
         returned_album_names = [a.album for a in response.data]
-        assert returned_album_names == ["Early Album", "Mid Album", "Late Album"]
+        assert returned_album_names == ["Late Album", "Mid Album", "Early Album"]
 
     def test_albums__returns_correct_artist_field(self, client, tmp_path):
         # Plain artist track
