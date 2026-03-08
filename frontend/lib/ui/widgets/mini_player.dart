@@ -34,6 +34,7 @@ class MiniPlayer extends ConsumerWidget {
         showModalBottomSheet<void>(
           context: context,
           isScrollControlled: true,
+          useSafeArea: true,
           builder: (_) => const FullPlayer(),
         );
       },

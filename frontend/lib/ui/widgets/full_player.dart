@@ -1,5 +1,3 @@
-import 'dart:io' show Platform;
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/audio_provider.dart';
@@ -25,15 +23,12 @@ class _FullPlayerState extends ConsumerState<FullPlayer> {
       return const SizedBox.shrink();
     }
 
-    // On iOS, add extra top spacing beyond the safe area for visual balance
-    final extraTop = Platform.isIOS ? 12.0 : 0.0;
-
     return SafeArea(
       child: Column(
         children: [
           // Drag handle
           Padding(
-            padding: EdgeInsets.only(top: 16 + extraTop),
+            padding: const EdgeInsets.only(top: 16),
             child: Container(
               width: 40,
               height: 4,

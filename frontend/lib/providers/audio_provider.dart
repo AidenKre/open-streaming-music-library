@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:just_audio/just_audio.dart' as ja;
+import 'package:just_audio_background/just_audio_background.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
@@ -195,7 +196,17 @@ class AudioNotifier extends Notifier<AudioState> {
       position: Duration.zero,
     );
     try {
-      await _player.setUrl(_streamUrl(track));
+      await _player.setAudioSource(
+        ja.AudioSource.uri(
+          Uri.parse(_streamUrl(track)),
+          tag: MediaItem(
+            id: track.uuidId,
+            title: track.title ?? 'Unknown',
+            artist: track.artist ?? '',
+            album: track.album ?? '',
+          ),
+        ),
+      );
       _player.play();
     } on Exception {
       state = state.copyWith(status: PlayerStatus.idle);

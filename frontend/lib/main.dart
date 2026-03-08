@@ -1,12 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 
-void main() => runApp(ProviderScope(child: Frontend()));
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.osml.audio',
+    androidNotificationChannelName: 'Audio playback',
+    androidNotificationOngoing: true,
+  );
+  runApp(ProviderScope(child: Frontend()));
+}
 
 class Frontend extends StatelessWidget {
   @override
