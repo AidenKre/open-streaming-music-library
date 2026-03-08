@@ -664,6 +664,115 @@ void main() {
     });
   });
 
+  final defaultArtistOrder = [
+    ArtistOrderParameter(column: 'artist'),
+  ];
+
+  group('getArtists with cursor', () {
+    test('cursor pagination skips artists before cursor', () async {
+      await insertTrack(db, uuid: '1', artist: 'Alice');
+      await insertTrack(db, uuid: '2', artist: 'Bob');
+      await insertTrack(db, uuid: '3', artist: 'Charlie');
+
+      final artists = await db.getArtists(
+        orderBy: defaultArtistOrder,
+        cursorFilters: [
+          ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+        ],
+      );
+      expect(artists, ['Charlie']);
+    });
+
+    test('cursor works across pages', () async {
+      await insertTrack(db, uuid: '1', artist: 'Alice');
+      await insertTrack(db, uuid: '2', artist: 'Bob');
+      await insertTrack(db, uuid: '3', artist: 'Charlie');
+      await insertTrack(db, uuid: '4', artist: 'Dave');
+      await insertTrack(db, uuid: '5', artist: 'Eve');
+
+      // First page
+      final page1 = await db.getArtists(
+        orderBy: defaultArtistOrder,
+        limit: 2,
+      );
+      expect(page1, ['Alice', 'Bob']);
+
+      // Second page via cursor
+      final page2 = await db.getArtists(
+        orderBy: defaultArtistOrder,
+        cursorFilters: [
+          ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+        ],
+        limit: 2,
+      );
+      expect(page2, ['Charlie', 'Dave']);
+
+      // Third page
+      final page3 = await db.getArtists(
+        orderBy: defaultArtistOrder,
+        cursorFilters: [
+          ArtistRowFilterParameter(column: 'artist', value: 'Dave'),
+        ],
+        limit: 2,
+      );
+      expect(page3, ['Eve']);
+    });
+
+    test('with orderBy and no cursor returns all sorted', () async {
+      await insertTrack(db, uuid: '1', artist: 'Charlie');
+      await insertTrack(db, uuid: '2', artist: 'Alice');
+      await insertTrack(db, uuid: '3', artist: 'Bob');
+
+      final artists = await db.getArtists(orderBy: defaultArtistOrder);
+      expect(artists, ['Alice', 'Bob', 'Charlie']);
+    });
+  });
+
+  group('watchArtistCount with cursor', () {
+    test('with cursor counts artists at or before cursor', () async {
+      await insertTrack(db, uuid: '1', artist: 'Alice');
+      await insertTrack(db, uuid: '2', artist: 'Bob');
+      await insertTrack(db, uuid: '3', artist: 'Charlie');
+
+      // Inverse cursor at Bob: NOT(after Bob) = Alice + Bob = 2
+      final count = await db.watchArtistCount(
+        orderBy: defaultArtistOrder,
+        cursorFilters: [
+          ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+        ],
+      ).first;
+      expect(count, 2);
+    });
+
+    test('with cursor emits updated count on insert', () async {
+      await insertTrack(db, uuid: '2', artist: 'Bob');
+
+      final stream = db.watchArtistCount(
+        orderBy: defaultArtistOrder,
+        cursorFilters: [
+          ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+        ],
+      );
+
+      // First: just Bob = 1
+      expect(await stream.first, 1);
+
+      // Insert before cursor
+      await insertTrack(db, uuid: '1', artist: 'Alice');
+
+      // Now Alice + Bob = 2
+      expect(await stream.first, 2);
+    });
+  });
+
+  // Standard album sort order: album, artist, year, is_single_grouping
+  final defaultAlbumOrder = [
+    AlbumOrderParameter(column: 'album', nullsLast: true),
+    AlbumOrderParameter(column: 'artist'),
+    AlbumOrderParameter(column: 'year'),
+    AlbumOrderParameter(column: 'is_single_grouping'),
+  ];
+
   group('getAlbums', () {
     test('returns albums for an artist', () async {
       await insertTrack(
@@ -681,7 +790,11 @@ void main() {
         year: 2021,
       );
 
-      final albums = await db.getAlbums(artist: 'Artist');
+      final rows = await db.getAlbums(
+        artist: 'Artist',
+        orderBy: defaultAlbumOrder,
+      );
+      final albums = rows.map((r) => r.read<String>('album')).toList();
       expect(albums, ['Album A', 'Album B']);
     });
 
@@ -701,7 +814,14 @@ void main() {
         year: 2019,
       );
 
-      final albums = await db.getAlbums(artist: 'Artist');
+      final yearOrder = [
+        AlbumOrderParameter(column: 'year'),
+        AlbumOrderParameter(column: 'album'),
+        AlbumOrderParameter(column: 'artist'),
+        AlbumOrderParameter(column: 'is_single_grouping'),
+      ];
+      final rows = await db.getAlbums(artist: 'Artist', orderBy: yearOrder);
+      final albums = rows.map((r) => r.read<String>('album')).toList();
       expect(albums, ['Older', 'Newer']);
     });
 
@@ -715,11 +835,12 @@ void main() {
         year: 2020,
       );
 
-      final albums = await db.getAlbums(artist: 'Main Artist');
+      final rows = await db.getAlbums(artist: 'Main Artist');
+      final albums = rows.map((r) => r.read<String>('album')).toList();
       expect(albums, ['Collab Album']);
     });
 
-    test('excludes tracks with null or empty album', () async {
+    test('excludes tracks with null or empty album from regular albums', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist', album: null);
       await insertTrack(
         db,
@@ -729,8 +850,12 @@ void main() {
         year: 2020,
       );
 
-      final albums = await db.getAlbums(artist: 'Artist');
-      expect(albums, ['Real Album']);
+      final rows = await db.getAlbums(artist: 'Artist');
+      final regularAlbums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('album'))
+          .toList();
+      expect(regularAlbums, ['Real Album']);
     });
 
     test('deduplicates albums by case-insensitive match', () async {
@@ -749,8 +874,11 @@ void main() {
         year: 2020,
       );
 
-      final albums = await db.getAlbums(artist: 'Artist');
-      expect(albums.length, 1);
+      final rows = await db.getAlbums(artist: 'Artist');
+      final regularAlbums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regularAlbums.length, 1);
     });
 
     test('does not return albums from other artists', () async {
@@ -769,8 +897,12 @@ void main() {
         year: 2020,
       );
 
-      final albums = await db.getAlbums(artist: 'Artist A');
-      expect(albums, ['Album A']);
+      final rows = await db.getAlbums(artist: 'Artist A');
+      final regularAlbums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('album'))
+          .toList();
+      expect(regularAlbums, ['Album A']);
     });
 
     test('respects limit', () async {
@@ -796,36 +928,12 @@ void main() {
         year: 2022,
       );
 
-      final albums = await db.getAlbums(artist: 'Artist', limit: 2);
-      expect(albums.length, 2);
-      expect(albums, ['A', 'B']);
-    });
-
-    test('respects limit and offset', () async {
-      await insertTrack(
-        db,
-        uuid: '1',
+      final rows = await db.getAlbums(
         artist: 'Artist',
-        album: 'A',
-        year: 2020,
+        orderBy: defaultAlbumOrder,
+        limit: 2,
       );
-      await insertTrack(
-        db,
-        uuid: '2',
-        artist: 'Artist',
-        album: 'B',
-        year: 2021,
-      );
-      await insertTrack(
-        db,
-        uuid: '3',
-        artist: 'Artist',
-        album: 'C',
-        year: 2022,
-      );
-
-      final albums = await db.getAlbums(artist: 'Artist', limit: 2, offset: 1);
-      expect(albums, ['B', 'C']);
+      expect(rows.length, 2);
     });
 
     test('returns all albums when artist is null', () async {
@@ -852,44 +960,199 @@ void main() {
         year: 2019,
       );
 
-      final albums = await db.getAlbums(artist: null);
-      expect(albums.toSet(), {'Album X', 'Album Y', 'Album Z'});
+      final rows = await db.getAlbums(artist: null);
+      final albums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('album'))
+          .toSet();
+      expect(albums, {'Album X', 'Album Y', 'Album Z'});
     });
 
-    test('orders alphabetically when orderBy is alphabetical', () async {
+    test('orders alphabetically with COLLATE NOCASE', () async {
       await insertTrack(db, uuid: '1', artist: 'A', album: 'Zebra', year: 2020);
       await insertTrack(db, uuid: '2', artist: 'B', album: 'apple', year: 2021);
       await insertTrack(db, uuid: '3', artist: 'C', album: 'Mango', year: 2019);
 
-      final albums = await db.getAlbums(artist: null, orderBy: 'alphabetical');
+      final alphaOrder = [
+        AlbumOrderParameter(column: 'album', nullsLast: true),
+        AlbumOrderParameter(column: 'artist'),
+        AlbumOrderParameter(column: 'year'),
+        AlbumOrderParameter(column: 'is_single_grouping'),
+      ];
+      final rows = await db.getAlbums(artist: null, orderBy: alphaOrder);
+      final albums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('album'))
+          .toList();
       expect(albums, ['apple', 'Mango', 'Zebra']);
     });
 
-    test('orders by year when orderBy is year', () async {
+    test('returns correct artist field for plain artist', () async {
       await insertTrack(
         db,
         uuid: '1',
-        artist: 'Artist',
-        album: 'Late',
-        year: 2023,
+        artist: 'Solo Artist',
+        album: 'Solo Album',
+        year: 2020,
+      );
+
+      final rows = await db.getAlbums(artist: 'Solo Artist');
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      expect(regular.first.read<String>('album'), 'Solo Album');
+      expect(regular.first.read<String>('artist'), 'Solo Artist');
+    });
+
+    test('returns correct artist field for album_artist', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Feat',
+        albumArtist: 'Main Artist',
+        album: 'Collab',
+        year: 2020,
+      );
+
+      final rows = await db.getAlbums(artist: 'Main Artist');
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      expect(regular.first.read<String>('album'), 'Collab');
+      expect(regular.first.read<String>('artist'), 'Main Artist');
+    });
+
+    test('same album name from different artists returns both', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist A',
+        album: 'Greatest Hits',
+        year: 2020,
       );
       await insertTrack(
         db,
         uuid: '2',
-        artist: 'Artist',
-        album: 'Early',
-        year: 2018,
-      );
-      await insertTrack(
-        db,
-        uuid: '3',
-        artist: 'Artist',
-        album: 'Mid',
-        year: 2020,
+        artist: 'Artist B',
+        album: 'Greatest Hits',
+        year: 2021,
       );
 
-      final albums = await db.getAlbums(artist: 'Artist', orderBy: 'year');
-      expect(albums, ['Early', 'Mid', 'Late']);
+      final rows = await db.getAlbums(artist: null, orderBy: defaultAlbumOrder);
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 2);
+      final pairs = regular.map((r) =>
+        (r.read<String>('album'), r.read<String>('artist'))
+      ).toSet();
+      expect(pairs, {('Greatest Hits', 'Artist A'), ('Greatest Hits', 'Artist B')});
+    });
+
+    test('returns is_single_grouping and year columns', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist',
+        album: 'My Album',
+        year: 2022,
+      );
+
+      final rows = await db.getAlbums(artist: 'Artist');
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      expect(regular.first.read<int>('is_single_grouping'), 0);
+      expect(regular.first.read<int>('year'), 2022);
+    });
+
+    test('includes single groupings for tracks without album', () async {
+      // Track with album
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist',
+        album: 'My Album',
+        year: 2022,
+      );
+      // Track without album (becomes single grouping)
+      await insertTrack(
+        db,
+        uuid: '2',
+        artist: 'Artist',
+        year: 2023,
+      );
+
+      final rows = await db.getAlbums(artist: 'Artist');
+      final singles = rows
+          .where((r) => r.read<int>('is_single_grouping') == 1)
+          .toList();
+      expect(singles.length, 1);
+      expect(singles.first.readNullable<String>('album'), equals(null));
+      expect(singles.first.read<String>('artist'), 'Artist');
+    });
+
+    test('single groupings group by artist and year', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'Artist', year: 2020);
+      await insertTrack(db, uuid: '3', artist: 'Artist', year: 2021);
+
+      final rows = await db.getAlbums(artist: 'Artist');
+      final singles = rows
+          .where((r) => r.read<int>('is_single_grouping') == 1)
+          .toList();
+      // Two groups: 2020 and 2021
+      expect(singles.length, 2);
+    });
+
+    test('single groupings appear for all artists when artist is null', () async {
+      await insertTrack(db, uuid: '1', artist: 'A');
+      await insertTrack(db, uuid: '2', artist: 'B');
+
+      final rows = await db.getAlbums(artist: null);
+      final singles = rows
+          .where((r) => r.read<int>('is_single_grouping') == 1)
+          .toList();
+      expect(singles.length, 2);
+    });
+
+    test('cursor pagination skips rows before cursor', () async {
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'Alpha', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'A', album: 'Beta', year: 2021);
+      await insertTrack(db, uuid: '3', artist: 'A', album: 'Gamma', year: 2022);
+
+      final rows = await db.getAlbums(
+        artist: null,
+        orderBy: defaultAlbumOrder,
+        cursorFilters: [
+          AlbumRowFilterParameter(column: 'album', value: 'Alpha'),
+          AlbumRowFilterParameter(column: 'artist', value: 'A'),
+          AlbumRowFilterParameter(column: 'year', value: 2020),
+          AlbumRowFilterParameter(column: 'is_single_grouping', value: 0),
+        ],
+      );
+      final albums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('album'))
+          .toList();
+      expect(albums, ['Beta', 'Gamma']);
+    });
+
+    test('nullsLast puts null album after non-null', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Zebra', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'Artist', year: 2020);
+
+      final rows = await db.getAlbums(
+        artist: 'Artist',
+        orderBy: defaultAlbumOrder,
+      );
+      // Regular album first, single grouping (null album) last
+      expect(rows.length, 2);
+      expect(rows.first.read<int>('is_single_grouping'), 0);
+      expect(rows.last.read<int>('is_single_grouping'), 1);
     });
   });
 
@@ -953,16 +1216,17 @@ void main() {
   });
 
   group('watchAlbumsCount', () {
-    test('returns count of distinct albums when artist is null', () async {
+    test('returns count of all albums and singles when artist is null', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Album A');
       await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'album a');
       await insertTrack(db, uuid: '3', artist: 'Artist C', album: 'Album B');
 
+      // 3 regular albums (same name, different artists = separate)
       final count = await db.watchAlbumsCount().first;
-      expect(count, 2);
+      expect(count, 3);
     });
 
-    test('returns 0 when no albums exist', () async {
+    test('returns 0 when no tracks exist', () async {
       final count = await db.watchAlbumsCount().first;
       expect(count, 0);
     });
@@ -988,13 +1252,21 @@ void main() {
       expect(count, 2);
     });
 
-    test('excludes null and empty albums', () async {
-      await insertTrack(db, uuid: '1', artist: 'Artist', album: null);
-      await insertTrack(db, uuid: '2', artist: 'Artist', album: '');
-      await insertTrack(db, uuid: '3', artist: 'Artist', album: 'Real Album');
+    test('counts single groupings for tracks without album', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Real Album');
+      await insertTrack(db, uuid: '2', artist: 'Artist'); // single grouping
 
       final count = await db.watchAlbumsCount().first;
-      expect(count, 1);
+      // 1 regular + 1 single grouping
+      expect(count, 2);
+    });
+
+    test('same album different artists counts separately', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Greatest Hits');
+      await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'Greatest Hits');
+
+      final count = await db.watchAlbumsCount().first;
+      expect(count, 2);
     });
 
     test('emits updated count when new album inserted', () async {
@@ -1006,6 +1278,24 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album B');
 
       expect(await stream.first, 2);
+    });
+
+    test('inverse cursor counts rows at or before cursor', () async {
+      await insertTrack(db, uuid: '1', artist: 'A', album: 'Alpha', year: 2020);
+      await insertTrack(db, uuid: '2', artist: 'A', album: 'Beta', year: 2021);
+      await insertTrack(db, uuid: '3', artist: 'A', album: 'Gamma', year: 2022);
+
+      final count = await db.watchAlbumsCount(
+        orderBy: defaultAlbumOrder,
+        cursorFilters: [
+          AlbumRowFilterParameter(column: 'album', value: 'Beta'),
+          AlbumRowFilterParameter(column: 'artist', value: 'A'),
+          AlbumRowFilterParameter(column: 'year', value: 2021),
+          AlbumRowFilterParameter(column: 'is_single_grouping', value: 0),
+        ],
+      ).first;
+      // Alpha and Beta are at or before cursor
+      expect(count, 2);
     });
   });
 }

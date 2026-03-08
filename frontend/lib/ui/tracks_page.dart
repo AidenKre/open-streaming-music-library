@@ -9,8 +9,9 @@ import 'package:frontend/providers/providers.dart';
 class TracksPage extends ConsumerStatefulWidget {
   final String? artist;
   final String? album;
+  final VoidCallback? onDisconnect;
 
-  const TracksPage({super.key, this.artist, this.album});
+  const TracksPage({super.key, this.artist, this.album, this.onDisconnect});
 
   @override
   ConsumerState<TracksPage> createState() => TracksPageState();
@@ -143,7 +144,7 @@ class TracksPageState extends ConsumerState<TracksPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
+    final body = Column(
       children: [
         if (_newTrackCount > 0)
           MaterialBanner(
@@ -179,5 +180,22 @@ class TracksPageState extends ConsumerState<TracksPage> {
         ),
       ],
     );
+
+    if (widget.onDisconnect != null) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('OSML'),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.logout),
+              tooltip: 'Disconnect',
+              onPressed: widget.onDisconnect,
+            ),
+          ],
+        ),
+        body: body,
+      );
+    }
+    return body;
   }
 }

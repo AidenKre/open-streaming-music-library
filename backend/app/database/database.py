@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from app.models.album import Album
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -30,6 +31,11 @@ ALLOWED_METADATA_COLUMNS = [
 ]
 
 ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
+
+ALLOWED_ALBUM_COLUMNS = ["album", "artist", "year", "is_single_grouping"]
+
+ALLOWED_ARTIST_COLUMNS = ["artist"]
+ARTIST_TEXT_COLUMNS = {"artist"}
 
 ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
 
@@ -78,6 +84,47 @@ class RowFilterParameter:
             raise ValueError(
                 "column must be in ALLOWED_TRACK_COLUMNS or ALLOWED_METADATA_COLUMNS"
             )
+
+
+@dataclass(frozen=True)
+class AlbumOrderParameter:
+    column: str
+    isAscending: bool = True
+    nullsLast: bool = False
+
+    def __post_init__(self):
+        if self.column not in ALLOWED_ALBUM_COLUMNS:
+            raise ValueError("column must be in ALLOWED_ALBUM_COLUMNS")
+
+
+@dataclass(frozen=True)
+class AlbumRowFilterParameter:
+    column: str
+    value: Optional[str]
+
+    def __post_init__(self):
+        if self.column not in ALLOWED_ALBUM_COLUMNS:
+            raise ValueError("column must be in ALLOWED_ALBUM_COLUMNS")
+
+
+@dataclass(frozen=True)
+class ArtistOrderParameter:
+    column: str
+    isAscending: bool = True
+
+    def __post_init__(self):
+        if self.column not in ALLOWED_ARTIST_COLUMNS:
+            raise ValueError("column must be in ALLOWED_ARTIST_COLUMNS")
+
+
+@dataclass(frozen=True)
+class ArtistRowFilterParameter:
+    column: str
+    value: Optional[str]
+
+    def __post_init__(self):
+        if self.column not in ALLOWED_ARTIST_COLUMNS:
+            raise ValueError("column must be in ALLOWED_ARTIST_COLUMNS")
 
 
 class Database:
@@ -470,7 +517,12 @@ class Database:
         return count
 
     def get_artists(
-        self, limit: int = 100, offset: int = 0, timeout: float = 5
+        self,
+        order_parameters: List[ArtistOrderParameter] = [],
+        row_filter_parameters: List[ArtistRowFilterParameter] = [],
+        limit: int = 100,
+        offset: int = 0,
+        timeout: float = 5,
     ) -> List[str] | None:
         if limit <= 0 or limit > 1000 or offset < 0:
             print(
@@ -483,6 +535,8 @@ class Database:
 
         conn.row_factory = sqlite3.Row
 
+        parameters: list = []
+
         query = (
             "WITH candidates(value, row_order) AS ( "
             " SELECT artist, rowid FROM trackmetadata "
@@ -492,15 +546,37 @@ class Database:
             " SELECT album_artist, rowid FROM trackmetadata "
             " WHERE album_artist IS NOT NULL AND album_artist <> '' "
             ") "
-            "SELECT value, MIN(row_order) FROM candidates "
+            "SELECT value AS artist FROM candidates "
             "GROUP BY LOWER(value) "
-            "ORDER BY LOWER(value) ASC "
-            "LIMIT ? OFFSET ?"
         )
+
+        # Cursor filter
+        cursor_clause, cursor_values = filter_for_artist_cursor(
+            row_filter_parameters, order_parameters
+        )
+        if cursor_clause:
+            query += f"HAVING {cursor_clause} "
+            parameters.extend(cursor_values)
+
+        # ORDER BY
+        order_parts: list[str] = []
+        for param in order_parameters:
+            col = param.column
+            direction = "ASC" if param.isAscending else "DESC"
+            collate = " COLLATE NOCASE" if col in ARTIST_TEXT_COLUMNS else ""
+            order_parts.append(f'"{col}"{collate} {direction}')
+
+        if order_parts:
+            query += "ORDER BY " + ", ".join(order_parts) + " "
+        else:
+            query += "ORDER BY LOWER(value) ASC "
+
+        query += "LIMIT ? OFFSET ?"
+        parameters.extend([limit, offset])
 
         try:
             cursor = conn.cursor()
-            rows = cursor.execute(query, (limit, offset)).fetchall()
+            rows = cursor.execute(query, tuple(parameters)).fetchall()
         except Exception as e:
             print(f"Error executing distinct artist query: {e}")
             conn.close()
@@ -508,15 +584,22 @@ class Database:
         finally:
             conn.close()
 
-        return [str(row["value"]) for row in rows if row]
+        return [str(row["artist"]) for row in rows if row]
 
-    def get_artists_count(self, timeout: float = 5) -> int | None:
+    def get_artists_count(
+        self,
+        order_parameters: List[ArtistOrderParameter] = [],
+        row_filter_parameters: List[ArtistRowFilterParameter] = [],
+        timeout: float = 5,
+    ) -> int | None:
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
             print("Unable to connect to database")
             return None
 
-        query = (
+        parameters: list = []
+
+        inner = (
             "WITH candidates(value) AS ( "
             " SELECT artist FROM trackmetadata "
             " WHERE (album_artist IS NULL OR album_artist IS '') "
@@ -525,15 +608,25 @@ class Database:
             " SELECT album_artist FROM trackmetadata "
             " WHERE album_artist IS NOT NULL AND album_artist <> '' "
             ") "
-            "SELECT COUNT(*) FROM ( "
-            " SELECT value FROM candidates "
-            " GROUP BY LOWER(value) "
-            ") "
+            "SELECT value AS artist FROM candidates "
+            "GROUP BY LOWER(value) "
         )
+
+        # Cursor filter: count rows after cursor position (remaining)
+        cursor_clause, cursor_values = filter_for_artist_cursor(
+            row_filter_parameters, order_parameters
+        )
+        if cursor_clause:
+            inner += f"HAVING {cursor_clause} "
+            parameters.extend(cursor_values)
+
+        query = f"SELECT COUNT(*) FROM ({inner})"
 
         try:
             cursor = conn.cursor()
-            artist_count = int(cursor.execute(query).fetchone()[0])
+            artist_count = int(
+                cursor.execute(query, tuple(parameters)).fetchone()[0]
+            )
         except Exception as e:
             print(f"Unable to fetch artist and/or album artists counts. {e}")
             conn.close()
@@ -546,11 +639,12 @@ class Database:
     def get_albums(
         self,
         artist: Optional[str] = None,
+        order_parameters: List[AlbumOrderParameter] = [],
+        row_filter_parameters: List[AlbumRowFilterParameter] = [],
         limit: int = 100,
         offset: int = 0,
-        order_by: str = "year",
         timeout: float = 5,
-    ) -> List[str] | None:
+    ) -> List[Album] | None:
         if limit <= 0 or limit > 1000 or offset < 0:
             print(
                 f"Limit {limit} or Offset {offset} was set incorrectly for database.get_albums"
@@ -563,46 +657,111 @@ class Database:
 
         conn.row_factory = sqlite3.Row
 
-        order_clause = (
-            "ORDER BY LOWER(value) ASC"
-            if order_by == "alphabetical"
-            else "ORDER BY MIN(year_n) ASC"
+        parameters: list = []
+
+        # CTE normalizes artist/album_artist into a single artist column
+        if artist is not None:
+            cte = (
+                "WITH album_candidates(album, artist, year) AS ("
+                ' SELECT album, artist, "year" FROM trackmetadata'
+                " WHERE artist LIKE ?"
+                " AND (album IS NOT NULL AND album IS NOT '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                " UNION ALL"
+                ' SELECT album, album_artist, "year" FROM trackmetadata'
+                " WHERE album_artist LIKE ?"
+                " AND (album IS NOT NULL AND album IS NOT '')"
+                ") "
+            )
+            parameters.extend([artist, artist])
+        else:
+            cte = (
+                "WITH album_candidates(album, artist, year) AS ("
+                ' SELECT album, artist, "year" FROM trackmetadata'
+                " WHERE (album IS NOT NULL AND album IS NOT '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                " UNION ALL"
+                ' SELECT album, album_artist, "year" FROM trackmetadata'
+                " WHERE (album IS NOT NULL AND album IS NOT '')"
+                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
+                ") "
+            )
+
+        # Regular albums from CTE
+        regular = (
+            "SELECT album, artist, year, 0 AS is_single_grouping"
+            " FROM album_candidates"
+            " GROUP BY LOWER(album), LOWER(artist), year"
         )
 
+        # Single groupings (tracks with no album, grouped by artist+year)
         if artist is not None:
-            query = (
-                "WITH candidates(value, year_n, row_order) AS ( "
-                ' SELECT album, "year", rowid FROM trackmetadata '
-                " WHERE artist LIKE ? "
-                " AND (album IS NOT NULL AND album IS NOT '') "
-                " AND (album_artist IS NULL OR album_artist IS '') "
-                " UNION ALL "
-                ' SELECT album, "year", rowid FROM trackmetadata '
-                " WHERE album_artist LIKE ? "
-                " AND (album IS NOT NULL AND album IS NOT '') "
-                ") "
-                "SELECT value, MIN(row_order) FROM candidates "
-                "GROUP BY LOWER(value) "
-                f"{order_clause} "
-                "LIMIT ? OFFSET ?"
+            singles = (
+                " UNION ALL"
+                ' SELECT NULL AS album, artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE artist LIKE ?"
+                " AND (album IS NULL OR album IS '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                ' GROUP BY LOWER(artist), "year"'
+                " UNION ALL"
+                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE album_artist LIKE ?"
+                " AND (album IS NULL OR album IS '')"
+                ' GROUP BY LOWER(album_artist), "year"'
             )
-            parameters = (artist, artist, limit, offset)
+            parameters.extend([artist, artist])
         else:
-            query = (
-                "WITH candidates(value, year_n, row_order) AS ( "
-                ' SELECT album, "year", rowid FROM trackmetadata '
-                " WHERE (album IS NOT NULL AND album IS NOT '') "
-                ") "
-                "SELECT value, MIN(row_order) FROM candidates "
-                "GROUP BY LOWER(value) "
-                f"{order_clause} "
-                "LIMIT ? OFFSET ?"
+            singles = (
+                " UNION ALL"
+                ' SELECT NULL AS album, artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE (album IS NULL OR album IS '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                " AND (artist IS NOT NULL AND artist IS NOT '')"
+                ' GROUP BY LOWER(artist), "year"'
+                " UNION ALL"
+                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE (album IS NULL OR album IS '')"
+                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
+                ' GROUP BY LOWER(album_artist), "year"'
             )
-            parameters = (limit, offset)
+
+        subquery = f"{cte}SELECT * FROM ({regular}{singles})"
+
+        # Cursor filter
+        cursor_clause, cursor_values = filter_for_album_cursor(
+            row_filter_parameters, order_parameters
+        )
+        if cursor_clause:
+            subquery += f" WHERE {cursor_clause}"
+            parameters.extend(cursor_values)
+
+        # ORDER BY
+        order_parts: list[str] = []
+        for param in order_parameters:
+            col = param.column
+            direction = "ASC" if param.isAscending else "DESC"
+            collate = " COLLATE NOCASE" if col in ALBUM_TEXT_COLUMNS else ""
+            if param.nullsLast:
+                order_parts.append(f'"{col}" IS NULL ASC')
+            order_parts.append(f'"{col}"{collate} {direction}')
+
+        if order_parts:
+            subquery += " ORDER BY " + ", ".join(order_parts)
+
+        subquery += " LIMIT ? OFFSET ?"
+        parameters.extend([limit, offset])
 
         try:
             cursor = conn.cursor()
-            album_rows = cursor.execute(query, parameters).fetchall()
+            album_rows = cursor.execute(subquery, tuple(parameters)).fetchall()
         except Exception as e:
             print(f"Failed to retrieve albums: {e}")
             conn.close()
@@ -610,47 +769,119 @@ class Database:
         finally:
             conn.close()
 
-        return [row["value"] for row in album_rows]
+        return [
+            Album(
+                album=row["album"],
+                artist=row["artist"],
+                year=row["year"] if row["year"] is not None else None,
+                isSingleGrouping=bool(row["is_single_grouping"]),
+            )
+            for row in album_rows
+        ]
 
     def get_albums_count(
-        self, artist: Optional[str] = None, timeout: float = 5
+        self,
+        artist: Optional[str] = None,
+        order_parameters: List[AlbumOrderParameter] = [],
+        row_filter_parameters: List[AlbumRowFilterParameter] = [],
+        timeout: float = 5,
     ) -> int | None:
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
             print("Unable to connect to database")
             return None
 
+        parameters: list = []
+
+        # Same CTE + UNION as get_albums
         if artist is not None:
-            query = (
-                "WITH candidates(value) AS ( "
-                " SELECT album FROM trackmetadata "
-                " WHERE artist LIKE ? "
-                " AND (album IS NOT NULL AND album IS NOT '') "
-                " AND (album_artist IS NULL OR album_artist IS '') "
-                " UNION ALL "
-                " SELECT album FROM trackmetadata "
-                " WHERE album_artist LIKE ? "
-                " AND (album IS NOT NULL AND album IS NOT '') "
+            cte = (
+                "WITH album_candidates(album, artist, year) AS ("
+                ' SELECT album, artist, "year" FROM trackmetadata'
+                " WHERE artist LIKE ?"
+                " AND (album IS NOT NULL AND album IS NOT '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                " UNION ALL"
+                ' SELECT album, album_artist, "year" FROM trackmetadata'
+                " WHERE album_artist LIKE ?"
+                " AND (album IS NOT NULL AND album IS NOT '')"
                 ") "
-                "SELECT COUNT(*) FROM ("
-                " SELECT value FROM candidates"
-                " GROUP BY LOWER(value)"
-                ")"
             )
-            parameters = (artist, artist)
+            parameters.extend([artist, artist])
         else:
-            query = (
-                "SELECT COUNT(*) FROM ("
-                " SELECT album FROM trackmetadata "
-                " WHERE (album IS NOT NULL AND album IS NOT '') "
-                " GROUP BY LOWER(album)"
-                ")"
+            cte = (
+                "WITH album_candidates(album, artist, year) AS ("
+                ' SELECT album, artist, "year" FROM trackmetadata'
+                " WHERE (album IS NOT NULL AND album IS NOT '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                " UNION ALL"
+                ' SELECT album, album_artist, "year" FROM trackmetadata'
+                " WHERE (album IS NOT NULL AND album IS NOT '')"
+                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
+                ") "
             )
-            parameters = ()
+
+        regular = (
+            "SELECT album, artist, year, 0 AS is_single_grouping"
+            " FROM album_candidates"
+            " GROUP BY LOWER(album), LOWER(artist), year"
+        )
+
+        if artist is not None:
+            singles = (
+                " UNION ALL"
+                ' SELECT NULL AS album, artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE artist LIKE ?"
+                " AND (album IS NULL OR album IS '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                ' GROUP BY LOWER(artist), "year"'
+                " UNION ALL"
+                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE album_artist LIKE ?"
+                " AND (album IS NULL OR album IS '')"
+                ' GROUP BY LOWER(album_artist), "year"'
+            )
+            parameters.extend([artist, artist])
+        else:
+            singles = (
+                " UNION ALL"
+                ' SELECT NULL AS album, artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE (album IS NULL OR album IS '')"
+                " AND (album_artist IS NULL OR album_artist IS '')"
+                " AND (artist IS NOT NULL AND artist IS NOT '')"
+                ' GROUP BY LOWER(artist), "year"'
+                " UNION ALL"
+                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
+                " 1 AS is_single_grouping"
+                " FROM trackmetadata"
+                " WHERE (album IS NULL OR album IS '')"
+                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
+                ' GROUP BY LOWER(album_artist), "year"'
+            )
+
+        inner = f"{cte}SELECT * FROM ({regular}{singles})"
+
+        # Cursor filter
+        cursor_clause, cursor_values = filter_for_album_cursor(
+            row_filter_parameters, order_parameters
+        )
+        if cursor_clause:
+            inner += f" WHERE {cursor_clause}"
+            parameters.extend(cursor_values)
+
+        query = f"SELECT COUNT(*) FROM ({inner})"
 
         try:
             cursor = conn.cursor()
-            album_count = int(cursor.execute(query, parameters).fetchone()[0])
+            album_count = int(
+                cursor.execute(query, tuple(parameters)).fetchone()[0]
+            )
         except Exception as e:
             print(f"Failed to retrieve album counts: {e}")
             conn.close()
@@ -725,6 +956,162 @@ def filter_for_cursor(
         else:
             op = ">" if order_parameters[depth].isAscending else "<"
             final_part = f'{alias}."{col}" {op} ?'
+            all_parts = equality_parts + [final_part]
+            all_values = equality_values + [cursor_value]
+
+        if len(all_parts) == 1:
+            constraints.append(all_parts[0])
+        else:
+            constraints.append("(" + " AND ".join(all_parts) + ")")
+        values.extend(all_values)
+
+    if not constraints:
+        return ("", values)
+
+    return (" OR ".join(constraints), values)
+
+
+ALBUM_TEXT_COLUMNS = {"album", "artist"}
+ALBUM_INTEGER_COLUMNS = {"year", "is_single_grouping"}
+
+
+def filter_for_album_cursor(
+    row_filter_list: List[AlbumRowFilterParameter],
+    order_parameters: List[AlbumOrderParameter],
+) -> tuple[str, List[str]]:
+    if not row_filter_list:
+        return ("", [])
+
+    columns = [param.column for param in row_filter_list]
+    input_columns = set(columns)
+    invalid_columns = input_columns - set(ALLOWED_ALBUM_COLUMNS)
+
+    if invalid_columns:
+        raise ValueError("Invalid columns input to filter for album cursor")
+
+    if len(set(columns)) != len(columns):
+        raise ValueError("Filtering by row requires all unique columns")
+
+    order_columns = [op.column for op in order_parameters]
+    if columns != order_columns:
+        raise ValueError(
+            "row_filter_parameters columns must match order_parameters columns"
+        )
+
+    constraints: List[str] = []
+    values: List[str] = []
+
+    for depth in range(len(row_filter_list)):
+        equality_parts: List[str] = []
+        equality_values: List[str] = []
+
+        for i in range(depth):
+            col = row_filter_list[i].column
+            value = row_filter_list[i].value
+            collate = " COLLATE NOCASE" if col in ALBUM_TEXT_COLUMNS else ""
+            param = "CAST(? AS INTEGER)" if col in ALBUM_INTEGER_COLUMNS else "?"
+            if value is None:
+                equality_parts.append(f'"{col}" IS NULL')
+            else:
+                equality_parts.append(f'"{col}"{collate} = {param}')
+                equality_values.append(value)
+
+        col = row_filter_list[depth].column
+        cursor_value = row_filter_list[depth].value
+        nulls_last = order_parameters[depth].nullsLast
+        collate = " COLLATE NOCASE" if col in ALBUM_TEXT_COLUMNS else ""
+        param = "CAST(? AS INTEGER)" if col in ALBUM_INTEGER_COLUMNS else "?"
+
+        if cursor_value is None:
+            if nulls_last:
+                # NULLs sort last: nothing comes after NULL
+                continue
+            elif order_parameters[depth].isAscending:
+                # NULLs sort first (default): any non-null comes after NULL
+                final_part = f'"{col}" IS NOT NULL'
+            else:
+                # DESC with NULLs first: nothing is "less than" NULL
+                continue
+            all_parts = equality_parts + [final_part]
+            all_values = equality_values
+        else:
+            op = ">" if order_parameters[depth].isAscending else "<"
+            if nulls_last:
+                # Non-NULL cursor with nullsLast: greater values OR NULLs come after
+                final_part = f'("{col}"{collate} {op} {param} OR "{col}" IS NULL)'
+                all_parts = equality_parts + [final_part]
+                all_values = equality_values + [cursor_value]
+            else:
+                final_part = f'"{col}"{collate} {op} {param}'
+                all_parts = equality_parts + [final_part]
+                all_values = equality_values + [cursor_value]
+
+        if len(all_parts) == 1:
+            constraints.append(all_parts[0])
+        else:
+            constraints.append("(" + " AND ".join(all_parts) + ")")
+        values.extend(all_values)
+
+    if not constraints:
+        return ("", values)
+
+    return (" OR ".join(constraints), values)
+
+
+def filter_for_artist_cursor(
+    row_filter_list: List[ArtistRowFilterParameter],
+    order_parameters: List[ArtistOrderParameter],
+) -> tuple[str, List[str]]:
+    if not row_filter_list:
+        return ("", [])
+
+    columns = [param.column for param in row_filter_list]
+    input_columns = set(columns)
+    invalid_columns = input_columns - set(ALLOWED_ARTIST_COLUMNS)
+
+    if invalid_columns:
+        raise ValueError("Invalid columns input to filter for artist cursor")
+
+    if len(set(columns)) != len(columns):
+        raise ValueError("Filtering by row requires all unique columns")
+
+    order_columns = [op.column for op in order_parameters]
+    if columns != order_columns:
+        raise ValueError(
+            "row_filter_parameters columns must match order_parameters columns"
+        )
+
+    constraints: List[str] = []
+    values: List[str] = []
+
+    for depth in range(len(row_filter_list)):
+        equality_parts: List[str] = []
+        equality_values: List[str] = []
+
+        for i in range(depth):
+            col = row_filter_list[i].column
+            value = row_filter_list[i].value
+            collate = " COLLATE NOCASE" if col in ARTIST_TEXT_COLUMNS else ""
+            if value is None:
+                equality_parts.append(f'"{col}" IS NULL')
+            else:
+                equality_parts.append(f'"{col}"{collate} = ?')
+                equality_values.append(value)
+
+        col = row_filter_list[depth].column
+        cursor_value = row_filter_list[depth].value
+        collate = " COLLATE NOCASE" if col in ARTIST_TEXT_COLUMNS else ""
+
+        if cursor_value is None:
+            if order_parameters[depth].isAscending:
+                final_part = f'"{col}" IS NOT NULL'
+            else:
+                continue
+            all_parts = equality_parts + [final_part]
+            all_values = equality_values
+        else:
+            op = ">" if order_parameters[depth].isAscending else "<"
+            final_part = f'"{col}"{collate} {op} ?'
             all_parts = equality_parts + [final_part]
             all_values = equality_values + [cursor_value]
 
