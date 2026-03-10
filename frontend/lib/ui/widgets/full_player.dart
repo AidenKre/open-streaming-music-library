@@ -59,9 +59,7 @@ class _FullPlayerState extends ConsumerState<FullPlayer> {
           ),
           // Content
           Expanded(
-            child: _showQueue
-                ? const _QueueView()
-                : const _NowPlayingView(),
+            child: _showQueue ? const _QueueView() : const _NowPlayingView(),
           ),
         ],
       ),
@@ -114,8 +112,12 @@ class _NowPlayingView extends ConsumerWidget {
 
     if (track == null) return const SizedBox.shrink();
 
-    final sliderMax =
-        duration.inMilliseconds > 0 ? duration.inMilliseconds.toDouble() : 1.0;
+    final sliderMax = duration.inMilliseconds > 0
+        ? duration.inMilliseconds.toDouble()
+        : 1.0;
+    final sliderValue = duration.inMilliseconds > 0
+        ? position.inMilliseconds.toDouble().clamp(0.0, sliderMax).toDouble()
+        : 0.0;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -123,141 +125,160 @@ class _NowPlayingView extends ConsumerWidget {
         final maxArtSize = (constraints.maxHeight * 0.45).clamp(0.0, 360.0);
 
         return SingleChildScrollView(
-      padding: const EdgeInsets.symmetric(horizontal: 24),
-      child: Column(
-        children: [
-          const SizedBox(height: 16),
-          // Album art placeholder
-          ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: maxArtSize, maxHeight: maxArtSize),
-            child: AspectRatio(
-              aspectRatio: 1,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: colors.primaryContainer,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Icon(
-                  Icons.music_note,
-                  size: 96,
-                  color: colors.onPrimaryContainer,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
-          // Track info
-          Text(
-            track.title ?? 'Unknown Title',
-            style: textTheme.headlineSmall,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 4),
-          Text(
-            [track.artist ?? 'Unknown Artist', track.album]
-                .where((s) => s != null)
-                .join(' — '),
-            style: textTheme.bodyMedium
-                ?.copyWith(color: colors.onSurfaceVariant),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 24),
-          // Seek slider
-          Slider(
-            value: position.inMilliseconds.toDouble().clamp(0, sliderMax),
-            max: sliderMax,
-            onChanged: (v) {
-              ref
-                  .read(audioProvider.notifier)
-                  .seek(Duration(milliseconds: v.toInt()));
-            },
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(formatDuration(position), style: textTheme.bodySmall),
-                Text(formatDuration(duration), style: textTheme.bodySmall),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-          // Transport controls
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Column(
             children: [
-              IconButton(
-                icon: Icon(
-                  Icons.shuffle,
-                  color: shuffleOn ? colors.primary : null,
+              const SizedBox(height: 16),
+              // Album art placeholder
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: maxArtSize,
+                  maxHeight: maxArtSize,
                 ),
-                iconSize: 24,
-                onPressed: () => ref.read(audioProvider.notifier).toggleShuffle(),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                icon: const Icon(Icons.skip_previous),
-                iconSize: 36,
-                onPressed: () => ref.read(audioProvider.notifier).skipPrevious(),
-              ),
-              const SizedBox(width: 16),
-              IconButton(
-                icon: Icon(
-                  status == PlayerStatus.playing
-                      ? Icons.pause_circle_filled
-                      : Icons.play_circle_filled,
+                child: AspectRatio(
+                  aspectRatio: 1,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: colors.primaryContainer,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(
+                      Icons.music_note,
+                      size: 96,
+                      color: colors.onPrimaryContainer,
+                    ),
+                  ),
                 ),
-                iconSize: 48,
-                onPressed: () {
-                  final notifier = ref.read(audioProvider.notifier);
-                  if (status == PlayerStatus.playing) {
-                    notifier.pause();
-                  } else {
-                    notifier.resume();
-                  }
+              ),
+              const SizedBox(height: 24),
+              // Track info
+              Text(
+                track.title ?? 'Unknown Title',
+                style: textTheme.headlineSmall,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                [
+                  track.artist ?? 'Unknown Artist',
+                  track.album,
+                ].where((s) => s != null).join(' — '),
+                style: textTheme.bodyMedium?.copyWith(
+                  color: colors.onSurfaceVariant,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 24),
+              // Seek slider
+              Slider(
+                value: sliderValue,
+                max: sliderMax,
+                onChanged: (v) {
+                  ref
+                      .read(audioProvider.notifier)
+                      .seek(Duration(milliseconds: v.toInt()));
                 },
               ),
-              const SizedBox(width: 16),
-              IconButton(
-                icon: const Icon(Icons.skip_next),
-                iconSize: 36,
-                onPressed: () => ref.read(audioProvider.notifier).skipNext(),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                icon: Icon(
-                  repeatMode == QueueRepeatMode.one ? Icons.repeat_one : Icons.repeat,
-                  color: repeatMode != QueueRepeatMode.off ? colors.primary : null,
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(formatDuration(position), style: textTheme.bodySmall),
+                    Text(formatDuration(duration), style: textTheme.bodySmall),
+                  ],
                 ),
-                iconSize: 24,
-                onPressed: () => ref.read(audioProvider.notifier).cycleQueueRepeatMode(),
+              ),
+              const SizedBox(height: 16),
+              // Transport controls
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  IconButton(
+                    icon: Icon(
+                      Icons.shuffle,
+                      color: shuffleOn ? colors.primary : null,
+                    ),
+                    iconSize: 24,
+                    onPressed: () =>
+                        ref.read(audioProvider.notifier).toggleShuffle(),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(Icons.skip_previous),
+                    iconSize: 36,
+                    onPressed: () =>
+                        ref.read(audioProvider.notifier).skipPrevious(),
+                  ),
+                  const SizedBox(width: 16),
+                  IconButton(
+                    icon: Icon(
+                      status == PlayerStatus.playing
+                          ? Icons.pause_circle_filled
+                          : Icons.play_circle_filled,
+                    ),
+                    iconSize: 48,
+                    onPressed: () {
+                      final notifier = ref.read(audioProvider.notifier);
+                      if (status == PlayerStatus.playing) {
+                        notifier.pause();
+                      } else {
+                        notifier.resume();
+                      }
+                    },
+                  ),
+                  const SizedBox(width: 16),
+                  IconButton(
+                    icon: const Icon(Icons.skip_next),
+                    iconSize: 36,
+                    onPressed: () =>
+                        ref.read(audioProvider.notifier).skipNext(),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: Icon(
+                      repeatMode == QueueRepeatMode.one
+                          ? Icons.repeat_one
+                          : Icons.repeat,
+                      color: repeatMode != QueueRepeatMode.off
+                          ? colors.primary
+                          : null,
+                    ),
+                    iconSize: 24,
+                    onPressed: () =>
+                        ref.read(audioProvider.notifier).cycleQueueRepeatMode(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              // Volume slider
+              Row(
+                children: [
+                  Icon(
+                    Icons.volume_down,
+                    size: 20,
+                    color: colors.onSurfaceVariant,
+                  ),
+                  Expanded(
+                    child: Slider(
+                      value: volume,
+                      onChanged: (v) {
+                        ref.read(audioProvider.notifier).setVolume(v);
+                      },
+                    ),
+                  ),
+                  Icon(
+                    Icons.volume_up,
+                    size: 20,
+                    color: colors.onSurfaceVariant,
+                  ),
+                ],
               ),
             ],
           ),
-          const SizedBox(height: 16),
-          // Volume slider
-          Row(
-            children: [
-              Icon(Icons.volume_down,
-                  size: 20, color: colors.onSurfaceVariant),
-              Expanded(
-                child: Slider(
-                  value: volume,
-                  onChanged: (v) {
-                    ref.read(audioProvider.notifier).setVolume(v);
-                  },
-                ),
-              ),
-              Icon(Icons.volume_up,
-                  size: 20, color: colors.onSurfaceVariant),
-            ],
-          ),
-        ],
-      ),
-    );
+        );
       },
     );
   }
