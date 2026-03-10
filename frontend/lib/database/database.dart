@@ -786,12 +786,12 @@ class AppDatabase extends _$AppDatabase {
       cte =
           'WITH album_candidates(album, artist, year) AS ('
           ' SELECT album, artist, "year" FROM trackmetadata'
-          ' WHERE artist LIKE ?'
+          ' WHERE LOWER(artist) = LOWER(?)'
           ' AND (album IS NOT NULL AND album IS NOT \'\')'
           ' AND (album_artist IS NULL OR album_artist IS \'\')'
           ' UNION ALL'
           ' SELECT album, album_artist, "year" FROM trackmetadata'
-          ' WHERE album_artist LIKE ?'
+          ' WHERE LOWER(album_artist) = LOWER(?)'
           ' AND (album IS NOT NULL AND album IS NOT \'\')'
           ') ';
       vars.addAll([Variable.withString(artist), Variable.withString(artist)]);
@@ -822,7 +822,7 @@ class AppDatabase extends _$AppDatabase {
           ' SELECT NULL AS album, artist, "year" AS year,'
           ' 1 AS is_single_grouping'
           ' FROM trackmetadata'
-          ' WHERE artist LIKE ?'
+          ' WHERE LOWER(artist) = LOWER(?)'
           ' AND (album IS NULL OR album IS \'\')'
           ' AND (album_artist IS NULL OR album_artist IS \'\')'
           ' GROUP BY LOWER(artist), "year"'
@@ -830,7 +830,7 @@ class AppDatabase extends _$AppDatabase {
           ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
           ' 1 AS is_single_grouping'
           ' FROM trackmetadata'
-          ' WHERE album_artist LIKE ?'
+          ' WHERE LOWER(album_artist) = LOWER(?)'
           ' AND (album IS NULL OR album IS \'\')'
           ' GROUP BY LOWER(album_artist), "year"';
       vars.addAll([Variable.withString(artist), Variable.withString(artist)]);
@@ -924,12 +924,12 @@ class AppDatabase extends _$AppDatabase {
       cte =
           'WITH album_candidates(album, artist, year) AS ('
           ' SELECT album, artist, "year" FROM trackmetadata'
-          ' WHERE artist LIKE ?'
+          ' WHERE LOWER(artist) = LOWER(?)'
           ' AND (album IS NOT NULL AND album IS NOT \'\')'
           ' AND (album_artist IS NULL OR album_artist IS \'\')'
           ' UNION ALL'
           ' SELECT album, album_artist, "year" FROM trackmetadata'
-          ' WHERE album_artist LIKE ?'
+          ' WHERE LOWER(album_artist) = LOWER(?)'
           ' AND (album IS NOT NULL AND album IS NOT \'\')'
           ') ';
       cteVars.addAll([
@@ -961,7 +961,7 @@ class AppDatabase extends _$AppDatabase {
           ' SELECT NULL AS album, artist, "year" AS year,'
           ' 1 AS is_single_grouping'
           ' FROM trackmetadata'
-          ' WHERE artist LIKE ?'
+          ' WHERE LOWER(artist) = LOWER(?)'
           ' AND (album IS NULL OR album IS \'\')'
           ' AND (album_artist IS NULL OR album_artist IS \'\')'
           ' GROUP BY LOWER(artist), "year"'
@@ -969,7 +969,7 @@ class AppDatabase extends _$AppDatabase {
           ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
           ' 1 AS is_single_grouping'
           ' FROM trackmetadata'
-          ' WHERE album_artist LIKE ?'
+          ' WHERE LOWER(album_artist) = LOWER(?)'
           ' AND (album IS NULL OR album IS \'\')'
           ' GROUP BY LOWER(album_artist), "year"';
       cteVars.addAll([

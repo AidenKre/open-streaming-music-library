@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -7,10 +8,7 @@ from app.models.album import Album
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
-# TODO: refactor try blocks to not be so atomic
-# TODO: actually catch real sqlite excpetions from the try blocks
-# TODO: use finally for the try blocks
-# TODO: do not let connect_to_database return None. raising and expection is probably fine, since consumers of the function should be try catching
+# TODO: catch specific sqlite3 exceptions rather than broad Exception
 
 ALLOWED_METADATA_COLUMNS = [
     "title",
@@ -131,56 +129,37 @@ class Database:
     def __init__(self, context: DatabaseContext):
         self.context = context
 
-    def connect_to_database(self, timeout: float = 5) -> sqlite3.Connection | None:
-        database_path = self.context.database_path
-        conn = None
+    @contextmanager
+    def _connection(self, *, commit: bool = False, timeout: float = 5):
+        conn = sqlite3.connect(self.context.database_path, timeout=timeout)
         try:
-            conn = sqlite3.connect(database_path, timeout=timeout)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.commit()
-            return conn
-
-        except Exception as e:
-            print(
-                f"Error connecting to the sqlite database. database path: {database_path} Exception: {e}"
-            )
-            return None
+            conn.row_factory = sqlite3.Row
+            yield conn
+            if commit:
+                conn.commit()
+        except BaseException:
+            if commit:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def initialize(self) -> bool:
         # TODO: Create database migration logic when I actually need to migrate a database
         if self.context.database_path.exists():
             print("Database already exists, so skipping")
             return True
-        conn = None
         try:
-            conn = self.connect_to_database()
+            with open(self.context.init_sql_path, "r") as f:
+                init_script = f.read()
+            with self._connection(commit=True) as conn:
+                conn.executescript(init_script)
+            return True
         except Exception as e:
-            print(e)
+            print(f"Error initializing database: {e}")
             return False
-
-        if not conn:
-            print(
-                "Unable to connect to the database, connect_to_database returned false"
-            )
-            return False
-
-        with open(self.context.init_sql_path, "r") as f:
-            init_script = f.read()
-
-        try:
-            conn.executescript(init_script)
-        except Exception as e:
-            print(
-                f"Error loading sqlite init script, found at path {self.context.init_sql_path} with exception {e}"
-            )
-            conn.rollback()
-            conn.close()
-
-        conn.commit()
-        conn.close()
-
-        return True
 
     def add_track(self, track: Track, timeout: float = 5) -> bool:
         if track.metadata.is_empty():
@@ -189,123 +168,78 @@ class Database:
             )
             return False
 
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            return False
-        tracks_cursor = conn.cursor()
-        trackmetadata_cursor = conn.cursor()
-
-        track_id = None
         try:
-            tracks_entry = (
-                track.uuid_id,
-                str(track.file_path),
-                track.file_hash,
-                track.created_at,
-                track.last_updated,
-            )
-            tracks_sql_query = (
-                "INSERT INTO tracks (uuid_id, file_path, file_hash, created_at, last_updated) "
-                "VALUES (?, ?, ?, ?, ?)"
-            )
-            temp = tracks_cursor.execute(tracks_sql_query, tracks_entry)
-            track_id = temp.lastrowid
-        except Exception as e:
-            print(f"Failed to insert {track} into tracks table {e}")
-            conn.rollback()
-            conn.close()
-            return False
+            with self._connection(commit=True, timeout=timeout) as conn:
+                tracks_entry = (
+                    track.uuid_id,
+                    str(track.file_path),
+                    track.file_hash,
+                    track.created_at,
+                    track.last_updated,
+                )
+                tracks_sql_query = (
+                    "INSERT INTO tracks (uuid_id, file_path, file_hash, created_at, last_updated) "
+                    "VALUES (?, ?, ?, ?, ?)"
+                )
+                temp = conn.cursor().execute(tracks_sql_query, tracks_entry)
+                track_id = temp.lastrowid
 
-        try:
-            trackmetadata = track.metadata
-            trackmetadata_entry = (
-                track_id,
-                track.uuid_id,
-                trackmetadata.title,
-                trackmetadata.artist,
-                trackmetadata.album,
-                trackmetadata.album_artist,
-                trackmetadata.year,
-                trackmetadata.date,
-                trackmetadata.genre,
-                trackmetadata.track_number,
-                trackmetadata.disc_number,
-                trackmetadata.codec,
-                trackmetadata.duration,
-                trackmetadata.bitrate_kbps,
-                trackmetadata.sample_rate_hz,
-                trackmetadata.channels,
-                trackmetadata.has_album_art,
-            )
-
-            trackmetadata_sql_query = (
-                "INSERT INTO trackmetadata (track_id, uuid_id, title, artist, album, album_artist, "
-                '"year", "date", genre, track_number, disc_number, codec, duration, '
-                "bitrate_kbps, sample_rate_hz, channels, has_album_art) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-
-            trackmetadata_cursor.execute(trackmetadata_sql_query, trackmetadata_entry)
-        except Exception as e:
-            print(f"Failed to insert {track.metadata} into trackmetadata table {e}")
-            conn.rollback()
-            conn.close()
-            return False
-
-        try:
-            conn.commit()
-            conn.close()
+                trackmetadata = track.metadata
+                trackmetadata_entry = (
+                    track_id,
+                    track.uuid_id,
+                    trackmetadata.title,
+                    trackmetadata.artist,
+                    trackmetadata.album,
+                    trackmetadata.album_artist,
+                    trackmetadata.year,
+                    trackmetadata.date,
+                    trackmetadata.genre,
+                    trackmetadata.track_number,
+                    trackmetadata.disc_number,
+                    trackmetadata.codec,
+                    trackmetadata.duration,
+                    trackmetadata.bitrate_kbps,
+                    trackmetadata.sample_rate_hz,
+                    trackmetadata.channels,
+                    trackmetadata.has_album_art,
+                )
+                trackmetadata_sql_query = (
+                    "INSERT INTO trackmetadata (track_id, uuid_id, title, artist, album, album_artist, "
+                    '"year", "date", genre, track_number, disc_number, codec, duration, '
+                    "bitrate_kbps, sample_rate_hz, channels, has_album_art) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                conn.cursor().execute(trackmetadata_sql_query, trackmetadata_entry)
             return True
         except Exception as e:
-            print(f"Failed to commit track {track}. {e}")
-            conn.rollback()
-            conn.close()
+            print(f"Failed to add track {track}. {e}")
             return False
 
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            return False
-        tracks_cursor = conn.cursor()
-        trackmetadata_cursor = conn.cursor()
-
         try:
-            trackmetadata_cursor.execute(
-                "DELETE FROM trackmetadata WHERE uuid_id = ?", (uuid_id,)
-            )
-        except Exception as e:
-            print(f"failed to delete {uuid_id} from trackmetadata {e}")
-            conn.rollback()
-            conn.close()
-            return False
+            with self._connection(commit=True, timeout=timeout) as conn:
+                trackmetadata_cursor = conn.cursor()
+                tracks_cursor = conn.cursor()
 
-        try:
-            tracks_cursor.execute("DELETE FROM tracks WHERE uuid_id = ?", (uuid_id,))
-        except Exception as e:
-            print(f"failed to delete {uuid_id} from tracks. {e}")
-            conn.rollback()
-            conn.close()
-            return False
+                trackmetadata_cursor.execute(
+                    "DELETE FROM trackmetadata WHERE uuid_id = ?", (uuid_id,)
+                )
+                tracks_cursor.execute(
+                    "DELETE FROM tracks WHERE uuid_id = ?", (uuid_id,)
+                )
 
-        if trackmetadata_cursor.rowcount == 0:
-            conn.rollback()
-            conn.close()
-            return False
+                if trackmetadata_cursor.rowcount != tracks_cursor.rowcount:
+                    raise ValueError(
+                        f"row was deleted from tracks XOR trackmetadata. uuid_id: {uuid_id}"
+                    )
 
-        if trackmetadata_cursor.rowcount != tracks_cursor.rowcount:
-            print(f"row was deleted from tracks XOR trackmetadata. uuid_id: {uuid_id}")
-            conn.rollback()
-            conn.close()
-            return False
+                if trackmetadata_cursor.rowcount == 0:
+                    raise ValueError("No rows deleted")
 
-        try:
-            conn.commit()
-            conn.close()
             return True
         except Exception as e:
-            print(f"Failed to commit deletion of uuid_id {uuid_id}. {e}")
-            conn.rollback()
-            conn.close()
+            print(f"Failed to delete track {uuid_id}. {e}")
             return False
 
     # TODO: searching needs some refactor. Specifically, using dicts for the searching is bad.
@@ -352,12 +286,6 @@ class Database:
                 f"columns {invalid_order_columns} are not allowed as a search parameter"
             )
             raise ValueError
-
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            return []
-        conn.row_factory = sqlite3.Row
-        search_cursor = conn.cursor()
 
         search_query = (
             "SELECT "
@@ -413,15 +341,15 @@ class Database:
         search_query += " LIMIT " + str(limit) + " OFFSET " + str(offset)
 
         try:
-            rows = search_cursor.execute(search_query, tuple(search_values)).fetchall()
+            with self._connection(timeout=timeout) as conn:
+                rows = conn.cursor().execute(
+                    search_query, tuple(search_values)
+                ).fetchall()
         except Exception as e:
             print(
                 f"Failed to search database. search_parameters: {search_parameters}. Exception: {e}"
             )
-            conn.close()
             return []
-        finally:
-            conn.close()
 
         tracks: List[Track] = []
         for row in rows:
@@ -474,10 +402,6 @@ class Database:
         if album is not None and artist is None:
             raise ValueError("Cannot filter by album without artist")
 
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            return None
-
         search_query = (
             "SELECT COUNT(*) FROM tracks as t "
             "JOIN trackmetadata AS tm ON "
@@ -514,19 +438,17 @@ class Database:
         if search_clauses:
             search_query += " WHERE " + " AND ".join(search_clauses)
 
-        cursor = conn.cursor()
         try:
-            count = int(
-                cursor.execute(search_query, tuple(search_values)).fetchone()[0]
-            )
+            with self._connection(timeout=timeout) as conn:
+                count = int(
+                    conn.cursor()
+                    .execute(search_query, tuple(search_values))
+                    .fetchone()[0]
+                )
+            return count
         except Exception as e:
-            print(f"Failed to get count from database whil executing query: {e}")
-            conn.close()
+            print(f"Failed to get count from database while executing query: {e}")
             return None
-        finally:
-            conn.close()
-
-        return count
 
     def get_artists(
         self,
@@ -545,12 +467,6 @@ class Database:
                 f"Limit {limit} or Offset {offset} was set incorrectly for database.get_artists"
             )
             raise ValueError
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            return None
-
-        conn.row_factory = sqlite3.Row
-
         parameters: list = []
 
         query = (
@@ -591,16 +507,12 @@ class Database:
         parameters.extend([limit, offset])
 
         try:
-            cursor = conn.cursor()
-            rows = cursor.execute(query, tuple(parameters)).fetchall()
+            with self._connection(timeout=timeout) as conn:
+                rows = conn.cursor().execute(query, tuple(parameters)).fetchall()
+            return [str(row["artist"]) for row in rows if row]
         except Exception as e:
             print(f"Error executing distinct artist query: {e}")
-            conn.close()
             return None
-        finally:
-            conn.close()
-
-        return [str(row["artist"]) for row in rows if row]
 
     def get_artists_count(
         self,
@@ -612,11 +524,6 @@ class Database:
             order_parameters = []
         if row_filter_parameters is None:
             row_filter_parameters = []
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            print("Unable to connect to database")
-            return None
-
         parameters: list = []
 
         inner = (
@@ -643,16 +550,14 @@ class Database:
         query = f"SELECT COUNT(*) FROM ({inner})"
 
         try:
-            cursor = conn.cursor()
-            artist_count = int(cursor.execute(query, tuple(parameters)).fetchone()[0])
+            with self._connection(timeout=timeout) as conn:
+                artist_count = int(
+                    conn.cursor().execute(query, tuple(parameters)).fetchone()[0]
+                )
+            return artist_count
         except Exception as e:
             print(f"Unable to fetch artist and/or album artists counts. {e}")
-            conn.close()
             return None
-        finally:
-            conn.close()
-
-        return artist_count
 
     def get_albums(
         self,
@@ -673,12 +578,6 @@ class Database:
             )
             raise ValueError
 
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            return None
-
-        conn.row_factory = sqlite3.Row
-
         parameters: list = []
 
         # CTE normalizes artist/album_artist into a single artist column
@@ -686,12 +585,12 @@ class Database:
             cte = (
                 "WITH album_candidates(album, artist, year) AS ("
                 ' SELECT album, artist, "year" FROM trackmetadata'
-                " WHERE artist LIKE ?"
+                " WHERE LOWER(artist) = LOWER(?)"
                 " AND (album IS NOT NULL AND album IS NOT '')"
                 " AND (album_artist IS NULL OR album_artist IS '')"
                 " UNION ALL"
                 ' SELECT album, album_artist, "year" FROM trackmetadata'
-                " WHERE album_artist LIKE ?"
+                " WHERE LOWER(album_artist) = LOWER(?)"
                 " AND (album IS NOT NULL AND album IS NOT '')"
                 ") "
             )
@@ -723,7 +622,7 @@ class Database:
                 ' SELECT NULL AS album, artist, "year" AS year,'
                 " 1 AS is_single_grouping"
                 " FROM trackmetadata"
-                " WHERE artist LIKE ?"
+                " WHERE LOWER(artist) = LOWER(?)"
                 " AND (album IS NULL OR album IS '')"
                 " AND (album_artist IS NULL OR album_artist IS '')"
                 ' GROUP BY LOWER(artist), "year"'
@@ -731,7 +630,7 @@ class Database:
                 ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
                 " 1 AS is_single_grouping"
                 " FROM trackmetadata"
-                " WHERE album_artist LIKE ?"
+                " WHERE LOWER(album_artist) = LOWER(?)"
                 " AND (album IS NULL OR album IS '')"
                 ' GROUP BY LOWER(album_artist), "year"'
             )
@@ -782,14 +681,11 @@ class Database:
         parameters.extend([limit, offset])
 
         try:
-            cursor = conn.cursor()
-            album_rows = cursor.execute(subquery, tuple(parameters)).fetchall()
+            with self._connection(timeout=timeout) as conn:
+                album_rows = conn.cursor().execute(subquery, tuple(parameters)).fetchall()
         except Exception as e:
             print(f"Failed to retrieve albums: {e}")
-            conn.close()
             return None
-        finally:
-            conn.close()
 
         return [
             Album(
@@ -812,10 +708,6 @@ class Database:
             order_parameters = []
         if row_filter_parameters is None:
             row_filter_parameters = []
-        conn = self.connect_to_database(timeout=timeout)
-        if not conn:
-            print("Unable to connect to database")
-            return None
 
         parameters: list = []
 
@@ -824,12 +716,12 @@ class Database:
             cte = (
                 "WITH album_candidates(album, artist, year) AS ("
                 ' SELECT album, artist, "year" FROM trackmetadata'
-                " WHERE artist LIKE ?"
+                " WHERE LOWER(artist) = LOWER(?)"
                 " AND (album IS NOT NULL AND album IS NOT '')"
                 " AND (album_artist IS NULL OR album_artist IS '')"
                 " UNION ALL"
                 ' SELECT album, album_artist, "year" FROM trackmetadata'
-                " WHERE album_artist LIKE ?"
+                " WHERE LOWER(album_artist) = LOWER(?)"
                 " AND (album IS NOT NULL AND album IS NOT '')"
                 ") "
             )
@@ -859,7 +751,7 @@ class Database:
                 ' SELECT NULL AS album, artist, "year" AS year,'
                 " 1 AS is_single_grouping"
                 " FROM trackmetadata"
-                " WHERE artist LIKE ?"
+                " WHERE LOWER(artist) = LOWER(?)"
                 " AND (album IS NULL OR album IS '')"
                 " AND (album_artist IS NULL OR album_artist IS '')"
                 ' GROUP BY LOWER(artist), "year"'
@@ -867,7 +759,7 @@ class Database:
                 ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
                 " 1 AS is_single_grouping"
                 " FROM trackmetadata"
-                " WHERE album_artist LIKE ?"
+                " WHERE LOWER(album_artist) = LOWER(?)"
                 " AND (album IS NULL OR album IS '')"
                 ' GROUP BY LOWER(album_artist), "year"'
             )
@@ -904,16 +796,14 @@ class Database:
         query = f"SELECT COUNT(*) FROM ({inner})"
 
         try:
-            cursor = conn.cursor()
-            album_count = int(cursor.execute(query, tuple(parameters)).fetchone()[0])
+            with self._connection(timeout=timeout) as conn:
+                album_count = int(
+                    conn.cursor().execute(query, tuple(parameters)).fetchone()[0]
+                )
+            return album_count
         except Exception as e:
             print(f"Failed to retrieve album counts: {e}")
-            conn.close()
             return None
-        finally:
-            conn.close()
-
-        return album_count
 
 
 def alias_map(column: str) -> str:
@@ -1155,15 +1045,15 @@ def artist_album_filter_clause(
     artist: str, album: Optional[str]
 ) -> tuple[str, List[str]]:
     artist_clause = (
-        '((tm."artist" LIKE ? AND (tm."album_artist" IS NULL OR tm."album_artist" = \'\'))'
-        ' OR tm."album_artist" LIKE ?)'
+        '((LOWER(tm."artist") = LOWER(?) AND (tm."album_artist" IS NULL OR tm."album_artist" = \'\'))'
+        ' OR LOWER(tm."album_artist") = LOWER(?))'
     )
     values = [artist, artist]
 
     if album is None:
         album_clause = 'tm."album" IS NULL'
     else:
-        album_clause = 'tm."album" LIKE ?'
+        album_clause = 'LOWER(tm."album") = LOWER(?)'
         values.append(album)
 
     return (artist_clause + " AND " + album_clause, values)
