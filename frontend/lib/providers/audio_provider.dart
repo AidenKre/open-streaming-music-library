@@ -158,6 +158,7 @@ class AudioNotifier extends Notifier<AudioState> {
           unawaited(
             _enqueueMutation(() async {
               if (_currentIndexMuteDepth > 0) return;
+              if (_hasNextTrackInWindow()) return;
               if (completedTrackUuid == null) return;
               if (state.currentTrack?.uuidId != completedTrackUuid) return;
               if (_player.processingState != ja.ProcessingState.completed) {
@@ -253,6 +254,12 @@ class AudioNotifier extends Notifier<AudioState> {
     } finally {
       _currentIndexMuteDepth--;
     }
+  }
+
+  bool _hasNextTrackInWindow() {
+    final currentIndex = _player.currentIndex ?? _windowCurrentIndex;
+    if (currentIndex == null) return false;
+    return currentIndex >= 0 && currentIndex < _windowTracks.length - 1;
   }
 
   String _streamUrl(TrackUI track) {
@@ -743,6 +750,8 @@ class AudioNotifier extends Notifier<AudioState> {
   }
 
   Future<void> _handlePlaybackCompleted() async {
+    if (_hasNextTrackInWindow()) return;
+
     final track = state.currentTrack;
     if (track == null) return;
 
