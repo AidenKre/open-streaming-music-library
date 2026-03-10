@@ -311,15 +311,21 @@ class Database:
     # TODO: searching needs some refactor. Specifically, using dicts for the searching is bad.
     def get_tracks(
         self,
-        search_parameters: List[SearchParameter] = [],
-        order_parameters: List[OrderParameter] = [],
-        row_filter_parameters: List[RowFilterParameter] = [],
+        search_parameters: List[SearchParameter] | None = None,
+        order_parameters: List[OrderParameter] | None = None,
+        row_filter_parameters: List[RowFilterParameter] | None = None,
         artist: Optional[str] = None,
         album: Optional[str] = None,
         timeout: float = 5,
         limit: int = 100,
         offset: int = 0,
     ) -> List[Track]:
+        if search_parameters is None:
+            search_parameters = []
+        if order_parameters is None:
+            order_parameters = []
+        if row_filter_parameters is None:
+            row_filter_parameters = []
         if album is not None and artist is None:
             raise ValueError("Cannot filter by album without artist")
 
@@ -452,13 +458,19 @@ class Database:
 
     def get_tracks_count(
         self,
-        search_parameters: List[SearchParameter] = [],
-        order_parameters: List[OrderParameter] = [],
-        row_filter_parameters: List[RowFilterParameter] = [],
+        search_parameters: List[SearchParameter] | None = None,
+        order_parameters: List[OrderParameter] | None = None,
+        row_filter_parameters: List[RowFilterParameter] | None = None,
         artist: Optional[str] = None,
         album: Optional[str] = None,
         timeout: float = 5,
     ) -> int | None:
+        if search_parameters is None:
+            search_parameters = []
+        if order_parameters is None:
+            order_parameters = []
+        if row_filter_parameters is None:
+            row_filter_parameters = []
         if album is not None and artist is None:
             raise ValueError("Cannot filter by album without artist")
 
@@ -518,12 +530,16 @@ class Database:
 
     def get_artists(
         self,
-        order_parameters: List[ArtistOrderParameter] = [],
-        row_filter_parameters: List[ArtistRowFilterParameter] = [],
+        order_parameters: List[ArtistOrderParameter] | None = None,
+        row_filter_parameters: List[ArtistRowFilterParameter] | None = None,
         limit: int = 100,
         offset: int = 0,
         timeout: float = 5,
     ) -> List[str] | None:
+        if order_parameters is None:
+            order_parameters = []
+        if row_filter_parameters is None:
+            row_filter_parameters = []
         if limit <= 0 or limit > 1000 or offset < 0:
             print(
                 f"Limit {limit} or Offset {offset} was set incorrectly for database.get_artists"
@@ -588,10 +604,14 @@ class Database:
 
     def get_artists_count(
         self,
-        order_parameters: List[ArtistOrderParameter] = [],
-        row_filter_parameters: List[ArtistRowFilterParameter] = [],
+        order_parameters: List[ArtistOrderParameter] | None = None,
+        row_filter_parameters: List[ArtistRowFilterParameter] | None = None,
         timeout: float = 5,
     ) -> int | None:
+        if order_parameters is None:
+            order_parameters = []
+        if row_filter_parameters is None:
+            row_filter_parameters = []
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
             print("Unable to connect to database")
@@ -637,12 +657,16 @@ class Database:
     def get_albums(
         self,
         artist: Optional[str] = None,
-        order_parameters: List[AlbumOrderParameter] = [],
-        row_filter_parameters: List[AlbumRowFilterParameter] = [],
+        order_parameters: List[AlbumOrderParameter] | None = None,
+        row_filter_parameters: List[AlbumRowFilterParameter] | None = None,
         limit: int = 100,
         offset: int = 0,
         timeout: float = 5,
     ) -> List[Album] | None:
+        if order_parameters is None:
+            order_parameters = []
+        if row_filter_parameters is None:
+            row_filter_parameters = []
         if limit <= 0 or limit > 1000 or offset < 0:
             print(
                 f"Limit {limit} or Offset {offset} was set incorrectly for database.get_albums"
@@ -780,10 +804,14 @@ class Database:
     def get_albums_count(
         self,
         artist: Optional[str] = None,
-        order_parameters: List[AlbumOrderParameter] = [],
-        row_filter_parameters: List[AlbumRowFilterParameter] = [],
+        order_parameters: List[AlbumOrderParameter] | None = None,
+        row_filter_parameters: List[AlbumRowFilterParameter] | None = None,
         timeout: float = 5,
     ) -> int | None:
+        if order_parameters is None:
+            order_parameters = []
+        if row_filter_parameters is None:
+            row_filter_parameters = []
         conn = self.connect_to_database(timeout=timeout)
         if not conn:
             print("Unable to connect to database")
