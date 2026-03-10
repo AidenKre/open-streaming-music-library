@@ -1,3 +1,4 @@
+import 'package:drift/drift.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
@@ -76,14 +77,14 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     AppDatabase db,
     List<ClientTrackDto> tracks,
   ) async {
-    for (final dto in tracks) {
-      await db.into(db.tracks).insertOnConflictUpdate(
-        tracksCompanionFromDto(dto),
-      );
-      await db.into(db.trackmetadata).insertOnConflictUpdate(
-        trackmetadataCompanionFromDto(dto),
-      );
-    }
+    await db.batch((batch) {
+      for (final dto in tracks) {
+        final tracksRow = tracksCompanionFromDto(dto);
+        final metaRow = trackmetadataCompanionFromDto(dto);
+        batch.insert(db.tracks, tracksRow, onConflict: DoUpdate((_) => tracksRow));
+        batch.insert(db.trackmetadata, metaRow, onConflict: DoUpdate((_) => metaRow));
+      }
+    });
   }
 }
 
