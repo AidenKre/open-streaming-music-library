@@ -125,7 +125,7 @@ List<RowFilterParameter> _cursorFromTrack(TrackUI track, List<OrderParameter> or
 class AudioNotifier extends Notifier<AudioState> {
   late final ja.AudioPlayer _player;
   final List<StreamSubscription<void>> _subscriptions = [];
-  bool _isAdvancing = false;
+  int _advanceGeneration = 0;
 
   AppDatabase get _db => ref.read(databaseProvider);
 
@@ -180,8 +180,7 @@ class AudioNotifier extends Notifier<AudioState> {
   }
 
   void _onTrackCompleted() {
-    if (_isAdvancing) return;
-    skipNext();
+    _autoAdvance();
   }
 
   String _streamUrl(TrackUI track) {
@@ -253,17 +252,21 @@ class AudioNotifier extends Notifier<AudioState> {
     await _playTrack(track);
   }
 
-  Future<void> skipNext() async {
-    if (_isAdvancing) return;
-    _isAdvancing = true;
-    try {
-      await _skipNextInner();
-    } finally {
-      _isAdvancing = false;
-    }
+  /// Called by auto-advance (song ended). Bumps generation so duplicate
+  /// `completed` events from the stream are ignored.
+  Future<void> _autoAdvance() async {
+    final gen = ++_advanceGeneration;
+    await _skipNextInner(gen);
   }
 
-  Future<void> _skipNextInner() async {
+  /// Called by user pressing next. Bumps generation, which cancels any
+  /// in-flight auto-advance (it will bail out at its next checkpoint).
+  Future<void> skipNext() async {
+    final gen = ++_advanceGeneration;
+    await _skipNextInner(gen);
+  }
+
+  Future<void> _skipNextInner(int gen) async {
     final track = state.currentTrack;
     final ctx = state.queueContext;
     if (track == null || ctx == null) {
@@ -280,13 +283,13 @@ class AudioNotifier extends Notifier<AudioState> {
     }
 
     if (state.shuffleOn && state.shuffledUuids.isNotEmpty) {
-      await _skipNextShuffle(ctx);
+      await _skipNextShuffle(gen, ctx);
     } else {
-      await _skipNextCursor(track, ctx);
+      await _skipNextCursor(gen, track, ctx);
     }
   }
 
-  Future<void> _skipNextCursor(TrackUI current, QueueContext ctx) async {
+  Future<void> _skipNextCursor(int gen, TrackUI current, QueueContext ctx) async {
     final cursor = _cursorFromTrack(current, ctx.orderParams);
     final rows = await _db.getTracks(
       orderBy: ctx.orderParams,
@@ -295,6 +298,7 @@ class AudioNotifier extends Notifier<AudioState> {
       album: ctx.album,
       limit: 1,
     );
+    if (gen != _advanceGeneration) return;
 
     if (rows.isNotEmpty) {
       await _playTrack(TrackUI.fromQueryRow(rows.first));
@@ -310,6 +314,7 @@ class AudioNotifier extends Notifier<AudioState> {
         album: ctx.album,
         limit: 1,
       );
+      if (gen != _advanceGeneration) return;
       if (firstRows.isNotEmpty) {
         await _playTrack(TrackUI.fromQueryRow(firstRows.first));
         return;
@@ -321,11 +326,12 @@ class AudioNotifier extends Notifier<AudioState> {
     state = state.copyWith(status: PlayerStatus.idle);
   }
 
-  Future<void> _skipNextShuffle(QueueContext ctx) async {
+  Future<void> _skipNextShuffle(int gen, QueueContext ctx) async {
     final nextIndex = state.shuffleIndex + 1;
     if (nextIndex < state.shuffledUuids.length) {
       final uuid = state.shuffledUuids[nextIndex];
       final rows = await _db.getTrackByUuid(uuid);
+      if (gen != _advanceGeneration) return;
       if (rows.isNotEmpty) {
         state = state.copyWith(shuffleIndex: nextIndex);
         await _playTrack(TrackUI.fromQueryRow(rows.first));
@@ -337,6 +343,7 @@ class AudioNotifier extends Notifier<AudioState> {
     if (state.repeatMode == QueueRepeatMode.all && state.shuffledUuids.isNotEmpty) {
       final uuid = state.shuffledUuids[0];
       final rows = await _db.getTrackByUuid(uuid);
+      if (gen != _advanceGeneration) return;
       if (rows.isNotEmpty) {
         state = state.copyWith(shuffleIndex: 0);
         await _playTrack(TrackUI.fromQueryRow(rows.first));
