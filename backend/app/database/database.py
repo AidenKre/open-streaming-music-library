@@ -259,7 +259,7 @@ class Database:
         except Exception as e:
             print(f"Failed to commit track {track}. {e}")
             conn.rollback()
-            conn.close
+            conn.close()
             return False
 
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
@@ -305,7 +305,7 @@ class Database:
         except Exception as e:
             print(f"Failed to commit deletion of uuid_id {uuid_id}. {e}")
             conn.rollback()
-            conn.close
+            conn.close()
             return False
 
     # TODO: searching needs some refactor. Specifically, using dicts for the searching is bad.
@@ -624,9 +624,7 @@ class Database:
 
         try:
             cursor = conn.cursor()
-            artist_count = int(
-                cursor.execute(query, tuple(parameters)).fetchone()[0]
-            )
+            artist_count = int(cursor.execute(query, tuple(parameters)).fetchone()[0])
         except Exception as e:
             print(f"Unable to fetch artist and/or album artists counts. {e}")
             conn.close()
@@ -879,9 +877,7 @@ class Database:
 
         try:
             cursor = conn.cursor()
-            album_count = int(
-                cursor.execute(query, tuple(parameters)).fetchone()[0]
-            )
+            album_count = int(cursor.execute(query, tuple(parameters)).fetchone()[0])
         except Exception as e:
             print(f"Failed to retrieve album counts: {e}")
             conn.close()
