@@ -1058,17 +1058,13 @@ class TestGetArtists:
         all_artists = []
 
         # First page
-        result = database.get_artists(
-            order_parameters=order_params, limit=2
-        )
+        result = database.get_artists(order_parameters=order_params, limit=2)
         assert result is not None
         all_artists.extend(result)
 
         # Pages via cursor
         while len(result) == 2:
-            row_filters = [
-                ArtistRowFilterParameter(column="artist", value=result[-1])
-            ]
+            row_filters = [ArtistRowFilterParameter(column="artist", value=result[-1])]
             result = database.get_artists(
                 order_parameters=order_params,
                 row_filter_parameters=row_filters,
@@ -1204,7 +1200,7 @@ class TestGetAlbums:
         # 5 tracks with no album from same artist, same year (None)
         # → 1 single grouping (artist, None)
         assert len(returned_albums) == 1
-        assert returned_albums[0].isSingleGrouping is True
+        assert returned_albums[0].is_single_grouping is True
         assert returned_albums[0].album is None
 
     def test_get_albums__artist_has_albums__returns_albums(self, tmp_path):
@@ -1225,9 +1221,11 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=artist)
         assert returned_albums
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         returned_album_names = [a.album for a in regular]
-        assert sorted(albums) == sorted(a for a in returned_album_names if a is not None)
+        assert sorted(albums) == sorted(
+            a for a in returned_album_names if a is not None
+        )
 
     def test_get_albums__album_artist_has_albums__returns_albums(self, tmp_path):
         database_path = tmp_path / "database.db"
@@ -1248,9 +1246,11 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=album_artist)
         assert returned_albums
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         returned_album_names = [a.album for a in regular]
-        assert sorted(albums) == sorted(a for a in returned_album_names if a is not None)
+        assert sorted(albums) == sorted(
+            a for a in returned_album_names if a is not None
+        )
 
     def test_get_albums__no_indpendant_artist_albums__returns_empty(self, tmp_path):
         database_path = tmp_path / "database.db"
@@ -1294,9 +1294,11 @@ class TestGetAlbums:
         for duplicate_artist in duplicate_artists:
             returned_albums = database.get_albums(artist=duplicate_artist)
             assert returned_albums
-            regular = [a for a in returned_albums if not a.isSingleGrouping]
+            regular = [a for a in returned_albums if not a.is_single_grouping]
             returned_album_names = [a.album for a in regular]
-            assert sorted(albums) == sorted(a for a in returned_album_names if a is not None)
+            assert sorted(albums) == sorted(
+                a for a in returned_album_names if a is not None
+            )
 
     def test_get_albums__bad_limit_offset__fails(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
@@ -1415,9 +1417,11 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=None)
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         returned_album_names = [a.album for a in regular]
-        assert sorted(all_albums) == sorted(a for a in returned_album_names if a is not None)
+        assert sorted(all_albums) == sorted(
+            a for a in returned_album_names if a is not None
+        )
 
     def test_get_albums__no_artist__pagination_works(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
@@ -1466,7 +1470,7 @@ class TestGetAlbums:
             ],
         )
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         returned_album_names = [a.album for a in regular]
         expected_order = sorted(albums_to_insert, key=str.lower)
         assert returned_album_names == expected_order
@@ -1494,7 +1498,7 @@ class TestGetAlbums:
             ],
         )
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         returned_album_names = [a.album for a in regular]
         assert returned_album_names == ["Early Album", "Mid Album", "Late Album"]
 
@@ -1516,7 +1520,7 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=None)
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         assert len(regular) == 2
 
         album_map = {a.album: a.artist for a in regular}
@@ -1537,7 +1541,7 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=None)
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         assert len(regular) == 2
 
         artists = {a.artist for a in regular}
@@ -1555,7 +1559,7 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=artist)
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         assert len(regular) == 1
         assert regular[0].album == "My Album"
         assert regular[0].artist == artist
@@ -1576,10 +1580,10 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=artist)
         assert returned_albums is not None
-        singles = [a for a in returned_albums if a.isSingleGrouping]
+        singles = [a for a in returned_albums if a.is_single_grouping]
         assert len(singles) == 1
         assert singles[0].album is None
-        assert singles[0].isSingleGrouping is True
+        assert singles[0].is_single_grouping is True
 
     def test_get_albums__singles_included_without_artist(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
@@ -1594,7 +1598,7 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=None)
         assert returned_albums is not None
-        singles = [a for a in returned_albums if a.isSingleGrouping]
+        singles = [a for a in returned_albums if a.is_single_grouping]
         # 3 different artists, each with no album, same year (None)
         # → 3 single groupings
         assert len(singles) == 3
@@ -1624,9 +1628,9 @@ class TestGetAlbums:
         assert returned_albums is not None
         assert len(returned_albums) == 2
         # Regular album first, single last
-        assert returned_albums[0].isSingleGrouping is False
+        assert returned_albums[0].is_single_grouping is False
         assert returned_albums[0].album == "Real Album"
-        assert returned_albums[1].isSingleGrouping is True
+        assert returned_albums[1].is_single_grouping is True
 
     def test_get_albums__singles_grouped_by_artist_year(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
@@ -1644,7 +1648,7 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=artist)
         assert returned_albums is not None
-        singles = [a for a in returned_albums if a.isSingleGrouping]
+        singles = [a for a in returned_albums if a.is_single_grouping]
         assert len(singles) == 2
         years = {s.year for s in singles}
         assert years == {2020, 2021}
@@ -1669,7 +1673,7 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=artist)
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         assert len(regular) == 2
         years = {a.year for a in regular}
         assert years == {2010, 2020}
@@ -1688,7 +1692,7 @@ class TestGetAlbums:
 
         returned_albums = database.get_albums(artist=artist)
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         assert len(regular) == 1
         assert regular[0].album == "Greatest Hits"
         assert regular[0].year == 2020
@@ -1717,7 +1721,7 @@ class TestGetAlbums:
             ],
         )
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         assert len(regular) == 2
         assert regular[0].album == "Album With Year"
         assert regular[0].year == 2020
@@ -1746,7 +1750,7 @@ class TestGetAlbums:
             ],
         )
         assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.isSingleGrouping]
+        regular = [a for a in returned_albums if not a.is_single_grouping]
         assert len(regular) == 2
         # Artist A has a non-empty artist → sorts first
         # Empty-string artist sorts after (or alongside) non-empty
@@ -1791,7 +1795,7 @@ class TestGetAlbums:
             row_filters = [
                 AlbumRowFilterParameter(
                     "is_single_grouping",
-                    str(int(last.isSingleGrouping)),
+                    str(int(last.is_single_grouping)),
                 ),
                 AlbumRowFilterParameter(
                     "year",
@@ -1812,7 +1816,7 @@ class TestGetAlbums:
             if page:
                 all_results.extend(page)
 
-        regular = [a for a in all_results if not a.isSingleGrouping]
+        regular = [a for a in all_results if not a.is_single_grouping]
         assert [a.album for a in regular] == ["Album A", "Album B", "Album C"]
 
     def test_get_albums__cursor_pagination_across_singles(self, tmp_path):
@@ -1851,7 +1855,7 @@ class TestGetAlbums:
         row_filters = [
             AlbumRowFilterParameter(
                 "is_single_grouping",
-                str(int(last.isSingleGrouping)),
+                str(int(last.is_single_grouping)),
             ),
             AlbumRowFilterParameter(
                 "year",
@@ -1873,9 +1877,9 @@ class TestGetAlbums:
         all_results.extend(page)
 
         assert len(all_results) == 2
-        assert all_results[0].isSingleGrouping is False
+        assert all_results[0].is_single_grouping is False
         assert all_results[0].album == "Real Album"
-        assert all_results[1].isSingleGrouping is True
+        assert all_results[1].is_single_grouping is True
 
 
 class TestGetAlbumsCount:

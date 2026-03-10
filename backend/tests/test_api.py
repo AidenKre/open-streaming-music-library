@@ -8,7 +8,13 @@ from typing import List, Optional, Set
 import pytest
 from fastapi.testclient import TestClient
 
-from app.models import GetAlbumsResponse, GetArtistsResponse, GetTracksResponse, Track, TrackMetaData
+from app.models import (
+    GetAlbumsResponse,
+    GetArtistsResponse,
+    GetTracksResponse,
+    Track,
+    TrackMetaData,
+)
 from app.models.client_track import ClientTrack
 
 
@@ -136,7 +142,9 @@ class TestGetTracks:
         # Random tracks that sort BEFORE the target artist
         add_tracks_to_client(client=client, amount_to_add=10)
         # Tracks from an artist that sorts AFTER the target artist
-        add_tracks_to_client(client=client, amount_to_add=5, artist="zzz_artist", album="zzz_album")
+        add_tracks_to_client(
+            client=client, amount_to_add=5, artist="zzz_artist", album="zzz_album"
+        )
 
         artist = "some random artist"
         albums = [f"album_{i}" for i in range(2)]
@@ -578,7 +586,7 @@ class TestGetAlbums:
         assert response
         # Track with no album produces a single grouping
         assert len(response.data) == 1
-        assert response.data[0].isSingleGrouping is True
+        assert response.data[0].is_single_grouping is True
         assert response.data[0].album is None
 
     def test_albums__has_albums__returns_albums(self, client):
@@ -696,7 +704,9 @@ class TestGetAlbums:
 
         gotten_album_names: List[str] = []
         for i in range(len(albums)):
-            r = client.get("/albums", params={"artist": artist, "limit": 1, "offset": i})
+            r = client.get(
+                "/albums", params={"artist": artist, "limit": 1, "offset": i}
+            )
             assert r.status_code == 200, r.text
 
             response = GetAlbumsResponse.model_validate(r.json())
@@ -781,7 +791,9 @@ class TestGetAlbums:
 
         response = GetAlbumsResponse.model_validate(r.json())
         returned_album_names = [a.album for a in response.data]
-        assert sorted(a for a in returned_album_names if a is not None) == sorted(all_albums)
+        assert sorted(a for a in returned_album_names if a is not None) == sorted(
+            all_albums
+        )
 
     def test_albums__no_artist__pagination_works(self, client, tmp_path):
         all_albums = set()
@@ -808,7 +820,9 @@ class TestGetAlbums:
             r = client.get("/albums", params={"limit": 2, "cursor": nextCursor})
             assert r.status_code == 200, r.text
             response = GetAlbumsResponse.model_validate(r.json())
-            gotten_album_names.extend(a.album for a in response.data if a.album is not None)
+            gotten_album_names.extend(
+                a.album for a in response.data if a.album is not None
+            )
             nextCursor = response.nextCursor
 
         assert sorted(all_albums) == sorted(gotten_album_names)

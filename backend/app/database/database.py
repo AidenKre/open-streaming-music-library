@@ -342,9 +342,9 @@ class Database:
 
         try:
             with self._connection(timeout=timeout) as conn:
-                rows = conn.cursor().execute(
-                    search_query, tuple(search_values)
-                ).fetchall()
+                rows = (
+                    conn.cursor().execute(search_query, tuple(search_values)).fetchall()
+                )
         except Exception as e:
             print(
                 f"Failed to search database. search_parameters: {search_parameters}. Exception: {e}"
@@ -682,7 +682,9 @@ class Database:
 
         try:
             with self._connection(timeout=timeout) as conn:
-                album_rows = conn.cursor().execute(subquery, tuple(parameters)).fetchall()
+                album_rows = (
+                    conn.cursor().execute(subquery, tuple(parameters)).fetchall()
+                )
         except Exception as e:
             print(f"Failed to retrieve albums: {e}")
             return None
@@ -692,7 +694,7 @@ class Database:
                 album=row["album"],
                 artist=row["artist"],
                 year=row["year"] if row["year"] is not None else None,
-                isSingleGrouping=bool(row["is_single_grouping"]),
+                is_single_grouping=bool(row["is_single_grouping"]),
             )
             for row in album_rows
         ]

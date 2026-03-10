@@ -294,7 +294,9 @@ def stream_track(uuid_id: str, request: Request):
 
         return StreamingResponse(
             iterfile(),
-            media_type=_CODEC_MIME.get(track.metadata.codec or "", f"audio/{track.metadata.codec}"),
+            media_type=_CODEC_MIME.get(
+                track.metadata.codec or "", f"audio/{track.metadata.codec}"
+            ),
             headers={"Accept-ranges": "bytes", "Content-length": str(file_size)},
         )
 
@@ -333,7 +335,9 @@ def stream_track(uuid_id: str, request: Request):
     return StreamingResponse(
         iter_range(),
         status_code=206,
-        media_type=_CODEC_MIME.get(track.metadata.codec or "", f"audio/{track.metadata.codec}"),
+        media_type=_CODEC_MIME.get(
+            track.metadata.codec or "", f"audio/{track.metadata.codec}"
+        ),
         headers={
             "Accept-ranges": "bytes",
             "Content-range": f"bytes {start}-{end}/{file_size}",
@@ -419,9 +423,7 @@ def get_artists(
 
         nextCursor = json.dumps(
             {
-                "order_parameters": [
-                    asdict(param) for param in order_parameters
-                ],
+                "order_parameters": [asdict(param) for param in order_parameters],
                 "row_filter_parameters": [
                     asdict(param) for param in new_row_filter_parameters
                 ],
@@ -446,26 +448,16 @@ def get_albums(
     if not cursor:
         if artist is not None:
             order_parameters = [
-                AlbumOrderParameter(
-                    column="year", isAscending=False, nullsLast=True
-                ),
+                AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
                 AlbumOrderParameter(column="is_single_grouping", isAscending=True),
-                AlbumOrderParameter(
-                    column="album", isAscending=True, nullsLast=True
-                ),
+                AlbumOrderParameter(column="album", isAscending=True, nullsLast=True),
             ]
         else:
             order_parameters = [
-                AlbumOrderParameter(
-                    column="artist", isAscending=True, nullsLast=True
-                ),
-                AlbumOrderParameter(
-                    column="year", isAscending=False, nullsLast=True
-                ),
+                AlbumOrderParameter(column="artist", isAscending=True, nullsLast=True),
+                AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
                 AlbumOrderParameter(column="is_single_grouping", isAscending=True),
-                AlbumOrderParameter(
-                    column="album", isAscending=True, nullsLast=True
-                ),
+                AlbumOrderParameter(column="album", isAscending=True, nullsLast=True),
             ]
         row_filter_parameters = []
     else:
@@ -538,7 +530,7 @@ def get_albums(
             elif col == "year":
                 raw_value = last_album.year
             elif col == "is_single_grouping":
-                raw_value = 1 if last_album.isSingleGrouping else 0
+                raw_value = 1 if last_album.is_single_grouping else 0
             else:
                 raw_value = None
             value = str(raw_value) if raw_value is not None else None
@@ -548,9 +540,7 @@ def get_albums(
 
         nextCursor = json.dumps(
             {
-                "order_parameters": [
-                    asdict(param) for param in order_parameters
-                ],
+                "order_parameters": [asdict(param) for param in order_parameters],
                 "row_filter_parameters": [
                     asdict(param) for param in new_row_filter_parameters
                 ],

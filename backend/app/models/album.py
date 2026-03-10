@@ -6,4 +6,5 @@ class Album(BaseModel):
     album: Optional[str] = None
     artist: Optional[str] = None
     year: Optional[int] = None
-    isSingleGrouping: bool = False
+    is_single_grouping: bool = False
+
