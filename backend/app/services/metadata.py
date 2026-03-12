@@ -107,7 +107,9 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
         if "track" in format_tags
         else None
     )
-    metadata.disc_number = format_tags.get("disc") if "disc" in format_tags else None
+    metadata.disc_number = (
+        _parse_track_number(format_tags.get("disc")) if "disc" in format_tags else None
+    )
 
     return metadata
 

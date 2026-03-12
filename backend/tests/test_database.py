@@ -6,7 +6,18 @@ from unittest.mock import patch
 
 import pytest
 
-from app.database.database import Database, DatabaseContext
+from app.database.database import (
+    ALLOWED_METADATA_COLUMNS,
+    AlbumOrderParameter,
+    AlbumRowFilterParameter,
+    ArtistOrderParameter,
+    ArtistRowFilterParameter,
+    Database,
+    DatabaseContext,
+    OrderParameter,
+    RowFilterParameter,
+    SearchParameter,
+)
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -396,7 +407,9 @@ class TestDatabaseGetTracks:
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
-        search_parameters = {"title": "test"}
+        search_parameters = [
+            SearchParameter(column="title", operator="=", value="test")
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
         assert len(returned_tracks) == 0
@@ -407,7 +420,9 @@ class TestDatabaseGetTracks:
 
         assert database.initialize()
 
-        search_parameters = {"title": "tests"}
+        search_parameters = [
+            SearchParameter(column="title", operator="=", value="test")
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
         assert len(returned_tracks) == 0
@@ -418,12 +433,14 @@ class TestDatabaseGetTracks:
 
         assert database.initialize()
 
-        search_parameters = {"invalid_column": "test"}
         with pytest.raises(ValueError):
+            search_parameters = [
+                SearchParameter(column="invalid_column", operator="=", value="test")
+            ]
             database.get_tracks(search_parameters=search_parameters)
 
-        order_parameters = {"invalid_column": "test"}
         with pytest.raises(ValueError):
+            order_parameters = [OrderParameter(column="invalid_column")]
             database.get_tracks(order_parameters=order_parameters)
 
     def test_get_tracks__valid_search__returns_results(self, tmp_path: Path):
@@ -451,7 +468,9 @@ class TestDatabaseGetTracks:
         assert database.add_track(track=track_5, timeout=1)
 
         # Searching by artist returns only the specified artists
-        search_parameters = {"artist": "artist"}
+        search_parameters = [
+            SearchParameter(column="artist", operator="=", value="artist")
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
@@ -465,7 +484,10 @@ class TestDatabaseGetTracks:
         assert len(titles) == 4
 
         # Artist + title search returns just the specific track
-        search_parameters = {"artist": "artist", "title": "title_1"}
+        search_parameters = [
+            SearchParameter(column="artist", operator="=", value="artist"),
+            SearchParameter(column="title", operator="=", value="title_1"),
+        ]
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
         assert len(returned_tracks) == 1
@@ -473,7 +495,7 @@ class TestDatabaseGetTracks:
         assert returned_tracks[0].metadata.title == "title_1"
 
         # Empty search returns all tracks
-        search_parameters = {}
+        search_parameters = []
         returned_tracks = database.get_tracks(search_parameters=search_parameters)
 
         titles = []
@@ -500,7 +522,7 @@ class TestDatabaseGetTracks:
             track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist")
             assert database.add_track(track=track, timeout=1)
 
-        order_by_asc = {"title": "ASC"}
+        order_by_asc = [OrderParameter(column="title", isAscending=True)]
 
         returned_tracks = database.get_tracks(order_parameters=order_by_asc)
         assert returned_tracks
@@ -511,7 +533,7 @@ class TestDatabaseGetTracks:
         ]
         assert sorted(returned_titles) == returned_titles
 
-        order_by_desc = {"title": "DESC"}
+        order_by_desc = [OrderParameter(column="title", isAscending=False)]
 
         returned_tracks = database.get_tracks(order_parameters=order_by_desc)
         assert returned_tracks
@@ -573,7 +595,7 @@ class TestDatabaseGetTracks:
         assert returned_artists is not None
         assert len(returned_artists) == 0
 
-    def test_get_tracks__track_search_parameter__works(self, tmp_path: Path):
+    def test_get_tracks__track_search_parameters__work(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path)
 
@@ -587,15 +609,175 @@ class TestDatabaseGetTracks:
             assert database.add_track(track=track, timeout=1)
             expected_tracks.append(track)
 
-        search_parameter = {"created_at": now - 1}
+        search_parameter = [
+            SearchParameter(column="created_at", operator=">", value=str(now - 1))
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameter)
         assert len(returned_tracks) == 5
 
-        search_parameter = {"created_at": now + 1}
+        search_parameter = [
+            SearchParameter(column="created_at", operator=">", value=str(now + 1))
+        ]
 
         returned_tracks = database.get_tracks(search_parameters=search_parameter)
         assert len(returned_tracks) == 0
+
+    def test_get_tracks__row_filter_parameters__work(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+
+        assert database.initialize()
+
+        for i in range(2):
+            artist = f"artist_{i}"
+            for j in range(2):
+                album = f"album_{i}"
+                for k in range(3):
+                    title = f"song_{i}_{j}_{k}"
+                    file_path = tmp_path / (title + ".mp3")
+                    track = create_track(path=file_path, title=title, artist=artist)
+                    track.metadata.album = album
+                    assert database.add_track(track=track)
+
+        columns: List[str] = [
+            "artist",
+            "album",
+            "disc_number",
+            "track_number",
+            "uuid_id",
+        ]
+
+        order_parameters: List[OrderParameter] = []
+        for column in columns:
+            order_parameters.append(OrderParameter(column=column, isAscending=True))
+
+        returned_tracks = database.get_tracks(
+            order_parameters=order_parameters, limit=4
+        )
+
+        all_returned_uuids = set()
+        all_returned_uuids.update([track.uuid_id for track in returned_tracks])
+
+        last_track = returned_tracks[-1]
+        row_filter_parameters: List[RowFilterParameter] = []
+        for column in columns:
+            if column in ALLOWED_METADATA_COLUMNS:
+                param = RowFilterParameter(
+                    column=column, value=str(getattr(last_track.metadata, column))
+                )
+            else:
+                param = RowFilterParameter(
+                    column=column, value=str(getattr(last_track, column))
+                )
+
+            row_filter_parameters.append(param)
+
+        returned_tracks = database.get_tracks(
+            order_parameters=order_parameters,
+            row_filter_parameters=row_filter_parameters,
+        )
+
+        for track in returned_tracks:
+            assert track.uuid_id not in all_returned_uuids
+
+        returned_uuids = [track.uuid_id for track in returned_tracks]
+        assert len(returned_uuids) == len(set(returned_uuids))
+
+    def test_get_tracks__artist_filter__returns_matching_tracks(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        # album=None means filter for IS NULL, so tracks here have no album
+        track_a = create_track(tmp_path / "a.mp3", "song_a", "ArtistA")
+        track_b = create_track(tmp_path / "b.mp3", "song_b", "ArtistB")
+        assert database.add_track(track=track_a)
+        assert database.add_track(track=track_b)
+
+        results = database.get_tracks(artist="ArtistA")
+        assert len(results) == 1
+        assert results[0].metadata.title == "song_a"
+
+    def test_get_tracks__artist_and_album_filter__returns_matching_tracks(
+        self, tmp_path
+    ):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track_a = create_track(tmp_path / "a.mp3", "song_a", "Artist")
+        track_a.metadata.album = "Album1"
+        track_b = create_track(tmp_path / "b.mp3", "song_b", "Artist")
+        track_b.metadata.album = "Album2"
+        track_c = create_track(tmp_path / "c.mp3", "song_c", "Other")
+        track_c.metadata.album = "Album1"
+        assert database.add_track(track=track_a)
+        assert database.add_track(track=track_b)
+        assert database.add_track(track=track_c)
+
+        results = database.get_tracks(artist="Artist", album="Album1")
+        assert len(results) == 1
+        assert results[0].metadata.title == "song_a"
+
+    def test_get_tracks__artist_with_null_album__returns_tracks_without_album(
+        self, tmp_path
+    ):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track_with_album = create_track(tmp_path / "a.mp3", "song_a", "Artist")
+        track_with_album.metadata.album = "SomeAlbum"
+        track_no_album = create_track(tmp_path / "b.mp3", "song_b", "Artist")
+        assert database.add_track(track=track_with_album)
+        assert database.add_track(track=track_no_album)
+
+        results = database.get_tracks(artist="Artist", album=None)
+        assert len(results) == 1
+        assert results[0].metadata.title == "song_b"
+
+    def test_get_tracks__album_without_artist__raises_value_error(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        with pytest.raises(ValueError):
+            database.get_tracks(album="SomeAlbum")
+
+    def test_get_tracks__album_artist_filter__uses_album_artist(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track_aa = create_track(
+            tmp_path / "a.mp3", "song_a", "feat_artist", "MainArtist"
+        )
+        track_aa.metadata.album = "TheAlbum"
+        track_plain = create_track(tmp_path / "b.mp3", "song_b", "MainArtist")
+        track_plain.metadata.album = "TheAlbum"
+        track_other = create_track(tmp_path / "c.mp3", "song_c", "Other")
+        track_other.metadata.album = "TheAlbum"
+        assert database.add_track(track=track_aa)
+        assert database.add_track(track=track_plain)
+        assert database.add_track(track=track_other)
+
+        results = database.get_tracks(artist="MainArtist", album="TheAlbum")
+        assert len(results) == 2
+        titles = {r.metadata.title for r in results}
+        assert titles == {"song_a", "song_b"}
+
+    def test_get_tracks__album_artist_excludes_plain_artist(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        database.initialize()
+
+        track = create_track(tmp_path / "a.mp3", "song_a", "feat_artist", "MainArtist")
+        track.metadata.album = "TheAlbum"
+        assert database.add_track(track=track)
+
+        results = database.get_tracks(artist="feat_artist")
+        assert len(results) == 0
 
 
 class TestGetTracksCount:
@@ -617,6 +799,35 @@ class TestGetTracksCount:
             assert database.add_track(track=track, timeout=1)
 
         assert database.get_tracks_count() == 5
+
+    def test_get_tracks_count__search_parameters__filter_count(self, tmp_path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+
+        assert database.initialize()
+
+        for i in range(5):
+            track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist_1")
+            assert database.add_track(track=track, timeout=1)
+
+        for i in range(5):
+            track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist_2")
+            assert database.add_track(track=track, timeout=1)
+
+        expected_count = 5
+        search_parameters: List[SearchParameter] = [
+            SearchParameter(column="artist", operator="=", value="artist_1")
+        ]
+
+        returned_count = database.get_tracks_count(search_parameters=search_parameters)
+        assert returned_count == expected_count
+
+        search_parameters: List[SearchParameter] = [
+            SearchParameter(column="artist", operator="=", value="artist_2")
+        ]
+
+        returned_count = database.get_tracks_count(search_parameters=search_parameters)
+        assert returned_count == expected_count
 
 
 class TestGetArtists:
@@ -816,6 +1027,55 @@ class TestGetArtists:
         assert returned_artists is not None
         assert len(returned_artists) == 0
 
+    def test_get_artists__cursor_pagination__skips_before_cursor(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        for name in ["Alice", "Bob", "Charlie"]:
+            track = create_track(tmp_path / f"{name}.mp3", f"song_{name}", name)
+            assert database.add_track(track=track)
+
+        order_params = [ArtistOrderParameter(column="artist", isAscending=True)]
+        row_filters = [ArtistRowFilterParameter(column="artist", value="Bob")]
+
+        result = database.get_artists(
+            order_parameters=order_params,
+            row_filter_parameters=row_filters,
+        )
+        assert result is not None
+        assert result == ["Charlie"]
+
+    def test_get_artists__cursor_pagination__across_pages(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        names = ["Alice", "Bob", "Charlie", "Dave", "Eve"]
+        for name in names:
+            track = create_track(tmp_path / f"{name}.mp3", f"song_{name}", name)
+            assert database.add_track(track=track)
+
+        order_params = [ArtistOrderParameter(column="artist", isAscending=True)]
+        all_artists = []
+
+        # First page
+        result = database.get_artists(order_parameters=order_params, limit=2)
+        assert result is not None
+        all_artists.extend(result)
+
+        # Pages via cursor
+        while len(result) == 2:
+            row_filters = [ArtistRowFilterParameter(column="artist", value=result[-1])]
+            result = database.get_artists(
+                order_parameters=order_params,
+                row_filter_parameters=row_filters,
+                limit=2,
+            )
+            assert result is not None
+            all_artists.extend(result)
+
+        assert sorted(all_artists) == sorted(names)
+        assert len(all_artists) == len(names)
+
 
 class TestGetArtistsCount:
     def test_get_artists_count__empty_db__returns_0(self, tmp_path):
@@ -894,18 +1154,36 @@ class TestGetArtistsCount:
 
         assert database.get_artists_count() == 1
 
+    def test_get_artists_count__with_cursor__counts_remaining(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
 
-class TestGetArtistAlbums:
-    def test_get_artist_albums__empty_db__returns_empty(self, tmp_path):
+        for name in ["Alice", "Bob", "Charlie"]:
+            track = create_track(tmp_path / f"{name}.mp3", f"song_{name}", name)
+            assert database.add_track(track=track)
+
+        order_params = [ArtistOrderParameter(column="artist", isAscending=True)]
+        # Cursor at Bob: count rows after Bob = Charlie = 1
+        row_filters = [ArtistRowFilterParameter(column="artist", value="Bob")]
+
+        count = database.get_artists_count(
+            order_parameters=order_params,
+            row_filter_parameters=row_filters,
+        )
+        assert count == 1
+
+
+class TestGetAlbums:
+    def test_get_albums__empty_db__returns_empty(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
 
-        returned_artists = database.get_artist_albums(artist="artist")
-        assert returned_artists is not None
-        assert len(returned_artists) == 0
+        returned_albums = database.get_albums(artist="artist")
+        assert returned_albums is not None
+        assert len(returned_albums) == 0
 
-    def test_get_artist_albums__no_albums__returns_empty(self, tmp_path):
+    def test_get_albums__no_albums__returns_singles(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
@@ -917,11 +1195,15 @@ class TestGetArtistAlbums:
             track = create_track(file_path, title, artist)
             assert database.add_track(track=track)
 
-        returned_albums = database.get_artist_albums(artist=artist)
+        returned_albums = database.get_albums(artist=artist)
         assert returned_albums is not None
-        assert len(returned_albums) == 0
+        # 5 tracks with no album from same artist, same year (None)
+        # → 1 single grouping (artist, None)
+        assert len(returned_albums) == 1
+        assert returned_albums[0].is_single_grouping is True
+        assert returned_albums[0].album is None
 
-    def test_get_artist_albums__artist_has_albums__returns_albums(self, tmp_path):
+    def test_get_albums__artist_has_albums__returns_albums(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
@@ -937,11 +1219,15 @@ class TestGetArtistAlbums:
             albums.add(album)
             assert database.add_track(track=track)
 
-        returned_albums = database.get_artist_albums(artist=artist)
+        returned_albums = database.get_albums(artist=artist)
         assert returned_albums
-        assert sorted(albums) == sorted(returned_albums)
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        returned_album_names = [a.album for a in regular]
+        assert sorted(albums) == sorted(
+            a for a in returned_album_names if a is not None
+        )
 
-    def test_get_artist_albums__album_artist_has_albums__returns_albums(self, tmp_path):
+    def test_get_albums__album_artist_has_albums__returns_albums(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
@@ -958,13 +1244,15 @@ class TestGetArtistAlbums:
             albums.add(album)
             assert database.add_track(track=track)
 
-        returned_albums = database.get_artist_albums(artist=album_artist)
+        returned_albums = database.get_albums(artist=album_artist)
         assert returned_albums
-        assert sorted(albums) == sorted(returned_albums)
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        returned_album_names = [a.album for a in regular]
+        assert sorted(albums) == sorted(
+            a for a in returned_album_names if a is not None
+        )
 
-    def test_get_artist_albums__no_indpendant_artist_albums__returns_empty(
-        self, tmp_path
-    ):
+    def test_get_albums__no_indpendant_artist_albums__returns_empty(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
@@ -982,11 +1270,11 @@ class TestGetArtistAlbums:
             assert database.add_track(track=track)
 
         for artist in artists:
-            returned_albums = database.get_artist_albums(artist=artist)
+            returned_albums = database.get_albums(artist=artist)
             assert returned_albums is not None
             assert len(returned_albums) == 0
 
-    def test_get_artist_albums__different_casing__returns_albums(self, tmp_path):
+    def test_get_albums__different_casing__returns_albums(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
         assert database.initialize()
 
@@ -1004,11 +1292,15 @@ class TestGetArtistAlbums:
             assert database.add_track(track=track)
 
         for duplicate_artist in duplicate_artists:
-            returned_albums = database.get_artist_albums(artist=duplicate_artist)
+            returned_albums = database.get_albums(artist=duplicate_artist)
             assert returned_albums
-            assert sorted(albums) == sorted(returned_albums)
+            regular = [a for a in returned_albums if not a.is_single_grouping]
+            returned_album_names = [a.album for a in regular]
+            assert sorted(albums) == sorted(
+                a for a in returned_album_names if a is not None
+            )
 
-    def test_get_artist_albums__bad_limit_offset__fails(self, tmp_path):
+    def test_get_albums__bad_limit_offset__fails(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
         assert database.initialize()
 
@@ -1023,22 +1315,22 @@ class TestGetArtistAlbums:
             assert database.add_track(track=track)
 
         with pytest.raises(ValueError):
-            database.get_artist_albums(artist=artist, limit=0)
+            database.get_albums(artist=artist, limit=0)
 
         with pytest.raises(ValueError):
-            database.get_artist_albums(artist=artist, limit=-1)
+            database.get_albums(artist=artist, limit=-1)
 
         with pytest.raises(ValueError):
-            database.get_artist_albums(artist=artist, limit=2000)
+            database.get_albums(artist=artist, limit=2000)
 
         with pytest.raises(ValueError):
-            database.get_artist_albums(artist=artist, offset=-1)
+            database.get_albums(artist=artist, offset=-1)
 
-        returned_albums = database.get_artist_albums(artist=artist, offset=1000)
+        returned_albums = database.get_albums(artist=artist, offset=1000)
         assert returned_albums is not None
         assert len(returned_albums) == 0
 
-    def test_get_artist_albums__limit_offset__works(self, tmp_path):
+    def test_get_albums__limit_offset__works(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
@@ -1067,35 +1359,539 @@ class TestGetArtistAlbums:
                     track.metadata.album = album
                     assert database.add_track(track=track)
 
-        total_returned_albums = []
-        returned_albums = database.get_artist_albums(artist=artist, limit=1)
+        total_returned_album_names = []
+        returned_albums = database.get_albums(artist=artist, limit=1)
         assert returned_albums
         assert len(returned_albums) == 1
-        total_returned_albums.append(returned_albums[0])
+        total_returned_album_names.append(returned_albums[0].album)
 
         offset = 1
         while returned_albums:
-            returned_albums = database.get_artist_albums(
-                artist=artist, limit=1, offset=offset
-            )
+            returned_albums = database.get_albums(artist=artist, limit=1, offset=offset)
             offset += 1
             if returned_albums:
                 assert len(returned_albums) == 1
-                total_returned_albums.append(returned_albums[0])
+                total_returned_album_names.append(returned_albums[0].album)
 
-        assert sorted(expected_albums) == sorted(total_returned_albums)
+        # Filter out single groupings (None album names) for comparison
+        regular_names = [n for n in total_returned_album_names if n is not None]
+        assert sorted(expected_albums) == sorted(regular_names)
+
+    def test_get_albums__no_artist__returns_all_albums(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        all_albums = set()
+
+        # Albums with artist set
+        for i in range(3):
+            title = f"song_a_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            album = f"artist_album_{i}"
+            all_albums.add(album)
+            track = create_track(file_path, title, f"artist_{i}")
+            track.metadata.album = album
+            assert database.add_track(track=track)
+
+        # Albums with album_artist set
+        for i in range(2):
+            title = f"song_aa_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            album = f"album_artist_album_{i}"
+            all_albums.add(album)
+            track = create_track(file_path, title, f"feat_{i}", "album_artist")
+            track.metadata.album = album
+            assert database.add_track(track=track)
+
+        # Albums with empty string artist — these have album set so they
+        # appear as regular albums (not singles). Empty-artist tracks go
+        # through the first UNION branch with artist="".
+        for i in range(2):
+            title = f"song_no_artist_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            album = f"no_artist_album_{i}"
+            all_albums.add(album)
+            track = create_track(file_path, title, "")
+            track.metadata.album = album
+            assert database.add_track(track=track)
+
+        returned_albums = database.get_albums(artist=None)
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        returned_album_names = [a.album for a in regular]
+        assert sorted(all_albums) == sorted(
+            a for a in returned_album_names if a is not None
+        )
+
+    def test_get_albums__no_artist__pagination_works(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        all_albums = set()
+        for i in range(5):
+            title = f"song_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            album = f"album_{i}"
+            all_albums.add(album)
+            track = create_track(file_path, title, f"artist_{i}")
+            track.metadata.album = album
+            assert database.add_track(track=track)
+
+        total_returned_names = []
+        offset = 0
+        while True:
+            returned = database.get_albums(artist=None, limit=2, offset=offset)
+            assert returned is not None
+            if not returned:
+                break
+            total_returned_names.extend([a.album for a in returned])
+            offset += 2
+
+        regular_names = [n for n in total_returned_names if n is not None]
+        assert sorted(all_albums) == sorted(regular_names)
+
+    def test_get_albums__order_by_alphabetical__returns_sorted(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        albums_to_insert = ["Zebra", "apple", "Mango", "banana", "Cherry"]
+        for i, album in enumerate(albums_to_insert):
+            title = f"song_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            track = create_track(file_path, title, f"artist_{i}")
+            track.metadata.album = album
+            assert database.add_track(track=track)
+
+        returned_albums = database.get_albums(
+            artist=None,
+            order_parameters=[
+                AlbumOrderParameter("is_single_grouping", True),
+                AlbumOrderParameter("album", True, nullsLast=True),
+            ],
+        )
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        returned_album_names = [a.album for a in regular]
+        expected_order = sorted(albums_to_insert, key=str.lower)
+        assert returned_album_names == expected_order
+
+    def test_get_albums__order_by_year__returns_year_sorted(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Insert in non-chronological order
+        album_years = [("Late Album", 2022), ("Early Album", 2018), ("Mid Album", 2020)]
+        for i, (album, year) in enumerate(album_years):
+            title = f"song_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            track = create_track(file_path, title, artist)
+            track.metadata.album = album
+            track.metadata.year = year
+            assert database.add_track(track=track)
+
+        returned_albums = database.get_albums(
+            artist=artist,
+            order_parameters=[
+                AlbumOrderParameter("is_single_grouping", True),
+                AlbumOrderParameter("year", True, nullsLast=True),
+            ],
+        )
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        returned_album_names = [a.album for a in regular]
+        assert returned_album_names == ["Early Album", "Mid Album", "Late Album"]
+
+    def test_get_albums__no_artist__returns_correct_artists(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        # Track with plain artist (no album_artist)
+        track1 = create_track(tmp_path / "s1.mp3", "song_1", "Artist A")
+        track1.metadata.album = "Album X"
+        assert database.add_track(track=track1)
+
+        # Track with album_artist
+        track2 = create_track(
+            tmp_path / "s2.mp3", "song_2", "feat_artist", "Album Artist B"
+        )
+        track2.metadata.album = "Album Y"
+        assert database.add_track(track=track2)
+
+        returned_albums = database.get_albums(artist=None)
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        assert len(regular) == 2
+
+        album_map = {a.album: a.artist for a in regular}
+        assert album_map["Album X"] == "Artist A"
+        assert album_map["Album Y"] == "Album Artist B"
+
+    def test_get_albums__same_album_different_artists__returns_both(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        track1 = create_track(tmp_path / "s1.mp3", "song_1", "Artist A")
+        track1.metadata.album = "Greatest Hits"
+        assert database.add_track(track=track1)
+
+        track2 = create_track(tmp_path / "s2.mp3", "song_2", "Artist B")
+        track2.metadata.album = "Greatest Hits"
+        assert database.add_track(track=track2)
+
+        returned_albums = database.get_albums(artist=None)
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        assert len(regular) == 2
+
+        artists = {a.artist for a in regular}
+        assert artists == {"Artist A", "Artist B"}
+        assert all(a.album == "Greatest Hits" for a in regular)
+
+    def test_get_albums__with_artist__returns_artist_field(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "Artist A"
+        track = create_track(tmp_path / "s1.mp3", "song_1", artist)
+        track.metadata.album = "My Album"
+        assert database.add_track(track=track)
+
+        returned_albums = database.get_albums(artist=artist)
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        assert len(regular) == 1
+        assert regular[0].album == "My Album"
+        assert regular[0].artist == artist
+
+    # --- New tests for singles and grouping behavior ---
+
+    def test_get_albums__singles_included_with_artist(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Insert tracks with no album → should produce single groupings
+        for i in range(3):
+            title = f"single_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            track = create_track(file_path, title, artist)
+            assert database.add_track(track=track)
+
+        returned_albums = database.get_albums(artist=artist)
+        assert returned_albums is not None
+        singles = [a for a in returned_albums if a.is_single_grouping]
+        assert len(singles) == 1
+        assert singles[0].album is None
+        assert singles[0].is_single_grouping is True
+
+    def test_get_albums__singles_included_without_artist(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        # Insert tracks with no album for different artists
+        for i in range(3):
+            title = f"single_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            track = create_track(file_path, title, f"artist_{i}")
+            assert database.add_track(track=track)
+
+        returned_albums = database.get_albums(artist=None)
+        assert returned_albums is not None
+        singles = [a for a in returned_albums if a.is_single_grouping]
+        # 3 different artists, each with no album, same year (None)
+        # → 3 single groupings
+        assert len(singles) == 3
+
+    def test_get_albums__singles_sort_last(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Insert a regular album
+        track1 = create_track(tmp_path / "s1.mp3", "album_song", artist)
+        track1.metadata.album = "Real Album"
+        track1.metadata.year = 2020
+        assert database.add_track(track=track1)
+
+        # Insert a single (no album)
+        track2 = create_track(tmp_path / "s2.mp3", "single_song", artist)
+        assert database.add_track(track=track2)
+
+        returned_albums = database.get_albums(
+            artist=artist,
+            order_parameters=[
+                AlbumOrderParameter("is_single_grouping", True),
+                AlbumOrderParameter("year", True, nullsLast=True),
+            ],
+        )
+        assert returned_albums is not None
+        assert len(returned_albums) == 2
+        # Regular album first, single last
+        assert returned_albums[0].is_single_grouping is False
+        assert returned_albums[0].album == "Real Album"
+        assert returned_albums[1].is_single_grouping is True
+
+    def test_get_albums__singles_grouped_by_artist_year(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Two singles from same artist but different years → two groupings
+        track1 = create_track(tmp_path / "s1.mp3", "single_2020", artist)
+        track1.metadata.year = 2020
+        assert database.add_track(track=track1)
+
+        track2 = create_track(tmp_path / "s2.mp3", "single_2021", artist)
+        track2.metadata.year = 2021
+        assert database.add_track(track=track2)
+
+        returned_albums = database.get_albums(artist=artist)
+        assert returned_albums is not None
+        singles = [a for a in returned_albums if a.is_single_grouping]
+        assert len(singles) == 2
+        years = {s.year for s in singles}
+        assert years == {2020, 2021}
+
+    def test_get_albums__same_album_same_artist_different_years__separate_entries(
+        self, tmp_path
+    ):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Same album name, same artist, different years → 2 entries
+        track1 = create_track(tmp_path / "s1.mp3", "song_1", artist)
+        track1.metadata.album = "Greatest Hits"
+        track1.metadata.year = 2010
+        assert database.add_track(track=track1)
+
+        track2 = create_track(tmp_path / "s2.mp3", "song_2", artist)
+        track2.metadata.album = "Greatest Hits"
+        track2.metadata.year = 2020
+        assert database.add_track(track=track2)
+
+        returned_albums = database.get_albums(artist=artist)
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        assert len(regular) == 2
+        years = {a.year for a in regular}
+        assert years == {2010, 2020}
+
+    def test_get_albums__same_album_same_artist_same_year__one_entry(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Two tracks, same album, same artist, same year → 1 entry
+        for i in range(2):
+            track = create_track(tmp_path / f"s{i}.mp3", f"song_{i}", artist)
+            track.metadata.album = "Greatest Hits"
+            track.metadata.year = 2020
+            assert database.add_track(track=track)
+
+        returned_albums = database.get_albums(artist=artist)
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        assert len(regular) == 1
+        assert regular[0].album == "Greatest Hits"
+        assert regular[0].year == 2020
+
+    def test_get_albums__null_year_sorts_last(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Album with year
+        track1 = create_track(tmp_path / "s1.mp3", "song_1", artist)
+        track1.metadata.album = "Album With Year"
+        track1.metadata.year = 2020
+        assert database.add_track(track=track1)
+
+        # Album without year
+        track2 = create_track(tmp_path / "s2.mp3", "song_2", artist)
+        track2.metadata.album = "Album No Year"
+        assert database.add_track(track=track2)
+
+        returned_albums = database.get_albums(
+            artist=artist,
+            order_parameters=[
+                AlbumOrderParameter("is_single_grouping", True),
+                AlbumOrderParameter("year", True, nullsLast=True),
+            ],
+        )
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        assert len(regular) == 2
+        assert regular[0].album == "Album With Year"
+        assert regular[0].year == 2020
+        assert regular[1].album == "Album No Year"
+        assert regular[1].year is None
+
+    def test_get_albums__null_artist_sorts_last(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        # Album with an artist
+        track1 = create_track(tmp_path / "s1.mp3", "song_1", "Artist A")
+        track1.metadata.album = "Album A"
+        assert database.add_track(track=track1)
+
+        # Album with empty string artist (treated as no real artist)
+        track2 = create_track(tmp_path / "s2.mp3", "song_2", "")
+        track2.metadata.album = "Album B"
+        assert database.add_track(track=track2)
+
+        returned_albums = database.get_albums(
+            artist=None,
+            order_parameters=[
+                AlbumOrderParameter("is_single_grouping", True),
+                AlbumOrderParameter("artist", True, nullsLast=True),
+            ],
+        )
+        assert returned_albums is not None
+        regular = [a for a in returned_albums if not a.is_single_grouping]
+        assert len(regular) == 2
+        # Artist A has a non-empty artist → sorts first
+        # Empty-string artist sorts after (or alongside) non-empty
+        assert regular[0].artist == ""
+        assert regular[1].artist == "Artist A"
+
+    def test_get_albums__cursor_pagination(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Insert albums with distinct years for deterministic ordering
+        album_data = [
+            ("Album A", 2018),
+            ("Album B", 2019),
+            ("Album C", 2020),
+        ]
+        for i, (album, year) in enumerate(album_data):
+            track = create_track(tmp_path / f"s{i}.mp3", f"song_{i}", artist)
+            track.metadata.album = album
+            track.metadata.year = year
+            assert database.add_track(track=track)
+
+        order_params = [
+            AlbumOrderParameter("is_single_grouping", True),
+            AlbumOrderParameter("year", True, nullsLast=True),
+            AlbumOrderParameter("album", True, nullsLast=True),
+        ]
+
+        # Get first page
+        all_results = []
+        page = database.get_albums(
+            artist=artist, order_parameters=order_params, limit=1
+        )
+        assert page is not None
+        assert len(page) == 1
+        all_results.extend(page)
+
+        # Paginate one-at-a-time using cursor
+        while page:
+            last = page[-1]
+            row_filters = [
+                AlbumRowFilterParameter(
+                    "is_single_grouping",
+                    str(int(last.is_single_grouping)),
+                ),
+                AlbumRowFilterParameter(
+                    "year",
+                    str(last.year) if last.year is not None else None,
+                ),
+                AlbumRowFilterParameter(
+                    "album",
+                    last.album,
+                ),
+            ]
+            page = database.get_albums(
+                artist=artist,
+                order_parameters=order_params,
+                row_filter_parameters=row_filters,
+                limit=1,
+            )
+            assert page is not None
+            if page:
+                all_results.extend(page)
+
+        regular = [a for a in all_results if not a.is_single_grouping]
+        assert [a.album for a in regular] == ["Album A", "Album B", "Album C"]
+
+    def test_get_albums__cursor_pagination_across_singles(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Regular album
+        track1 = create_track(tmp_path / "s1.mp3", "album_song", artist)
+        track1.metadata.album = "Real Album"
+        track1.metadata.year = 2020
+        assert database.add_track(track=track1)
+
+        # Single (no album)
+        track2 = create_track(tmp_path / "s2.mp3", "single_song", artist)
+        track2.metadata.year = 2021
+        assert database.add_track(track=track2)
+
+        order_params = [
+            AlbumOrderParameter("is_single_grouping", True),
+            AlbumOrderParameter("year", True, nullsLast=True),
+            AlbumOrderParameter("album", True, nullsLast=True),
+        ]
+
+        # First page: should get the regular album
+        all_results = []
+        page = database.get_albums(
+            artist=artist, order_parameters=order_params, limit=1
+        )
+        assert page is not None
+        assert len(page) == 1
+        all_results.extend(page)
+
+        # Second page via cursor: should get the single
+        last = page[-1]
+        row_filters = [
+            AlbumRowFilterParameter(
+                "is_single_grouping",
+                str(int(last.is_single_grouping)),
+            ),
+            AlbumRowFilterParameter(
+                "year",
+                str(last.year) if last.year is not None else None,
+            ),
+            AlbumRowFilterParameter(
+                "album",
+                last.album,
+            ),
+        ]
+        page = database.get_albums(
+            artist=artist,
+            order_parameters=order_params,
+            row_filter_parameters=row_filters,
+            limit=1,
+        )
+        assert page is not None
+        assert len(page) == 1
+        all_results.extend(page)
+
+        assert len(all_results) == 2
+        assert all_results[0].is_single_grouping is False
+        assert all_results[0].album == "Real Album"
+        assert all_results[1].is_single_grouping is True
 
 
-class TestGetArtistAlbumsCount:
-    def test_get_artist_albums_count__missing_artist__returns_0(self, tmp_path):
+class TestGetAlbumsCount:
+    def test_get_albums_count__missing_artist__returns_0(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
 
-        album_count = database.get_artist_albums_count(artist="artist")
+        album_count = database.get_albums_count(artist="artist")
         assert album_count == 0
 
-    def test_get_artist_albums_count__no_albums__returns_0(self, tmp_path):
+    def test_get_albums_count__no_albums__returns_1_single(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
@@ -1107,30 +1903,31 @@ class TestGetArtistAlbumsCount:
             track = create_track(file_path, title, artist)
             assert database.add_track(track=track)
 
-        album_count = database.get_artist_albums_count(artist=artist)
+        album_count = database.get_albums_count(artist=artist)
+        # 3 tracks with no album, same artist, same year (None)
+        # → 1 single grouping
+        assert album_count == 1
 
-        assert album_count == 0
-
-    def test_get_artist_albums_count__albums__returns_count(self, tmp_path):
+    def test_get_albums_count__albums__returns_count(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
 
-        expected_ablums = set()
+        expected_albums = set()
         artist = "artist"
         for i in range(3):
             title = f"song_{i}"
             album = f"album_{i}"
-            expected_ablums.add(album)
+            expected_albums.add(album)
             file_path = tmp_path / (title + ".mp3")
             track = create_track(file_path, title, artist)
             track.metadata.album = album
             assert database.add_track(track=track)
 
-        album_count = database.get_artist_albums_count(artist=artist)
-        assert album_count == len(expected_ablums)
+        album_count = database.get_albums_count(artist=artist)
+        assert album_count == len(expected_albums)
 
-    def test_get_artist_albums_count__different_casing__excludes_none(self, tmp_path):
+    def test_get_albums_count__different_casing__excludes_none(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
         assert database.initialize()
 
@@ -1148,11 +1945,11 @@ class TestGetArtistAlbumsCount:
             assert database.add_track(track=track)
 
         for duplicate_artist in duplicate_artists:
-            album_count = database.get_artist_albums_count(artist=duplicate_artist)
+            album_count = database.get_albums_count(artist=duplicate_artist)
             assert album_count
             assert len(albums) == album_count
 
-    def test_get_artist_albums_count__artist_ablums__returns_count(self, tmp_path):
+    def test_get_albums_count__artist_albums__returns_count(self, tmp_path):
         database_path = tmp_path / "database.db"
         database = set_up_database(database_path=database_path)
         database.initialize()
@@ -1171,13 +1968,13 @@ class TestGetArtistAlbumsCount:
             track.metadata.album = album
             assert database.add_track(track=track)
 
-        album_count = database.get_artist_albums_count(artist=album_artist)
+        album_count = database.get_albums_count(artist=album_artist)
         assert album_count == len(expected_artist_albums)
 
         # Check that the individual artists do not have any albums
         # if only on artist album
         for artist in empty_artists:
-            album_count = database.get_artist_albums_count(artist=artist)
+            album_count = database.get_albums_count(artist=artist)
             assert album_count == 0
 
         # Add some albums to one of the empty artists, to ensure that counts
@@ -1193,5 +1990,86 @@ class TestGetArtistAlbumsCount:
             track.metadata.album = album
             assert database.add_track(track=track)
 
-        album_count = database.get_artist_albums_count(artist=artist)
+        album_count = database.get_albums_count(artist=artist)
         assert album_count == len(expected_albums)
+
+    def test_get_albums_count__no_artist__returns_total_count(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        all_albums = set()
+
+        # Albums with artist
+        for i in range(3):
+            title = f"song_a_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            album = f"artist_album_{i}"
+            all_albums.add(album)
+            track = create_track(file_path, title, f"artist_{i}")
+            track.metadata.album = album
+            assert database.add_track(track=track)
+
+        # Albums with album_artist
+        for i in range(2):
+            title = f"song_aa_{i}"
+            file_path = tmp_path / (title + ".mp3")
+            album = f"album_artist_album_{i}"
+            all_albums.add(album)
+            track = create_track(file_path, title, f"feat_{i}", "album_artist")
+            track.metadata.album = album
+            assert database.add_track(track=track)
+
+        album_count = database.get_albums_count(artist=None)
+        assert album_count == len(all_albums)
+
+    def test_get_albums_count__with_cursor__counts_remaining(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        album_data = [
+            ("Album A", 2018),
+            ("Album B", 2019),
+            ("Album C", 2020),
+        ]
+        for i, (album, year) in enumerate(album_data):
+            track = create_track(tmp_path / f"s{i}.mp3", f"song_{i}", artist)
+            track.metadata.album = album
+            track.metadata.year = year
+            assert database.add_track(track=track)
+
+        order_params = [
+            AlbumOrderParameter("is_single_grouping", True),
+            AlbumOrderParameter("year", True, nullsLast=True),
+        ]
+
+        # Count with cursor past first album (year=2018)
+        row_filters = [
+            AlbumRowFilterParameter("is_single_grouping", "0"),
+            AlbumRowFilterParameter("year", "2018"),
+        ]
+        count = database.get_albums_count(
+            artist=artist,
+            order_parameters=order_params,
+            row_filter_parameters=row_filters,
+        )
+        assert count == 2  # Album B (2019) and Album C (2020)
+
+    def test_get_albums_count__includes_singles(self, tmp_path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        database.initialize()
+
+        artist = "artist"
+        # Regular album
+        track1 = create_track(tmp_path / "s1.mp3", "album_song", artist)
+        track1.metadata.album = "Real Album"
+        track1.metadata.year = 2020
+        assert database.add_track(track=track1)
+
+        # Single (no album)
+        track2 = create_track(tmp_path / "s2.mp3", "single_song", artist)
+        assert database.add_track(track=track2)
+
+        album_count = database.get_albums_count(artist=artist)
+        # 1 regular album + 1 single grouping = 2
+        assert album_count == 2

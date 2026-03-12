@@ -1,14 +1,35 @@
 import json
+import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from os import stat
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.database import Database, DatabaseContext
-from app.models import ClientTrack, GetArtistsResponse, GetTracksResponse, Track
+from app.database import (
+    AlbumOrderParameter,
+    AlbumRowFilterParameter,
+    ArtistOrderParameter,
+    ArtistRowFilterParameter,
+    Database,
+    DatabaseContext,
+    OrderParameter,
+    RowFilterParameter,
+    SearchParameter,
+)
+from app.models import (
+    Album,
+    ClientTrack,
+    GetAlbumsResponse,
+    GetArtistsResponse,
+    GetTracksResponse,
+    Track,
+    track_meta_data,
+)
 from app.services import (
     FileWatcher,
     Ingestor,
@@ -26,6 +47,7 @@ async def lifespan(app: FastAPI):
 
 
 # TODO: Implement locking so that only one uvicorn worker runs startup sequence. Use fasteners with a locking file.
+# TODO: Dependency inject depends on get_database into api endpoints (and make the new function needed for this)
 app = FastAPI(lifespan=lifespan)
 
 
@@ -35,6 +57,12 @@ def startup_event():
     app.state.organizer = None
     app.state.ingestor = None
     app.state.file_watcher = None
+
+    settings.app_data_dir.mkdir(parents=True, exist_ok=True)
+    settings.music_library_dir.mkdir(parents=True, exist_ok=True)
+    settings.import_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"app data dir: {settings.app_data_dir}")
 
     # Set up database
     database_path = settings.app_data_dir / "database" / "database.db"
@@ -87,18 +115,38 @@ def get_tracks(
     cursor: Optional[str] = None,
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    artist: Optional[str] = None,
+    album: Optional[str] = None,
     newer_than: Optional[int] = None,
+    older_than: Optional[int] = None,
 ):
-    total_track_count = app.state.database.get_tracks_count()
-    if total_track_count is None:
-        raise HTTPException(
-            status_code=500, detail="Could not find a total track count"
-        )
+    database: Database = cast(Database, app.state.database)
+
+    search_parameters: List[SearchParameter]
+    order_parameters: List[OrderParameter]
     if not cursor:
-        order_parameters = {"artist": "ASC", "album": "ASC", "track_number": "ASC"}
-        search_parameters = {}
+        order_parameters = [
+            OrderParameter(column="artist", isAscending=True),
+            OrderParameter(column="album", isAscending=True),
+            OrderParameter(column="disc_number", isAscending=True),
+            OrderParameter(column="track_number", isAscending=True),
+            OrderParameter(column="uuid_id", isAscending=True),
+        ]
+        search_parameters = []
+        row_filter_parameters = []
         if newer_than:
-            search_parameters["last_updated"] = newer_than
+            search_parameters.append(
+                SearchParameter(
+                    column="last_updated", operator=">", value=str(newer_than)
+                )
+            )
+        if older_than:
+            search_parameters.append(
+                SearchParameter(
+                    column="last_updated", operator="<=", value=str(older_than)
+                )
+            )
+
     else:
         try:
             decoded = json.loads(cursor)
@@ -118,47 +166,108 @@ def get_tracks(
                 status_code=400, detail="Cursor could not be decoded for json"
             )
 
-        if total_track_count == 0 or offset >= total_track_count:
-            return GetTracksResponse(data=[], nextCursor=None)
-
-        valid_cursor_keys = ["order_parameters", "search_parameters", "limit", "offset"]
-        valid_cursor_keys = sorted(valid_cursor_keys)
+        valid_cursor_keys = sorted(
+            [
+                "order_parameters",
+                "row_filter_parameters",
+                "search_parameters",
+                "artist",
+                "album",
+            ]
+        )
         if sorted(cursor_dict.keys()) != valid_cursor_keys:
             raise HTTPException(
                 status_code=400, detail="Invalid dictionary keys for the cursor_dict"
             )
-        order_parameters = cursor_dict["order_parameters"]
-        search_parameters = cursor_dict["search_parameters"]
-        limit = cursor_dict["limit"]
-        offset = cursor_dict["offset"]
 
-    gotten_tracks = app.state.database.get_tracks(
+        order_parameters = [
+            OrderParameter(**item) for item in cursor_dict["order_parameters"]
+        ]
+        search_parameters = [
+            SearchParameter(**item) for item in cursor_dict["search_parameters"]
+        ]
+        row_filter_parameters = [
+            RowFilterParameter(**item) for item in cursor_dict["row_filter_parameters"]
+        ]
+        artist = cursor_dict["artist"]
+        album = cursor_dict["album"]
+
+    remaining_track_count = database.get_tracks_count(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
+        row_filter_parameters=row_filter_parameters,
+        artist=artist,
+        album=album,
+    )
+    if remaining_track_count is None:
+        raise HTTPException(
+            status_code=500, detail="Unable to get count of remaining tracks"
+        )
+    if remaining_track_count == 0 or offset >= remaining_track_count:
+        return GetTracksResponse(data=[], nextCursor=None)
+
+    gotten_tracks = database.get_tracks(
+        search_parameters=search_parameters,
+        order_parameters=order_parameters,
+        row_filter_parameters=row_filter_parameters,
+        artist=artist,
+        album=album,
         limit=limit,
         offset=offset,
     )
 
     client_track_list = [ClientTrack.from_track(track=track) for track in gotten_tracks]
-    if offset + limit >= total_track_count:
+    if len(client_track_list) == remaining_track_count:
         nextCursor = None
     else:
+        last_track: ClientTrack = client_track_list[-1]
+
+        new_row_filter_parameters: List[RowFilterParameter] = []
+        for order_param in order_parameters:
+            col = order_param.column
+            # Linked to allowed track columns in database.py.
+            # probably should move these constants to their own
+            # file or something
+            if col in ["uuid_id", "created_at", "last_updated"]:
+                raw_value = getattr(last_track, col)
+            else:
+                raw_value = getattr(last_track.metadata, col)
+            value = str(raw_value) if raw_value is not None else None
+            new_row_filter_parameters.append(
+                RowFilterParameter(column=col, value=value)
+            )
+
         nextCursor = json.dumps(
             {
-                "order_parameters": order_parameters,
-                "search_parameters": search_parameters,
-                "limit": limit,
-                "offset": offset + limit,
+                "order_parameters": [asdict(param) for param in order_parameters],
+                "row_filter_parameters": [
+                    asdict(param) for param in new_row_filter_parameters
+                ],
+                "search_parameters": [asdict(param) for param in search_parameters],
+                "artist": artist,
+                "album": album,
             }
         )
 
     return GetTracksResponse(data=client_track_list, nextCursor=nextCursor)
 
 
+_CODEC_MIME: dict[str, str] = {
+    "aac": "audio/mp4",
+    "alac": "audio/mp4",
+    "mp3": "audio/mpeg",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+    "pcm_s16le": "audio/wav",
+    "pcm_s24le": "audio/wav",
+    "pcm_f32le": "audio/wav",
+}
+
+
 @app.get("/tracks/{uuid_id}/stream")
 def stream_track(uuid_id: str, request: Request):
     CHUNK_SIZE = 1024 * 1024
-    search_parameters = {"uuid_id": uuid_id}
+    search_parameters = [SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
     track_list: List[Track] = app.state.database.get_tracks(
         search_parameters=search_parameters
     )
@@ -185,7 +294,9 @@ def stream_track(uuid_id: str, request: Request):
 
         return StreamingResponse(
             iterfile(),
-            media_type=f"audio/{track.metadata.codec}",
+            media_type=_CODEC_MIME.get(
+                track.metadata.codec or "", f"audio/{track.metadata.codec}"
+            ),
             headers={"Accept-ranges": "bytes", "Content-length": str(file_size)},
         )
 
@@ -224,7 +335,9 @@ def stream_track(uuid_id: str, request: Request):
     return StreamingResponse(
         iter_range(),
         status_code=206,
-        media_type=f"audio/{track.metadata.codec}",
+        media_type=_CODEC_MIME.get(
+            track.metadata.codec or "", f"audio/{track.metadata.codec}"
+        ),
         headers={
             "Accept-ranges": "bytes",
             "Content-range": f"bytes {start}-{end}/{file_size}",
@@ -235,75 +348,209 @@ def stream_track(uuid_id: str, request: Request):
 
 @app.get("/artists", response_model=GetArtistsResponse)
 def get_artists(
+    cursor: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    cursor: Optional[str] = None,
 ):
-    artist_count = app.state.database.get_artists_count()
-    if not artist_count:
+    database: Database = cast(Database, app.state.database)
+
+    order_parameters: List[ArtistOrderParameter]
+    row_filter_parameters: List[ArtistRowFilterParameter]
+
+    if not cursor:
+        order_parameters = [
+            ArtistOrderParameter(column="artist", isAscending=True),
+        ]
+        row_filter_parameters = []
+    else:
+        try:
+            decoded = json.loads(cursor)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, detail="Cursor could not be decoded as JSON"
+            )
+        if not isinstance(decoded, dict):
+            raise HTTPException(
+                status_code=400, detail="Cursor did not decode to a dict"
+            )
+
+        cursor_dict: Dict[str, Any] = decoded
+        valid_cursor_keys = sorted(["order_parameters", "row_filter_parameters"])
+        if sorted(cursor_dict.keys()) != valid_cursor_keys:
+            raise HTTPException(
+                status_code=400, detail="Invalid dictionary keys for the cursor"
+            )
+
+        order_parameters = [
+            ArtistOrderParameter(**item) for item in cursor_dict["order_parameters"]
+        ]
+        row_filter_parameters = [
+            ArtistRowFilterParameter(**item)
+            for item in cursor_dict["row_filter_parameters"]
+        ]
+
+    remaining_count = database.get_artists_count(
+        order_parameters=order_parameters,
+        row_filter_parameters=row_filter_parameters,
+    )
+    if remaining_count is None:
         raise HTTPException(
-            status_code=500, detail="Server was unable to get count of all artists"
+            status_code=500, detail="Unable to get count of remaining artists"
         )
 
-    if artist_count <= 0:
+    if remaining_count == 0 or offset >= remaining_count:
         return GetArtistsResponse(data=[], nextCursor=None)
 
-    if cursor:
-        try:
-            limit_s, offset_s = cursor.split("-")
-            limit = int(limit_s)
-            offset = int(offset_s)
-        except Exception:
-            raise HTTPException(status_code=422, detail="Cursor format was invalid")
-
-    if offset >= artist_count:
-        return GetArtistsResponse(data=[], nextCursor=None)
-
-    returned_artists: List[str] = app.state.database.get_artists(
-        limit=limit, offset=offset
+    returned_artists = database.get_artists(
+        order_parameters=order_parameters,
+        row_filter_parameters=row_filter_parameters,
+        limit=limit,
+        offset=offset,
     )
 
-    if limit + offset >= artist_count:
+    if returned_artists is None:
+        raise HTTPException(
+            status_code=500, detail="Unable to fetch artists from the database"
+        )
+
+    if len(returned_artists) == remaining_count:
         nextCursor = None
     else:
-        nextCursor = f"{limit}-{limit + offset}"
+        last_artist = returned_artists[-1]
+        new_row_filter_parameters = [
+            ArtistRowFilterParameter(column="artist", value=last_artist),
+        ]
+
+        nextCursor = json.dumps(
+            {
+                "order_parameters": [asdict(param) for param in order_parameters],
+                "row_filter_parameters": [
+                    asdict(param) for param in new_row_filter_parameters
+                ],
+            }
+        )
 
     return GetArtistsResponse(data=returned_artists, nextCursor=nextCursor)
 
 
-@app.get("/artists/{artist}/albums", response_model=GetArtistsResponse)
-def get_artist_album(
-    artist: str,
+@app.get("/albums", response_model=GetAlbumsResponse)
+def get_albums(
+    cursor: Optional[str] = None,
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    cursor: Optional[str] = None,
+    artist: Optional[str] = None,
 ):
-    album_count = app.state.database.get_artist_albums_count(artist=artist)
-    if album_count is None:
+    database: Database = cast(Database, app.state.database)
+
+    order_parameters: List[AlbumOrderParameter]
+    row_filter_parameters: List[AlbumRowFilterParameter]
+
+    if not cursor:
+        if artist is not None:
+            order_parameters = [
+                AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
+                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
+                AlbumOrderParameter(column="album", isAscending=True, nullsLast=True),
+            ]
+        else:
+            order_parameters = [
+                AlbumOrderParameter(column="artist", isAscending=True, nullsLast=True),
+                AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
+                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
+                AlbumOrderParameter(column="album", isAscending=True, nullsLast=True),
+            ]
+        row_filter_parameters = []
+    else:
+        try:
+            decoded = json.loads(cursor)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, detail="Cursor could not be decoded as JSON"
+            )
+        if not isinstance(decoded, dict):
+            raise HTTPException(
+                status_code=400, detail="Cursor did not decode to a dict"
+            )
+
+        cursor_dict: Dict[str, Any] = decoded
+        valid_cursor_keys = sorted(
+            ["order_parameters", "row_filter_parameters", "artist"]
+        )
+        if sorted(cursor_dict.keys()) != valid_cursor_keys:
+            raise HTTPException(
+                status_code=400, detail="Invalid dictionary keys for the cursor"
+            )
+
+        order_parameters = [
+            AlbumOrderParameter(**item) for item in cursor_dict["order_parameters"]
+        ]
+        row_filter_parameters = [
+            AlbumRowFilterParameter(**item)
+            for item in cursor_dict["row_filter_parameters"]
+        ]
+        artist = cursor_dict["artist"]
+
+    remaining_count = database.get_albums_count(
+        artist=artist,
+        order_parameters=order_parameters,
+        row_filter_parameters=row_filter_parameters,
+    )
+    if remaining_count is None:
         raise HTTPException(status_code=500, detail="Unable to get count")
 
-    if cursor:
-        try:
-            limit_s, offset_s = cursor.split("-")
-            limit = int(limit_s)
-            offset = int(offset_s)
-        except Exception:
-            raise HTTPException(status_code=422, detail="Cursor format was invalid")
+    if remaining_count == 0 or offset >= remaining_count:
+        return GetAlbumsResponse(data=[], nextCursor=None)
 
-    if offset >= album_count or album_count == 0:
-        return GetArtistsResponse(data=[], nextCursor=None)
-
-    returned_albums: List[str] = app.state.database.get_artist_albums(
-        artist=artist, limit=limit, offset=offset
+    returned_albums: List[Album] | None = database.get_albums(
+        artist=artist,
+        order_parameters=order_parameters,
+        row_filter_parameters=row_filter_parameters,
+        limit=limit,
+        offset=offset,
     )
 
-    if limit + offset >= album_count:
+    if returned_albums is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to fetch albums from the backends database",
+        )
+
+    if len(returned_albums) == remaining_count:
         nextCursor = None
     else:
-        nextCursor = f"{limit}-{offset + limit}"
-    return GetArtistsResponse(data=returned_albums, nextCursor=nextCursor)
+        last_album: Album = returned_albums[-1]
+        new_row_filter_parameters: List[AlbumRowFilterParameter] = []
+        for order_param in order_parameters:
+            col = order_param.column
+            raw_value: Any
+            if col == "album":
+                raw_value = last_album.album
+            elif col == "artist":
+                raw_value = last_album.artist
+            elif col == "year":
+                raw_value = last_album.year
+            elif col == "is_single_grouping":
+                raw_value = 1 if last_album.is_single_grouping else 0
+            else:
+                raw_value = None
+            value = str(raw_value) if raw_value is not None else None
+            new_row_filter_parameters.append(
+                AlbumRowFilterParameter(column=col, value=value)
+            )
+
+        nextCursor = json.dumps(
+            {
+                "order_parameters": [asdict(param) for param in order_parameters],
+                "row_filter_parameters": [
+                    asdict(param) for param in new_row_filter_parameters
+                ],
+                "artist": artist,
+            }
+        )
+
+    return GetAlbumsResponse(data=returned_albums, nextCursor=nextCursor)
 
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello, World!"}
+    return {"message": "Healthy"}
