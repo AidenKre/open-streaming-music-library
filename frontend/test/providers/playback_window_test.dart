@@ -34,6 +34,23 @@ void main() {
       expect(plan.currentIndex, 2);
     });
 
+    test('keeps a wrapped first album track centered in the window', () {
+      final plan = buildPlaybackWindowPlan(
+        current: _track('a'),
+        previousCandidates: [_track('e'), _track('d'), _track('c')],
+        nextCandidates: [_track('b'), _track('c'), _track('d')],
+      );
+
+      expect(plan.tracks.map((track) => track.uuidId).toList(), [
+        'd',
+        'e',
+        'a',
+        'b',
+        'c',
+      ]);
+      expect(plan.currentIndex, 2);
+    });
+
     test('fills extra slots from the next side near the queue start', () {
       final plan = buildPlaybackWindowPlan(
         current: _track('c'),

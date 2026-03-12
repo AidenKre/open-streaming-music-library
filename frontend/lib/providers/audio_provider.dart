@@ -138,7 +138,6 @@ class AudioNotifier extends Notifier<AudioState> {
   Future<void> _mutationQueue = Future<void>.value();
   int _windowGeneration = 0;
   int _currentIndexMuteDepth = 0;
-  int _sequenceMutationDepth = 0;
   int _upcomingRefreshGeneration = 0;
   bool _isDisposed = false;
   List<TrackUI> _windowTracks = const [];
@@ -154,25 +153,6 @@ class AudioNotifier extends Notifier<AudioState> {
       _player.playerStateStream.listen((playerState) {
         final status = _mapStatus(playerState);
         state = state.copyWith(status: status);
-        if (playerState.processingState == ja.ProcessingState.completed) {
-          final completedTrackUuid = state.currentTrack?.uuidId;
-          final ignoreCompleted = _sequenceMutationDepth > 0;
-          unawaited(
-            _enqueueMutation(() async {
-              if (_currentIndexMuteDepth > 0) return;
-              if (ignoreCompleted) return;
-              if (completedTrackUuid == null) return;
-              await Future<void>.delayed(const Duration(milliseconds: 100));
-              if (_sequenceMutationDepth > 0) return;
-              if (_player.processingState != ja.ProcessingState.completed) {
-                return;
-              }
-              if (_hasNextTrackInWindow()) return;
-              if (state.currentTrack?.uuidId != completedTrackUuid) return;
-              await _handlePlaybackCompleted();
-            }),
-          );
-        }
       }),
     );
 
@@ -259,27 +239,6 @@ class AudioNotifier extends Notifier<AudioState> {
     } finally {
       _currentIndexMuteDepth--;
     }
-  }
-
-  Future<T> _withSequenceMutation<T>(Future<T> Function() action) async {
-    _sequenceMutationDepth++;
-    try {
-      return await action();
-    } finally {
-      _sequenceMutationDepth--;
-    }
-  }
-
-  bool _hasNextTrackInWindow() {
-    final currentIndex = _player.currentIndex;
-    final sequenceLength = _player.sequence.length;
-    if (currentIndex != null && sequenceLength > 0) {
-      return currentIndex >= 0 && currentIndex < sequenceLength - 1;
-    }
-
-    final mirroredIndex = _windowCurrentIndex;
-    if (mirroredIndex == null) return false;
-    return mirroredIndex >= 0 && mirroredIndex < _windowTracks.length - 1;
   }
 
   String _streamUrl(TrackUI track) {
@@ -382,6 +341,7 @@ class AudioNotifier extends Notifier<AudioState> {
     TrackUI current, {
     required bool forward,
     required int limit,
+    required bool allowWrap,
   }) async {
     if (limit <= 0 || state.shuffledUuids.isEmpty) return const [];
 
@@ -393,7 +353,7 @@ class AudioNotifier extends Notifier<AudioState> {
     for (var step = 1; step <= limit; step++) {
       var index = forward ? currentIndex + step : currentIndex - step;
       if (index < 0 || index >= total) {
-        if (state.repeatMode != QueueRepeatMode.all) break;
+        if (!allowWrap) break;
         index = ((index % total) + total) % total;
       }
       uuids.add(state.shuffledUuids[index]);
@@ -408,6 +368,7 @@ class AudioNotifier extends Notifier<AudioState> {
     TrackUI current,
     QueueContext context, {
     required int limit,
+    required bool allowWrap,
   }) async {
     if (limit <= 0) return const [];
 
@@ -420,7 +381,7 @@ class AudioNotifier extends Notifier<AudioState> {
       limit: limit,
     );
     final tracks = rows.map(TrackUI.fromQueryRow).toList();
-    if (tracks.length < limit && state.repeatMode == QueueRepeatMode.all) {
+    if (tracks.length < limit && allowWrap) {
       final wrapRows = await _db.getTracks(
         orderBy: context.orderParams,
         artist: context.artist,
@@ -441,6 +402,7 @@ class AudioNotifier extends Notifier<AudioState> {
     TrackUI current,
     QueueContext context, {
     required int limit,
+    required bool allowWrap,
   }) async {
     if (limit <= 0) return const [];
 
@@ -454,7 +416,7 @@ class AudioNotifier extends Notifier<AudioState> {
       limit: limit,
     );
     final tracks = rows.map(TrackUI.fromQueryRow).toList();
-    if (tracks.length < limit && state.repeatMode == QueueRepeatMode.all) {
+    if (tracks.length < limit && allowWrap) {
       final wrapRows = await _db.getTracks(
         orderBy: reversed,
         artist: context.artist,
@@ -473,32 +435,55 @@ class AudioNotifier extends Notifier<AudioState> {
 
   Future<PlaybackWindowPlan> _buildWindowPlan(TrackUI current) async {
     final context = state.queueContext;
-    if (context == null || state.repeatMode == QueueRepeatMode.one) {
+    if (context == null) {
       return _singleTrackPlan(current);
     }
+
+    if (state.repeatMode == QueueRepeatMode.one) {
+      return PlaybackWindowPlan(
+        tracks: List<TrackUI>.generate(_playbackWindowSize, (_) => current),
+        currentIndex: _preferredNeighborsPerSide,
+      );
+    }
+
+    final allowWrappedPrevious = true;
+    final allowWrappedNext = state.repeatMode == QueueRepeatMode.all;
 
     final previousCandidates = state.shuffleOn && state.shuffledUuids.isNotEmpty
         ? await _loadShuffleCandidates(
             current,
             forward: false,
             limit: _playbackWindowSize - 1,
+            allowWrap: allowWrappedPrevious,
           )
         : await _loadPreviousCursorCandidates(
             current,
             context,
             limit: _playbackWindowSize - 1,
+            allowWrap: allowWrappedPrevious,
           );
     final nextCandidates = state.shuffleOn && state.shuffledUuids.isNotEmpty
         ? await _loadShuffleCandidates(
             current,
             forward: true,
             limit: _playbackWindowSize - 1,
+            allowWrap: allowWrappedNext,
           )
         : await _loadNextCursorCandidates(
             current,
             context,
             limit: _playbackWindowSize - 1,
+            allowWrap: allowWrappedNext,
           );
+
+    if (state.repeatMode == QueueRepeatMode.all &&
+        previousCandidates.isEmpty &&
+        nextCandidates.isEmpty) {
+      return PlaybackWindowPlan(
+        tracks: List<TrackUI>.generate(_playbackWindowSize, (_) => current),
+        currentIndex: _preferredNeighborsPerSide,
+      );
+    }
 
     return buildPlaybackWindowPlan(
       current: current,
@@ -519,29 +504,25 @@ class AudioNotifier extends Notifier<AudioState> {
     required Duration initialPosition,
   }) async {
     try {
-      await _withSequenceMutation(() async {
-        await _withMutedCurrentIndexEvents(() async {
-          if (plan.tracks.length == 1 && plan.currentIndex == 0) {
-            await _player.setAudioSource(
-              _audioSourceForTrack(plan.tracks.first),
-            );
-          } else {
-            await _player.setAudioSources(
-              plan.tracks.map(_audioSourceForTrack).toList(growable: false),
-              initialIndex: plan.currentIndex,
-            );
-          }
+      await _withMutedCurrentIndexEvents(() async {
+        if (plan.tracks.length == 1 && plan.currentIndex == 0) {
+          await _player.setAudioSource(_audioSourceForTrack(plan.tracks.first));
+        } else {
+          await _player.setAudioSources(
+            plan.tracks.map(_audioSourceForTrack).toList(growable: false),
+            initialIndex: plan.currentIndex,
+          );
+        }
+        if (generation != _windowGeneration) return;
+        if (initialPosition > Duration.zero) {
+          await _player.seek(initialPosition, index: plan.currentIndex);
           if (generation != _windowGeneration) return;
-          if (initialPosition > Duration.zero) {
-            await _player.seek(initialPosition, index: plan.currentIndex);
-            if (generation != _windowGeneration) return;
-          }
-          _windowTracks = List<TrackUI>.unmodifiable(plan.tracks);
-          _windowCurrentIndex = plan.currentIndex;
-          if (shouldPlay) {
-            _playWithoutAwait();
-          }
-        });
+        }
+        _windowTracks = List<TrackUI>.unmodifiable(plan.tracks);
+        _windowCurrentIndex = plan.currentIndex;
+        if (shouldPlay) {
+          _playWithoutAwait();
+        }
       });
     } on Exception {
       return false;
@@ -549,43 +530,14 @@ class AudioNotifier extends Notifier<AudioState> {
 
     if (generation != _windowGeneration) return false;
     await _refreshUpcoming(windowGenerationSnapshot: generation);
+    await _reconcileCurrentIndexIfNeeded(generation: generation);
     return true;
-  }
-
-  Future<void> _expandPlaybackWindow(
-    TrackUI track, {
-    required int generation,
-  }) async {
-    if (generation != _windowGeneration) return;
-    if (state.queueContext == null || state.repeatMode == QueueRepeatMode.one) {
-      return;
-    }
-
-    PlaybackWindowPlan desired;
-    try {
-      desired = await _buildWindowPlan(track);
-    } on Exception {
-      return;
-    }
-    if (generation != _windowGeneration) return;
-    if (_sameTrackSequence(_windowTracks, desired.tracks) &&
-        _windowCurrentIndex == desired.currentIndex) {
-      return;
-    }
-
-    await _applyWindowPlan(
-      desired,
-      generation: generation,
-      shouldPlay: _player.playing,
-      initialPosition: _player.position,
-    );
   }
 
   Future<void> _replaceWindowAroundTrack(
     TrackUI track, {
     required bool shouldPlay,
     required Duration initialPosition,
-    bool eagerStart = false,
   }) async {
     final generation = ++_windowGeneration;
     final resetDuration = state.currentTrack?.uuidId != track.uuidId;
@@ -595,27 +547,6 @@ class AudioNotifier extends Notifier<AudioState> {
       resetDuration: resetDuration,
       status: PlayerStatus.loading,
     );
-
-    if (eagerStart) {
-      final started = await _applyWindowPlan(
-        _singleTrackPlan(track),
-        generation: generation,
-        shouldPlay: shouldPlay,
-        initialPosition: initialPosition,
-      );
-      if (!started) {
-        if (generation == _windowGeneration) {
-          state = state.copyWith(status: PlayerStatus.idle);
-        }
-        return;
-      }
-      unawaited(
-        _enqueueMutation(() async {
-          await _expandPlaybackWindow(track, generation: generation);
-        }),
-      );
-      return;
-    }
 
     try {
       final plan = await _buildWindowPlan(track);
@@ -679,43 +610,72 @@ class AudioNotifier extends Notifier<AudioState> {
       return;
     }
 
+    if (_canSlideWindowForward(
+      currentIndex: windowCurrentIndex,
+      desired: desired,
+    )) {
+      await _withMutedCurrentIndexEvents(() async {
+        await _player.removeAudioSourceAt(0);
+        await _player.addAudioSource(_audioSourceForTrack(desired.tracks.last));
+      });
+      _windowTracks = List<TrackUI>.unmodifiable(desired.tracks);
+      _windowCurrentIndex = desired.currentIndex;
+      await _reconcileCurrentIndexIfNeeded(generation: generation);
+      return;
+    }
+
+    if (_canSlideWindowBackward(
+      currentIndex: windowCurrentIndex,
+      desired: desired,
+    )) {
+      await _withMutedCurrentIndexEvents(() async {
+        await _player.insertAudioSource(
+          0,
+          _audioSourceForTrack(desired.tracks.first),
+        );
+        await _player.removeAudioSourceAt(_windowTracks.length);
+      });
+      _windowTracks = List<TrackUI>.unmodifiable(desired.tracks);
+      _windowCurrentIndex = desired.currentIndex;
+      await _reconcileCurrentIndexIfNeeded(generation: generation);
+      return;
+    }
+
     final working = List<TrackUI>.from(_windowTracks);
     var currentIndex = windowCurrentIndex;
     var committedWindowState = false;
 
-    await _withSequenceMutation(() async {
-      await _withMutedCurrentIndexEvents(() async {
-        while (currentIndex > 0) {
-          if (generation != _windowGeneration || working.isEmpty) return;
-          await _player.removeAudioSourceAt(0);
-          working.removeAt(0);
-          currentIndex--;
-        }
+    await _withMutedCurrentIndexEvents(() async {
+      while (currentIndex > 0) {
+        if (generation != _windowGeneration || working.isEmpty) return;
+        await _player.removeAudioSourceAt(0);
+        working.removeAt(0);
+        currentIndex--;
+      }
 
-        while (working.length > currentIndex + 1) {
-          if (generation != _windowGeneration || working.isEmpty) return;
-          await _player.removeAudioSourceAt(working.length - 1);
-          working.removeLast();
-        }
+      while (working.length > currentIndex + 1) {
+        if (generation != _windowGeneration || working.isEmpty) return;
+        await _player.removeAudioSourceAt(working.length - 1);
+        working.removeLast();
+      }
 
-        for (var i = desired.currentIndex - 1; i >= 0; i--) {
-          if (generation != _windowGeneration) return;
-          final track = desired.tracks[i];
-          await _player.insertAudioSource(0, _audioSourceForTrack(track));
-          working.insert(0, track);
-          currentIndex++;
-        }
+      for (var i = desired.currentIndex - 1; i >= 0; i--) {
+        if (generation != _windowGeneration) return;
+        final track = desired.tracks[i];
+        await _player.insertAudioSource(0, _audioSourceForTrack(track));
+        working.insert(0, track);
+        currentIndex++;
+      }
 
-        for (var i = desired.currentIndex + 1; i < desired.tracks.length; i++) {
-          if (generation != _windowGeneration) return;
-          final track = desired.tracks[i];
-          await _player.addAudioSource(_audioSourceForTrack(track));
-          working.add(track);
-        }
-        _windowTracks = List<TrackUI>.unmodifiable(working);
-        _windowCurrentIndex = currentIndex;
-        committedWindowState = true;
-      });
+      for (var i = desired.currentIndex + 1; i < desired.tracks.length; i++) {
+        if (generation != _windowGeneration) return;
+        final track = desired.tracks[i];
+        await _player.addAudioSource(_audioSourceForTrack(track));
+        working.add(track);
+      }
+      _windowTracks = List<TrackUI>.unmodifiable(working);
+      _windowCurrentIndex = currentIndex;
+      committedWindowState = true;
     });
 
     if (generation != _windowGeneration) return;
@@ -729,28 +689,42 @@ class AudioNotifier extends Notifier<AudioState> {
       );
       return;
     }
+
+    await _reconcileCurrentIndexIfNeeded(generation: generation);
   }
 
-  Future<TrackUI?> _resolveNextTrack(TrackUI current) async {
-    final context = state.queueContext;
-    if (state.repeatMode == QueueRepeatMode.one) return current;
-    if (context == null) return null;
-
-    final tracks = state.shuffleOn && state.shuffledUuids.isNotEmpty
-        ? await _loadShuffleCandidates(current, forward: true, limit: 1)
-        : await _loadNextCursorCandidates(current, context, limit: 1);
-    return tracks.isEmpty ? null : tracks.first;
+  bool _canSlideWindowForward({
+    required int currentIndex,
+    required PlaybackWindowPlan desired,
+  }) {
+    if (_windowTracks.length != desired.tracks.length ||
+        _windowTracks.isEmpty) {
+      return false;
+    }
+    if (desired.currentIndex != currentIndex - 1) return false;
+    for (var i = 0; i < desired.tracks.length - 1; i++) {
+      if (desired.tracks[i].uuidId != _windowTracks[i + 1].uuidId) {
+        return false;
+      }
+    }
+    return true;
   }
 
-  Future<TrackUI?> _resolvePreviousTrack(TrackUI current) async {
-    final context = state.queueContext;
-    if (state.repeatMode == QueueRepeatMode.one) return current;
-    if (context == null) return null;
-
-    final tracks = state.shuffleOn && state.shuffledUuids.isNotEmpty
-        ? await _loadShuffleCandidates(current, forward: false, limit: 1)
-        : await _loadPreviousCursorCandidates(current, context, limit: 1);
-    return tracks.isEmpty ? null : tracks.first;
+  bool _canSlideWindowBackward({
+    required int currentIndex,
+    required PlaybackWindowPlan desired,
+  }) {
+    if (_windowTracks.length != desired.tracks.length ||
+        _windowTracks.isEmpty) {
+      return false;
+    }
+    if (desired.currentIndex != currentIndex + 1) return false;
+    for (var i = 1; i < desired.tracks.length; i++) {
+      if (desired.tracks[i].uuidId != _windowTracks[i - 1].uuidId) {
+        return false;
+      }
+    }
+    return true;
   }
 
   Future<void> _handleCurrentIndexChanged(int index) async {
@@ -775,42 +749,22 @@ class AudioNotifier extends Notifier<AudioState> {
     await _syncPlayerWindowToPlan(desired, generation: generation);
   }
 
-  Future<void> _handlePlaybackCompleted() async {
-    if (_sequenceMutationDepth > 0) return;
-    if (_hasNextTrackInWindow()) return;
-
-    final track = state.currentTrack;
-    if (track == null) return;
-
-    if (state.repeatMode == QueueRepeatMode.one) {
-      await _player.seek(Duration.zero);
-      _playWithoutAwait();
+  Future<void> _reconcileCurrentIndexIfNeeded({required int generation}) async {
+    if (generation != _windowGeneration) return;
+    final playerIndex = _player.currentIndex;
+    if (playerIndex == null ||
+        playerIndex < 0 ||
+        playerIndex >= _windowTracks.length) {
       return;
     }
 
-    final nextTrack = await _resolveNextTrack(track);
-    if (nextTrack == null) {
-      _windowGeneration++;
-      await _withSequenceMutation(() async {
-        await _withMutedCurrentIndexEvents(() async {
-          await _player.stop();
-          await _player.clearAudioSources();
-        });
-      });
-      _windowTracks = const [];
-      _windowCurrentIndex = null;
-      state = state.copyWith(
-        status: PlayerStatus.idle,
-        position: Duration.zero,
-      );
+    final currentTrack = _windowTracks[playerIndex];
+    if (_windowCurrentIndex == playerIndex &&
+        state.currentTrack?.uuidId == currentTrack.uuidId) {
       return;
     }
 
-    await _replaceWindowAroundTrack(
-      nextTrack,
-      shouldPlay: true,
-      initialPosition: Duration.zero,
-    );
+    await _handleCurrentIndexChanged(playerIndex);
   }
 
   Future<void> _reconfigureWindowAroundCurrentTrack(TrackUI track) async {
@@ -836,7 +790,6 @@ class AudioNotifier extends Notifier<AudioState> {
         track,
         shouldPlay: true,
         initialPosition: Duration.zero,
-        eagerStart: true,
       );
     });
   }
@@ -873,7 +826,6 @@ class AudioNotifier extends Notifier<AudioState> {
         track,
         shouldPlay: true,
         initialPosition: Duration.zero,
-        eagerStart: true,
       );
     });
   }
@@ -893,20 +845,12 @@ class AudioNotifier extends Notifier<AudioState> {
         return;
       }
 
-      final nextIndex = (_windowCurrentIndex ?? 0) + 1;
+      final currentIndex = _player.currentIndex ?? _windowCurrentIndex;
+      if (currentIndex == null) return;
+      final nextIndex = currentIndex + 1;
       if (nextIndex < _windowTracks.length) {
         await _player.seek(Duration.zero, index: nextIndex);
         _playWithoutAwait();
-        return;
-      }
-
-      final nextTrack = await _resolveNextTrack(track);
-      if (nextTrack != null) {
-        await _replaceWindowAroundTrack(
-          nextTrack,
-          shouldPlay: true,
-          initialPosition: Duration.zero,
-        );
         return;
       }
 
@@ -935,20 +879,15 @@ class AudioNotifier extends Notifier<AudioState> {
         return;
       }
 
-      final previousIndex = (_windowCurrentIndex ?? 0) - 1;
+      final currentIndex = _player.currentIndex ?? _windowCurrentIndex;
+      if (currentIndex == null) {
+        await _player.seek(Duration.zero);
+        return;
+      }
+      final previousIndex = currentIndex - 1;
       if (previousIndex >= 0) {
         await _player.seek(Duration.zero, index: previousIndex);
         _playWithoutAwait();
-        return;
-      }
-
-      final previousTrack = await _resolvePreviousTrack(track);
-      if (previousTrack != null) {
-        await _replaceWindowAroundTrack(
-          previousTrack,
-          shouldPlay: true,
-          initialPosition: Duration.zero,
-        );
         return;
       }
 
@@ -1029,7 +968,6 @@ class AudioNotifier extends Notifier<AudioState> {
         track,
         shouldPlay: true,
         initialPosition: Duration.zero,
-        eagerStart: true,
       );
     });
   }
@@ -1103,11 +1041,9 @@ class AudioNotifier extends Notifier<AudioState> {
   Future<void> stop() {
     return _enqueueMutation(() async {
       _windowGeneration++;
-      await _withSequenceMutation(() async {
-        await _withMutedCurrentIndexEvents(() async {
-          await _player.stop();
-          await _player.clearAudioSources();
-        });
+      await _withMutedCurrentIndexEvents(() async {
+        await _player.stop();
+        await _player.clearAudioSources();
       });
       _windowTracks = const [];
       _windowCurrentIndex = null;
