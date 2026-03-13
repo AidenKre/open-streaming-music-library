@@ -360,7 +360,12 @@ class AudioCoordinator extends Notifier<AudioState> {
       return;
     }
 
-    _setCurrentTrackState(track, position: Duration.zero, resetDuration: true);
+    _setCurrentTrackState(
+      track,
+      position: Duration.zero,
+      duration: Duration(milliseconds: (track.duration * 1000).round()),
+      resetDuration: true,
+    );
     _updateBridgeNowPlaying(track);
 
     await _refreshUpcoming();

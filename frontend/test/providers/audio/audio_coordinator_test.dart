@@ -480,6 +480,45 @@ void main() {
       },
     );
 
+    test(
+      'natural track change should seed playback duration from track metadata before a duration event arrives',
+      () async {
+        final a = _track('a', duration: 180);
+        final b = _track('b', duration: 245);
+
+        final c = createContainer(queueLookup: FakeQueueLookup());
+        final notifier = c.read(audioProvider.notifier);
+        notifier.debugSetState(
+          AudioState(
+            playback: PlaybackSlice(
+              currentTrack: a,
+              status: PlayerStatus.playing,
+              duration: const Duration(seconds: 180),
+            ),
+            queue: QueueSlice(
+              queueContext: QueueContext(
+                orderParams: [OrderParameter(column: 'track_number')],
+              ),
+            ),
+          ),
+        );
+        fakeWindow.setWindow([a, b], 1);
+
+        await notifier.debugHandleTrackChanged(
+          WindowTrackChange(
+            track: b,
+            index: 1,
+            origin: WindowTrackChangeOrigin.directPlayerIndex,
+          ),
+        );
+
+        expect(
+          c.read(audioProvider).playback.duration,
+          const Duration(seconds: 245),
+        );
+      },
+    );
+
     test('stop should clear the now playing item in audio_service', () async {
       final current = _track('b', title: 'B');
       final queue = FakeQueueLookup(
@@ -513,6 +552,7 @@ TrackUI _track(
   String? artist,
   String? album,
   int? trackNumber,
+  double duration = 180,
 }) {
   return TrackUI(
     uuidId: uuid,
@@ -522,7 +562,7 @@ TrackUI _track(
     trackNumber: trackNumber,
     createdAt: 0,
     lastUpdated: 0,
-    duration: 180,
+    duration: duration,
     bitrateKbps: 320,
     sampleRateHz: 44100,
     channels: 2,
