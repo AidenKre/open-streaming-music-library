@@ -366,6 +366,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       position: Duration.zero,
       duration: Duration(milliseconds: (track.duration * 1000).round()),
       resetDuration: true,
+      acknowledgeTrack: false,
     );
     _updateBridgeNowPlaying(track);
     _updateBridgePlaybackState();
@@ -419,9 +420,12 @@ class AudioCoordinator extends Notifier<AudioState> {
     Duration? duration,
     required bool resetDuration,
     PlayerStatus? status,
+    bool acknowledgeTrack = true,
   }) {
     final shuffleIndex = _resolvedShuffleIndex(track);
-    _window.acknowledgeCurrentTrack(track);
+    if (acknowledgeTrack) {
+      _window.acknowledgeCurrentTrack(track);
+    }
     state = state.copyWith(
       playback: state.playback.copyWith(
         currentTrack: track,
@@ -492,6 +496,9 @@ class AudioCoordinator extends Notifier<AudioState> {
     required Duration initialPosition,
   }) async {
     final generation = _window.incrementGeneration();
+    final previousPlayback = state.playback;
+    final previousUpcoming = state.queue.upcomingTracks;
+    final previousTrack = state.playback.currentTrack;
     final resetDuration = state.playback.currentTrack?.uuidId != track.uuidId;
     _setCurrentTrackState(
       track,
@@ -501,6 +508,20 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
     _updateBridgeNowPlaying(track);
     _updateBridgePlaybackState();
+
+    void restorePreviousPlayback() {
+      state = state.copyWith(
+        playback: previousPlayback,
+        queue: state.queue.copyWith(upcomingTracks: previousUpcoming),
+      );
+      _window.acknowledgeCurrentTrack(previousTrack);
+      if (previousTrack != null) {
+        _updateBridgeNowPlaying(previousTrack);
+      } else {
+        _bridge.clearNowPlaying();
+      }
+      _updateBridgePlaybackState();
+    }
 
     try {
       final plan = await _buildWindowPlan(track);
@@ -513,19 +534,16 @@ class AudioCoordinator extends Notifier<AudioState> {
         initialPosition: initialPosition,
       );
       if (!applied && generation == _window.generation) {
-        state = state.copyWith(
-          playback: state.playback.copyWith(status: PlayerStatus.idle),
-        );
+        restorePreviousPlayback();
       }
     } on Exception {
       if (generation == _window.generation) {
-        state = state.copyWith(
-          playback: state.playback.copyWith(status: PlayerStatus.idle),
-        );
+        restorePreviousPlayback();
       }
     }
 
-    if (generation == _window.generation) {
+    if (generation == _window.generation &&
+        state.playback.currentTrack?.uuidId == track.uuidId) {
       await _refreshUpcoming();
     }
   }

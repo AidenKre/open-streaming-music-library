@@ -42,6 +42,8 @@ class FakeWindowController implements AudioWindowController {
   int seekCalls = 0;
   int playCalls = 0;
   String? acknowledgedTrackUuid;
+  bool fullReplaceShouldSucceed = true;
+  Object? fullReplaceError;
 
   @override
   List<TrackUI> get windowTracks => _windowTracks;
@@ -101,6 +103,12 @@ class FakeWindowController implements AudioWindowController {
     required Duration initialPosition,
   }) async {
     fullReplaceCalls++;
+    if (fullReplaceError != null) {
+      throw fullReplaceError!;
+    }
+    if (!fullReplaceShouldSucceed) {
+      return false;
+    }
     _windowTracks = List<TrackUI>.unmodifiable(tracks);
     _windowCurrentIndex = currentIndex;
     if (shouldPlay) {
@@ -203,6 +211,8 @@ class FakeWindowController implements AudioWindowController {
     seekToIndexCalls = 0;
     seekCalls = 0;
     playCalls = 0;
+    fullReplaceShouldSucceed = true;
+    fullReplaceError = null;
   }
 }
 
@@ -291,6 +301,91 @@ void main() {
 
   group('AudioCoordinator bug regressions', () {
     test(
+      'failed window replacement should keep current track and background state unchanged',
+      () async {
+        final a = _track(
+          'a',
+          title: 'A',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 1,
+        );
+        final b = _track(
+          'b',
+          title: 'B',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 2,
+        );
+        final cTrack = _track(
+          'c',
+          title: 'C',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 3,
+        );
+        final d = _track(
+          'd',
+          title: 'D',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 4,
+        );
+        final queue = FakeQueueLookup(
+          candidates: {
+            'a': (previous: [d], next: [b]),
+            'b': (previous: [a], next: [cTrack]),
+          },
+          upcoming: {
+            'a': [b, cTrack],
+            'b': [cTrack, d],
+          },
+        );
+
+        final c = createContainer(queueLookup: queue);
+        final notifier = c.read(audioProvider.notifier);
+        final context = QueueContext(
+          artist: 'Artist',
+          album: 'Album',
+          orderParams: [OrderParameter(column: 'track_number')],
+        );
+
+        await notifier.playFromQueue(context, a);
+        fakeWindow.emitStatus(PlayerStatus.playing);
+        await Future<void>.delayed(Duration.zero);
+        expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'a');
+        expect(c.read(audioProvider).playback.status, PlayerStatus.playing);
+        expect(bridge.mediaItemEvents.whereType<MediaItem>().last.id, 'a');
+        expect(
+          c
+              .read(audioProvider)
+              .queue
+              .upcomingTracks
+              .map((t) => t.uuidId)
+              .toList(),
+          ['b', 'c'],
+        );
+
+        fakeWindow.fullReplaceShouldSucceed = false;
+        await notifier.skipToTrack(b);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'a');
+        expect(c.read(audioProvider).playback.status, PlayerStatus.playing);
+        expect(
+          c
+              .read(audioProvider)
+              .queue
+              .upcomingTracks
+              .map((t) => t.uuidId)
+              .toList(),
+          ['b', 'c'],
+        );
+        expect(bridge.mediaItemEvents.whereType<MediaItem>().last.id, 'a');
+      },
+    );
+
+    test(
       'repeat-all upcoming queue should wrap at the end of the queue',
       () async {
         await _insertTrack(
@@ -334,6 +429,57 @@ void main() {
 
         final upcoming = c.read(audioProvider).queue.upcomingTracks;
         expect(upcoming.map((t) => t.uuidId).toList(), ['a', 'b']);
+      },
+    );
+
+    test(
+      'toggleShuffle keeps the current track first in the shuffled order',
+      () async {
+        final a = await _insertTrack(
+          db,
+          uuid: 'a',
+          title: 'A',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 1,
+        );
+        await _insertTrack(
+          db,
+          uuid: 'b',
+          title: 'B',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 2,
+        );
+        await _insertTrack(
+          db,
+          uuid: 'c',
+          title: 'C',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 3,
+        );
+
+        final c = createContainer(queueLookup: QueueResolver(db));
+        final notifier = c.read(audioProvider.notifier);
+        final context = QueueContext(
+          artist: 'Artist',
+          album: 'Album',
+          orderParams: [
+            OrderParameter(column: 'track_number'),
+            OrderParameter(column: 'uuid_id'),
+          ],
+        );
+
+        await notifier.playFromQueue(context, a);
+        fakeWindow.resetCounters();
+
+        await notifier.toggleShuffle();
+
+        final state = c.read(audioProvider);
+        expect(state.shuffle.shuffleOn, isTrue);
+        expect(state.shuffle.shuffledUuids.first, 'a');
+        expect(fakeWindow.reconfigureCalls, 1);
       },
     );
 

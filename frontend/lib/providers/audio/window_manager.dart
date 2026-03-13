@@ -219,10 +219,10 @@ class WindowManager implements AudioWindowController {
     if (_acknowledgedTrackUuid == track.uuidId) {
       return;
     }
-    _acknowledgedTrackUuid = track.uuidId;
     await onTrackChanged?.call(
       WindowTrackChange(track: track, index: index, origin: origin),
     );
+    _acknowledgedTrackUuid = track.uuidId;
   }
 
   @override

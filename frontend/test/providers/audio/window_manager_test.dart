@@ -269,6 +269,51 @@ void main() {
         expect(seenOrigins, [WindowTrackChangeOrigin.reconciledAfterMutation]);
       },
     );
+
+    test(
+      're-emits the same track change after a previous callback failure',
+      () async {
+        var callbackCalls = 0;
+        final successfulTrackUuids = <String>[];
+        manager.onTrackChanged = (change) async {
+          callbackCalls++;
+          if (callbackCalls == 1) {
+            throw StateError('boom');
+          }
+          successfulTrackUuids.add(change.track.uuidId);
+        };
+
+        when(
+          () => mockPlayer.setAudioSources(
+            any(),
+            initialIndex: any(named: 'initialIndex'),
+            initialPosition: any(named: 'initialPosition'),
+          ),
+        ).thenAnswer((_) async {
+          currentIndexController.add(2);
+          when(() => mockPlayer.currentIndex).thenReturn(2);
+          await Future<void>.delayed(Duration.zero);
+          return Duration.zero;
+        });
+
+        final gen = manager.incrementGeneration();
+        await expectLater(
+          manager.fullReplace(
+            [_track('a'), _track('b'), _track('c')],
+            1,
+            generation: gen,
+            shouldPlay: false,
+            initialPosition: Duration.zero,
+          ),
+          throwsStateError,
+        );
+
+        currentIndexController.add(2);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(successfulTrackUuids, ['c']);
+      },
+    );
   });
 
   group('slideForward', () {
