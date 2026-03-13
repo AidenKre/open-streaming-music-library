@@ -173,6 +173,10 @@ class FakeWindowController implements AudioWindowController {
     onStatusChanged?.call(status);
   }
 
+  void emitPosition(Duration position) {
+    onPositionChanged?.call(position);
+  }
+
   Future<void> emitIndexAsTrackChange(int index) async {
     _windowCurrentIndex = index;
     final track = _windowTracks[index];
@@ -238,14 +242,18 @@ class FakeQueueLookup implements AudioQueueLookup {
 
 class RecordingAudioServiceBridge extends AudioServiceBridge {
   final List<MediaItem?> mediaItemEvents = [];
+  final List<PlaybackState> playbackStateEvents = [];
   late final StreamSubscription<MediaItem?> _mediaSub;
+  late final StreamSubscription<PlaybackState> _playbackSub;
 
   RecordingAudioServiceBridge() {
     _mediaSub = mediaItem.listen(mediaItemEvents.add);
+    _playbackSub = playbackState.listen(playbackStateEvents.add);
   }
 
   Future<void> disposeBridge() async {
     await _mediaSub.cancel();
+    await _playbackSub.cancel();
   }
 }
 
@@ -515,6 +523,88 @@ void main() {
         expect(
           c.read(audioProvider).playback.duration,
           const Duration(seconds: 245),
+        );
+      },
+    );
+
+    test(
+      'natural track change should reset audio_service playback position to zero',
+      () async {
+        final a = _track('a', duration: 180);
+        final b = _track('b', duration: 240);
+
+        final c = createContainer(queueLookup: FakeQueueLookup());
+        final notifier = c.read(audioProvider.notifier);
+        notifier.debugSetState(
+          AudioState(
+            playback: PlaybackSlice(
+              currentTrack: a,
+              status: PlayerStatus.playing,
+              position: const Duration(minutes: 2),
+              duration: const Duration(minutes: 3),
+            ),
+            queue: QueueSlice(
+              queueContext: QueueContext(
+                orderParams: [OrderParameter(column: 'track_number')],
+              ),
+            ),
+          ),
+        );
+        fakeWindow.setWindow([a, b], 1);
+
+        fakeWindow.emitStatus(PlayerStatus.playing);
+        await Future<void>.delayed(Duration.zero);
+        expect(
+          bridge.playbackStateEvents.last.updatePosition,
+          const Duration(minutes: 2),
+        );
+
+        await notifier.debugHandleTrackChanged(
+          WindowTrackChange(
+            track: b,
+            index: 1,
+            origin: WindowTrackChangeOrigin.directPlayerIndex,
+          ),
+        );
+
+        expect(bridge.playbackStateEvents.last.updatePosition, Duration.zero);
+      },
+    );
+
+    test(
+      'position updates while playing should be forwarded to audio_service playbackState',
+      () async {
+        final current = _track('b', duration: 240);
+
+        final c = createContainer(queueLookup: FakeQueueLookup());
+        final notifier = c.read(audioProvider.notifier);
+        notifier.debugSetState(
+          AudioState(
+            playback: PlaybackSlice(
+              currentTrack: current,
+              status: PlayerStatus.playing,
+              position: Duration.zero,
+              duration: const Duration(minutes: 4),
+            ),
+            queue: QueueSlice(
+              queueContext: QueueContext(
+                orderParams: [OrderParameter(column: 'track_number')],
+              ),
+            ),
+          ),
+        );
+        fakeWindow.setWindow([current], 0);
+
+        fakeWindow.emitStatus(PlayerStatus.playing);
+        await Future<void>.delayed(Duration.zero);
+        expect(bridge.playbackStateEvents.last.updatePosition, Duration.zero);
+
+        fakeWindow.emitPosition(const Duration(seconds: 90));
+        await Future<void>.delayed(Duration.zero);
+
+        expect(
+          bridge.playbackStateEvents.last.updatePosition,
+          const Duration(seconds: 90),
         );
       },
     );

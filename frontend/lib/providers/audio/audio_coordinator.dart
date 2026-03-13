@@ -63,6 +63,7 @@ class AudioCoordinator extends Notifier<AudioState> {
 
     _window.onPositionChanged = (pos) {
       state = state.copyWith(playback: state.playback.copyWith(position: pos));
+      _updateBridgePlaybackState();
     };
 
     _window.onDurationChanged = (dur) {
@@ -367,6 +368,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       resetDuration: true,
     );
     _updateBridgeNowPlaying(track);
+    _updateBridgePlaybackState();
 
     await _refreshUpcoming();
 
@@ -498,6 +500,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       status: PlayerStatus.loading,
     );
     _updateBridgeNowPlaying(track);
+    _updateBridgePlaybackState();
 
     try {
       final plan = await _buildWindowPlan(track);
