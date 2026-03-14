@@ -1,6 +1,9 @@
+import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:just_audio_background/just_audio_background.dart';
+import 'package:frontend/providers/audio/audio_dependencies.dart';
+import 'package:frontend/providers/audio/audio_service_bridge.dart';
+import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
@@ -9,12 +12,22 @@ import 'package:frontend/ui/widgets/mini_player.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.osml.audio',
-    androidNotificationChannelName: 'Audio playback',
-    androidNotificationOngoing: true,
+  final audioHandler = await AudioService.init<AudioServiceBridge>(
+    builder: () => AudioServiceBridge(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.osml.audio',
+      androidNotificationChannelName: 'Audio playback',
+      androidNotificationOngoing: true,
+    ),
   );
-  runApp(ProviderScope(child: Frontend()));
+  final trackCache = await HttpTrackCacheManager.create();
+  runApp(ProviderScope(
+    overrides: [
+      audioServiceProvider.overrideWithValue(audioHandler),
+      trackCacheProvider.overrideWithValue(trackCache),
+    ],
+    child: Frontend(),
+  ));
 }
 
 class Frontend extends StatelessWidget {

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/providers/audio_provider.dart';
+import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
