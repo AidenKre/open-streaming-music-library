@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:drift/native.dart';
@@ -9,16 +10,33 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
+import 'package:frontend/providers/audio/audio_player_controller.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/audio/queue_resolver.dart';
-import 'package:frontend/providers/audio/window_manager.dart';
+import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/providers/providers.dart';
 
-class FakeWindowController implements AudioWindowController {
+class PlayTrackCall {
+  final TrackUI track;
+  final bool shouldPlay;
+  final Duration initialPosition;
+  final TrackCacheManager cache;
+  final int generation;
+
+  const PlayTrackCall({
+    required this.track,
+    required this.shouldPlay,
+    required this.initialPosition,
+    required this.cache,
+    required this.generation,
+  });
+}
+
+class FakePlayerController implements AudioPlayerController {
   @override
-  TrackChangeCallback? onTrackChanged;
+  TrackCompletedCallback? onTrackCompleted;
 
   @override
   StatusChangedCallback? onStatusChanged;
@@ -29,27 +47,16 @@ class FakeWindowController implements AudioWindowController {
   @override
   DurationChangedCallback? onDurationChanged;
 
-  List<TrackUI> _windowTracks = const [];
-  int? _windowCurrentIndex;
   int _generation = 0;
-
-  int fullReplaceCalls = 0;
-  int slideForwardCalls = 0;
-  int reconfigureCalls = 0;
-  int stopPlaybackCalls = 0;
-  int stopPlayerCalls = 0;
-  int seekToIndexCalls = 0;
-  int seekCalls = 0;
+  final List<PlayTrackCall> playTrackCalls = [];
   int playCalls = 0;
-  String? acknowledgedTrackUuid;
-  bool fullReplaceShouldSucceed = true;
-  Object? fullReplaceError;
-
-  @override
-  List<TrackUI> get windowTracks => _windowTracks;
-
-  @override
-  int? get windowCurrentIndex => _windowCurrentIndex;
+  int pauseCalls = 0;
+  int seekCalls = 0;
+  int stopCalls = 0;
+  int setVolumeCalls = 0;
+  Duration? lastSeekPosition;
+  double? lastVolume;
+  bool playTrackShouldSucceed = true;
 
   @override
   int get generation => _generation;
@@ -58,124 +65,53 @@ class FakeWindowController implements AudioWindowController {
   int incrementGeneration() => ++_generation;
 
   @override
-  Future<void> enqueueMutation(Future<void> Function() action) async {
-    await action();
-  }
-
-  @override
-  Future<void> slideForward(TrackUI newNext, {required int generation}) async {
-    slideForwardCalls++;
-    if (_windowTracks.isEmpty || _windowCurrentIndex == null) return;
-    _windowTracks = List<TrackUI>.unmodifiable([
-      ..._windowTracks.sublist(1),
-      newNext,
-    ]);
-    _windowCurrentIndex = (_windowCurrentIndex! - 1).clamp(
-      0,
-      _windowTracks.length - 1,
-    );
-  }
-
-  @override
-  Future<void> reconfigureNeighbors(
-    TrackUI? newPrev,
-    TrackUI? newNext, {
-    required int generation,
-  }) async {
-    reconfigureCalls++;
-    if (_windowTracks.isEmpty || _windowCurrentIndex == null) return;
-    final current = _windowTracks[_windowCurrentIndex!];
-    final nextTracks = <TrackUI>[
-      if (newPrev != null) newPrev,
-      current,
-      if (newNext != null) newNext,
-    ];
-    _windowTracks = List<TrackUI>.unmodifiable(nextTracks);
-    _windowCurrentIndex = newPrev == null ? 0 : 1;
-  }
-
-  @override
-  Future<bool> fullReplace(
-    List<TrackUI> tracks,
-    int currentIndex, {
-    required int generation,
+  Future<bool> playTrack(
+    TrackUI track, {
     required bool shouldPlay,
     required Duration initialPosition,
+    required TrackCacheManager cache,
+    required int generation,
   }) async {
-    fullReplaceCalls++;
-    if (fullReplaceError != null) {
-      throw fullReplaceError!;
-    }
-    if (!fullReplaceShouldSucceed) {
-      return false;
-    }
-    _windowTracks = List<TrackUI>.unmodifiable(tracks);
-    _windowCurrentIndex = currentIndex;
-    if (shouldPlay) {
-      playWithoutAwait();
-    }
-    return true;
+    playTrackCalls.add(PlayTrackCall(
+      track: track,
+      shouldPlay: shouldPlay,
+      initialPosition: initialPosition,
+      cache: cache,
+      generation: generation,
+    ));
+    return playTrackShouldSucceed;
   }
 
   @override
-  Future<void> seekToIndex(
-    int index, {
-    Duration position = Duration.zero,
-  }) async {
-    seekToIndexCalls++;
-    _windowCurrentIndex = index;
-  }
-
-  @override
-  void playWithoutAwait() {
+  Future<void> play() async {
     playCalls++;
   }
 
   @override
-  Future<void> pause() async {}
+  Future<void> pause() async {
+    pauseCalls++;
+  }
 
   @override
   Future<void> seek(Duration position) async {
     seekCalls++;
+    lastSeekPosition = position;
   }
 
   @override
-  Future<void> setVolume(double v) async {}
-
-  @override
-  Future<void> stopPlayback() async {
-    stopPlaybackCalls++;
+  Future<void> setVolume(double volume) async {
+    setVolumeCalls++;
+    lastVolume = volume;
   }
 
   @override
-  Future<void> stopPlayer() async {
-    stopPlayerCalls++;
-    _windowTracks = const [];
-    _windowCurrentIndex = null;
-  }
-
-  @override
-  int? get playerCurrentIndex => _windowCurrentIndex;
-
-  @override
-  TrackUI? get currentTrack {
-    final idx = _windowCurrentIndex;
-    if (idx == null || idx < 0 || idx >= _windowTracks.length) return null;
-    return _windowTracks[idx];
-  }
-
-  @override
-  void acknowledgeCurrentTrack(TrackUI? track) {
-    acknowledgedTrackUuid = track?.uuidId;
+  Future<void> stop() async {
+    _generation++;
+    stopCalls++;
   }
 
   @override
   void dispose() {}
-
-  Future<void> emitTrackChanged(WindowTrackChange change) async {
-    _windowCurrentIndex = change.index;
-    await onTrackChanged?.call(change);
-  }
 
   void emitStatus(PlayerStatus status) {
     onStatusChanged?.call(status);
@@ -185,34 +121,64 @@ class FakeWindowController implements AudioWindowController {
     onPositionChanged?.call(position);
   }
 
-  Future<void> emitIndexAsTrackChange(int index) async {
-    _windowCurrentIndex = index;
-    final track = _windowTracks[index];
-    await onTrackChanged?.call(
-      WindowTrackChange(
-        track: track,
-        index: index,
-        origin: WindowTrackChangeOrigin.directPlayerIndex,
-      ),
-    );
+  void emitDuration(Duration duration) {
+    onDurationChanged?.call(duration);
   }
 
-  void setWindow(List<TrackUI> tracks, int currentIndex) {
-    _windowTracks = List<TrackUI>.unmodifiable(tracks);
-    _windowCurrentIndex = currentIndex;
+  Future<void> emitTrackCompleted() async {
+    await onTrackCompleted?.call();
   }
 
   void resetCounters() {
-    fullReplaceCalls = 0;
-    slideForwardCalls = 0;
-    reconfigureCalls = 0;
-    stopPlaybackCalls = 0;
-    stopPlayerCalls = 0;
-    seekToIndexCalls = 0;
-    seekCalls = 0;
+    playTrackCalls.clear();
     playCalls = 0;
-    fullReplaceShouldSucceed = true;
-    fullReplaceError = null;
+    pauseCalls = 0;
+    seekCalls = 0;
+    stopCalls = 0;
+    setVolumeCalls = 0;
+    lastSeekPosition = null;
+    lastVolume = null;
+    playTrackShouldSucceed = true;
+  }
+}
+
+class FakeTrackCacheManager implements TrackCacheManager {
+  final Map<String, File> cachedFiles = {};
+  final List<String> prefetchedUuids = [];
+  final List<String> evictedUuids = [];
+  int cancelPrefetchCalls = 0;
+  int clearCalls = 0;
+
+  @override
+  File? getCachedFile(String uuidId) => cachedFiles[uuidId];
+
+  @override
+  Future<void> prefetch(TrackUI track) async {
+    prefetchedUuids.add(track.uuidId);
+  }
+
+  @override
+  Future<void> cancelPrefetch() async {
+    cancelPrefetchCalls++;
+  }
+
+  @override
+  Future<void> clear() async {
+    clearCalls++;
+    cachedFiles.clear();
+  }
+
+  @override
+  Future<void> evict(String uuidId) async {
+    evictedUuids.add(uuidId);
+    cachedFiles.remove(uuidId);
+  }
+
+  void resetCounters() {
+    prefetchedUuids.clear();
+    evictedUuids.clear();
+    cancelPrefetchCalls = 0;
+    clearCalls = 0;
   }
 }
 
@@ -269,19 +235,21 @@ class RecordingAudioServiceBridge extends AudioServiceBridge {
 
 void main() {
   late AppDatabase db;
-  late ProviderContainer container;
-  late FakeWindowController fakeWindow;
+  ProviderContainer? container;
+  late FakePlayerController fakePlayer;
+  late FakeTrackCacheManager fakeCache;
   late RecordingAudioServiceBridge bridge;
 
   setUp(() {
     db = AppDatabase(NativeDatabase.memory());
-    fakeWindow = FakeWindowController();
+    fakePlayer = FakePlayerController();
+    fakeCache = FakeTrackCacheManager();
     bridge = RecordingAudioServiceBridge();
   });
 
   tearDown(() async {
     await bridge.disposeBridge();
-    container.dispose();
+    container?.dispose();
     await db.close();
   });
 
@@ -289,19 +257,20 @@ void main() {
     container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
-        audioWindowProvider.overrideWithValue(fakeWindow),
+        audioPlayerProvider.overrideWithValue(fakePlayer),
+        trackCacheProvider.overrideWithValue(fakeCache),
         audioQueueLookupProvider.overrideWithValue(
           queueLookup ?? FakeQueueLookup(),
         ),
         audioServiceProvider.overrideWithValue(bridge),
       ],
     );
-    return container;
+    return container!;
   }
 
   group('AudioCoordinator bug regressions', () {
     test(
-      'failed window replacement should keep current track and background state unchanged',
+      'failed playTrack should keep current track and background state unchanged',
       () async {
         final a = _track(
           'a',
@@ -351,34 +320,25 @@ void main() {
         );
 
         await notifier.playFromQueue(context, a);
-        fakeWindow.emitStatus(PlayerStatus.playing);
+        fakePlayer.emitStatus(PlayerStatus.playing);
         await Future<void>.delayed(Duration.zero);
+
         expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'a');
         expect(c.read(audioProvider).playback.status, PlayerStatus.playing);
         expect(bridge.mediaItemEvents.whereType<MediaItem>().last.id, 'a');
         expect(
-          c
-              .read(audioProvider)
-              .queue
-              .upcomingTracks
-              .map((t) => t.uuidId)
-              .toList(),
+          c.read(audioProvider).queue.upcomingTracks.map((track) => track.uuidId),
           ['b', 'c'],
         );
 
-        fakeWindow.fullReplaceShouldSucceed = false;
+        fakePlayer.playTrackShouldSucceed = false;
         await notifier.skipToTrack(b);
         await Future<void>.delayed(Duration.zero);
 
         expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'a');
         expect(c.read(audioProvider).playback.status, PlayerStatus.playing);
         expect(
-          c
-              .read(audioProvider)
-              .queue
-              .upcomingTracks
-              .map((t) => t.uuidId)
-              .toList(),
+          c.read(audioProvider).queue.upcomingTracks.map((track) => track.uuidId),
           ['b', 'c'],
         );
         expect(bridge.mediaItemEvents.whereType<MediaItem>().last.id, 'a');
@@ -386,7 +346,7 @@ void main() {
     );
 
     test(
-      'repeat-all upcoming queue should wrap at the end of the queue',
+      'repeat-all upcoming queue should wrap at the end of the queue without replaying the current track',
       () async {
         await _insertTrack(
           db,
@@ -425,15 +385,67 @@ void main() {
         );
 
         await notifier.playFromQueue(context, current);
-        await notifier.cycleQueueRepeatMode(); // off -> all
+        fakePlayer.resetCounters();
+        fakeCache.resetCounters();
 
-        final upcoming = c.read(audioProvider).queue.upcomingTracks;
-        expect(upcoming.map((t) => t.uuidId).toList(), ['a', 'b']);
+        await notifier.cycleQueueRepeatMode();
+
+        expect(
+          c.read(audioProvider).queue.upcomingTracks.map((track) => track.uuidId),
+          ['a', 'b'],
+        );
+        expect(fakePlayer.playTrackCalls, isEmpty);
       },
     );
 
+    test('playFromQueue prefetches the next track in non-shuffle playback', () async {
+      final a = await _insertTrack(
+        db,
+        uuid: 'a',
+        title: 'A',
+        artist: 'Artist',
+        album: 'Album',
+        trackNumber: 1,
+      );
+      await _insertTrack(
+        db,
+        uuid: 'b',
+        title: 'B',
+        artist: 'Artist',
+        album: 'Album',
+        trackNumber: 2,
+      );
+      await _insertTrack(
+        db,
+        uuid: 'c',
+        title: 'C',
+        artist: 'Artist',
+        album: 'Album',
+        trackNumber: 3,
+      );
+
+      final c = createContainer(queueLookup: QueueResolver(db));
+      final notifier = c.read(audioProvider.notifier);
+      final context = QueueContext(
+        artist: 'Artist',
+        album: 'Album',
+        orderParams: [
+          OrderParameter(column: 'track_number'),
+          OrderParameter(column: 'uuid_id'),
+        ],
+      );
+
+      await notifier.playFromQueue(context, a);
+
+      expect(c.read(audioProvider).queue.upcomingTracks.map((track) => track.uuidId), [
+        'b',
+        'c',
+      ]);
+      expect(fakeCache.prefetchedUuids, contains('b'));
+    });
+
     test(
-      'toggleShuffle keeps the current track first in the shuffled order',
+      'toggleShuffle keeps the current track first in the shuffled order and leaves the player untouched',
       () async {
         final a = await _insertTrack(
           db,
@@ -472,96 +484,47 @@ void main() {
         );
 
         await notifier.playFromQueue(context, a);
-        fakeWindow.resetCounters();
+        fakePlayer.resetCounters();
+        fakeCache.resetCounters();
 
         await notifier.toggleShuffle();
 
         final state = c.read(audioProvider);
         expect(state.shuffle.shuffleOn, isTrue);
         expect(state.shuffle.shuffledUuids.first, 'a');
-        expect(fakeWindow.reconfigureCalls, 1);
+        expect(fakePlayer.playTrackCalls, isEmpty);
+        expect(fakeCache.cancelPrefetchCalls, 1);
       },
     );
 
-    test(
-      'duplicate track-change callbacks should not reshape the playlist again',
-      () async {
-        final a = _track('a');
-        final b = _track('b');
-        final cTrack = _track('c');
-        final d = _track('d');
-        final queue = FakeQueueLookup(
-          candidates: {
-            'b': (previous: [a], next: [cTrack]),
-          },
-          upcoming: {
-            'b': [cTrack, d],
-          },
-        );
+    test('skipNext should not stop when upcoming queue entries still exist', () async {
+      final cTrack = _track('c');
+      final d = _track('d');
 
-        final c = createContainer(queueLookup: queue);
-        final notifier = c.read(audioProvider.notifier);
-        final context = QueueContext(
-          orderParams: [OrderParameter(column: 'track_number')],
-        );
-
-        await notifier.playFromQueue(context, b);
-        fakeWindow.resetCounters();
-        notifier.debugSetState(
-          c
-              .read(audioProvider)
-              .copyWith(
-                playback: c
-                    .read(audioProvider)
-                    .playback
-                    .copyWith(currentTrack: b),
-              ),
-        );
-
-        await notifier.debugHandleTrackChanged(
-          WindowTrackChange(
-            track: b,
-            index: fakeWindow.windowCurrentIndex!,
-            origin: WindowTrackChangeOrigin.directPlayerIndex,
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      notifier.debugSetState(
+        AudioState(
+          playback: PlaybackSlice(
+            currentTrack: cTrack,
+            status: PlayerStatus.playing,
           ),
-        );
-
-        expect(fakeWindow.slideForwardCalls, 0);
-        expect(fakeWindow.reconfigureCalls, 0);
-      },
-    );
-
-    test(
-      'skipNext should not stop when upcoming queue entries still exist',
-      () async {
-        final a = _track('a');
-        final b = _track('b');
-        final cTrack = _track('c');
-        final d = _track('d');
-
-        final c = createContainer();
-        final notifier = c.read(audioProvider.notifier);
-        notifier.debugSetState(
-          AudioState(
-            playback: PlaybackSlice(
-              currentTrack: cTrack,
-              status: PlayerStatus.playing,
+          queue: QueueSlice(
+            queueContext: QueueContext(
+              orderParams: [OrderParameter(column: 'track_number')],
             ),
-            queue: QueueSlice(
-              queueContext: QueueContext(
-                orderParams: [OrderParameter(column: 'track_number')],
-              ),
-              upcomingTracks: [d],
-            ),
+            upcomingTracks: [d],
           ),
-        );
-        fakeWindow.setWindow([a, b, cTrack], 2);
+        ),
+      );
+      fakePlayer.resetCounters();
 
-        await notifier.skipNext();
+      await notifier.skipNext();
 
-        expect(fakeWindow.stopPlaybackCalls, 0);
-      },
-    );
+      expect(fakePlayer.stopCalls, 0);
+      expect(fakePlayer.playTrackCalls.single.track.uuidId, 'd');
+      expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'd');
+    });
 
     test(
       'skipPrevious should not restart current song when a logical previous track exists',
@@ -591,13 +554,63 @@ void main() {
             ),
           ),
         );
-        fakeWindow.setWindow([b, cTrack], 0);
+        fakePlayer.resetCounters();
 
         await notifier.skipPrevious();
 
-        expect(fakeWindow.seekCalls, 0);
-        expect(fakeWindow.playCalls, greaterThan(0));
+        expect(fakePlayer.seekCalls, 0);
+        expect(fakePlayer.playTrackCalls.single.track.uuidId, 'a');
         expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'a');
+      },
+    );
+
+    test(
+      'skipPrevious on first track with repeat-off should restart instead of wrapping to last track',
+      () async {
+        final a = await _insertTrack(
+          db,
+          uuid: 'a',
+          title: 'A',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 1,
+        );
+        await _insertTrack(
+          db,
+          uuid: 'b',
+          title: 'B',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 2,
+        );
+        await _insertTrack(
+          db,
+          uuid: 'c',
+          title: 'C',
+          artist: 'Artist',
+          album: 'Album',
+          trackNumber: 3,
+        );
+
+        final c = createContainer(queueLookup: QueueResolver(db));
+        final notifier = c.read(audioProvider.notifier);
+        final context = QueueContext(
+          artist: 'Artist',
+          album: 'Album',
+          orderParams: [
+            OrderParameter(column: 'track_number'),
+            OrderParameter(column: 'uuid_id'),
+          ],
+        );
+
+        await notifier.playFromQueue(context, a);
+        fakePlayer.resetCounters();
+
+        await notifier.skipPrevious();
+
+        expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'a');
+        expect(fakePlayer.seekCalls, 1);
+        expect(fakePlayer.playTrackCalls, isEmpty);
       },
     );
 
@@ -622,100 +635,106 @@ void main() {
             ),
           ),
         );
-        fakeWindow.setWindow([current, current, current], 1);
-        fakeWindow.resetCounters();
+        fakePlayer.resetCounters();
 
-        fakeWindow.emitStatus(PlayerStatus.idle);
+        fakePlayer.emitStatus(PlayerStatus.idle);
+        await fakePlayer.emitTrackCompleted();
         await Future<void>.delayed(Duration.zero);
 
-        expect(fakeWindow.seekCalls, 1);
-        expect(fakeWindow.playCalls, 1);
+        expect(fakePlayer.seekCalls, 1);
+        expect(fakePlayer.playCalls, 1);
         expect(c.read(audioProvider).playback.status, isNot(PlayerStatus.idle));
       },
     );
 
     test(
-      'natural track change should seed playback duration from track metadata before a duration event arrives',
+      'natural completion should not broadcast idle to bridge when a next track exists',
       () async {
-        final a = _track('a', duration: 180);
-        final b = _track('b', duration: 245);
+        final a = _track('a');
+        final b = _track('b');
+        final queue = FakeQueueLookup(
+          upcoming: {'a': [b]},
+        );
 
-        final c = createContainer(queueLookup: FakeQueueLookup());
+        final c = createContainer(queueLookup: queue);
         final notifier = c.read(audioProvider.notifier);
         notifier.debugSetState(
           AudioState(
             playback: PlaybackSlice(
               currentTrack: a,
               status: PlayerStatus.playing,
-              duration: const Duration(seconds: 180),
             ),
             queue: QueueSlice(
               queueContext: QueueContext(
                 orderParams: [OrderParameter(column: 'track_number')],
               ),
+              upcomingTracks: [b],
             ),
           ),
         );
-        fakeWindow.setWindow([a, b], 1);
+        bridge.playbackStateEvents.clear();
 
-        await notifier.debugHandleTrackChanged(
-          WindowTrackChange(
-            track: b,
-            index: 1,
-            origin: WindowTrackChangeOrigin.directPlayerIndex,
-          ),
-        );
-
-        expect(
-          c.read(audioProvider).playback.duration,
-          const Duration(seconds: 245),
-        );
-      },
-    );
-
-    test(
-      'natural track change should reset audio_service playback position to zero',
-      () async {
-        final a = _track('a', duration: 180);
-        final b = _track('b', duration: 240);
-
-        final c = createContainer(queueLookup: FakeQueueLookup());
-        final notifier = c.read(audioProvider.notifier);
-        notifier.debugSetState(
-          AudioState(
-            playback: PlaybackSlice(
-              currentTrack: a,
-              status: PlayerStatus.playing,
-              position: const Duration(minutes: 2),
-              duration: const Duration(minutes: 3),
-            ),
-            queue: QueueSlice(
-              queueContext: QueueContext(
-                orderParams: [OrderParameter(column: 'track_number')],
-              ),
-            ),
-          ),
-        );
-        fakeWindow.setWindow([a, b], 1);
-
-        fakeWindow.emitStatus(PlayerStatus.playing);
+        // Simulate what the real player controller does on track completion:
+        // 1. onStatusChanged fires with idle
+        // 2. onTrackCompleted fires
+        fakePlayer.emitStatus(PlayerStatus.idle);
+        await fakePlayer.emitTrackCompleted();
         await Future<void>.delayed(Duration.zero);
+
+        // The bridge should never have received AudioProcessingState.idle
+        // between tracks — this would tear down the background audio session
+        final idleEvents = bridge.playbackStateEvents.where(
+          (e) => e.processingState == AudioProcessingState.idle,
+        );
         expect(
-          bridge.playbackStateEvents.last.updatePosition,
-          const Duration(minutes: 2),
+          idleEvents,
+          isEmpty,
+          reason:
+              'Bridge received idle between tracks, tearing down the audio session',
         );
-
-        await notifier.debugHandleTrackChanged(
-          WindowTrackChange(
-            track: b,
-            index: 1,
-            origin: WindowTrackChangeOrigin.directPlayerIndex,
-          ),
-        );
-
-        expect(bridge.playbackStateEvents.last.updatePosition, Duration.zero);
       },
     );
+
+    test('natural completion should play the next track', () async {
+      final a = _track('a', duration: 180);
+      final b = _track('b', duration: 245);
+      final queue = FakeQueueLookup(
+        upcoming: {
+          'a': [b],
+        },
+      );
+
+      final c = createContainer(queueLookup: queue);
+      final notifier = c.read(audioProvider.notifier);
+      notifier.debugSetState(
+        AudioState(
+          playback: PlaybackSlice(
+            currentTrack: a,
+            status: PlayerStatus.playing,
+            position: const Duration(minutes: 2),
+            duration: const Duration(seconds: 180),
+          ),
+          queue: QueueSlice(
+            queueContext: QueueContext(
+              orderParams: [OrderParameter(column: 'track_number')],
+            ),
+            upcomingTracks: [b],
+          ),
+        ),
+      );
+      fakePlayer.resetCounters();
+
+      await fakePlayer.emitTrackCompleted();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(fakePlayer.playTrackCalls.single.track.uuidId, 'b');
+      expect(c.read(audioProvider).playback.currentTrack?.uuidId, 'b');
+      expect(
+        c.read(audioProvider).playback.duration,
+        const Duration(seconds: 245),
+      );
+      expect(bridge.playbackStateEvents.last.updatePosition, Duration.zero);
+    });
 
     test(
       'position updates while playing should be forwarded to audio_service playbackState',
@@ -739,13 +758,12 @@ void main() {
             ),
           ),
         );
-        fakeWindow.setWindow([current], 0);
 
-        fakeWindow.emitStatus(PlayerStatus.playing);
+        fakePlayer.emitStatus(PlayerStatus.playing);
         await Future<void>.delayed(Duration.zero);
         expect(bridge.playbackStateEvents.last.updatePosition, Duration.zero);
 
-        fakeWindow.emitPosition(const Duration(seconds: 90));
+        fakePlayer.emitPosition(const Duration(seconds: 90));
         await Future<void>.delayed(Duration.zero);
 
         expect(
@@ -755,7 +773,7 @@ void main() {
       },
     );
 
-    test('stop should clear the now playing item in audio_service', () async {
+    test('stop should clear the now playing item in audio_service and cache', () async {
       final current = _track('b', title: 'B');
       final queue = FakeQueueLookup(
         upcoming: {
@@ -772,12 +790,11 @@ void main() {
       await notifier.playFromQueue(context, current);
       await notifier.stop();
 
-      expect(
-        bridge.mediaItemEvents.where((item) => item != null),
-        hasLength(1),
-      );
+      expect(bridge.mediaItemEvents.where((item) => item != null), hasLength(1));
       expect(bridge.mediaItemEvents.whereType<MediaItem>().single.id, 'b');
       expect(bridge.mediaItemEvents.last, isNull);
+      expect(fakeCache.clearCalls, 1);
+      expect(fakePlayer.stopCalls, 1);
     });
   });
 }

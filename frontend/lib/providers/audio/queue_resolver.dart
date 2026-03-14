@@ -215,7 +215,7 @@ class QueueResolver implements AudioQueueLookup {
     required QueueRepeatMode repeatMode,
     required int limit,
   }) async {
-    final allowWrappedPrevious = true;
+    final allowWrappedPrevious = repeatMode == QueueRepeatMode.all;
     final allowWrappedNext = repeatMode == QueueRepeatMode.all;
 
     final List<TrackUI> previous;

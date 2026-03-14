@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
+import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
@@ -19,9 +20,11 @@ Future<void> main() async {
       androidNotificationOngoing: true,
     ),
   );
+  final trackCache = await HttpTrackCacheManager.create();
   runApp(ProviderScope(
     overrides: [
       audioServiceProvider.overrideWithValue(audioHandler),
+      trackCacheProvider.overrideWithValue(trackCache),
     ],
     child: Frontend(),
   ));
