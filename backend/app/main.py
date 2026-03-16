@@ -1,8 +1,6 @@
 import json
-import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from os import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -28,7 +26,6 @@ from app.models import (
     GetArtistsResponse,
     GetTracksResponse,
     Track,
-    track_meta_data,
 )
 from app.services import (
     FileWatcher,

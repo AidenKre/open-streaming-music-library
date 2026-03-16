@@ -1653,14 +1653,14 @@ class TestGetAlbums:
         years = {s.year for s in singles}
         assert years == {2020, 2021}
 
-    def test_get_albums__same_album_same_artist_different_years__separate_entries(
+    def test_get_albums__same_album_same_artist_different_years__merged_entry(
         self, tmp_path
     ):
         database = set_up_database(database_path=tmp_path / "database.db")
         database.initialize()
 
         artist = "artist"
-        # Same album name, same artist, different years → 2 entries
+        # Same album name, same artist, different years → 1 entry with max year
         track1 = create_track(tmp_path / "s1.mp3", "song_1", artist)
         track1.metadata.album = "Greatest Hits"
         track1.metadata.year = 2010
@@ -1674,9 +1674,8 @@ class TestGetAlbums:
         returned_albums = database.get_albums(artist=artist)
         assert returned_albums is not None
         regular = [a for a in returned_albums if not a.is_single_grouping]
-        assert len(regular) == 2
-        years = {a.year for a in regular}
-        assert years == {2010, 2020}
+        assert len(regular) == 1
+        assert regular[0].year == 2020
 
     def test_get_albums__same_album_same_artist_same_year__one_entry(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")

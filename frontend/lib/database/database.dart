@@ -810,9 +810,9 @@ class AppDatabase extends _$AppDatabase {
 
     // Regular albums from CTE
     const regular =
-        'SELECT album, artist, year, 0 AS is_single_grouping'
+        'SELECT album, artist, MAX("year") AS year, 0 AS is_single_grouping'
         ' FROM album_candidates'
-        ' GROUP BY LOWER(album), LOWER(artist), year';
+        ' GROUP BY LOWER(album), LOWER(artist)';
 
     // Single groupings (tracks with no album, grouped by artist+year)
     late final String singles;
@@ -950,9 +950,9 @@ class AppDatabase extends _$AppDatabase {
     }
 
     const regular =
-        'SELECT album, artist, year, 0 AS is_single_grouping'
+        'SELECT album, artist, MAX("year") AS year, 0 AS is_single_grouping'
         ' FROM album_candidates'
-        ' GROUP BY LOWER(album), LOWER(artist), year';
+        ' GROUP BY LOWER(album), LOWER(artist)';
 
     late final String singles;
     if (artist != null) {

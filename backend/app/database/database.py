@@ -610,9 +610,9 @@ class Database:
 
         # Regular albums from CTE
         regular = (
-            "SELECT album, artist, year, 0 AS is_single_grouping"
+            'SELECT album, artist, MAX("year") AS year, 0 AS is_single_grouping'
             " FROM album_candidates"
-            " GROUP BY LOWER(album), LOWER(artist), year"
+            " GROUP BY LOWER(album), LOWER(artist)"
         )
 
         # Single groupings (tracks with no album, grouped by artist+year)
@@ -742,9 +742,9 @@ class Database:
             )
 
         regular = (
-            "SELECT album, artist, year, 0 AS is_single_grouping"
+            'SELECT album, artist, MAX("year") AS year, 0 AS is_single_grouping'
             " FROM album_candidates"
-            " GROUP BY LOWER(album), LOWER(artist), year"
+            " GROUP BY LOWER(album), LOWER(artist)"
         )
 
         if artist is not None:
