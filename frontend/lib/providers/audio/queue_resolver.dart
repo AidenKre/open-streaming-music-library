@@ -149,16 +149,16 @@ class QueueResolver implements AudioQueueLookup {
     final rows = await _db.getTracks(
       orderBy: context.orderParams,
       cursorFilters: cursor,
-      artist: context.artist,
-      album: context.album,
+      artistId: context.artistId,
+      albumId: context.albumId,
       limit: limit,
     );
     final tracks = rows.map(TrackUI.fromQueryRow).toList();
     if (tracks.length < limit && allowWrap) {
       final wrapRows = await _db.getTracks(
         orderBy: context.orderParams,
-        artist: context.artist,
-        album: context.album,
+        artistId: context.artistId,
+        albumId: context.albumId,
         limit: limit - tracks.length,
       );
       tracks.addAll(wrapRows.map(TrackUI.fromQueryRow));
@@ -184,16 +184,16 @@ class QueueResolver implements AudioQueueLookup {
     final rows = await _db.getTracks(
       orderBy: reversed,
       cursorFilters: cursor,
-      artist: context.artist,
-      album: context.album,
+      artistId: context.artistId,
+      albumId: context.albumId,
       limit: limit,
     );
     final tracks = rows.map(TrackUI.fromQueryRow).toList();
     if (tracks.length < limit && allowWrap) {
       final wrapRows = await _db.getTracks(
         orderBy: reversed,
-        artist: context.artist,
-        album: context.album,
+        artistId: context.artistId,
+        albumId: context.albumId,
         limit: limit - tracks.length,
       );
       tracks.addAll(wrapRows.map(TrackUI.fromQueryRow));
@@ -294,16 +294,16 @@ class QueueResolver implements AudioQueueLookup {
       final rows = await _db.getTracks(
         orderBy: context.orderParams,
         cursorFilters: cursor,
-        artist: context.artist,
-        album: context.album,
+        artistId: context.artistId,
+        albumId: context.albumId,
         limit: 20,
       );
       tracks.addAll(rows.map(TrackUI.fromQueryRow));
       if (tracks.length < 20 && repeatMode == QueueRepeatMode.all) {
         final wrapRows = await _db.getTracks(
           orderBy: context.orderParams,
-          artist: context.artist,
-          album: context.album,
+          artistId: context.artistId,
+          albumId: context.albumId,
           limit: 20 - tracks.length,
         );
         tracks.addAll(wrapRows.map(TrackUI.fromQueryRow));

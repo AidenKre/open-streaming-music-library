@@ -8,9 +8,9 @@ import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
-  final String? artist;
+  final int? artistId;
   final VoidCallback? onDisconnect;
-  const AlbumsPage({super.key, this.artist, this.onDisconnect});
+  const AlbumsPage({super.key, this.artistId, this.onDisconnect});
 
   @override
   ConsumerState<AlbumsPage> createState() => _AlbumsPageState();
@@ -30,7 +30,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
     AlbumOrderParameter(column: 'artist'),
     AlbumOrderParameter(column: 'year', isAscending: false, nullsLast: true),
     AlbumOrderParameter(column: 'is_single_grouping'),
-    AlbumOrderParameter(column: 'album', nullsLast: true),
+    AlbumOrderParameter(column: 'name', nullsLast: true),
   ];
 
   @override
@@ -45,7 +45,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
     Future.microtask(
       () => ref
           .read(trackSyncProvider.notifier)
-          .sync(artist: widget.artist, album: null),
+          .sync(artistId: widget.artistId, albumId: null),
     );
   }
 
@@ -69,7 +69,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
 
     _watchSub = db
         .watchAlbumsCount(
-          artist: widget.artist,
+          artistId: widget.artistId,
           orderBy: orderBy,
           cursorFilters: cursorFilters,
         )
@@ -100,7 +100,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
         : _buildCursorFromLast(_albums.last);
 
     final rows = await db.getAlbums(
-      artist: widget.artist,
+      artistId: widget.artistId,
       orderBy: _orderParams,
       cursorFilters: cursorFilters,
       limit: _pageSize,
@@ -123,7 +123,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
         column: 'is_single_grouping',
         value: last.isSingleGrouping ? 1 : 0,
       ),
-      AlbumRowFilterParameter(column: 'album', value: last.title),
+      AlbumRowFilterParameter(column: 'name', value: last.name),
     ];
   }
 
@@ -139,22 +139,18 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage> {
 
   void _onAlbumTap(AlbumUI album) {
     final String appBarTitle;
-    final String? trackArtist = album.artist;
-    final String? trackAlbum;
 
     if (album.isSingleGrouping) {
       appBarTitle = '${album.artist ?? "Unknown Artist"} - Singles';
-      trackAlbum = null;
     } else {
-      appBarTitle = album.title ?? 'Unknown Album';
-      trackAlbum = album.title;
+      appBarTitle = album.name ?? 'Unknown Album';
     }
 
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => Scaffold(
           appBar: AppBar(title: Text(appBarTitle)),
-          body: TracksPage(artist: trackArtist, album: trackAlbum),
+          body: TracksPage(artistId: album.artistId, albumId: album.id),
         ),
       ),
     );

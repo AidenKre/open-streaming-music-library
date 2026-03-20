@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
@@ -18,14 +19,14 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
   static const _pageSize = 30;
 
   final _scrollController = ScrollController();
-  List<String> _artists = [];
+  List<ArtistUI> _artists = [];
   bool _hasMore = true;
   bool _isLoading = false;
   int _newArtistCount = 0;
   StreamSubscription<int>? _watchSub;
 
   List<ArtistOrderParameter> get _orderParams => [
-    ArtistOrderParameter(column: 'artist'),
+    ArtistOrderParameter(column: 'name'),
   ];
 
   @override
@@ -85,7 +86,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
         ? <ArtistRowFilterParameter>[]
         : _buildCursorFromLast(_artists.last);
 
-    final artists = await db.getArtists(
+    final rows = await db.getArtists(
       orderBy: _orderParams,
       cursorFilters: cursorFilters,
       limit: _pageSize,
@@ -93,16 +94,16 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
 
     if (!mounted) return;
     setState(() {
-      _artists.addAll(artists);
-      _hasMore = artists.length == _pageSize;
+      _artists.addAll(rows.map(ArtistUI.fromQueryRow));
+      _hasMore = rows.length == _pageSize;
       _isLoading = false;
     });
     _startWatching();
   }
 
-  List<ArtistRowFilterParameter> _buildCursorFromLast(String lastArtist) {
+  List<ArtistRowFilterParameter> _buildCursorFromLast(ArtistUI last) {
     return [
-      ArtistRowFilterParameter(column: 'artist', value: lastArtist),
+      ArtistRowFilterParameter(column: 'name', value: last.name),
     ];
   }
 
@@ -116,12 +117,12 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
     _loadMore();
   }
 
-  void _onArtistTap(String artistName) {
+  void _onArtistTap(ArtistUI artist) {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => Scaffold(
-          appBar: AppBar(title: Text(artistName)),
-          body: AlbumsPage(artist: artistName),
+          appBar: AppBar(title: Text(artist.name)),
+          body: AlbumsPage(artistId: artist.id),
         ),
       ),
     );
@@ -155,7 +156,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
               }
               final artist = _artists[index];
               return ArtistCard(
-                artistName: artist,
+                artistName: artist.name,
                 onTap: () => _onArtistTap(artist),
               );
             },

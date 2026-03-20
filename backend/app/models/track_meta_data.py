@@ -10,6 +10,8 @@ class TrackMetaData(BaseModel):
     artist: str | None = None
     album: str | None = None
     album_artist: str | None = None
+    artist_id: int | None = None
+    album_id: int | None = None
     year: int | None = None
     date: str | None = None
 

@@ -45,7 +45,7 @@ class AlbumCard extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    isSingle ? 'Singles' : (album.title ?? 'Unknown Album'),
+                    isSingle ? 'Singles' : (album.name ?? 'Unknown Album'),
                     style: theme.textTheme.titleSmall,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,

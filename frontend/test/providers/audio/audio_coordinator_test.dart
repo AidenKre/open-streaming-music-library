@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
+import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -245,6 +246,10 @@ void main() {
     fakePlayer = FakePlayerController();
     fakeCache = FakeTrackCacheManager();
     bridge = RecordingAudioServiceBridge();
+    _nextArtistId = 1;
+    _nextAlbumId = 1;
+    _artistIds.clear();
+    _albumIds.clear();
   });
 
   tearDown(() async {
@@ -314,8 +319,8 @@ void main() {
         final c = createContainer(queueLookup: queue);
         final notifier = c.read(audioProvider.notifier);
         final context = QueueContext(
-          artist: 'Artist',
-          album: 'Album',
+          artistId: 1,
+          albumId: 1,
           orderParams: [OrderParameter(column: 'track_number')],
         );
 
@@ -376,8 +381,8 @@ void main() {
         final c = createContainer(queueLookup: QueueResolver(db));
         final notifier = c.read(audioProvider.notifier);
         final context = QueueContext(
-          artist: 'Artist',
-          album: 'Album',
+          artistId: 1,
+          albumId: 1,
           orderParams: [
             OrderParameter(column: 'track_number'),
             OrderParameter(column: 'uuid_id'),
@@ -427,8 +432,8 @@ void main() {
       final c = createContainer(queueLookup: QueueResolver(db));
       final notifier = c.read(audioProvider.notifier);
       final context = QueueContext(
-        artist: 'Artist',
-        album: 'Album',
+        artistId: 1,
+        albumId: 1,
         orderParams: [
           OrderParameter(column: 'track_number'),
           OrderParameter(column: 'uuid_id'),
@@ -475,8 +480,8 @@ void main() {
         final c = createContainer(queueLookup: QueueResolver(db));
         final notifier = c.read(audioProvider.notifier);
         final context = QueueContext(
-          artist: 'Artist',
-          album: 'Album',
+          artistId: 1,
+          albumId: 1,
           orderParams: [
             OrderParameter(column: 'track_number'),
             OrderParameter(column: 'uuid_id'),
@@ -595,8 +600,8 @@ void main() {
         final c = createContainer(queueLookup: QueueResolver(db));
         final notifier = c.read(audioProvider.notifier);
         final context = QueueContext(
-          artist: 'Artist',
-          album: 'Album',
+          artistId: 1,
+          albumId: 1,
           orderParams: [
             OrderParameter(column: 'track_number'),
             OrderParameter(column: 'uuid_id'),
@@ -804,6 +809,8 @@ TrackUI _track(
   String? title,
   String? artist,
   String? album,
+  int? artistId,
+  int? albumId,
   int? trackNumber,
   double duration = 180,
 }) {
@@ -812,6 +819,8 @@ TrackUI _track(
     title: title,
     artist: artist,
     album: album,
+    artistId: artistId,
+    albumId: albumId,
     trackNumber: trackNumber,
     createdAt: 0,
     lastUpdated: 0,
@@ -823,6 +832,16 @@ TrackUI _track(
   );
 }
 
+int _nextArtistId = 1;
+int _nextAlbumId = 1;
+final _artistIds = <String, int>{};
+final _albumIds = <String, int>{};
+
+int _ensureArtist(String name) =>
+    _artistIds.putIfAbsent(name.toLowerCase(), () => _nextArtistId++);
+int _ensureAlbum(String name, int artistId) =>
+    _albumIds.putIfAbsent('${artistId}_${name.toLowerCase()}', () => _nextAlbumId++);
+
 Future<TrackUI> _insertTrack(
   AppDatabase db, {
   required String uuid,
@@ -831,6 +850,22 @@ Future<TrackUI> _insertTrack(
   required String album,
   required int trackNumber,
 }) async {
+  final artistId = _ensureArtist(artist);
+  final albumId = _ensureAlbum(album, artistId);
+
+  // Upsert artist and album rows
+  await db.into(db.artists).insertOnConflictUpdate(
+    ArtistsCompanion(id: Value(artistId), name: Value(artist)),
+  );
+  await db.into(db.albums).insertOnConflictUpdate(
+    AlbumsCompanion(
+      id: Value(albumId),
+      name: Value(album),
+      artistId: Value(artistId),
+      isSingleGrouping: const Value(false),
+    ),
+  );
+
   final dto = ClientTrackDto.fromJson({
     'uuid_id': uuid,
     'created_at': 1000,
@@ -839,6 +874,8 @@ Future<TrackUI> _insertTrack(
       'title': title,
       'artist': artist,
       'album': album,
+      'artist_id': artistId,
+      'album_id': albumId,
       'track_number': trackNumber,
       'duration': 180.0,
       'bitrate_kbps': 320.0,
@@ -854,6 +891,8 @@ Future<TrackUI> _insertTrack(
     title: title,
     artist: artist,
     album: album,
+    artistId: artistId,
+    albumId: albumId,
     trackNumber: trackNumber,
   );
 }

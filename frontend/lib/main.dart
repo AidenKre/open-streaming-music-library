@@ -7,6 +7,7 @@ import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
+import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 
@@ -59,6 +60,7 @@ class _AppShellState extends ConsumerState<AppShell> {
     GlobalKey<NavigatorState>(debugLabel: 'artists'),
     GlobalKey<NavigatorState>(debugLabel: 'albums'),
     GlobalKey<NavigatorState>(debugLabel: 'tracks'),
+    GlobalKey<NavigatorState>(debugLabel: 'search'),
   ];
 
   Widget _buildTabNavigator(int index, Widget Function() rootBuilder) {
@@ -112,6 +114,10 @@ class _AppShellState extends ConsumerState<AppShell> {
                       onDisconnect: widget.onDisconnect,
                     ),
                   ),
+                  _buildTabNavigator(
+                    3,
+                    () => const SearchPage(),
+                  ),
                 ],
               ),
             ),
@@ -121,13 +127,21 @@ class _AppShellState extends ConsumerState<AppShell> {
         bottomNavigationBar: BottomNavigationBar(
           currentIndex: _tabIndex,
           onTap: _onTabTap,
+          type: BottomNavigationBarType.fixed,
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.home), label: "Artists"),
             BottomNavigationBarItem(
               icon: Icon(Icons.library_music),
               label: "Albums",
             ),
-            BottomNavigationBarItem(icon: Icon(Icons.search), label: "Tracks"),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.music_note),
+              label: "Tracks",
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.search),
+              label: "Search",
+            ),
           ],
         ),
       ),

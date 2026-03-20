@@ -10,6 +10,8 @@ class TrackUI {
   final String? artist;
   final String? album;
   final String? albumArtist;
+  final int? artistId;
+  final int? albumId;
   final int? year;
   final String? date;
   final String? genre;
@@ -33,6 +35,8 @@ class TrackUI {
     this.artist,
     this.album,
     this.albumArtist,
+    this.artistId,
+    this.albumId,
     this.year,
     this.date,
     this.genre,
@@ -69,6 +73,8 @@ class TrackUI {
       artist: row.readNullable<String>('artist'),
       album: row.readNullable<String>('album'),
       albumArtist: row.readNullable<String>('album_artist'),
+      artistId: row.readNullable<int>('artist_id'),
+      albumId: row.readNullable<int>('album_id'),
       year: row.readNullable<int>('year'),
       date: row.readNullable<String>('date'),
       genre: row.readNullable<String>('genre'),
@@ -93,6 +99,8 @@ class TrackUI {
       artist: meta.artist,
       album: meta.album,
       albumArtist: meta.albumArtist,
+      artistId: meta.artistId,
+      albumId: meta.albumId,
       year: meta.year,
       date: meta.date,
       genre: meta.genre,

@@ -3,8 +3,9 @@ from typing import Optional
 
 
 class Album(BaseModel):
-    album: Optional[str] = None
+    id: int
+    name: Optional[str] = None
     artist: Optional[str] = None
+    artist_id: int
     year: Optional[int] = None
     is_single_grouping: bool = False
-

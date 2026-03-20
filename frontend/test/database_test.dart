@@ -43,8 +43,23 @@ Map<String, dynamic> _minimalMetadataJson() => {
 void main() {
   late AppDatabase db;
 
+  // ID counters for artists and albums tables
+  var nextArtistId = 1;
+  var nextAlbumId = 1;
+
+  // Maps to deduplicate artists/albums by lowercase name (per artist for albums)
+  final artistIds = <String, int>{}; // lowercased name -> id
+  final albumIds = <String, int>{}; // "artistId:lowercasedAlbumName" -> id
+  // Track single-grouping albums per (artistId, year)
+  final singleGroupingIds = <String, int>{}; // "artistId:year" -> id
+
   setUp(() {
     db = AppDatabase(NativeDatabase.memory());
+    nextArtistId = 1;
+    nextAlbumId = 1;
+    artistIds.clear();
+    albumIds.clear();
+    singleGroupingIds.clear();
   });
 
   tearDown(() async {
@@ -176,7 +191,88 @@ void main() {
     });
   });
 
-  Future<void> insertTrack(
+  /// Ensures an artist row exists and returns its id.
+  Future<int> ensureArtist(AppDatabase db, String name) async {
+    final key = name.toLowerCase();
+    if (artistIds.containsKey(key)) return artistIds[key]!;
+    final id = nextArtistId++;
+    await db.into(db.artists).insert(
+      ArtistsCompanion(id: Value(id), name: Value(name)),
+    );
+    artistIds[key] = id;
+    return id;
+  }
+
+  /// Ensures an album row exists and returns its id.
+  Future<int> ensureAlbum(
+    AppDatabase db, {
+    required int artistId,
+    required String name,
+    int? year,
+  }) async {
+    final key = '$artistId:${name.toLowerCase()}';
+    if (albumIds.containsKey(key)) return albumIds[key]!;
+    final id = nextAlbumId++;
+    await db.into(db.albums).insert(
+      AlbumsCompanion(
+        id: Value(id),
+        name: Value(name),
+        artistId: Value(artistId),
+        year: Value(year),
+        isSingleGrouping: const Value(false),
+      ),
+    );
+    albumIds[key] = id;
+    return id;
+  }
+
+  /// Ensures a single-grouping album row exists and returns its id.
+  Future<int> ensureSingleGrouping(
+    AppDatabase db, {
+    required int artistId,
+    int? year,
+  }) async {
+    final key = '$artistId:${year ?? 'null'}';
+    if (singleGroupingIds.containsKey(key)) {
+      return singleGroupingIds[key]!;
+    }
+    final id = nextAlbumId++;
+    await db.into(db.albums).insert(
+      AlbumsCompanion(
+        id: Value(id),
+        name: const Value(null),
+        artistId: Value(artistId),
+        year: Value(year),
+        isSingleGrouping: const Value(true),
+      ),
+    );
+    singleGroupingIds[key] = id;
+    return id;
+  }
+
+  /// Rebuilds all FTS tables from current data.
+  Future<void> rebuildFts(AppDatabase db) async {
+    await db.customStatement("DELETE FROM fts_artists");
+    await db.customStatement(
+      "INSERT INTO fts_artists(rowid, name) SELECT id, name FROM artists",
+    );
+    await db.customStatement("DELETE FROM fts_albums");
+    await db.customStatement(
+      "INSERT INTO fts_albums(rowid, name, artist_name) "
+      "SELECT a.id, COALESCE(a.name, ''), ar.name "
+      "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
+    );
+    await db.customStatement("DELETE FROM fts_tracks");
+    await db.customStatement(
+      "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+      "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
+      "FROM trackmetadata",
+    );
+  }
+
+  /// Inserts a track with its metadata, creating artist/album rows as needed.
+  /// Returns (artistId, albumId) where albumId may be null.
+  Future<(int?, int?)> insertTrack(
     AppDatabase db, {
     required String uuid,
     String? title,
@@ -186,6 +282,30 @@ void main() {
     int? trackNumber,
     int? year,
   }) async {
+    // Determine effective artist for grouping (albumArtist takes precedence)
+    final effectiveArtist = albumArtist ?? artist;
+
+    int? artistId;
+    int? albumId;
+
+    if (effectiveArtist != null) {
+      artistId = await ensureArtist(db, effectiveArtist);
+      if (album != null) {
+        albumId = await ensureAlbum(
+          db,
+          artistId: artistId,
+          name: album,
+          year: year,
+        );
+      } else {
+        albumId = await ensureSingleGrouping(
+          db,
+          artistId: artistId,
+          year: year,
+        );
+      }
+    }
+
     final dto = ClientTrackDto.fromJson({
       'uuid_id': uuid,
       'created_at': 1700000000,
@@ -197,6 +317,8 @@ void main() {
         if (albumArtist != null) 'album_artist': albumArtist,
         if (trackNumber != null) 'track_number': trackNumber,
         if (year != null) 'year': year,
+        if (artistId != null) 'artist_id': artistId,
+        if (albumId != null) 'album_id': albumId,
         'duration': 180.0,
         'bitrate_kbps': 256.0,
         'sample_rate_hz': 44100,
@@ -206,6 +328,17 @@ void main() {
     });
     await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
     await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
+    return (artistId, albumId);
+  }
+
+  // Helper to look up an artist ID by name (case-insensitive)
+  int? artistIdFor(String name) => artistIds[name.toLowerCase()];
+
+  // Helper to look up an album ID by artist name + album name
+  int? albumIdFor(String artistName, String albumName) {
+    final aId = artistIdFor(artistName);
+    if (aId == null) return null;
+    return albumIds['$aId:${albumName.toLowerCase()}'];
   }
 
   // Standard all-tracks sort order: artist, album, track_number, uuid_id
@@ -358,8 +491,8 @@ void main() {
       );
 
       final results = await db.getTracks(
-        artist: 'Artist A',
-        album: 'Album A',
+        artistId: artistIdFor('Artist A'),
+        albumId: albumIdFor('Artist A', 'Album A'),
         orderBy: albumOrder,
         limit: 100,
       );
@@ -378,8 +511,8 @@ void main() {
       );
 
       final results = await db.getTracks(
-        artist: 'Album Artist',
-        album: 'My Album',
+        artistId: artistIdFor('Album Artist'),
+        albumId: albumIdFor('Album Artist', 'My Album'),
         orderBy: albumOrder,
         limit: 100,
       );
@@ -397,8 +530,8 @@ void main() {
       );
 
       final results = await db.getTracks(
-        artist: 'Solo Artist',
-        album: 'My Album',
+        artistId: artistIdFor('Solo Artist'),
+        albumId: albumIdFor('Solo Artist', 'My Album'),
         orderBy: albumOrder,
         limit: 100,
       );
@@ -430,8 +563,8 @@ void main() {
       );
 
       final results = await db.getTracks(
-        artist: 'Artist',
-        album: 'Album',
+        artistId: artistIdFor('Artist'),
+        albumId: albumIdFor('Artist', 'Album'),
         orderBy: albumOrder,
         limit: 100,
       );
@@ -439,7 +572,7 @@ void main() {
       expect(uuids, ['1', '2', '3']);
     });
 
-    test('artist-only filtering returns tracks with null album', () async {
+    test('artist-only filtering returns all tracks for that artist', () async {
       await insertTrack(
         db,
         uuid: '1',
@@ -463,17 +596,18 @@ void main() {
       );
 
       final results = await db.getTracks(
-        artist: 'X',
+        artistId: artistIdFor('X'),
         orderBy: allTracksOrder,
         limit: 100,
       );
-      expect(results.length, 1);
-      expect(results.first.read<String>('uuid_id'), '1');
+      expect(results.length, 2);
+      final uuids = results.map((r) => r.read<String>('uuid_id')).toSet();
+      expect(uuids, {'1', '2'});
     });
 
-    test('throws when album is provided without artist', () async {
+    test('throws when albumId is provided without artistId', () async {
       expect(
-        () => db.getTracks(album: 'Album A', orderBy: albumOrder, limit: 100),
+        () => db.getTracks(albumId: 1, orderBy: albumOrder, limit: 100),
         throwsArgumentError,
       );
     });
@@ -502,8 +636,8 @@ void main() {
       );
 
       final results = await db.getTracks(
-        artist: 'Artist',
-        album: 'Album',
+        artistId: artistIdFor('Artist'),
+        albumId: albumIdFor('Artist', 'Album'),
         orderBy: albumOrder,
         cursorFilters: [
           RowFilterParameter(column: 'track_number', value: 1),
@@ -591,7 +725,10 @@ void main() {
       );
 
       final count = await db
-          .watchTrackCount(artist: 'Artist A', album: 'Album A')
+          .watchTrackCount(
+            artistId: artistIdFor('Artist A'),
+            albumId: albumIdFor('Artist A', 'Album A'),
+          )
           .first;
       expect(count, 1);
     });
@@ -603,7 +740,8 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Alice');
       await insertTrack(db, uuid: '3', artist: 'Bob');
 
-      final artists = await db.getArtists();
+      final rows = await db.getArtists();
+      final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Alice', 'Bob', 'Charlie']);
     });
 
@@ -612,10 +750,10 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Alice');
       await insertTrack(db, uuid: '3', artist: 'ALICE');
 
-      final artists = await db.getArtists();
-      expect(artists.length, 1);
+      final rows = await db.getArtists();
+      expect(rows.length, 1);
       // Should return one of the casing variants
-      expect(artists.first.toLowerCase(), 'alice');
+      expect(rows.first.read<String>('name').toLowerCase(), 'alice');
     });
 
     test('prefers albumArtist over artist when albumArtist is set', () async {
@@ -626,22 +764,24 @@ void main() {
         albumArtist: 'Album Artist',
       );
 
-      final artists = await db.getArtists();
+      final rows = await db.getArtists();
+      final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Album Artist']);
     });
 
     test('falls back to artist when albumArtist is null', () async {
       await insertTrack(db, uuid: '1', artist: 'Solo Artist');
 
-      final artists = await db.getArtists();
+      final rows = await db.getArtists();
+      final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Solo Artist']);
     });
 
     test('excludes tracks with no artist and no albumArtist', () async {
       await insertTrack(db, uuid: '1');
 
-      final artists = await db.getArtists();
-      expect(artists, isEmpty);
+      final rows = await db.getArtists();
+      expect(rows, isEmpty);
     });
 
     test('respects limit', () async {
@@ -649,7 +789,8 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'B');
       await insertTrack(db, uuid: '3', artist: 'C');
 
-      final artists = await db.getArtists(limit: 2);
+      final rows = await db.getArtists(limit: 2);
+      final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists.length, 2);
       expect(artists, ['A', 'B']);
     });
@@ -659,12 +800,13 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'B');
       await insertTrack(db, uuid: '3', artist: 'C');
 
-      final artists = await db.getArtists(limit: 2, offset: 1);
+      final rows = await db.getArtists(limit: 2, offset: 1);
+      final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['B', 'C']);
     });
   });
 
-  final defaultArtistOrder = [ArtistOrderParameter(column: 'artist')];
+  final defaultArtistOrder = [ArtistOrderParameter(column: 'name')];
 
   group('getArtists with cursor', () {
     test('cursor pagination skips artists before cursor', () async {
@@ -672,12 +814,13 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Bob');
       await insertTrack(db, uuid: '3', artist: 'Charlie');
 
-      final artists = await db.getArtists(
+      final rows = await db.getArtists(
         orderBy: defaultArtistOrder,
         cursorFilters: [
-          ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+          ArtistRowFilterParameter(column: 'name', value: 'Bob'),
         ],
       );
+      final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Charlie']);
     });
 
@@ -690,27 +833,30 @@ void main() {
 
       // First page
       final page1 = await db.getArtists(orderBy: defaultArtistOrder, limit: 2);
-      expect(page1, ['Alice', 'Bob']);
+      final page1Names = page1.map((r) => r.read<String>('name')).toList();
+      expect(page1Names, ['Alice', 'Bob']);
 
       // Second page via cursor
       final page2 = await db.getArtists(
         orderBy: defaultArtistOrder,
         cursorFilters: [
-          ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+          ArtistRowFilterParameter(column: 'name', value: 'Bob'),
         ],
         limit: 2,
       );
-      expect(page2, ['Charlie', 'Dave']);
+      final page2Names = page2.map((r) => r.read<String>('name')).toList();
+      expect(page2Names, ['Charlie', 'Dave']);
 
       // Third page
       final page3 = await db.getArtists(
         orderBy: defaultArtistOrder,
         cursorFilters: [
-          ArtistRowFilterParameter(column: 'artist', value: 'Dave'),
+          ArtistRowFilterParameter(column: 'name', value: 'Dave'),
         ],
         limit: 2,
       );
-      expect(page3, ['Eve']);
+      final page3Names = page3.map((r) => r.read<String>('name')).toList();
+      expect(page3Names, ['Eve']);
     });
 
     test('with orderBy and no cursor returns all sorted', () async {
@@ -718,7 +864,8 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Alice');
       await insertTrack(db, uuid: '3', artist: 'Bob');
 
-      final artists = await db.getArtists(orderBy: defaultArtistOrder);
+      final rows = await db.getArtists(orderBy: defaultArtistOrder);
+      final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Alice', 'Bob', 'Charlie']);
     });
   });
@@ -734,7 +881,7 @@ void main() {
           .watchArtistCount(
             orderBy: defaultArtistOrder,
             cursorFilters: [
-              ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+              ArtistRowFilterParameter(column: 'name', value: 'Bob'),
             ],
           )
           .first;
@@ -747,7 +894,7 @@ void main() {
       final stream = db.watchArtistCount(
         orderBy: defaultArtistOrder,
         cursorFilters: [
-          ArtistRowFilterParameter(column: 'artist', value: 'Bob'),
+          ArtistRowFilterParameter(column: 'name', value: 'Bob'),
         ],
       );
 
@@ -764,7 +911,7 @@ void main() {
 
   // Standard album sort order: album, artist, year, is_single_grouping
   final defaultAlbumOrder = [
-    AlbumOrderParameter(column: 'album', nullsLast: true),
+    AlbumOrderParameter(column: 'name', nullsLast: true),
     AlbumOrderParameter(column: 'artist'),
     AlbumOrderParameter(column: 'year'),
     AlbumOrderParameter(column: 'is_single_grouping'),
@@ -788,10 +935,13 @@ void main() {
       );
 
       final rows = await db.getAlbums(
-        artist: 'Artist',
+        artistId: artistIdFor('Artist'),
         orderBy: defaultAlbumOrder,
       );
-      final albums = rows.map((r) => r.read<String>('album')).toList();
+      final albums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('name'))
+          .toList();
       expect(albums, ['Album A', 'Album B']);
     });
 
@@ -813,12 +963,18 @@ void main() {
 
       final yearOrder = [
         AlbumOrderParameter(column: 'year'),
-        AlbumOrderParameter(column: 'album'),
+        AlbumOrderParameter(column: 'name'),
         AlbumOrderParameter(column: 'artist'),
         AlbumOrderParameter(column: 'is_single_grouping'),
       ];
-      final rows = await db.getAlbums(artist: 'Artist', orderBy: yearOrder);
-      final albums = rows.map((r) => r.read<String>('album')).toList();
+      final rows = await db.getAlbums(
+        artistId: artistIdFor('Artist'),
+        orderBy: yearOrder,
+      );
+      final albums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('name'))
+          .toList();
       expect(albums, ['Older', 'Newer']);
     });
 
@@ -832,8 +988,11 @@ void main() {
         year: 2020,
       );
 
-      final rows = await db.getAlbums(artist: 'Main Artist');
-      final albums = rows.map((r) => r.read<String>('album')).toList();
+      final rows = await db.getAlbums(artistId: artistIdFor('Main Artist'));
+      final albums = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .map((r) => r.read<String>('name'))
+          .toList();
       expect(albums, ['Collab Album']);
     });
 
@@ -849,10 +1008,10 @@ void main() {
           year: 2020,
         );
 
-        final rows = await db.getAlbums(artist: 'Artist');
+        final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
         final regularAlbums = rows
             .where((r) => r.read<int>('is_single_grouping') == 0)
-            .map((r) => r.read<String>('album'))
+            .map((r) => r.read<String>('name'))
             .toList();
         expect(regularAlbums, ['Real Album']);
       },
@@ -874,7 +1033,7 @@ void main() {
         year: 2020,
       );
 
-      final rows = await db.getAlbums(artist: 'Artist');
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
       final regularAlbums = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
           .toList();
@@ -897,10 +1056,10 @@ void main() {
         year: 2020,
       );
 
-      final rows = await db.getAlbums(artist: 'Artist A');
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist A'));
       final regularAlbums = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
-          .map((r) => r.read<String>('album'))
+          .map((r) => r.read<String>('name'))
           .toList();
       expect(regularAlbums, ['Album A']);
     });
@@ -929,14 +1088,14 @@ void main() {
       );
 
       final rows = await db.getAlbums(
-        artist: 'Artist',
+        artistId: artistIdFor('Artist'),
         orderBy: defaultAlbumOrder,
         limit: 2,
       );
       expect(rows.length, 2);
     });
 
-    test('returns all albums when artist is null', () async {
+    test('returns all albums when artistId is null', () async {
       await insertTrack(
         db,
         uuid: '1',
@@ -960,10 +1119,10 @@ void main() {
         year: 2019,
       );
 
-      final rows = await db.getAlbums(artist: null);
+      final rows = await db.getAlbums(artistId: null);
       final albums = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
-          .map((r) => r.read<String>('album'))
+          .map((r) => r.read<String>('name'))
           .toSet();
       expect(albums, {'Album X', 'Album Y', 'Album Z'});
     });
@@ -974,15 +1133,15 @@ void main() {
       await insertTrack(db, uuid: '3', artist: 'C', album: 'Mango', year: 2019);
 
       final alphaOrder = [
-        AlbumOrderParameter(column: 'album', nullsLast: true),
+        AlbumOrderParameter(column: 'name', nullsLast: true),
         AlbumOrderParameter(column: 'artist'),
         AlbumOrderParameter(column: 'year'),
         AlbumOrderParameter(column: 'is_single_grouping'),
       ];
-      final rows = await db.getAlbums(artist: null, orderBy: alphaOrder);
+      final rows = await db.getAlbums(artistId: null, orderBy: alphaOrder);
       final albums = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
-          .map((r) => r.read<String>('album'))
+          .map((r) => r.read<String>('name'))
           .toList();
       expect(albums, ['apple', 'Mango', 'Zebra']);
     });
@@ -996,12 +1155,12 @@ void main() {
         year: 2020,
       );
 
-      final rows = await db.getAlbums(artist: 'Solo Artist');
+      final rows = await db.getAlbums(artistId: artistIdFor('Solo Artist'));
       final regular = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
           .toList();
       expect(regular.length, 1);
-      expect(regular.first.read<String>('album'), 'Solo Album');
+      expect(regular.first.read<String>('name'), 'Solo Album');
       expect(regular.first.read<String>('artist'), 'Solo Artist');
     });
 
@@ -1015,12 +1174,12 @@ void main() {
         year: 2020,
       );
 
-      final rows = await db.getAlbums(artist: 'Main Artist');
+      final rows = await db.getAlbums(artistId: artistIdFor('Main Artist'));
       final regular = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
           .toList();
       expect(regular.length, 1);
-      expect(regular.first.read<String>('album'), 'Collab');
+      expect(regular.first.read<String>('name'), 'Collab');
       expect(regular.first.read<String>('artist'), 'Main Artist');
     });
 
@@ -1040,13 +1199,13 @@ void main() {
         year: 2021,
       );
 
-      final rows = await db.getAlbums(artist: null, orderBy: defaultAlbumOrder);
+      final rows = await db.getAlbums(artistId: null, orderBy: defaultAlbumOrder);
       final regular = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
           .toList();
       expect(regular.length, 2);
       final pairs = regular
-          .map((r) => (r.read<String>('album'), r.read<String>('artist')))
+          .map((r) => (r.read<String>('name'), r.read<String>('artist')))
           .toSet();
       expect(pairs, {
         ('Greatest Hits', 'Artist A'),
@@ -1063,7 +1222,7 @@ void main() {
         year: 2022,
       );
 
-      final rows = await db.getAlbums(artist: 'Artist');
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
       final regular = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
           .toList();
@@ -1084,12 +1243,12 @@ void main() {
       // Track without album (becomes single grouping)
       await insertTrack(db, uuid: '2', artist: 'Artist', year: 2023);
 
-      final rows = await db.getAlbums(artist: 'Artist');
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
       final singles = rows
           .where((r) => r.read<int>('is_single_grouping') == 1)
           .toList();
       expect(singles.length, 1);
-      expect(singles.first.readNullable<String>('album'), equals(null));
+      expect(singles.first.readNullable<String>('name'), equals(null));
       expect(singles.first.read<String>('artist'), 'Artist');
     });
 
@@ -1098,7 +1257,7 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Artist', year: 2020);
       await insertTrack(db, uuid: '3', artist: 'Artist', year: 2021);
 
-      final rows = await db.getAlbums(artist: 'Artist');
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
       final singles = rows
           .where((r) => r.read<int>('is_single_grouping') == 1)
           .toList();
@@ -1107,12 +1266,12 @@ void main() {
     });
 
     test(
-      'single groupings appear for all artists when artist is null',
+      'single groupings appear for all artists when artistId is null',
       () async {
         await insertTrack(db, uuid: '1', artist: 'A');
         await insertTrack(db, uuid: '2', artist: 'B');
 
-        final rows = await db.getAlbums(artist: null);
+        final rows = await db.getAlbums(artistId: null);
         final singles = rows
             .where((r) => r.read<int>('is_single_grouping') == 1)
             .toList();
@@ -1126,10 +1285,10 @@ void main() {
       await insertTrack(db, uuid: '3', artist: 'A', album: 'Gamma', year: 2022);
 
       final rows = await db.getAlbums(
-        artist: null,
+        artistId: null,
         orderBy: defaultAlbumOrder,
         cursorFilters: [
-          AlbumRowFilterParameter(column: 'album', value: 'Alpha'),
+          AlbumRowFilterParameter(column: 'name', value: 'Alpha'),
           AlbumRowFilterParameter(column: 'artist', value: 'A'),
           AlbumRowFilterParameter(column: 'year', value: 2020),
           AlbumRowFilterParameter(column: 'is_single_grouping', value: 0),
@@ -1137,7 +1296,7 @@ void main() {
       );
       final albums = rows
           .where((r) => r.read<int>('is_single_grouping') == 0)
-          .map((r) => r.read<String>('album'))
+          .map((r) => r.read<String>('name'))
           .toList();
       expect(albums, ['Beta', 'Gamma']);
     });
@@ -1153,7 +1312,7 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Artist', year: 2020);
 
       final rows = await db.getAlbums(
-        artist: 'Artist',
+        artistId: artistIdFor('Artist'),
         orderBy: defaultAlbumOrder,
       );
       // Regular album first, single grouping (null album) last
@@ -1224,7 +1383,7 @@ void main() {
 
   group('watchAlbumsCount', () {
     test(
-      'returns count of all albums and singles when artist is null',
+      'returns count of all albums and singles when artistId is null',
       () async {
         await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Album A');
         await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'album a');
@@ -1258,7 +1417,9 @@ void main() {
         album: 'Excluded Album',
       );
 
-      final count = await db.watchAlbumsCount(artist: 'Main').first;
+      final count = await db
+          .watchAlbumsCount(artistId: artistIdFor('Main'))
+          .first;
       expect(count, 2);
     });
 
@@ -1309,7 +1470,7 @@ void main() {
           .watchAlbumsCount(
             orderBy: defaultAlbumOrder,
             cursorFilters: [
-              AlbumRowFilterParameter(column: 'album', value: 'Beta'),
+              AlbumRowFilterParameter(column: 'name', value: 'Beta'),
               AlbumRowFilterParameter(column: 'artist', value: 'A'),
               AlbumRowFilterParameter(column: 'year', value: 2021),
               AlbumRowFilterParameter(column: 'is_single_grouping', value: 0),
@@ -1318,6 +1479,98 @@ void main() {
           .first;
       // Alpha and Beta are at or before cursor
       expect(count, 2);
+    });
+  });
+
+  group('getSearchResults', () {
+    test('returns matching tracks by title', () async {
+      await insertTrack(db, uuid: '1', title: 'Bohemian Rhapsody', artist: 'Queen', album: 'A Night at the Opera');
+      await insertTrack(db, uuid: '2', title: 'Other Song', artist: 'Other', album: 'Other Album');
+      await rebuildFts(db);
+
+      final results = await db.getSearchResults('Bohemian');
+      expect(results.tracks.length, 1);
+      expect(results.tracks.first.read<String>('title'), 'Bohemian Rhapsody');
+    });
+
+    test('returns matching artists', () async {
+      await insertTrack(db, uuid: '1', title: 'Song', artist: 'Radiohead', album: 'OK Computer');
+      await rebuildFts(db);
+
+      final results = await db.getSearchResults('Radiohead', searchTracks: false, searchAlbums: false);
+      expect(results.artists.length, 1);
+      expect(results.artists.first.read<String>('name'), 'Radiohead');
+      expect(results.tracks, isEmpty);
+      expect(results.albums, isEmpty);
+    });
+
+    test('searchTracks false excludes tracks', () async {
+      await insertTrack(db, uuid: '1', title: 'TestSong', artist: 'TestArtist', album: 'TestAlbum');
+      await rebuildFts(db);
+
+      final results = await db.getSearchResults('Test', searchTracks: false);
+      expect(results.tracks, isEmpty);
+      expect(results.artists.length, greaterThanOrEqualTo(1));
+    });
+
+    test('empty query returns empty results', () async {
+      await insertTrack(db, uuid: '1', title: 'Song', artist: 'Artist');
+      await rebuildFts(db);
+
+      final results = await db.getSearchResults('');
+      expect(results.tracks, isEmpty);
+      expect(results.artists, isEmpty);
+      expect(results.albums, isEmpty);
+    });
+
+    test('prefix matching works', () async {
+      await insertTrack(db, uuid: '1', title: 'Song', artist: 'ArtistName');
+      await rebuildFts(db);
+
+      final results = await db.getSearchResults('Art', searchTracks: false, searchAlbums: false);
+      expect(results.artists.length, greaterThanOrEqualTo(1));
+      expect(results.artists.first.read<String>('name'), 'ArtistName');
+    });
+  });
+
+  group('SearchParameter validation', () {
+    test('accepts valid metadata columns', () {
+      expect(
+        () => SearchParameter(column: 'title', operator: '=', value: 'x'),
+        returnsNormally,
+      );
+      expect(
+        () => SearchParameter(column: 'year', operator: '>=', value: 2020),
+        returnsNormally,
+      );
+    });
+
+    test('accepts valid track columns', () {
+      expect(
+        () => SearchParameter(column: 'uuid_id', operator: '=', value: 'abc'),
+        returnsNormally,
+      );
+    });
+
+    test('rejects artist_id as a metadata column', () {
+      expect(
+        () => SearchParameter(column: 'artist_id', operator: '=', value: 1),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects album_id as a metadata column', () {
+      expect(
+        () => SearchParameter(column: 'album_id', operator: '=', value: 1),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects invalid operator', () {
+      expect(
+        () => SearchParameter(column: 'title', operator: '!=', value: 'x'),
+        throwsArgumentError,
+      );
     });
   });
 }
