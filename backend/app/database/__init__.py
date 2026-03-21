@@ -7,5 +7,7 @@ from .database import (
     DatabaseContext,
     OrderParameter,
     RowFilterParameter,
+    SearchEntityType,
     SearchParameter,
+    SearchResults,
 )

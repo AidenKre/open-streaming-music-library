@@ -182,6 +182,32 @@ void main() {
       expect(tracks.length, 1);
     });
 
+    test('multi-page sync populates FTS tables correctly', () async {
+      var callCount = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          callCount++;
+          if (callCount == 1) {
+            return _tracksResponse(['uuid-1'], nextCursor: 'cursor-1');
+          } else {
+            return _tracksResponse(['uuid-2']);
+          }
+        }),
+      );
+
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+
+      // FTS should be populated after sync completes
+      final ftsRows = await db.customSelect(
+        'SELECT rowid FROM fts_tracks',
+      ).get();
+      expect(ftsRows.length, 2);
+    });
+
     test('concurrent sync call is a no-op', () async {
       var callCount = 0;
       ApiClient.initForTest(

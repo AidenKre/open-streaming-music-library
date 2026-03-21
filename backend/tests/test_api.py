@@ -9,8 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.models import (
+    Album,
+    Artist,
     GetAlbumsResponse,
     GetArtistsResponse,
+    GetSearchResponse,
     GetTracksResponse,
     Track,
     TrackMetaData,
@@ -35,6 +38,37 @@ def client(tmp_path, monkeypatch):
 
     with TestClient(app.main.app) as c:
         yield c
+
+
+def get_artist_id(client, artist_name: str) -> int:
+    """Look up artist ID by name from the database."""
+    artists = client.app.state.database.get_artists()
+    for a in artists:
+        if a.name.lower() == artist_name.lower():
+            return a.id
+    raise ValueError(f"Artist '{artist_name}' not found")
+
+
+def get_album_id(client, album_name: str, artist_name: Optional[str] = None) -> int:
+    """Look up album ID by name (and optionally artist name) from the database."""
+    artist_id = None
+    if artist_name:
+        artist_id = get_artist_id(client, artist_name)
+    albums = client.app.state.database.get_albums(artist_id=artist_id)
+    for a in albums:
+        if a.name is not None and a.name.lower() == album_name.lower():
+            return a.id
+    raise ValueError(f"Album '{album_name}' not found")
+
+
+def get_singles_album_id(client, artist_name: str) -> int:
+    """Look up single grouping album ID for an artist."""
+    artist_id = get_artist_id(client, artist_name)
+    albums = client.app.state.database.get_albums(artist_id=artist_id)
+    for a in albums:
+        if a.is_single_grouping:
+            return a.id
+    raise ValueError(f"Singles album for '{artist_name}' not found")
 
 
 # Tests assume that each track has a unique artist and album
@@ -154,10 +188,14 @@ class TestGetTracks:
                 client=client, amount_to_add=5, artist=artist, album=album
             )
 
+            artist_id = get_artist_id(client, artist)
+            album_id = get_album_id(client, album, artist)
+
             returned_tracks = []
 
             r = client.get(
-                "/tracks", params={"limit": 1, "artist": artist, "album": album}
+                "/tracks",
+                params={"limit": 1, "artist_id": artist_id, "album_id": album_id},
             )
             assert r.status_code == 200, r.text
 
@@ -322,7 +360,11 @@ class TestGetTracks:
         assert client.app.state.database.add_track(track_other)
 
         # MainArtist + TheAlbum returns both album_artist and plain artist tracks
-        r = client.get("/tracks", params={"artist": album_artist, "album": album})
+        artist_id = get_artist_id(client, album_artist)
+        album_id = get_album_id(client, album, album_artist)
+        r = client.get(
+            "/tracks", params={"artist_id": artist_id, "album_id": album_id}
+        )
         assert r.status_code == 200, r.text
 
         response = GetTracksResponse.model_validate(r.json())
@@ -330,15 +372,19 @@ class TestGetTracks:
         titles = {t.metadata.title for t in response.data}
         assert titles == {"song_aa", "song_plain"}
 
-        # feat_artist should NOT return the album_artist track
-        r = client.get("/tracks", params={"artist": feat_artist, "album": album})
-        assert r.status_code == 200, r.text
-
-        response = GetTracksResponse.model_validate(r.json())
-        assert len(response.data) == 0
+        # feat_artist is NOT a standalone artist — album_artist takes priority,
+        # so only MainArtist and OtherArtist exist in the artists table
+        all_artists = client.app.state.database.get_artists()
+        artist_names = {a.name for a in all_artists}
+        assert feat_artist not in artist_names
 
         # OtherArtist should only return their own track
-        r = client.get("/tracks", params={"artist": "OtherArtist", "album": album})
+        other_artist_id = get_artist_id(client, "OtherArtist")
+        other_album_id = get_album_id(client, album, "OtherArtist")
+        r = client.get(
+            "/tracks",
+            params={"artist_id": other_artist_id, "album_id": other_album_id},
+        )
         assert r.status_code == 200, r.text
 
         response = GetTracksResponse.model_validate(r.json())
@@ -442,8 +488,8 @@ class TestGetArtists:
 
         assert getartistresponse
 
-        gotten_artists = {artist for artist in getartistresponse.data}
-        assert gotten_artists == expected_artists
+        gotten_artist_names = {artist.name for artist in getartistresponse.data}
+        assert gotten_artist_names == expected_artists
         assert len(expected_artists) == len(getartistresponse.data)
 
     def test_artists__cursor_logic__works(self, client):
@@ -454,7 +500,7 @@ class TestGetArtists:
             if artist:
                 expected_artists.add(artist)
 
-        gotten_artists = []
+        gotten_artist_names = []
 
         r = client.get("/artists?limit=1")
         assert r.status_code == 200, r.text
@@ -463,7 +509,7 @@ class TestGetArtists:
         assert getartistresponse
 
         assert len(getartistresponse.data) == 1
-        gotten_artists.append(getartistresponse.data[0])
+        gotten_artist_names.append(getartistresponse.data[0].name)
 
         nextCursor = getartistresponse.nextCursor
         assert nextCursor
@@ -476,11 +522,11 @@ class TestGetArtists:
             assert getartistresponse
 
             assert len(getartistresponse.data) == 1
-            gotten_artists.append(getartistresponse.data[0])
+            gotten_artist_names.append(getartistresponse.data[0].name)
 
             nextCursor = getartistresponse.nextCursor
 
-        assert sorted(expected_artists) == sorted(gotten_artists)
+        assert sorted(expected_artists) == sorted(gotten_artist_names)
 
     def test_artists__limit_offset__works(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=2)
@@ -492,7 +538,7 @@ class TestGetArtists:
         first_response = GetArtistsResponse.model_validate(r.json())
         assert first_response
         assert len(first_response.data) == 1
-        assert first_response.data[0] in expected_artists
+        assert first_response.data[0].name in expected_artists
 
         r = client.get("/artists?limit=1&offset=1")
         assert r.status_code == 200, r.text
@@ -500,9 +546,9 @@ class TestGetArtists:
         second_response = GetArtistsResponse.model_validate(r.json())
         assert second_response
         assert len(second_response.data) == 1
-        assert second_response.data[0] in expected_artists
+        assert second_response.data[0].name in expected_artists
 
-        all_gotten_artists = set(first_response.data + second_response.data)
+        all_gotten_artists = {a.name for a in first_response.data + second_response.data}
 
         assert all_gotten_artists == expected_artists
 
@@ -559,14 +605,15 @@ class TestGetArtists:
             nextCursor = response.nextCursor
 
         assert len(all_artists) == 10
-        assert len(set(all_artists)) == 10
+        assert len({a.name for a in all_artists}) == 10
 
 
 class TestGetAlbums:
     def test_albums__invalid_artist__returns_empty(self, client):
         add_tracks_to_client(client=client, amount_to_add=1)
 
-        r = client.get("/albums", params={"artist": "fake_artist"})
+        # Use a non-existent artist_id
+        r = client.get("/albums", params={"artist_id": 999999})
         assert r.status_code == 200, r.text
 
         response = GetAlbumsResponse.model_validate(r.json())
@@ -579,7 +626,8 @@ class TestGetAlbums:
 
         client.app.state.database.add_track(track=track)
 
-        r = client.get("/albums", params={"artist": "artist"})
+        artist_id = get_artist_id(client, "artist")
+        r = client.get("/albums", params={"artist_id": artist_id})
         assert r.status_code == 200, r.text
 
         response = GetAlbumsResponse.model_validate(r.json())
@@ -587,7 +635,7 @@ class TestGetAlbums:
         # Track with no album produces a single grouping
         assert len(response.data) == 1
         assert response.data[0].is_single_grouping is True
-        assert response.data[0].album is None
+        assert response.data[0].name is None
 
     def test_albums__has_albums__returns_albums(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=5)
@@ -607,15 +655,16 @@ class TestGetAlbums:
 
             artist_albums[artist].add(album)
 
-        for artist in artist_albums:
-            expected_albums = artist_albums[artist]
-            r = client.get("/albums", params={"artist": artist})
+        for artist_name in artist_albums:
+            expected_albums = artist_albums[artist_name]
+            artist_id = get_artist_id(client, artist_name)
+            r = client.get("/albums", params={"artist_id": artist_id})
             assert r.status_code == 200, r.text
 
             response = GetAlbumsResponse.model_validate(r.json())
             assert response
 
-            gotten_album_names = [a.album for a in response.data]
+            gotten_album_names = [a.name for a in response.data]
             set_gotten_albums = set(gotten_album_names)
             assert len(gotten_album_names) == len(set_gotten_albums)
             assert set_gotten_albums == expected_albums
@@ -651,18 +700,19 @@ class TestGetAlbums:
 
             artist_albums[artist].add(album)
 
-        for artist, expected_albums in artist_albums.items():
+        for artist_name, expected_albums in artist_albums.items():
             if len(expected_albums) == 0:
                 continue
 
+            artist_id = get_artist_id(client, artist_name)
             gotten_album_names: List[str] = []
-            r = client.get("/albums", params={"artist": artist, "limit": 1})
+            r = client.get("/albums", params={"artist_id": artist_id, "limit": 1})
             assert r.status_code == 200, r.text
 
             response = GetAlbumsResponse.model_validate(r.json())
             assert response
             assert len(response.data) == 1
-            gotten_album_names.append(response.data[0].album)
+            gotten_album_names.append(response.data[0].name)
 
             nextCursor = response.nextCursor
             assert response.nextCursor
@@ -670,14 +720,14 @@ class TestGetAlbums:
             while nextCursor:
                 r = client.get(
                     "/albums",
-                    params={"artist": artist, "limit": 1, "cursor": nextCursor},
+                    params={"artist_id": artist_id, "limit": 1, "cursor": nextCursor},
                 )
                 assert r.status_code == 200, r.text
 
                 response = GetAlbumsResponse.model_validate(r.json())
                 assert response
                 assert len(response.data) == 1
-                gotten_album_names.append(response.data[0].album)
+                gotten_album_names.append(response.data[0].name)
 
                 nextCursor = response.nextCursor
 
@@ -702,10 +752,11 @@ class TestGetAlbums:
             track_added = client.app.state.database.add_track(track=track)
             assert track_added
 
+        artist_id = get_artist_id(client, artist)
         gotten_album_names: List[str] = []
         for i in range(len(albums)):
             r = client.get(
-                "/albums", params={"artist": artist, "limit": 1, "offset": i}
+                "/albums", params={"artist_id": artist_id, "limit": 1, "offset": i}
             )
             assert r.status_code == 200, r.text
 
@@ -713,7 +764,7 @@ class TestGetAlbums:
             assert response
             assert len(response.data) == 1
 
-            gotten_album_name = response.data[0].album
+            gotten_album_name = response.data[0].name
             assert gotten_album_name not in gotten_album_names
             assert gotten_album_name in albums
 
@@ -733,21 +784,23 @@ class TestGetAlbums:
             track_added = client.app.state.database.add_track(track=track)
             assert track_added
 
+        artist_id = get_artist_id(client, artist)
+
         # Bad limit tests
-        r = client.get("/albums?artist=artist&limit=0")
+        r = client.get(f"/albums?artist_id={artist_id}&limit=0")
         assert r.status_code == 422, r.text
 
-        r = client.get("/albums?artist=artist&limit=-1")
+        r = client.get(f"/albums?artist_id={artist_id}&limit=-1")
         assert r.status_code == 422, r.text
 
-        r = client.get("/albums?artist=artist&limit=2000")
+        r = client.get(f"/albums?artist_id={artist_id}&limit=2000")
         assert r.status_code == 422, r.text
 
         # Bad offset tests
-        r = client.get("/albums?artist=artist&offset=-1")
+        r = client.get(f"/albums?artist_id={artist_id}&offset=-1")
         assert r.status_code == 422, r.text
 
-        r = client.get("/albums?artist=artist&offset=1000")
+        r = client.get(f"/albums?artist_id={artist_id}&offset=1000")
         assert r.status_code == 200, r.text
 
         response = GetAlbumsResponse.model_validate(r.json())
@@ -790,7 +843,7 @@ class TestGetAlbums:
         assert r.status_code == 200, r.text
 
         response = GetAlbumsResponse.model_validate(r.json())
-        returned_album_names = [a.album for a in response.data]
+        returned_album_names = [a.name for a in response.data]
         assert sorted(a for a in returned_album_names if a is not None) == sorted(
             all_albums
         )
@@ -813,7 +866,7 @@ class TestGetAlbums:
         assert r.status_code == 200, r.text
 
         response = GetAlbumsResponse.model_validate(r.json())
-        gotten_album_names.extend(a.album for a in response.data if a.album is not None)
+        gotten_album_names.extend(a.name for a in response.data if a.name is not None)
 
         nextCursor = response.nextCursor
         while nextCursor:
@@ -821,7 +874,7 @@ class TestGetAlbums:
             assert r.status_code == 200, r.text
             response = GetAlbumsResponse.model_validate(r.json())
             gotten_album_names.extend(
-                a.album for a in response.data if a.album is not None
+                a.name for a in response.data if a.name is not None
             )
             nextCursor = response.nextCursor
 
@@ -843,7 +896,7 @@ class TestGetAlbums:
         assert r.status_code == 200, r.text
 
         response = GetAlbumsResponse.model_validate(r.json())
-        returned_album_names = [a.album for a in response.data]
+        returned_album_names = [a.name for a in response.data]
         expected_order = sorted(albums_to_insert, key=str.lower)
         assert returned_album_names == expected_order
 
@@ -859,11 +912,12 @@ class TestGetAlbums:
             track = Track(file_path=file_path, metadata=metadata)
             assert client.app.state.database.add_track(track=track)
 
-        r = client.get("/albums", params={"artist": artist})
+        artist_id = get_artist_id(client, artist)
+        r = client.get("/albums", params={"artist_id": artist_id})
         assert r.status_code == 200, r.text
 
         response = GetAlbumsResponse.model_validate(r.json())
-        returned_album_names = [a.album for a in response.data]
+        returned_album_names = [a.name for a in response.data]
         assert returned_album_names == ["Late Album", "Mid Album", "Early Album"]
 
     def test_albums__returns_correct_artist_field(self, client, tmp_path):
@@ -891,7 +945,7 @@ class TestGetAlbums:
         response = GetAlbumsResponse.model_validate(r.json())
         assert len(response.data) == 2
 
-        album_map = {a.album: a.artist for a in response.data}
+        album_map = {a.name: a.artist for a in response.data}
         assert album_map["Album X"] == "Artist A"
         assert album_map["Album Y"] == "Album Artist B"
 
@@ -916,4 +970,82 @@ class TestGetAlbums:
 
         artists = {a.artist for a in response.data}
         assert artists == {"Artist A", "Artist B"}
-        assert all(a.album == "Greatest Hits" for a in response.data)
+        assert all(a.name == "Greatest Hits" for a in response.data)
+
+
+class TestSearch:
+    def test_search__by_title__returns_track(self, client, tmp_path):
+        metadata = TrackMetaData(
+            title="Bohemian Rhapsody", artist="Queen", album="A Night at the Opera",
+            duration=1.0,
+        )
+        track = Track(file_path=tmp_path / "br.mp3", metadata=metadata)
+        assert client.app.state.database.add_track(track=track)
+
+        r = client.get("/search", params={"q": "Bohemian"})
+        assert r.status_code == 200, r.text
+
+        response = GetSearchResponse.model_validate(r.json())
+        assert len(response.tracks) >= 1
+        assert any(t.metadata.title == "Bohemian Rhapsody" for t in response.tracks)
+
+    def test_search__by_artist__returns_artist(self, client, tmp_path):
+        metadata = TrackMetaData(
+            title="Song", artist="Radiohead", album="OK Computer", duration=1.0,
+        )
+        track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
+        assert client.app.state.database.add_track(track=track)
+
+        r = client.get("/search", params={"q": "Radiohead"})
+        assert r.status_code == 200, r.text
+
+        response = GetSearchResponse.model_validate(r.json())
+        assert len(response.artists) >= 1
+        assert any(a.name == "Radiohead" for a in response.artists)
+
+    def test_search__by_album__returns_album(self, client, tmp_path):
+        metadata = TrackMetaData(
+            title="Song", artist="Artist", album="Dark Side of the Moon", duration=1.0,
+        )
+        track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
+        assert client.app.state.database.add_track(track=track)
+
+        r = client.get("/search", params={"q": "Dark Side"})
+        assert r.status_code == 200, r.text
+
+        response = GetSearchResponse.model_validate(r.json())
+        assert len(response.albums) >= 1
+        assert any(a.name == "Dark Side of the Moon" for a in response.albums)
+
+    def test_search__types_filter__works(self, client, tmp_path):
+        metadata = TrackMetaData(
+            title="Song", artist="Artist", album="Album", duration=1.0,
+        )
+        track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
+        assert client.app.state.database.add_track(track=track)
+
+        r = client.get("/search", params={"q": "Song", "types": "tracks"})
+        assert r.status_code == 200, r.text
+
+        response = GetSearchResponse.model_validate(r.json())
+        assert len(response.artists) == 0
+        assert len(response.albums) == 0
+
+    def test_search__no_match__returns_empty(self, client, tmp_path):
+        metadata = TrackMetaData(
+            title="Song", artist="Artist", album="Album", duration=1.0,
+        )
+        track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
+        assert client.app.state.database.add_track(track=track)
+
+        r = client.get("/search", params={"q": "xyznonexistent"})
+        assert r.status_code == 200, r.text
+
+        response = GetSearchResponse.model_validate(r.json())
+        assert len(response.tracks) == 0
+        assert len(response.artists) == 0
+        assert len(response.albums) == 0
+
+    def test_search__invalid_types__returns_error(self, client):
+        r = client.get("/search", params={"q": "test", "types": "invalid"})
+        assert r.status_code == 400, r.text

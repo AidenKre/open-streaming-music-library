@@ -14,6 +14,8 @@ class TrackMetadataDto {
   final int sampleRateHz;
   final int channels;
   final bool hasAlbumArt;
+  final int? artistId;
+  final int? albumId;
 
   const TrackMetadataDto({
     this.title,
@@ -31,6 +33,8 @@ class TrackMetadataDto {
     required this.sampleRateHz,
     required this.channels,
     required this.hasAlbumArt,
+    this.artistId,
+    this.albumId,
   });
 
   factory TrackMetadataDto.fromJson(Map<String, dynamic> json) {
@@ -50,6 +54,8 @@ class TrackMetadataDto {
       sampleRateHz: (json['sample_rate_hz'] as num).toInt(),
       channels: (json['channels'] as num).toInt(),
       hasAlbumArt: json['has_album_art'] as bool? ?? false,
+      artistId: (json['artist_id'] as num?)?.toInt(),
+      albumId: (json['album_id'] as num?)?.toInt(),
     );
   }
 }

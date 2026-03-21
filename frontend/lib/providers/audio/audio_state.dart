@@ -8,21 +8,21 @@ enum PlayerStatus { idle, loading, playing, paused }
 enum QueueRepeatMode { off, all, one }
 
 class QueueContext {
-  final String? artist;
-  final String? album;
+  final int? artistId;
+  final int? albumId;
   final List<OrderParameter> orderParams;
   final int shuffleSeed;
 
   const QueueContext({
-    this.artist,
-    this.album,
+    this.artistId,
+    this.albumId,
     this.orderParams = const [],
     int? shuffleSeed,
   }) : shuffleSeed = shuffleSeed ?? 0;
 
   QueueContext withNewSeed() => QueueContext(
-    artist: artist,
-    album: album,
+    artistId: artistId,
+    albumId: albumId,
     orderParams: orderParams,
     shuffleSeed: Random().nextInt(1 << 32),
   );

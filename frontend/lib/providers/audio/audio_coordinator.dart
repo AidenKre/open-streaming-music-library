@@ -90,8 +90,8 @@ class AudioCoordinator extends Notifier<AudioState> {
           .read(databaseProvider)
           .getTrackUuids(
             orderBy: nextContext.orderParams,
-            artist: nextContext.artist,
-            album: nextContext.album,
+            artistId: nextContext.artistId,
+            albumId: nextContext.albumId,
           );
       final shuffled = shuffleWithCurrentFirst(
         uuids,
@@ -201,8 +201,8 @@ class AudioCoordinator extends Notifier<AudioState> {
           .read(databaseProvider)
           .getTrackUuids(
             orderBy: newContext.orderParams,
-            artist: newContext.artist,
-            album: newContext.album,
+            artistId: newContext.artistId,
+            albumId: newContext.albumId,
           );
       final currentUuid = state.playback.currentTrack?.uuidId;
       final shuffled = shuffleWithCurrentFirst(

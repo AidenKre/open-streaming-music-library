@@ -37,7 +37,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     return const TrackSyncState();
   }
 
-  Future<void> sync({String? artist, String? album}) async {
+  Future<void> sync({int? artistId, int? albumId}) async {
     final current = state.value;
     if (current != null && current.isSyncing) return;
 
@@ -55,8 +55,8 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       var response = await api.getTracksPage(
         newerThan: lastFetchTime,
         olderThan: now,
-        artist: artist,
-        album: album,
+        artistId: artistId,
+        albumId: albumId,
       );
       await _upsertTracks(db, response.data);
 
@@ -66,6 +66,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         await _upsertTracks(db, response.data);
       }
 
+      await _rebuildFts(db);
       await prefs.setInt(lastFetchTimeKey, now);
       state = AsyncData(const TrackSyncState());
     } catch (e) {
@@ -78,6 +79,49 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     List<ClientTrackDto> tracks,
   ) async {
     await db.batch((batch) {
+      // Upsert artists first (parent table)
+      for (final dto in tracks) {
+        final meta = dto.metadata;
+        final effectiveArtist = meta.albumArtist ?? meta.artist;
+        if (meta.artistId != null && effectiveArtist != null) {
+          final artistRow = ArtistsCompanion(
+            id: Value(meta.artistId!),
+            name: Value(effectiveArtist),
+          );
+          batch.insert(
+            db.artists,
+            artistRow,
+            onConflict: DoUpdate((_) => ArtistsCompanion(name: Value(effectiveArtist))),
+          );
+        }
+      }
+
+      // Upsert albums (references artists)
+      for (final dto in tracks) {
+        final meta = dto.metadata;
+        if (meta.albumId != null && meta.artistId != null) {
+          final hasAlbumName = meta.album != null && meta.album!.isNotEmpty;
+          final albumRow = AlbumsCompanion(
+            id: Value(meta.albumId!),
+            name: hasAlbumName ? Value(meta.album) : const Value(null),
+            artistId: Value(meta.artistId!),
+            year: Value(meta.year),
+            isSingleGrouping: Value(!hasAlbumName),
+          );
+          batch.insert(
+            db.albums,
+            albumRow,
+            onConflict: DoUpdate((_) => AlbumsCompanion(
+              name: hasAlbumName ? Value(meta.album) : const Value(null),
+              artistId: Value(meta.artistId!),
+              year: Value(meta.year),
+              isSingleGrouping: Value(!hasAlbumName),
+            )),
+          );
+        }
+      }
+
+      // Upsert tracks and trackmetadata
       for (final dto in tracks) {
         final tracksRow = tracksCompanionFromDto(dto);
         final metaRow = trackmetadataCompanionFromDto(dto);
@@ -85,6 +129,28 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         batch.insert(db.trackmetadata, metaRow, onConflict: DoUpdate((_) => metaRow));
       }
     });
+  }
+
+  Future<void> _rebuildFts(AppDatabase db) async {
+    await db.customStatement("DELETE FROM fts_artists");
+    await db.customStatement(
+      "INSERT INTO fts_artists(rowid, name) "
+      "SELECT id, name FROM artists",
+    );
+
+    await db.customStatement("DELETE FROM fts_albums");
+    await db.customStatement(
+      "INSERT INTO fts_albums(rowid, name, artist_name) "
+      "SELECT a.id, COALESCE(a.name, ''), ar.name "
+      "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
+    );
+
+    await db.customStatement("DELETE FROM fts_tracks");
+    await db.customStatement(
+      "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+      "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
+      "FROM trackmetadata",
+    );
   }
 }
 

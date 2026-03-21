@@ -17,13 +17,16 @@ from app.database import (
     DatabaseContext,
     OrderParameter,
     RowFilterParameter,
+    SearchEntityType,
     SearchParameter,
 )
 from app.models import (
     Album,
+    Artist,
     ClientTrack,
     GetAlbumsResponse,
     GetArtistsResponse,
+    GetSearchResponse,
     GetTracksResponse,
     Track,
 )
@@ -112,8 +115,8 @@ def get_tracks(
     cursor: Optional[str] = None,
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    artist: Optional[str] = None,
-    album: Optional[str] = None,
+    artist_id: Optional[int] = None,
+    album_id: Optional[int] = None,
     newer_than: Optional[int] = None,
     older_than: Optional[int] = None,
 ):
@@ -168,8 +171,8 @@ def get_tracks(
                 "order_parameters",
                 "row_filter_parameters",
                 "search_parameters",
-                "artist",
-                "album",
+                "artist_id",
+                "album_id",
             ]
         )
         if sorted(cursor_dict.keys()) != valid_cursor_keys:
@@ -186,15 +189,15 @@ def get_tracks(
         row_filter_parameters = [
             RowFilterParameter(**item) for item in cursor_dict["row_filter_parameters"]
         ]
-        artist = cursor_dict["artist"]
-        album = cursor_dict["album"]
+        artist_id = cursor_dict["artist_id"]
+        album_id = cursor_dict["album_id"]
 
     remaining_track_count = database.get_tracks_count(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
-        artist=artist,
-        album=album,
+        artist_id=artist_id,
+        album_id=album_id,
     )
     if remaining_track_count is None:
         raise HTTPException(
@@ -207,8 +210,8 @@ def get_tracks(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
-        artist=artist,
-        album=album,
+        artist_id=artist_id,
+        album_id=album_id,
         limit=limit,
         offset=offset,
     )
@@ -223,8 +226,6 @@ def get_tracks(
         for order_param in order_parameters:
             col = order_param.column
             # Linked to allowed track columns in database.py.
-            # probably should move these constants to their own
-            # file or something
             if col in ["uuid_id", "created_at", "last_updated"]:
                 raw_value = getattr(last_track, col)
             else:
@@ -241,8 +242,8 @@ def get_tracks(
                     asdict(param) for param in new_row_filter_parameters
                 ],
                 "search_parameters": [asdict(param) for param in search_parameters],
-                "artist": artist,
-                "album": album,
+                "artist_id": artist_id,
+                "album_id": album_id,
             }
         )
 
@@ -356,7 +357,7 @@ def get_artists(
 
     if not cursor:
         order_parameters = [
-            ArtistOrderParameter(column="artist", isAscending=True),
+            ArtistOrderParameter(column="name", isAscending=True),
         ]
         row_filter_parameters = []
     else:
@@ -415,7 +416,7 @@ def get_artists(
     else:
         last_artist = returned_artists[-1]
         new_row_filter_parameters = [
-            ArtistRowFilterParameter(column="artist", value=last_artist),
+            ArtistRowFilterParameter(column="name", value=last_artist.name),
         ]
 
         nextCursor = json.dumps(
@@ -435,7 +436,7 @@ def get_albums(
     cursor: Optional[str] = None,
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    artist: Optional[str] = None,
+    artist_id: Optional[int] = None,
 ):
     database: Database = cast(Database, app.state.database)
 
@@ -443,18 +444,18 @@ def get_albums(
     row_filter_parameters: List[AlbumRowFilterParameter]
 
     if not cursor:
-        if artist is not None:
+        if artist_id is not None:
             order_parameters = [
                 AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
                 AlbumOrderParameter(column="is_single_grouping", isAscending=True),
-                AlbumOrderParameter(column="album", isAscending=True, nullsLast=True),
+                AlbumOrderParameter(column="name", isAscending=True, nullsLast=True),
             ]
         else:
             order_parameters = [
                 AlbumOrderParameter(column="artist", isAscending=True, nullsLast=True),
                 AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
                 AlbumOrderParameter(column="is_single_grouping", isAscending=True),
-                AlbumOrderParameter(column="album", isAscending=True, nullsLast=True),
+                AlbumOrderParameter(column="name", isAscending=True, nullsLast=True),
             ]
         row_filter_parameters = []
     else:
@@ -471,7 +472,7 @@ def get_albums(
 
         cursor_dict: Dict[str, Any] = decoded
         valid_cursor_keys = sorted(
-            ["order_parameters", "row_filter_parameters", "artist"]
+            ["order_parameters", "row_filter_parameters", "artist_id"]
         )
         if sorted(cursor_dict.keys()) != valid_cursor_keys:
             raise HTTPException(
@@ -485,10 +486,10 @@ def get_albums(
             AlbumRowFilterParameter(**item)
             for item in cursor_dict["row_filter_parameters"]
         ]
-        artist = cursor_dict["artist"]
+        artist_id = cursor_dict["artist_id"]
 
     remaining_count = database.get_albums_count(
-        artist=artist,
+        artist_id=artist_id,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
     )
@@ -499,7 +500,7 @@ def get_albums(
         return GetAlbumsResponse(data=[], nextCursor=None)
 
     returned_albums: List[Album] | None = database.get_albums(
-        artist=artist,
+        artist_id=artist_id,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
         limit=limit,
@@ -520,8 +521,8 @@ def get_albums(
         for order_param in order_parameters:
             col = order_param.column
             raw_value: Any
-            if col == "album":
-                raw_value = last_album.album
+            if col == "name":
+                raw_value = last_album.name
             elif col == "artist":
                 raw_value = last_album.artist
             elif col == "year":
@@ -541,11 +542,45 @@ def get_albums(
                 "row_filter_parameters": [
                     asdict(param) for param in new_row_filter_parameters
                 ],
-                "artist": artist,
+                "artist_id": artist_id,
             }
         )
 
     return GetAlbumsResponse(data=returned_albums, nextCursor=nextCursor)
+
+
+@app.get("/search", response_model=GetSearchResponse)
+def search(
+    q: str = Query(..., min_length=1),
+    types: str = Query("tracks,artists,albums"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    database: Database = cast(Database, app.state.database)
+
+    return_types = SearchEntityType(0)
+    for t in types.split(","):
+        t = t.strip().lower()
+        if t == "tracks":
+            return_types |= SearchEntityType.TRACKS
+        elif t == "artists":
+            return_types |= SearchEntityType.ARTISTS
+        elif t == "albums":
+            return_types |= SearchEntityType.ALBUMS
+
+    if not return_types:
+        raise HTTPException(status_code=400, detail="No valid types specified")
+
+    results = database.get_search_results(
+        query=q,
+        return_types=return_types,
+        limit_per_type=limit,
+    )
+
+    return GetSearchResponse(
+        tracks=[ClientTrack.from_track(t) for t in results.tracks],
+        artists=results.artists,
+        albums=results.albums,
+    )
 
 
 @app.get("/")

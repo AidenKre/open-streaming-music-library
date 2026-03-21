@@ -10,11 +10,11 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
-  final String? artist;
-  final String? album;
+  final int? artistId;
+  final int? albumId;
   final VoidCallback? onDisconnect;
 
-  const TracksPage({super.key, this.artist, this.album, this.onDisconnect});
+  const TracksPage({super.key, this.artistId, this.albumId, this.onDisconnect});
 
   @override
   ConsumerState<TracksPage> createState() => TracksPageState();
@@ -50,7 +50,7 @@ class TracksPageState extends ConsumerState<TracksPage> {
     Future.microtask(
       () => ref
           .read(trackSyncProvider.notifier)
-          .sync(artist: widget.artist, album: widget.album),
+          .sync(artistId: widget.artistId, albumId: widget.albumId),
     );
   }
 
@@ -79,8 +79,8 @@ class TracksPageState extends ConsumerState<TracksPage> {
         .watchTrackCount(
           orderBy: orderBy,
           cursorFilters: cursorFilters,
-          artist: widget.artist,
-          album: widget.album,
+          artistId: widget.artistId,
+          albumId: widget.albumId,
         )
         .listen((count) {
           if (!mounted) return;
@@ -111,8 +111,8 @@ class TracksPageState extends ConsumerState<TracksPage> {
     final rows = await db.getTracks(
       orderBy: _orderParams,
       cursorFilters: cursorFilters,
-      artist: widget.artist,
-      album: widget.album,
+      artistId: widget.artistId,
+      albumId: widget.albumId,
       limit: _pageSize,
     );
 
@@ -171,7 +171,7 @@ class TracksPageState extends ConsumerState<TracksPage> {
               return TrackTile(
                 track: track,
                 onTap: () => ref.read(audioProvider.notifier).playFromQueue(
-                  QueueContext(artist: widget.artist, album: widget.album, orderParams: _orderParams),
+                  QueueContext(artistId: widget.artistId, albumId: widget.albumId, orderParams: _orderParams),
                   track,
                 ),
               );

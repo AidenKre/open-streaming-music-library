@@ -1,6 +1,4 @@
 from pydantic import BaseModel
-from pathlib import Path
-import subprocess
 
 # TODO: add comment field to TrackMetaData. This would also mean having to implement
 # parsing for it in metadata.py and supporting it in the database (update schema, etc.)
@@ -10,6 +8,8 @@ class TrackMetaData(BaseModel):
     artist: str | None = None
     album: str | None = None
     album_artist: str | None = None
+    artist_id: int | None = None
+    album_id: int | None = None
     year: int | None = None
     date: str | None = None
 
@@ -27,7 +27,7 @@ class TrackMetaData(BaseModel):
 
     def is_empty(self) -> bool:
         return (
-            self.codec == None
+            self.codec is None
             and self.duration == 0.0
             and self.bitrate_kbps == 0.0
             and self.sample_rate_hz == 0

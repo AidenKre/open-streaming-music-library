@@ -93,11 +93,11 @@ void main() {
       expect(captured?.queryParameters.containsKey('cursor'), false);
       expect(captured?.queryParameters.containsKey('newer_than'), false);
       expect(captured?.queryParameters.containsKey('older_than'), false);
-      expect(captured?.queryParameters.containsKey('artist'), false);
-      expect(captured?.queryParameters.containsKey('album'), false);
+      expect(captured?.queryParameters.containsKey('artist_id'), false);
+      expect(captured?.queryParameters.containsKey('album_id'), false);
     });
 
-    test('sends artist and album as query params', () async {
+    test('sends artist_id and album_id as query params', () async {
       Uri? captured;
       ApiClient.initForTest(
         'http://localhost:8000',
@@ -107,13 +107,13 @@ void main() {
         }),
       );
 
-      await api.getTracksPage(artist: 'some-artist', album: 'some-album');
+      await api.getTracksPage(artistId: 1, albumId: 2);
 
-      expect(captured?.queryParameters['artist'], 'some-artist');
-      expect(captured?.queryParameters['album'], 'some-album');
+      expect(captured?.queryParameters['artist_id'], '1');
+      expect(captured?.queryParameters['album_id'], '2');
     });
 
-    test('sends artist without album as query param', () async {
+    test('sends artist_id without album_id as query param', () async {
       Uri? captured;
       ApiClient.initForTest(
         'http://localhost:8000',
@@ -123,10 +123,10 @@ void main() {
         }),
       );
 
-      await api.getTracksPage(artist: 'some-artist');
+      await api.getTracksPage(artistId: 1);
 
-      expect(captured?.queryParameters['artist'], 'some-artist');
-      expect(captured?.queryParameters.containsKey('album'), false);
+      expect(captured?.queryParameters['artist_id'], '1');
+      expect(captured?.queryParameters.containsKey('album_id'), false);
     });
 
     test('returns null nextCursor when not present in response', () async {

@@ -1,10 +1,12 @@
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Flag, auto
 from pathlib import Path
 from typing import List, Optional
 
 from app.models.album import Album
+from app.models.artist import Artist
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -30,12 +32,27 @@ ALLOWED_METADATA_COLUMNS = [
 
 ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
 
-ALLOWED_ALBUM_COLUMNS = ["album", "artist", "year", "is_single_grouping"]
+ALLOWED_ALBUM_COLUMNS = ["id", "name", "artist", "artist_id", "year", "is_single_grouping"]
+ALBUM_TEXT_COLUMNS = {"name", "artist"}
+ALBUM_INTEGER_COLUMNS = {"id", "artist_id", "year", "is_single_grouping"}
 
-ALLOWED_ARTIST_COLUMNS = ["artist"]
-ARTIST_TEXT_COLUMNS = {"artist"}
+ALLOWED_ARTIST_COLUMNS = ["id", "name"]
+ARTIST_TEXT_COLUMNS = {"name"}
 
 ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
+
+
+class SearchEntityType(Flag):
+    TRACKS = auto()
+    ARTISTS = auto()
+    ALBUMS = auto()
+
+
+@dataclass(frozen=True)
+class SearchResults:
+    tracks: List[Track]
+    artists: List[Artist]
+    albums: List[Album]
 
 
 @dataclass(frozen=True)
@@ -125,6 +142,36 @@ class ArtistRowFilterParameter:
             raise ValueError("column must be in ALLOWED_ARTIST_COLUMNS")
 
 
+def _row_to_track(row) -> Track:
+    metadata = TrackMetaData(
+        title=row["title"],
+        artist=row["artist"],
+        album=row["album"],
+        album_artist=row["album_artist"],
+        artist_id=row["artist_id"],
+        album_id=row["album_id"],
+        year=row["year"],
+        date=row["date"],
+        genre=row["genre"],
+        track_number=row["track_number"],
+        disc_number=row["disc_number"],
+        codec=row["codec"],
+        duration=row["duration"],
+        bitrate_kbps=row["bitrate_kbps"],
+        sample_rate_hz=row["sample_rate_hz"],
+        channels=row["channels"],
+        has_album_art=bool(row["has_album_art"]),
+    )
+    return Track(
+        uuid_id=row["uuid_id"],
+        file_path=Path(row["file_path"]),
+        metadata=metadata,
+        file_hash=row["file_hash"],
+        created_at=row["created_at"],
+        last_updated=row["last_updated"],
+    )
+
+
 class Database:
     def __init__(self, context: DatabaseContext):
         self.context = context
@@ -170,6 +217,31 @@ class Database:
 
         try:
             with self._connection(commit=True, timeout=timeout) as conn:
+                metadata = track.metadata
+
+                # Determine effective artist: album_artist takes priority
+                effective_artist = None
+                if metadata.album_artist and metadata.album_artist.strip():
+                    effective_artist = metadata.album_artist.strip()
+                elif metadata.artist and metadata.artist.strip():
+                    effective_artist = metadata.artist.strip()
+
+                artist_id = None
+                if effective_artist:
+                    artist_id = self._upsert_artist(conn, effective_artist)
+
+                # Determine album type
+                album_name = metadata.album
+                has_album = album_name is not None and album_name.strip() != ""
+                album_id = None
+
+                if artist_id is not None and effective_artist is not None:
+                    album_id = self._upsert_album(
+                        conn, album_name if has_album else None,
+                        artist_id, metadata.year, effective_artist,
+                    )
+
+                # Insert track
                 tracks_entry = (
                     track.uuid_id,
                     str(track.file_path),
@@ -182,74 +254,214 @@ class Database:
                     "VALUES (?, ?, ?, ?, ?)"
                 )
                 temp = conn.cursor().execute(tracks_sql_query, tracks_entry)
-                track_id = temp.lastrowid
+                track_db_id = temp.lastrowid
 
-                trackmetadata = track.metadata
+                # Insert trackmetadata
                 trackmetadata_entry = (
-                    track_id,
+                    track_db_id,
                     track.uuid_id,
-                    trackmetadata.title,
-                    trackmetadata.artist,
-                    trackmetadata.album,
-                    trackmetadata.album_artist,
-                    trackmetadata.year,
-                    trackmetadata.date,
-                    trackmetadata.genre,
-                    trackmetadata.track_number,
-                    trackmetadata.disc_number,
-                    trackmetadata.codec,
-                    trackmetadata.duration,
-                    trackmetadata.bitrate_kbps,
-                    trackmetadata.sample_rate_hz,
-                    trackmetadata.channels,
-                    trackmetadata.has_album_art,
+                    metadata.title,
+                    metadata.artist,
+                    metadata.album,
+                    metadata.album_artist,
+                    artist_id,
+                    album_id,
+                    metadata.year,
+                    metadata.date,
+                    metadata.genre,
+                    metadata.track_number,
+                    metadata.disc_number,
+                    metadata.codec,
+                    metadata.duration,
+                    metadata.bitrate_kbps,
+                    metadata.sample_rate_hz,
+                    metadata.channels,
+                    metadata.has_album_art,
                 )
                 trackmetadata_sql_query = (
                     "INSERT INTO trackmetadata (track_id, uuid_id, title, artist, album, album_artist, "
-                    '"year", "date", genre, track_number, disc_number, codec, duration, '
+                    'artist_id, album_id, "year", "date", genre, track_number, disc_number, codec, duration, '
                     "bitrate_kbps, sample_rate_hz, channels, has_album_art) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 conn.cursor().execute(trackmetadata_sql_query, trackmetadata_entry)
+
+                # Insert into FTS for tracks
+                fts_title = metadata.title or ""
+                fts_artist = effective_artist or ""
+                fts_album = album_name if has_album else ""
+                conn.execute(
+                    "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) VALUES (?, ?, ?, ?)",
+                    (track_db_id, fts_title, fts_artist, fts_album),
+                )
+
             return True
         except Exception as e:
             print(f"Failed to add track {track}. {e}")
             return False
 
+    def _upsert_artist(self, conn, effective_artist: str) -> int:
+        conn.execute(
+            'INSERT OR IGNORE INTO artists ("name") VALUES (?)',
+            (effective_artist,),
+        )
+        was_new_artist = conn.execute("SELECT changes()").fetchone()[0] > 0
+        row = conn.execute(
+            "SELECT id FROM artists WHERE name_lower = LOWER(?)",
+            (effective_artist,),
+        ).fetchone()
+        artist_id = row["id"]
+
+        if was_new_artist:
+            conn.execute(
+                "INSERT INTO fts_artists(rowid, name) VALUES (?, ?)",
+                (artist_id, effective_artist),
+            )
+
+        return artist_id
+
+    def _upsert_album(
+        self, conn, album_name: str | None, artist_id: int, year: int | None, effective_artist: str
+    ) -> int:
+        if album_name is not None:
+            # Regular album
+            conn.execute(
+                'INSERT OR IGNORE INTO albums ("name", "artist_id", "year", "is_single_grouping") '
+                "VALUES (?, ?, ?, 0)",
+                (album_name, artist_id, year),
+            )
+            was_new_album = conn.execute("SELECT changes()").fetchone()[0] > 0
+            # Update year if new track's year is higher
+            conn.execute(
+                "UPDATE albums SET year = ? "
+                "WHERE name_lower = LOWER(?) AND artist_id = ? AND is_single_grouping = 0 "
+                "AND (year IS NULL OR year < ?)",
+                (year, album_name, artist_id, year),
+            )
+            row = conn.execute(
+                "SELECT id FROM albums WHERE name_lower = LOWER(?) AND artist_id = ? AND is_single_grouping = 0",
+                (album_name, artist_id),
+            ).fetchone()
+            album_id = row["id"]
+
+            if was_new_album:
+                conn.execute(
+                    "INSERT INTO fts_albums(rowid, name, artist_name) VALUES (?, ?, ?)",
+                    (album_id, album_name, effective_artist),
+                )
+        else:
+            # Single grouping
+            conn.execute(
+                'INSERT OR IGNORE INTO albums ("name", "artist_id", "year", "is_single_grouping") '
+                "VALUES (NULL, ?, ?, 1)",
+                (artist_id, year),
+            )
+            was_new_album = conn.execute("SELECT changes()").fetchone()[0] > 0
+            row = conn.execute(
+                "SELECT id FROM albums WHERE artist_id = ? AND COALESCE(year, -1) = COALESCE(?, -1) AND is_single_grouping = 1",
+                (artist_id, year),
+            ).fetchone()
+            album_id = row["id"]
+
+            if was_new_album:
+                conn.execute(
+                    "INSERT INTO fts_albums(rowid, name, artist_name) VALUES (?, ?, ?)",
+                    (album_id, "", effective_artist),
+                )
+
+        return album_id
+
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
         try:
             with self._connection(commit=True, timeout=timeout) as conn:
-                trackmetadata_cursor = conn.cursor()
-                tracks_cursor = conn.cursor()
+                # Fetch metadata before deletion for FTS cleanup
+                meta_row = conn.execute(
+                    "SELECT tm.track_id, tm.artist_id, tm.album_id, tm.title, "
+                    "tm.artist, tm.album, tm.album_artist "
+                    "FROM trackmetadata tm WHERE tm.uuid_id = ?",
+                    (uuid_id,),
+                ).fetchone()
 
-                trackmetadata_cursor.execute(
+                if meta_row is None:
+                    raise ValueError("No rows deleted")
+
+                track_db_id = meta_row["track_id"]
+                artist_id = meta_row["artist_id"]
+                album_id = meta_row["album_id"]
+                fts_title = meta_row["title"] or ""
+
+                # Determine effective artist and album for FTS delete
+                effective_artist = ""
+                if meta_row["album_artist"] and meta_row["album_artist"].strip():
+                    effective_artist = meta_row["album_artist"].strip()
+                elif meta_row["artist"] and meta_row["artist"].strip():
+                    effective_artist = meta_row["artist"].strip()
+
+                fts_album = meta_row["album"] or ""
+
+                # Delete trackmetadata and tracks
+                conn.execute(
                     "DELETE FROM trackmetadata WHERE uuid_id = ?", (uuid_id,)
                 )
-                tracks_cursor.execute(
-                    "DELETE FROM tracks WHERE uuid_id = ?", (uuid_id,)
+                conn.execute("DELETE FROM tracks WHERE uuid_id = ?", (uuid_id,))
+
+                # Delete from FTS for tracks
+                conn.execute(
+                    "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
+                    "VALUES('delete', ?, ?, ?, ?)",
+                    (track_db_id, fts_title, effective_artist, fts_album),
                 )
 
-                if trackmetadata_cursor.rowcount != tracks_cursor.rowcount:
-                    raise ValueError(
-                        f"row was deleted from tracks XOR trackmetadata. uuid_id: {uuid_id}"
-                    )
+                # Cleanup orphaned album
+                if album_id is not None:
+                    remaining = conn.execute(
+                        "SELECT COUNT(*) FROM trackmetadata WHERE album_id = ?",
+                        (album_id,),
+                    ).fetchone()[0]
+                    if remaining == 0:
+                        album_row = conn.execute(
+                            "SELECT name FROM albums WHERE id = ?", (album_id,)
+                        ).fetchone()
+                        album_name_for_fts = album_row["name"] or "" if album_row else ""
+                        conn.execute(
+                            "INSERT INTO fts_albums(fts_albums, rowid, name, artist_name) "
+                            "VALUES('delete', ?, ?, ?)",
+                            (album_id, album_name_for_fts, effective_artist),
+                        )
+                        conn.execute("DELETE FROM albums WHERE id = ?", (album_id,))
 
-                if trackmetadata_cursor.rowcount == 0:
-                    raise ValueError("No rows deleted")
+                # Cleanup orphaned artist
+                if artist_id is not None:
+                    remaining = conn.execute(
+                        "SELECT COUNT(*) FROM trackmetadata WHERE artist_id = ?",
+                        (artist_id,),
+                    ).fetchone()[0]
+                    if remaining == 0:
+                        artist_row = conn.execute(
+                            "SELECT name FROM artists WHERE id = ?", (artist_id,)
+                        ).fetchone()
+                        artist_name_for_fts = artist_row["name"] if artist_row else ""
+                        conn.execute(
+                            "INSERT INTO fts_artists(fts_artists, rowid, name) "
+                            "VALUES('delete', ?, ?)",
+                            (artist_id, artist_name_for_fts),
+                        )
+                        conn.execute(
+                            "DELETE FROM artists WHERE id = ?", (artist_id,)
+                        )
 
             return True
         except Exception as e:
             print(f"Failed to delete track {uuid_id}. {e}")
             return False
 
-    # TODO: searching needs some refactor. Specifically, using dicts for the searching is bad.
     def get_tracks(
         self,
         search_parameters: List[SearchParameter] | None = None,
         order_parameters: List[OrderParameter] | None = None,
         row_filter_parameters: List[RowFilterParameter] | None = None,
-        artist: Optional[str] = None,
-        album: Optional[str] = None,
+        artist_id: Optional[int] = None,
+        album_id: Optional[int] = None,
         timeout: float = 5,
         limit: int = 100,
         offset: int = 0,
@@ -260,7 +472,7 @@ class Database:
             order_parameters = []
         if row_filter_parameters is None:
             row_filter_parameters = []
-        if album is not None and artist is None:
+        if album_id is not None and artist_id is None:
             raise ValueError("Cannot filter by album without artist")
 
         if limit <= 0 or limit > 1000 or offset < 0:
@@ -289,7 +501,8 @@ class Database:
 
         search_query = (
             "SELECT "
-            'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, tm."year", '
+            'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
+            'tm.artist_id, tm.album_id, tm."year", '
             'tm."date", tm.genre, tm.track_number, tm.disc_number, tm.codec, tm.duration, '
             "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, t.file_path, "
             "t.file_hash, t.created_at, t.last_updated "
@@ -298,7 +511,7 @@ class Database:
             " tm.uuid_id = t.uuid_id"
         )
         search_clauses = []
-        search_values = []
+        search_values: list = []
 
         for param in search_parameters:
             column = param.column
@@ -311,10 +524,12 @@ class Database:
                 search_clauses.append(f'{alias}."{column}" {operator} ?')
                 search_values.append(value)
 
-        if artist is not None:
-            aa_clause, aa_values = artist_album_filter_clause(artist, album)
-            search_clauses.append("(" + aa_clause + ")")
-            search_values.extend(aa_values)
+        if artist_id is not None:
+            search_clauses.append('tm."artist_id" = ?')
+            search_values.append(artist_id)
+        if album_id is not None:
+            search_clauses.append('tm."album_id" = ?')
+            search_values.append(album_id)
 
         if row_filter_parameters and order_parameters:
             cursor_clause, cursor_values = filter_for_cursor(
@@ -351,36 +566,7 @@ class Database:
             )
             return []
 
-        tracks: List[Track] = []
-        for row in rows:
-            metadata = TrackMetaData(
-                title=row["title"],
-                artist=row["artist"],
-                album=row["album"],
-                album_artist=row["album_artist"],
-                year=row["year"],
-                date=row["date"],
-                genre=row["genre"],
-                track_number=row["track_number"],
-                disc_number=row["disc_number"],
-                codec=row["codec"],
-                duration=row["duration"],
-                bitrate_kbps=row["bitrate_kbps"],
-                sample_rate_hz=row["sample_rate_hz"],
-                channels=row["channels"],
-                has_album_art=bool(row["has_album_art"]),
-            )
-
-            tracks.append(
-                Track(
-                    uuid_id=row["uuid_id"],
-                    file_path=Path(row["file_path"]),
-                    metadata=metadata,
-                    file_hash=row["file_hash"],
-                    created_at=row["created_at"],
-                    last_updated=row["last_updated"],
-                )
-            )
+        tracks: List[Track] = [_row_to_track(row) for row in rows]
 
         return tracks
 
@@ -389,8 +575,8 @@ class Database:
         search_parameters: List[SearchParameter] | None = None,
         order_parameters: List[OrderParameter] | None = None,
         row_filter_parameters: List[RowFilterParameter] | None = None,
-        artist: Optional[str] = None,
-        album: Optional[str] = None,
+        artist_id: Optional[int] = None,
+        album_id: Optional[int] = None,
         timeout: float = 5,
     ) -> int | None:
         if search_parameters is None:
@@ -399,7 +585,7 @@ class Database:
             order_parameters = []
         if row_filter_parameters is None:
             row_filter_parameters = []
-        if album is not None and artist is None:
+        if album_id is not None and artist_id is None:
             raise ValueError("Cannot filter by album without artist")
 
         search_query = (
@@ -409,7 +595,7 @@ class Database:
         )
 
         search_clauses = []
-        search_values = []
+        search_values: list = []
 
         for param in search_parameters:
             column = param.column
@@ -422,10 +608,12 @@ class Database:
                 search_clauses.append(f'{alias}."{column}" {operator} ?')
                 search_values.append(value)
 
-        if artist is not None:
-            aa_clause, aa_values = artist_album_filter_clause(artist, album)
-            search_clauses.append("(" + aa_clause + ")")
-            search_values.extend(aa_values)
+        if artist_id is not None:
+            search_clauses.append('tm."artist_id" = ?')
+            search_values.append(artist_id)
+        if album_id is not None:
+            search_clauses.append('tm."album_id" = ?')
+            search_values.append(album_id)
 
         if row_filter_parameters and order_parameters:
             cursor_clause, cursor_values = filter_for_cursor(
@@ -457,7 +645,7 @@ class Database:
         limit: int = 100,
         offset: int = 0,
         timeout: float = 5,
-    ) -> List[str] | None:
+    ) -> List[Artist] | None:
         if order_parameters is None:
             order_parameters = []
         if row_filter_parameters is None:
@@ -469,25 +657,14 @@ class Database:
             raise ValueError
         parameters: list = []
 
-        query = (
-            "WITH candidates(value, row_order) AS ( "
-            " SELECT artist, rowid FROM trackmetadata "
-            " WHERE (album_artist IS NULL OR album_artist IS '') "
-            " AND (artist IS NOT NULL AND artist <> '') "
-            " UNION ALL "
-            " SELECT album_artist, rowid FROM trackmetadata "
-            " WHERE album_artist IS NOT NULL AND album_artist <> '' "
-            ") "
-            "SELECT value AS artist FROM candidates "
-            "GROUP BY LOWER(value) "
-        )
+        query = "SELECT id, name FROM artists "
 
         # Cursor filter
         cursor_clause, cursor_values = filter_for_artist_cursor(
             row_filter_parameters, order_parameters
         )
         if cursor_clause:
-            query += f"HAVING {cursor_clause} "
+            query += f"WHERE {cursor_clause} "
             parameters.extend(cursor_values)
 
         # ORDER BY
@@ -501,7 +678,7 @@ class Database:
         if order_parts:
             query += "ORDER BY " + ", ".join(order_parts) + " "
         else:
-            query += "ORDER BY LOWER(value) ASC "
+            query += "ORDER BY name COLLATE NOCASE ASC "
 
         query += "LIMIT ? OFFSET ?"
         parameters.extend([limit, offset])
@@ -509,9 +686,9 @@ class Database:
         try:
             with self._connection(timeout=timeout) as conn:
                 rows = conn.cursor().execute(query, tuple(parameters)).fetchall()
-            return [str(row["artist"]) for row in rows if row]
+            return [Artist(id=row["id"], name=row["name"]) for row in rows]
         except Exception as e:
-            print(f"Error executing distinct artist query: {e}")
+            print(f"Error executing artist query: {e}")
             return None
 
     def get_artists_count(
@@ -526,28 +703,14 @@ class Database:
             row_filter_parameters = []
         parameters: list = []
 
-        inner = (
-            "WITH candidates(value) AS ( "
-            " SELECT artist FROM trackmetadata "
-            " WHERE (album_artist IS NULL OR album_artist IS '') "
-            " AND (artist IS NOT NULL AND artist <> '') "
-            " UNION ALL "
-            " SELECT album_artist FROM trackmetadata "
-            " WHERE album_artist IS NOT NULL AND album_artist <> '' "
-            ") "
-            "SELECT value AS artist FROM candidates "
-            "GROUP BY LOWER(value) "
-        )
+        query = "SELECT COUNT(*) FROM artists "
 
-        # Cursor filter: count rows after cursor position (remaining)
         cursor_clause, cursor_values = filter_for_artist_cursor(
             row_filter_parameters, order_parameters
         )
         if cursor_clause:
-            inner += f"HAVING {cursor_clause} "
+            query += f"WHERE {cursor_clause} "
             parameters.extend(cursor_values)
-
-        query = f"SELECT COUNT(*) FROM ({inner})"
 
         try:
             with self._connection(timeout=timeout) as conn:
@@ -556,12 +719,12 @@ class Database:
                 )
             return artist_count
         except Exception as e:
-            print(f"Unable to fetch artist and/or album artists counts. {e}")
+            print(f"Unable to fetch artist counts. {e}")
             return None
 
     def get_albums(
         self,
-        artist: Optional[str] = None,
+        artist_id: Optional[int] = None,
         order_parameters: List[AlbumOrderParameter] | None = None,
         row_filter_parameters: List[AlbumRowFilterParameter] | None = None,
         limit: int = 100,
@@ -580,110 +743,51 @@ class Database:
 
         parameters: list = []
 
-        # CTE normalizes artist/album_artist into a single artist column
-        if artist is not None:
-            cte = (
-                "WITH album_candidates(album, artist, year) AS ("
-                ' SELECT album, artist, "year" FROM trackmetadata'
-                " WHERE LOWER(artist) = LOWER(?)"
-                " AND (album IS NOT NULL AND album IS NOT '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                " UNION ALL"
-                ' SELECT album, album_artist, "year" FROM trackmetadata'
-                " WHERE LOWER(album_artist) = LOWER(?)"
-                " AND (album IS NOT NULL AND album IS NOT '')"
-                ") "
-            )
-            parameters.extend([artist, artist])
-        else:
-            cte = (
-                "WITH album_candidates(album, artist, year) AS ("
-                ' SELECT album, artist, "year" FROM trackmetadata'
-                " WHERE (album IS NOT NULL AND album IS NOT '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                " UNION ALL"
-                ' SELECT album, album_artist, "year" FROM trackmetadata'
-                " WHERE (album IS NOT NULL AND album IS NOT '')"
-                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
-                ") "
-            )
-
-        # Regular albums from CTE
-        regular = (
-            'SELECT album, artist, MAX("year") AS year, 0 AS is_single_grouping'
-            " FROM album_candidates"
-            " GROUP BY LOWER(album), LOWER(artist)"
+        query = (
+            "SELECT a.id, a.name, ar.name AS artist, a.artist_id, "
+            'a."year", a.is_single_grouping '
+            "FROM albums a "
+            "JOIN artists ar ON a.artist_id = ar.id"
         )
 
-        # Single groupings (tracks with no album, grouped by artist+year)
-        if artist is not None:
-            singles = (
-                " UNION ALL"
-                ' SELECT NULL AS album, artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE LOWER(artist) = LOWER(?)"
-                " AND (album IS NULL OR album IS '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                ' GROUP BY LOWER(artist), "year"'
-                " UNION ALL"
-                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE LOWER(album_artist) = LOWER(?)"
-                " AND (album IS NULL OR album IS '')"
-                ' GROUP BY LOWER(album_artist), "year"'
-            )
-            parameters.extend([artist, artist])
-        else:
-            singles = (
-                " UNION ALL"
-                ' SELECT NULL AS album, artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE (album IS NULL OR album IS '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                " AND (artist IS NOT NULL AND artist IS NOT '')"
-                ' GROUP BY LOWER(artist), "year"'
-                " UNION ALL"
-                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE (album IS NULL OR album IS '')"
-                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
-                ' GROUP BY LOWER(album_artist), "year"'
-            )
+        where_clauses: list[str] = []
 
-        subquery = f"{cte}SELECT * FROM ({regular}{singles})"
+        if artist_id is not None:
+            where_clauses.append("a.artist_id = ?")
+            parameters.append(artist_id)
 
         # Cursor filter
         cursor_clause, cursor_values = filter_for_album_cursor(
             row_filter_parameters, order_parameters
         )
         if cursor_clause:
-            subquery += f" WHERE {cursor_clause}"
+            where_clauses.append(f"({cursor_clause})")
             parameters.extend(cursor_values)
+
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
 
         # ORDER BY
         order_parts: list[str] = []
         for param in order_parameters:
             col = param.column
+            col_ref = _album_col_ref(col)
             direction = "ASC" if param.isAscending else "DESC"
             collate = " COLLATE NOCASE" if col in ALBUM_TEXT_COLUMNS else ""
             if param.nullsLast:
-                order_parts.append(f'"{col}" IS NULL ASC')
-            order_parts.append(f'"{col}"{collate} {direction}')
+                order_parts.append(f'{col_ref} IS NULL ASC')
+            order_parts.append(f'{col_ref}{collate} {direction}')
 
         if order_parts:
-            subquery += " ORDER BY " + ", ".join(order_parts)
+            query += " ORDER BY " + ", ".join(order_parts)
 
-        subquery += " LIMIT ? OFFSET ?"
+        query += " LIMIT ? OFFSET ?"
         parameters.extend([limit, offset])
 
         try:
             with self._connection(timeout=timeout) as conn:
                 album_rows = (
-                    conn.cursor().execute(subquery, tuple(parameters)).fetchall()
+                    conn.cursor().execute(query, tuple(parameters)).fetchall()
                 )
         except Exception as e:
             print(f"Failed to retrieve albums: {e}")
@@ -691,8 +795,10 @@ class Database:
 
         return [
             Album(
-                album=row["album"],
+                id=row["id"],
+                name=row["name"],
                 artist=row["artist"],
+                artist_id=row["artist_id"],
                 year=row["year"] if row["year"] is not None else None,
                 is_single_grouping=bool(row["is_single_grouping"]),
             )
@@ -701,7 +807,7 @@ class Database:
 
     def get_albums_count(
         self,
-        artist: Optional[str] = None,
+        artist_id: Optional[int] = None,
         order_parameters: List[AlbumOrderParameter] | None = None,
         row_filter_parameters: List[AlbumRowFilterParameter] | None = None,
         timeout: float = 5,
@@ -713,89 +819,26 @@ class Database:
 
         parameters: list = []
 
-        # Same CTE + UNION as get_albums
-        if artist is not None:
-            cte = (
-                "WITH album_candidates(album, artist, year) AS ("
-                ' SELECT album, artist, "year" FROM trackmetadata'
-                " WHERE LOWER(artist) = LOWER(?)"
-                " AND (album IS NOT NULL AND album IS NOT '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                " UNION ALL"
-                ' SELECT album, album_artist, "year" FROM trackmetadata'
-                " WHERE LOWER(album_artist) = LOWER(?)"
-                " AND (album IS NOT NULL AND album IS NOT '')"
-                ") "
-            )
-            parameters.extend([artist, artist])
-        else:
-            cte = (
-                "WITH album_candidates(album, artist, year) AS ("
-                ' SELECT album, artist, "year" FROM trackmetadata'
-                " WHERE (album IS NOT NULL AND album IS NOT '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                " UNION ALL"
-                ' SELECT album, album_artist, "year" FROM trackmetadata'
-                " WHERE (album IS NOT NULL AND album IS NOT '')"
-                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
-                ") "
-            )
-
-        regular = (
-            'SELECT album, artist, MAX("year") AS year, 0 AS is_single_grouping'
-            " FROM album_candidates"
-            " GROUP BY LOWER(album), LOWER(artist)"
+        query = (
+            "SELECT COUNT(*) FROM albums a "
+            "JOIN artists ar ON a.artist_id = ar.id"
         )
 
-        if artist is not None:
-            singles = (
-                " UNION ALL"
-                ' SELECT NULL AS album, artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE LOWER(artist) = LOWER(?)"
-                " AND (album IS NULL OR album IS '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                ' GROUP BY LOWER(artist), "year"'
-                " UNION ALL"
-                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE LOWER(album_artist) = LOWER(?)"
-                " AND (album IS NULL OR album IS '')"
-                ' GROUP BY LOWER(album_artist), "year"'
-            )
-            parameters.extend([artist, artist])
-        else:
-            singles = (
-                " UNION ALL"
-                ' SELECT NULL AS album, artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE (album IS NULL OR album IS '')"
-                " AND (album_artist IS NULL OR album_artist IS '')"
-                " AND (artist IS NOT NULL AND artist IS NOT '')"
-                ' GROUP BY LOWER(artist), "year"'
-                " UNION ALL"
-                ' SELECT NULL AS album, album_artist AS artist, "year" AS year,'
-                " 1 AS is_single_grouping"
-                " FROM trackmetadata"
-                " WHERE (album IS NULL OR album IS '')"
-                " AND (album_artist IS NOT NULL AND album_artist IS NOT '')"
-                ' GROUP BY LOWER(album_artist), "year"'
-            )
+        where_clauses: list[str] = []
 
-        inner = f"{cte}SELECT * FROM ({regular}{singles})"
+        if artist_id is not None:
+            where_clauses.append("a.artist_id = ?")
+            parameters.append(artist_id)
 
-        # Cursor filter
         cursor_clause, cursor_values = filter_for_album_cursor(
             row_filter_parameters, order_parameters
         )
         if cursor_clause:
-            inner += f" WHERE {cursor_clause}"
+            where_clauses.append(f"({cursor_clause})")
             parameters.extend(cursor_values)
 
-        query = f"SELECT COUNT(*) FROM ({inner})"
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
 
         try:
             with self._connection(timeout=timeout) as conn:
@@ -806,6 +849,120 @@ class Database:
         except Exception as e:
             print(f"Failed to retrieve album counts: {e}")
             return None
+
+    def get_search_results(
+        self,
+        query: str,
+        return_types: SearchEntityType = SearchEntityType.TRACKS | SearchEntityType.ARTISTS | SearchEntityType.ALBUMS,
+        limit_per_type: int = 10,
+        timeout: float = 5,
+    ) -> SearchResults:
+        fts_query = prepare_fts_query(query)
+        if not fts_query:
+            return SearchResults(tracks=[], artists=[], albums=[])
+
+        result_tracks: List[Track] = []
+        result_artists: List[Artist] = []
+        result_albums: List[Album] = []
+
+        try:
+            with self._connection(timeout=timeout) as conn:
+                if SearchEntityType.TRACKS in return_types:
+                    track_rows = conn.execute(
+                        "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH ? ORDER BY rank LIMIT ?",
+                        (fts_query, limit_per_type),
+                    ).fetchall()
+                    if track_rows:
+                        track_ids = [r["rowid"] for r in track_rows]
+                        placeholders = ", ".join("?" for _ in track_ids)
+                        full_rows = conn.execute(
+                            "SELECT "
+                            'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
+                            'tm.artist_id, tm.album_id, tm."year", '
+                            'tm."date", tm.genre, tm.track_number, tm.disc_number, tm.codec, tm.duration, '
+                            "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, t.file_path, "
+                            "t.file_hash, t.created_at, t.last_updated, tm.track_id "
+                            "FROM trackmetadata AS tm "
+                            "JOIN tracks AS t ON tm.uuid_id = t.uuid_id "
+                            f"WHERE tm.track_id IN ({placeholders})",
+                            tuple(track_ids),
+                        ).fetchall()
+                        # Preserve FTS rank order
+                        id_order = {tid: i for i, tid in enumerate(track_ids)}
+                        full_rows_sorted = sorted(
+                            full_rows,
+                            key=lambda r: id_order.get(r["track_id"], 999),
+                        )
+                        for row in full_rows_sorted:
+                            result_tracks.append(_row_to_track(row))
+
+                if SearchEntityType.ARTISTS in return_types:
+                    artist_rows = conn.execute(
+                        "SELECT rowid FROM fts_artists WHERE fts_artists MATCH ? ORDER BY rank LIMIT ?",
+                        (fts_query, limit_per_type),
+                    ).fetchall()
+                    if artist_rows:
+                        artist_ids = [r["rowid"] for r in artist_rows]
+                        placeholders = ", ".join("?" for _ in artist_ids)
+                        full_rows = conn.execute(
+                            f"SELECT id, name FROM artists WHERE id IN ({placeholders})",
+                            tuple(artist_ids),
+                        ).fetchall()
+                        id_order = {aid: i for i, aid in enumerate(artist_ids)}
+                        full_rows_sorted = sorted(
+                            full_rows, key=lambda r: id_order.get(r["id"], 999)
+                        )
+                        result_artists = [
+                            Artist(id=r["id"], name=r["name"])
+                            for r in full_rows_sorted
+                        ]
+
+                if SearchEntityType.ALBUMS in return_types:
+                    album_rows = conn.execute(
+                        "SELECT rowid FROM fts_albums WHERE fts_albums MATCH ? ORDER BY rank LIMIT ?",
+                        (fts_query, limit_per_type),
+                    ).fetchall()
+                    if album_rows:
+                        album_ids = [r["rowid"] for r in album_rows]
+                        placeholders = ", ".join("?" for _ in album_ids)
+                        full_rows = conn.execute(
+                            "SELECT a.id, a.name, ar.name AS artist, a.artist_id, "
+                            'a."year", a.is_single_grouping '
+                            "FROM albums a "
+                            "JOIN artists ar ON a.artist_id = ar.id "
+                            f"WHERE a.id IN ({placeholders})",
+                            tuple(album_ids),
+                        ).fetchall()
+                        id_order = {aid: i for i, aid in enumerate(album_ids)}
+                        full_rows_sorted = sorted(
+                            full_rows, key=lambda r: id_order.get(r["id"], 999)
+                        )
+                        result_albums = [
+                            Album(
+                                id=r["id"],
+                                name=r["name"],
+                                artist=r["artist"],
+                                artist_id=r["artist_id"],
+                                year=r["year"],
+                                is_single_grouping=bool(r["is_single_grouping"]),
+                            )
+                            for r in full_rows_sorted
+                        ]
+
+        except Exception as e:
+            print(f"Search failed: {e}")
+
+        return SearchResults(
+            tracks=result_tracks, artists=result_artists, albums=result_albums
+        )
+
+
+def prepare_fts_query(raw_query: str) -> str:
+    terms = raw_query.strip().split()
+    if not terms:
+        return ""
+    escaped = ['"' + t.replace('"', '""') + '"*' for t in terms]
+    return " ".join(escaped)
 
 
 def alias_map(column: str) -> str:
@@ -887,8 +1044,19 @@ def filter_for_cursor(
     return (" OR ".join(constraints), values)
 
 
-ALBUM_TEXT_COLUMNS = {"album", "artist"}
-ALBUM_INTEGER_COLUMNS = {"year", "is_single_grouping"}
+def _album_col_ref(col: str) -> str:
+    """Return a table-qualified column reference for album queries.
+
+    The get_albums query joins ``albums a`` with ``artists ar`` and aliases
+    ``ar.name AS artist``.  Using a bare ``"name"`` would be ambiguous, so
+    columns that live on the albums table are prefixed with ``a.``.
+    """
+    # "artist" maps to ar."name" — the actual column on the joined artists
+    # table.  A SELECT alias cannot be used in WHERE clauses.
+    if col == "artist":
+        return 'ar."name"'
+    # Everything else lives on the albums table.
+    return f'a."{col}"'
 
 
 def filter_for_album_cursor(
@@ -924,15 +1092,17 @@ def filter_for_album_cursor(
         for i in range(depth):
             col = row_filter_list[i].column
             value = row_filter_list[i].value
+            col_ref = _album_col_ref(col)
             collate = " COLLATE NOCASE" if col in ALBUM_TEXT_COLUMNS else ""
             param = "CAST(? AS INTEGER)" if col in ALBUM_INTEGER_COLUMNS else "?"
             if value is None:
-                equality_parts.append(f'"{col}" IS NULL')
+                equality_parts.append(f'{col_ref} IS NULL')
             else:
-                equality_parts.append(f'"{col}"{collate} = {param}')
+                equality_parts.append(f'{col_ref}{collate} = {param}')
                 equality_values.append(value)
 
         col = row_filter_list[depth].column
+        col_ref = _album_col_ref(col)
         cursor_value = row_filter_list[depth].value
         nulls_last = order_parameters[depth].nullsLast
         collate = " COLLATE NOCASE" if col in ALBUM_TEXT_COLUMNS else ""
@@ -944,7 +1114,7 @@ def filter_for_album_cursor(
                 continue
             elif order_parameters[depth].isAscending:
                 # NULLs sort first (default): any non-null comes after NULL
-                final_part = f'"{col}" IS NOT NULL'
+                final_part = f'{col_ref} IS NOT NULL'
             else:
                 # DESC with NULLs first: nothing is "less than" NULL
                 continue
@@ -954,11 +1124,11 @@ def filter_for_album_cursor(
             op = ">" if order_parameters[depth].isAscending else "<"
             if nulls_last:
                 # Non-NULL cursor with nullsLast: greater values OR NULLs come after
-                final_part = f'("{col}"{collate} {op} {param} OR "{col}" IS NULL)'
+                final_part = f'({col_ref}{collate} {op} {param} OR {col_ref} IS NULL)'
                 all_parts = equality_parts + [final_part]
                 all_values = equality_values + [cursor_value]
             else:
-                final_part = f'"{col}"{collate} {op} {param}'
+                final_part = f'{col_ref}{collate} {op} {param}'
                 all_parts = equality_parts + [final_part]
                 all_values = equality_values + [cursor_value]
 
@@ -1041,21 +1211,3 @@ def filter_for_artist_cursor(
         return ("", values)
 
     return (" OR ".join(constraints), values)
-
-
-def artist_album_filter_clause(
-    artist: str, album: Optional[str]
-) -> tuple[str, List[str]]:
-    artist_clause = (
-        '((LOWER(tm."artist") = LOWER(?) AND (tm."album_artist" IS NULL OR tm."album_artist" = \'\'))'
-        ' OR LOWER(tm."album_artist") = LOWER(?))'
-    )
-    values = [artist, artist]
-
-    if album is None:
-        album_clause = 'tm."album" IS NULL'
-    else:
-        album_clause = 'LOWER(tm."album") = LOWER(?)'
-        values.append(album)
-
-    return (artist_clause + " AND " + album_clause, values)
