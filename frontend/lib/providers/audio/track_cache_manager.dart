@@ -50,7 +50,6 @@ class HttpTrackCacheManager implements TrackCacheManager {
   final bool _ownsClient;
 
   StreamSubscription<List<int>>? _prefetchSubscription;
-  IOSink? _prefetchSink;
   File? _prefetchPartialFile;
   Completer<void>? _prefetchCompleter;
   Completer<void>? _prefetchDone;
@@ -150,7 +149,6 @@ class HttpTrackCacheManager implements TrackCacheManager {
         var downloadCompleted = false;
 
         _prefetchPartialFile = partialFile;
-        _prefetchSink = sink;
         _prefetchCompleter = completer;
         _prefetchSubscription = response.stream.listen(
           sink.add,
@@ -248,7 +246,6 @@ class HttpTrackCacheManager implements TrackCacheManager {
 
   void _clearActivePrefetchHandles() {
     _prefetchSubscription = null;
-    _prefetchSink = null;
     _prefetchPartialFile = null;
     _prefetchCompleter = null;
   }

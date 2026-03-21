@@ -235,7 +235,7 @@ class Database:
                 has_album = album_name is not None and album_name.strip() != ""
                 album_id = None
 
-                if artist_id is not None:
+                if artist_id is not None and effective_artist is not None:
                     album_id = self._upsert_album(
                         conn, album_name if has_album else None,
                         artist_id, metadata.year, effective_artist,
