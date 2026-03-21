@@ -72,6 +72,18 @@ class Tracks extends Table {
 @TableIndex(name: 'idx_sample_rate_hz', columns: {#sampleRateHz})
 @TableIndex(name: 'idx_channels', columns: {#channels})
 @TableIndex(name: 'idx_has_album_art', columns: {#hasAlbumArt})
+@TableIndex.sql(
+  'CREATE INDEX idx_tm_library_queue_order '
+  'ON trackmetadata (artist, album, disc_number, track_number, uuid_id)',
+)
+@TableIndex.sql(
+  'CREATE INDEX idx_tm_artist_queue_order '
+  'ON trackmetadata (artist_id, album, disc_number, track_number, uuid_id)',
+)
+@TableIndex.sql(
+  'CREATE INDEX idx_tm_album_queue_order '
+  'ON trackmetadata (artist_id, album_id, disc_number, track_number, uuid_id)',
+)
 class Trackmetadata extends Table {
   TextColumn get uuidId => text().references(Tracks, #uuidId)();
   TextColumn get title => text().nullable()();
@@ -90,11 +102,73 @@ class Trackmetadata extends Table {
   RealColumn get bitrateKbps => real()();
   IntColumn get sampleRateHz => integer()();
   IntColumn get channels => integer()();
-  BoolColumn get hasAlbumArt =>
-      boolean().withDefault(const Constant(false))();
+  BoolColumn get hasAlbumArt => boolean().withDefault(const Constant(false))();
 
   @override
   Set<Column> get primaryKey => {uuidId};
+}
+
+class QueueSessions extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  BoolColumn get isActive => boolean().withDefault(const Constant(false))();
+  IntColumn get createdAt => integer()();
+  IntColumn get updatedAt => integer()();
+  TextColumn get sourceType => text()(); // library|artist|album|search|single
+  IntColumn get sourceArtistId => integer().nullable()();
+  IntColumn get sourceAlbumId => integer().nullable()();
+  IntColumn get currentItemId => integer().nullable()();
+  IntColumn get resumeMainItemId => integer().nullable()();
+  IntColumn get currentPositionMs => integer().withDefault(const Constant(0))();
+  TextColumn get repeatMode => text().withDefault(const Constant('off'))();
+  BoolColumn get shuffleEnabled =>
+      boolean().withDefault(const Constant(false))();
+}
+
+@TableIndex(
+  name: 'idx_queue_session_items_session_position',
+  columns: {#sessionId, #queueType, #position},
+)
+@TableIndex(
+  name: 'idx_queue_session_items_session_uuid',
+  columns: {#sessionId, #uuidId},
+)
+class QueueSessionItems extends Table {
+  IntColumn get itemId => integer().autoIncrement()();
+  IntColumn get sessionId =>
+      integer().references(QueueSessions, #id, onDelete: KeyAction.cascade)();
+  TextColumn get queueType => text().withDefault(const Constant('main'))();
+  IntColumn get position => integer()();
+  TextColumn get uuidId => text().references(Tracks, #uuidId)();
+
+  @override
+  List<String> get customConstraints => const [
+    'UNIQUE(session_id, queue_type, position)',
+  ];
+}
+
+@TableIndex(
+  name: 'idx_queue_session_play_order_session_position',
+  columns: {#sessionId, #playPosition},
+)
+@TableIndex(
+  name: 'idx_queue_session_play_order_session_item',
+  columns: {#sessionId, #itemId},
+)
+class QueueSessionPlayOrder extends Table {
+  IntColumn get sessionId =>
+      integer().references(QueueSessions, #id, onDelete: KeyAction.cascade)();
+  IntColumn get playPosition => integer()();
+  IntColumn get itemId => integer().references(
+    QueueSessionItems,
+    #itemId,
+    onDelete: KeyAction.cascade,
+  )();
+
+  @override
+  Set<Column> get primaryKey => {sessionId, playPosition};
+
+  @override
+  List<String> get customConstraints => const ['UNIQUE(session_id, item_id)'];
 }
 
 // ── Column allowlists (mirrors backend database.py) ─────────────────────
@@ -362,10 +436,10 @@ String _albumColRef(String col) {
       final col = rowFilters[i].column;
       final v = rowFilters[i].value;
       final colRef = _albumColRef(col);
-      final collate =
-          albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
-      final param =
-          albumIntegerColumns.contains(col) ? 'CAST(? AS INTEGER)' : '?';
+      final collate = albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
+      final param = albumIntegerColumns.contains(col)
+          ? 'CAST(? AS INTEGER)'
+          : '?';
       if (v == null) {
         equalityParts.add('$colRef IS NULL');
       } else {
@@ -378,10 +452,10 @@ String _albumColRef(String col) {
     final cursorValue = rowFilters[depth].value;
     final nullsLast = orderParams[depth].nullsLast;
     final colRef = _albumColRef(col);
-    final collate =
-        albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
-    final param =
-        albumIntegerColumns.contains(col) ? 'CAST(? AS INTEGER)' : '?';
+    final collate = albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
+    final param = albumIntegerColumns.contains(col)
+        ? 'CAST(? AS INTEGER)'
+        : '?';
 
     if (cursorValue == null) {
       if (nullsLast) {
@@ -456,8 +530,7 @@ String _albumColRef(String col) {
     for (var i = 0; i < depth; i++) {
       final col = rowFilters[i].column;
       final v = rowFilters[i].value;
-      final collate =
-          artistTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
+      final collate = artistTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
       if (v == null) {
         equalityParts.add('"$col" IS NULL');
       } else {
@@ -468,8 +541,7 @@ String _albumColRef(String col) {
 
     final col = rowFilters[depth].column;
     final cursorValue = rowFilters[depth].value;
-    final collate =
-        artistTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
+    final collate = artistTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
 
     if (cursorValue == null) {
       if (orderParams[depth].isAscending) {
@@ -503,12 +575,13 @@ String _albumColRef(String col) {
 
 // ── SELECT columns for track queries ────────────────────────────────────
 
-const _selectColumns =
+const trackSelectColumns =
     'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
     'tm.artist_id, tm.album_id, '
     'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
     'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated';
+const _selectColumns = trackSelectColumns;
 
 // ── FTS5 virtual table creation statements ──────────────────────────────
 
@@ -532,37 +605,32 @@ String prepareFtsQuery(String rawQuery) {
 
 // ── Database ────────────────────────────────────────────────────────────
 
-@DriftDatabase(tables: [Artists, Albums, Tracks, Trackmetadata])
+@DriftDatabase(
+  tables: [
+    Artists,
+    Albums,
+    Tracks,
+    Trackmetadata,
+    QueueSessions,
+    QueueSessionItems,
+    QueueSessionPlayOrder,
+  ],
+)
 class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 1;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
-        onCreate: (m) async {
-          await m.createAll();
-          for (final stmt in _ftsStatements) {
-            await customStatement(stmt);
-          }
-        },
-        onUpgrade: (m, from, to) async {
-          // Destructive migration: drop everything and recreate.
-          // The backend is the ground truth; a full re-sync repopulates.
-          await customStatement('DROP TABLE IF EXISTS fts_tracks');
-          await customStatement('DROP TABLE IF EXISTS fts_artists');
-          await customStatement('DROP TABLE IF EXISTS fts_albums');
-          await m.deleteTable('trackmetadata');
-          await m.deleteTable('tracks');
-          await m.deleteTable('albums');
-          await m.deleteTable('artists');
-          await m.createAll();
-          for (final stmt in _ftsStatements) {
-            await customStatement(stmt);
-          }
-        },
-      );
+    onCreate: (m) async {
+      await m.createAll();
+      for (final stmt in _ftsStatements) {
+        await customStatement(stmt);
+      }
+    },
+  );
 
   // ── Track queries ─────────────────────────────────────────────────────
 
@@ -663,11 +731,11 @@ class AppDatabase extends _$AppDatabase {
     ).get();
   }
 
-  Future<List<String>> getTrackUuids({
+  (String, List<Variable>) buildTrackUuidQuery({
     List<OrderParameter> orderBy = const [],
     int? artistId,
     int? albumId,
-  }) async {
+  }) {
     if (albumId != null && artistId == null) {
       throw ArgumentError('Cannot filter by album without artist');
     }
@@ -702,6 +770,20 @@ class AppDatabase extends _$AppDatabase {
       sql += ' ORDER BY ${orderParts.join(', ')}';
     }
 
+    return (sql, vars);
+  }
+
+  Future<List<String>> getTrackUuids({
+    List<OrderParameter> orderBy = const [],
+    int? artistId,
+    int? albumId,
+  }) async {
+    final (sql, vars) = buildTrackUuidQuery(
+      orderBy: orderBy,
+      artistId: artistId,
+      albumId: albumId,
+    );
+
     final rows = await customSelect(
       sql,
       variables: vars,
@@ -735,7 +817,15 @@ class AppDatabase extends _$AppDatabase {
       sql,
       variables: vars,
       readsFrom: {trackmetadata, tracks},
-    ).get();
+    ).get().then((rows) {
+      final rowsByUuid = {
+        for (final row in rows) row.read<String>('uuid_id'): row,
+      };
+      return [
+        for (final uuid in uuids)
+          if (rowsByUuid.containsKey(uuid)) rowsByUuid[uuid]!,
+      ];
+    });
   }
 
   Stream<int> watchTrackCount({
@@ -818,8 +908,9 @@ class AppDatabase extends _$AppDatabase {
       for (final o in orderBy) {
         final col = o.column;
         final dir = o.isAscending ? 'ASC' : 'DESC';
-        final collate =
-            artistTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
+        final collate = artistTextColumns.contains(col)
+            ? ' COLLATE NOCASE'
+            : '';
         orderParts.add('"$col"$collate $dir');
       }
       query += ' ORDER BY ${orderParts.join(', ')}';
@@ -836,11 +927,7 @@ class AppDatabase extends _$AppDatabase {
       }
     }
 
-    return customSelect(
-      query,
-      variables: vars,
-      readsFrom: {artists},
-    ).get();
+    return customSelect(query, variables: vars, readsFrom: {artists}).get();
   }
 
   Stream<int> watchArtistCount({
@@ -916,8 +1003,7 @@ class AppDatabase extends _$AppDatabase {
         final col = o.column;
         final colRef = _albumColRef(col);
         final dir = o.isAscending ? 'ASC' : 'DESC';
-        final collate =
-            albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
+        final collate = albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
         if (o.nullsLast) {
           orderParts.add('$colRef IS NULL ASC');
         }
@@ -994,7 +1080,10 @@ class AppDatabase extends _$AppDatabase {
     ).watch().map((rows) => rows.first.read<int>('c'));
   }
 
-  Future<({List<QueryRow> tracks, List<QueryRow> artists, List<QueryRow> albums})> getSearchResults(
+  Future<
+    ({List<QueryRow> tracks, List<QueryRow> artists, List<QueryRow> albums})
+  >
+  getSearchResults(
     String query, {
     bool searchTracks = true,
     bool searchArtists = true,
@@ -1003,7 +1092,11 @@ class AppDatabase extends _$AppDatabase {
   }) async {
     final ftsQuery = prepareFtsQuery(query);
     if (ftsQuery.isEmpty) {
-      return (tracks: <QueryRow>[], artists: <QueryRow>[], albums: <QueryRow>[]);
+      return (
+        tracks: <QueryRow>[],
+        artists: <QueryRow>[],
+        albums: <QueryRow>[],
+      );
     }
 
     final resultTracks = <QueryRow>[];
@@ -1013,7 +1106,10 @@ class AppDatabase extends _$AppDatabase {
     if (searchTracks) {
       final ftsRows = await customSelect(
         'SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH ? ORDER BY rank LIMIT ?',
-        variables: [Variable.withString(ftsQuery), Variable.withInt(limitPerType)],
+        variables: [
+          Variable.withString(ftsQuery),
+          Variable.withInt(limitPerType),
+        ],
         readsFrom: {},
       ).get();
       if (ftsRows.isNotEmpty) {
@@ -1028,10 +1124,15 @@ class AppDatabase extends _$AppDatabase {
           variables: vars,
           readsFrom: {trackmetadata, tracks},
         ).get();
-        final idOrder = {for (var i = 0; i < trackIds.length; i++) trackIds[i]: i};
+        final idOrder = {
+          for (var i = 0; i < trackIds.length; i++) trackIds[i]: i,
+        };
         final sorted = List<QueryRow>.from(fullRows)
-          ..sort((a, b) => (idOrder[a.read<int>('_tm_rowid')] ?? 999)
-              .compareTo(idOrder[b.read<int>('_tm_rowid')] ?? 999));
+          ..sort(
+            (a, b) => (idOrder[a.read<int>('_tm_rowid')] ?? 999).compareTo(
+              idOrder[b.read<int>('_tm_rowid')] ?? 999,
+            ),
+          );
         resultTracks.addAll(sorted);
       }
     }
@@ -1039,7 +1140,10 @@ class AppDatabase extends _$AppDatabase {
     if (searchArtists) {
       final ftsRows = await customSelect(
         'SELECT rowid FROM fts_artists WHERE fts_artists MATCH ? ORDER BY rank LIMIT ?',
-        variables: [Variable.withString(ftsQuery), Variable.withInt(limitPerType)],
+        variables: [
+          Variable.withString(ftsQuery),
+          Variable.withInt(limitPerType),
+        ],
         readsFrom: {},
       ).get();
       if (ftsRows.isNotEmpty) {
@@ -1051,10 +1155,15 @@ class AppDatabase extends _$AppDatabase {
           variables: vars,
           readsFrom: {artists},
         ).get();
-        final idOrder = {for (var i = 0; i < artistIds.length; i++) artistIds[i]: i};
+        final idOrder = {
+          for (var i = 0; i < artistIds.length; i++) artistIds[i]: i,
+        };
         final sorted = List<QueryRow>.from(fullRows)
-          ..sort((a, b) => (idOrder[a.read<int>('id')] ?? 999)
-              .compareTo(idOrder[b.read<int>('id')] ?? 999));
+          ..sort(
+            (a, b) => (idOrder[a.read<int>('id')] ?? 999).compareTo(
+              idOrder[b.read<int>('id')] ?? 999,
+            ),
+          );
         resultArtists.addAll(sorted);
       }
     }
@@ -1062,7 +1171,10 @@ class AppDatabase extends _$AppDatabase {
     if (searchAlbums) {
       final ftsRows = await customSelect(
         'SELECT rowid FROM fts_albums WHERE fts_albums MATCH ? ORDER BY rank LIMIT ?',
-        variables: [Variable.withString(ftsQuery), Variable.withInt(limitPerType)],
+        variables: [
+          Variable.withString(ftsQuery),
+          Variable.withInt(limitPerType),
+        ],
         readsFrom: {},
       ).get();
       if (ftsRows.isNotEmpty) {
@@ -1078,10 +1190,15 @@ class AppDatabase extends _$AppDatabase {
           variables: vars,
           readsFrom: {albums, artists},
         ).get();
-        final idOrder = {for (var i = 0; i < albumIds.length; i++) albumIds[i]: i};
+        final idOrder = {
+          for (var i = 0; i < albumIds.length; i++) albumIds[i]: i,
+        };
         final sorted = List<QueryRow>.from(fullRows)
-          ..sort((a, b) => (idOrder[a.read<int>('id')] ?? 999)
-              .compareTo(idOrder[b.read<int>('id')] ?? 999));
+          ..sort(
+            (a, b) => (idOrder[a.read<int>('id')] ?? 999).compareTo(
+              idOrder[b.read<int>('id')] ?? 999,
+            ),
+          );
         resultAlbums.addAll(sorted);
       }
     }

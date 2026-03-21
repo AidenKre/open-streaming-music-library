@@ -4,8 +4,47 @@ import 'package:frontend/models/ui/album_ui.dart';
 class AlbumCard extends StatelessWidget {
   final AlbumUI album;
   final VoidCallback onTap;
+  final VoidCallback? onPlayNext;
+  final VoidCallback? onAddToQueue;
 
-  const AlbumCard({super.key, required this.album, required this.onTap});
+  const AlbumCard({
+    super.key,
+    required this.album,
+    required this.onTap,
+    this.onPlayNext,
+    this.onAddToQueue,
+  });
+
+  void _showAlbumMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (onPlayNext != null)
+              ListTile(
+                leading: const Icon(Icons.playlist_play),
+                title: const Text('Play Next'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onPlayNext!();
+                },
+              ),
+            if (onAddToQueue != null)
+              ListTile(
+                leading: const Icon(Icons.queue_music),
+                title: const Text('Add to Queue'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onAddToQueue!();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -20,6 +59,9 @@ class AlbumCard extends StatelessWidget {
       ),
       child: InkWell(
         onTap: onTap,
+        onLongPress: (onPlayNext != null || onAddToQueue != null)
+            ? () => _showAlbumMenu(context)
+            : null,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [

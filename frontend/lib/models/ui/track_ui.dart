@@ -26,6 +26,9 @@ class TrackUI {
 
   bool get isDownloaded => filePath != null;
 
+  String get subtitle =>
+      [artist ?? 'Unknown Artist', album].whereType<String>().join(' \u2014 ');
+
   const TrackUI({
     required this.uuidId,
     this.filePath,

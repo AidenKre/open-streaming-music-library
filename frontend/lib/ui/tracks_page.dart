@@ -1,12 +1,10 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
@@ -20,15 +18,13 @@ class TracksPage extends ConsumerStatefulWidget {
   ConsumerState<TracksPage> createState() => TracksPageState();
 }
 
-class TracksPageState extends ConsumerState<TracksPage> {
-  static const _pageSize = 50;
+class TracksPageState extends ConsumerState<TracksPage>
+    with CursorPaginationMixin<TrackUI> {
+  @override
+  final scrollController = ScrollController();
 
-  final _scrollController = ScrollController();
-  List<TrackUI> _tracks = [];
-  bool _hasMore = true;
-  bool _isLoading = false;
-  int _newTrackCount = 0;
-  StreamSubscription<int>? _watchSub;
+  @override
+  int get pageSize => 50;
 
   List<OrderParameter> get _orderParams => [
     OrderParameter(column: 'artist'),
@@ -42,8 +38,7 @@ class TracksPageState extends ConsumerState<TracksPage> {
   void initState() {
     super.initState();
     sync();
-    _scrollController.addListener(_onScroll);
-    _loadMore();
+    initPagination();
   }
 
   void sync() {
@@ -56,73 +51,36 @@ class TracksPageState extends ConsumerState<TracksPage> {
 
   @override
   void dispose() {
-    _watchSub?.cancel();
-    _scrollController.dispose();
+    disposePagination();
+    scrollController.dispose();
     super.dispose();
   }
 
-  void _startWatching() {
-    _watchSub?.cancel();
-
-    final db = ref.read(databaseProvider);
-
-    // If all tracks are loaded, or there is no loaded cursor row yet, count
-    // everything. Otherwise, count only tracks at or before the last loaded
-    // position.
-    final useCursor = _hasMore && _tracks.isNotEmpty;
-    final cursorFilters = useCursor
-        ? _buildCursorFromLast(_tracks.last)
-        : <RowFilterParameter>[];
-    final orderBy = useCursor ? _orderParams : <OrderParameter>[];
-
-    _watchSub = db
-        .watchTrackCount(
-          orderBy: orderBy,
-          cursorFilters: cursorFilters,
-          artistId: widget.artistId,
-          albumId: widget.albumId,
-        )
-        .listen((count) {
-          if (!mounted) return;
-          final newCount = count - _tracks.length;
-          if (newCount != _newTrackCount) {
-            setState(() => _newTrackCount = newCount > 0 ? newCount : 0);
-          }
-        });
-  }
-
-  void _onScroll() {
-    if (_scrollController.position.pixels >=
-        _scrollController.position.maxScrollExtent - 200) {
-      _loadMore();
-    }
-  }
-
-  Future<void> _loadMore() async {
-    if (_isLoading || !_hasMore) return;
-    _isLoading = true;
-
-    final db = ref.read(databaseProvider);
-
-    final cursorFilters = _tracks.isEmpty
-        ? <RowFilterParameter>[]
-        : _buildCursorFromLast(_tracks.last);
-
-    final rows = await db.getTracks(
+  @override
+  Future<List<TrackUI>> loadPage({required bool useCursor}) {
+    final repo = ref.read(browseRepositoryProvider);
+    return repo.getTracks(
       orderBy: _orderParams,
-      cursorFilters: cursorFilters,
+      cursorFilters: useCursor
+          ? _buildCursorFromLast(paginatedItems.last)
+          : [],
       artistId: widget.artistId,
       albumId: widget.albumId,
-      limit: _pageSize,
+      limit: pageSize,
     );
+  }
 
-    if (!mounted) return;
-    setState(() {
-      _tracks.addAll(rows.map(TrackUI.fromQueryRow));
-      _hasMore = rows.length == _pageSize;
-      _isLoading = false;
-    });
-    _startWatching();
+  @override
+  Stream<int> watchItemCount({required bool useCursor}) {
+    final repo = ref.read(browseRepositoryProvider);
+    return repo.watchTrackCount(
+      orderBy: useCursor ? _orderParams : [],
+      cursorFilters: useCursor
+          ? _buildCursorFromLast(paginatedItems.last)
+          : [],
+      artistId: widget.artistId,
+      albumId: widget.albumId,
+    );
   }
 
   List<RowFilterParameter> _buildCursorFromLast(TrackUI last) {
@@ -135,45 +93,40 @@ class TracksPageState extends ConsumerState<TracksPage> {
     ];
   }
 
-  void _refresh() {
-    _watchSub?.cancel();
-    setState(() {
-      _tracks = [];
-      _hasMore = true;
-      _newTrackCount = 0;
-    });
-    _loadMore();
-  }
-
   @override
   Widget build(BuildContext context) {
     final body = Column(
       children: [
-        if (_newTrackCount > 0)
-          MaterialBanner(
-            content: Text('$_newTrackCount new tracks available'),
-            actions: [
-              TextButton(onPressed: _refresh, child: const Text('Refresh')),
-            ],
-          ),
+        buildNewItemsBanner('tracks'),
         Expanded(
           child: ListView.builder(
-            controller: _scrollController,
-            itemCount: _tracks.length + (_hasMore ? 1 : 0),
+            controller: scrollController,
+            itemCount: paginatedItems.length + (hasMore ? 1 : 0),
             itemBuilder: (context, index) {
-              if (index >= _tracks.length) {
+              if (index >= paginatedItems.length) {
                 return const Padding(
                   padding: EdgeInsets.all(16),
                   child: Center(child: CircularProgressIndicator()),
                 );
               }
-              final track = _tracks[index];
+              final track = paginatedItems[index];
               return TrackTile(
                 track: track,
                 onTap: () => ref.read(audioProvider.notifier).playFromQueue(
-                  QueueContext(artistId: widget.artistId, albumId: widget.albumId, orderParams: _orderParams),
-                  track,
+                  track: track,
+                  sourceType: widget.albumId != null
+                      ? 'album'
+                      : widget.artistId != null
+                          ? 'artist'
+                          : 'library',
+                  artistId: widget.artistId,
+                  albumId: widget.albumId,
+                  orderParams: _orderParams,
                 ),
+                onPlayNext: () =>
+                    ref.read(audioProvider.notifier).playNext([track]),
+                onAddToQueue: () =>
+                    ref.read(audioProvider.notifier).addToQueue([track]),
               );
             },
           ),
