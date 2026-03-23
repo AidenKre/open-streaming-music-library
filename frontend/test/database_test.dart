@@ -1354,6 +1354,140 @@ void main() {
     });
   });
 
+  group('getAlbums cover_art_id subquery', () {
+    test('returns null cover_art_id when no tracks have art', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+      );
+
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      expect(regular.first.readNullable<int>('cover_art_id'), equals(null));
+    });
+
+    test('returns cover_art_id from track with art', () async {
+      final (artistId, _) = await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+      );
+
+      // Manually set has_album_art and cover_art_id
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 42 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('1')],
+        updates: {db.trackmetadata},
+      );
+
+      final rows = await db.getAlbums(artistId: artistId);
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      expect(regular.first.readNullable<int>('cover_art_id'), 42);
+    });
+
+    test('returns cover_art_id from lowest track_number', () async {
+      await insertTrack(
+        db,
+        uuid: 'tr-2',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+        trackNumber: 2,
+      );
+      await insertTrack(
+        db,
+        uuid: 'tr-1',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+        trackNumber: 1,
+      );
+
+      // Track 2 gets cover_art_id 99, Track 1 gets cover_art_id 42
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 99 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('tr-2')],
+        updates: {db.trackmetadata},
+      );
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 42 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('tr-1')],
+        updates: {db.trackmetadata},
+      );
+
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      // Should pick track 1's art (lowest track_number)
+      expect(regular.first.readNullable<int>('cover_art_id'), 42);
+    });
+
+    test('ignores tracks with has_album_art=false even if cover_art_id set', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+      );
+
+      // Set cover_art_id but leave has_album_art = false
+      await db.customUpdate(
+        'UPDATE trackmetadata SET cover_art_id = 42 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('1')],
+        updates: {db.trackmetadata},
+      );
+
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.first.readNullable<int>('cover_art_id'), equals(null));
+    });
+  });
+
+  group('getArtists cover_art_id subquery', () {
+    test('returns null cover_art_id when no tracks have art', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist');
+
+      final rows = await db.getArtists();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), equals(null));
+    });
+
+    test('returns cover_art_id from track with art', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist');
+
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 7 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('1')],
+        updates: {db.trackmetadata},
+      );
+
+      final rows = await db.getArtists();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), 7);
+    });
+  });
+
   group('watchArtistCount', () {
     test('returns count of distinct artists', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist A');
@@ -1635,6 +1769,119 @@ void main() {
         () => SearchParameter(column: 'title', operator: '!=', value: 'x'),
         throwsArgumentError,
       );
+    });
+  });
+
+  group('cover_art_id', () {
+    test('trackmetadataCompanionFromDto includes coverArtId when present', () {
+      final dto = ClientTrackDto.fromJson(
+        _trackJson(
+          metadata: {..._fullMetadataJson(), 'cover_art_id': 42},
+        ),
+      );
+
+      final companion = trackmetadataCompanionFromDto(dto);
+
+      expect(companion.coverArtId, const Value<int?>(42));
+    });
+
+    test('trackmetadataCompanionFromDto has null coverArtId when absent', () {
+      final dto = ClientTrackDto.fromJson(_trackJson());
+
+      final companion = trackmetadataCompanionFromDto(dto);
+
+      expect(companion.coverArtId, const Value<int?>(null));
+    });
+
+    test('coverArtId round-trips through database', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'cover-art-test-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': {
+          ..._fullMetadataJson(),
+          'cover_art_id': 7,
+        },
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final metas = await db.select(db.trackmetadata).get();
+      expect(metas.length, 1);
+      expect(metas.first.coverArtId, 7);
+    });
+
+    test('coverArtId is null when not set', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'no-cover-art-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': _minimalMetadataJson(),
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final metas = await db.select(db.trackmetadata).get();
+      expect(metas.length, 1);
+      expect(metas.first.coverArtId, null);
+    });
+
+    test('coverArtId is included in track SELECT queries', () async {
+      final artistId = await ensureArtist(db, 'Cover Art Artist');
+      final albumId = await ensureAlbum(
+        db,
+        artistId: artistId,
+        name: 'Cover Album',
+      );
+
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'cover-select-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': {
+          ..._fullMetadataJson(),
+          'artist_id': artistId,
+          'album_id': albumId,
+          'cover_art_id': 99,
+        },
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final rows = await db.getTracks();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), 99);
+    });
+
+    test('coverArtId is null in track SELECT when not set', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'cover-select-null-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': _minimalMetadataJson(),
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final rows = await db.getTracks();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), null);
+    });
+
+    test('cover_art_id is accepted in allowedMetadataColumns', () {
+      expect(allowedMetadataColumns.contains('cover_art_id'), isTrue);
     });
   });
 }

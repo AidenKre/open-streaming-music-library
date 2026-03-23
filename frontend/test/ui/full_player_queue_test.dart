@@ -1,9 +1,11 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_coordinator.dart';
@@ -11,6 +13,7 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
 
 void main() {
@@ -190,6 +193,87 @@ void main() {
       expect(find.text('Track T000'), findsNothing);
     },
   );
+
+  group('cover art', () {
+    setUpAll(() {
+      ApiClient.init('http://localhost:8000');
+    });
+
+    Future<void> pumpFullPlayer(
+      WidgetTester tester,
+      TrackUI track,
+    ) async {
+      await _seedQueueTracks(db, ['test-track']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'test',
+        trackUuids: const ['test-track'],
+        currentIndex: 0,
+      );
+      final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+
+      final container = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          audioProvider.overrideWith(
+            () => _TestQueueAudioCoordinator(
+              _audioStateFor(
+                sessionId: sessionId,
+                currentItemId: snapshot.currentItem!.itemId,
+                currentPlayPosition: 0,
+                totalCount: 1,
+                currentTrack: track,
+              ),
+            ),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(
+            home: Scaffold(body: SizedBox(height: 700, child: FullPlayer())),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    testWidgets(
+      'track without art shows music note placeholder',
+      (tester) async {
+        await pumpFullPlayer(tester, _track('no-art'));
+
+        expect(find.byIcon(Icons.music_note), findsWidgets);
+        expect(find.byType(CachedNetworkImage), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'track with art shows CoverArtImage',
+      (tester) async {
+        final trackWithArt = TrackUI(
+          uuidId: 'with-art',
+          createdAt: 1,
+          lastUpdated: 1,
+          title: 'Art Track',
+          artist: 'Artist',
+          album: 'Album',
+          duration: 180,
+          bitrateKbps: 320,
+          sampleRateHz: 44100,
+          channels: 2,
+          hasAlbumArt: true,
+          coverArtId: 99,
+        );
+        await pumpFullPlayer(tester, trackWithArt);
+
+        expect(find.byType(CoverArtImage), findsOneWidget);
+        expect(find.byType(CachedNetworkImage), findsOneWidget);
+      },
+    );
+  });
 }
 
 Future<void> _seedQueueTracks(AppDatabase db, List<String> uuids) async {

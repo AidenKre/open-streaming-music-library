@@ -1,14 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:frontend/models/ui/artist_ui.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
 
 class ArtistCard extends StatelessWidget {
-  final String artistName;
+  final ArtistUI artist;
   final VoidCallback onTap;
   final VoidCallback? onPlayNext;
   final VoidCallback? onAddToQueue;
 
   const ArtistCard({
     super.key,
-    required this.artistName,
+    required this.artist,
     required this.onTap,
     this.onPlayNext,
     this.onAddToQueue,
@@ -63,21 +65,25 @@ class ArtistCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // TODO: Fetch artist art from API
             Expanded(
-              child: Container(
-                color: colorScheme.secondaryContainer,
-                child: Icon(
-                  Icons.person,
-                  size: 48,
-                  color: colorScheme.onSecondaryContainer,
+              child: CoverArtImage(
+                hasAlbumArt: artist.coverArtId != null,
+                coverArtId: artist.coverArtId,
+                borderRadius: BorderRadius.zero,
+                fallback: Container(
+                  color: colorScheme.secondaryContainer,
+                  child: Icon(
+                    Icons.person,
+                    size: 48,
+                    color: colorScheme.onSecondaryContainer,
+                  ),
                 ),
               ),
             ),
             Padding(
               padding: const EdgeInsets.all(8),
               child: Text(
-                artistName,
+                artist.name,
                 style: theme.textTheme.titleSmall,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,

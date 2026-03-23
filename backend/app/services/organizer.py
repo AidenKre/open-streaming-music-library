@@ -4,7 +4,7 @@ from typing import Callable
 
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
-from app.services.metadata import get_track_metadata
+from app.services.metadata import extract_cover_art_bytes, get_track_metadata
 
 # TODO: implement copy_file
 # TODO: do not assume that move destination is on the same filesystem as the source aka atomic rename for moving
@@ -21,6 +21,7 @@ class OrganizerContext:
     should_organize_files: bool
     should_copy_files: bool
     add_to_database: Callable[[Track], bool]
+    add_cover_art: Callable[[bytes], int] | None = None
 
     def __post_init__(self):
         if not self.should_organize_files and self.should_copy_files:
@@ -49,6 +50,18 @@ class Organizer:
         if trackmetadata is None or trackmetadata.is_empty():
             print(f"{file_path} does not result in a TrackMetaData")
             return False
+
+        # Extract and register cover art if present
+        if trackmetadata.has_album_art and self.ctx.add_cover_art is not None:
+            art_bytes = extract_cover_art_bytes(file_path)
+            if art_bytes:
+                try:
+                    cover_art_id = self.ctx.add_cover_art(art_bytes)
+                    trackmetadata = trackmetadata.model_copy(
+                        update={"cover_art_id": cover_art_id}
+                    )
+                except ValueError as e:
+                    print(f"Failed to add cover art for {file_path}: {e}")
 
         destination_dir = create_destination_dir(
             trackmetadata=trackmetadata, root_dir=self.ctx.music_library_dir

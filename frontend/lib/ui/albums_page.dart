@@ -6,6 +6,7 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
@@ -131,6 +132,15 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                 return const Center(child: CircularProgressIndicator());
               }
               final album = paginatedItems[index];
+              if (index % 6 == 0) {
+                final end = (index + 12).clamp(0, paginatedItems.length);
+                final ids = paginatedItems
+                    .sublist(index, end)
+                    .map((a) => a.coverArtId)
+                    .whereType<int>()
+                    .toList();
+                prefetchCoverArt(context, ids);
+              }
               return AlbumCard(
                 album: album,
                 onTap: () => _onAlbumTap(album),

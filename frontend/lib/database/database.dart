@@ -103,6 +103,7 @@ class Trackmetadata extends Table {
   IntColumn get sampleRateHz => integer()();
   IntColumn get channels => integer()();
   BoolColumn get hasAlbumArt => boolean().withDefault(const Constant(false))();
+  IntColumn get coverArtId => integer().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -189,6 +190,7 @@ const allowedMetadataColumns = {
   'sample_rate_hz',
   'channels',
   'has_album_art',
+  'cover_art_id',
 };
 
 const allowedTrackColumns = {'uuid_id', 'created_at', 'last_updated'};
@@ -580,7 +582,7 @@ const trackSelectColumns =
     'tm.artist_id, tm.album_id, '
     'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
-    'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated';
+    'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated';
 const _selectColumns = trackSelectColumns;
 
 // ── FTS5 virtual table creation statements ──────────────────────────────
@@ -620,7 +622,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -628,6 +630,13 @@ class AppDatabase extends _$AppDatabase {
       await m.createAll();
       for (final stmt in _ftsStatements) {
         await customStatement(stmt);
+      }
+    },
+    onUpgrade: (m, from, to) async {
+      if (from < 2) {
+        await customStatement(
+          'ALTER TABLE trackmetadata ADD COLUMN cover_art_id INTEGER',
+        );
       }
     },
   );
@@ -888,7 +897,15 @@ class AppDatabase extends _$AppDatabase {
   }) async {
     final vars = <Variable>[];
 
-    var query = 'SELECT id, name FROM artists';
+    var query =
+        'SELECT id, name, '
+        '(SELECT tm.cover_art_id FROM trackmetadata tm '
+        'WHERE tm.artist_id = artists.id '
+        'AND tm.has_album_art = 1 '
+        'AND tm.cover_art_id IS NOT NULL '
+        'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+        'LIMIT 1) AS cover_art_id '
+        'FROM artists';
 
     // Cursor filter
     if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
@@ -927,7 +944,7 @@ class AppDatabase extends _$AppDatabase {
       }
     }
 
-    return customSelect(query, variables: vars, readsFrom: {artists}).get();
+    return customSelect(query, variables: vars, readsFrom: {artists, trackmetadata}).get();
   }
 
   Stream<int> watchArtistCount({
@@ -969,7 +986,13 @@ class AppDatabase extends _$AppDatabase {
 
     var sql =
         'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
-        'a."year", a.is_single_grouping '
+        'a."year", a.is_single_grouping, '
+        '(SELECT tm.cover_art_id FROM trackmetadata tm '
+        'WHERE tm.album_id = a.id '
+        'AND tm.has_album_art = 1 '
+        'AND tm.cover_art_id IS NOT NULL '
+        'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+        'LIMIT 1) AS cover_art_id '
         'FROM albums a '
         'JOIN artists ar ON a.artist_id = ar.id';
 
@@ -1035,7 +1058,7 @@ class AppDatabase extends _$AppDatabase {
     return customSelect(
       sql,
       variables: vars,
-      readsFrom: {albums, artists},
+      readsFrom: {albums, artists, trackmetadata},
     ).get();
   }
 
@@ -1151,9 +1174,16 @@ class AppDatabase extends _$AppDatabase {
         final placeholders = List.filled(artistIds.length, '?').join(', ');
         final vars = artistIds.map((id) => Variable.withInt(id)).toList();
         final fullRows = await customSelect(
-          'SELECT id, name FROM artists WHERE id IN ($placeholders)',
+          'SELECT id, name, '
+          '(SELECT tm.cover_art_id FROM trackmetadata tm '
+          'WHERE tm.artist_id = artists.id '
+          'AND tm.has_album_art = 1 '
+          'AND tm.cover_art_id IS NOT NULL '
+          'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+          'LIMIT 1) AS cover_art_id '
+          'FROM artists WHERE id IN ($placeholders)',
           variables: vars,
-          readsFrom: {artists},
+          readsFrom: {artists, trackmetadata},
         ).get();
         final idOrder = {
           for (var i = 0; i < artistIds.length; i++) artistIds[i]: i,
@@ -1183,12 +1213,18 @@ class AppDatabase extends _$AppDatabase {
         final vars = albumIds.map((id) => Variable.withInt(id)).toList();
         final fullRows = await customSelect(
           'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
-          'a."year", a.is_single_grouping '
+          'a."year", a.is_single_grouping, '
+          '(SELECT tm.cover_art_id FROM trackmetadata tm '
+          'WHERE tm.album_id = a.id '
+          'AND tm.has_album_art = 1 '
+          'AND tm.cover_art_id IS NOT NULL '
+          'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+          'LIMIT 1) AS cover_art_id '
           'FROM albums a '
           'JOIN artists ar ON a.artist_id = ar.id '
           'WHERE a.id IN ($placeholders)',
           variables: vars,
-          readsFrom: {albums, artists},
+          readsFrom: {albums, artists, trackmetadata},
         ).get();
         final idOrder = {
           for (var i = 0; i < albumIds.length; i++) albumIds[i]: i,
@@ -1249,5 +1285,6 @@ TrackmetadataCompanion trackmetadataCompanionFromDto(ClientTrackDto dto) {
     sampleRateHz: Value(meta.sampleRateHz),
     channels: Value(meta.channels),
     hasAlbumArt: Value(meta.hasAlbumArt),
+    coverArtId: Value(meta.coverArtId),
   );
 }

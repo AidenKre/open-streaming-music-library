@@ -157,7 +157,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                   return SizedBox(
                     width: 140,
                     child: ArtistCard(
-                      artistName: artist.name,
+                      artist: artist,
                       onTap: () => _onArtistTap(artist),
                       onPlayNext: () async {
                         final tracks = await ref.read(browseRepositoryProvider)

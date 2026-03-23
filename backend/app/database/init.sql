@@ -34,6 +34,16 @@ CREATE TABLE IF NOT EXISTS tracks (
     "last_updated" INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+CREATE TABLE IF NOT EXISTS cover_arts (
+    "id" INTEGER PRIMARY KEY,
+    "sha256" TEXT UNIQUE NOT NULL,
+    "phash" TEXT NOT NULL,
+    "phash_prefix" TEXT NOT NULL,
+    "file_path" TEXT UNIQUE NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cover_arts_phash_prefix ON cover_arts("phash_prefix");
+
 CREATE TABLE IF NOT EXISTS trackmetadata (
     "track_id" INTEGER UNIQUE NOT NULL,
     "uuid_id" TEXT UNIQUE NOT NULL,
@@ -54,10 +64,12 @@ CREATE TABLE IF NOT EXISTS trackmetadata (
     "sample_rate_hz" INTEGER,
     "channels" INTEGER,
     "has_album_art" INTEGER NOT NULL CHECK ("has_album_art" IN (0,1)),
+    "cover_art_id" INTEGER,
     FOREIGN KEY ("track_id") REFERENCES tracks("id"),
     FOREIGN KEY ("uuid_id") REFERENCES tracks("uuid_id"),
     FOREIGN KEY ("artist_id") REFERENCES artists("id"),
-    FOREIGN KEY ("album_id") REFERENCES albums("id")
+    FOREIGN KEY ("album_id") REFERENCES albums("id"),
+    FOREIGN KEY ("cover_art_id") REFERENCES cover_arts("id") ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_title ON trackmetadata("title");

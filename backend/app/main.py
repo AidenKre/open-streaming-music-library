@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.config import settings
 from app.database import (
@@ -31,6 +31,8 @@ from app.models import (
     Track,
 )
 from app.services import (
+    CoverArtContext,
+    CoverArtManager,
     FileWatcher,
     Ingestor,
     IngestorContext,
@@ -54,6 +56,7 @@ app = FastAPI(lifespan=lifespan)
 def startup_event():
     # Set app.state classes to be None
     app.state.database = None
+    app.state.cover_art_manager = None
     app.state.organizer = None
     app.state.ingestor = None
     app.state.file_watcher = None
@@ -76,12 +79,25 @@ def startup_event():
     print(f"Database initialized: {db_intialized}")
     app.state.database = database
 
+    # Set up cover art manager
+    cover_art_dir = settings.app_data_dir / "cover_art"
+    cover_art_dir.mkdir(parents=True, exist_ok=True)
+    cover_art_context = CoverArtContext(
+        cover_art_dir=cover_art_dir, database=database
+    )
+    cover_art_manager = CoverArtManager(ctx=cover_art_context)
+    app.state.cover_art_manager = cover_art_manager
+
+    # Backfill cover_art_id for tracks ingested before cover art support
+    cover_art_manager.backfill_cover_art()
+
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
             music_library_dir=settings.music_library_dir,
             should_organize_files=True,
             should_copy_files=False,
             add_to_database=app.state.database.add_track,
+            add_cover_art=cover_art_manager.add_album_art,
         )
 
         organizer = Organizer(ctx=organizer_context)
@@ -248,6 +264,31 @@ def get_tracks(
         )
 
     return GetTracksResponse(data=client_track_list, nextCursor=nextCursor)
+
+
+_IMAGE_MIME: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+}
+
+
+@app.get("/cover_art/{cover_art_id}")
+def get_cover_art(cover_art_id: int):
+    manager: CoverArtManager = app.state.cover_art_manager
+    path = manager.get_album_art(cover_art_id)
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="Cover art not found")
+    media_type = _IMAGE_MIME.get(path.suffix.lower(), "image/jpeg")
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 _CODEC_MIME: dict[str, str] = {

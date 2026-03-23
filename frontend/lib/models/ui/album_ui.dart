@@ -7,6 +7,7 @@ class AlbumUI {
   final int artistId;
   final int? year;
   final bool isSingleGrouping;
+  final int? coverArtId;
 
   const AlbumUI({
     required this.id,
@@ -15,6 +16,7 @@ class AlbumUI {
     required this.artistId,
     this.year,
     this.isSingleGrouping = false,
+    this.coverArtId,
   });
 
   factory AlbumUI.fromQueryRow(QueryRow row) {
@@ -25,6 +27,7 @@ class AlbumUI {
       artistId: row.read<int>('artist_id'),
       year: row.readNullable<int>('year'),
       isSingleGrouping: row.read<int>('is_single_grouping') == 1,
+      coverArtId: row.readNullable<int>('cover_art_id'),
     );
   }
 }

@@ -23,6 +23,7 @@ class TrackUI {
   final int sampleRateHz;
   final int channels;
   final bool hasAlbumArt;
+  final int? coverArtId;
 
   bool get isDownloaded => filePath != null;
 
@@ -51,6 +52,7 @@ class TrackUI {
     required this.sampleRateHz,
     required this.channels,
     required this.hasAlbumArt,
+    this.coverArtId,
   });
 
   String get formattedDuration {
@@ -89,6 +91,7 @@ class TrackUI {
       sampleRateHz: row.read<int>('sample_rate_hz'),
       channels: row.read<int>('channels'),
       hasAlbumArt: row.read<bool>('has_album_art'),
+      coverArtId: row.readNullable<int>('cover_art_id'),
     );
   }
 
@@ -115,6 +118,7 @@ class TrackUI {
       sampleRateHz: meta.sampleRateHz,
       channels: meta.channels,
       hasAlbumArt: meta.hasAlbumArt,
+      coverArtId: meta.coverArtId,
     );
   }
 }
