@@ -19,11 +19,52 @@ Map<String, dynamic> _minimalMetadataJson() => {
   'has_album_art': false,
 };
 
+Map<String, dynamic> _richMetadataJson({
+  required String title,
+  required String artist,
+  required String album,
+  required int artistId,
+  required int albumId,
+}) => {
+  'title': title,
+  'artist': artist,
+  'album': album,
+  'album_artist': artist,
+  'artist_id': artistId,
+  'album_id': albumId,
+  'duration': 180.0,
+  'bitrate_kbps': 320.0,
+  'sample_rate_hz': 44100,
+  'channels': 2,
+  'has_album_art': false,
+};
+
 Map<String, dynamic> _trackJson(String uuid) => {
   'uuid_id': uuid,
   'created_at': 1000,
   'last_updated': 2000,
   'metadata': _minimalMetadataJson(),
+};
+
+Map<String, dynamic> _richTrackJson(
+  String uuid, {
+  required String title,
+  required String artist,
+  required String album,
+  required int artistId,
+  required int albumId,
+  int createdAt = 1000,
+}) => {
+  'uuid_id': uuid,
+  'created_at': createdAt,
+  'last_updated': createdAt,
+  'metadata': _richMetadataJson(
+    title: title,
+    artist: artist,
+    album: album,
+    artistId: artistId,
+    albumId: albumId,
+  ),
 };
 
 Response _tracksResponse(List<String> uuids, {String? nextCursor}) => Response(
@@ -231,6 +272,88 @@ void main() {
 
       // Only one API call should have been made
       expect(callCount, 1);
+    });
+
+    test('FTS tables include tracks added on a second sync', () async {
+      // First sync: one track
+      var callCount = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          callCount++;
+          return Response(
+            jsonEncode({
+              'data': [
+                _richTrackJson(
+                  'uuid-first',
+                  title: 'Alpha Song',
+                  artist: 'Alpha Artist',
+                  album: 'Alpha Album',
+                  artistId: 1,
+                  albumId: 1,
+                  createdAt: 1000,
+                ),
+              ],
+              'nextCursor': null,
+            }),
+            200,
+          );
+        }),
+      );
+
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+
+      // Verify first sync populated FTS
+      var ftsRows = await db.customSelect(
+        "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Alpha\"*'",
+      ).get();
+      expect(ftsRows.length, 1, reason: 'First sync should populate FTS');
+
+      // Second sync: return a new track
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          return Response(
+            jsonEncode({
+              'data': [
+                _richTrackJson(
+                  'uuid-second',
+                  title: 'Bravo Song',
+                  artist: 'Bravo Artist',
+                  album: 'Bravo Album',
+                  artistId: 2,
+                  albumId: 2,
+                  createdAt: 2000,
+                ),
+              ],
+              'nextCursor': null,
+            }),
+            200,
+          );
+        }),
+      );
+
+      // Reset lastFetchTime so second sync fetches the new track
+      SharedPreferences.setMockInitialValues({});
+      await notifier.sync();
+
+      // Verify second track is in the main table
+      final allTracks = await db.select(db.trackmetadata).get();
+      expect(allTracks.length, 2, reason: 'Both tracks should be in DB');
+
+      // Verify FTS contains BOTH tracks after second sync
+      ftsRows = await db.customSelect(
+        "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Alpha\"*'",
+      ).get();
+      expect(ftsRows.length, 1, reason: 'Original track should still be searchable');
+
+      ftsRows = await db.customSelect(
+        "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Bravo\"*'",
+      ).get();
+      expect(ftsRows.length, 1, reason: 'Newly synced track should be searchable');
     });
   });
 }

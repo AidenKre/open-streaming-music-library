@@ -3,10 +3,12 @@ import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/repositories/browse_repository.dart';
+import 'package:frontend/repositories/queue_repository.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 final databaseProvider = Provider<AppDatabase>((ref) {
-  return AppDatabase(openAppDatabase());
+  throw UnimplementedError('databaseProvider must be overridden');
 });
 
 final sharedPreferencesProvider = FutureProvider<SharedPreferences>((ref) {
@@ -14,6 +16,14 @@ final sharedPreferencesProvider = FutureProvider<SharedPreferences>((ref) {
 });
 
 final tracksApiProvider = Provider<TracksApi>((ref) => TracksApi());
+
+final queueRepositoryProvider = Provider<QueueRepository>((ref) {
+  return QueueRepository(ref.read(databaseProvider));
+});
+
+final browseRepositoryProvider = Provider<BrowseRepository>((ref) {
+  return BrowseRepository(ref.read(databaseProvider));
+});
 
 class TrackSyncState {
   final bool isSyncing;
@@ -132,20 +142,20 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
   }
 
   Future<void> _rebuildFts(AppDatabase db) async {
-    await db.customStatement("DELETE FROM fts_artists");
+    await db.customStatement("INSERT INTO fts_artists(fts_artists) VALUES('delete-all')");
     await db.customStatement(
       "INSERT INTO fts_artists(rowid, name) "
       "SELECT id, name FROM artists",
     );
 
-    await db.customStatement("DELETE FROM fts_albums");
+    await db.customStatement("INSERT INTO fts_albums(fts_albums) VALUES('delete-all')");
     await db.customStatement(
       "INSERT INTO fts_albums(rowid, name, artist_name) "
       "SELECT a.id, COALESCE(a.name, ''), ar.name "
       "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
     );
 
-    await db.customStatement("DELETE FROM fts_tracks");
+    await db.customStatement("INSERT INTO fts_tracks(fts_tracks) VALUES('delete-all')");
     await db.customStatement(
       "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
       "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "

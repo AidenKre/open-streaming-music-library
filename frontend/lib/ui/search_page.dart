@@ -6,7 +6,6 @@ import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
@@ -25,6 +24,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   final _controller = TextEditingController();
   Timer? _debounceTimer;
   String _query = '';
+  bool _isSearching = false;
   List<ArtistUI> _artists = [];
   List<AlbumUI> _albums = [];
   List<TrackUI> _tracks = [];
@@ -48,6 +48,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   Future<void> _search() async {
     if (_query.isEmpty) {
       setState(() {
+        _isSearching = false;
         _artists = [];
         _albums = [];
         _tracks = [];
@@ -55,14 +56,17 @@ class _SearchPageState extends ConsumerState<SearchPage> {
       return;
     }
 
-    final db = ref.read(databaseProvider);
-    final results = await db.getSearchResults(_query, limitPerType: 5);
+    setState(() => _isSearching = true);
+
+    final results = await ref.read(browseRepositoryProvider)
+        .search(_query, limitPerType: 5);
 
     if (!mounted) return;
     setState(() {
-      _artists = results.artists.map(ArtistUI.fromQueryRow).toList();
-      _albums = results.albums.map(AlbumUI.fromQueryRow).toList();
-      _tracks = results.tracks.map(TrackUI.fromQueryRow).toList();
+      _isSearching = false;
+      _artists = results.artists;
+      _albums = results.albums;
+      _tracks = results.tracks;
     });
   }
 
@@ -98,10 +102,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   Widget _buildSectionHeader(String title) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-      child: Text(
-        title,
-        style: Theme.of(context).textTheme.titleMedium,
-      ),
+      child: Text(title, style: Theme.of(context).textTheme.titleMedium),
     );
   }
 
@@ -138,12 +139,10 @@ class _SearchPageState extends ConsumerState<SearchPage> {
               onChanged: _onQueryChanged,
             ),
           ),
-          if (_query.isNotEmpty && !hasResults)
+          if (_query.isNotEmpty && !hasResults && !_isSearching)
             const Padding(
               padding: EdgeInsets.all(32),
-              child: Center(
-                child: Text('No results found'),
-              ),
+              child: Center(child: Text('No results found')),
             ),
           if (_artists.isNotEmpty) ...[
             _buildSectionHeader('Artists'),
@@ -160,6 +159,20 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                     child: ArtistCard(
                       artistName: artist.name,
                       onTap: () => _onArtistTap(artist),
+                      onPlayNext: () async {
+                        final tracks = await ref.read(browseRepositoryProvider)
+                            .getTracksForArtist(artist.id);
+                        if (tracks.isNotEmpty) {
+                          ref.read(audioProvider.notifier).playNext(tracks);
+                        }
+                      },
+                      onAddToQueue: () async {
+                        final tracks = await ref.read(browseRepositoryProvider)
+                            .getTracksForArtist(artist.id);
+                        if (tracks.isNotEmpty) {
+                          ref.read(audioProvider.notifier).addToQueue(tracks);
+                        }
+                      },
                     ),
                   );
                 },
@@ -181,6 +194,20 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                     child: AlbumCard(
                       album: album,
                       onTap: () => _onAlbumTap(album),
+                      onPlayNext: () async {
+                        final tracks = await ref.read(browseRepositoryProvider)
+                            .getTracksForAlbum(album.artistId, album.id);
+                        if (tracks.isNotEmpty) {
+                          ref.read(audioProvider.notifier).playNext(tracks);
+                        }
+                      },
+                      onAddToQueue: () async {
+                        final tracks = await ref.read(browseRepositoryProvider)
+                            .getTracksForAlbum(album.artistId, album.id);
+                        if (tracks.isNotEmpty) {
+                          ref.read(audioProvider.notifier).addToQueue(tracks);
+                        }
+                      },
                     ),
                   );
                 },
@@ -192,10 +219,17 @@ class _SearchPageState extends ConsumerState<SearchPage> {
             for (final track in _tracks)
               TrackTile(
                 track: track,
-                onTap: () => ref.read(audioProvider.notifier).playFromQueue(
-                  const QueueContext(),
-                  track,
-                ),
+                onTap: () => ref
+                    .read(audioProvider.notifier)
+                    .playFromTrackList(
+                      _tracks.map((t) => t.uuidId).toList(),
+                      track,
+                      sourceType: 'search',
+                    ),
+                onPlayNext: () =>
+                    ref.read(audioProvider.notifier).playNext([track]),
+                onAddToQueue: () =>
+                    ref.read(audioProvider.notifier).addToQueue([track]),
               ),
           ],
         ],

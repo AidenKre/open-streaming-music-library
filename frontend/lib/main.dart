@@ -1,9 +1,12 @@
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/api/api_client.dart';
+import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
-import 'package:frontend/providers/audio/track_cache_manager.dart';
+import 'package:frontend/providers/providers.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
@@ -13,6 +16,12 @@ import 'package:frontend/ui/widgets/mini_player.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  final savedUrl = prefs.getString('serverUrl');
+  if (savedUrl != null) {
+    ApiClient.init(savedUrl);
+  }
+  final db = AppDatabase(openAppDatabase());
   final audioHandler = await AudioService.init<AudioServiceBridge>(
     builder: () => AudioServiceBridge(),
     config: const AudioServiceConfig(
@@ -21,11 +30,10 @@ Future<void> main() async {
       androidNotificationOngoing: true,
     ),
   );
-  final trackCache = await HttpTrackCacheManager.create();
   runApp(ProviderScope(
     overrides: [
+      databaseProvider.overrideWithValue(db),
       audioServiceProvider.overrideWithValue(audioHandler),
-      trackCacheProvider.overrideWithValue(trackCache),
     ],
     child: Frontend(),
   ));

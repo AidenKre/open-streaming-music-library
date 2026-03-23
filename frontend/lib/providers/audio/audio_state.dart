@@ -1,32 +1,8 @@
-import 'dart:math';
-
-import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 
 enum PlayerStatus { idle, loading, playing, paused }
 
 enum QueueRepeatMode { off, all, one }
-
-class QueueContext {
-  final int? artistId;
-  final int? albumId;
-  final List<OrderParameter> orderParams;
-  final int shuffleSeed;
-
-  const QueueContext({
-    this.artistId,
-    this.albumId,
-    this.orderParams = const [],
-    int? shuffleSeed,
-  }) : shuffleSeed = shuffleSeed ?? 0;
-
-  QueueContext withNewSeed() => QueueContext(
-    artistId: artistId,
-    albumId: albumId,
-    orderParams: orderParams,
-    shuffleSeed: Random().nextInt(1 << 32),
-  );
-}
 
 class PlaybackSlice {
   final TrackUI? currentTrack;
@@ -62,53 +38,52 @@ class PlaybackSlice {
 }
 
 class QueueSlice {
-  final QueueContext? queueContext;
+  final int? sessionId;
+  final int? currentItemId;
+  final int currentPlayPosition;
+  final int totalCount;
   final QueueRepeatMode repeatMode;
-  final List<TrackUI> upcomingTracks;
+  final int queueVersion;
 
   const QueueSlice({
-    this.queueContext,
+    this.sessionId,
+    this.currentItemId,
+    this.currentPlayPosition = 0,
+    this.totalCount = 0,
     this.repeatMode = QueueRepeatMode.off,
-    this.upcomingTracks = const [],
+    this.queueVersion = 0,
   });
 
   QueueSlice copyWith({
-    QueueContext? queueContext,
-    bool clearQueueContext = false,
+    int? sessionId,
+    bool clearSession = false,
+    int? currentItemId,
+    bool clearCurrentItem = false,
+    int? currentPlayPosition,
+    int? totalCount,
     QueueRepeatMode? repeatMode,
-    List<TrackUI>? upcomingTracks,
+    int? queueVersion,
   }) {
     return QueueSlice(
-      queueContext: clearQueueContext
+      sessionId: clearSession ? null : (sessionId ?? this.sessionId),
+      currentItemId: clearCurrentItem
           ? null
-          : (queueContext ?? this.queueContext),
+          : (currentItemId ?? this.currentItemId),
+      currentPlayPosition: currentPlayPosition ?? this.currentPlayPosition,
+      totalCount: totalCount ?? this.totalCount,
       repeatMode: repeatMode ?? this.repeatMode,
-      upcomingTracks: upcomingTracks ?? this.upcomingTracks,
+      queueVersion: queueVersion ?? this.queueVersion,
     );
   }
 }
 
 class ShuffleSlice {
   final bool shuffleOn;
-  final List<String> shuffledUuids;
-  final int shuffleIndex;
 
-  const ShuffleSlice({
-    this.shuffleOn = false,
-    this.shuffledUuids = const [],
-    this.shuffleIndex = 0,
-  });
+  const ShuffleSlice({this.shuffleOn = false});
 
-  ShuffleSlice copyWith({
-    bool? shuffleOn,
-    List<String>? shuffledUuids,
-    int? shuffleIndex,
-  }) {
-    return ShuffleSlice(
-      shuffleOn: shuffleOn ?? this.shuffleOn,
-      shuffledUuids: shuffledUuids ?? this.shuffledUuids,
-      shuffleIndex: shuffleIndex ?? this.shuffleIndex,
-    );
+  ShuffleSlice copyWith({bool? shuffleOn}) {
+    return ShuffleSlice(shuffleOn: shuffleOn ?? this.shuffleOn);
   }
 }
 
@@ -135,7 +110,3 @@ class AudioState {
     );
   }
 }
-
-List<OrderParameter> reversedOrder(List<OrderParameter> params) => params
-    .map((o) => OrderParameter(column: o.column, isAscending: !o.isAscending))
-    .toList();

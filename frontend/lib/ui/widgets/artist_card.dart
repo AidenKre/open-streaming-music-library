@@ -3,8 +3,47 @@ import 'package:flutter/material.dart';
 class ArtistCard extends StatelessWidget {
   final String artistName;
   final VoidCallback onTap;
+  final VoidCallback? onPlayNext;
+  final VoidCallback? onAddToQueue;
 
-  const ArtistCard({super.key, required this.artistName, required this.onTap});
+  const ArtistCard({
+    super.key,
+    required this.artistName,
+    required this.onTap,
+    this.onPlayNext,
+    this.onAddToQueue,
+  });
+
+  void _showArtistMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (onPlayNext != null)
+              ListTile(
+                leading: const Icon(Icons.playlist_play),
+                title: const Text('Play Next'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onPlayNext!();
+                },
+              ),
+            if (onAddToQueue != null)
+              ListTile(
+                leading: const Icon(Icons.queue_music),
+                title: const Text('Add to Queue'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onAddToQueue!();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -18,6 +57,9 @@ class ArtistCard extends StatelessWidget {
       ),
       child: InkWell(
         onTap: onTap,
+        onLongPress: (onPlayNext != null || onAddToQueue != null)
+            ? () => _showArtistMenu(context)
+            : null,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [

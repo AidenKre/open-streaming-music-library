@@ -1,10 +1,11 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
+import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/albums_page.dart';
+import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
@@ -15,15 +16,13 @@ class ArtistsPage extends ConsumerStatefulWidget {
   ConsumerState<ArtistsPage> createState() => _ArtistPageState();
 }
 
-class _ArtistPageState extends ConsumerState<ArtistsPage> {
-  static const _pageSize = 30;
+class _ArtistPageState extends ConsumerState<ArtistsPage>
+    with CursorPaginationMixin<ArtistUI> {
+  @override
+  final scrollController = ScrollController();
 
-  final _scrollController = ScrollController();
-  List<ArtistUI> _artists = [];
-  bool _hasMore = true;
-  bool _isLoading = false;
-  int _newArtistCount = 0;
-  StreamSubscription<int>? _watchSub;
+  @override
+  int get pageSize => 30;
 
   List<ArtistOrderParameter> get _orderParams => [
     ArtistOrderParameter(column: 'name'),
@@ -33,88 +32,43 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
   void initState() {
     super.initState();
     Future.microtask(() => ref.read(trackSyncProvider.notifier).sync());
-    _scrollController.addListener(_onScroll);
-    _loadMore();
+    initPagination();
   }
 
   @override
   void dispose() {
-    _watchSub?.cancel();
-    _scrollController.dispose();
+    disposePagination();
+    scrollController.dispose();
     super.dispose();
   }
 
-  void _startWatching() {
-    _watchSub?.cancel();
-
-    final db = ref.read(databaseProvider);
-
-    final useCursor = _hasMore && _artists.isNotEmpty;
-    final cursorFilters = useCursor
-        ? _buildCursorFromLast(_artists.last)
-        : <ArtistRowFilterParameter>[];
-    final orderBy = useCursor ? _orderParams : <ArtistOrderParameter>[];
-
-    _watchSub = db
-        .watchArtistCount(
-          orderBy: orderBy,
-          cursorFilters: cursorFilters,
-        )
-        .listen((count) {
-          if (!mounted) return;
-          final newCount = count - _artists.length;
-          if (newCount != _newArtistCount) {
-            setState(() => _newArtistCount = newCount > 0 ? newCount : 0);
-          }
-        });
-  }
-
-  void _onScroll() {
-    if (_scrollController.position.pixels >=
-        _scrollController.position.maxScrollExtent - 200) {
-      _loadMore();
-    }
-  }
-
-  Future<void> _loadMore() async {
-    if (_isLoading || !_hasMore) return;
-    _isLoading = true;
-
-    final db = ref.read(databaseProvider);
-
-    final cursorFilters = _artists.isEmpty
-        ? <ArtistRowFilterParameter>[]
-        : _buildCursorFromLast(_artists.last);
-
-    final rows = await db.getArtists(
+  @override
+  Future<List<ArtistUI>> loadPage({required bool useCursor}) {
+    final repo = ref.read(browseRepositoryProvider);
+    return repo.getArtists(
       orderBy: _orderParams,
-      cursorFilters: cursorFilters,
-      limit: _pageSize,
+      cursorFilters: useCursor
+          ? _buildCursorFromLast(paginatedItems.last)
+          : [],
+      limit: pageSize,
     );
+  }
 
-    if (!mounted) return;
-    setState(() {
-      _artists.addAll(rows.map(ArtistUI.fromQueryRow));
-      _hasMore = rows.length == _pageSize;
-      _isLoading = false;
-    });
-    _startWatching();
+  @override
+  Stream<int> watchItemCount({required bool useCursor}) {
+    final repo = ref.read(browseRepositoryProvider);
+    return repo.watchArtistCount(
+      orderBy: useCursor ? _orderParams : [],
+      cursorFilters: useCursor
+          ? _buildCursorFromLast(paginatedItems.last)
+          : [],
+    );
   }
 
   List<ArtistRowFilterParameter> _buildCursorFromLast(ArtistUI last) {
     return [
       ArtistRowFilterParameter(column: 'name', value: last.name),
     ];
-  }
-
-  void _refresh() {
-    _watchSub?.cancel();
-    setState(() {
-      _artists = [];
-      _hasMore = true;
-      _newArtistCount = 0;
-    });
-    _loadMore();
   }
 
   void _onArtistTap(ArtistUI artist) {
@@ -132,16 +86,10 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
   Widget build(BuildContext context) {
     final body = Column(
       children: [
-        if (_newArtistCount > 0)
-          MaterialBanner(
-            content: Text('$_newArtistCount new artists available'),
-            actions: [
-              TextButton(onPressed: _refresh, child: const Text('Refresh')),
-            ],
-          ),
+        buildNewItemsBanner('artists'),
         Expanded(
           child: GridView.builder(
-            controller: _scrollController,
+            controller: scrollController,
             padding: const EdgeInsets.all(8),
             gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
               maxCrossAxisExtent: 200,
@@ -149,15 +97,29 @@ class _ArtistPageState extends ConsumerState<ArtistsPage> {
               mainAxisSpacing: 8,
               crossAxisSpacing: 8,
             ),
-            itemCount: _artists.length + (_hasMore ? 1 : 0),
+            itemCount: paginatedItems.length + (hasMore ? 1 : 0),
             itemBuilder: (context, index) {
-              if (index >= _artists.length) {
+              if (index >= paginatedItems.length) {
                 return const Center(child: CircularProgressIndicator());
               }
-              final artist = _artists[index];
+              final artist = paginatedItems[index];
               return ArtistCard(
                 artistName: artist.name,
                 onTap: () => _onArtistTap(artist),
+                onPlayNext: () async {
+                  final tracks = await ref.read(browseRepositoryProvider)
+                      .getTracksForArtist(artist.id);
+                  if (tracks.isNotEmpty) {
+                    ref.read(audioProvider.notifier).playNext(tracks);
+                  }
+                },
+                onAddToQueue: () async {
+                  final tracks = await ref.read(browseRepositoryProvider)
+                      .getTracksForArtist(artist.id);
+                  if (tracks.isNotEmpty) {
+                    ref.read(audioProvider.notifier).addToQueue(tracks);
+                  }
+                },
               );
             },
           ),

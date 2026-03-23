@@ -1,23 +1,13 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'package:frontend/providers/audio/audio_player_controller.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
-import 'package:frontend/providers/audio/queue_resolver.dart';
-import 'package:frontend/providers/audio/track_cache_manager.dart';
-import 'package:frontend/providers/providers.dart';
+import 'package:frontend/providers/audio/concatenating_player_controller.dart';
 
-final audioPlayerProvider = Provider<AudioPlayerController>((ref) {
-  final controller = SingleAudioPlayerController.create();
+final concatenatingPlayerProvider =
+    Provider<ConcatenatingPlayerController>((ref) {
+  final controller = ConcatenatingPlayerController.create();
   ref.onDispose(controller.dispose);
   return controller;
-});
-
-final trackCacheProvider = Provider<TrackCacheManager>((ref) {
-  throw UnimplementedError('trackCacheProvider must be overridden');
-});
-
-final audioQueueLookupProvider = Provider<AudioQueueLookup>((ref) {
-  return QueueResolver(ref.read(databaseProvider));
 });
 
 final audioServiceProvider = Provider<AudioServiceBridge>((ref) {
