@@ -10,6 +10,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
 import 'package:frontend/providers/audio/queue_hydration_controller.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
@@ -24,6 +25,7 @@ class AudioCoordinator extends Notifier<AudioState> {
   late AudioServiceBridge _bridge;
   late QueueOrderManager _orderManager;
   late QueueHydrationController _hydrationController;
+  late CoverArtCacheManager _coverArtCache;
 
   final List<StreamSubscription<Object?>> _subscriptions = [];
   Future<void> _mutationTail = Future<void>.value();
@@ -36,6 +38,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     _player = ref.read(concatenatingPlayerProvider);
     _queueRepo = ref.read(queueRepositoryProvider);
     _bridge = ref.read(audioServiceProvider);
+    _coverArtCache = ref.read(coverArtCacheProvider);
     _orderManager = QueueOrderManager(_queueRepo);
     _hydrationController = QueueHydrationController(_queueRepo, _player);
 
@@ -541,7 +544,11 @@ class AudioCoordinator extends Notifier<AudioState> {
       shuffle: ShuffleSlice(shuffleOn: snapshot.session.shuffleEnabled),
     );
 
-    _bridge.updateNowPlaying(currentTrack.track);
+    final artUri = await _coverArtCache.resolveArtUri(
+      hasAlbumArt: currentTrack.track.hasAlbumArt,
+      coverArtId: currentTrack.track.coverArtId,
+    );
+    _bridge.updateNowPlaying(currentTrack.track, artUri: artUri);
     _updateBridgePlaybackState();
     _scheduleForwardHydration();
   }
@@ -709,7 +716,11 @@ class AudioCoordinator extends Notifier<AudioState> {
       ),
     );
 
-    _bridge.updateNowPlaying(currentTrack.track);
+    final artUri = await _coverArtCache.resolveArtUri(
+      hasAlbumArt: currentTrack.track.hasAlbumArt,
+      coverArtId: currentTrack.track.coverArtId,
+    );
+    _bridge.updateNowPlaying(currentTrack.track, artUri: artUri);
     _updateBridgePlaybackState();
     await _persistPlaybackCursor(
       resetPosition: true,

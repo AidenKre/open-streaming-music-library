@@ -139,7 +139,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                     .map((a) => a.coverArtId)
                     .whereType<int>()
                     .toList();
-                prefetchCoverArt(context, ids);
+                prefetchCoverArt(ids);
               }
               return AlbumCard(
                 album: album,

@@ -1,6 +1,5 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
-import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 
 /// Displays cover art from the backend when [hasAlbumArt] is true and
 /// [coverArtId] is non-null. Falls back to [fallback] while loading, on error,
@@ -29,15 +28,16 @@ class CoverArtImage extends StatelessWidget {
 
     return ClipRRect(
       borderRadius: borderRadius,
-      child: CachedNetworkImage(
-        imageUrl: ApiClient.instance.coverArtUrl(coverArtId!),
+      child: Image(
+        image: coverArtCache.imageProvider(coverArtId!),
         width: width,
         height: height,
         fit: BoxFit.cover,
-        fadeInDuration: Duration.zero,
-        fadeOutDuration: Duration.zero,
-        placeholder: (_, _) => fallback,
-        errorWidget: (_, _, _) => fallback,
+        errorBuilder: (_, _, _) => fallback,
+        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+          if (wasSynchronouslyLoaded || frame != null) return child;
+          return fallback;
+        },
       ),
     );
   }

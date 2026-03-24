@@ -1,9 +1,9 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_coordinator.dart';
@@ -71,6 +71,7 @@ Future<void> _pumpMiniPlayer(WidgetTester tester, TrackUI track) async {
 void main() {
   setUpAll(() {
     ApiClient.init('http://localhost:8000');
+    initCoverArtCache(CoverArtCacheManager.noop());
   });
 
   group('MiniPlayer cover art', () {
@@ -83,7 +84,7 @@ void main() {
         );
 
         expect(find.byIcon(Icons.music_note), findsOneWidget);
-        expect(find.byType(CachedNetworkImage), findsNothing);
+        expect(find.byType(Image), findsNothing);
       },
     );
 
@@ -96,7 +97,7 @@ void main() {
         );
 
         expect(find.byType(CoverArtImage), findsOneWidget);
-        expect(find.byType(CachedNetworkImage), findsOneWidget);
+        expect(find.byType(Image), findsOneWidget);
       },
     );
   });

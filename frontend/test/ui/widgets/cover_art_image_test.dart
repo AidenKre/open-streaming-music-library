@@ -1,12 +1,13 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 
 void main() {
   setUpAll(() {
     ApiClient.init('http://localhost:8000');
+    initCoverArtCache(CoverArtCacheManager.noop());
   });
 
   Widget buildWidget({
@@ -36,7 +37,7 @@ void main() {
         );
 
         expect(find.byIcon(Icons.music_note), findsOneWidget);
-        expect(find.byType(CachedNetworkImage), findsNothing);
+        expect(find.byType(Image), findsNothing);
       },
     );
 
@@ -48,7 +49,7 @@ void main() {
         );
 
         expect(find.byIcon(Icons.music_note), findsOneWidget);
-        expect(find.byType(CachedNetworkImage), findsNothing);
+        expect(find.byType(Image), findsNothing);
       },
     );
 
@@ -60,96 +61,69 @@ void main() {
         );
 
         expect(find.byIcon(Icons.music_note), findsOneWidget);
-        expect(find.byType(CachedNetworkImage), findsNothing);
+        expect(find.byType(Image), findsNothing);
       },
     );
 
     testWidgets(
-      'shows CachedNetworkImage when hasAlbumArt=true and coverArtId is set',
+      'shows Image when hasAlbumArt=true and coverArtId is set',
       (tester) async {
         await tester.pumpWidget(
           buildWidget(hasAlbumArt: true, coverArtId: 5),
         );
 
-        // CachedNetworkImage is in the tree (image load is async;
-        // the placeholder/error widget may still appear, which is correct)
-        expect(find.byType(CachedNetworkImage), findsOneWidget);
+        expect(find.byType(Image), findsOneWidget);
       },
     );
 
     testWidgets(
-      'CachedNetworkImage uses correct URL from ApiClient',
+      'Image uses correct URL from ApiClient',
       (tester) async {
         await tester.pumpWidget(
           buildWidget(hasAlbumArt: true, coverArtId: 42),
         );
 
-        final image = tester.widget<CachedNetworkImage>(
-          find.byType(CachedNetworkImage),
-        );
-        expect(image.imageUrl, 'http://localhost:8000/cover_art/42');
+        final image = tester.widget<Image>(find.byType(Image));
+        final provider = image.image as NetworkImage;
+        expect(provider.url, 'http://localhost:8000/cover_art/42');
       },
     );
 
     testWidgets(
-      'placeholder builder returns fallback widget',
+      'frameBuilder shows fallback before first frame arrives',
       (tester) async {
         await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: CoverArtImage(
-                hasAlbumArt: true,
-                coverArtId: 99,
-                width: 48,
-                height: 48,
-                borderRadius: BorderRadius.circular(4),
-                fallback: const Icon(Icons.music_note),
-              ),
-            ),
-          ),
+          buildWidget(hasAlbumArt: true, coverArtId: 99),
         );
 
-        final image = tester.widget<CachedNetworkImage>(
-          find.byType(CachedNetworkImage),
+        final image = tester.widget<Image>(find.byType(Image));
+        // Simulate frameBuilder called with frame=null (loading)
+        final result = image.frameBuilder!(
+          tester.element(find.byType(Image)),
+          const SizedBox(), // child
+          null, // frame (null = not yet loaded)
+          false, // wasSynchronouslyLoaded
         );
-        // Verify placeholder builder produces our fallback
-        final placeholder = image.placeholder!(
-          tester.element(find.byType(CachedNetworkImage)),
-          'http://localhost:8000/cover_art/99',
-        );
-        expect(placeholder, isA<Icon>());
-        expect((placeholder as Icon).icon, Icons.music_note);
+        expect(result, isA<Icon>());
+        expect((result as Icon).icon, Icons.music_note);
       },
     );
 
     testWidgets(
-      'errorWidget builder returns fallback widget',
+      'errorBuilder shows fallback on load failure',
       (tester) async {
         await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: CoverArtImage(
-                hasAlbumArt: true,
-                coverArtId: 99,
-                width: 48,
-                height: 48,
-                borderRadius: BorderRadius.circular(4),
-                fallback: const Icon(Icons.music_note),
-              ),
-            ),
-          ),
+          buildWidget(hasAlbumArt: true, coverArtId: 99),
         );
 
-        final image = tester.widget<CachedNetworkImage>(
-          find.byType(CachedNetworkImage),
-        );
-        final errorWidget = image.errorWidget!(
-          tester.element(find.byType(CachedNetworkImage)),
-          'http://localhost:8000/cover_art/99',
+        final image = tester.widget<Image>(find.byType(Image));
+        final result = image.errorBuilder!(
+          tester.element(find.byType(Image)),
           Exception('network error'),
+          null,
         );
-        expect(errorWidget, isA<Icon>());
-        expect((errorWidget as Icon).icon, Icons.music_note);
+        expect(result, isA<Icon>());
+        expect((result as Icon).icon, Icons.music_note);
       },
     );
   });

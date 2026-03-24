@@ -2,6 +2,7 @@ import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
@@ -21,6 +22,7 @@ Future<void> main() async {
   if (savedUrl != null) {
     ApiClient.init(savedUrl);
   }
+  initCoverArtCache();
   final db = AppDatabase(openAppDatabase());
   final audioHandler = await AudioService.init<AudioServiceBridge>(
     builder: () => AudioServiceBridge(),

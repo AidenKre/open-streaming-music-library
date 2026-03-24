@@ -1,7 +1,7 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 
@@ -46,6 +46,7 @@ Widget buildCard(AlbumUI album) {
 void main() {
   setUpAll(() {
     ApiClient.init('http://localhost:8000');
+    initCoverArtCache(CoverArtCacheManager.noop());
   });
 
   group('AlbumCard cover art', () {
@@ -55,16 +56,16 @@ void main() {
         await tester.pumpWidget(buildCard(_album));
 
         expect(find.byIcon(Icons.album), findsOneWidget);
-        expect(find.byType(CachedNetworkImage), findsNothing);
+        expect(find.byType(Image), findsNothing);
       },
     );
 
     testWidgets(
-      'shows CachedNetworkImage when coverArtId is set',
+      'shows Image when coverArtId is set',
       (tester) async {
         await tester.pumpWidget(buildCard(_albumWithArt));
 
-        expect(find.byType(CachedNetworkImage), findsOneWidget);
+        expect(find.byType(Image), findsOneWidget);
       },
     );
 
