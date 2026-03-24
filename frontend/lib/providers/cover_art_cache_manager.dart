@@ -3,7 +3,6 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
-import 'package:meta/meta.dart';
 
 import 'package:frontend/api/api_client.dart';
 
@@ -25,7 +24,7 @@ void initCoverArtCache([CoverArtCacheManager? manager]) {
 /// system media notification (audio service).
 class CoverArtCacheManager {
   CoverArtCacheManager({BaseCacheManager? cache})
-      : _cache = cache ?? DefaultCacheManager();
+    : _cache = cache ?? DefaultCacheManager();
 
   /// Creates a [CoverArtCacheManager] without a backing cache.
   /// Only for use in tests where the cache is not exercised.
@@ -40,11 +39,20 @@ class CoverArtCacheManager {
   ///
   /// If the image is already on disk it is served immediately; otherwise it
   /// is fetched from the network and cached for future use.
-  ImageProvider imageProvider(int coverArtId) {
+  ///
+  /// Optional [cacheWidth] and [cacheHeight] allow the image to be decoded at
+  /// the size the UI actually needs instead of full resolution.
+  ImageProvider imageProvider(
+    int coverArtId, {
+    int? cacheWidth,
+    int? cacheHeight,
+  }) {
     final url = _url(coverArtId);
     final cache = _cache;
-    if (cache == null) return NetworkImage(url);
-    return CoverArtImageProvider(url, cache);
+    final ImageProvider provider = cache == null
+        ? NetworkImage(url)
+        : CoverArtImageProvider(url, cache);
+    return ResizeImage.resizeIfNeeded(cacheWidth, cacheHeight, provider);
   }
 
   /// Prefetches cover art so it is ready when the UI or audio service needs it.
