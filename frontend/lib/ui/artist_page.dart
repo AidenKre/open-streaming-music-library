@@ -94,7 +94,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
             padding: const EdgeInsets.all(8),
             gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
               maxCrossAxisExtent: 200,
-              childAspectRatio: 0.85,
+              childAspectRatio: 0.78,
               mainAxisSpacing: 8,
               crossAxisSpacing: 8,
             ),

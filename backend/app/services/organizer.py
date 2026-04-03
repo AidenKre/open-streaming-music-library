@@ -4,6 +4,7 @@ from typing import Callable
 
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
+from app.services.cover_art_manager import CoverArtAddResult
 from app.services.metadata import extract_cover_art_bytes, get_track_metadata
 
 # TODO: implement copy_file
@@ -21,7 +22,8 @@ class OrganizerContext:
     should_organize_files: bool
     should_copy_files: bool
     add_to_database: Callable[[Track], bool]
-    add_cover_art: Callable[[bytes], int] | None = None
+    add_cover_art: Callable[[bytes], CoverArtAddResult] | None = None
+    remove_cover_art: Callable[[int], bool] | None = None
 
     def __post_init__(self):
         if not self.should_organize_files and self.should_copy_files:
@@ -51,14 +53,16 @@ class Organizer:
             print(f"{file_path} does not result in a TrackMetaData")
             return False
 
+        cover_art_result: CoverArtAddResult | None = None
+
         # Extract and register cover art if present
         if trackmetadata.has_album_art and self.ctx.add_cover_art is not None:
             art_bytes = extract_cover_art_bytes(file_path)
             if art_bytes:
                 try:
-                    cover_art_id = self.ctx.add_cover_art(art_bytes)
+                    cover_art_result = self.ctx.add_cover_art(art_bytes)
                     trackmetadata = trackmetadata.model_copy(
-                        update={"cover_art_id": cover_art_id}
+                        update={"cover_art_id": cover_art_result.cover_art_id}
                     )
                 except ValueError as e:
                     print(f"Failed to add cover art for {file_path}: {e}")
@@ -74,15 +78,31 @@ class Organizer:
         was_moved = move_file(file_path=file_path, destination_path=destination_path)
 
         if not was_moved:
+            self._cleanup_cover_art(cover_art_result)
             return False
 
         track = Track(
             file_path=destination_path, metadata=trackmetadata, file_hash=None
         )
 
-        self.ctx.add_to_database(track)
+        was_added = self.ctx.add_to_database(track)
+        if not was_added:
+            print(f"Failed to add track to database after move: {destination_path}")
+            rollback_move(destination_path=destination_path, original_path=file_path)
+            self._cleanup_cover_art(cover_art_result)
+            return False
 
         return True
+
+    def _cleanup_cover_art(self, cover_art_result: CoverArtAddResult | None) -> None:
+        if cover_art_result is None or not cover_art_result.was_created:
+            return
+        if self.ctx.remove_cover_art is None:
+            return
+        try:
+            self.ctx.remove_cover_art(cover_art_result.cover_art_id)
+        except ValueError as e:
+            print(f"Failed to remove cover art {cover_art_result.cover_art_id}: {e}")
 
 
 def move_file(file_path: Path, destination_path: Path) -> bool:
@@ -109,6 +129,23 @@ def move_file(file_path: Path, destination_path: Path) -> bool:
         return False
 
 
+def rollback_move(destination_path: Path, original_path: Path) -> bool:
+    if not destination_path.exists():
+        return False
+    if original_path.exists():
+        print(f"Cannot roll back move because original path already exists: {original_path}")
+        return False
+    try:
+        original_path.parent.mkdir(parents=True, exist_ok=True)
+        destination_path.replace(original_path)
+        return True
+    except (PermissionError, FileExistsError, OSError) as e:
+        print(
+            f"Exception trying to roll back move from {destination_path} to {original_path}: {e}"
+        )
+        return False
+
+
 def create_destination_dir(trackmetadata: TrackMetaData, root_dir: Path) -> Path:
     destination_dir = root_dir
 
@@ -122,4 +159,3 @@ def create_destination_dir(trackmetadata: TrackMetaData, root_dir: Path) -> Path
             destination_dir /= trackmetadata.album
 
     return destination_dir
-

@@ -10,18 +10,32 @@ void main() {
     initCoverArtCache(CoverArtCacheManager.noop());
   });
 
-  Widget buildWidget({required bool hasAlbumArt, required int? coverArtId}) {
+  Widget buildSizedWidget({
+    required bool hasAlbumArt,
+    required int? coverArtId,
+    required double width,
+    required double height,
+  }) {
     return MaterialApp(
       home: Scaffold(
         body: CoverArtImage(
           hasAlbumArt: hasAlbumArt,
           coverArtId: coverArtId,
-          width: 48,
-          height: 48,
+          width: width,
+          height: height,
           borderRadius: BorderRadius.circular(4),
           fallback: const Icon(Icons.music_note),
         ),
       ),
+    );
+  }
+
+  Widget buildWidget({required bool hasAlbumArt, required int? coverArtId}) {
+    return buildSizedWidget(
+      hasAlbumArt: hasAlbumArt,
+      coverArtId: coverArtId,
+      width: 48,
+      height: 48,
     );
   }
 
@@ -77,6 +91,27 @@ void main() {
         (provider.imageProvider as NetworkImage).url,
         'http://localhost:8000/cover_art/42',
       );
+    });
+
+    testWidgets('uses the full requested decode size for larger artwork', (
+      tester,
+    ) async {
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        buildSizedWidget(
+          hasAlbumArt: true,
+          coverArtId: 42,
+          width: 140,
+          height: 140,
+        ),
+      );
+
+      final image = tester.widget<Image>(find.byType(Image));
+      final provider = image.image as ResizeImage;
+      expect(provider.width, 140);
+      expect(provider.height, 140);
     });
 
     testWidgets('frameBuilder shows fallback before first frame arrives', (

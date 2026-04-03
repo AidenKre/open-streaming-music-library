@@ -65,7 +65,8 @@ class ArtistCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Expanded(
+            AspectRatio(
+              aspectRatio: 1,
               child: CoverArtImage(
                 hasAlbumArt: artist.coverArtId != null,
                 coverArtId: artist.coverArtId,

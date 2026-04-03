@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import sqlite3
 from io import BytesIO
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 import pytest
@@ -152,6 +154,17 @@ class TestAddAlbumArt:
         files = list(manager.ctx.cover_art_dir.iterdir())
         assert len(files) == 1
 
+    def test_add_album_art_with_status_reports_created_then_reused(self, tmp_path: Path):
+        manager = _create_manager(tmp_path)
+        png_bytes = _make_png_bytes()
+
+        created = manager.add_album_art_with_status(png_bytes)
+        reused = manager.add_album_art_with_status(png_bytes)
+
+        assert created.was_created is True
+        assert reused.was_created is False
+        assert created.cover_art_id == reused.cover_art_id
+
     def test_different_images_get_different_ids(self, tmp_path: Path):
         manager = _create_manager(tmp_path)
         red = _make_png_bytes(color=(255, 0, 0))
@@ -241,6 +254,29 @@ class TestAddAlbumArt:
 
         assert id_png == id_jpeg
 
+    def test_concurrent_same_image_returns_single_id_and_keeps_file(self, tmp_path: Path):
+        manager = _create_manager(tmp_path)
+        png_bytes = _make_png_bytes()
+        worker_count = 8
+        barrier = Barrier(worker_count)
+
+        def add_art(_):
+            barrier.wait()
+            return manager.add_album_art(png_bytes)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            ids = list(executor.map(add_art, range(worker_count)))
+
+        assert len(set(ids)) == 1
+
+        files = list(manager.ctx.cover_art_dir.iterdir())
+        assert len(files) == 1
+        assert files[0].read_bytes() == png_bytes
+
+        sha256 = hashlib.sha256(png_bytes).hexdigest()
+        row = manager.ctx.database.get_cover_art_by_sha256(sha256)
+        assert row is not None
+        assert row.file_path.exists()
 
     def test_cleans_up_file_when_db_insert_fails(self, tmp_path: Path):
         manager = _create_manager(tmp_path)

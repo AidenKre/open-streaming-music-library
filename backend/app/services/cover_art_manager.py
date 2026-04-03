@@ -1,7 +1,9 @@
 import hashlib
+import sqlite3
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from threading import Lock
 
 import imagehash
 from PIL import Image, UnidentifiedImageError
@@ -26,14 +28,24 @@ class CoverArtContext:
     database: Database
 
 
+@dataclass(frozen=True)
+class CoverArtAddResult:
+    cover_art_id: int
+    was_created: bool
+
+
 class CoverArtManager:
     PHASH_THRESHOLD = 10  # max Hamming distance (out of 64 bits)
 
     def __init__(self, ctx: CoverArtContext):
         self.ctx = ctx
         self.ctx.cover_art_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = Lock()
 
     def add_album_art(self, image_bytes: bytes) -> int:
+        return self.add_album_art_with_status(image_bytes).cover_art_id
+
+    def add_album_art_with_status(self, image_bytes: bytes) -> CoverArtAddResult:
         """Add cover art image. Returns the cover art ID.
 
         If an identical or perceptually similar image already exists,
@@ -49,42 +61,65 @@ class CoverArtManager:
 
         ext = _FORMAT_TO_EXT.get(img.format or "", ".jpg")
 
-        # Exact dedup via SHA256
         sha256 = hashlib.sha256(image_bytes).hexdigest()
-        existing = self.ctx.database.get_cover_art_by_sha256(sha256)
-        if existing is not None:
-            return existing.id
-
-        # Perceptual dedup via phash
         phash = imagehash.phash(img)
         phash_str = str(phash)
-        # Use first 2 hex chars (8 bits) for prefix bucketing. Broader than 4 chars
-        # to reduce false negatives — with 10k images, ~39 candidates per bucket
-        # is still trivial to compare via Hamming distance.
         phash_prefix = phash_str[:2]
 
-        candidates = self.ctx.database.get_cover_arts_by_phash_prefix(phash_prefix)
-        for candidate in candidates:
-            candidate_phash = imagehash.hex_to_hash(candidate.phash)
-            distance = phash - candidate_phash
-            if distance <= self.PHASH_THRESHOLD:
-                return candidate.id
+        with self._lock:
+            existing = self.ctx.database.get_cover_art_by_sha256(sha256)
+            if existing is not None:
+                return CoverArtAddResult(cover_art_id=existing.id, was_created=False)
 
-        # No match — save to disk and insert
-        file_path = self.ctx.cover_art_dir / f"{sha256}{ext}"
-        file_path.write_bytes(image_bytes)
+            candidate = self._find_candidate_by_phash(phash, phash_prefix)
+            if candidate is not None:
+                return CoverArtAddResult(
+                    cover_art_id=candidate.id,
+                    was_created=False,
+                )
 
-        try:
-            cover_art_id = self.ctx.database.insert_cover_art(
-                sha256=sha256,
-                phash=phash_str,
-                phash_prefix=phash_prefix,
-                file_path=str(file_path),
-            )
-        except Exception:
-            file_path.unlink(missing_ok=True)
-            raise
-        return cover_art_id
+            file_path = self.ctx.cover_art_dir / f"{sha256}{ext}"
+            created_file = False
+            try:
+                try:
+                    with file_path.open("xb") as f:
+                        f.write(image_bytes)
+                    created_file = True
+                except FileExistsError:
+                    # Another writer already materialized the canonical file.
+                    pass
+
+                try:
+                    cover_art_id = self.ctx.database.insert_cover_art(
+                        sha256=sha256,
+                        phash=phash_str,
+                        phash_prefix=phash_prefix,
+                        file_path=str(file_path),
+                    )
+                    return CoverArtAddResult(
+                        cover_art_id=cover_art_id,
+                        was_created=True,
+                    )
+                except sqlite3.IntegrityError:
+                    # Another worker won the race to persist this image.
+                    existing = self.ctx.database.get_cover_art_by_sha256(sha256)
+                    if existing is not None:
+                        return CoverArtAddResult(
+                            cover_art_id=existing.id,
+                            was_created=False,
+                        )
+
+                    candidate = self._find_candidate_by_phash(phash, phash_prefix)
+                    if candidate is not None:
+                        return CoverArtAddResult(
+                            cover_art_id=candidate.id,
+                            was_created=False,
+                        )
+                    raise
+            except Exception:
+                if created_file and self.ctx.database.get_cover_art_by_sha256(sha256) is None:
+                    file_path.unlink(missing_ok=True)
+                raise
 
     def get_album_art(self, cover_art_id: int) -> Path | None:
         """Return the file path for a cover art ID, or None if not found."""
@@ -142,3 +177,16 @@ class CoverArtManager:
                 print(f"  [{i}/{total}] Invalid art in {track.file_path}: {e}")
 
         print("Cover art backfill complete.")
+
+    def _find_candidate_by_phash(
+        self,
+        phash: imagehash.ImageHash,
+        phash_prefix: str,
+    ):
+        candidates = self.ctx.database.get_cover_arts_by_phash_prefix(phash_prefix)
+        for candidate in candidates:
+            candidate_phash = imagehash.hex_to_hash(candidate.phash)
+            distance = phash - candidate_phash
+            if distance <= self.PHASH_THRESHOLD:
+                return candidate
+        return None

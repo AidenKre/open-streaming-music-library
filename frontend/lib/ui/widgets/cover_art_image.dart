@@ -5,7 +5,7 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 /// [coverArtId] is non-null. Falls back to [fallback] while loading, on error,
 /// or when either condition is not met.
 class CoverArtImage extends StatelessWidget {
-  static const List<int> _decodeBuckets = [96, 384, 768];
+  static const int _maxDecodeDimension = 2048;
 
   final bool hasAlbumArt;
   final int? coverArtId;
@@ -75,11 +75,7 @@ class CoverArtImage extends StatelessWidget {
       return null;
     }
 
-    final physicalPixels = logicalPixels * devicePixelRatio;
-    return _decodeBuckets.reduce((best, candidate) {
-      final bestDistance = (best - physicalPixels).abs();
-      final candidateDistance = (candidate - physicalPixels).abs();
-      return candidateDistance < bestDistance ? candidate : best;
-    });
+    final physicalPixels = (logicalPixels * devicePixelRatio).ceil();
+    return physicalPixels.clamp(1, _maxDecodeDimension);
   }
 }

@@ -97,7 +97,8 @@ def startup_event():
             should_organize_files=True,
             should_copy_files=False,
             add_to_database=app.state.database.add_track,
-            add_cover_art=cover_art_manager.add_album_art,
+            add_cover_art=cover_art_manager.add_album_art_with_status,
+            remove_cover_art=cover_art_manager.remove_album_art,
         )
 
         organizer = Organizer(ctx=organizer_context)

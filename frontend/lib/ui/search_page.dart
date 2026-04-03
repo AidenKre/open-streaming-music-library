@@ -147,7 +147,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           if (_artists.isNotEmpty) ...[
             _buildSectionHeader('Artists'),
             SizedBox(
-              height: 160,
+              height: 190,
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 8),

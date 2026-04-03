@@ -735,7 +735,6 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final sessionId = c.read(audioProvider).queue.sessionId!;
     await notifier.stop();
 
     expect(c.read(audioProvider).queue.sessionId, isNull);

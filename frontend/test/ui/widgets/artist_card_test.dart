@@ -8,12 +8,16 @@ import 'package:frontend/ui/widgets/artist_card.dart';
 const _artist = ArtistUI(id: 1, name: 'Test Artist');
 const _artistWithArt = ArtistUI(id: 1, name: 'Test Artist', coverArtId: 3);
 
-Widget buildCard(ArtistUI artist) {
+Widget buildCard(
+  ArtistUI artist, {
+  double width = 200,
+  double height = 240,
+}) {
   return MaterialApp(
     home: Scaffold(
       body: SizedBox(
-        width: 200,
-        height: 240,
+        width: width,
+        height: height,
         child: ArtistCard(artist: artist, onTap: () {}),
       ),
     ),
@@ -43,6 +47,18 @@ void main() {
         await tester.pumpWidget(buildCard(_artistWithArt));
 
         expect(find.byType(Image), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'keeps cover art square in compact search-style layout',
+      (tester) async {
+        await tester.pumpWidget(
+          buildCard(_artistWithArt, width: 140, height: 190),
+        );
+
+        final imageSize = tester.getSize(find.byType(Image));
+        expect(imageSize.width, imageSize.height);
       },
     );
 

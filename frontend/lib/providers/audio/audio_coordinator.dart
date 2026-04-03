@@ -29,7 +29,6 @@ class AudioCoordinator extends Notifier<AudioState> {
 
   final List<StreamSubscription<Object?>> _subscriptions = [];
   Future<void> _mutationTail = Future<void>.value();
-  bool _disposed = false;
   bool _stopInProgress = false;
   DateTime? _lastPositionSave;
 
@@ -67,7 +66,6 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
 
     ref.onDispose(() {
-      _disposed = true;
       _hydrationController.dispose();
       for (final sub in _subscriptions) {
         sub.cancel();
