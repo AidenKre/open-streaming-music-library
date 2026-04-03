@@ -24,6 +24,7 @@ class TrackMetaData(BaseModel):
     channels: int = 0
 
     has_album_art: bool = False
+    cover_art_id: int | None = None
 
     def is_empty(self) -> bool:
         return (

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
 
 class TrackTile extends StatelessWidget {
   final TrackUI track;
@@ -74,19 +75,33 @@ class TrackTile extends StatelessWidget {
                 children: [
                   Opacity(
                     opacity: opacity,
-                    child: Container(
-                      width: 48,
-                      height: 48,
-                      decoration: BoxDecoration(
-                        color: colors.primaryContainer,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: isHighlighted
-                          ? Icon(Icons.equalizer,
-                              color: colors.primary)
-                          : Icon(Icons.music_note,
-                              color: colors.onPrimaryContainer),
-                    ),
+                    child: isHighlighted
+                        ? Container(
+                            width: 48,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              color: colors.primaryContainer,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Icon(Icons.equalizer, color: colors.primary),
+                          )
+                        : CoverArtImage(
+                            hasAlbumArt: track.hasAlbumArt,
+                            coverArtId: track.coverArtId,
+                            width: 48,
+                            height: 48,
+                            borderRadius: BorderRadius.circular(4),
+                            fallback: Container(
+                              width: 48,
+                              height: 48,
+                              decoration: BoxDecoration(
+                                color: colors.primaryContainer,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Icon(Icons.music_note,
+                                  color: colors.onPrimaryContainer),
+                            ),
+                          ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(

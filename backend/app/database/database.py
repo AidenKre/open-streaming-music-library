@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from app.models.album import Album
 from app.models.artist import Artist
+from app.models.cover_art import CoverArt
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -28,6 +29,7 @@ ALLOWED_METADATA_COLUMNS = [
     "sample_rate_hz",
     "channels",
     "has_album_art",
+    "cover_art_id",
 ]
 
 ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
@@ -161,6 +163,7 @@ def _row_to_track(row) -> Track:
         sample_rate_hz=row["sample_rate_hz"],
         channels=row["channels"],
         has_album_art=bool(row["has_album_art"]),
+        cover_art_id=row["cover_art_id"],
     )
     return Track(
         uuid_id=row["uuid_id"],
@@ -194,18 +197,168 @@ class Database:
             conn.close()
 
     def initialize(self) -> bool:
-        # TODO: Create database migration logic when I actually need to migrate a database
         if self.context.database_path.exists():
-            print("Database already exists, so skipping")
+            print("Database already exists, running migrations")
+            self._migrate()
             return True
         try:
             with open(self.context.init_sql_path, "r") as f:
                 init_script = f.read()
             with self._connection(commit=True) as conn:
                 conn.executescript(init_script)
+                conn.execute("PRAGMA user_version = 1")
             return True
         except Exception as e:
             print(f"Error initializing database: {e}")
+            return False
+
+    def _migrate(self):
+        with self._connection(commit=True) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+            if version < 1:
+                print("Migrating database to version 1: adding cover_arts table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS cover_arts ('
+                    '    "id" INTEGER PRIMARY KEY,'
+                    '    "sha256" TEXT UNIQUE NOT NULL,'
+                    '    "phash" TEXT NOT NULL,'
+                    '    "phash_prefix" TEXT NOT NULL,'
+                    '    "file_path" TEXT UNIQUE NOT NULL'
+                    ')'
+                )
+                conn.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_cover_arts_phash_prefix ON cover_arts("phash_prefix")'
+                )
+                try:
+                    conn.execute(
+                        'ALTER TABLE trackmetadata ADD COLUMN "cover_art_id" INTEGER REFERENCES cover_arts("id")'
+                    )
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                # Truncate any existing 4-char phash prefixes to 2 chars
+                conn.execute(
+                    'UPDATE cover_arts SET phash_prefix = substr(phash_prefix, 1, 2) '
+                    'WHERE length(phash_prefix) > 2'
+                )
+                # Note: PRAGMA user_version is not transactional in SQLite,
+                # but the DDL above is, so partial migration is still detectable.
+                conn.execute("PRAGMA user_version = 1")
+
+    def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE id = ?",
+                    (cover_art_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return CoverArt(
+                    id=row["id"], sha256=row["sha256"], phash=row["phash"],
+                    phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
+                )
+        except Exception as e:
+            print(f"Failed to get cover art by id {cover_art_id}: {e}")
+            return None
+
+    def get_cover_art_by_sha256(self, sha256: str) -> CoverArt | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE sha256 = ?",
+                    (sha256,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return CoverArt(
+                    id=row["id"], sha256=row["sha256"], phash=row["phash"],
+                    phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
+                )
+        except Exception as e:
+            print(f"Failed to get cover art by sha256: {e}")
+            return None
+
+    def get_cover_arts_by_phash_prefix(self, prefix: str) -> list[CoverArt]:
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE phash_prefix = ?",
+                    (prefix,),
+                ).fetchall()
+                return [
+                    CoverArt(
+                        id=row["id"], sha256=row["sha256"], phash=row["phash"],
+                        phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
+                    )
+                    for row in rows
+                ]
+        except Exception as e:
+            print(f"Failed to get cover arts by phash prefix: {e}")
+            return []
+
+    def insert_cover_art(self, sha256: str, phash: str, phash_prefix: str, file_path: str) -> int:
+        try:
+            with self._connection(commit=True) as conn:
+                cursor = conn.execute(
+                    'INSERT INTO cover_arts (sha256, phash, phash_prefix, file_path) VALUES (?, ?, ?, ?)',
+                    (sha256, phash, phash_prefix, file_path),
+                )
+                return cursor.lastrowid  # type: ignore[return-value]
+        except Exception as e:
+            print(f"Error inserting cover art: {e}")
+            raise
+
+    def clear_cover_art_references(self, cover_art_id: int) -> None:
+        """Set cover_art_id to NULL on all trackmetadata rows referencing this cover art."""
+        with self._connection(commit=True) as conn:
+            conn.execute(
+                "UPDATE trackmetadata SET cover_art_id = NULL WHERE cover_art_id = ?",
+                (cover_art_id,),
+            )
+
+    def delete_cover_art(self, cover_art_id: int) -> bool:
+        try:
+            with self._connection(commit=True) as conn:
+                cursor = conn.execute(
+                    "DELETE FROM cover_arts WHERE id = ?", (cover_art_id,)
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Failed to delete cover art {cover_art_id}: {e}")
+            return False
+
+    def get_tracks_missing_cover_art(self) -> List[Track]:
+        """Return tracks where has_album_art=1 AND cover_art_id IS NULL."""
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT "
+                    'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
+                    'tm.artist_id, tm.album_id, tm."year", '
+                    'tm."date", tm.genre, tm.track_number, tm.disc_number, tm.codec, tm.duration, '
+                    "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, "
+                    "t.file_hash, t.created_at, t.last_updated "
+                    "FROM trackmetadata AS tm "
+                    "JOIN tracks AS t ON tm.uuid_id = t.uuid_id "
+                    "WHERE tm.has_album_art = 1 AND tm.cover_art_id IS NULL"
+                ).fetchall()
+                return [_row_to_track(row) for row in rows]
+        except Exception as e:
+            print(f"Failed to get tracks missing cover art: {e}")
+            return []
+
+    def update_track_cover_art_id(self, uuid_id: str, cover_art_id: int) -> bool:
+        """Set cover_art_id for a specific track identified by uuid_id."""
+        try:
+            with self._connection(commit=True) as conn:
+                cursor = conn.execute(
+                    "UPDATE trackmetadata SET cover_art_id = ? WHERE uuid_id = ?",
+                    (cover_art_id, uuid_id),
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Failed to update cover_art_id for track {uuid_id}: {e}")
             return False
 
     def add_track(self, track: Track, timeout: float = 5) -> bool:
@@ -277,12 +430,13 @@ class Database:
                     metadata.sample_rate_hz,
                     metadata.channels,
                     metadata.has_album_art,
+                    metadata.cover_art_id,
                 )
                 trackmetadata_sql_query = (
                     "INSERT INTO trackmetadata (track_id, uuid_id, title, artist, album, album_artist, "
                     'artist_id, album_id, "year", "date", genre, track_number, disc_number, codec, duration, '
-                    "bitrate_kbps, sample_rate_hz, channels, has_album_art) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "bitrate_kbps, sample_rate_hz, channels, has_album_art, cover_art_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 conn.cursor().execute(trackmetadata_sql_query, trackmetadata_entry)
 
@@ -504,7 +658,7 @@ class Database:
             'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
             'tm.artist_id, tm.album_id, tm."year", '
             'tm."date", tm.genre, tm.track_number, tm.disc_number, tm.codec, tm.duration, '
-            "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, t.file_path, "
+            "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, "
             "t.file_hash, t.created_at, t.last_updated "
             "FROM trackmetadata AS tm "
             "JOIN tracks AS t ON "
@@ -880,7 +1034,7 @@ class Database:
                             'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
                             'tm.artist_id, tm.album_id, tm."year", '
                             'tm."date", tm.genre, tm.track_number, tm.disc_number, tm.codec, tm.duration, '
-                            "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, t.file_path, "
+                            "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, "
                             "t.file_hash, t.created_at, t.last_updated, tm.track_id "
                             "FROM trackmetadata AS tm "
                             "JOIN tracks AS t ON tm.uuid_id = t.uuid_id "

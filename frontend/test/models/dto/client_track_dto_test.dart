@@ -91,6 +91,28 @@ void main() {
 
       expect(dto.hasAlbumArt, false);
     });
+
+    test('parses coverArtId when present', () {
+      final json = {..._fullMetadataJson(), 'cover_art_id': 42};
+
+      final dto = TrackMetadataDto.fromJson(json);
+
+      expect(dto.coverArtId, 42);
+    });
+
+    test('coverArtId is null when absent', () {
+      final dto = TrackMetadataDto.fromJson(_minimalMetadataJson());
+
+      expect(dto.coverArtId, isNull);
+    });
+
+    test('coverArtId is null when explicitly null in JSON', () {
+      final json = {..._minimalMetadataJson(), 'cover_art_id': null};
+
+      final dto = TrackMetadataDto.fromJson(json);
+
+      expect(dto.coverArtId, isNull);
+    });
   });
 
   group('ClientTrackDto.fromJson', () {

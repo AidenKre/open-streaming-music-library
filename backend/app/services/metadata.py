@@ -114,6 +114,35 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
     return metadata
 
 
+def extract_cover_art_bytes(file_path: Path) -> bytes | None:
+    """Extract embedded cover art from an audio file using ffmpeg."""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-i", str(file_path),
+                "-an",
+                "-vcodec", "copy",
+                "-f", "image2pipe",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        print("ffmpeg not found")
+        return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0 or not result.stdout:
+        return None
+
+    return result.stdout
+
+
 def _parse_year(date_val: object) -> int | None:
     """
     Best-effort year extraction from ffprobe date tags.

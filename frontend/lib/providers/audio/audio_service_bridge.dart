@@ -19,13 +19,14 @@ class AudioServiceBridge extends BaseAudioHandler {
   AsyncAction? onStop;
 
   /// Called by coordinator when the current track changes.
-  void updateNowPlaying(TrackUI track) {
+  void updateNowPlaying(TrackUI track, {Uri? artUri}) {
     mediaItem.add(MediaItem(
       id: track.uuidId,
       title: track.title ?? 'Unknown',
       artist: track.artist ?? '',
       album: track.album ?? '',
       duration: Duration(milliseconds: (track.duration * 1000).round()),
+      artUri: artUri,
     ));
   }
 

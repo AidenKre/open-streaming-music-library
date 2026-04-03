@@ -78,6 +78,8 @@ class ApiClient {
     }
   }
 
+  String coverArtUrl(int coverArtId) => '$baseUrl/cover_art/$coverArtId';
+
   void close() {
     _http.close();
   }

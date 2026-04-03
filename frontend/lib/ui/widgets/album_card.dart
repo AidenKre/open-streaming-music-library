@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:frontend/models/ui/album_ui.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
 
 class AlbumCard extends StatelessWidget {
   final AlbumUI album;
@@ -65,24 +66,28 @@ class AlbumCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // TODO: Fetch album art from API
             AspectRatio(
               aspectRatio: 1,
-              child: Container(
-                color: isSingle
-                    ? colorScheme.tertiaryContainer
-                    : colorScheme.primaryContainer,
-                child: Icon(
-                  isSingle ? Icons.library_music_outlined : Icons.album,
-                  size: 48,
+              child: CoverArtImage(
+                hasAlbumArt: album.coverArtId != null,
+                coverArtId: album.coverArtId,
+                borderRadius: BorderRadius.zero,
+                fallback: Container(
                   color: isSingle
-                      ? colorScheme.onTertiaryContainer
-                      : colorScheme.onPrimaryContainer,
+                      ? colorScheme.tertiaryContainer
+                      : colorScheme.primaryContainer,
+                  child: Icon(
+                    isSingle ? Icons.library_music_outlined : Icons.album,
+                    size: 48,
+                    color: isSingle
+                        ? colorScheme.onTertiaryContainer
+                        : colorScheme.onPrimaryContainer,
+                  ),
                 ),
               ),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+              padding: const EdgeInsets.all(8),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [

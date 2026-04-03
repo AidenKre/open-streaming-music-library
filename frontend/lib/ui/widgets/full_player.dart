@@ -7,6 +7,7 @@ import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class FullPlayer extends ConsumerStatefulWidget {
@@ -154,7 +155,6 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
           child: Column(
             children: [
               const SizedBox(height: 16),
-              // Album art placeholder
               ConstrainedBox(
                 constraints: BoxConstraints(
                   maxWidth: maxArtSize,
@@ -162,15 +162,20 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                 ),
                 child: AspectRatio(
                   aspectRatio: 1,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: colors.primaryContainer,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Icon(
-                      Icons.music_note,
-                      size: 96,
-                      color: colors.onPrimaryContainer,
+                  child: CoverArtImage(
+                    hasAlbumArt: track.hasAlbumArt,
+                    coverArtId: track.coverArtId,
+                    borderRadius: BorderRadius.circular(12),
+                    fallback: Container(
+                      decoration: BoxDecoration(
+                        color: colors.primaryContainer,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Icon(
+                        Icons.music_note,
+                        size: 96,
+                        color: colors.onPrimaryContainer,
+                      ),
                     ),
                   ),
                 ),

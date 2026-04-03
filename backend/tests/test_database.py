@@ -2598,3 +2598,255 @@ class TestPrepareFtsQuery:
 
     def test_prepare_fts_query__double_quotes__escapes_correctly(self):
         assert prepare_fts_query('say "hi"') == '"say"* """hi"""*'
+
+
+class TestDatabaseMigration:
+    def _create_v0_database(self, tmp_path: Path) -> Path:
+        """Create a database at version 0 (no cover_arts table, no cover_art_id column)."""
+        database_path = tmp_path / "database.db"
+        conn = sqlite3.connect(database_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Create minimal schema without cover_arts
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS artists (
+                "id" INTEGER PRIMARY KEY,
+                "name" TEXT NOT NULL,
+                "name_lower" TEXT NOT NULL GENERATED ALWAYS AS (LOWER("name")) STORED UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS albums (
+                "id" INTEGER PRIMARY KEY,
+                "name" TEXT,
+                "name_lower" TEXT GENERATED ALWAYS AS (LOWER("name")) STORED,
+                "artist_id" INTEGER NOT NULL,
+                "year" INTEGER,
+                "is_single_grouping" INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY ("artist_id") REFERENCES artists("id")
+            );
+            CREATE TABLE IF NOT EXISTS tracks (
+                "id" INTEGER PRIMARY KEY,
+                "uuid_id" TEXT UNIQUE NOT NULL,
+                "file_path" TEXT NOT NULL,
+                "file_hash" TEXT UNIQUE,
+                "created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
+                "last_updated" INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE TABLE IF NOT EXISTS trackmetadata (
+                "track_id" INTEGER UNIQUE NOT NULL,
+                "uuid_id" TEXT UNIQUE NOT NULL,
+                "title" TEXT,
+                "artist" TEXT,
+                "album" TEXT,
+                "album_artist" TEXT,
+                "artist_id" INTEGER,
+                "album_id" INTEGER,
+                "year" INTEGER,
+                "date" TEXT,
+                "genre" TEXT,
+                "track_number" INTEGER,
+                "disc_number" INTEGER,
+                "codec" TEXT,
+                "duration" FLOAT,
+                "bitrate_kbps" FLOAT,
+                "sample_rate_hz" INTEGER,
+                "channels" INTEGER,
+                "has_album_art" INTEGER NOT NULL CHECK ("has_album_art" IN (0,1)),
+                FOREIGN KEY ("track_id") REFERENCES tracks("id"),
+                FOREIGN KEY ("uuid_id") REFERENCES tracks("uuid_id"),
+                FOREIGN KEY ("artist_id") REFERENCES artists("id"),
+                FOREIGN KEY ("album_id") REFERENCES albums("id")
+            );
+        """)
+        # user_version stays at 0 (default)
+        conn.commit()
+        conn.close()
+        return database_path
+
+    def test_migrate__v0_database__creates_cover_arts_table(self, tmp_path: Path):
+        database_path = self._create_v0_database(tmp_path)
+
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        tables = [row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_arts" in tables
+
+    def test_migrate__v0_database__adds_cover_art_id_column(self, tmp_path: Path):
+        database_path = self._create_v0_database(tmp_path)
+
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        columns = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(trackmetadata)"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_art_id" in columns
+
+    def test_migrate__v0_database__sets_user_version_to_1(self, tmp_path: Path):
+        database_path = self._create_v0_database(tmp_path)
+
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+
+        assert version == 1
+
+    def test_migrate__already_at_v1__does_not_fail(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        # Initialize again — should not fail
+        database2 = set_up_database(database_path=database_path)
+        result = database2.initialize()
+
+        assert result is True
+
+    def test_fresh_database__includes_cover_arts_table(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        tables = [row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_arts" in tables
+
+    def test_fresh_database__trackmetadata_has_cover_art_id(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        columns = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(trackmetadata)"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_art_id" in columns
+
+
+class TestDatabaseCoverArtCrud:
+    def test_insert_and_get_by_id(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        cover_art_id = database.insert_cover_art(
+            sha256="abc123", phash="0123456789abcdef", phash_prefix="0123", file_path="/tmp/art.png"
+        )
+
+        result = database.get_cover_art_by_id(cover_art_id)
+
+        assert result is not None
+        assert result.id == cover_art_id
+        assert result.sha256 == "abc123"
+        assert result.phash == "0123456789abcdef"
+        assert result.phash_prefix == "0123"
+
+    def test_get_by_id__nonexistent__returns_none(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        result = database.get_cover_art_by_id(999)
+
+        assert result is None
+
+    def test_get_by_sha256__found(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        database.insert_cover_art(
+            sha256="unique_hash", phash="abcdef0123456789", phash_prefix="abcd", file_path="/tmp/a.png"
+        )
+
+        result = database.get_cover_art_by_sha256("unique_hash")
+
+        assert result is not None
+        assert result.sha256 == "unique_hash"
+
+    def test_get_by_sha256__not_found__returns_none(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        result = database.get_cover_art_by_sha256("nonexistent")
+
+        assert result is None
+
+    def test_get_by_phash_prefix__returns_matching_entries(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        database.insert_cover_art(sha256="a", phash="aaaa111122223333", phash_prefix="aaaa", file_path="/tmp/1.png")
+        database.insert_cover_art(sha256="b", phash="aaaa444455556666", phash_prefix="aaaa", file_path="/tmp/2.png")
+        database.insert_cover_art(sha256="c", phash="bbbb111122223333", phash_prefix="bbbb", file_path="/tmp/3.png")
+
+        results = database.get_cover_arts_by_phash_prefix("aaaa")
+
+        assert len(results) == 2
+        sha_set = {r.sha256 for r in results}
+        assert sha_set == {"a", "b"}
+
+    def test_get_by_phash_prefix__no_matches__returns_empty(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        results = database.get_cover_arts_by_phash_prefix("zzzz")
+
+        assert results == []
+
+    def test_delete__existing__returns_true(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        cover_art_id = database.insert_cover_art(
+            sha256="del_me", phash="1111222233334444", phash_prefix="1111", file_path="/tmp/del.png"
+        )
+
+        result = database.delete_cover_art(cover_art_id)
+
+        assert result is True
+        assert database.get_cover_art_by_id(cover_art_id) is None
+
+    def test_delete__nonexistent__returns_false(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        result = database.delete_cover_art(999)
+
+        assert result is False
+
+    def test_insert_duplicate_sha256__raises_error(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        database.insert_cover_art(sha256="dup", phash="aaaa", phash_prefix="aa", file_path="/tmp/1.png")
+
+        with pytest.raises(Exception):
+            database.insert_cover_art(sha256="dup", phash="bbbb", phash_prefix="bb", file_path="/tmp/2.png")

@@ -17,6 +17,7 @@ import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
@@ -31,6 +32,7 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     ApiClient.init('http://localhost:8080');
+    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     repo = QueueRepository(db);
     fixture = _LibraryFixture(db);
@@ -733,7 +735,6 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final sessionId = c.read(audioProvider).queue.sessionId!;
     await notifier.stop();
 
     expect(c.read(audioProvider).queue.sessionId, isNull);

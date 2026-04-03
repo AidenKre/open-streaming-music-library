@@ -327,3 +327,47 @@ class TestBuildTrackMetadata:
         track_metadata = metadata.build_track_metadata(json_data)
         assert track_metadata is not None
         assert track_metadata.track_number == expected_track_number
+
+
+class TestExtractCoverArtBytes:
+    def test_returns_none_on_timeout(self):
+        with patch(
+            "app.services.metadata.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="ffmpeg", timeout=30),
+        ):
+            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+
+        assert result is None
+
+    def test_returns_none_when_ffmpeg_not_found(self):
+        with patch(
+            "app.services.metadata.subprocess.run",
+            side_effect=FileNotFoundError,
+        ):
+            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+
+        assert result is None
+
+    def test_returns_none_on_nonzero_exit(self):
+        mock_result = subprocess.CompletedProcess(
+            args=["ffmpeg"], returncode=1, stdout=b""
+        )
+        with patch(
+            "app.services.metadata.subprocess.run",
+            return_value=mock_result,
+        ):
+            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+
+        assert result is None
+
+    def test_returns_bytes_on_success(self):
+        mock_result = subprocess.CompletedProcess(
+            args=["ffmpeg"], returncode=0, stdout=b"\x89PNG fake image data"
+        )
+        with patch(
+            "app.services.metadata.subprocess.run",
+            return_value=mock_result,
+        ):
+            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+
+        assert result == b"\x89PNG fake image data"

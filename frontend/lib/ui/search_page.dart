@@ -147,7 +147,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           if (_artists.isNotEmpty) ...[
             _buildSectionHeader('Artists'),
             SizedBox(
-              height: 160,
+              height: 190,
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -157,7 +157,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                   return SizedBox(
                     width: 140,
                     child: ArtistCard(
-                      artistName: artist.name,
+                      artist: artist,
                       onTap: () => _onArtistTap(artist),
                       onPlayNext: () async {
                         final tracks = await ref.read(browseRepositoryProvider)

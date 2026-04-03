@@ -276,11 +276,9 @@ void main() {
 
     test('FTS tables include tracks added on a second sync', () async {
       // First sync: one track
-      var callCount = 0;
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async {
-          callCount++;
           return Response(
             jsonEncode({
               'data': [

@@ -14,18 +14,12 @@ class QueueHydrationController {
 
   Future<void>? _hydrateFuture;
   bool _disposed = false;
-  int _nextForwardHydrationPlayPosition = 0;
+  int nextForwardHydrationPlayPosition = 0;
 
   QueueHydrationController(this._queueRepo, this._player);
 
-  int get nextForwardHydrationPlayPosition => _nextForwardHydrationPlayPosition;
-
-  set nextForwardHydrationPlayPosition(int value) {
-    _nextForwardHydrationPlayPosition = value;
-  }
-
   void reset() {
-    _nextForwardHydrationPlayPosition = 0;
+    nextForwardHydrationPlayPosition = 0;
   }
 
   void dispose() {
@@ -61,8 +55,8 @@ class QueueHydrationController {
 
     await _player.addEntries(entries);
     final loadedMax = entries.map((entry) => entry.playPosition).reduce(max);
-    if (loadedMax + 1 > _nextForwardHydrationPlayPosition) {
-      _nextForwardHydrationPlayPosition = loadedMax + 1;
+    if (loadedMax + 1 > nextForwardHydrationPlayPosition) {
+      nextForwardHydrationPlayPosition = loadedMax + 1;
     }
   }
 
@@ -72,8 +66,8 @@ class QueueHydrationController {
     required int currentPlayPosition,
   }) {
     if (_disposed || _hydrateFuture != null) return;
-    if (_nextForwardHydrationPlayPosition >= totalCount) return;
-    if ((_nextForwardHydrationPlayPosition - currentPlayPosition) >
+    if (nextForwardHydrationPlayPosition >= totalCount) return;
+    if ((nextForwardHydrationPlayPosition - currentPlayPosition) >
         _hydrateThreshold) {
       return;
     }
@@ -95,19 +89,19 @@ class QueueHydrationController {
   }
 
   Future<void> _hydrateForwardChunk(int sessionId, int totalCount) async {
-    if (_nextForwardHydrationPlayPosition >= totalCount) return;
+    if (nextForwardHydrationPlayPosition >= totalCount) return;
 
     final entries = await _queueRepo.getPlaybackEntries(
       sessionId,
-      startPlayPosition: _nextForwardHydrationPlayPosition,
+      startPlayPosition: nextForwardHydrationPlayPosition,
       limit: _hydrateChunkSize,
     );
     if (entries.isEmpty) {
-      _nextForwardHydrationPlayPosition = totalCount;
+      nextForwardHydrationPlayPosition = totalCount;
       return;
     }
 
     await _player.addEntries(entries);
-    _nextForwardHydrationPlayPosition = entries.last.playPosition + 1;
+    nextForwardHydrationPlayPosition = entries.last.playPosition + 1;
   }
 }
