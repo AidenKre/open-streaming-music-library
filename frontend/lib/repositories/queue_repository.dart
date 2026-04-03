@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:drift/drift.dart';
 
 import 'package:frontend/database/database.dart';
@@ -8,6 +10,9 @@ abstract final class QueueItemTypes {
   static const manual = 'manual';
 }
 
+/// Direction passed to [QueueRepository.findNextLocallyPlayableEntry].
+enum PlayOrderDirection { forward, backward }
+
 class QueuePlaybackEntry {
   final int itemId;
   final String queueType;
@@ -15,12 +20,17 @@ class QueuePlaybackEntry {
   final int playPosition;
   final String uuidId;
 
+  /// Local download path for this track, if it has been downloaded. The
+  /// player consults this to prefer file:// playback over streaming.
+  final String? filePath;
+
   const QueuePlaybackEntry({
     required this.itemId,
     required this.queueType,
     required this.canonicalPosition,
     required this.playPosition,
     required this.uuidId,
+    this.filePath,
   });
 }
 
@@ -49,10 +59,25 @@ class QueueSessionSnapshot {
   });
 }
 
+class QueueTrackRemovalResult {
+  final Set<int> affectedSessionIds;
+
+  const QueueTrackRemovalResult({required this.affectedSessionIds});
+}
+
 class QueueRepository {
   final AppDatabase _db;
+  // Indirection so tests can drive the "is this file actually on disk?" check
+  // without touching the filesystem. Production stays a real existsSync().
+  final bool Function(String path) _localFileExists;
 
-  QueueRepository(this._db);
+  QueueRepository(this._db, {bool Function(String path)? localFileExists})
+    : _localFileExists = localFileExists ?? ((path) => File(path).existsSync());
+
+  bool _isLocallyPlayable(QueuePlaybackEntry entry) {
+    final path = entry.filePath;
+    return path != null && path.isNotEmpty && _localFileExists(path);
+  }
 
   Future<int> createSessionFromQuery({
     required String sourceType,
@@ -62,6 +87,7 @@ class QueueRepository {
     List<OrderParameter> orderBy = const [],
     String repeatMode = 'off',
     bool shuffleEnabled = false,
+    bool downloadedOnly = false,
   }) {
     return _db.transaction(() async {
       await deactivateAll();
@@ -79,6 +105,7 @@ class QueueRepository {
         orderBy: orderBy,
         artistId: sourceArtistId,
         albumId: sourceAlbumId,
+        downloadedOnly: downloadedOnly,
       );
       await _db.customStatement(sql, args);
 
@@ -229,15 +256,31 @@ class QueueRepository {
     if (session == null) return null;
 
     final totalCount = await _countItems(sessionId);
-    final currentItem = session.currentItemId == null
+    var currentItem = session.currentItemId == null
         ? null
         : await getPlaybackEntryForItem(sessionId, session.currentItemId!);
+
+    // current_item_id may be null (no current track yet) or dangle at a track
+    // that was tombstone-deleted server-side (the INNER JOIN on tracks then
+    // resolves it to null). Fall back to the first surviving entry so a queue
+    // with remaining tracks stays restorable instead of resolving to null.
+    if (currentItem == null && totalCount > 0) {
+      currentItem = await getFirstPlayableEntry(sessionId);
+    }
 
     return QueueSessionSnapshot(
       session: session,
       totalCount: totalCount,
       currentItem: currentItem,
     );
+  }
+
+  /// The lowest-play-position entry whose track row still exists. Used as a
+  /// recovery fallback when a session's `current_item_id` is null or points at
+  /// a deleted track.
+  Future<QueuePlaybackEntry?> getFirstPlayableEntry(int sessionId) async {
+    final entries = await getPlaybackEntries(sessionId, limit: 1);
+    return entries.isEmpty ? null : entries.first;
   }
 
   Future<List<QueuePlaybackEntry>> getPlaybackEntries(
@@ -252,9 +295,10 @@ class QueueRepository {
 
     var sql =
         'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-        'po.play_position, qsi.uuid_id '
+        'po.play_position, qsi.uuid_id, t.file_path '
         'FROM queue_session_play_order AS po '
         'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+        'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
         'WHERE po.session_id = ? AND po.play_position >= ? '
         'ORDER BY po.play_position ASC';
 
@@ -278,9 +322,10 @@ class QueueRepository {
     final rows = await _db
         .customSelect(
           'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id '
+          'po.play_position, qsi.uuid_id, t.file_path '
           'FROM queue_session_play_order AS po '
           'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
           'WHERE po.session_id = ? AND po.item_id IN ($placeholders)',
           variables: [
             Variable.withInt(sessionId),
@@ -299,9 +344,10 @@ class QueueRepository {
     final row = await _db
         .customSelect(
           'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id '
+          'po.play_position, qsi.uuid_id, t.file_path '
           'FROM queue_session_play_order AS po '
           'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
           'WHERE po.session_id = ? AND po.item_id = ? '
           'LIMIT 1',
           variables: [Variable.withInt(sessionId), Variable.withInt(itemId)],
@@ -309,6 +355,92 @@ class QueueRepository {
         .getSingleOrNull();
 
     return row == null ? null : _playbackEntryFromRow(row);
+  }
+
+  /// Returns the nearest entry whose local file is verified to exist on disk,
+  /// starting at [fromPlayPosition] and walking in [direction]. When
+  /// [includeStart] is true the entry at [fromPlayPosition] itself is eligible;
+  /// otherwise the search starts at the next position in [direction].
+  ///
+  /// Honours [repeatMode]: 'all' wraps once around the queue in [direction];
+  /// 'off' and 'one' do not wrap. Returns `null` if no playable entry exists.
+  Future<QueuePlaybackEntry?> findNextLocallyPlayableEntry({
+    required int sessionId,
+    required int fromPlayPosition,
+    required PlayOrderDirection direction,
+    required String repeatMode,
+    required int totalCount,
+    bool includeStart = false,
+  }) async {
+    if (totalCount <= 0) return null;
+
+    final entries = await getPlaybackEntries(sessionId);
+    if (entries.isEmpty) return null;
+
+    final byPlayPosition = <int, QueuePlaybackEntry>{
+      for (final entry in entries) entry.playPosition: entry,
+    };
+
+    final maxPosition = totalCount - 1;
+    final wrap = repeatMode == 'all';
+    final step = direction == PlayOrderDirection.forward ? 1 : -1;
+    final startPosition = includeStart
+        ? fromPlayPosition
+        : fromPlayPosition + step;
+
+    var position = startPosition;
+    var visited = 0;
+    while (visited < totalCount) {
+      if (position < 0 || position > maxPosition) {
+        if (!wrap) return null;
+        position = position < 0 ? maxPosition : 0;
+      }
+      final candidate = byPlayPosition[position];
+      if (candidate != null && _isLocallyPlayable(candidate)) {
+        return candidate;
+      }
+      position += step;
+      visited++;
+    }
+    return null;
+  }
+
+  /// Returns [preferredItemId] if its entry is locally playable; otherwise the
+  /// nearest locally playable entry, preferring forward over backward. Used
+  /// for offline session restore and for offline session creation when the
+  /// user-selected start track is no longer on disk.
+  Future<QueuePlaybackEntry?> findLocallyPlayableFallback({
+    required int sessionId,
+    required int preferredItemId,
+    required int totalCount,
+  }) async {
+    final preferred = await getPlaybackEntryForItem(sessionId, preferredItemId);
+    if (preferred != null && _isLocallyPlayable(preferred)) {
+      return preferred;
+    }
+    final basePosition = preferred?.playPosition ?? 0;
+    final forward = await findNextLocallyPlayableEntry(
+      sessionId: sessionId,
+      fromPlayPosition: basePosition,
+      direction: PlayOrderDirection.forward,
+      repeatMode: 'off',
+      totalCount: totalCount,
+    );
+    if (forward != null) return forward;
+    return findNextLocallyPlayableEntry(
+      sessionId: sessionId,
+      fromPlayPosition: basePosition,
+      direction: PlayOrderDirection.backward,
+      repeatMode: 'off',
+      totalCount: totalCount,
+    );
+  }
+
+  /// True when the given entry's local file is verified on disk.
+  Future<bool> isItemLocallyPlayable(int sessionId, int itemId) async {
+    final entry = await getPlaybackEntryForItem(sessionId, itemId);
+    if (entry == null) return false;
+    return _isLocallyPlayable(entry);
   }
 
   Future<Map<int, int>> getPlayPositionsForItemIds(
@@ -614,7 +746,9 @@ class QueueRepository {
       });
 
       final newItemIds = await _getManualItemIdsByPosition(
-        sessionId, 0, uuids.length,
+        sessionId,
+        0,
+        uuids.length,
       );
       await _appendToPlayOrder(sessionId, newItemIds);
       await _touchSession(sessionId);
@@ -645,7 +779,9 @@ class QueueRepository {
       });
 
       final newItemIds = await _getManualItemIdsByPosition(
-        sessionId, startPosition, uuids.length,
+        sessionId,
+        startPosition,
+        uuids.length,
       );
       await _appendToPlayOrder(sessionId, newItemIds);
       await _touchSession(sessionId);
@@ -701,6 +837,53 @@ class QueueRepository {
 
       await _touchSession(sessionId);
     });
+  }
+
+  Future<QueueTrackRemovalResult> removeTrackUuidsFromQueues(
+    List<String> uuids,
+  ) {
+    return _db.transaction(
+      () => removeTrackUuidsFromQueuesInTransaction(uuids),
+    );
+  }
+
+  Future<QueueTrackRemovalResult> removeTrackUuidsFromQueuesInTransaction(
+    List<String> uuids,
+  ) async {
+    if (uuids.isEmpty) {
+      return const QueueTrackRemovalResult(affectedSessionIds: {});
+    }
+
+    final affectedSessionIds = await _queueSessionsContainingTracks(uuids);
+    if (affectedSessionIds.isEmpty) {
+      return const QueueTrackRemovalResult(affectedSessionIds: {});
+    }
+
+    final placeholders = List.filled(uuids.length, '?').join(', ');
+    final itemIdSubquery =
+        'SELECT item_id FROM queue_session_items WHERE uuid_id IN ($placeholders)';
+    await _db.customStatement(
+      'DELETE FROM queue_session_play_order WHERE item_id IN ($itemIdSubquery)',
+      uuids,
+    );
+    await _db.customStatement(
+      'UPDATE queue_sessions '
+      'SET current_item_id = NULL, current_position_ms = 0 '
+      'WHERE current_item_id IN ($itemIdSubquery)',
+      uuids,
+    );
+    await _db.customStatement(
+      'UPDATE queue_sessions SET resume_main_item_id = NULL '
+      'WHERE resume_main_item_id IN ($itemIdSubquery)',
+      uuids,
+    );
+    await (_db.delete(
+      _db.queueSessionItems,
+    )..where((t) => t.uuidId.isIn(uuids))).go();
+    await _compactQueueSessionPositions(affectedSessionIds.toList());
+    await _touchSessions(affectedSessionIds);
+
+    return QueueTrackRemovalResult(affectedSessionIds: affectedSessionIds);
   }
 
   Future<void> deactivateAll() {
@@ -793,6 +976,91 @@ class QueueRepository {
         .write(QueueSessionsCompanion(updatedAt: Value(_timestampSeconds())));
   }
 
+  Future<void> _touchSessions(Set<int> sessionIds) async {
+    if (sessionIds.isEmpty) return;
+    await (_db.update(_db.queueSessions)..where((s) => s.id.isIn(sessionIds)))
+        .write(QueueSessionsCompanion(updatedAt: Value(_timestampSeconds())));
+  }
+
+  Future<Set<int>> _queueSessionsContainingTracks(List<String> uuids) async {
+    final placeholders = List.filled(uuids.length, '?').join(', ');
+    final rows = await _db
+        .customSelect(
+          'SELECT DISTINCT session_id '
+          'FROM queue_session_items '
+          'WHERE uuid_id IN ($placeholders) '
+          'ORDER BY session_id',
+          variables: [for (final uuid in uuids) Variable.withString(uuid)],
+        )
+        .get();
+
+    return rows.map((row) => row.read<int>('session_id')).toSet();
+  }
+
+  Future<void> _compactQueueSessionPositions(List<int> sessionIds) async {
+    if (sessionIds.isEmpty) return;
+
+    final placeholders = List.filled(sessionIds.length, '?').join(', ');
+
+    await _db.customStatement(
+      'UPDATE queue_session_play_order '
+      'SET play_position = -(play_position + 1) '
+      'WHERE session_id IN ($placeholders)',
+      sessionIds,
+    );
+    await _db.customStatement(
+      'WITH ranked AS ('
+      'SELECT session_id, item_id, '
+      'ROW_NUMBER() OVER ('
+      'PARTITION BY session_id '
+      'ORDER BY -play_position ASC, item_id ASC'
+      ') - 1 AS new_position '
+      'FROM queue_session_play_order '
+      'WHERE session_id IN ($placeholders)'
+      ') '
+      'UPDATE queue_session_play_order '
+      'SET play_position = ('
+      'SELECT new_position FROM ranked '
+      'WHERE ranked.session_id = queue_session_play_order.session_id '
+      'AND ranked.item_id = queue_session_play_order.item_id'
+      ') '
+      'WHERE EXISTS ('
+      'SELECT 1 FROM ranked '
+      'WHERE ranked.session_id = queue_session_play_order.session_id '
+      'AND ranked.item_id = queue_session_play_order.item_id'
+      ')',
+      sessionIds,
+    );
+
+    await _db.customStatement(
+      'UPDATE queue_session_items '
+      'SET position = -(position + 1) '
+      'WHERE session_id IN ($placeholders)',
+      sessionIds,
+    );
+    await _db.customStatement(
+      'WITH ranked AS ('
+      'SELECT item_id, '
+      'ROW_NUMBER() OVER ('
+      'PARTITION BY session_id, queue_type '
+      'ORDER BY -position ASC, item_id ASC'
+      ') - 1 AS new_position '
+      'FROM queue_session_items '
+      'WHERE session_id IN ($placeholders)'
+      ') '
+      'UPDATE queue_session_items '
+      'SET position = ('
+      'SELECT new_position FROM ranked '
+      'WHERE ranked.item_id = queue_session_items.item_id'
+      ') '
+      'WHERE EXISTS ('
+      'SELECT 1 FROM ranked '
+      'WHERE ranked.item_id = queue_session_items.item_id'
+      ')',
+      sessionIds,
+    );
+  }
+
   Future<List<int>> _getManualItemIdsByPosition(
     int sessionId,
     int startPosition,
@@ -812,9 +1080,7 @@ class QueueRepository {
           ],
         )
         .get();
-    return rows
-        .map((row) => row.read<int>('item_id'))
-        .toList(growable: false);
+    return rows.map((row) => row.read<int>('item_id')).toList(growable: false);
   }
 
   Future<void> _appendToPlayOrder(int sessionId, List<int> itemIds) async {
@@ -959,6 +1225,7 @@ class QueueRepository {
     required List<OrderParameter> orderBy,
     int? artistId,
     int? albumId,
+    bool downloadedOnly = false,
   }) {
     if (albumId != null && artistId == null) {
       throw ArgumentError('Cannot filter by album without artist');
@@ -974,6 +1241,9 @@ class QueueRepository {
     if (albumId != null) {
       whereClauses.add('tm."album_id" = ?');
       args.add(albumId);
+    }
+    if (downloadedOnly) {
+      whereClauses.add('t.file_path IS NOT NULL');
     }
 
     final orderClause = _buildTrackOrderClause(orderBy);
@@ -1013,6 +1283,7 @@ class QueueRepository {
       canonicalPosition: row.read<int>('canonical_position'),
       playPosition: row.read<int>('play_position'),
       uuidId: row.read<String>('uuid_id'),
+      filePath: row.readNullable<String>('file_path'),
     );
   }
 

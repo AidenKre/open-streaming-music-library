@@ -3,9 +3,17 @@ from .track_meta_data import TrackMetaData
 from .client_track import ClientTrack
 from .artist import Artist
 from .album import Album
+from .cover_art import CoverArt
 from .api_return_models import (
+    ChangeEntry,
+    GetChangesResponse,
     GetTracksResponse,
     GetArtistsResponse,
     GetAlbumsResponse,
     GetSearchResponse,
+    WarmRequest,
+    WarmResponse,
+    QualitySettingResponse,
+    SetQualityRequest,
+    SetQualityResponse,
 )

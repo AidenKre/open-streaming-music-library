@@ -1,4 +1,4 @@
-import 'package:drift/drift.dart';
+import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
@@ -255,24 +255,7 @@ void main() {
   }
 
   /// Rebuilds all FTS tables from current data.
-  Future<void> rebuildFts(AppDatabase db) async {
-    await db.customStatement("DELETE FROM fts_artists");
-    await db.customStatement(
-      "INSERT INTO fts_artists(rowid, name) SELECT id, name FROM artists",
-    );
-    await db.customStatement("DELETE FROM fts_albums");
-    await db.customStatement(
-      "INSERT INTO fts_albums(rowid, name, artist_name) "
-      "SELECT a.id, COALESCE(a.name, ''), ar.name "
-      "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
-    );
-    await db.customStatement("DELETE FROM fts_tracks");
-    await db.customStatement(
-      "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
-      "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
-      "FROM trackmetadata",
-    );
-  }
+  Future<void> rebuildFts(AppDatabase db) => db.rebuildFtsIndexes();
 
   /// Inserts a track with its metadata, creating artist/album rows as needed.
   /// Returns (artistId, albumId) where albumId may be null.
@@ -358,6 +341,50 @@ void main() {
     OrderParameter(column: 'track_number'),
     OrderParameter(column: 'uuid_id'),
   ];
+
+  group('download counts', () {
+    Future<void> markDownloaded(String uuid) async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+          .write(TracksCompanion(filePath: Value('/local/$uuid')));
+    }
+
+    test('getAllAlbumDownloadCounts groups every album in one query', () async {
+      final (_, albumA) =
+          await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
+      await insertTrack(db, uuid: 'a2', artist: 'A', album: 'AL');
+      final (_, albumB) =
+          await insertTrack(db, uuid: 'b1', artist: 'B', album: 'BL');
+      await markDownloaded('a1');
+
+      final counts = await db.getAllAlbumDownloadCounts();
+      expect(counts[albumA!]!.total, 2);
+      expect(counts[albumA]!.downloaded, 1);
+      expect(counts[albumB!]!.total, 1);
+      expect(counts[albumB]!.downloaded, 0);
+    });
+
+    test('getAllAlbumDownloadCounts matches the per-id query', () async {
+      final (_, albumA) =
+          await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
+      await markDownloaded('a1');
+
+      final all = await db.getAllAlbumDownloadCounts();
+      final scoped = await db.getAlbumDownloadCounts([albumA!]);
+      expect(all[albumA], scoped[albumA]);
+    });
+
+    test('getAllArtistDownloadCounts groups every artist', () async {
+      final (artistA, _) =
+          await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
+      await insertTrack(db, uuid: 'a2', artist: 'A', album: 'AL');
+      await markDownloaded('a1');
+      await markDownloaded('a2');
+
+      final counts = await db.getAllArtistDownloadCounts();
+      expect(counts[artistA!]!.total, 2);
+      expect(counts[artistA]!.downloaded, 2);
+    });
+  });
 
   group('getTracks', () {
     test('getTracksByUuids preserves caller order', () async {
@@ -1354,6 +1381,200 @@ void main() {
     });
   });
 
+  group('getAlbums cover_art_id subquery', () {
+    test('returns null cover_art_id when no tracks have art', () async {
+      await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+      );
+
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      expect(regular.first.readNullable<int>('cover_art_id'), equals(null));
+    });
+
+    test('returns cover_art_id from track with art', () async {
+      final (artistId, _) = await insertTrack(
+        db,
+        uuid: '1',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+      );
+
+      // Manually set has_album_art and cover_art_id
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 42 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('1')],
+        updates: {db.trackmetadata},
+      );
+
+      final rows = await db.getAlbums(artistId: artistId);
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      expect(regular.first.readNullable<int>('cover_art_id'), 42);
+    });
+
+    test('returns cover_art_id from lowest track_number', () async {
+      await insertTrack(
+        db,
+        uuid: 'tr-2',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+        trackNumber: 2,
+      );
+      await insertTrack(
+        db,
+        uuid: 'tr-1',
+        artist: 'Artist',
+        album: 'Album',
+        year: 2020,
+        trackNumber: 1,
+      );
+
+      // Track 2 gets cover_art_id 99, Track 1 gets cover_art_id 42
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 99 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('tr-2')],
+        updates: {db.trackmetadata},
+      );
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 42 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('tr-1')],
+        updates: {db.trackmetadata},
+      );
+
+      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
+      final regular = rows
+          .where((r) => r.read<int>('is_single_grouping') == 0)
+          .toList();
+      expect(regular.length, 1);
+      // Should pick track 1's art (lowest track_number)
+      expect(regular.first.readNullable<int>('cover_art_id'), 42);
+    });
+
+    test(
+      'downloadedOnly restricts cover_art_id to downloaded tracks',
+      () async {
+        // Track 1 has the lowest track_number and has cover art, but is NOT
+        // downloaded. Track 2 has higher track_number, has different cover
+        // art, IS downloaded. Without the downloaded-only constraint on the
+        // cover-art subquery, an offline list would surface art belonging
+        // to a streaming-only track — and resolving that would require
+        // hitting the network.
+        await insertTrack(
+          db, uuid: 'tr-1', artist: 'Artist', album: 'Album',
+          year: 2020, trackNumber: 1,
+        );
+        await insertTrack(
+          db, uuid: 'tr-2', artist: 'Artist', album: 'Album',
+          year: 2020, trackNumber: 2,
+        );
+        await db.customUpdate(
+          'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 11 '
+          'WHERE uuid_id = ?',
+          variables: [Variable.withString('tr-1')],
+          updates: {db.trackmetadata},
+        );
+        await db.customUpdate(
+          'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 22 '
+          'WHERE uuid_id = ?',
+          variables: [Variable.withString('tr-2')],
+          updates: {db.trackmetadata},
+        );
+        // Only track 2 is downloaded.
+        await db.customUpdate(
+          "UPDATE tracks SET file_path = '/tmp/tr-2.audio' WHERE uuid_id = ?",
+          variables: [Variable.withString('tr-2')],
+          updates: {db.tracks},
+        );
+
+        final unfiltered = await db.getAlbums(
+          artistId: artistIdFor('Artist'),
+        );
+        final unfilteredRegular = unfiltered
+            .where((r) => r.read<int>('is_single_grouping') == 0)
+            .toList();
+        // Without the filter, lowest track_number (tr-1) wins → 11.
+        expect(unfilteredRegular.first.readNullable<int>('cover_art_id'), 11);
+
+        final downloadedOnly = await db.getAlbums(
+          artistId: artistIdFor('Artist'),
+          downloadedOnly: true,
+        );
+        final downloadedRegular = downloadedOnly
+            .where((r) => r.read<int>('is_single_grouping') == 0)
+            .toList();
+        // With the filter, tr-1 is ineligible (not downloaded) → tr-2's 22.
+        expect(downloadedRegular.first.readNullable<int>('cover_art_id'), 22);
+      },
+    );
+
+    test(
+      'ignores tracks with has_album_art=false even if cover_art_id set',
+      () async {
+        await insertTrack(
+          db,
+          uuid: '1',
+          artist: 'Artist',
+          album: 'Album',
+          year: 2020,
+        );
+
+        // Set cover_art_id but leave has_album_art = false
+        await db.customUpdate(
+          'UPDATE trackmetadata SET cover_art_id = 42 '
+          'WHERE uuid_id = ?',
+          variables: [Variable.withString('1')],
+          updates: {db.trackmetadata},
+        );
+
+        final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
+        final regular = rows
+            .where((r) => r.read<int>('is_single_grouping') == 0)
+            .toList();
+        expect(regular.first.readNullable<int>('cover_art_id'), equals(null));
+      },
+    );
+  });
+
+  group('getArtists cover_art_id subquery', () {
+    test('returns null cover_art_id when no tracks have art', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist');
+
+      final rows = await db.getArtists();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), equals(null));
+    });
+
+    test('returns cover_art_id from track with art', () async {
+      await insertTrack(db, uuid: '1', artist: 'Artist');
+
+      await db.customUpdate(
+        'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 7 '
+        'WHERE uuid_id = ?',
+        variables: [Variable.withString('1')],
+        updates: {db.trackmetadata},
+      );
+
+      final rows = await db.getArtists();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), 7);
+    });
+  });
+
   group('watchArtistCount', () {
     test('returns count of distinct artists', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist A');
@@ -1636,5 +1857,259 @@ void main() {
         throwsArgumentError,
       );
     });
+  });
+
+  group('cover_art_id', () {
+    test('trackmetadataCompanionFromDto includes coverArtId when present', () {
+      final dto = ClientTrackDto.fromJson(
+        _trackJson(metadata: {..._fullMetadataJson(), 'cover_art_id': 42}),
+      );
+
+      final companion = trackmetadataCompanionFromDto(dto);
+
+      expect(companion.coverArtId, const Value<int?>(42));
+    });
+
+    test('trackmetadataCompanionFromDto has null coverArtId when absent', () {
+      final dto = ClientTrackDto.fromJson(_trackJson());
+
+      final companion = trackmetadataCompanionFromDto(dto);
+
+      expect(companion.coverArtId, const Value<int?>(null));
+    });
+
+    test('coverArtId round-trips through database', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'cover-art-test-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': {..._fullMetadataJson(), 'cover_art_id': 7},
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final metas = await db.select(db.trackmetadata).get();
+      expect(metas.length, 1);
+      expect(metas.first.coverArtId, 7);
+    });
+
+    test('coverArtId is null when not set', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'no-cover-art-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': _minimalMetadataJson(),
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final metas = await db.select(db.trackmetadata).get();
+      expect(metas.length, 1);
+      expect(metas.first.coverArtId, null);
+    });
+
+    test('coverArtId is included in track SELECT queries', () async {
+      final artistId = await ensureArtist(db, 'Cover Art Artist');
+      final albumId = await ensureAlbum(
+        db,
+        artistId: artistId,
+        name: 'Cover Album',
+      );
+
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'cover-select-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': {
+          ..._fullMetadataJson(),
+          'artist_id': artistId,
+          'album_id': albumId,
+          'cover_art_id': 99,
+        },
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final rows = await db.getTracks();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), 99);
+    });
+
+    test('coverArtId is null in track SELECT when not set', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'cover-select-null-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': _minimalMetadataJson(),
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db
+          .into(db.trackmetadata)
+          .insert(trackmetadataCompanionFromDto(dto));
+
+      final rows = await db.getTracks();
+      expect(rows.length, 1);
+      expect(rows.first.readNullable<int>('cover_art_id'), null);
+    });
+
+    test('cover_art_id is accepted in allowedMetadataColumns', () {
+      expect(allowedMetadataColumns.contains('cover_art_id'), isTrue);
+    });
+  });
+
+  group('resetLocalData', () {
+    test(
+      'clears all app tables and FTS rows while leaving DB writable',
+      () async {
+        await db.customStatement(
+          "INSERT INTO artists (id, name) VALUES (1, 'Reset Artist')",
+        );
+        await db.customStatement(
+          "INSERT INTO albums "
+          "(id, name, artist_id, year, is_single_grouping) "
+          "VALUES (1, 'Reset Album', 1, 2024, 0)",
+        );
+        await db.customStatement(
+          "INSERT INTO tracks "
+          "(uuid_id, created_at, last_updated, file_path) "
+          "VALUES ('reset-track', 1, 2, '/tmp/reset-track.m4a')",
+        );
+        await db.customStatement(
+          "INSERT INTO trackmetadata "
+          "(uuid_id, title, artist, album, artist_id, album_id, duration, "
+          "bitrate_kbps, sample_rate_hz, channels, has_album_art) "
+          "VALUES ('reset-track', 'Reset Song', 'Reset Artist', "
+          "'Reset Album', 1, 1, 120, 320, 44100, 2, 0)",
+        );
+        await db.customStatement(
+          "INSERT INTO queue_sessions "
+          "(id, is_active, created_at, updated_at, source_type) "
+          "VALUES (1, 1, 1, 1, 'library')",
+        );
+        await db.customStatement(
+          "INSERT INTO queue_session_items "
+          "(item_id, session_id, queue_type, position, uuid_id) "
+          "VALUES (1, 1, 'main', 0, 'reset-track')",
+        );
+        await db.customStatement(
+          "INSERT INTO queue_session_play_order "
+          "(session_id, play_position, item_id) VALUES (1, 0, 1)",
+        );
+        await db.customStatement(
+          "INSERT INTO fts_tracks "
+          "(rowid, title, artist_name, album_name) "
+          "VALUES (1, 'Reset Song', 'Reset Artist', 'Reset Album')",
+        );
+        await db.customStatement(
+          "INSERT INTO fts_artists (rowid, name) VALUES (1, 'Reset Artist')",
+        );
+        await db.customStatement(
+          "INSERT INTO fts_albums "
+          "(rowid, name, artist_name) VALUES (1, 'Reset Album', 'Reset Artist')",
+        );
+
+        await db.resetLocalData();
+
+        expect(await db.select(db.queueSessionPlayOrder).get(), isEmpty);
+        expect(await db.select(db.queueSessionItems).get(), isEmpty);
+        expect(await db.select(db.queueSessions).get(), isEmpty);
+        expect(await db.select(db.trackmetadata).get(), isEmpty);
+        expect(await db.select(db.tracks).get(), isEmpty);
+        expect(await db.select(db.albums).get(), isEmpty);
+        expect(await db.select(db.artists).get(), isEmpty);
+
+        final ftsRows = await db
+            .customSelect(
+              "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Reset\"*'",
+            )
+            .get();
+        expect(ftsRows, isEmpty);
+
+        await db.customStatement(
+          "INSERT INTO artists (id, name) VALUES (2, 'After Reset')",
+        );
+        expect(await db.select(db.artists).get(), hasLength(1));
+      },
+    );
+  });
+
+  group('schema migration', () {
+    // A fresh in-memory DB at the latest schema does not exercise the
+    // onUpgrade ALTER TABLE statements at all — a missing step (e.g. forgot
+    // to add `downloaded_quality` in v5) silently passes such a test but
+    // breaks every upgrading user. This test simulates the v3 starting
+    // state, runs each upgrade ALTER, and asserts the resulting columns are
+    // queryable through the same row-shape the app uses.
+    test(
+      'v3 → current upgrade adds all post-v3 columns and preserves data',
+      () async {
+        // Drop the modern `tracks` table and rebuild it as it was at v3
+        // (only `downloaded_bitrate_kbps`; no file_size_bytes or
+        // downloaded_quality).
+        await db.customStatement('PRAGMA foreign_keys = OFF');
+        await db.customStatement('DROP TABLE tracks');
+        await db.customStatement(
+          'CREATE TABLE tracks ('
+          'uuid_id TEXT NOT NULL PRIMARY KEY, '
+          'file_path TEXT, '
+          'created_at INTEGER NOT NULL, '
+          'last_updated INTEGER NOT NULL, '
+          'downloaded_bitrate_kbps INTEGER'
+          ')',
+        );
+        await db.customStatement(
+          "INSERT INTO tracks (uuid_id, file_path, created_at, "
+          "last_updated, downloaded_bitrate_kbps) "
+          "VALUES ('uuid-1', '/tmp/foo.audio', 1700000000, 1700000000, 256)",
+        );
+
+        // Apply the v4 and v5 upgrades exactly as the MigrationStrategy
+        // would. Keep this list in sync with AppDatabase.migration.
+        await db.customStatement(
+          'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
+        );
+        await db.customStatement(
+          'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
+        );
+
+        // Pre-migration row must still be intact and the new columns must
+        // exist and be readable.
+        final rows = await db
+            .customSelect(
+              'SELECT uuid_id, file_path, downloaded_bitrate_kbps, '
+              'file_size_bytes, downloaded_quality FROM tracks',
+            )
+            .get();
+        expect(rows, hasLength(1));
+        expect(rows.first.read<String>('uuid_id'), 'uuid-1');
+        expect(rows.first.read<String?>('file_path'), '/tmp/foo.audio');
+        expect(rows.first.read<int?>('downloaded_bitrate_kbps'), 256);
+        expect(rows.first.read<int?>('file_size_bytes'), isNull);
+        expect(rows.first.read<String?>('downloaded_quality'), isNull);
+
+        // The new columns must also be writable.
+        await db.customStatement(
+          "UPDATE tracks SET file_size_bytes = 1024, "
+          "downloaded_quality = '320' WHERE uuid_id = 'uuid-1'",
+        );
+        final updated = await db
+            .customSelect(
+              'SELECT file_size_bytes, downloaded_quality FROM tracks',
+            )
+            .getSingle();
+        expect(updated.read<int>('file_size_bytes'), 1024);
+        expect(updated.read<String>('downloaded_quality'), '320');
+      },
+    );
   });
 }

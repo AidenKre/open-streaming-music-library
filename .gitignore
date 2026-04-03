@@ -4,6 +4,8 @@ __pycache__/
 .vscode/
 .DS_store
 pyrightconfig.json
+temp/
+
 # Flutter/Dart
 frontend/.dart_tool/
 frontend/.packages

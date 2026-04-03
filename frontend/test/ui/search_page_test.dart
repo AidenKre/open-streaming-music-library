@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
@@ -6,20 +8,28 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 
 void main() {
   late AppDatabase db;
+  late Directory tempDir;
+  late LocalCoverArtStore coverStore;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     await _seedSearchData(db);
+    tempDir = await Directory.systemTemp.createTemp('search-page-test');
+    coverStore =
+        await LocalCoverArtStore.create(directoryProvider: () async => tempDir);
   });
 
   tearDown(() async {
     await db.close();
+    if (await tempDir.exists()) await tempDir.delete(recursive: true);
   });
 
   testWidgets(
@@ -27,7 +37,10 @@ void main() {
     (tester) async {
       await tester.pumpWidget(
         ProviderScope(
-          overrides: [databaseProvider.overrideWithValue(db)],
+          overrides: [
+            databaseProvider.overrideWithValue(db),
+            localCoverArtStoreProvider.overrideWithValue(coverStore),
+          ],
           child: const MaterialApp(home: SearchPage()),
         ),
       );
@@ -106,21 +119,5 @@ Future<void> _seedSearchData(AppDatabase db) async {
     );
   });
 
-  await db.customStatement("INSERT INTO fts_artists(fts_artists) VALUES('delete-all')");
-  await db.customStatement(
-    'INSERT INTO fts_artists(rowid, name) '
-    'SELECT id, name FROM artists',
-  );
-  await db.customStatement("INSERT INTO fts_albums(fts_albums) VALUES('delete-all')");
-  await db.customStatement(
-    'INSERT INTO fts_albums(rowid, name, artist_name) '
-    'SELECT a.id, COALESCE(a.name, \'\'), ar.name '
-    'FROM albums a JOIN artists ar ON a.artist_id = ar.id',
-  );
-  await db.customStatement("INSERT INTO fts_tracks(fts_tracks) VALUES('delete-all')");
-  await db.customStatement(
-    'INSERT INTO fts_tracks(rowid, title, artist_name, album_name) '
-    'SELECT rowid, COALESCE(title, \'\'), COALESCE(artist, \'\'), COALESCE(album, \'\') '
-    'FROM trackmetadata',
-  );
+  await db.rebuildFtsIndexes();
 }

@@ -23,6 +23,15 @@ class TrackUI {
   final int sampleRateHz;
   final int channels;
   final bool hasAlbumArt;
+  final int? coverArtId;
+  // Bitrate of the file actually on disk. Null until a download completes.
+  final int? downloadedBitrateKbps;
+  // Size in bytes of the file on disk. Null until a download completes.
+  final int? fileSizeBytes;
+  // Quality preset that produced this download (e.g. 'original', '320').
+  // Distinct from `downloadedBitrateKbps`, which is the actual on-disk
+  // bitrate — for passthrough downloads the two can differ.
+  final String? downloadedQuality;
 
   bool get isDownloaded => filePath != null;
 
@@ -51,7 +60,54 @@ class TrackUI {
     required this.sampleRateHz,
     required this.channels,
     required this.hasAlbumArt,
+    this.coverArtId,
+    this.downloadedBitrateKbps,
+    this.fileSizeBytes,
+    this.downloadedQuality,
   });
+
+  static const Object _sentinel = Object();
+
+  TrackUI copyWith({
+    Object? filePath = _sentinel,
+    Object? downloadedBitrateKbps = _sentinel,
+    Object? fileSizeBytes = _sentinel,
+    Object? downloadedQuality = _sentinel,
+  }) {
+    return TrackUI(
+      uuidId: uuidId,
+      filePath: filePath == _sentinel ? this.filePath : filePath as String?,
+      createdAt: createdAt,
+      lastUpdated: lastUpdated,
+      title: title,
+      artist: artist,
+      album: album,
+      albumArtist: albumArtist,
+      artistId: artistId,
+      albumId: albumId,
+      year: year,
+      date: date,
+      genre: genre,
+      trackNumber: trackNumber,
+      discNumber: discNumber,
+      codec: codec,
+      duration: duration,
+      bitrateKbps: bitrateKbps,
+      sampleRateHz: sampleRateHz,
+      channels: channels,
+      hasAlbumArt: hasAlbumArt,
+      coverArtId: coverArtId,
+      downloadedBitrateKbps: downloadedBitrateKbps == _sentinel
+          ? this.downloadedBitrateKbps
+          : downloadedBitrateKbps as int?,
+      fileSizeBytes: fileSizeBytes == _sentinel
+          ? this.fileSizeBytes
+          : fileSizeBytes as int?,
+      downloadedQuality: downloadedQuality == _sentinel
+          ? this.downloadedQuality
+          : downloadedQuality as String?,
+    );
+  }
 
   String get formattedDuration {
     final totalSeconds = duration.truncate();
@@ -89,6 +145,10 @@ class TrackUI {
       sampleRateHz: row.read<int>('sample_rate_hz'),
       channels: row.read<int>('channels'),
       hasAlbumArt: row.read<bool>('has_album_art'),
+      coverArtId: row.readNullable<int>('cover_art_id'),
+      downloadedBitrateKbps: row.readNullable<int>('downloaded_bitrate_kbps'),
+      fileSizeBytes: row.readNullable<int>('file_size_bytes'),
+      downloadedQuality: row.readNullable<String>('downloaded_quality'),
     );
   }
 
@@ -115,6 +175,10 @@ class TrackUI {
       sampleRateHz: meta.sampleRateHz,
       channels: meta.channels,
       hasAlbumArt: meta.hasAlbumArt,
+      coverArtId: meta.coverArtId,
+      downloadedBitrateKbps: track.downloadedBitrateKbps,
+      fileSizeBytes: track.fileSizeBytes,
+      downloadedQuality: track.downloadedQuality,
     );
   }
 }

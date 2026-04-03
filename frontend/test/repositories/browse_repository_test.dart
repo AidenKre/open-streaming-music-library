@@ -110,7 +110,52 @@ void main() {
     expect(results.albums, isEmpty);
     expect(results.tracks, isEmpty);
   });
+
+  test('search downloadedOnly filters before LIMIT, keeping a low-ranked match',
+      () async {
+    // 6 artists/albums/tracks all matching "Blue"; only the 6th is
+    // downloaded. With limitPerType 5 a naive post-filter on the top-5 FTS
+    // hits would miss the 6th — the filter must run inside the query.
+    for (var i = 1; i <= 6; i++) {
+      await fixture.insertAlbum(
+        artist: 'Blue Artist $i',
+        album: 'Blue Album $i',
+        uuids: ['blue$i'],
+        trackTitlePrefix: 'Blue Song',
+      );
+    }
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals('blue6')))
+        .write(const TracksCompanion(filePath: Value('/tmp/blue6.m4a')));
+    await _populateFts(db);
+
+    final results =
+        await repo.search('Blue', limitPerType: 5, downloadedOnly: true);
+
+    expect(results.tracks.map((t) => t.uuidId), ['blue6']);
+    expect(results.artists.map((a) => a.name), ['Blue Artist 6']);
+    expect(results.albums.map((a) => a.name), ['Blue Album 6']);
+  });
+
+  test('search without downloadedOnly is still capped at limitPerType',
+      () async {
+    for (var i = 1; i <= 6; i++) {
+      await fixture.insertAlbum(
+        artist: 'Blue Artist $i',
+        album: 'Blue Album $i',
+        uuids: ['blue$i'],
+        trackTitlePrefix: 'Blue Song',
+      );
+    }
+    await _populateFts(db);
+
+    final results = await repo.search('Blue', limitPerType: 5);
+
+    expect(results.tracks, hasLength(5));
+  });
 }
+
+/// Mirrors the FTS population the sync pipeline performs in production.
+Future<void> _populateFts(AppDatabase db) => db.rebuildFtsIndexes();
 
 class _LibraryFixture {
   final AppDatabase db;

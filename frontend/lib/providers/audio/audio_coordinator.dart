@@ -10,11 +10,16 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
 import 'package:frontend/providers/audio/queue_hydration_controller.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/queue_warm_service.dart';
+import 'package:frontend/services/settings_service.dart';
 
 class AudioCoordinator extends Notifier<AudioState> {
   static const _volumePreferenceKey = 'audioVolume';
@@ -24,11 +29,12 @@ class AudioCoordinator extends Notifier<AudioState> {
   late AudioServiceBridge _bridge;
   late QueueOrderManager _orderManager;
   late QueueHydrationController _hydrationController;
+  late CoverArtCacheManager _coverArtCache;
 
   final List<StreamSubscription<Object?>> _subscriptions = [];
   Future<void> _mutationTail = Future<void>.value();
-  bool _disposed = false;
   bool _stopInProgress = false;
+  bool _playerIntendsPlaying = false;
   DateTime? _lastPositionSave;
 
   @override
@@ -36,15 +42,69 @@ class AudioCoordinator extends Notifier<AudioState> {
     _player = ref.read(concatenatingPlayerProvider);
     _queueRepo = ref.read(queueRepositoryProvider);
     _bridge = ref.read(audioServiceProvider);
+    _coverArtCache = ref.read(coverArtCacheProvider);
     _orderManager = QueueOrderManager(_queueRepo);
     _hydrationController = QueueHydrationController(_queueRepo, _player);
 
-    _bridge.onPlay = resume;
-    _bridge.onPause = pause;
-    _bridge.onSkipToNext = skipNext;
-    _bridge.onSkipToPrevious = skipPrevious;
-    _bridge.onSeek = seek;
-    _bridge.onStop = stop;
+    // Push stream quality changes into the player so newly-built sources use
+    // the user's current preset. The very first fire happens during build() —
+    // before `state` is initialised — so we only push the quality through and
+    // skip the prefetch on that initial call.
+    ref.listen<String>(streamQualityProvider, (previous, next) {
+      _player.setStreamQuality(next);
+      if (previous != null) {
+        _scheduleQueueSync();
+        // Rebuild playlist sources so in-flight buffered tracks switch to the
+        // new quality. Full change rebuilds all; temp change rebuilds only the
+        // current source (cheaper — avoids rebuffering the whole ahead window).
+        final kind = ref.read(streamQualityChangeKindProvider);
+        final seekTo = _player.position;
+        if (kind == QualityChangeKind.full) {
+          unawaited(_player.rebuildAllSources(next, seekTo));
+        } else if (kind == QualityChangeKind.temporary) {
+          unawaited(_player.rebuildCurrentSource(next, seekTo));
+        }
+      }
+    }, fireImmediately: true);
+
+    // When a track is downloaded or deleted while it's already in the loaded
+    // player window, its in-flight just_audio source still points at the old
+    // stream/file URI. Refresh metadata and rebuild any source whose local
+    // file vs streaming availability changed. Skip the synthetic
+    // AsyncLoading → AsyncData(initial) transition that fires once on build —
+    // there's no real download-state change to reconcile yet.
+    ref.listen<AsyncValue<int>>(downloadStatusVersionProvider, (
+      previous,
+      next,
+    ) {
+      final previousValue = previous?.value;
+      final nextValue = next.value;
+      if (previousValue == null || nextValue == null) return;
+      if (previousValue == nextValue) return;
+      unawaited(_serialize(_refreshLoadedSourcesForDownloadChange));
+    });
+
+    ref.listen<AsyncValue<TrackSyncState>>(trackSyncProvider, (previous, next) {
+      final previousValue = previous?.value;
+      final nextValue = next.value;
+      if (nextValue == null) return;
+      final previousVersion = previousValue?.queueMutationVersion ?? 0;
+      if (nextValue.queueMutationVersion <= previousVersion) return;
+      if (nextValue.affectedQueueSessionIds.isEmpty) return;
+      unawaited(
+        reconcileAfterSyncQueueMutation(nextValue.affectedQueueSessionIds),
+      );
+    });
+
+    _bridge.bindCallbacks(
+      owner: this,
+      onPlay: resume,
+      onPause: pause,
+      onSkipToNext: skipNext,
+      onSkipToPrevious: skipPrevious,
+      onSeek: seek,
+      onStop: stop,
+    );
 
     _subscriptions.add(_player.playerStateStream.listen(_onPlayerStateChanged));
     _subscriptions.add(_player.positionStream.listen(_onPositionChanged));
@@ -62,9 +122,18 @@ class AudioCoordinator extends Notifier<AudioState> {
         unawaited(_serialize(() => _onCurrentItemChanged(currentItemId)));
       }),
     );
+    _subscriptions.add(
+      _player.unavailableAdvanceStream.listen((event) {
+        unawaited(_serialize(() => _onUnavailableAdvance(event)));
+      }),
+    );
 
     ref.onDispose(() {
-      _disposed = true;
+      // Clear bridge callbacks first so an OS notification tap firing during
+      // teardown can't reach the about-to-be-disposed player. clearCallbacks
+      // is owner-aware — a newer coordinator that already rebound the bridge
+      // is left intact.
+      _bridge.clearCallbacks(this);
       _hydrationController.dispose();
       for (final sub in _subscriptions) {
         sub.cancel();
@@ -85,7 +154,9 @@ class AudioCoordinator extends Notifier<AudioState> {
         repeatMode: state.queue.repeatMode.name,
         shuffleEnabled: false,
       );
-      await _startSession(sessionId, autoPlay: true);
+      if (!await _startSessionWithOfflinePolicy(sessionId, autoPlay: true)) {
+        return;
+      }
     });
   }
 
@@ -95,9 +166,15 @@ class AudioCoordinator extends Notifier<AudioState> {
     int? artistId,
     int? albumId,
     List<OrderParameter> orderParams = const [],
+    bool downloadedOnly = false,
   }) {
     return _serialize(() async {
       _setPlaybackStatus(PlayerStatus.loading);
+      // Offline forces the underlying DB filter so we never even insert
+      // streaming-only tracks into the queue; callers that explicitly asked
+      // for a downloaded-only queue (e.g. the downloaded-tracks page) get
+      // the same behaviour online.
+      final filterDownloadedOnly = downloadedOnly || _isOffline;
       final sessionId = await _queueRepo.createSessionFromQuery(
         sourceType: sourceType,
         sourceArtistId: artistId,
@@ -106,8 +183,11 @@ class AudioCoordinator extends Notifier<AudioState> {
         orderBy: orderParams,
         repeatMode: state.queue.repeatMode.name,
         shuffleEnabled: false,
+        downloadedOnly: filterDownloadedOnly,
       );
-      await _startSession(sessionId, autoPlay: true);
+      if (!await _startSessionWithOfflinePolicy(sessionId, autoPlay: true)) {
+        return;
+      }
       if (state.shuffle.shuffleOn) {
         await _toggleShuffleInternal(forceEnable: true);
       }
@@ -129,7 +209,9 @@ class AudioCoordinator extends Notifier<AudioState> {
         repeatMode: state.queue.repeatMode.name,
         shuffleEnabled: false,
       );
-      await _startSession(sessionId, autoPlay: true);
+      if (!await _startSessionWithOfflinePolicy(sessionId, autoPlay: true)) {
+        return;
+      }
       if (state.shuffle.shuffleOn) {
         await _toggleShuffleInternal(forceEnable: true);
       }
@@ -148,23 +230,12 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
-      var targetPlayPosition = state.queue.currentPlayPosition + 1;
-      if (targetPlayPosition >= state.queue.totalCount) {
-        if (state.queue.repeatMode != QueueRepeatMode.all ||
-            state.queue.totalCount == 0) {
-          return;
-        }
-        targetPlayPosition = 0;
-      }
-
-      final targetEntries = await _queueRepo.getPlaybackEntries(
-        sessionId,
-        startPlayPosition: targetPlayPosition,
-        limit: 1,
+      final target = await _resolveAdvanceTarget(
+        sessionId: sessionId,
+        direction: PlayOrderDirection.forward,
       );
-      if (targetEntries.isEmpty) return;
+      if (target == null) return;
 
-      final target = targetEntries.first;
       await _hydrationController.ensureItemLoaded(sessionId, target);
       await _player.seekToItem(target.itemId);
       await _player.play();
@@ -191,24 +262,15 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
-      var targetPlayPosition = state.queue.currentPlayPosition - 1;
-      if (targetPlayPosition < 0) {
-        if (state.queue.repeatMode != QueueRepeatMode.all ||
-            state.queue.totalCount == 0) {
-          await _player.seek(Duration.zero);
-          return;
-        }
-        targetPlayPosition = state.queue.totalCount - 1;
+      final target = await _resolveAdvanceTarget(
+        sessionId: sessionId,
+        direction: PlayOrderDirection.backward,
+      );
+      if (target == null) {
+        await _player.seek(Duration.zero);
+        return;
       }
 
-      final targetEntries = await _queueRepo.getPlaybackEntries(
-        sessionId,
-        startPlayPosition: targetPlayPosition,
-        limit: 1,
-      );
-      if (targetEntries.isEmpty) return;
-
-      final target = targetEntries.first;
       await _hydrationController.ensureItemLoaded(sessionId, target);
       await _player.seekToItem(target.itemId);
       await _player.play();
@@ -220,11 +282,23 @@ class AudioCoordinator extends Notifier<AudioState> {
       final sessionId = state.queue.sessionId;
       if (sessionId == null) return;
 
-      final entry = await _queueRepo.getPlaybackEntryForItem(sessionId, itemId);
+      var entry = await _queueRepo.getPlaybackEntryForItem(sessionId, itemId);
       if (entry == null) return;
 
+      // Offline: if the user tapped a row whose file is no longer on disk,
+      // walk forward (then backward) to the nearest locally playable entry.
+      if (_isOffline) {
+        final playable = await _queueRepo.findLocallyPlayableFallback(
+          sessionId: sessionId,
+          preferredItemId: entry.itemId,
+          totalCount: state.queue.totalCount,
+        );
+        if (playable == null) return;
+        entry = playable;
+      }
+
       await _hydrationController.ensureItemLoaded(sessionId, entry);
-      await _player.seekToItem(itemId);
+      await _player.seekToItem(entry.itemId);
       await _player.play();
     });
   }
@@ -377,12 +451,14 @@ class AudioCoordinator extends Notifier<AudioState> {
   Future<void> resume() {
     return _serialize(() async {
       if (state.queue.sessionId == null) return;
+      _playerIntendsPlaying = true;
       await _player.play();
     });
   }
 
   Future<void> pause() {
     return _serialize(() async {
+      _playerIntendsPlaying = false;
       await _player.pause();
       await _persistPlaybackCursor();
     });
@@ -392,6 +468,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     return _serialize(() async {
       _stopInProgress = true;
       try {
+        _playerIntendsPlaying = false;
         await _player.stop();
         _bridge.clearNowPlaying();
 
@@ -406,6 +483,66 @@ class AudioCoordinator extends Notifier<AudioState> {
       } finally {
         _stopInProgress = false;
       }
+    });
+  }
+
+  Future<void> reconcileAfterSyncQueueMutation(Set<int> affectedSessionIds) {
+    return _serialize(() async {
+      final sessionId = state.queue.sessionId;
+      if (sessionId == null || !affectedSessionIds.contains(sessionId)) {
+        return;
+      }
+
+      final previousCurrentItemId = state.queue.currentItemId;
+      final previousPosition = state.playback.position;
+      final wasPlaying =
+          _playerIntendsPlaying ||
+          state.playback.status == PlayerStatus.playing;
+      final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
+
+      if (snapshot == null ||
+          snapshot.currentItem == null ||
+          snapshot.totalCount == 0) {
+        await _player.stop();
+        _playerIntendsPlaying = false;
+        _bridge.clearNowPlaying();
+        await _queueRepo.deactivateAll();
+        _hydrationController.reset();
+        state = state.copyWith(
+          playback: state.playback.copyWith(
+            clearTrack: true,
+            status: PlayerStatus.idle,
+            position: Duration.zero,
+            duration: Duration.zero,
+          ),
+          queue: state.queue.copyWith(
+            clearSession: true,
+            clearCurrentItem: true,
+            currentPlayPosition: 0,
+            totalCount: 0,
+            queueVersion: state.queue.queueVersion + 1,
+          ),
+        );
+        _updateBridgePlaybackState();
+        return;
+      }
+
+      final nextCurrentItem = snapshot.currentItem!;
+      final preservePosition = previousCurrentItemId == nextCurrentItem.itemId;
+      await _startSession(
+        sessionId,
+        autoPlay: wasPlaying,
+        initialPosition: preservePosition ? previousPosition : Duration.zero,
+        overrideCurrentItem: nextCurrentItem,
+      );
+      await _persistPlaybackCursor(
+        resetPosition: !preservePosition,
+        resumeMainItemId: nextCurrentItem.queueType == QueueItemTypes.main
+            ? nextCurrentItem.itemId
+            : null,
+        updateResumeMainItemId:
+            nextCurrentItem.queueType == QueueItemTypes.main,
+      );
     });
   }
 
@@ -469,12 +606,32 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
+      // Offline restore must not seed the player on a streaming-only entry.
+      // Pick the nearest locally playable item before handing to _startSession.
+      final initialPosition = Duration(
+        milliseconds: snapshot.session.currentPositionMs,
+      );
+      if (_isOffline) {
+        final fallback = await _queueRepo.findLocallyPlayableFallback(
+          sessionId: snapshot.session.id,
+          preferredItemId: snapshot.currentItem!.itemId,
+          totalCount: snapshot.totalCount,
+        );
+        if (fallback == null) return;
+        final usePreferred = fallback.itemId == snapshot.currentItem!.itemId;
+        await _startSession(
+          snapshot.session.id,
+          autoPlay: false,
+          initialPosition: usePreferred ? initialPosition : Duration.zero,
+          overrideCurrentItem: usePreferred ? null : fallback,
+        );
+        return;
+      }
+
       await _startSession(
         snapshot.session.id,
         autoPlay: false,
-        initialPosition: Duration(
-          milliseconds: snapshot.session.currentPositionMs,
-        ),
+        initialPosition: initialPosition,
       );
     });
   }
@@ -483,9 +640,10 @@ class AudioCoordinator extends Notifier<AudioState> {
     int sessionId, {
     required bool autoPlay,
     Duration initialPosition = Duration.zero,
+    QueuePlaybackEntry? overrideCurrentItem,
   }) async {
     final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
-    final currentItem = snapshot?.currentItem;
+    final currentItem = overrideCurrentItem ?? snapshot?.currentItem;
     if (snapshot == null || currentItem == null || snapshot.totalCount == 0) {
       throw StateError('Cannot start an empty queue session');
     }
@@ -509,6 +667,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     await _player.setLoopMode(
       _loopModeFrom(_repeatModeFrom(snapshot.session.repeatMode)),
     );
+    _playerIntendsPlaying = autoPlay;
 
     _hydrationController.nextForwardHydrationPlayPosition =
         seedEntries.map((entry) => entry.playPosition).reduce(max) + 1;
@@ -541,9 +700,117 @@ class AudioCoordinator extends Notifier<AudioState> {
       shuffle: ShuffleSlice(shuffleOn: snapshot.session.shuffleEnabled),
     );
 
-    _bridge.updateNowPlaying(currentTrack.track);
+    final artUri = await _coverArtCache.resolveArtUri(
+      hasAlbumArt: currentTrack.track.hasAlbumArt,
+      coverArtId: currentTrack.track.coverArtId,
+    );
+    _bridge.updateNowPlaying(currentTrack.track, artUri: artUri);
     _updateBridgePlaybackState();
     _scheduleForwardHydration();
+  }
+
+  bool get _isOffline => ref.read(offlineModeProvider);
+
+  /// Starts the given session while honouring offline policy: if offline and
+  /// the snapshot's current item is not locally playable, swap it for the
+  /// nearest playable fallback before seeding. Returns `false` when offline
+  /// and no entry in the session is locally playable (the session is left
+  /// inactive; nothing has been played).
+  Future<bool> _startSessionWithOfflinePolicy(
+    int sessionId, {
+    required bool autoPlay,
+  }) async {
+    if (!_isOffline) {
+      await _startSession(sessionId, autoPlay: autoPlay);
+      return true;
+    }
+
+    final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
+    if (snapshot == null ||
+        snapshot.currentItem == null ||
+        snapshot.totalCount == 0) {
+      return false;
+    }
+
+    final fallback = await _queueRepo.findLocallyPlayableFallback(
+      sessionId: sessionId,
+      preferredItemId: snapshot.currentItem!.itemId,
+      totalCount: snapshot.totalCount,
+    );
+    if (fallback == null) {
+      _setPlaybackStatus(PlayerStatus.idle);
+      return false;
+    }
+    final usePreferred = fallback.itemId == snapshot.currentItem!.itemId;
+    await _startSession(
+      sessionId,
+      autoPlay: autoPlay,
+      overrideCurrentItem: usePreferred ? null : fallback,
+    );
+    return true;
+  }
+
+  /// Picks the next entry the player should land on for skipNext / skipPrev /
+  /// natural advance. Offline searches the FULL queue (not just the loaded
+  /// window) for the nearest entry with a verified local file in [direction];
+  /// online uses the immediate next/previous play position. Honours the
+  /// current repeat mode for wrapping.
+  Future<QueuePlaybackEntry?> _resolveAdvanceTarget({
+    required int sessionId,
+    required PlayOrderDirection direction,
+  }) async {
+    final repeatModeName = state.queue.repeatMode.name;
+    if (_isOffline) {
+      return _queueRepo.findNextLocallyPlayableEntry(
+        sessionId: sessionId,
+        fromPlayPosition: state.queue.currentPlayPosition,
+        direction: direction,
+        repeatMode: repeatModeName,
+        totalCount: state.queue.totalCount,
+      );
+    }
+
+    final step = direction == PlayOrderDirection.forward ? 1 : -1;
+    var targetPlayPosition = state.queue.currentPlayPosition + step;
+    if (targetPlayPosition < 0 ||
+        targetPlayPosition >= state.queue.totalCount) {
+      if (state.queue.repeatMode != QueueRepeatMode.all ||
+          state.queue.totalCount == 0) {
+        return null;
+      }
+      targetPlayPosition = direction == PlayOrderDirection.forward
+          ? 0
+          : state.queue.totalCount - 1;
+    }
+
+    final entries = await _queueRepo.getPlaybackEntries(
+      sessionId,
+      startPlayPosition: targetPlayPosition,
+      limit: 1,
+    );
+    if (entries.isEmpty) return null;
+    return entries.first;
+  }
+
+  Future<void> _onUnavailableAdvance(UnavailableAdvance event) async {
+    if (_stopInProgress) return;
+    final sessionId = state.queue.sessionId;
+    if (sessionId == null) return;
+
+    final target = await _queueRepo.findNextLocallyPlayableEntry(
+      sessionId: sessionId,
+      fromPlayPosition: event.playPosition,
+      direction: PlayOrderDirection.forward,
+      repeatMode: state.queue.repeatMode.name,
+      totalCount: state.queue.totalCount,
+    );
+    if (target == null) {
+      await _player.stop();
+      return;
+    }
+    await _hydrationController.ensureItemLoaded(sessionId, target);
+    await _player.seekToItem(target.itemId);
+    await _player.play();
   }
 
   bool get _hasHydratedSessionState =>
@@ -589,8 +856,8 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
     _hydrationController.nextForwardHydrationPlayPosition =
         windowEntries.isEmpty
-            ? rebuiltCurrentEntry.playPosition + 1
-            : windowEntries.last.playPosition + 1;
+        ? rebuiltCurrentEntry.playPosition + 1
+        : windowEntries.last.playPosition + 1;
     await _refreshCurrentQueueState(sessionId, preservePlaybackPosition: true);
     state = state.copyWith(shuffle: ShuffleSlice(shuffleOn: enable));
 
@@ -642,6 +909,19 @@ class AudioCoordinator extends Notifier<AudioState> {
     _player.replaceLoadedEntriesMetadata(entries);
   }
 
+  Future<void> _refreshLoadedSourcesForDownloadChange() async {
+    final sessionId = state.queue.sessionId;
+    if (sessionId == null) return;
+    final itemIds = _player.loadedItemIds;
+    if (itemIds.isEmpty) return;
+
+    final entries = await _queueRepo.getPlaybackEntriesForItemIds(
+      sessionId,
+      itemIds,
+    );
+    await _player.refreshLoadedSourcesForAvailabilityChanges(entries);
+  }
+
   Future<void> _replaceLoadedFutureSuffixForCurrent(
     int sessionId, {
     required int currentItemId,
@@ -663,8 +943,8 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
     _hydrationController.nextForwardHydrationPlayPosition =
         futureEntries.isEmpty
-            ? currentEntry.playPosition + 1
-            : futureEntries.last.playPosition + 1;
+        ? currentEntry.playPosition + 1
+        : futureEntries.last.playPosition + 1;
   }
 
   void _scheduleForwardHydration() {
@@ -675,6 +955,22 @@ class AudioCoordinator extends Notifier<AudioState> {
       totalCount: state.queue.totalCount,
       currentPlayPosition: state.queue.currentPlayPosition,
     );
+    _scheduleQueueSync();
+  }
+
+  /// Syncs the current queue state to the backend so it can autonomously
+  /// manage its encoded-track cache. Debounced inside the service.
+  void _scheduleQueueSync() {
+    final sessionId = state.queue.sessionId;
+    if (sessionId == null) return;
+    final quality = ref.read(streamQualityProvider);
+    ref
+        .read(queueWarmServiceProvider)
+        .scheduleWarm(
+          sessionId: sessionId,
+          currentPlayPosition: state.queue.currentPlayPosition,
+          quality: quality,
+        );
   }
 
   Future<void> _onCurrentItemChanged(int? currentItemId) async {
@@ -709,7 +1005,11 @@ class AudioCoordinator extends Notifier<AudioState> {
       ),
     );
 
-    _bridge.updateNowPlaying(currentTrack.track);
+    final artUri = await _coverArtCache.resolveArtUri(
+      hasAlbumArt: currentTrack.track.hasAlbumArt,
+      coverArtId: currentTrack.track.coverArtId,
+    );
+    _bridge.updateNowPlaying(currentTrack.track, artUri: artUri);
     _updateBridgePlaybackState();
     await _persistPlaybackCursor(
       resetPosition: true,
@@ -723,8 +1023,10 @@ class AudioCoordinator extends Notifier<AudioState> {
 
   void _onPlayerStateChanged(ja.PlayerState playerState) {
     if (_stopInProgress) return;
+    _playerIntendsPlaying = playerState.playing;
 
     if (playerState.processingState == ja.ProcessingState.completed) {
+      _playerIntendsPlaying = false;
       state = state.copyWith(
         playback: state.playback.copyWith(status: PlayerStatus.idle),
       );

@@ -3,15 +3,18 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
+import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
   final int? artistId;
-  final VoidCallback? onDisconnect;
-  const AlbumsPage({super.key, this.artistId, this.onDisconnect});
+  const AlbumsPage({super.key, this.artistId});
 
   @override
   ConsumerState<AlbumsPage> createState() => _AlbumsPageState();
@@ -41,9 +44,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
 
   void sync() {
     Future.microtask(
-      () => ref
-          .read(trackSyncProvider.notifier)
-          .sync(artistId: widget.artistId, albumId: null),
+      () => ref.read(trackSyncProvider.notifier).sync(),
     );
   }
 
@@ -57,25 +58,25 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
   @override
   Future<List<AlbumUI>> loadPage({required bool useCursor}) {
     final repo = ref.read(browseRepositoryProvider);
+    final downloadedOnly = ref.read(offlineModeProvider);
     return repo.getAlbums(
       artistId: widget.artistId,
       orderBy: _orderParams,
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
       limit: pageSize,
+      downloadedOnly: downloadedOnly,
     );
   }
 
   @override
   Stream<int> watchItemCount({required bool useCursor}) {
     final repo = ref.read(browseRepositoryProvider);
+    final downloadedOnly = ref.read(offlineModeProvider);
     return repo.watchAlbumsCount(
       artistId: widget.artistId,
       orderBy: useCursor ? _orderParams : [],
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
+      downloadedOnly: downloadedOnly,
     );
   }
 
@@ -112,8 +113,19 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<bool>(offlineModeProvider, (prev, next) {
+      if (prev != next) refresh();
+    });
+    // While offline, the downloaded-only filter is part of the query; a
+    // delete that removes the last downloaded item must re-fetch from
+    // page 1 so the stale card doesn't linger.
+    ref.listen(downloadStatusVersionProvider, (_, _) {
+      if (ref.read(offlineModeProvider)) refresh();
+    });
+    final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
+        if (isOffline) const DownloadedOnlyBadge(),
         buildNewItemsBanner('albums'),
         Expanded(
           child: GridView.builder(
@@ -131,23 +143,53 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                 return const Center(child: CircularProgressIndicator());
               }
               final album = paginatedItems[index];
+              if (index % 6 == 0) {
+                final end = (index + 12).clamp(0, paginatedItems.length);
+                final ids = paginatedItems
+                    .sublist(index, end)
+                    .map((a) => a.coverArtId)
+                    .whereType<int>()
+                    .toList();
+                prefetchCoverArt(ids);
+              }
               return AlbumCard(
                 album: album,
                 onTap: () => _onAlbumTap(album),
                 onPlayNext: () async {
-                  final tracks = await ref.read(browseRepositoryProvider)
+                  final tracks = await ref
+                      .read(browseRepositoryProvider)
                       .getTracksForAlbum(album.artistId, album.id);
                   if (tracks.isNotEmpty) {
                     ref.read(audioProvider.notifier).playNext(tracks);
                   }
                 },
                 onAddToQueue: () async {
-                  final tracks = await ref.read(browseRepositoryProvider)
+                  final tracks = await ref
+                      .read(browseRepositoryProvider)
                       .getTracksForAlbum(album.artistId, album.id);
                   if (tracks.isNotEmpty) {
                     ref.read(audioProvider.notifier).addToQueue(tracks);
                   }
                 },
+                onDownload: isOffline
+                    ? null
+                    : () => downloadScope(
+                        ref,
+                        AlbumScope(
+                            artistId: album.artistId, albumId: album.id),
+                      ),
+                onDownloadAtQuality: isOffline
+                    ? null
+                    : (q) => downloadScope(
+                        ref,
+                        AlbumScope(
+                            artistId: album.artistId, albumId: album.id),
+                        quality: q,
+                      ),
+                onDeleteDownload: () => deleteScope(
+                  ref,
+                  AlbumScope(artistId: album.artistId, albumId: album.id),
+                ),
               );
             },
           ),
@@ -155,21 +197,6 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
       ],
     );
 
-    if (widget.onDisconnect != null) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('OSML'),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.logout),
-              tooltip: 'Disconnect',
-              onPressed: widget.onDisconnect,
-            ),
-          ],
-        ),
-        body: body,
-      );
-    }
     return body;
   }
 }

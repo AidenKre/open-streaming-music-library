@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:audio_service/audio_service.dart';
-import 'package:drift/drift.dart' hide isNull;
+import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -17,8 +17,11 @@ import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/services/download_providers.dart';
 
 void main() {
   late AppDatabase db;
@@ -28,31 +31,62 @@ void main() {
   late FakeConcatenatingPlayerController fakePlayer;
   late RecordingAudioServiceBridge bridge;
 
+  final Set<String> existingFiles = <String>{};
+  late StreamController<int> downloadStatusController;
+
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     ApiClient.init('http://localhost:8080');
+    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
-    repo = QueueRepository(db);
+    existingFiles.clear();
+    repo = QueueRepository(db, localFileExists: existingFiles.contains);
     fixture = _LibraryFixture(db);
     fakePlayer = FakeConcatenatingPlayerController();
     bridge = RecordingAudioServiceBridge();
+    downloadStatusController = StreamController<int>.broadcast();
   });
 
   tearDown(() async {
     await bridge.disposeBridge();
     container?.dispose();
+    await downloadStatusController.close();
     await db.close();
   });
 
-  ProviderContainer createContainer() {
+  ProviderContainer createContainer({bool offline = false}) {
     container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
         concatenatingPlayerProvider.overrideWithValue(fakePlayer),
         audioServiceProvider.overrideWithValue(bridge),
+        queueRepositoryProvider.overrideWithValue(repo),
+        downloadStatusVersionProvider.overrideWith(
+          (ref) => downloadStatusController.stream,
+        ),
+        if (offline) offlineModeProvider.overrideWith(() => _OfflineOn()),
       ],
     );
+    // Hold a long-lived listener on the audio notifier so its in-build
+    // ref.listen subscriptions stay active. Without this, riverpod 3 treats
+    // the notifier as paused once the test stops reading it, which silently
+    // suppresses downstream StreamProvider emissions.
+    container!.listen(audioProvider, (_, _) {});
     return container!;
+  }
+
+  Future<void> markDownloaded(String uuid, String path) async {
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid))).write(
+      TracksCompanion(filePath: Value(path)),
+    );
+    existingFiles.add(path);
+  }
+
+  Future<void> markDeleted(String uuid, String path) async {
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid))).write(
+      const TracksCompanion(filePath: Value(null)),
+    );
+    existingFiles.remove(path);
   }
 
   test('playFromQueue seeds only a bounded initial player queue', () async {
@@ -578,7 +612,10 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(c.read(currentTrackProvider)?.uuidId, 'b');
-    expect(fakePlayer.seekedItems.last, c.read(audioProvider).queue.currentItemId);
+    expect(
+      fakePlayer.seekedItems.last,
+      c.read(audioProvider).queue.currentItemId,
+    );
   });
 
   test('skipNext at end with repeat off is a no-op', () async {
@@ -733,7 +770,6 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final sessionId = c.read(audioProvider).queue.sessionId!;
     await notifier.stop();
 
     expect(c.read(audioProvider).queue.sessionId, isNull);
@@ -768,6 +804,407 @@ void main() {
     expect(c.read(currentTrackProvider)?.uuidId, 'a');
   });
 
+  test(
+    'bridge media callbacks no-op after the coordinator is disposed',
+    () async {
+      // Wire up a coordinator, then tear down its scope. An OS notification
+      // tap firing afterwards must NOT reach the disposed coordinator/player.
+      await fixture.insertSingles(['a']);
+      final c = createContainer();
+      c.read(audioProvider.notifier); // build the coordinator
+      // Let the build's Future.microtask(_restoreStartupState) complete
+      // before tearing the scope down; otherwise the in-flight restore
+      // throws ref-after-dispose noise unrelated to the assertion below.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(bridge.onPlay, isNotNull);
+
+      container?.dispose();
+      container = null;
+
+      expect(bridge.onPlay, isNull);
+      expect(bridge.onPause, isNull);
+      expect(bridge.onSkipToNext, isNull);
+      expect(bridge.onSkipToPrevious, isNull);
+      expect(bridge.onSeek, isNull);
+      expect(bridge.onStop, isNull);
+
+      // audio_service still routes media button events through the bridge.
+      // After clearCallbacks they must be no-ops, not throws — this would
+      // previously have called into a torn-down player.
+      await bridge.play();
+      await bridge.pause();
+      await bridge.skipToNext();
+      await bridge.skipToPrevious();
+      await bridge.seek(const Duration(seconds: 5));
+      await bridge.stop();
+    },
+  );
+
+  test(
+    'a newer coordinator rebinding the bridge survives the old one disposing',
+    () async {
+      // Two coordinators in sequence: scope A binds, scope B binds, then
+      // scope A disposes. Owner-aware clearCallbacks must leave B's
+      // callbacks intact.
+      await fixture.insertSingles(['a']);
+
+      final cA = createContainer();
+      cA.read(audioProvider.notifier);
+      // Wait for the first coordinator's startup-restore microtask.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final firstOnPlay = bridge.onPlay;
+      expect(firstOnPlay, isNotNull);
+
+      // Build a second container against the same bridge — its coordinator
+      // rebinds the callbacks.
+      final cB = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          concatenatingPlayerProvider.overrideWithValue(
+            FakeConcatenatingPlayerController(),
+          ),
+          audioServiceProvider.overrideWithValue(bridge),
+        ],
+      );
+      addTearDown(cB.dispose);
+      cB.read(audioProvider.notifier);
+      // Wait for the second coordinator's startup-restore microtask.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(
+        identical(bridge.onPlay, firstOnPlay),
+        isFalse,
+        reason: 'second coordinator should have rebound onPlay',
+      );
+
+      // Disposing scope A must NOT clear scope B's callbacks.
+      cA.dispose();
+      container = null;
+      expect(bridge.onPlay, isNotNull);
+      expect(bridge.onPause, isNotNull);
+    },
+  );
+
+  group('offline playback policy', () {
+    test(
+      'offline skipNext jumps past streaming-only entries to next downloaded',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('d', '/dl/d');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c', 'd', 'e'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        await notifier.skipNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+        expect(c.read(audioProvider).queue.currentPlayPosition, 3);
+      },
+    );
+
+    test(
+      'offline skipPrevious searches backward for a downloaded entry',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('e', '/dl/e');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('e');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c', 'd', 'e'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        await notifier.skipPrevious();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'a');
+        expect(c.read(audioProvider).queue.currentPlayPosition, 0);
+      },
+    );
+
+    test(
+      'offline repeat-all wraps to a downloaded entry on skipNext',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/dl/a');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        await notifier.cycleQueueRepeatMode();
+        await Future<void>.delayed(Duration.zero);
+
+        await notifier.skipNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      },
+    );
+
+    test(
+      'offline skipNext finds a downloaded target outside the loaded window',
+      () async {
+        final uuids = List.generate(120, (i) => 'track-${i + 1}');
+        await fixture.insertAlbum(
+          artist: 'Artist',
+          album: 'Album',
+          uuids: uuids,
+        );
+        await markDownloaded('track-1', '/dl/1');
+        await markDownloaded('track-119', '/dl/119');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('track-1');
+        await notifier.playFromQueue(
+          track: startTrack,
+          sourceType: 'album',
+          artistId: 1,
+          albumId: 1,
+          orderParams: [OrderParameter(column: 'track_number')],
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        // Confirm the loaded window doesn't already contain track-119 — the
+        // controller must consult the repository, not just its loaded entries.
+        expect(fakePlayer.loadedItemIds.length, lessThan(120));
+
+        await notifier.skipNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'track-119');
+      },
+    );
+
+    test(
+      'natural advance onto an unavailable entry rescues forward to downloaded',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('d', '/dl/d');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c', 'd'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        // Simulate just_audio naturally advancing into the streaming-only
+        // entry "b" — the controller surfaces the bad index to the coordinator
+        // which must hop the queue forward to "d".
+        final entries = await repo.getPlaybackEntries(
+          c.read(audioProvider).queue.sessionId!,
+        );
+        final bEntry = entries.firstWhere((e) => e.uuidId == 'b');
+        fakePlayer.emitUnavailableAdvance(
+          UnavailableAdvance(
+            itemId: bEntry.itemId,
+            playPosition: bEntry.playPosition,
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+      },
+    );
+
+    test(
+      'offline session restore lands on the nearest downloaded entry',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd']);
+        await markDownloaded('d', '/dl/d');
+
+        final sessionId = await repo.createSessionFromExplicitList(
+          sourceType: 'search',
+          trackUuids: const ['a', 'b', 'c', 'd'],
+          currentIndex: 0,
+        );
+        final snapshot = await repo.getSessionSnapshot(sessionId);
+        await repo.updatePlaybackCursor(
+          sessionId: sessionId,
+          currentItemId: snapshot!.currentItem!.itemId,
+          positionMs: 12345,
+        );
+
+        final c = createContainer(offline: true);
+        c.read(audioProvider);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(fakePlayer.seedCalls, hasLength(1));
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+        // Restoring onto a fallback resets the cursor to zero — the saved
+        // position belonged to the unavailable original track, not this one.
+        expect(c.read(audioPositionProvider), Duration.zero);
+      },
+    );
+
+    test('offline session restore skips when no entry is downloaded', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['a', 'b'],
+        currentIndex: 0,
+      );
+      final snapshot = await repo.getSessionSnapshot(sessionId);
+      await repo.updatePlaybackCursor(
+        sessionId: sessionId,
+        currentItemId: snapshot!.currentItem!.itemId,
+        positionMs: 0,
+      );
+
+      final c = createContainer(offline: true);
+      c.read(audioProvider);
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(fakePlayer.seedCalls, isEmpty);
+      expect(c.read(currentTrackProvider), isNull);
+    });
+
+    test(
+      'hydrated stream rebuilds to file when download lands, then advances offline',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/dl/a');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        // 'b' is currently a streaming-only entry hydrated into the player.
+        final bEntryBefore = fakePlayer.loadedItemIds.contains(
+          (await repo.getPlaybackEntries(
+            c.read(audioProvider).queue.sessionId!,
+          )).firstWhere((e) => e.uuidId == 'b').itemId,
+        );
+        expect(bEntryBefore, isTrue);
+
+        // Seed the version stream with a baseline so the next emission is a
+        // genuine prev→next transition (the coordinator suppresses the
+        // synthetic loading→initial hop).
+        downloadStatusController.add(0);
+        await Future<void>.delayed(Duration.zero);
+
+        // 'b' is downloaded mid-playback; download-status bump must rebuild
+        // the in-flight source so the offline rescue picks 'b' next.
+        await markDownloaded('b', '/dl/b');
+        downloadStatusController.add(1);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(
+          fakePlayer.refreshedSources.any((r) => !r.oldHadFile && r.newHasFile),
+          isTrue,
+          reason: 'refresh should report b flipping stream → file',
+        );
+
+        await notifier.skipNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      },
+    );
+
+    test(
+      'hydrated file rescues via UnavailableAdvance when current download is deleted',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('c', '/dl/c');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'a');
+
+        downloadStatusController.add(0);
+        await Future<void>.delayed(Duration.zero);
+
+        // Tell the fake to treat the next file→null transition on the
+        // current item as an offline rescue.
+        fakePlayer.offlineForRefresh = true;
+        await markDeleted('a', '/dl/a');
+        downloadStatusController.add(1);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(
+          fakePlayer.refreshedSources.any((r) => r.oldHadFile && !r.newHasFile),
+          isTrue,
+          reason: 'refresh should report a flipping file → stream',
+        );
+        expect(c.read(currentTrackProvider)?.uuidId, 'c');
+      },
+    );
+
+    test(
+      'offline skipToTrack on an unavailable entry redirects to nearest downloaded',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('d', '/dl/d');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c', 'd'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        final entries = await c.read(queueTracksProvider.future);
+        final unavailable = entries.firstWhere((e) => e.uuidId == 'b');
+
+        await notifier.skipToTrack(unavailable.itemId);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+      },
+    );
+  });
+
   test('seek persists playback cursor immediately', () async {
     await fixture.insertSingles(['a', 'b']);
     final startTrack = await fixture.track('a');
@@ -789,6 +1226,164 @@ void main() {
     expect(c.read(audioPositionProvider), const Duration(seconds: 75));
     expect(snapshot?.session.currentPositionMs, 75000);
   });
+
+  test(
+    'sync queue mutation clears deleted current item and loads fallback',
+    () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final startTrack = await fixture.track('b');
+
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(
+        const ['a', 'b', 'c'],
+        startTrack,
+        sourceType: 'search',
+      );
+      await notifier.seek(const Duration(seconds: 45));
+
+      final sessionId = c.read(audioProvider).queue.sessionId!;
+      final firstCurrentItemId = c.read(audioProvider).queue.currentItemId;
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(audioPositionProvider), const Duration(seconds: 45));
+
+      await repo.removeTrackUuidsFromQueues(const ['b']);
+      await notifier.reconcileAfterSyncQueueMutation({sessionId});
+
+      final sessionRow = await (db.select(
+        db.queueSessions,
+      )..where((s) => s.id.equals(sessionId))).getSingle();
+      expect(await _playOrderCount(db, sessionId), 2);
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(audioPositionProvider), Duration.zero);
+      expect(c.read(audioProvider).queue.currentPlayPosition, 0);
+      expect(c.read(audioProvider).queue.totalCount, 2);
+      expect(
+        c.read(audioProvider).queue.currentItemId,
+        isNot(firstCurrentItemId),
+      );
+      expect(fakePlayer.seedCalls, hasLength(2));
+      expect(fakePlayer.seedCalls.last.initialPosition, Duration.zero);
+      expect(fakePlayer.seedCalls.last.autoPlay, isTrue);
+      expect(
+        sessionRow.currentItemId,
+        c.read(audioProvider).queue.currentItemId,
+      );
+      expect(sessionRow.currentPositionMs, 0);
+    },
+  );
+
+  test(
+    'sync queue mutation deleting the whole active queue clears session',
+    () async {
+      await fixture.insertSingles(['a', 'b']);
+      final startTrack = await fixture.track('a');
+      final nextTrack = await fixture.track('b');
+
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(
+        const ['a'],
+        startTrack,
+        sourceType: 'search',
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      final sessionId = c.read(audioProvider).queue.sessionId!;
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+
+      await repo.removeTrackUuidsFromQueues(const ['a']);
+      await notifier.reconcileAfterSyncQueueMutation({sessionId});
+
+      expect(c.read(audioProvider).queue.sessionId, isNull);
+      expect(c.read(audioProvider).queue.currentItemId, isNull);
+      expect(c.read(currentTrackProvider), isNull);
+      expect(await repo.getActiveSession(), isNull);
+
+      await notifier.addToQueue([nextTrack]);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(audioProvider).queue.sessionId, isNot(sessionId));
+      expect(c.read(audioProvider).queue.currentItemId, isNotNull);
+    },
+  );
+
+  test(
+    'sync queue mutation preserves surviving current item position',
+    () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final startTrack = await fixture.track('b');
+
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(
+        const ['a', 'b', 'c'],
+        startTrack,
+        sourceType: 'search',
+      );
+      await notifier.seek(const Duration(seconds: 45));
+
+      final sessionId = c.read(audioProvider).queue.sessionId!;
+      final currentItemId = c.read(audioProvider).queue.currentItemId;
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(audioProvider).queue.currentPlayPosition, 1);
+
+      await repo.removeTrackUuidsFromQueues(const ['a']);
+      await notifier.reconcileAfterSyncQueueMutation({sessionId});
+
+      final sessionRow = await (db.select(
+        db.queueSessions,
+      )..where((s) => s.id.equals(sessionId))).getSingle();
+      expect(await _playOrderCount(db, sessionId), 2);
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(audioPositionProvider), const Duration(seconds: 45));
+      expect(c.read(audioProvider).queue.currentItemId, currentItemId);
+      expect(c.read(audioProvider).queue.currentPlayPosition, 0);
+      expect(fakePlayer.seedCalls, hasLength(2));
+      expect(
+        fakePlayer.seedCalls.last.initialPosition,
+        const Duration(seconds: 45),
+      );
+      expect(sessionRow.currentItemId, currentItemId);
+      expect(sessionRow.currentPositionMs, 45000);
+    },
+  );
+
+  test(
+    'sync queue mutation keeps autoplay while player is buffering',
+    () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final startTrack = await fixture.track('b');
+
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(
+        const ['a', 'b', 'c'],
+        startTrack,
+        sourceType: 'search',
+      );
+      await notifier.seek(const Duration(seconds: 12));
+
+      fakePlayer.emitPlayerState(
+        ja.PlayerState(true, ja.ProcessingState.buffering),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(c.read(audioProvider).playback.status, PlayerStatus.loading);
+
+      final sessionId = c.read(audioProvider).queue.sessionId!;
+      final currentItemId = c.read(audioProvider).queue.currentItemId;
+
+      await repo.removeTrackUuidsFromQueues(const ['c']);
+      await notifier.reconcileAfterSyncQueueMutation({sessionId});
+
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(audioPositionProvider), const Duration(seconds: 12));
+      expect(c.read(audioProvider).queue.currentItemId, currentItemId);
+      expect(fakePlayer.seedCalls, hasLength(2));
+      expect(fakePlayer.seedCalls.last.autoPlay, isTrue);
+    },
+  );
 }
 
 Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
@@ -807,6 +1402,8 @@ class FakeConcatenatingPlayerController
   final _positionController = StreamController<Duration>.broadcast();
   final _durationController = StreamController<Duration?>.broadcast();
   final _currentItemIdController = StreamController<int?>.broadcast();
+  final _unavailableAdvanceController =
+      StreamController<UnavailableAdvance>.broadcast();
 
   List<QueuePlaybackEntry> _loadedEntries = const [];
   int? _currentLocalIndex;
@@ -825,6 +1422,18 @@ class FakeConcatenatingPlayerController
   int stopCalls = 0;
   ja.LoopMode? lastLoopMode;
   double? lastVolume;
+  String? lastStreamQuality;
+
+  @override
+  void setStreamQuality(String quality) {
+    lastStreamQuality = quality;
+  }
+
+  @override
+  Future<void> rebuildCurrentSource(String quality, Duration seekTo) async {}
+
+  @override
+  Future<void> rebuildAllSources(String quality, Duration seekTo) async {}
 
   @override
   Future<void> setSeed(
@@ -879,6 +1488,62 @@ class FakeConcatenatingPlayerController
     _loadedEntries = _loadedEntries
         .map((entry) => byItemId[entry.itemId] ?? entry)
         .toList(growable: false);
+  }
+
+  /// Set by the test harness so the fake can decide, on a per-itemId basis,
+  /// whether the simulated local file is currently considered present. The
+  /// production controller goes through dart:io File.existsSync() — in tests
+  /// we steer it through the same external set the QueueRepository fixture
+  /// uses to decide playability.
+  bool Function(QueuePlaybackEntry entry) sourceAvailability = (entry) =>
+      entry.filePath != null && entry.filePath!.isNotEmpty;
+
+  bool offlineForRefresh = false;
+
+  final List<RefreshedSource> refreshedSources = [];
+  final List<int> rescuedItemIds = [];
+
+  @override
+  Future<void> refreshLoadedSourcesForAvailabilityChanges(
+    List<QueuePlaybackEntry> updatedEntries,
+  ) async {
+    final byItemId = {for (final entry in updatedEntries) entry.itemId: entry};
+    final nextEntries = <QueuePlaybackEntry>[];
+    int? rescueItemId;
+    int? rescuePlayPosition;
+    for (final oldEntry in _loadedEntries) {
+      final newEntry = byItemId[oldEntry.itemId] ?? oldEntry;
+      nextEntries.add(newEntry);
+      final oldHadFile = sourceAvailability(oldEntry);
+      final newHasFile = sourceAvailability(newEntry);
+      if (oldHadFile == newHasFile && oldEntry.filePath == newEntry.filePath) {
+        continue;
+      }
+      refreshedSources.add(
+        RefreshedSource(
+          itemId: newEntry.itemId,
+          oldHadFile: oldHadFile,
+          newHasFile: newHasFile,
+        ),
+      );
+      if (newEntry.itemId == _committedCurrentItemId &&
+          oldHadFile &&
+          !newHasFile &&
+          offlineForRefresh) {
+        rescueItemId = newEntry.itemId;
+        rescuePlayPosition = newEntry.playPosition;
+      }
+    }
+    _loadedEntries = nextEntries;
+    if (rescueItemId != null && rescuePlayPosition != null) {
+      rescuedItemIds.add(rescueItemId);
+      _unavailableAdvanceController.add(
+        UnavailableAdvance(
+          itemId: rescueItemId,
+          playPosition: rescuePlayPosition,
+        ),
+      );
+    }
   }
 
   @override
@@ -1025,6 +1690,18 @@ class FakeConcatenatingPlayerController
   Stream<int?> get currentItemIdStream => _currentItemIdController.stream;
 
   @override
+  Stream<UnavailableAdvance> get unavailableAdvanceStream =>
+      _unavailableAdvanceController.stream;
+
+  void emitPlayerState(ja.PlayerState state) {
+    _playerStateController.add(state);
+  }
+
+  void emitUnavailableAdvance(UnavailableAdvance event) {
+    _unavailableAdvanceController.add(event);
+  }
+
+  @override
   void dispose() {
     if (_disposed) return;
     _disposed = true;
@@ -1032,6 +1709,7 @@ class FakeConcatenatingPlayerController
     _positionController.close();
     _durationController.close();
     _currentItemIdController.close();
+    _unavailableAdvanceController.close();
   }
 
   static List<QueuePlaybackEntry> _sorted(List<QueuePlaybackEntry> entries) {
@@ -1048,6 +1726,18 @@ class FakeConcatenatingPlayerController
     }
     return _loadedEntries.length;
   }
+}
+
+class RefreshedSource {
+  final int itemId;
+  final bool oldHadFile;
+  final bool newHasFile;
+
+  const RefreshedSource({
+    required this.itemId,
+    required this.oldHadFile,
+    required this.newHasFile,
+  });
 }
 
 class SeedCall {
@@ -1081,6 +1771,11 @@ class RecordingAudioServiceBridge extends AudioServiceBridge {
     await _mediaSub.cancel();
     await _playbackSub.cancel();
   }
+}
+
+class _OfflineOn extends OfflineModeNotifier {
+  @override
+  bool build() => true;
 }
 
 class _LibraryFixture {

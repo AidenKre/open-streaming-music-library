@@ -1,11 +1,12 @@
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.config import settings
 from app.database import (
@@ -22,25 +23,43 @@ from app.database import (
 )
 from app.models import (
     Album,
-    Artist,
+    ChangeEntry,
     ClientTrack,
     GetAlbumsResponse,
     GetArtistsResponse,
+    GetChangesResponse,
     GetSearchResponse,
     GetTracksResponse,
+    WarmRequest,
+    WarmResponse,
+    QualitySettingResponse,
+    SetQualityRequest,
+    SetQualityResponse,
     Track,
 )
 from app.services import (
+    CoverArtContext,
+    CoverArtManager,
+    EncodedCache,
+    EncodedCacheContext,
+    EncoderCoordinator,
     FileWatcher,
     Ingestor,
     IngestorContext,
     Organizer,
     OrganizerContext,
+    ORIGINAL_QUALITY,
+    normalize_quality,
+)
+from app.services.encoder_coordinator import (
+    EncodeResult,
+    PrefetchOutcome,
+    SourceUnavailable,
 )
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     startup_event()
     yield
     shutdown_event()
@@ -51,12 +70,25 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _resolve_track_source_path(database: Database, uuid_id: str) -> Optional[Path]:
+    rows = database.get_tracks(
+        search_parameters=[SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
+    )
+    if not rows:
+        return None
+    return rows[0].file_path
+
+
 def startup_event():
     # Set app.state classes to be None
     app.state.database = None
+    app.state.cover_art_manager = None
     app.state.organizer = None
     app.state.ingestor = None
     app.state.file_watcher = None
+    app.state.encoded_cache = None
+    app.state.default_cache = None
+    app.state.encoder_coordinator = None
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
     settings.music_library_dir.mkdir(parents=True, exist_ok=True)
@@ -76,12 +108,83 @@ def startup_event():
     print(f"Database initialized: {db_intialized}")
     app.state.database = database
 
+    # Set up cover art manager
+    cover_art_dir = settings.app_data_dir / "cover_art"
+    cover_art_dir.mkdir(parents=True, exist_ok=True)
+    cover_art_context = CoverArtContext(
+        cover_art_dir=cover_art_dir, database=database
+    )
+    cover_art_manager = CoverArtManager(ctx=cover_art_context)
+    app.state.cover_art_manager = cover_art_manager
+
+    # Backfill cover_art_id for tracks ingested before cover art support
+    cover_art_manager.backfill_cover_art()
+
+    # Set up the encoded-track cache + coordinator used by the streaming endpoint.
+    encoded_cache_dir = settings.app_data_dir / "encoded_cache"
+    encoded_cache_dir.mkdir(parents=True, exist_ok=True)
+    max_cache_bytes = int(settings.encoded_cache_size_gb * 1024 * 1024 * 1024)
+    encoded_cache = EncodedCache(
+        ctx=EncodedCacheContext(
+            cache_dir=encoded_cache_dir,
+            max_size_bytes=max_cache_bytes,
+        )
+    )
+    # Unlimited cache for the server's default streaming quality — these files
+    # are never evicted by on-demand traffic.
+    default_cache_dir = settings.app_data_dir / "default_cache"
+    default_cache_dir.mkdir(parents=True, exist_ok=True)
+    default_cache = EncodedCache(
+        ctx=EncodedCacheContext(
+            cache_dir=default_cache_dir,
+            max_size_bytes=0,  # unlimited
+        )
+    )
+    # Resolve the startup default quality. Bad persisted/env values must not
+    # leak into EncoderCoordinator — fall through persisted → env → ORIGINAL.
+    persisted_quality = database.get_setting("default_streaming_quality")
+    default_quality = ORIGINAL_QUALITY
+    for candidate, source_label in (
+        (persisted_quality, "persisted"),
+        (settings.default_streaming_quality, "env/config"),
+    ):
+        if candidate is None:
+            continue
+        try:
+            default_quality = normalize_quality(candidate)
+            break
+        except ValueError:
+            print(
+                f"Invalid {source_label} default_streaming_quality "
+                f"{candidate!r}; falling back."
+            )
+    else:
+        print(
+            f"No valid default_streaming_quality configured; using "
+            f"{ORIGINAL_QUALITY!r}."
+        )
+
+    app.state.encoded_cache = encoded_cache
+    app.state.default_cache = default_cache
+    encoder_coordinator = EncoderCoordinator(
+        cache=encoded_cache,
+        source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
+        workers=max(1, settings.encoded_cache_prefetch_workers),
+        default_cache=default_cache,
+        default_quality=default_quality,
+        all_uuids_fn=lambda: database.get_all_track_uuids(),
+    )
+    app.state.encoder_coordinator = encoder_coordinator
+    encoder_coordinator.startup()
+
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
             music_library_dir=settings.music_library_dir,
             should_organize_files=True,
             should_copy_files=False,
             add_to_database=app.state.database.add_track,
+            add_cover_art=cover_art_manager.add_album_art_with_status,
+            remove_cover_art=cover_art_manager.remove_album_art,
         )
 
         organizer = Organizer(ctx=organizer_context)
@@ -108,6 +211,9 @@ def shutdown_event():
     watcher = getattr(app.state, "file_watcher", None)
     if watcher:
         watcher.stop_file_watcher()
+    coordinator = getattr(app.state, "encoder_coordinator", None)
+    if coordinator:
+        coordinator.shutdown()
 
 
 @app.get("/tracks", response_model=GetTracksResponse)
@@ -117,10 +223,22 @@ def get_tracks(
     offset: int = Query(0, ge=0),
     artist_id: Optional[int] = None,
     album_id: Optional[int] = None,
-    newer_than: Optional[int] = None,
-    older_than: Optional[int] = None,
 ):
+    """Browse tracks in display order (artist/album/disc/track), optionally
+    scoped by artist/album, with keyset cursor pagination. Incremental sync
+    lives on ``GET /changes`` — this endpoint no longer windows by timestamp
+    or returns tombstones."""
     database: Database = cast(Database, app.state.database)
+
+    # ``album_id`` is only meaningful when paired with ``artist_id`` — the
+    # query layer rejects album-only filters because album IDs are not
+    # globally unique across artists. Reject at the API boundary so the
+    # client gets a clear 422 instead of a 500 from a deeper layer.
+    if album_id is not None and artist_id is None and not cursor:
+        raise HTTPException(
+            status_code=422,
+            detail="album_id requires artist_id",
+        )
 
     search_parameters: List[SearchParameter]
     order_parameters: List[OrderParameter]
@@ -134,18 +252,6 @@ def get_tracks(
         ]
         search_parameters = []
         row_filter_parameters = []
-        if newer_than:
-            search_parameters.append(
-                SearchParameter(
-                    column="last_updated", operator=">", value=str(newer_than)
-                )
-            )
-        if older_than:
-            search_parameters.append(
-                SearchParameter(
-                    column="last_updated", operator="<=", value=str(older_than)
-                )
-            )
 
     else:
         try:
@@ -203,6 +309,7 @@ def get_tracks(
         raise HTTPException(
             status_code=500, detail="Unable to get count of remaining tracks"
         )
+
     if remaining_track_count == 0 or offset >= remaining_track_count:
         return GetTracksResponse(data=[], nextCursor=None)
 
@@ -247,8 +354,88 @@ def get_tracks(
             }
         )
 
-    return GetTracksResponse(data=client_track_list, nextCursor=nextCursor)
+    return GetTracksResponse(
+        data=client_track_list,
+        nextCursor=nextCursor,
+    )
 
+
+@app.get("/changes", response_model=GetChangesResponse)
+def get_changes(
+    after_revision: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=1000),
+):
+    """Revision-based incremental sync. Returns ordered upsert/delete entries
+    with ``revision > after_revision``; the client persists the last applied
+    entry's revision and pages until ``nextCursor`` is null. ``after_revision=0``
+    is a full resync."""
+    database: Database = cast(Database, app.state.database)
+
+    try:
+        changes, latest_revision, next_cursor = database.get_changes(
+            after_revision=after_revision, limit=limit
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail="Failed to fetch changes"
+        ) from e
+
+    entries = [
+        ChangeEntry(
+            type=change.type,
+            revision=change.revision,
+            uuid_id=change.uuid_id,
+            track=(
+                ClientTrack.from_track(track=change.track)
+                if change.track is not None
+                else None
+            ),
+        )
+        for change in changes
+    ]
+
+    return GetChangesResponse(
+        changes=entries,
+        nextCursor=next_cursor,
+        latestRevision=latest_revision,
+    )
+
+
+_IMAGE_MIME: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+}
+
+
+@app.get("/cover_art/{cover_art_id}")
+def get_cover_art(cover_art_id: int):
+    manager: CoverArtManager = app.state.cover_art_manager
+    path = manager.get_album_art(cover_art_id)
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="Cover art not found")
+    media_type = _IMAGE_MIME.get(path.suffix.lower(), "image/jpeg")
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+_MIME_EXTENSION: dict[str, str] = {
+    "audio/mp4": "m4a",
+    "audio/mpeg": "mp3",
+    "audio/flac": "flac",
+    "audio/x-flac": "flac",
+    "audio/ogg": "ogg",
+    "audio/aac": "aac",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+}
 
 _CODEC_MIME: dict[str, str] = {
     "aac": "audio/mp4",
@@ -262,9 +449,93 @@ _CODEC_MIME: dict[str, str] = {
 }
 
 
+def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int]:
+    """Parse a single HTTP byte range and return ``(start, end)`` inclusive.
+
+    Supports the three single-range forms from RFC 7233:
+      ``bytes=start-end`` — explicit window
+      ``bytes=start-``    — from ``start`` to EOF
+      ``bytes=-N``        — the last ``N`` bytes (suffix range)
+
+    Anything else — multi-range requests, malformed values, ranges entirely
+    past EOF — raises 416. We treat 416 as the right answer for "could not
+    parse" too: returning a 200 with the whole file would silently mask a
+    bad client header.
+    """
+    if "," in range_header:
+        # Multi-range responses require multipart/byteranges; we only serve
+        # single ranges, so reject explicitly rather than serving the first.
+        raise HTTPException(
+            status_code=416,
+            detail=f"Multi-range requests are not supported: {range_header}",
+        )
+
+    if "=" not in range_header:
+        raise HTTPException(
+            status_code=416, detail=f"Invalid Range Header: {range_header}"
+        )
+
+    units, _, rng = range_header.partition("=")
+    if units.strip().lower() != "bytes":
+        raise HTTPException(
+            status_code=422,
+            detail=f"range must be in bytes. Instead {units} was used",
+        )
+
+    rng = rng.strip()
+    # Exactly one "-" separator; partition guarantees that. The earlier
+    # split("-") accepted "1-2-3" by silently dropping the tail.
+    if rng.count("-") != 1:
+        raise HTTPException(
+            status_code=416, detail=f"Invalid Range Header: {range_header}"
+        )
+    start_s, end_s = rng.split("-")
+
+    try:
+        if not start_s and not end_s:
+            # "bytes=-" — malformed.
+            raise ValueError("empty range")
+        if not start_s:
+            # Suffix range: last N bytes.
+            suffix_len = int(end_s)
+            if suffix_len <= 0:
+                raise ValueError("non-positive suffix length")
+            if suffix_len >= file_size:
+                start = 0
+            else:
+                start = file_size - suffix_len
+            end = file_size - 1
+        else:
+            start = int(start_s)
+            if start < 0:
+                raise ValueError("negative start")
+            end = int(end_s) if end_s else file_size - 1
+            if end < 0:
+                raise ValueError("negative end")
+    except ValueError:
+        raise HTTPException(
+            status_code=416, detail=f"Invalid Range Header: {range_header}"
+        )
+
+    if start >= file_size or end >= file_size or start > end:
+        raise HTTPException(
+            status_code=416, detail=f"Range not satisfiable: {range_header}"
+        )
+
+    return start, end
+
+
 @app.get("/tracks/{uuid_id}/stream")
-def stream_track(uuid_id: str, request: Request):
+def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     CHUNK_SIZE = 1024 * 1024
+    try:
+        quality_canonical = normalize_quality(quality)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported quality preset: {quality}",
+        )
+
     search_parameters = [SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
     track_list: List[Track] = app.state.database.get_tracks(
         search_parameters=search_parameters
@@ -274,74 +545,124 @@ def stream_track(uuid_id: str, request: Request):
             status_code=404, detail=f"Could not find track with uuid: {uuid_id}"
         )
     track: Track = track_list[0]
-    file_path = track.file_path
-    if not file_path.exists():
+    source_bitrate = int(track.metadata.bitrate_kbps or 0) or None
+
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    try:
+        encode_result: Optional[EncodeResult] = coordinator.encode_for_stream(
+            uuid_id,
+            quality_canonical,
+            source_bitrate_kbps=source_bitrate,
+            source_path=track.file_path,
+        )
+    except SourceUnavailable:
+        # Track row exists but its source file is gone — 404 so clients drop it
+        # instead of retrying a permanently-missing file as if it were transient.
+        raise HTTPException(
+            status_code=404,
+            detail=f"Source file for track {uuid_id} is no longer available",
+        )
+    if encode_result is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to encode track {uuid_id} at quality {quality_canonical}",
+        )
+    file_path = encode_result.path
+
+    # Use audio/mp4 only when we actually transcoded; for passthrough (including
+    # ORIGINAL_QUALITY and bitrate-based passthrough) use the source codec's type
+    # so the MIME header always matches what is actually being served.
+    if encode_result.transcoded:
+        media_type = "audio/mp4"
+    else:
+        media_type = _CODEC_MIME.get(
+            track.metadata.codec or "", f"audio/{track.metadata.codec or 'octet-stream'}"
+        )
+
+    # For passthrough/original responses, the source's own file extension is
+    # a better fallback than the literal string "audio" when the codec is not
+    # in [_MIME_EXTENSION] (e.g. opus, vorbis) — that name is what the client
+    # would have got had it downloaded the source directly.
+    extension = _MIME_EXTENSION.get(media_type)
+    if extension is None:
+        source_suffix = file_path.suffix.lstrip(".").lower() if not encode_result.transcoded else ""
+        extension = source_suffix or "audio"
+
+    extra_headers = {
+        "X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps),
+        "X-Audio-Extension": extension,
+    }
+
+    # Open the cache file eagerly (before returning the StreamingResponse) so
+    # the active file descriptor pins the inode. EncodedCache pruning and
+    # default-quality changes may unlink the path after we validate it but
+    # before a lazy generator would otherwise open it; on Unix the open
+    # handle keeps the data readable even after unlink, so streaming
+    # survives concurrent cache eviction.
+    try:
+        f = file_path.open("rb")
+    except FileNotFoundError:
         raise HTTPException(
             status_code=404,
             detail=f"file path for the track is now dead. Path: {file_path}",
         )
-    file_size = file_path.stat().st_size
-    range_header = request.headers.get("range")
-
-    if not range_header:
-
-        def iterfile():
-            with file_path.open("rb") as f:
-                while chunk := f.read(CHUNK_SIZE):
-                    yield chunk
-
-        return StreamingResponse(
-            iterfile(),
-            media_type=_CODEC_MIME.get(
-                track.metadata.codec or "", f"audio/{track.metadata.codec}"
-            ),
-            headers={"Accept-ranges": "bytes", "Content-length": str(file_size)},
-        )
 
     try:
-        units, rng = range_header.split("=")
-        if units.strip().lower() != "bytes":
-            raise HTTPException(
-                status_code=422,
-                detail=f"range must be in bytes. Instead {units} was used",
+        file_size = os.fstat(f.fileno()).st_size
+        range_header = request.headers.get("range")
+
+        if not range_header:
+
+            def iterfile(handle):
+                try:
+                    while chunk := handle.read(CHUNK_SIZE):
+                        yield chunk
+                finally:
+                    handle.close()
+
+            response = StreamingResponse(
+                iterfile(f),
+                media_type=media_type,
+                headers={
+                    "Accept-ranges": "bytes",
+                    "Content-length": str(file_size),
+                    **extra_headers,
+                },
             )
+            f = None  # ownership transferred to the generator
+            return response
 
-        start_s, end_s = (rng.split("-") + [""])[:2]
-        start = int(start_s) if start_s else 0
-        end = int(end_s) if end_s else file_size - 1
-    except Exception:
-        raise HTTPException(
-            status_code=416, detail=f"Invalid Range Header: {range_header}"
+        start, end = _parse_byte_range(range_header, file_size)
+        content_length = end - start + 1
+        f.seek(start)
+
+        def iter_range(handle, remaining_bytes):
+            try:
+                while remaining_bytes:
+                    chunk = handle.read(min(CHUNK_SIZE, remaining_bytes))
+                    if not chunk:
+                        break
+                    remaining_bytes -= len(chunk)
+                    yield chunk
+            finally:
+                handle.close()
+
+        response = StreamingResponse(
+            iter_range(f, content_length),
+            status_code=206,
+            media_type=media_type,
+            headers={
+                "Accept-ranges": "bytes",
+                "Content-range": f"bytes {start}-{end}/{file_size}",
+                "Content-length": str(content_length),
+                **extra_headers,
+            },
         )
-
-    if start < 0 or end >= file_size or start > end:
-        raise HTTPException(
-            status_code=416, detail=f"Range not satisfiable: {range_header}"
-        )
-
-    content_length = end - start + 1
-
-    def iter_range():
-        with file_path.open("rb") as f:
-            f.seek(start)
-            remaining_bytes = content_length
-            while remaining_bytes:
-                chunk = f.read(min(CHUNK_SIZE, remaining_bytes))
-                remaining_bytes -= len(chunk)
-                yield chunk
-
-    return StreamingResponse(
-        iter_range(),
-        status_code=206,
-        media_type=_CODEC_MIME.get(
-            track.metadata.codec or "", f"audio/{track.metadata.codec}"
-        ),
-        headers={
-            "Accept-ranges": "bytes",
-            "Content-range": f"bytes {start}-{end}/{file_size}",
-            "Content-length": str(content_length),
-        },
-    )
+        f = None  # ownership transferred to the generator
+        return response
+    finally:
+        if f is not None:
+            f.close()
 
 
 @app.get("/artists", response_model=GetArtistsResponse)
@@ -581,6 +902,80 @@ def search(
         artists=results.artists,
         albums=results.albums,
     )
+
+
+_WARM_MAX_UUIDS = 500
+
+
+@app.post("/tracks/warm", response_model=WarmResponse)
+def warm_tracks(request: WarmRequest):
+    if len(request.track_uuids) > _WARM_MAX_UUIDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many track_uuids: max {_WARM_MAX_UUIDS}",
+        )
+    try:
+        quality_canonical = normalize_quality(request.quality)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported quality preset: {request.quality}",
+        )
+
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    window = request.count if request.count is not None else settings.prefetch_lookahead
+    start = request.current_index
+    end = min(start + window, len(request.track_uuids))
+    queued = 0
+    skipped = 0
+    for i in range(start, end):
+        outcome = coordinator.enqueue_prefetch(
+            request.track_uuids[i], quality_canonical
+        )
+        if outcome == PrefetchOutcome.QUEUED:
+            queued += 1
+        elif outcome in (
+            PrefetchOutcome.ALREADY_CACHED,
+            PrefetchOutcome.SKIPPED_ORIGINAL,
+        ):
+            skipped += 1
+
+    return WarmResponse(
+        accepted=True, prefetch_queued=queued, prefetch_skipped=skipped
+    )
+
+
+@app.get("/settings/quality", response_model=QualitySettingResponse)
+def get_quality_setting():
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    return QualitySettingResponse(quality=coordinator.default_quality)
+
+
+@app.put("/settings/quality", response_model=SetQualityResponse)
+def set_quality_setting(request: SetQualityRequest):
+    try:
+        quality_canonical = normalize_quality(request.quality)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported quality preset: {request.quality}",
+        )
+
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    database: Database = cast(Database, app.state.database)
+
+    try:
+        _, warming = coordinator.persist_and_set_default_quality(
+            quality_canonical,
+            lambda q: database.set_setting("default_streaming_quality", q),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to persist default quality setting",
+        )
+
+    return SetQualityResponse(quality=quality_canonical, warming=warming)
 
 
 @app.get("/")

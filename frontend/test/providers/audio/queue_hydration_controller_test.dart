@@ -164,6 +164,9 @@ class _FakePlayer implements ConcatenatingPlayerController {
   Stream<Duration?> get durationStream => const Stream.empty();
   @override
   Stream<int?> get currentItemIdStream => const Stream.empty();
+  @override
+  Stream<UnavailableAdvance> get unavailableAdvanceStream =>
+      const Stream.empty();
 
   @override
   Future<void> setSeed(List<QueuePlaybackEntry> entries,
@@ -182,6 +185,9 @@ class _FakePlayer implements ConcatenatingPlayerController {
   @override
   void replaceLoadedEntriesMetadata(List<QueuePlaybackEntry> entries) {}
   @override
+  Future<void> refreshLoadedSourcesForAvailabilityChanges(
+      List<QueuePlaybackEntry> entries) async {}
+  @override
   Future<void> removeItem(int itemId) async {}
   @override
   Future<void> seekToItem(int itemId, {Duration position = Duration.zero}) async {}
@@ -197,6 +203,12 @@ class _FakePlayer implements ConcatenatingPlayerController {
   Future<void> setVolume(double volume) async {}
   @override
   Future<void> setLoopMode(ja.LoopMode mode) async {}
+  @override
+  void setStreamQuality(String quality) {}
+  @override
+  Future<void> rebuildCurrentSource(String quality, Duration seekTo) async {}
+  @override
+  Future<void> rebuildAllSources(String quality, Duration seekTo) async {}
   @override
   void dispose() {}
 }

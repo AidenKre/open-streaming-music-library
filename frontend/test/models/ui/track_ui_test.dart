@@ -35,6 +35,7 @@ const _fullMeta = TrackmetadataData(
   sampleRateHz: 44100,
   channels: 2,
   hasAlbumArt: true,
+  coverArtId: 42,
 );
 
 const _minimalMeta = TrackmetadataData(
@@ -235,6 +236,69 @@ void main() {
       expect(ui.sampleRateHz, 44100);
       expect(ui.channels, 2);
       expect(ui.hasAlbumArt, true);
+    });
+
+    test('maps coverArtId via DB round-trip', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'qr-cover-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': {
+          'title': 'Cover Song',
+          'artist': 'Artist',
+          'duration': 100.0,
+          'bitrate_kbps': 128.0,
+          'sample_rate_hz': 44100,
+          'channels': 2,
+          'has_album_art': true,
+          'cover_art_id': 55,
+        },
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
+
+      final rows = await db.getTracks(
+        orderBy: [OrderParameter(column: 'uuid_id')],
+      );
+      final ui = TrackUI.fromQueryRow(rows.first);
+      expect(ui.coverArtId, 55);
+    });
+
+    test('coverArtId is null when not set via DB round-trip', () async {
+      final dto = ClientTrackDto.fromJson({
+        'uuid_id': 'qr-no-cover-1',
+        'created_at': 1700000000,
+        'last_updated': 1700001000,
+        'metadata': {
+          'duration': 100.0,
+          'bitrate_kbps': 128.0,
+          'sample_rate_hz': 44100,
+          'channels': 2,
+          'has_album_art': false,
+        },
+      });
+
+      await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
+      await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
+
+      final rows = await db.getTracks(
+        orderBy: [OrderParameter(column: 'uuid_id')],
+      );
+      final ui = TrackUI.fromQueryRow(rows.first);
+      expect(ui.coverArtId, isNull);
+    });
+  });
+
+  group('coverArtId fromDrift', () {
+    test('maps coverArtId from metadata', () {
+      final ui = TrackUI.fromDrift(_track, _fullMeta);
+      expect(ui.coverArtId, 42);
+    });
+
+    test('coverArtId is null from minimal metadata', () {
+      final ui = TrackUI.fromDrift(_track, _minimalMeta);
+      expect(ui.coverArtId, isNull);
     });
   });
 }

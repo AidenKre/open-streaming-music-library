@@ -3,10 +3,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Flag, auto
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from app.models.album import Album
 from app.models.artist import Artist
+from app.models.cover_art import CoverArt
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -28,6 +29,7 @@ ALLOWED_METADATA_COLUMNS = [
     "sample_rate_hz",
     "channels",
     "has_album_art",
+    "cover_art_id",
 ]
 
 ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
@@ -53,6 +55,17 @@ class SearchResults:
     tracks: List[Track]
     artists: List[Artist]
     albums: List[Album]
+
+
+@dataclass(frozen=True)
+class TrackChange:
+    """One ordered entry in the revision-based change stream. ``track`` is the
+    hydrated row for ``type == "upsert"`` and ``None`` for ``type == "delete"``."""
+
+    type: Literal["upsert", "delete"]
+    revision: int
+    uuid_id: str
+    track: Optional[Track] = None
 
 
 @dataclass(frozen=True)
@@ -161,7 +174,9 @@ def _row_to_track(row) -> Track:
         sample_rate_hz=row["sample_rate_hz"],
         channels=row["channels"],
         has_album_art=bool(row["has_album_art"]),
+        cover_art_id=row["cover_art_id"],
     )
+    keys = row.keys()
     return Track(
         uuid_id=row["uuid_id"],
         file_path=Path(row["file_path"]),
@@ -169,7 +184,25 @@ def _row_to_track(row) -> Track:
         file_hash=row["file_hash"],
         created_at=row["created_at"],
         last_updated=row["last_updated"],
+        revision=row["revision"] if "revision" in keys else 0,
     )
+
+
+TRACK_SELECT_COLUMNS = (
+    "tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, "
+    'tm.artist_id, tm.album_id, tm."year", tm."date", tm.genre, '
+    "tm.track_number, tm.disc_number, tm.codec, tm.duration, "
+    "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, "
+    "tm.has_album_art, tm.cover_art_id, t.file_path, t.file_hash, "
+    "t.created_at, t.last_updated, t.revision"
+)
+
+
+def _track_select_columns(*extra_columns: str) -> str:
+    columns = TRACK_SELECT_COLUMNS
+    if extra_columns:
+        columns += ", " + ", ".join(extra_columns)
+    return columns
 
 
 class Database:
@@ -193,19 +226,344 @@ class Database:
         finally:
             conn.close()
 
+    # Schema version a freshly-initialized database lands on. Keep in sync
+    # with the highest version handled in ``_migrate`` and the schema in
+    # ``init.sql``. The previous value of 2 left fresh DBs reporting an
+    # older version than they actually had (init.sql already creates the v3
+    # ``app_settings`` table), which would have made any future v3→v4
+    # migration spuriously re-create existing tables.
+    LATEST_SCHEMA_VERSION = 5
+
     def initialize(self) -> bool:
-        # TODO: Create database migration logic when I actually need to migrate a database
         if self.context.database_path.exists():
-            print("Database already exists, so skipping")
+            print("Database already exists, running migrations")
+            self._migrate()
             return True
         try:
             with open(self.context.init_sql_path, "r") as f:
                 init_script = f.read()
             with self._connection(commit=True) as conn:
                 conn.executescript(init_script)
+                conn.execute(f"PRAGMA user_version = {self.LATEST_SCHEMA_VERSION}")
             return True
         except Exception as e:
             print(f"Error initializing database: {e}")
+            return False
+
+    def _migrate(self):
+        with self._connection(commit=True) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+            if version < 1:
+                print("Migrating database to version 1: adding cover_arts table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS cover_arts ('
+                    '    "id" INTEGER PRIMARY KEY,'
+                    '    "sha256" TEXT UNIQUE NOT NULL,'
+                    '    "phash" TEXT NOT NULL,'
+                    '    "phash_prefix" TEXT NOT NULL,'
+                    '    "file_path" TEXT UNIQUE NOT NULL'
+                    ')'
+                )
+                conn.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_cover_arts_phash_prefix ON cover_arts("phash_prefix")'
+                )
+                try:
+                    conn.execute(
+                        'ALTER TABLE trackmetadata ADD COLUMN "cover_art_id" INTEGER REFERENCES cover_arts("id")'
+                    )
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                # Truncate any existing 4-char phash prefixes to 2 chars
+                conn.execute(
+                    'UPDATE cover_arts SET phash_prefix = substr(phash_prefix, 1, 2) '
+                    'WHERE length(phash_prefix) > 2'
+                )
+                # Note: PRAGMA user_version is not transactional in SQLite,
+                # but the DDL above is, so partial migration is still detectable.
+                conn.execute("PRAGMA user_version = 1")
+
+            if version < 2:
+                print("Migrating database to version 2: adding queue_sync_state table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS queue_sync_state ('
+                    '"session_id" TEXT NOT NULL PRIMARY KEY, '
+                    '"current_index" INTEGER NOT NULL, '
+                    '"quality" TEXT NOT NULL, '
+                    '"track_uuids" TEXT NOT NULL, '
+                    '"updated_at" REAL NOT NULL'
+                    ')'
+                )
+                conn.execute("PRAGMA user_version = 2")
+
+            if version < 3:
+                print("Migrating database to version 3: adding app_settings table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS app_settings ('
+                    'key TEXT NOT NULL PRIMARY KEY, '
+                    'value TEXT NOT NULL'
+                    ')'
+                )
+                conn.execute("PRAGMA user_version = 3")
+
+            if version < 4:
+                print(
+                    "Migrating database to version 4: adding track_tombstones table"
+                )
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS track_tombstones ('
+                    '    "uuid_id"    TEXT PRIMARY KEY,'
+                    '    "deleted_at" INTEGER NOT NULL'
+                    ')'
+                )
+                conn.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_track_tombstones_deleted_at '
+                    'ON track_tombstones("deleted_at")'
+                )
+                conn.execute("PRAGMA user_version = 4")
+
+            if version < 5:
+                print(
+                    "Migrating database to version 5: adding monotonic "
+                    "revisions for incremental sync"
+                )
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS revision_counter ('
+                    '    "id"    INTEGER PRIMARY KEY CHECK ("id" = 0),'
+                    '    "value" INTEGER NOT NULL'
+                    ')'
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO revision_counter (id, value) "
+                    "VALUES (0, 0)"
+                )
+
+                def _table_exists(name: str) -> bool:
+                    return (
+                        conn.execute(
+                            "SELECT 1 FROM sqlite_master "
+                            "WHERE type='table' AND name=?",
+                            (name,),
+                        ).fetchone()
+                        is not None
+                    )
+
+                # Backfill numbers existing tracks (by last_updated) then
+                # tombstones (by deleted_at) into one revision space. Exact
+                # historical interleave does not matter — only that every uuid
+                # gets a unique revision and a live track out-numbers any prior
+                # tombstone for the same uuid.
+                track_max = 0
+                if _table_exists("tracks"):
+                    try:
+                        conn.execute(
+                            'ALTER TABLE tracks ADD COLUMN "revision" '
+                            "INTEGER NOT NULL DEFAULT 0"
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                    conn.execute(
+                        'CREATE INDEX IF NOT EXISTS idx_tracks_revision '
+                        'ON tracks("revision")'
+                    )
+                    conn.execute(
+                        "UPDATE tracks SET revision = rn FROM ("
+                        "  SELECT id, ROW_NUMBER() OVER ("
+                        "    ORDER BY last_updated, id) AS rn FROM tracks"
+                        ") AS ordered WHERE tracks.id = ordered.id"
+                    )
+                    track_max = conn.execute(
+                        "SELECT COALESCE(MAX(revision), 0) FROM tracks"
+                    ).fetchone()[0]
+
+                tombstone_max = track_max
+                if _table_exists("track_tombstones"):
+                    try:
+                        conn.execute(
+                            'ALTER TABLE track_tombstones ADD COLUMN "revision" '
+                            "INTEGER NOT NULL DEFAULT 0"
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                    conn.execute(
+                        'CREATE INDEX IF NOT EXISTS idx_track_tombstones_revision '
+                        'ON track_tombstones("revision")'
+                    )
+                    conn.execute(
+                        "UPDATE track_tombstones SET revision = ? + rn FROM ("
+                        "  SELECT uuid_id, ROW_NUMBER() OVER ("
+                        "    ORDER BY deleted_at, uuid_id) AS rn"
+                        "  FROM track_tombstones"
+                        ") AS ordered "
+                        "WHERE track_tombstones.uuid_id = ordered.uuid_id",
+                        (track_max,),
+                    )
+                    tombstone_max = conn.execute(
+                        "SELECT COALESCE(MAX(revision), 0) FROM track_tombstones"
+                    ).fetchone()[0]
+
+                conn.execute(
+                    "UPDATE revision_counter SET value = ? WHERE id = 0",
+                    (max(track_max, tombstone_max),),
+                )
+                conn.execute("PRAGMA user_version = 5")
+
+    @staticmethod
+    def _next_revision(conn) -> int:
+        """Allocate the next monotonic revision on ``conn``'s open transaction.
+
+        Safe under SQLite's single-writer serialization — the increment and
+        read-back happen inside the caller's exclusive write transaction, so
+        no two writers can observe the same value. Must be called before the
+        row write that stores the returned revision."""
+        conn.execute("UPDATE revision_counter SET value = value + 1 WHERE id = 0")
+        return conn.execute(
+            "SELECT value FROM revision_counter WHERE id = 0"
+        ).fetchone()[0]
+
+    @staticmethod
+    def _bump_track_revision(conn, uuid_id: str) -> None:
+        conn.execute(
+            "UPDATE tracks SET revision = ?, last_updated = unixepoch() "
+            "WHERE uuid_id = ?",
+            (Database._next_revision(conn), uuid_id),
+        )
+
+    def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE id = ?",
+                    (cover_art_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return CoverArt(
+                    id=row["id"], sha256=row["sha256"], phash=row["phash"],
+                    phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
+                )
+        except Exception as e:
+            print(f"Failed to get cover art by id {cover_art_id}: {e}")
+            return None
+
+    def get_cover_art_by_sha256(self, sha256: str) -> CoverArt | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE sha256 = ?",
+                    (sha256,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return CoverArt(
+                    id=row["id"], sha256=row["sha256"], phash=row["phash"],
+                    phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
+                )
+        except Exception as e:
+            print(f"Failed to get cover art by sha256: {e}")
+            return None
+
+    def get_cover_arts_by_phash_prefix(self, prefix: str) -> list[CoverArt]:
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE phash_prefix = ?",
+                    (prefix,),
+                ).fetchall()
+                return [
+                    CoverArt(
+                        id=row["id"], sha256=row["sha256"], phash=row["phash"],
+                        phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
+                    )
+                    for row in rows
+                ]
+        except Exception as e:
+            print(f"Failed to get cover arts by phash prefix: {e}")
+            return []
+
+    def insert_cover_art(self, sha256: str, phash: str, phash_prefix: str, file_path: str) -> int:
+        try:
+            with self._connection(commit=True) as conn:
+                cursor = conn.execute(
+                    'INSERT INTO cover_arts (sha256, phash, phash_prefix, file_path) VALUES (?, ?, ?, ?)',
+                    (sha256, phash, phash_prefix, file_path),
+                )
+                return cursor.lastrowid  # type: ignore[return-value]
+        except Exception as e:
+            print(f"Error inserting cover art: {e}")
+            raise
+
+    def clear_cover_art_references(self, cover_art_id: int) -> None:
+        """Set cover_art_id to NULL on all trackmetadata rows referencing this cover art.
+
+        Allocates a fresh revision per affected row so each cover-art removal
+        propagates as its own change to incremental-sync clients — without
+        this it would never reach a client that synced before the next "real"
+        metadata edit.
+        """
+        with self._connection(commit=True) as conn:
+            affected = conn.execute(
+                "SELECT uuid_id FROM trackmetadata WHERE cover_art_id = ?",
+                (cover_art_id,),
+            ).fetchall()
+            conn.execute(
+                "UPDATE trackmetadata SET cover_art_id = NULL WHERE cover_art_id = ?",
+                (cover_art_id,),
+            )
+            for row in affected:
+                self._bump_track_revision(conn, row["uuid_id"])
+
+    def delete_cover_art(self, cover_art_id: int) -> bool:
+        try:
+            with self._connection(commit=True) as conn:
+                affected = conn.execute(
+                    "SELECT uuid_id FROM trackmetadata WHERE cover_art_id = ?",
+                    (cover_art_id,),
+                ).fetchall()
+                cursor = conn.execute(
+                    "DELETE FROM cover_arts WHERE id = ?", (cover_art_id,)
+                )
+                if cursor.rowcount > 0:
+                    for row in affected:
+                        self._bump_track_revision(conn, row["uuid_id"])
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Failed to delete cover art {cover_art_id}: {e}")
+            return False
+
+    def get_tracks_missing_cover_art(self) -> List[Track]:
+        """Return tracks where has_album_art=1 AND cover_art_id IS NULL."""
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    f"SELECT {_track_select_columns()} "
+                    "FROM trackmetadata AS tm "
+                    "JOIN tracks AS t ON tm.uuid_id = t.uuid_id "
+                    "WHERE tm.has_album_art = 1 AND tm.cover_art_id IS NULL"
+                ).fetchall()
+                return [_row_to_track(row) for row in rows]
+        except Exception as e:
+            print(f"Failed to get tracks missing cover art: {e}")
+            return []
+
+    def update_track_cover_art_id(self, uuid_id: str, cover_art_id: int) -> bool:
+        """Set cover_art_id for a specific track identified by uuid_id.
+
+        Allocates a fresh revision so the frontend's incremental sync sees the
+        cover-art assignment — without it, a backfill-only change would never
+        appear in a ``GET /changes`` page.
+        """
+        try:
+            with self._connection(commit=True) as conn:
+                cursor = conn.execute(
+                    "UPDATE trackmetadata SET cover_art_id = ? WHERE uuid_id = ?",
+                    (cover_art_id, uuid_id),
+                )
+                if cursor.rowcount > 0:
+                    self._bump_track_revision(conn, uuid_id)
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Failed to update cover_art_id for track {uuid_id}: {e}")
             return False
 
     def add_track(self, track: Track, timeout: float = 5) -> bool:
@@ -241,17 +599,29 @@ class Database:
                         artist_id, metadata.year, effective_artist,
                     )
 
-                # Insert track
+                # Clear any stale tombstone so a re-added uuid is not also
+                # streamed as a delete; the fresh row's higher revision would
+                # supersede it anyway, but dropping it keeps the stream clean.
+                conn.execute(
+                    "DELETE FROM track_tombstones WHERE uuid_id = ?",
+                    (track.uuid_id,),
+                )
+
+                # Insert track with a freshly allocated monotonic revision.
+                revision = self._next_revision(conn)
+                track.revision = revision
                 tracks_entry = (
                     track.uuid_id,
                     str(track.file_path),
                     track.file_hash,
                     track.created_at,
                     track.last_updated,
+                    revision,
                 )
                 tracks_sql_query = (
-                    "INSERT INTO tracks (uuid_id, file_path, file_hash, created_at, last_updated) "
-                    "VALUES (?, ?, ?, ?, ?)"
+                    "INSERT INTO tracks "
+                    "(uuid_id, file_path, file_hash, created_at, last_updated, revision) "
+                    "VALUES (?, ?, ?, ?, ?, ?)"
                 )
                 temp = conn.cursor().execute(tracks_sql_query, tracks_entry)
                 track_db_id = temp.lastrowid
@@ -277,12 +647,13 @@ class Database:
                     metadata.sample_rate_hz,
                     metadata.channels,
                     metadata.has_album_art,
+                    metadata.cover_art_id,
                 )
                 trackmetadata_sql_query = (
                     "INSERT INTO trackmetadata (track_id, uuid_id, title, artist, album, album_artist, "
                     'artist_id, album_id, "year", "date", genre, track_number, disc_number, codec, duration, '
-                    "bitrate_kbps, sample_rate_hz, channels, has_album_art) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "bitrate_kbps, sample_rate_hz, channels, has_album_art, cover_art_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 conn.cursor().execute(trackmetadata_sql_query, trackmetadata_entry)
 
@@ -399,6 +770,16 @@ class Database:
 
                 fts_album = meta_row["album"] or ""
 
+                # Record a tombstone before the hard delete so incremental
+                # sync clients can reconcile the removal — the row is about to
+                # vanish from `tracks`/`trackmetadata`, leaving the frontend no
+                # other signal that it ever existed.
+                conn.execute(
+                    "INSERT OR REPLACE INTO track_tombstones "
+                    "(uuid_id, deleted_at, revision) VALUES (?, unixepoch(), ?)",
+                    (uuid_id, self._next_revision(conn)),
+                )
+
                 # Delete trackmetadata and tracks
                 conn.execute(
                     "DELETE FROM trackmetadata WHERE uuid_id = ?", (uuid_id,)
@@ -500,12 +881,7 @@ class Database:
             raise ValueError
 
         search_query = (
-            "SELECT "
-            'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
-            'tm.artist_id, tm.album_id, tm."year", '
-            'tm."date", tm.genre, tm.track_number, tm.disc_number, tm.codec, tm.duration, '
-            "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, t.file_path, "
-            "t.file_hash, t.created_at, t.last_updated "
+            f"SELECT {_track_select_columns()} "
             "FROM trackmetadata AS tm "
             "JOIN tracks AS t ON "
             " tm.uuid_id = t.uuid_id"
@@ -569,6 +945,108 @@ class Database:
         tracks: List[Track] = [_row_to_track(row) for row in rows]
 
         return tracks
+
+    def get_changes(
+        self, after_revision: int, limit: int, timeout: float = 5
+    ) -> tuple[List[TrackChange], int, Optional[int]]:
+        """Return up to ``limit`` change entries with ``revision >
+        after_revision`` (ascending), the current latest revision, and the
+        next cursor (the highest revision consumed when the raw stream filled
+        the page, else ``None``).
+
+        Upserts (live ``tracks``) and deletes (``track_tombstones``) share one
+        revision space and interleave by revision, so a single ordered stream
+        carries both — deletes are no longer a first-page side channel and
+        surface on whichever page their revision lands on.
+
+        ``next_cursor`` is derived from the *raw* stream length, not the
+        returned ``changes``: an upsert whose track was concurrently deleted
+        between this query and the hydration JOIN is dropped from ``changes``,
+        which would otherwise shrink the page below ``limit`` and falsely
+        signal "caught up", stranding higher-revision rows until the next
+        sync. Advancing past the consumed revision is safe — the dropped
+        row's delete carries a higher revision and arrives on a later page."""
+        try:
+            with self._connection(timeout=timeout) as conn:
+                latest = conn.execute(
+                    "SELECT value FROM revision_counter WHERE id = 0"
+                ).fetchone()[0]
+                stream = conn.execute(
+                    "SELECT 'upsert' AS change_type, revision, uuid_id FROM tracks "
+                    "WHERE revision > ? "
+                    "UNION ALL "
+                    "SELECT 'delete' AS change_type, revision, uuid_id "
+                    "FROM track_tombstones WHERE revision > ? "
+                    "ORDER BY revision ASC LIMIT ?",
+                    (after_revision, after_revision, limit),
+                ).fetchall()
+
+                upsert_uuids = [
+                    r["uuid_id"] for r in stream if r["change_type"] == "upsert"
+                ]
+                track_by_uuid: dict[str, Track] = {}
+                if upsert_uuids:
+                    placeholders = ",".join("?" * len(upsert_uuids))
+                    hydrated = conn.execute(
+                        f"SELECT {_track_select_columns()} "
+                        "FROM trackmetadata AS tm "
+                        "JOIN tracks AS t ON tm.uuid_id = t.uuid_id "
+                        f"WHERE t.uuid_id IN ({placeholders})",
+                        tuple(upsert_uuids),
+                    ).fetchall()
+                    track_by_uuid = {
+                        row["uuid_id"]: _row_to_track(row) for row in hydrated
+                    }
+
+                changes: List[TrackChange] = []
+                for r in stream:
+                    if r["change_type"] == "upsert":
+                        track = track_by_uuid.get(r["uuid_id"])
+                        if track is None:
+                            # Raced with a concurrent delete; the delete entry
+                            # carries a higher revision and will be streamed.
+                            continue
+                        changes.append(
+                            TrackChange(
+                                type="upsert",
+                                revision=r["revision"],
+                                uuid_id=r["uuid_id"],
+                                track=track,
+                            )
+                        )
+                    else:
+                        changes.append(
+                            TrackChange(
+                                type="delete",
+                                revision=r["revision"],
+                                uuid_id=r["uuid_id"],
+                            )
+                        )
+
+                # Normally, a cursor is needed only when the raw stream hit
+                # the page limit. If hydration dropped raw upsert rows, return
+                # a cursor even on a short final page so clients can advance
+                # past the consumed revision instead of requesting it forever.
+                last_consumed_revision = stream[-1]["revision"] if stream else None
+                last_returned_revision = (
+                    changes[-1].revision if changes else after_revision
+                )
+                should_advance_past_dropped_rows = (
+                    last_consumed_revision is not None
+                    and last_consumed_revision > last_returned_revision
+                )
+                next_cursor = (
+                    last_consumed_revision
+                    if len(stream) == limit or should_advance_past_dropped_rows
+                    else None
+                )
+                return changes, latest, next_cursor
+        except Exception as e:
+            # Re-raise so the endpoint surfaces a 5xx. Swallowing here would
+            # return an empty page, which the client reads as "caught up" and
+            # silently stops syncing — masking a transient DB failure.
+            print(f"Failed to get changes after revision {after_revision}: {e}")
+            raise
 
     def get_tracks_count(
         self,
@@ -876,12 +1354,7 @@ class Database:
                         track_ids = [r["rowid"] for r in track_rows]
                         placeholders = ", ".join("?" for _ in track_ids)
                         full_rows = conn.execute(
-                            "SELECT "
-                            'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
-                            'tm.artist_id, tm.album_id, tm."year", '
-                            'tm."date", tm.genre, tm.track_number, tm.disc_number, tm.codec, tm.duration, '
-                            "tm.bitrate_kbps, tm.sample_rate_hz, tm.channels, tm.has_album_art, t.file_path, "
-                            "t.file_hash, t.created_at, t.last_updated, tm.track_id "
+                            f"SELECT {_track_select_columns('tm.track_id')} "
                             "FROM trackmetadata AS tm "
                             "JOIN tracks AS t ON tm.uuid_id = t.uuid_id "
                             f"WHERE tm.track_id IN ({placeholders})",
@@ -955,6 +1428,115 @@ class Database:
         return SearchResults(
             tracks=result_tracks, artists=result_artists, albums=result_albums
         )
+
+    # ── Queue sync state ─────────────────────────────────────────────────
+
+    def upsert_queue_sync_state(
+        self,
+        session_id: str,
+        current_index: int,
+        quality: str,
+        track_uuids_json: str,
+        updated_at: float,
+    ) -> None:
+        try:
+            with self._connection(commit=True) as conn:
+                # Conditional upsert: a late-arriving snapshot with an older
+                # updated_at must NOT clobber a newer one. INSERT OR REPLACE
+                # would happily overwrite — the ON CONFLICT WHERE clause keeps
+                # the existing row when the incoming updated_at is older.
+                conn.execute(
+                    "INSERT INTO queue_sync_state "
+                    "(session_id, current_index, quality, track_uuids, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET "
+                    "current_index = excluded.current_index, "
+                    "quality = excluded.quality, "
+                    "track_uuids = excluded.track_uuids, "
+                    "updated_at = excluded.updated_at "
+                    "WHERE excluded.updated_at >= queue_sync_state.updated_at",
+                    (session_id, current_index, quality, track_uuids_json, updated_at),
+                )
+        except Exception as e:
+            print(f"Error upserting queue sync state: {e}")
+
+    def get_queue_sync_state(self, session_id: str) -> dict | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT session_id, current_index, quality, track_uuids, updated_at "
+                    "FROM queue_sync_state WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return {
+                    "session_id": row["session_id"],
+                    "current_index": row["current_index"],
+                    "quality": row["quality"],
+                    "track_uuids": row["track_uuids"],
+                    "updated_at": row["updated_at"],
+                }
+        except Exception as e:
+            print(f"Error getting queue sync state: {e}")
+            return None
+
+    def delete_queue_sync_state(self, session_id: str) -> bool:
+        try:
+            with self._connection(commit=True) as conn:
+                cursor = conn.execute(
+                    "DELETE FROM queue_sync_state WHERE session_id = ?",
+                    (session_id,),
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error deleting queue sync state: {e}")
+            return False
+
+    # ── App settings ──────────────────────────────────────────────────────
+
+    def get_setting(self, key: str) -> str | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT value FROM app_settings WHERE key = ?", (key,)
+                ).fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            print(f"Error reading setting {key!r}: {e}")
+            return None
+
+    def set_setting(self, key: str, value: str) -> None:
+        # Raises on failure so callers can keep in-memory state consistent
+        # with what is actually persisted.
+        with self._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
+    def get_track_tombstones(self) -> list[str]:
+        """Return uuids of all hard-deleted tracks. Incremental sync streams
+        tombstones by revision via ``get_changes``; this remains as a simple
+        helper for ops and tests."""
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT uuid_id FROM track_tombstones"
+                ).fetchall()
+                return [row[0] for row in rows]
+        except Exception as e:
+            print(f"Error fetching track tombstones: {e}")
+            return []
+
+    def get_all_track_uuids(self) -> list[str]:
+        try:
+            with self._connection() as conn:
+                rows = conn.execute("SELECT uuid_id FROM tracks").fetchall()
+                return [row[0] for row in rows]
+        except Exception as e:
+            print(f"Error fetching all track UUIDs: {e}")
+            return []
 
 
 def prepare_fts_query(raw_query: str) -> str:

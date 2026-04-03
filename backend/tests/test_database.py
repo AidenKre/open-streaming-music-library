@@ -104,8 +104,43 @@ class TestDatabaseInitialize:
         assert "trackmetadata" in db_names
         assert "artists" in db_names
         assert "albums" in db_names
+        # app_settings ships in init.sql; a fresh install should already
+        # have it without needing the v3 migration to run.
+        assert "app_settings" in db_names
+
+        # Both single-text-PK tables must declare NOT NULL explicitly. SQLite
+        # treats a bare ``TEXT PRIMARY KEY`` as nullable (a historical quirk
+        # — only INTEGER PRIMARY KEY auto-rejects NULL), so without this an
+        # INSERT with NULL keys would succeed at the storage layer and only
+        # break later.
+        for table in ("queue_sync_state", "app_settings"):
+            cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            pk_cols = [c for c in cols if c["pk"] >= 1]
+            assert len(pk_cols) == 1, f"{table} should have a single PK column"
+            assert pk_cols[0]["notnull"] == 1, (
+                f"{table}.{pk_cols[0]['name']} must be declared NOT NULL"
+            )
 
         conn.close()
+
+    def test_initialize__fresh_db__user_version_matches_latest_schema(
+        self, tmp_path: Path
+    ):
+        """init.sql already includes the v3 ``app_settings`` table, so
+        ``PRAGMA user_version`` on a fresh DB must report the version it
+        actually contains. Otherwise a future v3→v4 migration would
+        spuriously re-run v3 logic against a DB that already has it.
+        """
+        from app.database.database import Database
+
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        assert database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+        assert version == Database.LATEST_SCHEMA_VERSION
 
     def test_initialize__database_does_exist__does_not_overwrite(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
@@ -585,6 +620,111 @@ class TestDatabaseDeleteTrack:
         res = cur.execute("SELECT COUNT(*) FROM albums;")
         assert res.fetchone()[0] == 0
         conn.close()
+
+
+class TestDatabaseTombstones:
+    def test_delete_track__valid_uuid__inserts_tombstone(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        track = create_track(tmp_path / "t.mp3", "song", "artist")
+        track.uuid_id = "tomb_uuid"
+        assert database.add_track(track=track)
+
+        assert database.delete_track(uuid_id="tomb_uuid")
+
+        tombstones = database.get_track_tombstones()
+        assert "tomb_uuid" in tombstones
+
+    def test_delete_track__missing_uuid__no_tombstone(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        assert database.delete_track(uuid_id="never_existed") is False
+        assert database.get_track_tombstones() == []
+
+    def test_get_track_tombstones__returns_all(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        with database._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT INTO track_tombstones (uuid_id, deleted_at) VALUES (?, ?)",
+                ("old_uuid", 100),
+            )
+            conn.execute(
+                "INSERT INTO track_tombstones (uuid_id, deleted_at) VALUES (?, ?)",
+                ("new_uuid", 200),
+            )
+
+        assert sorted(database.get_track_tombstones()) == ["new_uuid", "old_uuid"]
+
+    def test_delete_track__re_delete__bumps_tombstone_timestamp(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        # Manually seed an old tombstone, then re-add and re-delete the same
+        # uuid to verify INSERT OR REPLACE updates deleted_at.
+        with database._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT INTO track_tombstones (uuid_id, deleted_at) VALUES (?, ?)",
+                ("revived_uuid", 1),
+            )
+
+        track = create_track(tmp_path / "t.mp3", "song", "artist")
+        track.uuid_id = "revived_uuid"
+        assert database.add_track(track=track)
+        assert database.delete_track(uuid_id="revived_uuid")
+
+        with database._connection() as conn:
+            row = conn.execute(
+                "SELECT deleted_at FROM track_tombstones WHERE uuid_id = ?",
+                ("revived_uuid",),
+            ).fetchone()
+            assert row is not None
+            assert row[0] > 1
+
+
+class TestUpsertQueueSyncState:
+    def test_upsert__newer_updated_at__overwrites(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        database.upsert_queue_sync_state("s1", 0, "320", '["a"]', 100.0)
+        database.upsert_queue_sync_state("s1", 5, "192", '["b","c"]', 200.0)
+
+        row = database.get_queue_sync_state("s1")
+        assert row is not None
+        assert row["current_index"] == 5
+        assert row["quality"] == "192"
+        assert row["track_uuids"] == '["b","c"]'
+        assert row["updated_at"] == 200.0
+
+    def test_upsert__older_updated_at__keeps_existing(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        database.upsert_queue_sync_state("s1", 5, "192", '["b","c"]', 200.0)
+        # A stale snapshot arriving late must not clobber the newer one.
+        database.upsert_queue_sync_state("s1", 0, "320", '["a"]', 100.0)
+
+        row = database.get_queue_sync_state("s1")
+        assert row is not None
+        assert row["current_index"] == 5
+        assert row["updated_at"] == 200.0
+
+    def test_upsert__equal_updated_at__overwrites(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        database.upsert_queue_sync_state("s1", 0, "320", '["a"]', 100.0)
+        # Equal timestamps overwrite — the client may be replaying the same
+        # snapshot with corrected fields rather than a strictly newer one.
+        database.upsert_queue_sync_state("s1", 7, "192", '["b"]', 100.0)
+
+        row = database.get_queue_sync_state("s1")
+        assert row is not None
+        assert row["current_index"] == 7
 
 
 class TestDatabaseGetTracks:
@@ -2598,3 +2738,616 @@ class TestPrepareFtsQuery:
 
     def test_prepare_fts_query__double_quotes__escapes_correctly(self):
         assert prepare_fts_query('say "hi"') == '"say"* """hi"""*'
+
+
+class TestDatabaseMigration:
+    def _create_v0_database(self, tmp_path: Path) -> Path:
+        """Create a database at version 0 (no cover_arts table, no cover_art_id column)."""
+        database_path = tmp_path / "database.db"
+        conn = sqlite3.connect(database_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Create minimal schema without cover_arts
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS artists (
+                "id" INTEGER PRIMARY KEY,
+                "name" TEXT NOT NULL,
+                "name_lower" TEXT NOT NULL GENERATED ALWAYS AS (LOWER("name")) STORED UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS albums (
+                "id" INTEGER PRIMARY KEY,
+                "name" TEXT,
+                "name_lower" TEXT GENERATED ALWAYS AS (LOWER("name")) STORED,
+                "artist_id" INTEGER NOT NULL,
+                "year" INTEGER,
+                "is_single_grouping" INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY ("artist_id") REFERENCES artists("id")
+            );
+            CREATE TABLE IF NOT EXISTS tracks (
+                "id" INTEGER PRIMARY KEY,
+                "uuid_id" TEXT UNIQUE NOT NULL,
+                "file_path" TEXT NOT NULL,
+                "file_hash" TEXT UNIQUE,
+                "created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
+                "last_updated" INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE TABLE IF NOT EXISTS trackmetadata (
+                "track_id" INTEGER UNIQUE NOT NULL,
+                "uuid_id" TEXT UNIQUE NOT NULL,
+                "title" TEXT,
+                "artist" TEXT,
+                "album" TEXT,
+                "album_artist" TEXT,
+                "artist_id" INTEGER,
+                "album_id" INTEGER,
+                "year" INTEGER,
+                "date" TEXT,
+                "genre" TEXT,
+                "track_number" INTEGER,
+                "disc_number" INTEGER,
+                "codec" TEXT,
+                "duration" FLOAT,
+                "bitrate_kbps" FLOAT,
+                "sample_rate_hz" INTEGER,
+                "channels" INTEGER,
+                "has_album_art" INTEGER NOT NULL CHECK ("has_album_art" IN (0,1)),
+                FOREIGN KEY ("track_id") REFERENCES tracks("id"),
+                FOREIGN KEY ("uuid_id") REFERENCES tracks("uuid_id"),
+                FOREIGN KEY ("artist_id") REFERENCES artists("id"),
+                FOREIGN KEY ("album_id") REFERENCES albums("id")
+            );
+        """)
+        # user_version stays at 0 (default)
+        conn.commit()
+        conn.close()
+        return database_path
+
+    def test_migrate__v0_database__creates_cover_arts_table(self, tmp_path: Path):
+        database_path = self._create_v0_database(tmp_path)
+
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        tables = [row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_arts" in tables
+
+    def test_migrate__v0_database__adds_cover_art_id_column(self, tmp_path: Path):
+        database_path = self._create_v0_database(tmp_path)
+
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        columns = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(trackmetadata)"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_art_id" in columns
+
+    def test_migrate__v0_database__sets_user_version_to_latest(self, tmp_path: Path):
+        database_path = self._create_v0_database(tmp_path)
+
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+
+        assert version == Database.LATEST_SCHEMA_VERSION
+
+    def test_migrate__already_at_v1__does_not_fail(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        # Initialize again — should not fail
+        database2 = set_up_database(database_path=database_path)
+        result = database2.initialize()
+
+        assert result is True
+
+    def test_fresh_database__includes_cover_arts_table(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        tables = [row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_arts" in tables
+
+    def test_fresh_database__trackmetadata_has_cover_art_id(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        columns = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(trackmetadata)"
+        ).fetchall()]
+        conn.close()
+
+        assert "cover_art_id" in columns
+
+    def _create_v4_database(self, tmp_path: Path) -> Path:
+        """Create a v4 database: tracks/track_tombstones without a revision
+        column and no revision_counter, seeded with rows to backfill."""
+        database_path = tmp_path / "database.db"
+        conn = sqlite3.connect(database_path)
+        conn.executescript(
+            """
+            CREATE TABLE tracks (
+                "id" INTEGER PRIMARY KEY,
+                "uuid_id" TEXT UNIQUE NOT NULL,
+                "file_path" TEXT NOT NULL,
+                "file_hash" TEXT UNIQUE,
+                "created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
+                "last_updated" INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE TABLE track_tombstones (
+                "uuid_id"    TEXT PRIMARY KEY,
+                "deleted_at" INTEGER NOT NULL
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO tracks (uuid_id, file_path, last_updated) VALUES (?, ?, ?)",
+            [("t-a", "/a", 100), ("t-b", "/b", 300), ("t-c", "/c", 200)],
+        )
+        conn.executemany(
+            "INSERT INTO track_tombstones (uuid_id, deleted_at) VALUES (?, ?)",
+            [("d-x", 400), ("d-y", 500)],
+        )
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+        return database_path
+
+    def test_migrate__v4_database__adds_revision_columns_and_counter(
+        self, tmp_path: Path
+    ):
+        database_path = self._create_v4_database(tmp_path)
+        set_up_database(database_path=database_path).initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        track_cols = [r["name"] for r in conn.execute("PRAGMA table_info(tracks)")]
+        tomb_cols = [
+            r["name"] for r in conn.execute("PRAGMA table_info(track_tombstones)")
+        ]
+        tables = [
+            r["name"]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        ]
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+
+        assert "revision" in track_cols
+        assert "revision" in tomb_cols
+        assert "revision_counter" in tables
+        assert version == Database.LATEST_SCHEMA_VERSION
+
+    def test_migrate__v4_database__backfills_monotonic_revisions(
+        self, tmp_path: Path
+    ):
+        database_path = self._create_v4_database(tmp_path)
+        set_up_database(database_path=database_path).initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        # Tracks numbered by last_updated: t-a(100)=1, t-c(200)=2, t-b(300)=3.
+        track_rev = {
+            r["uuid_id"]: r["revision"]
+            for r in conn.execute("SELECT uuid_id, revision FROM tracks")
+        }
+        # Tombstones continue the numbering by deleted_at: d-x(400)=4, d-y(500)=5.
+        tomb_rev = {
+            r["uuid_id"]: r["revision"]
+            for r in conn.execute("SELECT uuid_id, revision FROM track_tombstones")
+        }
+        counter = conn.execute(
+            "SELECT value FROM revision_counter WHERE id = 0"
+        ).fetchone()["value"]
+        conn.close()
+
+        assert track_rev == {"t-a": 1, "t-c": 2, "t-b": 3}
+        assert tomb_rev == {"d-x": 4, "d-y": 5}
+        # All revisions unique and the counter sits at the maximum assigned.
+        all_revs = list(track_rev.values()) + list(tomb_rev.values())
+        assert len(set(all_revs)) == len(all_revs)
+        assert counter == max(all_revs)
+
+    def _revisions_snapshot(self, database_path: Path) -> dict:
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        snap = {
+            "tracks": {
+                r["uuid_id"]: r["revision"]
+                for r in conn.execute("SELECT uuid_id, revision FROM tracks")
+            },
+            "tombstones": {
+                r["uuid_id"]: r["revision"]
+                for r in conn.execute(
+                    "SELECT uuid_id, revision FROM track_tombstones"
+                )
+            },
+            "counter": conn.execute(
+                "SELECT value FROM revision_counter WHERE id = 0"
+            ).fetchone()["value"],
+        }
+        conn.close()
+        return snap
+
+    def test_migrate__v5_rerun__is_idempotent(self, tmp_path: Path):
+        # Force the v5 block to run a second time by resetting user_version
+        # without changing data; the deterministic backfill must reproduce the
+        # same revisions and counter rather than double-applying.
+        database_path = self._create_v4_database(tmp_path)
+        set_up_database(database_path=database_path).initialize()
+        first = self._revisions_snapshot(database_path)
+
+        conn = sqlite3.connect(database_path)
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+
+        set_up_database(database_path=database_path).initialize()
+        second = self._revisions_snapshot(database_path)
+
+        assert second == first
+
+    def test_migrate__v4_database_without_tombstones_table__succeeds(
+        self, tmp_path: Path
+    ):
+        # A partial DB missing track_tombstones must still migrate: the v5
+        # block guards each table with _table_exists.
+        database_path = tmp_path / "database.db"
+        conn = sqlite3.connect(database_path)
+        conn.executescript(
+            """
+            CREATE TABLE tracks (
+                "id" INTEGER PRIMARY KEY,
+                "uuid_id" TEXT UNIQUE NOT NULL,
+                "file_path" TEXT NOT NULL,
+                "file_hash" TEXT UNIQUE,
+                "created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
+                "last_updated" INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO tracks (uuid_id, file_path, last_updated) "
+            "VALUES ('only', '/o', 50)"
+        )
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+
+        assert set_up_database(database_path=database_path).initialize()
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        rev = conn.execute(
+            "SELECT revision FROM tracks WHERE uuid_id = 'only'"
+        ).fetchone()["revision"]
+        counter = conn.execute(
+            "SELECT value FROM revision_counter WHERE id = 0"
+        ).fetchone()["value"]
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+
+        assert rev == 1
+        assert counter == 1
+        assert version == Database.LATEST_SCHEMA_VERSION
+
+
+class TestRevisionAllocation:
+    def _revision_of(self, database_path: Path, uuid_id: str) -> int:
+        conn = sqlite3.connect(database_path)
+        row = conn.execute(
+            "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
+        ).fetchone()
+        conn.close()
+        return row[0]
+
+    def _tombstone_revision(self, database_path: Path, uuid_id: str) -> int:
+        conn = sqlite3.connect(database_path)
+        row = conn.execute(
+            "SELECT revision FROM track_tombstones WHERE uuid_id = ?", (uuid_id,)
+        ).fetchone()
+        conn.close()
+        return row[0]
+
+    def _counter(self, database_path: Path) -> int:
+        conn = sqlite3.connect(database_path)
+        row = conn.execute(
+            "SELECT value FROM revision_counter WHERE id = 0"
+        ).fetchone()
+        conn.close()
+        return row[0]
+
+    def test_add_track__allocates_increasing_revisions(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        a = create_track("/a", "A", "Artist")
+        b = create_track("/b", "B", "Artist")
+        database.add_track(a)
+        database.add_track(b)
+
+        rev_a = self._revision_of(database_path, a.uuid_id)
+        rev_b = self._revision_of(database_path, b.uuid_id)
+        assert rev_a >= 1
+        assert rev_b > rev_a
+        assert self._counter(database_path) == rev_b
+
+        hydrated = database.get_tracks(
+            search_parameters=[
+                SearchParameter(column="uuid_id", operator="=", value=a.uuid_id)
+            ]
+        )
+        assert hydrated[0].revision == rev_a
+
+    def test_update_cover_art__bumps_revision(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        track = create_track("/a", "A", "Artist")
+        database.add_track(track)
+        rev_before = self._revision_of(database_path, track.uuid_id)
+
+        cover_id = database.insert_cover_art(
+            sha256="s", phash="p", phash_prefix="pp", file_path="/c.png"
+        )
+        assert database.update_track_cover_art_id(track.uuid_id, cover_id)
+
+        rev_after = self._revision_of(database_path, track.uuid_id)
+        assert rev_after > rev_before
+
+    def test_delete_track__tombstone_revision_exceeds_track(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        track = create_track("/a", "A", "Artist")
+        database.add_track(track)
+        track_rev = self._revision_of(database_path, track.uuid_id)
+
+        assert database.delete_track(track.uuid_id)
+        tomb_rev = self._tombstone_revision(database_path, track.uuid_id)
+        assert tomb_rev > track_rev
+
+    def test_readd_after_delete__clears_tombstone_and_outranks_it(
+        self, tmp_path: Path
+    ):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        track = create_track("/a", "A", "Artist")
+        database.add_track(track)
+        database.delete_track(track.uuid_id)
+        tomb_rev = self._tombstone_revision(database_path, track.uuid_id)
+
+        readded = create_track("/a", "A", "Artist")
+        readded.uuid_id = track.uuid_id
+        database.add_track(readded)
+
+        # Tombstone gone, live row out-revisions the prior delete.
+        conn = sqlite3.connect(database_path)
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM track_tombstones WHERE uuid_id = ?",
+            (track.uuid_id,),
+        ).fetchone()[0]
+        conn.close()
+        assert remaining == 0
+        assert self._revision_of(database_path, track.uuid_id) > tomb_rev
+
+    def test_clear_cover_art_references__allocates_one_revision_per_track(
+        self, tmp_path: Path
+    ):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        a = create_track("/a", "A", "Artist")
+        b = create_track("/b", "B", "Artist")
+        database.add_track(a)
+        database.add_track(b)
+
+        cover_id = database.insert_cover_art(
+            sha256="s", phash="p", phash_prefix="pp", file_path="/c.png"
+        )
+        database.update_track_cover_art_id(a.uuid_id, cover_id)
+        database.update_track_cover_art_id(b.uuid_id, cover_id)
+        rev_a_before = self._revision_of(database_path, a.uuid_id)
+        rev_b_before = self._revision_of(database_path, b.uuid_id)
+
+        database.clear_cover_art_references(cover_id)
+
+        rev_a_after = self._revision_of(database_path, a.uuid_id)
+        rev_b_after = self._revision_of(database_path, b.uuid_id)
+        # Both tracks advanced, to distinct revisions (one allocation each).
+        assert rev_a_after > rev_a_before
+        assert rev_b_after > rev_b_before
+        assert rev_a_after != rev_b_after
+        assert self._counter(database_path) == max(rev_a_after, rev_b_after)
+
+    def test_delete_cover_art__direct_call_bumps_referencing_tracks(
+        self, tmp_path: Path
+    ):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        track = create_track("/a", "A", "Artist")
+        database.add_track(track)
+        cover_id = database.insert_cover_art(
+            sha256="s", phash="p", phash_prefix="pp", file_path="/c.png"
+        )
+        assert database.update_track_cover_art_id(track.uuid_id, cover_id)
+        rev_before = self._revision_of(database_path, track.uuid_id)
+
+        assert database.delete_cover_art(cover_id)
+
+        conn = sqlite3.connect(database_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT t.revision, tm.cover_art_id "
+            "FROM tracks t JOIN trackmetadata tm ON tm.uuid_id = t.uuid_id "
+            "WHERE t.uuid_id = ?",
+            (track.uuid_id,),
+        ).fetchone()
+        conn.close()
+
+        assert row["cover_art_id"] is None
+        assert row["revision"] > rev_before
+
+        changes, _, _ = database.get_changes(after_revision=rev_before, limit=10)
+        assert len(changes) == 1
+        assert changes[0].type == "upsert"
+        assert changes[0].uuid_id == track.uuid_id
+        assert changes[0].track is not None
+        assert changes[0].track.metadata.cover_art_id is None
+
+    def test_interleaved_writes__strictly_increasing(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        a = create_track("/a", "A", "Artist")
+        b = create_track("/b", "B", "Artist")
+        database.add_track(a)
+        cover_id = database.insert_cover_art(
+            sha256="s", phash="p", phash_prefix="pp", file_path="/c.png"
+        )
+        database.update_track_cover_art_id(a.uuid_id, cover_id)
+        database.add_track(b)
+        database.delete_track(a.uuid_id)
+
+        # The counter only ever advanced, one step per write.
+        assert self._counter(database_path) == 4
+
+
+class TestDatabaseCoverArtCrud:
+    def test_insert_and_get_by_id(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        cover_art_id = database.insert_cover_art(
+            sha256="abc123", phash="0123456789abcdef", phash_prefix="0123", file_path="/tmp/art.png"
+        )
+
+        result = database.get_cover_art_by_id(cover_art_id)
+
+        assert result is not None
+        assert result.id == cover_art_id
+        assert result.sha256 == "abc123"
+        assert result.phash == "0123456789abcdef"
+        assert result.phash_prefix == "0123"
+
+    def test_get_by_id__nonexistent__returns_none(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        result = database.get_cover_art_by_id(999)
+
+        assert result is None
+
+    def test_get_by_sha256__found(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        database.insert_cover_art(
+            sha256="unique_hash", phash="abcdef0123456789", phash_prefix="abcd", file_path="/tmp/a.png"
+        )
+
+        result = database.get_cover_art_by_sha256("unique_hash")
+
+        assert result is not None
+        assert result.sha256 == "unique_hash"
+
+    def test_get_by_sha256__not_found__returns_none(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        result = database.get_cover_art_by_sha256("nonexistent")
+
+        assert result is None
+
+    def test_get_by_phash_prefix__returns_matching_entries(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        database.insert_cover_art(sha256="a", phash="aaaa111122223333", phash_prefix="aaaa", file_path="/tmp/1.png")
+        database.insert_cover_art(sha256="b", phash="aaaa444455556666", phash_prefix="aaaa", file_path="/tmp/2.png")
+        database.insert_cover_art(sha256="c", phash="bbbb111122223333", phash_prefix="bbbb", file_path="/tmp/3.png")
+
+        results = database.get_cover_arts_by_phash_prefix("aaaa")
+
+        assert len(results) == 2
+        sha_set = {r.sha256 for r in results}
+        assert sha_set == {"a", "b"}
+
+    def test_get_by_phash_prefix__no_matches__returns_empty(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        results = database.get_cover_arts_by_phash_prefix("zzzz")
+
+        assert results == []
+
+    def test_delete__existing__returns_true(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        cover_art_id = database.insert_cover_art(
+            sha256="del_me", phash="1111222233334444", phash_prefix="1111", file_path="/tmp/del.png"
+        )
+
+        result = database.delete_cover_art(cover_art_id)
+
+        assert result is True
+        assert database.get_cover_art_by_id(cover_art_id) is None
+
+    def test_delete__nonexistent__returns_false(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        result = database.delete_cover_art(999)
+
+        assert result is False
+
+    def test_insert_duplicate_sha256__raises_error(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        database.initialize()
+
+        database.insert_cover_art(sha256="dup", phash="aaaa", phash_prefix="aa", file_path="/tmp/1.png")
+
+        with pytest.raises(Exception):
+            database.insert_cover_art(sha256="dup", phash="bbbb", phash_prefix="bb", file_path="/tmp/2.png")

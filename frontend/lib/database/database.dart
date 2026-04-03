@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/services/local_resettable.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -50,6 +51,18 @@ class Tracks extends Table {
   TextColumn get filePath => text().nullable()();
   IntColumn get createdAt => integer()();
   IntColumn get lastUpdated => integer()();
+  // Bitrate of the file actually stored on disk. Null until a download
+  // completes. May differ from trackmetadata.bitrate_kbps when downloaded at
+  // a lower quality than the server source (e.g. 128 kbps download from a
+  // 320 kbps source) or when bitrate passthrough serves the original.
+  IntColumn get downloadedBitrateKbps => integer().nullable()();
+  IntColumn get fileSizeBytes => integer().nullable()();
+  // The quality preset the user/server selected for this download (e.g.
+  // 'original', '320'). Independent of `downloadedBitrateKbps`, which is the
+  // bitrate actually written to disk. Storing both lets us answer
+  // "is the file at the requested quality?" idempotently even when the
+  // backend served a passthrough that didn't match the requested bitrate.
+  TextColumn get downloadedQuality => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -103,6 +116,7 @@ class Trackmetadata extends Table {
   IntColumn get sampleRateHz => integer()();
   IntColumn get channels => integer()();
   BoolColumn get hasAlbumArt => boolean().withDefault(const Constant(false))();
+  IntColumn get coverArtId => integer().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -189,6 +203,7 @@ const allowedMetadataColumns = {
   'sample_rate_hz',
   'channels',
   'has_album_art',
+  'cover_art_id',
 };
 
 const allowedTrackColumns = {'uuid_id', 'created_at', 'last_updated'};
@@ -580,7 +595,8 @@ const trackSelectColumns =
     'tm.artist_id, tm.album_id, '
     'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
-    'tm.channels, tm.has_album_art, t.file_path, t.created_at, t.last_updated';
+    'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
+    't.downloaded_bitrate_kbps, t.file_size_bytes, t.downloaded_quality';
 const _selectColumns = trackSelectColumns;
 
 // ── FTS5 virtual table creation statements ──────────────────────────────
@@ -603,6 +619,10 @@ String prepareFtsQuery(String rawQuery) {
   return terms.map((t) => '"${t.replaceAll('"', '""')}"*').join(' ');
 }
 
+String _quoteSqlIdentifier(String identifier) {
+  return '"${identifier.replaceAll('"', '""')}"';
+}
+
 // ── Database ────────────────────────────────────────────────────────────
 
 @DriftDatabase(
@@ -616,11 +636,11 @@ String prepareFtsQuery(String rawQuery) {
     QueueSessionPlayOrder,
   ],
 )
-class AppDatabase extends _$AppDatabase {
+class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 5;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -630,7 +650,92 @@ class AppDatabase extends _$AppDatabase {
         await customStatement(stmt);
       }
     },
+    onUpgrade: (m, from, to) async {
+      if (from < 2) {
+        await customStatement(
+          'ALTER TABLE trackmetadata ADD COLUMN cover_art_id INTEGER',
+        );
+      }
+      if (from < 3) {
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN downloaded_bitrate_kbps INTEGER',
+        );
+      }
+      if (from < 4) {
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
+        );
+      }
+      if (from < 5) {
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
+        );
+      }
+    },
   );
+
+  Future<void> resetLocalData() async {
+    await transaction(() async {
+      final ftsTables = await customSelect(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' "
+        "AND sql LIKE 'CREATE VIRTUAL TABLE%USING fts5%'",
+        readsFrom: {},
+      ).get();
+      for (final row in ftsTables) {
+        final name = row.read<String>('name');
+        final quoted = _quoteSqlIdentifier(name);
+        await customStatement(
+          "INSERT INTO $quoted($quoted) VALUES('delete-all')",
+        );
+      }
+
+      for (final table in allTables.toList().reversed) {
+        await customStatement(
+          'DELETE FROM ${_quoteSqlIdentifier(table.actualTableName)}',
+        );
+      }
+
+      try {
+        await customStatement('DELETE FROM sqlite_sequence');
+      } catch (_) {}
+    });
+  }
+
+  Future<void> rebuildFtsIndexes() async {
+    await customStatement(
+      "INSERT INTO fts_artists(fts_artists) VALUES('delete-all')",
+    );
+    await customStatement(
+      "INSERT INTO fts_artists(rowid, name) "
+      "SELECT id, name FROM artists",
+    );
+
+    await customStatement(
+      "INSERT INTO fts_albums(fts_albums) VALUES('delete-all')",
+    );
+    await customStatement(
+      "INSERT INTO fts_albums(rowid, name, artist_name) "
+      "SELECT a.id, COALESCE(a.name, ''), ar.name "
+      "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
+    );
+
+    await customStatement(
+      "INSERT INTO fts_tracks(fts_tracks) VALUES('delete-all')",
+    );
+    await customStatement(
+      "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+      "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
+      "FROM trackmetadata",
+    );
+  }
+
+  // --- LocalResettable -------------------------------------------------------
+  @override
+  int get resetPriority => ResetPriority.wipeDatabase;
+
+  @override
+  Future<void> resetLocalState() => resetLocalData();
 
   // ── Track queries ─────────────────────────────────────────────────────
 
@@ -641,6 +746,7 @@ class AppDatabase extends _$AppDatabase {
     int? artistId,
     int? albumId,
     int? limit,
+    bool downloadedOnly = false,
   }) {
     if (albumId != null && artistId == null) {
       throw ArgumentError('Cannot filter by album without artist');
@@ -668,6 +774,10 @@ class AppDatabase extends _$AppDatabase {
     if (albumId != null) {
       whereClauses.add('tm."album_id" = ?');
       vars.add(Variable.withInt(albumId));
+    }
+
+    if (downloadedOnly) {
+      whereClauses.add('t.file_path IS NOT NULL');
     }
 
     // Cursor filter
@@ -715,6 +825,7 @@ class AppDatabase extends _$AppDatabase {
     int? artistId,
     int? albumId,
     int? limit,
+    bool downloadedOnly = false,
   }) {
     final (sql, vars) = _buildTrackQuery(
       searchParams: searchParams,
@@ -723,6 +834,7 @@ class AppDatabase extends _$AppDatabase {
       artistId: artistId,
       albumId: albumId,
       limit: limit,
+      downloadedOnly: downloadedOnly,
     );
     return customSelect(
       sql,
@@ -833,6 +945,7 @@ class AppDatabase extends _$AppDatabase {
     List<RowFilterParameter> cursorFilters = const [],
     int? artistId,
     int? albumId,
+    bool downloadedOnly = false,
   }) {
     if (albumId != null && artistId == null) {
       throw ArgumentError('Cannot filter by album without artist');
@@ -848,6 +961,10 @@ class AppDatabase extends _$AppDatabase {
     if (albumId != null) {
       whereClauses.add('tm."album_id" = ?');
       vars.add(Variable.withInt(albumId));
+    }
+
+    if (downloadedOnly) {
+      whereClauses.add('t.file_path IS NOT NULL');
     }
 
     // Inverse cursor: count rows at or before the cursor position
@@ -878,6 +995,51 @@ class AppDatabase extends _$AppDatabase {
     ).watch().map((rows) => rows.first.read<int>('c'));
   }
 
+  Future<
+    Map<
+      String,
+      ({
+        String? filePath,
+        int? downloadedBitrateKbps,
+        int? fileSizeBytes,
+        String? downloadedQuality,
+      })
+    >
+  >
+  getTrackDownloadStates(List<String> uuids) async {
+    if (uuids.isEmpty) return {};
+    final placeholders = List.filled(uuids.length, '?').join(', ');
+    final rows = await customSelect(
+      'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes, '
+      'downloaded_quality '
+      'FROM tracks WHERE uuid_id IN ($placeholders)',
+      variables: uuids.map(Variable.withString).toList(),
+      readsFrom: {tracks},
+    ).get();
+    return {
+      for (final r in rows)
+        r.read<String>('uuid_id'): (
+          filePath: r.readNullable<String>('file_path'),
+          downloadedBitrateKbps: r.readNullable<int>('downloaded_bitrate_kbps'),
+          fileSizeBytes: r.readNullable<int>('file_size_bytes'),
+          downloadedQuality: r.readNullable<String>('downloaded_quality'),
+        ),
+    };
+  }
+
+  Stream<({int count, int totalBytes})> watchDownloadedStats() {
+    return customSelect(
+      'SELECT COUNT(*) AS c, COALESCE(SUM(file_size_bytes), 0) AS total_bytes '
+      'FROM tracks WHERE file_path IS NOT NULL',
+      readsFrom: {tracks},
+    ).watch().map(
+      (rows) => (
+        count: rows.first.read<int>('c'),
+        totalBytes: rows.first.read<int>('total_bytes'),
+      ),
+    );
+  }
+
   // ── Artist queries ────────────────────────────────────────────────────
 
   Future<List<QueryRow>> getArtists({
@@ -885,10 +1047,45 @@ class AppDatabase extends _$AppDatabase {
     List<ArtistRowFilterParameter> cursorFilters = const [],
     int? limit,
     int? offset,
+    bool downloadedOnly = false,
   }) async {
     final vars = <Variable>[];
 
-    var query = 'SELECT id, name FROM artists';
+    // When offline, the cover-art subquery must restrict candidate tracks to
+    // downloaded ones; otherwise the chosen `cover_art_id` may belong to a
+    // streaming-only track and resolving it requires a network round trip.
+    final coverArtSubquery = downloadedOnly
+        ? 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+            'WHERE tm.artist_id = artists.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'AND t.file_path IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1'
+        : 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'WHERE tm.artist_id = artists.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1';
+
+    var query =
+        'SELECT id, name, '
+        '($coverArtSubquery) AS cover_art_id '
+        'FROM artists';
+
+    final whereClauses = <String>[];
+
+    if (downloadedOnly) {
+      // Artist appears iff at least one of their tracks is downloaded. EXISTS
+      // short-circuits on first hit, so this is cheaper than a COUNT.
+      whereClauses.add(
+        'EXISTS (SELECT 1 FROM trackmetadata tm '
+        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+        'WHERE tm.artist_id = artists.id AND t.file_path IS NOT NULL)',
+      );
+    }
 
     // Cursor filter
     if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
@@ -897,9 +1094,13 @@ class AppDatabase extends _$AppDatabase {
         orderBy,
       );
       if (cursorClause.isNotEmpty) {
-        query += ' WHERE $cursorClause';
+        whereClauses.add(cursorClause);
         vars.addAll(cursorVars);
       }
+    }
+
+    if (whereClauses.isNotEmpty) {
+      query += ' WHERE ${whereClauses.join(' AND ')}';
     }
 
     // ORDER BY
@@ -927,16 +1128,31 @@ class AppDatabase extends _$AppDatabase {
       }
     }
 
-    return customSelect(query, variables: vars, readsFrom: {artists}).get();
+    return customSelect(
+      query,
+      variables: vars,
+      readsFrom: {artists, trackmetadata, tracks},
+    ).get();
   }
 
   Stream<int> watchArtistCount({
     List<ArtistOrderParameter> orderBy = const [],
     List<ArtistRowFilterParameter> cursorFilters = const [],
+    bool downloadedOnly = false,
   }) {
     final vars = <Variable>[];
 
     var query = 'SELECT COUNT(*) AS c FROM artists';
+
+    final whereClauses = <String>[];
+
+    if (downloadedOnly) {
+      whereClauses.add(
+        'EXISTS (SELECT 1 FROM trackmetadata tm '
+        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+        'WHERE tm.artist_id = artists.id AND t.file_path IS NOT NULL)',
+      );
+    }
 
     // Inverse cursor: count rows at or before cursor position
     if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
@@ -945,16 +1161,83 @@ class AppDatabase extends _$AppDatabase {
         orderBy,
       );
       if (cursorClause.isNotEmpty) {
-        query += ' WHERE NOT ($cursorClause)';
+        whereClauses.add('NOT ($cursorClause)');
         vars.addAll(cursorVars);
       }
+    }
+
+    if (whereClauses.isNotEmpty) {
+      query += ' WHERE ${whereClauses.join(' AND ')}';
     }
 
     return customSelect(
       query,
       variables: vars,
-      readsFrom: {artists},
+      readsFrom: {artists, trackmetadata, tracks},
     ).watch().map((rows) => rows.first.read<int>('c'));
+  }
+
+  // ── Download status aggregates ────────────────────────────────────────
+
+  /// For each album id, returns `(total, downloaded)` track counts. An album
+  /// is "fully downloaded" iff `downloaded == total && total > 0`.
+  Future<Map<int, ({int total, int downloaded})>> getAlbumDownloadCounts(
+    Iterable<int> albumIds,
+  ) => _downloadCountsByColumn('album_id', albumIds);
+
+  /// Same as [getAlbumDownloadCounts] but per artist. Used by ArtistCard to
+  /// show a "downloaded" badge when ALL of the artist's tracks are downloaded.
+  Future<Map<int, ({int total, int downloaded})>> getArtistDownloadCounts(
+    Iterable<int> artistIds,
+  ) => _downloadCountsByColumn('artist_id', artistIds);
+
+  /// Download counts for every album in one grouped query. Lets the UI batch
+  /// all visible album cards into a single read instead of one query per card.
+  Future<Map<int, ({int total, int downloaded})>> getAllAlbumDownloadCounts() =>
+      _downloadCountsByColumn('album_id', null);
+
+  /// Download counts for every artist in one grouped query.
+  Future<Map<int, ({int total, int downloaded})>>
+      getAllArtistDownloadCounts() =>
+          _downloadCountsByColumn('artist_id', null);
+
+  /// Grouped (total, downloaded) track counts by [groupColumn]. When [ids] is
+  /// null, counts every (non-null) group; otherwise restricts to [ids].
+  /// [groupColumn] is a hardcoded internal literal ('album_id'/'artist_id') —
+  /// never user input — so interpolating it is safe.
+  Future<Map<int, ({int total, int downloaded})>> _downloadCountsByColumn(
+    String groupColumn,
+    Iterable<int>? ids,
+  ) async {
+    final String whereClause;
+    final List<Variable> variables;
+    if (ids == null) {
+      whereClause = 'WHERE tm.$groupColumn IS NOT NULL ';
+      variables = const [];
+    } else {
+      final list = ids.toSet().toList(growable: false);
+      if (list.isEmpty) return const {};
+      final placeholders = List.filled(list.length, '?').join(', ');
+      whereClause = 'WHERE tm.$groupColumn IN ($placeholders) ';
+      variables = list.map(Variable.withInt).toList();
+    }
+    final rows = await customSelect(
+      'SELECT tm.$groupColumn AS aid, COUNT(*) AS total, '
+      'SUM(CASE WHEN t.file_path IS NOT NULL THEN 1 ELSE 0 END) AS downloaded '
+      'FROM trackmetadata tm '
+      'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+      '$whereClause'
+      'GROUP BY tm.$groupColumn',
+      variables: variables,
+      readsFrom: {trackmetadata, tracks},
+    ).get();
+    return {
+      for (final r in rows)
+        r.read<int>('aid'): (
+          total: r.read<int>('total'),
+          downloaded: r.read<int>('downloaded'),
+        ),
+    };
   }
 
   // ── Album queries ─────────────────────────────────────────────────────
@@ -964,12 +1247,33 @@ class AppDatabase extends _$AppDatabase {
     List<AlbumOrderParameter> orderBy = const [],
     List<AlbumRowFilterParameter> cursorFilters = const [],
     int? limit,
+    bool downloadedOnly = false,
   }) {
     final vars = <Variable>[];
 
+    // See [getArtists] — when offline, restrict the cover-art subquery to
+    // tracks that are downloaded so the chosen `cover_art_id` resolves
+    // locally instead of triggering a streaming fallback.
+    final coverArtSubquery = downloadedOnly
+        ? 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+            'WHERE tm.album_id = a.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'AND t.file_path IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1'
+        : 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'WHERE tm.album_id = a.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1';
+
     var sql =
         'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
-        'a."year", a.is_single_grouping '
+        'a."year", a.is_single_grouping, '
+        '($coverArtSubquery) AS cover_art_id '
         'FROM albums a '
         'JOIN artists ar ON a.artist_id = ar.id';
 
@@ -978,6 +1282,14 @@ class AppDatabase extends _$AppDatabase {
     if (artistId != null) {
       whereClauses.add('a.artist_id = ?');
       vars.add(Variable.withInt(artistId));
+    }
+
+    if (downloadedOnly) {
+      whereClauses.add(
+        'EXISTS (SELECT 1 FROM trackmetadata tm '
+        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+        'WHERE tm.album_id = a.id AND t.file_path IS NOT NULL)',
+      );
     }
 
     // Cursor filter
@@ -1025,17 +1337,19 @@ class AppDatabase extends _$AppDatabase {
     List<AlbumOrderParameter> orderBy = const [],
     List<AlbumRowFilterParameter> cursorFilters = const [],
     int? limit,
+    bool downloadedOnly = false,
   }) {
     final (sql, vars) = _buildAlbumQuery(
       artistId: artistId,
       orderBy: orderBy,
       cursorFilters: cursorFilters,
       limit: limit,
+      downloadedOnly: downloadedOnly,
     );
     return customSelect(
       sql,
       variables: vars,
-      readsFrom: {albums, artists},
+      readsFrom: {albums, artists, trackmetadata, tracks},
     ).get();
   }
 
@@ -1043,6 +1357,7 @@ class AppDatabase extends _$AppDatabase {
     int? artistId,
     List<AlbumOrderParameter> orderBy = const [],
     List<AlbumRowFilterParameter> cursorFilters = const [],
+    bool downloadedOnly = false,
   }) {
     final vars = <Variable>[];
 
@@ -1055,6 +1370,14 @@ class AppDatabase extends _$AppDatabase {
     if (artistId != null) {
       whereClauses.add('a.artist_id = ?');
       vars.add(Variable.withInt(artistId));
+    }
+
+    if (downloadedOnly) {
+      whereClauses.add(
+        'EXISTS (SELECT 1 FROM trackmetadata tm '
+        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+        'WHERE tm.album_id = a.id AND t.file_path IS NOT NULL)',
+      );
     }
 
     // Inverse cursor
@@ -1076,7 +1399,7 @@ class AppDatabase extends _$AppDatabase {
     return customSelect(
       sql,
       variables: vars,
-      readsFrom: {albums, artists},
+      readsFrom: {albums, artists, trackmetadata, tracks},
     ).watch().map((rows) => rows.first.read<int>('c'));
   }
 
@@ -1089,6 +1412,7 @@ class AppDatabase extends _$AppDatabase {
     bool searchArtists = true,
     bool searchAlbums = true,
     int limitPerType = 10,
+    bool downloadedOnly = false,
   }) async {
     final ftsQuery = prepareFtsQuery(query);
     if (ftsQuery.isEmpty) {
@@ -1103,9 +1427,29 @@ class AppDatabase extends _$AppDatabase {
     final resultArtists = <QueryRow>[];
     final resultAlbums = <QueryRow>[];
 
+    // When downloadedOnly, the filter is applied INSIDE the FTS query, before
+    // LIMIT — otherwise a downloaded match ranked below limitPerType would be
+    // dropped before we ever see it.
+    final trackDownloadedFilter = downloadedOnly
+        ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
+              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+              'WHERE tm.rowid = fts_tracks.rowid AND t.file_path IS NOT NULL)'
+        : '';
+    final artistDownloadedFilter = downloadedOnly
+        ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
+              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+              'WHERE tm.artist_id = fts_artists.rowid AND t.file_path IS NOT NULL)'
+        : '';
+    final albumDownloadedFilter = downloadedOnly
+        ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
+              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+              'WHERE tm.album_id = fts_albums.rowid AND t.file_path IS NOT NULL)'
+        : '';
+
     if (searchTracks) {
       final ftsRows = await customSelect(
-        'SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH ? ORDER BY rank LIMIT ?',
+        'SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH ?'
+        '$trackDownloadedFilter ORDER BY rank LIMIT ?',
         variables: [
           Variable.withString(ftsQuery),
           Variable.withInt(limitPerType),
@@ -1139,7 +1483,8 @@ class AppDatabase extends _$AppDatabase {
 
     if (searchArtists) {
       final ftsRows = await customSelect(
-        'SELECT rowid FROM fts_artists WHERE fts_artists MATCH ? ORDER BY rank LIMIT ?',
+        'SELECT rowid FROM fts_artists WHERE fts_artists MATCH ?'
+        '$artistDownloadedFilter ORDER BY rank LIMIT ?',
         variables: [
           Variable.withString(ftsQuery),
           Variable.withInt(limitPerType),
@@ -1151,9 +1496,16 @@ class AppDatabase extends _$AppDatabase {
         final placeholders = List.filled(artistIds.length, '?').join(', ');
         final vars = artistIds.map((id) => Variable.withInt(id)).toList();
         final fullRows = await customSelect(
-          'SELECT id, name FROM artists WHERE id IN ($placeholders)',
+          'SELECT id, name, '
+          '(SELECT tm.cover_art_id FROM trackmetadata tm '
+          'WHERE tm.artist_id = artists.id '
+          'AND tm.has_album_art = 1 '
+          'AND tm.cover_art_id IS NOT NULL '
+          'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+          'LIMIT 1) AS cover_art_id '
+          'FROM artists WHERE id IN ($placeholders)',
           variables: vars,
-          readsFrom: {artists},
+          readsFrom: {artists, trackmetadata},
         ).get();
         final idOrder = {
           for (var i = 0; i < artistIds.length; i++) artistIds[i]: i,
@@ -1170,7 +1522,8 @@ class AppDatabase extends _$AppDatabase {
 
     if (searchAlbums) {
       final ftsRows = await customSelect(
-        'SELECT rowid FROM fts_albums WHERE fts_albums MATCH ? ORDER BY rank LIMIT ?',
+        'SELECT rowid FROM fts_albums WHERE fts_albums MATCH ?'
+        '$albumDownloadedFilter ORDER BY rank LIMIT ?',
         variables: [
           Variable.withString(ftsQuery),
           Variable.withInt(limitPerType),
@@ -1183,12 +1536,18 @@ class AppDatabase extends _$AppDatabase {
         final vars = albumIds.map((id) => Variable.withInt(id)).toList();
         final fullRows = await customSelect(
           'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
-          'a."year", a.is_single_grouping '
+          'a."year", a.is_single_grouping, '
+          '(SELECT tm.cover_art_id FROM trackmetadata tm '
+          'WHERE tm.album_id = a.id '
+          'AND tm.has_album_art = 1 '
+          'AND tm.cover_art_id IS NOT NULL '
+          'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+          'LIMIT 1) AS cover_art_id '
           'FROM albums a '
           'JOIN artists ar ON a.artist_id = ar.id '
           'WHERE a.id IN ($placeholders)',
           variables: vars,
-          readsFrom: {albums, artists},
+          readsFrom: {albums, artists, trackmetadata},
         ).get();
         final idOrder = {
           for (var i = 0; i < albumIds.length; i++) albumIds[i]: i,
@@ -1249,5 +1608,6 @@ TrackmetadataCompanion trackmetadataCompanionFromDto(ClientTrackDto dto) {
     sampleRateHz: Value(meta.sampleRateHz),
     channels: Value(meta.channels),
     hasAlbumArt: Value(meta.hasAlbumArt),
+    coverArtId: Value(meta.coverArtId),
   );
 }

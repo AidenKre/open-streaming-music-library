@@ -1,13 +1,22 @@
 import 'package:flutter/material.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
+import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 
 class TrackTile extends StatelessWidget {
   final TrackUI track;
   final VoidCallback? onTap;
   final VoidCallback? onPlayNext;
   final VoidCallback? onAddToQueue;
+  final VoidCallback? onDownload;
+  final void Function(String quality)? onDownloadAtQuality;
+  final VoidCallback? onDeleteDownload;
   final bool isHighlighted;
   final bool isDimmed;
+  /// When `false`, the row swallows taps and the more-vert button is rendered
+  /// in a disabled state. Used by offline mode on the tracks page so the row
+  /// stays visible (visual consistency with album views) but inert.
+  final bool isInteractive;
   final Widget? trailing;
 
   const TrackTile({
@@ -16,8 +25,12 @@ class TrackTile extends StatelessWidget {
     this.onTap,
     this.onPlayNext,
     this.onAddToQueue,
+    this.onDownload,
+    this.onDownloadAtQuality,
+    this.onDeleteDownload,
     this.isHighlighted = false,
     this.isDimmed = false,
+    this.isInteractive = true,
     this.trailing,
   });
 
@@ -46,6 +59,28 @@ class TrackTile extends StatelessWidget {
                   onAddToQueue!();
                 },
               ),
+            if (track.isDownloaded && onDeleteDownload != null)
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Delete download'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDeleteDownload!();
+                },
+              )
+            else if (!track.isDownloaded && onDownload != null)
+              SplitDownloadTile(
+                onDownload: () {
+                  Navigator.pop(ctx);
+                  onDownload!();
+                },
+                onDownloadAtQuality: onDownloadAtQuality != null
+                    ? (quality) {
+                        Navigator.pop(ctx);
+                        onDownloadAtQuality!(quality);
+                      }
+                    : null,
+              ),
           ],
         ),
       ),
@@ -62,7 +97,7 @@ class TrackTile extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         InkWell(
-          onTap: onTap,
+          onTap: isInteractive ? onTap : null,
           child: Container(
             color: isHighlighted
                 ? colors.primaryContainer.withValues(alpha: 0.3)
@@ -74,19 +109,33 @@ class TrackTile extends StatelessWidget {
                 children: [
                   Opacity(
                     opacity: opacity,
-                    child: Container(
-                      width: 48,
-                      height: 48,
-                      decoration: BoxDecoration(
-                        color: colors.primaryContainer,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: isHighlighted
-                          ? Icon(Icons.equalizer,
-                              color: colors.primary)
-                          : Icon(Icons.music_note,
-                              color: colors.onPrimaryContainer),
-                    ),
+                    child: isHighlighted
+                        ? Container(
+                            width: 48,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              color: colors.primaryContainer,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Icon(Icons.equalizer, color: colors.primary),
+                          )
+                        : CoverArtImage(
+                            hasAlbumArt: track.hasAlbumArt,
+                            coverArtId: track.coverArtId,
+                            width: 48,
+                            height: 48,
+                            borderRadius: BorderRadius.circular(4),
+                            fallback: Container(
+                              width: 48,
+                              height: 48,
+                              decoration: BoxDecoration(
+                                color: colors.primaryContainer,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Icon(Icons.music_note,
+                                  color: colors.onPrimaryContainer),
+                            ),
+                          ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
@@ -119,6 +168,17 @@ class TrackTile extends StatelessWidget {
                     ),
                   ),
                   if (trailing != null) trailing!,
+                  if (trailing == null && track.isDownloaded) ...[
+                    const SizedBox(width: 8),
+                    Opacity(
+                      opacity: opacity,
+                      child: Icon(
+                        Icons.download_done,
+                        size: 16,
+                        color: colors.primary,
+                      ),
+                    ),
+                  ],
                   if (trailing == null &&
                       (onPlayNext != null || onAddToQueue != null)) ...[
                     const SizedBox(width: 8),
@@ -138,8 +198,11 @@ class TrackTile extends StatelessWidget {
                         padding: EdgeInsets.zero,
                         icon: Icon(Icons.more_vert,
                             size: 20, color: colors.onSurfaceVariant),
-                        onPressed: () =>
-                            _showTrackMenu(context),
+                        // Null onPressed renders the button in Flutter's
+                        // built-in disabled style (grayed but visible).
+                        onPressed: isInteractive
+                            ? () => _showTrackMenu(context)
+                            : null,
                       ),
                     ),
                   ],

@@ -4,14 +4,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_coordinator.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
+import 'package:frontend/ui/widgets/track_tile.dart';
 
 void main() {
   late AppDatabase db;
@@ -190,9 +195,160 @@ void main() {
       expect(find.text('Track T000'), findsNothing);
     },
   );
+
+  group('offline dimming', () {
+    Future<void> pumpQueue(WidgetTester tester, {required bool offline}) async {
+      await _seedQueueTracks(db, ['a', 'b'], downloadedUuids: const {'a'});
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['a', 'b'],
+        currentIndex: 0,
+      );
+      final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+
+      final container = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+          audioProvider.overrideWith(
+            () => _TestQueueAudioCoordinator(
+              _audioStateFor(
+                sessionId: sessionId,
+                currentItemId: snapshot.currentItem!.itemId,
+                currentPlayPosition: 0,
+                totalCount: 2,
+                currentTrack: _track('a'),
+              ),
+            ),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(
+            home: Scaffold(body: SizedBox(height: 700, child: FullPlayer())),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Queue'));
+      await tester.pump();
+      await tester.pumpAndSettle();
+    }
+
+    TrackTile tileFor(WidgetTester tester, String title) {
+      return tester.widget<TrackTile>(find.ancestor(
+        of: find.text(title),
+        matching: find.byType(TrackTile),
+      ));
+    }
+
+    testWidgets('offline: streaming-only row dimmed, downloaded row normal',
+        (tester) async {
+      await pumpQueue(tester, offline: true);
+
+      expect(tileFor(tester, 'Track A').isDimmed, isFalse);
+      expect(tileFor(tester, 'Track B').isDimmed, isTrue);
+    });
+
+    testWidgets('online: no row is dimmed for download state', (tester) async {
+      await pumpQueue(tester, offline: false);
+
+      expect(tileFor(tester, 'Track A').isDimmed, isFalse);
+      expect(tileFor(tester, 'Track B').isDimmed, isFalse);
+    });
+  });
+
+  group('cover art', () {
+    setUpAll(() {
+      ApiClient.init('http://localhost:8000');
+      initCoverArtCache(CoverArtCacheManager.noop());
+    });
+
+    Future<void> pumpFullPlayer(
+      WidgetTester tester,
+      TrackUI track,
+    ) async {
+      await _seedQueueTracks(db, ['test-track']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'test',
+        trackUuids: const ['test-track'],
+        currentIndex: 0,
+      );
+      final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+
+      final container = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          audioProvider.overrideWith(
+            () => _TestQueueAudioCoordinator(
+              _audioStateFor(
+                sessionId: sessionId,
+                currentItemId: snapshot.currentItem!.itemId,
+                currentPlayPosition: 0,
+                totalCount: 1,
+                currentTrack: track,
+              ),
+            ),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(
+            home: Scaffold(body: SizedBox(height: 700, child: FullPlayer())),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    testWidgets(
+      'track without art shows music note placeholder',
+      (tester) async {
+        await pumpFullPlayer(tester, _track('no-art'));
+
+        expect(find.byIcon(Icons.music_note), findsWidgets);
+        expect(find.byType(Image), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'track with art shows CoverArtImage',
+      (tester) async {
+        final trackWithArt = TrackUI(
+          uuidId: 'with-art',
+          createdAt: 1,
+          lastUpdated: 1,
+          title: 'Art Track',
+          artist: 'Artist',
+          album: 'Album',
+          duration: 180,
+          bitrateKbps: 320,
+          sampleRateHz: 44100,
+          channels: 2,
+          hasAlbumArt: true,
+          coverArtId: 99,
+        );
+        await pumpFullPlayer(tester, trackWithArt);
+
+        expect(find.byType(CoverArtImage), findsOneWidget);
+        expect(find.byType(Image), findsOneWidget);
+      },
+    );
+  });
 }
 
-Future<void> _seedQueueTracks(AppDatabase db, List<String> uuids) async {
+Future<void> _seedQueueTracks(
+  AppDatabase db,
+  List<String> uuids, {
+  Set<String> downloadedUuids = const {},
+}) async {
   await db.batch((batch) {
     batch.insert(
       db.artists,
@@ -217,6 +373,9 @@ Future<void> _seedQueueTracks(AppDatabase db, List<String> uuids) async {
           uuidId: Value(uuid),
           createdAt: Value(i + 1),
           lastUpdated: Value(i + 1),
+          filePath: downloadedUuids.contains(uuid)
+              ? Value('/downloads/$uuid.mp3')
+              : const Value.absent(),
         ),
       );
       batch.insert(
@@ -283,6 +442,15 @@ TrackUI _track(String uuidId) {
     channels: 2,
     hasAlbumArt: false,
   );
+}
+
+/// Forces [offlineModeProvider] to a fixed value without starting the real
+/// health-poll timer.
+class _StubOffline extends OfflineModeNotifier {
+  _StubOffline(this._value);
+  final bool _value;
+  @override
+  bool build() => _value;
 }
 
 class _TestQueueAudioCoordinator extends AudioCoordinator {

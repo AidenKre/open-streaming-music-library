@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
 
 String formatDuration(Duration d) {
@@ -45,14 +46,21 @@ class MiniPlayer extends ConsumerWidget {
         padding: const EdgeInsets.symmetric(horizontal: 8),
         child: Row(
           children: [
-            Container(
+            CoverArtImage(
+              hasAlbumArt: track.hasAlbumArt,
+              coverArtId: track.coverArtId,
               width: 48,
               height: 48,
-              decoration: BoxDecoration(
-                color: colors.primaryContainer,
-                borderRadius: BorderRadius.circular(4),
+              borderRadius: BorderRadius.circular(4),
+              fallback: Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: colors.primaryContainer,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Icon(Icons.music_note, color: colors.onPrimaryContainer),
               ),
-              child: Icon(Icons.music_note, color: colors.onPrimaryContainer),
             ),
             const SizedBox(width: 8),
             Expanded(

@@ -12,3 +12,5 @@ class Track(BaseModel):
     file_hash: str | None = None
     created_at: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     last_updated: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
+    # Assigned by the database on insert; 0 until persisted.
+    revision: int = 0

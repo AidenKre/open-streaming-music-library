@@ -31,8 +31,22 @@ CREATE TABLE IF NOT EXISTS tracks (
     "file_path" TEXT NOT NULL,
     "file_hash" TEXT UNIQUE,
     "created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
-    "last_updated" INTEGER NOT NULL DEFAULT (unixepoch())
+    "last_updated" INTEGER NOT NULL DEFAULT (unixepoch()),
+    -- Monotonic sync watermark, assigned from revision_counter on add/update.
+    "revision" INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS idx_tracks_revision ON tracks("revision");
+
+CREATE TABLE IF NOT EXISTS cover_arts (
+    "id" INTEGER PRIMARY KEY,
+    "sha256" TEXT UNIQUE NOT NULL,
+    "phash" TEXT NOT NULL,
+    "phash_prefix" TEXT NOT NULL,
+    "file_path" TEXT UNIQUE NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cover_arts_phash_prefix ON cover_arts("phash_prefix");
 
 CREATE TABLE IF NOT EXISTS trackmetadata (
     "track_id" INTEGER UNIQUE NOT NULL,
@@ -54,10 +68,12 @@ CREATE TABLE IF NOT EXISTS trackmetadata (
     "sample_rate_hz" INTEGER,
     "channels" INTEGER,
     "has_album_art" INTEGER NOT NULL CHECK ("has_album_art" IN (0,1)),
+    "cover_art_id" INTEGER,
     FOREIGN KEY ("track_id") REFERENCES tracks("id"),
     FOREIGN KEY ("uuid_id") REFERENCES tracks("uuid_id"),
     FOREIGN KEY ("artist_id") REFERENCES artists("id"),
-    FOREIGN KEY ("album_id") REFERENCES albums("id")
+    FOREIGN KEY ("album_id") REFERENCES albums("id"),
+    FOREIGN KEY ("cover_art_id") REFERENCES cover_arts("id") ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_title ON trackmetadata("title");
@@ -92,3 +108,43 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_albums USING fts5(
     name, artist_name,
     content='', content_rowid='id', tokenize='unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS queue_sync_state (
+    "session_id" TEXT NOT NULL PRIMARY KEY,
+    "current_index" INTEGER NOT NULL,
+    "quality" TEXT NOT NULL,
+    "track_uuids" TEXT NOT NULL,
+    "updated_at" REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Tombstones for tracks deleted from the server. The frontend's incremental
+-- sync only sees rows currently in `tracks`/`trackmetadata` (hard deletes leave
+-- no trace), so without a record of removed uuids the client cannot tell that
+-- something disappeared and stale rows linger until a full local reset.
+CREATE TABLE IF NOT EXISTS track_tombstones (
+    "uuid_id"    TEXT PRIMARY KEY,
+    "deleted_at" INTEGER NOT NULL,
+    -- Monotonic sync watermark, assigned from revision_counter on delete.
+    "revision"   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_track_tombstones_deleted_at
+    ON track_tombstones("deleted_at");
+
+CREATE INDEX IF NOT EXISTS idx_track_tombstones_revision
+    ON track_tombstones("revision");
+
+-- Single-row monotonic counter (id pinned to 0). Every add/update/delete
+-- allocates the next value inside its write transaction, giving incremental
+-- sync a gap-free, clock-independent ordering for tracks and tombstones.
+CREATE TABLE IF NOT EXISTS revision_counter (
+    "id"    INTEGER PRIMARY KEY CHECK ("id" = 0),
+    "value" INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO revision_counter ("id", "value") VALUES (0, 0);

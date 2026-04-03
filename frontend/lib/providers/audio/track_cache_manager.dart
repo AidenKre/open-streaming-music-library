@@ -8,13 +8,23 @@ import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/services/quality_presets.dart';
 
 typedef TempDirectoryProvider = Future<Directory> Function();
 
-Uri buildTrackStreamUri(String uuidId) {
+/// Build the streaming URL for a track. When [quality] is `null` or
+/// `original`, no `quality` query parameter is sent — the server returns the
+/// untouched source file. Any other preset triggers server-side transcoding.
+Uri buildTrackStreamUri(String uuidId, {String? quality}) {
   final baseUri = Uri.parse(ApiClient.instance.baseUrl);
   final basePath = baseUri.pathSegments.where((segment) => segment.isNotEmpty);
-  return baseUri.replace(pathSegments: [...basePath, 'tracks', uuidId, 'stream']);
+  final query = (quality == null || quality == originalQuality)
+      ? null
+      : {'quality': quality};
+  return baseUri.replace(
+    pathSegments: [...basePath, 'tracks', uuidId, 'stream'],
+    queryParameters: query,
+  );
 }
 
 abstract class TrackCacheManager {
@@ -46,8 +56,7 @@ String _extensionFromContentType(String? contentType) {
 
 class HttpTrackCacheManager implements TrackCacheManager {
   final Directory _cacheDirectory;
-  final http.Client _client;
-  final bool _ownsClient;
+  final ApiClient _apiClient;
 
   StreamSubscription<List<int>>? _prefetchSubscription;
   File? _prefetchPartialFile;
@@ -55,16 +64,11 @@ class HttpTrackCacheManager implements TrackCacheManager {
   Completer<void>? _prefetchDone;
   int _prefetchGeneration = 0;
 
-  HttpTrackCacheManager._(
-    this._cacheDirectory, {
-    required http.Client client,
-    required bool ownsClient,
-  }) : _client = client,
-       _ownsClient = ownsClient;
+  HttpTrackCacheManager._(this._cacheDirectory, this._apiClient);
 
   static Future<HttpTrackCacheManager> create({
-    http.Client? client,
     TempDirectoryProvider? tempDirectoryProvider,
+    ApiClient? apiClient,
   }) async {
     final tempDirectory = await (tempDirectoryProvider ?? getTemporaryDirectory)();
     final cacheDirectory = Directory(
@@ -74,8 +78,7 @@ class HttpTrackCacheManager implements TrackCacheManager {
     await _clearDirectory(cacheDirectory);
     return HttpTrackCacheManager._(
       cacheDirectory,
-      client: client ?? http.Client(),
-      ownsClient: client == null,
+      apiClient ?? ApiClient.instance,
     );
   }
 
@@ -127,17 +130,27 @@ class HttpTrackCacheManager implements TrackCacheManager {
         await _cacheDirectory.create(recursive: true);
         await _deleteIfExists(partialFile);
 
-        final response = await _client.send(
-          http.Request('GET', buildTrackStreamUri(track.uuidId)),
-        );
+        final http.StreamedResponse response;
+        try {
+          response = await _apiClient.send(
+            () => http.Request('GET', buildTrackStreamUri(track.uuidId)),
+          );
+        } on ApiException {
+          await _deleteIfExists(partialFile);
+          return;
+        } on NetworkException {
+          await _deleteIfExists(partialFile);
+          return;
+        } catch (_) {
+          // Defensive fallback for unexpected exceptions.
+          await _deleteIfExists(partialFile);
+          return;
+        }
         if (generation != _prefetchGeneration) {
           await _deleteIfExists(partialFile);
           return;
         }
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          await _deleteIfExists(partialFile);
-          return;
-        }
+        // ApiClient.send guarantees a 2xx response or throws.
 
         final ext = _extensionFromContentType(response.headers['content-type']);
         final cachedFile = File(
@@ -268,8 +281,5 @@ class HttpTrackCacheManager implements TrackCacheManager {
   @visibleForTesting
   Future<void> close() async {
     await cancelPrefetch();
-    if (_ownsClient) {
-      _client.close();
-    }
   }
 }

@@ -1,7 +1,6 @@
 import importlib
 import json
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Optional, Set
 
@@ -11,8 +10,10 @@ from fastapi.testclient import TestClient
 from app.models import (
     Album,
     Artist,
+    ChangeEntry,
     GetAlbumsResponse,
     GetArtistsResponse,
+    GetChangesResponse,
     GetSearchResponse,
     GetTracksResponse,
     Track,
@@ -127,6 +128,15 @@ class TestGetTracks:
         r = client.get(f"/tracks?cursor={json.dumps(bad_cursor)}")
         assert r.status_code == 400, r.text
 
+    def test_tracks__album_id_without_artist_id__rejected(self, client):
+        """album_id is meaningful only when paired with artist_id (album IDs
+        are not globally unique across artists). The query layer used to
+        500 in this case; the API should reject it as 422 instead."""
+        add_tracks_to_client(client=client, amount_to_add=3)
+        r = client.get("/tracks", params={"album_id": 1})
+        assert r.status_code == 422, r.text
+        assert "album_id" in r.text and "artist_id" in r.text
+
     def test_tracks__full_library_cursor_logic__works(self, client):
         tracks = []
 
@@ -231,78 +241,6 @@ class TestGetTracks:
             assert sorted(t.uuid_id for t in returned_tracks) == sorted(
                 t.uuid_id for t in tracks
             )
-
-    def test_tracks__newer_than__works(self, client):
-        metadata = TrackMetaData(duration=1.0)
-
-        now = int(datetime.now(UTC).timestamp())
-        track = Track(
-            metadata=metadata,
-            file_path=Path("whatever.mp3"),
-            created_at=now,
-            last_updated=now,
-        )
-
-        track_added = client.app.state.database.add_track(track)
-        assert track_added
-
-        r = client.get(f"/tracks?newer_than={now - 1}")
-
-        assert r.status_code == 200, r.text
-
-        gettracksresponse = GetTracksResponse.model_validate(r.json())
-
-        assert gettracksresponse
-        assert gettracksresponse.nextCursor is None
-        assert gettracksresponse.data
-        assert len(gettracksresponse.data) == 1
-        assert gettracksresponse.data[0].uuid_id == track.uuid_id
-
-        r = client.get(f"/tracks?newer_than={now + 1}")
-
-        assert r.status_code == 200, r.text
-
-        gettracksresponse = GetTracksResponse.model_validate(r.json())
-
-        assert gettracksresponse
-        assert gettracksresponse.nextCursor is None
-        assert len(gettracksresponse.data) == 0
-
-    def test_tracks__older_than__works(self, client):
-        metadata = TrackMetaData(duration=1.0)
-
-        now = int(datetime.now(UTC).timestamp())
-        track = Track(
-            metadata=metadata,
-            file_path=Path("whatever.mp3"),
-            created_at=now,
-            last_updated=now,
-        )
-
-        track_added = client.app.state.database.add_track(track)
-        assert track_added
-
-        r = client.get(f"/tracks?older_than={now + 1}")
-
-        assert r.status_code == 200, r.text
-
-        gettracksresponse = GetTracksResponse.model_validate(r.json())
-
-        assert gettracksresponse
-        assert gettracksresponse.nextCursor is None
-        assert gettracksresponse.data
-        assert len(gettracksresponse.data) == 1
-        assert gettracksresponse.data[0].uuid_id == track.uuid_id
-
-        r = client.get(f"/tracks?older_than={now - 1}")
-
-        assert r.status_code == 200, r.text
-
-        gettracksresponse = GetTracksResponse.model_validate(r.json())
-
-        assert gettracksresponse
-        assert gettracksresponse.nextCursor is None
-        assert len(gettracksresponse.data) == 0
 
     def test_tracks__limit_offset__works(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=5)
@@ -415,6 +353,216 @@ class TestGetTracks:
         gettracksresponse = GetTracksResponse.model_validate(r.json())
         assert len(gettracksresponse.data) == 0
         assert gettracksresponse.nextCursor is None
+
+
+def _drain_changes(client, limit: int = 500) -> List[dict]:
+    """Page through /changes from 0 and return all change entries in order."""
+    after = 0
+    collected: List[dict] = []
+    while True:
+        r = client.get("/changes", params={"after_revision": after, "limit": limit})
+        assert r.status_code == 200, r.text
+        body = GetChangesResponse.model_validate(r.json())
+        collected.extend(c.model_dump() for c in body.changes)
+        if body.nextCursor is None:
+            break
+        after = body.nextCursor
+    return collected
+
+
+class TestGetChanges:
+    def test_change_entry__validates_track_payload_shape(self, client):
+        with pytest.raises(ValueError, match="upsert"):
+            ChangeEntry(type="upsert", revision=1, uuid_id="missing-track")
+
+        add_tracks_to_client(client=client, amount_to_add=1)
+        body = GetChangesResponse.model_validate(client.get("/changes").json())
+        track = body.changes[0].track
+        assert track is not None
+
+        with pytest.raises(ValueError, match="delete"):
+            ChangeEntry(
+                type="delete",
+                revision=2,
+                uuid_id=body.changes[0].uuid_id,
+                track=track,
+            )
+
+    def test_changes__from_zero__returns_all_upserts_in_order(self, client):
+        add_tracks_to_client(client=client, amount_to_add=3)
+
+        r = client.get("/changes")
+        assert r.status_code == 200, r.text
+        body = GetChangesResponse.model_validate(r.json())
+
+        assert [c.type for c in body.changes] == ["upsert"] * 3
+        revisions = [c.revision for c in body.changes]
+        assert revisions == sorted(revisions)
+        assert body.latestRevision == revisions[-1]
+        assert body.nextCursor is None  # short page → caught up
+        # Upserts carry full track payloads.
+        assert all(c.track is not None for c in body.changes)
+
+    def test_changes__after_revision__excludes_already_seen(self, client):
+        add_tracks_to_client(client=client, amount_to_add=3)
+        first = GetChangesResponse.model_validate(client.get("/changes").json())
+        seen_through = first.changes[1].revision
+
+        r = client.get("/changes", params={"after_revision": seen_through})
+        body = GetChangesResponse.model_validate(r.json())
+        assert all(c.revision > seen_through for c in body.changes)
+        assert len(body.changes) == 1
+
+    def test_changes__interleaves_upserts_and_deletes_by_revision(self, client):
+        tracks = add_tracks_to_client(client=client, amount_to_add=2)
+        # Delete the first track so its tombstone gets the newest revision.
+        assert client.app.state.database.delete_track(uuid_id=tracks[0].uuid_id)
+
+        entries = _drain_changes(client)
+        # Strictly increasing revisions across the whole interleaved stream.
+        revs = [e["revision"] for e in entries]
+        assert revs == sorted(revs)
+        # The delete is last (newest revision) and names the removed uuid.
+        assert entries[-1]["type"] == "delete"
+        assert entries[-1]["uuid_id"] == tracks[0].uuid_id
+        assert entries[-1]["track"] is None
+
+    def test_changes__delete_on_later_page__is_not_missed(self, client):
+        # Regression for the old design where deletes only rode page 1: with
+        # limit=1 the delete lands on a later page and must still surface.
+        tracks = add_tracks_to_client(client=client, amount_to_add=3)
+        assert client.app.state.database.delete_track(uuid_id=tracks[0].uuid_id)
+
+        entries = _drain_changes(client, limit=1)
+        delete_entries = [e for e in entries if e["type"] == "delete"]
+        assert len(delete_entries) == 1
+        assert delete_entries[0]["uuid_id"] == tracks[0].uuid_id
+        # It genuinely paginated past the first page.
+        assert delete_entries[0]["revision"] > entries[0]["revision"]
+
+    def test_changes__pagination_cursor_resumes(self, client):
+        tracks = add_tracks_to_client(client=client, amount_to_add=5)
+
+        entries = _drain_changes(client, limit=2)
+        assert [e["uuid_id"] for e in entries if e["type"] == "upsert"]
+        # Every added track appears exactly once across the paged stream.
+        upserted = sorted(e["uuid_id"] for e in entries if e["type"] == "upsert")
+        assert upserted == sorted(t.uuid_id for t in tracks)
+
+    def test_changes__upsert_unhydratable_on_full_page__still_paginates(
+        self, client
+    ):
+        # Regression: an upsert whose metadata can't hydrate (simulating a
+        # track concurrently hard-deleted between the stream query and the
+        # hydration JOIN) is dropped from `changes`, shrinking the page below
+        # the limit. nextCursor must still be derived from the raw stream so
+        # pagination does not falsely report "caught up" and strand newer rows.
+        tracks = add_tracks_to_client(client=client, amount_to_add=2)
+
+        # Insert a bare `tracks` row (revision 3, no trackmetadata) so the
+        # change stream lists it as an upsert but the hydration JOIN misses it.
+        # Advance the counter past it so the next real add gets revision 4.
+        db = client.app.state.database
+        with db._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT INTO tracks (uuid_id, file_path, created_at, "
+                "last_updated, revision) VALUES ('orphan', '/o', 0, 0, 3)"
+            )
+            conn.execute("UPDATE revision_counter SET value = 3 WHERE id = 0")
+
+        # A full raw page (limit == 3) that yields only 2 hydrated entries.
+        r = client.get("/changes", params={"after_revision": 0, "limit": 3})
+        body = GetChangesResponse.model_validate(r.json())
+        assert len(body.changes) == 2
+        assert {c.uuid_id for c in body.changes} == {t.uuid_id for t in tracks}
+        # Must not be None — the old len(entries)==limit logic returned None here.
+        assert body.nextCursor == 3
+
+        # A later real change is reachable by resuming from the cursor.
+        newer = add_tracks_to_client(client=client, amount_to_add=1)[0]
+        r = client.get("/changes", params={"after_revision": body.nextCursor})
+        body = GetChangesResponse.model_validate(r.json())
+        assert [c.uuid_id for c in body.changes] == [newer.uuid_id]
+
+    def test_changes__unhydratable_final_page_still_advances_cursor(
+        self, client
+    ):
+        # Same raw-row drop as above, but on a final short page. Even when no
+        # newer rows remain, the client still needs a cursor so it can advance
+        # past the consumed raw revision instead of requesting it forever.
+        tracks = add_tracks_to_client(client=client, amount_to_add=1)
+
+        db = client.app.state.database
+        with db._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT INTO tracks (uuid_id, file_path, created_at, "
+                "last_updated, revision) VALUES ('final-orphan', '/o', 0, 0, 2)"
+            )
+            conn.execute("UPDATE revision_counter SET value = 2 WHERE id = 0")
+
+        r = client.get("/changes", params={"after_revision": 0, "limit": 500})
+        body = GetChangesResponse.model_validate(r.json())
+        assert [c.uuid_id for c in body.changes] == [tracks[0].uuid_id]
+        assert body.nextCursor == 2
+
+        r = client.get("/changes", params={"after_revision": body.nextCursor})
+        body = GetChangesResponse.model_validate(r.json())
+        assert body.changes == []
+        assert body.nextCursor is None
+        assert body.latestRevision == 2
+
+    def test_changes__db_error__returns_500(self, client):
+        # A DB failure must surface as a 5xx, not a silent empty page that the
+        # client would read as "caught up" and stop syncing on.
+        db = client.app.state.database
+        with db._connection(commit=True) as conn:
+            conn.execute("DROP TABLE revision_counter")
+
+        r = client.get("/changes")
+        assert r.status_code == 500
+
+    def test_changes__caught_up__returns_empty(self, client):
+        add_tracks_to_client(client=client, amount_to_add=2)
+        latest = GetChangesResponse.model_validate(
+            client.get("/changes").json()
+        ).latestRevision
+
+        r = client.get("/changes", params={"after_revision": latest})
+        body = GetChangesResponse.model_validate(r.json())
+        assert body.changes == []
+        assert body.nextCursor is None
+        assert body.latestRevision == latest
+
+    def test_changes__invalid_after_revision__fails_validation(self, client):
+        r = client.get("/changes", params={"after_revision": -1})
+        assert r.status_code == 422, r.text
+
+    def test_changes__invalid_limit__fails_validation(self, client):
+        for limit in (0, -1, 1001):
+            r = client.get("/changes", params={"limit": limit})
+            assert r.status_code == 422, r.text
+
+    def test_changes__exactly_full_final_page_returns_empty_followup(
+        self, client
+    ):
+        add_tracks_to_client(client=client, amount_to_add=2)
+
+        r = client.get("/changes", params={"after_revision": 0, "limit": 2})
+        assert r.status_code == 200, r.text
+        body = GetChangesResponse.model_validate(r.json())
+
+        assert len(body.changes) == 2
+        assert body.nextCursor == body.changes[-1].revision
+
+        r = client.get(
+            "/changes", params={"after_revision": body.nextCursor, "limit": 2}
+        )
+        assert r.status_code == 200, r.text
+        followup = GetChangesResponse.model_validate(r.json())
+
+        assert followup.changes == []
+        assert followup.nextCursor is None
+        assert followup.latestRevision == body.latestRevision
 
 
 class TestGetTracksStream:
