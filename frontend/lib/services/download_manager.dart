@@ -270,23 +270,31 @@ class DownloadManager extends ChangeNotifier {
 
   Future<bool> _downloadOne(DownloadJob job) async {
     final dir = await _ensureDownloadDir();
-    // Audio container is opaque to the UI; the server may rewrite the
-    // extension when transcoding so we save with `.audio` and let just_audio
-    // sniff the format on playback.
-    final destination = File(p.join(dir.path, '${job.uuidId}.audio'));
+
+    final request = http.Request(
+      'GET',
+      buildTrackStreamUri(job.uuidId, quality: job.quality),
+    );
+    final response = await _client.send(request);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      // Drain to avoid leaking the connection.
+      await response.stream.drain<void>();
+      return false;
+    }
+
+    // Determine the file extension from the server's X-Audio-Extension header.
+    // Transcoded files are always m4a; originals get their actual extension.
+    // Fall back to 'audio' only as a last resort (AVFoundation rejects unknown
+    // extensions, but 'audio' is better than a silent failure from a wrong one).
+    final ext = job.quality != originalQuality
+        ? 'm4a'
+        : (response.headers['x-audio-extension'] ?? 'audio');
+
+    final destination = File(p.join(dir.path, '${job.uuidId}.$ext'));
     final partial = File('${destination.path}.partial');
 
     try {
       if (await partial.exists()) await partial.delete();
-
-      final request = http.Request(
-        'GET',
-        buildTrackStreamUri(job.uuidId, quality: job.quality),
-      );
-      final response = await _client.send(request);
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        return false;
-      }
 
       final total = response.contentLength ?? 0;
       var received = 0;

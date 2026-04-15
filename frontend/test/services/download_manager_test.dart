@@ -136,6 +136,64 @@ void main() {
     expect(row.filePath, isNotNull);
     expect(File(row.filePath!).existsSync(), isTrue);
     expect(await File(row.filePath!).readAsBytes(), [1, 2, 3, 4]);
+    // Transcoded quality → always .m4a regardless of response headers.
+    expect(row.filePath, endsWith('.m4a'));
+  });
+
+  test('transcoded quality always saves as .m4a', () async {
+    await _insertTrack(db, 'abc');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes(
+        [1],
+        200,
+        headers: {'x-audio-extension': 'flac'}, // header should be ignored
+      )),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '128');
+    await _waitForFinish(manager);
+
+    final row = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals('abc')))
+        .getSingle();
+    expect(row.filePath, endsWith('.m4a'));
+  });
+
+  test('original quality uses X-Audio-Extension header for extension', () async {
+    await _insertTrack(db, 'abc');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes(
+        [1, 2],
+        200,
+        headers: {'x-audio-extension': 'flac'},
+      )),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: originalQuality);
+    await _waitForFinish(manager);
+
+    final row = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals('abc')))
+        .getSingle();
+    expect(row.filePath, endsWith('.flac'));
+  });
+
+  test('original quality falls back to .audio when header absent', () async {
+    await _insertTrack(db, 'abc');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1], 200)),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: originalQuality);
+    await _waitForFinish(manager);
+
+    final row = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals('abc')))
+        .getSingle();
+    expect(row.filePath, endsWith('.audio'));
   });
 
   test('uses no quality query for the original preset', () async {
