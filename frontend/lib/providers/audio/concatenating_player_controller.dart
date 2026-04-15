@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:io';
 
 import 'package:just_audio/just_audio.dart' as ja;
 
 import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/services/quality_presets.dart';
 
 class ConcatenatingPlayerController {
   final ja.AudioPlayer _player;
@@ -15,6 +17,11 @@ class ConcatenatingPlayerController {
   int? _committedCurrentItemId;
   int _structuralMutationDepth = 0;
   bool _isDisposed = false;
+
+  /// Quality preset applied to NEW source URIs. Existing in-flight sources
+  /// keep whatever quality they were created with — quality switches take
+  /// effect at the next track boundary.
+  String _streamQuality = originalQuality;
 
   ConcatenatingPlayerController(this._player) {
     _currentIndexSubscription = _player.currentIndexStream.listen(
@@ -237,9 +244,24 @@ class ConcatenatingPlayerController {
     unawaited(_player.dispose());
   }
 
+  /// Update the quality applied to subsequent source builds. Existing
+  /// in-flight sources are not rebuilt — the change takes effect on the next
+  /// track loaded into the queue.
+  void setStreamQuality(String quality) {
+    _streamQuality = quality;
+  }
+
   ja.AudioSource _sourceForEntry(QueuePlaybackEntry entry) {
+    final localPath = entry.filePath;
+    if (localPath != null && File(localPath).existsSync()) {
+      // Local file is always served verbatim — quality preset doesn't apply.
+      return ja.AudioSource.uri(
+        Uri.file(localPath),
+        tag: entry.itemId,
+      );
+    }
     return ja.AudioSource.uri(
-      buildTrackStreamUri(entry.uuidId),
+      buildTrackStreamUri(entry.uuidId, quality: _streamQuality),
       tag: entry.itemId,
     );
   }

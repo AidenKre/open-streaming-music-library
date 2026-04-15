@@ -17,8 +17,12 @@ class Settings(BaseSettings):
     # Feature flags
     enable_file_watcher: bool = True
 
+    # Encoded tracks cache (used for transcoded streams)
+    encoded_cache_size_gb: float = 5.0
+    encoded_cache_prefetch_workers: int = 2
+    prefetch_lookahead: int = 20
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 settings = Settings()
-

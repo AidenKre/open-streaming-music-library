@@ -2692,7 +2692,7 @@ class TestDatabaseMigration:
 
         assert "cover_art_id" in columns
 
-    def test_migrate__v0_database__sets_user_version_to_1(self, tmp_path: Path):
+    def test_migrate__v0_database__sets_user_version_to_latest(self, tmp_path: Path):
         database_path = self._create_v0_database(tmp_path)
 
         database = set_up_database(database_path=database_path)
@@ -2702,7 +2702,7 @@ class TestDatabaseMigration:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         conn.close()
 
-        assert version == 1
+        assert version == 2
 
     def test_migrate__already_at_v1__does_not_fail(self, tmp_path: Path):
         database_path = tmp_path / "database.db"

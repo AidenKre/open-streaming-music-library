@@ -198,6 +198,8 @@ class _FakePlayer implements ConcatenatingPlayerController {
   @override
   Future<void> setLoopMode(ja.LoopMode mode) async {}
   @override
+  void setStreamQuality(String quality) {}
+  @override
   void dispose() {}
 }
 

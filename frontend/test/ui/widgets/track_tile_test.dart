@@ -6,9 +6,14 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
-TrackUI _track({bool hasAlbumArt = false, int? coverArtId}) {
+TrackUI _track({
+  bool hasAlbumArt = false,
+  int? coverArtId,
+  String? filePath,
+}) {
   return TrackUI(
     uuidId: 'test-uuid',
+    filePath: filePath,
     createdAt: 1,
     lastUpdated: 1,
     title: 'Test Track',
@@ -28,10 +33,24 @@ void main() {
     initCoverArtCache(CoverArtCacheManager.noop());
   });
 
-  Widget buildTile(TrackUI track, {bool isHighlighted = false}) {
+  Widget buildTile(
+    TrackUI track, {
+    bool isHighlighted = false,
+    VoidCallback? onPlayNext,
+    VoidCallback? onAddToQueue,
+    VoidCallback? onDownload,
+    VoidCallback? onDeleteDownload,
+  }) {
     return MaterialApp(
       home: Scaffold(
-        body: TrackTile(track: track, isHighlighted: isHighlighted),
+        body: TrackTile(
+          track: track,
+          isHighlighted: isHighlighted,
+          onPlayNext: onPlayNext,
+          onAddToQueue: onAddToQueue,
+          onDownload: onDownload,
+          onDeleteDownload: onDeleteDownload,
+        ),
       ),
     );
   }
@@ -75,5 +94,64 @@ void main() {
         expect(find.byType(Image), findsNothing);
       },
     );
+  });
+
+  group('TrackTile downloaded indicator', () {
+    testWidgets('shows download_done icon when track is downloaded',
+        (tester) async {
+      await tester.pumpWidget(buildTile(_track(filePath: '/tmp/abc.audio')));
+
+      expect(find.byIcon(Icons.download_done), findsOneWidget);
+    });
+
+    testWidgets('omits the icon when track is not downloaded', (tester) async {
+      await tester.pumpWidget(buildTile(_track()));
+
+      expect(find.byIcon(Icons.download_done), findsNothing);
+    });
+  });
+
+  group('TrackTile context menu', () {
+    testWidgets('Download menu item appears for un-downloaded tracks',
+        (tester) async {
+      var downloadCalled = false;
+      await tester.pumpWidget(buildTile(
+        _track(),
+        onPlayNext: () {},
+        onDownload: () => downloadCalled = true,
+        onDeleteDownload: () {},
+      ));
+
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Download'), findsOneWidget);
+      expect(find.text('Delete download'), findsNothing);
+
+      await tester.tap(find.text('Download'));
+      await tester.pumpAndSettle();
+      expect(downloadCalled, isTrue);
+    });
+
+    testWidgets('Delete download appears instead when track is downloaded',
+        (tester) async {
+      var deleteCalled = false;
+      await tester.pumpWidget(buildTile(
+        _track(filePath: '/tmp/abc.audio'),
+        onPlayNext: () {},
+        onDownload: () {},
+        onDeleteDownload: () => deleteCalled = true,
+      ));
+
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Delete download'), findsOneWidget);
+      expect(find.text('Download'), findsNothing);
+
+      await tester.tap(find.text('Delete download'));
+      await tester.pumpAndSettle();
+      expect(deleteCalled, isTrue);
+    });
   });
 }

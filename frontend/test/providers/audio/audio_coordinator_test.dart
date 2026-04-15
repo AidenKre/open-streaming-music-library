@@ -826,6 +826,12 @@ class FakeConcatenatingPlayerController
   int stopCalls = 0;
   ja.LoopMode? lastLoopMode;
   double? lastVolume;
+  String? lastStreamQuality;
+
+  @override
+  void setStreamQuality(String quality) {
+    lastStreamQuality = quality;
+  }
 
   @override
   Future<void> setSeed(

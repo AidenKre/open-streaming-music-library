@@ -104,3 +104,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_albums USING fts5(
     name, artist_name,
     content='', content_rowid='id', tokenize='unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS queue_sync_state (
+    "session_id" TEXT PRIMARY KEY,
+    "current_index" INTEGER NOT NULL,
+    "quality" TEXT NOT NULL,
+    "track_uuids" TEXT NOT NULL,
+    "updated_at" REAL NOT NULL
+);

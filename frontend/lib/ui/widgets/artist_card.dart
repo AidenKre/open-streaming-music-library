@@ -1,12 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 
-class ArtistCard extends StatelessWidget {
+class ArtistCard extends ConsumerWidget {
   final ArtistUI artist;
   final VoidCallback onTap;
   final VoidCallback? onPlayNext;
   final VoidCallback? onAddToQueue;
+  final VoidCallback? onDownload;
+  final VoidCallback? onDeleteDownload;
 
   const ArtistCard({
     super.key,
@@ -14,9 +18,11 @@ class ArtistCard extends StatelessWidget {
     required this.onTap,
     this.onPlayNext,
     this.onAddToQueue,
+    this.onDownload,
+    this.onDeleteDownload,
   });
 
-  void _showArtistMenu(BuildContext context) {
+  void _showArtistMenu(BuildContext context, bool isDownloaded) {
     showModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
@@ -41,6 +47,24 @@ class ArtistCard extends StatelessWidget {
                   onAddToQueue!();
                 },
               ),
+            if (isDownloaded && onDeleteDownload != null)
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Delete downloads'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDeleteDownload!();
+                },
+              )
+            else if (!isDownloaded && onDownload != null)
+              ListTile(
+                leading: const Icon(Icons.download),
+                title: const Text('Download'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDownload!();
+                },
+              ),
           ],
         ),
       ),
@@ -48,9 +72,14 @@ class ArtistCard extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
+    final isDownloaded =
+        ref.watch(artistDownloadedProvider(artist.id)).maybeWhen(
+              data: (v) => v,
+              orElse: () => false,
+            );
 
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -59,26 +88,41 @@ class ArtistCard extends StatelessWidget {
       ),
       child: InkWell(
         onTap: onTap,
-        onLongPress: (onPlayNext != null || onAddToQueue != null)
-            ? () => _showArtistMenu(context)
+        onLongPress: (onPlayNext != null ||
+                onAddToQueue != null ||
+                onDownload != null ||
+                onDeleteDownload != null)
+            ? () => _showArtistMenu(context, isDownloaded)
             : null,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             AspectRatio(
               aspectRatio: 1,
-              child: CoverArtImage(
-                hasAlbumArt: artist.coverArtId != null,
-                coverArtId: artist.coverArtId,
-                borderRadius: BorderRadius.zero,
-                fallback: Container(
-                  color: colorScheme.secondaryContainer,
-                  child: Icon(
-                    Icons.person,
-                    size: 48,
-                    color: colorScheme.onSecondaryContainer,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: CoverArtImage(
+                      hasAlbumArt: artist.coverArtId != null,
+                      coverArtId: artist.coverArtId,
+                      borderRadius: BorderRadius.zero,
+                      fallback: Container(
+                        color: colorScheme.secondaryContainer,
+                        child: Icon(
+                          Icons.person,
+                          size: 48,
+                          color: colorScheme.onSecondaryContainer,
+                        ),
+                      ),
+                    ),
                   ),
-                ),
+                  if (isDownloaded)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: _DownloadedBadge(colorScheme: colorScheme),
+                    ),
+                ],
               ),
             ),
             Padding(
@@ -92,6 +136,27 @@ class ArtistCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _DownloadedBadge extends StatelessWidget {
+  final ColorScheme colorScheme;
+  const _DownloadedBadge({required this.colorScheme});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: colorScheme.primary,
+        shape: BoxShape.circle,
+      ),
+      child: Icon(
+        Icons.download_done,
+        size: 14,
+        color: colorScheme.onPrimary,
       ),
     );
   }

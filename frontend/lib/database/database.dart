@@ -974,6 +974,62 @@ class AppDatabase extends _$AppDatabase {
     ).watch().map((rows) => rows.first.read<int>('c'));
   }
 
+  // ── Download status aggregates ────────────────────────────────────────
+
+  /// For each album id, returns `(total, downloaded)` track counts. An album
+  /// is "fully downloaded" iff `downloaded == total && total > 0`.
+  Future<Map<int, ({int total, int downloaded})>> getAlbumDownloadCounts(
+    Iterable<int> albumIds,
+  ) async {
+    final ids = albumIds.toSet().toList(growable: false);
+    if (ids.isEmpty) return const {};
+    final placeholders = List.filled(ids.length, '?').join(', ');
+    final rows = await customSelect(
+      'SELECT tm.album_id AS aid, COUNT(*) AS total, '
+      'SUM(CASE WHEN t.file_path IS NOT NULL THEN 1 ELSE 0 END) AS downloaded '
+      'FROM trackmetadata tm '
+      'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+      'WHERE tm.album_id IN ($placeholders) '
+      'GROUP BY tm.album_id',
+      variables: ids.map(Variable.withInt).toList(),
+      readsFrom: {trackmetadata, tracks},
+    ).get();
+    return {
+      for (final r in rows)
+        r.read<int>('aid'): (
+          total: r.read<int>('total'),
+          downloaded: r.read<int>('downloaded'),
+        ),
+    };
+  }
+
+  /// Same as above but per artist. Used by ArtistCard to show a "downloaded"
+  /// badge when ALL of the artist's tracks have been downloaded.
+  Future<Map<int, ({int total, int downloaded})>> getArtistDownloadCounts(
+    Iterable<int> artistIds,
+  ) async {
+    final ids = artistIds.toSet().toList(growable: false);
+    if (ids.isEmpty) return const {};
+    final placeholders = List.filled(ids.length, '?').join(', ');
+    final rows = await customSelect(
+      'SELECT tm.artist_id AS aid, COUNT(*) AS total, '
+      'SUM(CASE WHEN t.file_path IS NOT NULL THEN 1 ELSE 0 END) AS downloaded '
+      'FROM trackmetadata tm '
+      'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+      'WHERE tm.artist_id IN ($placeholders) '
+      'GROUP BY tm.artist_id',
+      variables: ids.map(Variable.withInt).toList(),
+      readsFrom: {trackmetadata, tracks},
+    ).get();
+    return {
+      for (final r in rows)
+        r.read<int>('aid'): (
+          total: r.read<int>('total'),
+          downloaded: r.read<int>('downloaded'),
+        ),
+    };
+  }
+
   // ── Album queries ─────────────────────────────────────────────────────
 
   (String, List<Variable>) _buildAlbumQuery({

@@ -7,6 +7,7 @@ import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
@@ -173,6 +174,8 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                           ref.read(audioProvider.notifier).addToQueue(tracks);
                         }
                       },
+                      onDownload: () => downloadArtistTracks(ref, artist.id),
+                      onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
                     ),
                   );
                 },
@@ -208,6 +211,8 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                           ref.read(audioProvider.notifier).addToQueue(tracks);
                         }
                       },
+                      onDownload: () => downloadAlbumTracks(ref, album.artistId, album.id),
+                      onDeleteDownload: () => deleteAlbumDownloads(ref, album.artistId, album.id),
                     ),
                   );
                 },
@@ -230,6 +235,8 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                     ref.read(audioProvider.notifier).playNext([track]),
                 onAddToQueue: () =>
                     ref.read(audioProvider.notifier).addToQueue([track]),
+                onDownload: () => downloadTrack(ref, track),
+                onDeleteDownload: () => deleteTrackDownload(ref, track.uuidId),
               ),
           ],
         ],

@@ -1,12 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/album_ui.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 
-class AlbumCard extends StatelessWidget {
+class AlbumCard extends ConsumerWidget {
   final AlbumUI album;
   final VoidCallback onTap;
   final VoidCallback? onPlayNext;
   final VoidCallback? onAddToQueue;
+  final VoidCallback? onDownload;
+  final VoidCallback? onDeleteDownload;
 
   const AlbumCard({
     super.key,
@@ -14,9 +18,11 @@ class AlbumCard extends StatelessWidget {
     required this.onTap,
     this.onPlayNext,
     this.onAddToQueue,
+    this.onDownload,
+    this.onDeleteDownload,
   });
 
-  void _showAlbumMenu(BuildContext context) {
+  void _showAlbumMenu(BuildContext context, bool isDownloaded) {
     showModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
@@ -41,6 +47,24 @@ class AlbumCard extends StatelessWidget {
                   onAddToQueue!();
                 },
               ),
+            if (isDownloaded && onDeleteDownload != null)
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Delete downloads'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDeleteDownload!();
+                },
+              )
+            else if (!isDownloaded && onDownload != null)
+              ListTile(
+                leading: const Icon(Icons.download),
+                title: const Text('Download'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDownload!();
+                },
+              ),
           ],
         ),
       ),
@@ -48,10 +72,15 @@ class AlbumCard extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
     final isSingle = album.isSingleGrouping;
+    final isDownloaded =
+        ref.watch(albumDownloadedProvider(album.id)).maybeWhen(
+              data: (v) => v,
+              orElse: () => false,
+            );
 
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -60,30 +89,45 @@ class AlbumCard extends StatelessWidget {
       ),
       child: InkWell(
         onTap: onTap,
-        onLongPress: (onPlayNext != null || onAddToQueue != null)
-            ? () => _showAlbumMenu(context)
+        onLongPress: (onPlayNext != null ||
+                onAddToQueue != null ||
+                onDownload != null ||
+                onDeleteDownload != null)
+            ? () => _showAlbumMenu(context, isDownloaded)
             : null,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             AspectRatio(
               aspectRatio: 1,
-              child: CoverArtImage(
-                hasAlbumArt: album.coverArtId != null,
-                coverArtId: album.coverArtId,
-                borderRadius: BorderRadius.zero,
-                fallback: Container(
-                  color: isSingle
-                      ? colorScheme.tertiaryContainer
-                      : colorScheme.primaryContainer,
-                  child: Icon(
-                    isSingle ? Icons.library_music_outlined : Icons.album,
-                    size: 48,
-                    color: isSingle
-                        ? colorScheme.onTertiaryContainer
-                        : colorScheme.onPrimaryContainer,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: CoverArtImage(
+                      hasAlbumArt: album.coverArtId != null,
+                      coverArtId: album.coverArtId,
+                      borderRadius: BorderRadius.zero,
+                      fallback: Container(
+                        color: isSingle
+                            ? colorScheme.tertiaryContainer
+                            : colorScheme.primaryContainer,
+                        child: Icon(
+                          isSingle ? Icons.library_music_outlined : Icons.album,
+                          size: 48,
+                          color: isSingle
+                              ? colorScheme.onTertiaryContainer
+                              : colorScheme.onPrimaryContainer,
+                        ),
+                      ),
+                    ),
                   ),
-                ),
+                  if (isDownloaded)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: _DownloadedBadge(colorScheme: colorScheme),
+                    ),
+                ],
               ),
             ),
             Padding(
@@ -114,6 +158,27 @@ class AlbumCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _DownloadedBadge extends StatelessWidget {
+  final ColorScheme colorScheme;
+  const _DownloadedBadge({required this.colorScheme});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: colorScheme.primary,
+        shape: BoxShape.circle,
+      ),
+      child: Icon(
+        Icons.download_done,
+        size: 14,
+        color: colorScheme.onPrimary,
       ),
     );
   }

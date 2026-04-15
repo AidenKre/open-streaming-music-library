@@ -8,13 +8,23 @@ import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/services/quality_presets.dart';
 
 typedef TempDirectoryProvider = Future<Directory> Function();
 
-Uri buildTrackStreamUri(String uuidId) {
+/// Build the streaming URL for a track. When [quality] is `null` or
+/// `original`, no `quality` query parameter is sent — the server returns the
+/// untouched source file. Any other preset triggers server-side transcoding.
+Uri buildTrackStreamUri(String uuidId, {String? quality}) {
   final baseUri = Uri.parse(ApiClient.instance.baseUrl);
   final basePath = baseUri.pathSegments.where((segment) => segment.isNotEmpty);
-  return baseUri.replace(pathSegments: [...basePath, 'tracks', uuidId, 'stream']);
+  final query = (quality == null || quality == originalQuality)
+      ? null
+      : {'quality': quality};
+  return baseUri.replace(
+    pathSegments: [...basePath, 'tracks', uuidId, 'stream'],
+    queryParameters: query,
+  );
 }
 
 abstract class TrackCacheManager {

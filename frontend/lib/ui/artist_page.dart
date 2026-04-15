@@ -4,8 +4,10 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
+import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 
@@ -130,6 +132,8 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
                     ref.read(audioProvider.notifier).addToQueue(tracks);
                   }
                 },
+                onDownload: () => downloadArtistTracks(ref, artist.id),
+                onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
               );
             },
           ),
@@ -141,13 +145,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
       return Scaffold(
         appBar: AppBar(
           title: const Text('OSML'),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.logout),
-              tooltip: 'Disconnect',
-              onPressed: widget.onDisconnect,
-            ),
-          ],
+          actions: buildTopBarActions(context, ref, widget.onDisconnect),
         ),
         body: body,
       );

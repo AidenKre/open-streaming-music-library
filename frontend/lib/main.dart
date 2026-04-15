@@ -7,6 +7,8 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
@@ -22,8 +24,9 @@ Future<void> main() async {
   if (savedUrl != null) {
     ApiClient.init(savedUrl);
   }
-  initCoverArtCache();
   final db = AppDatabase(openAppDatabase());
+  final coverArtStore = await LocalCoverArtStore.create();
+  initCoverArtCache(CoverArtCacheManager(localStore: coverArtStore));
   final audioHandler = await AudioService.init<AudioServiceBridge>(
     builder: () => AudioServiceBridge(),
     config: const AudioServiceConfig(
@@ -36,6 +39,7 @@ Future<void> main() async {
     overrides: [
       databaseProvider.overrideWithValue(db),
       audioServiceProvider.overrideWithValue(audioHandler),
+      localCoverArtStoreProvider.overrideWithValue(coverArtStore),
     ],
     child: Frontend(),
   ));

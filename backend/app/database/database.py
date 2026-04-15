@@ -206,7 +206,7 @@ class Database:
                 init_script = f.read()
             with self._connection(commit=True) as conn:
                 conn.executescript(init_script)
-                conn.execute("PRAGMA user_version = 1")
+                conn.execute("PRAGMA user_version = 2")
             return True
         except Exception as e:
             print(f"Error initializing database: {e}")
@@ -244,6 +244,19 @@ class Database:
                 # Note: PRAGMA user_version is not transactional in SQLite,
                 # but the DDL above is, so partial migration is still detectable.
                 conn.execute("PRAGMA user_version = 1")
+
+            if version < 2:
+                print("Migrating database to version 2: adding queue_sync_state table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS queue_sync_state ('
+                    '"session_id" TEXT PRIMARY KEY, '
+                    '"current_index" INTEGER NOT NULL, '
+                    '"quality" TEXT NOT NULL, '
+                    '"track_uuids" TEXT NOT NULL, '
+                    '"updated_at" REAL NOT NULL'
+                    ')'
+                )
+                conn.execute("PRAGMA user_version = 2")
 
     def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
         try:
@@ -1109,6 +1122,60 @@ class Database:
         return SearchResults(
             tracks=result_tracks, artists=result_artists, albums=result_albums
         )
+
+    # ── Queue sync state ─────────────────────────────────────────────────
+
+    def upsert_queue_sync_state(
+        self,
+        session_id: str,
+        current_index: int,
+        quality: str,
+        track_uuids_json: str,
+        updated_at: float,
+    ) -> None:
+        try:
+            with self._connection(commit=True) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO queue_sync_state "
+                    "(session_id, current_index, quality, track_uuids, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (session_id, current_index, quality, track_uuids_json, updated_at),
+                )
+        except Exception as e:
+            print(f"Error upserting queue sync state: {e}")
+
+    def get_queue_sync_state(self, session_id: str) -> dict | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT session_id, current_index, quality, track_uuids, updated_at "
+                    "FROM queue_sync_state WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return {
+                    "session_id": row["session_id"],
+                    "current_index": row["current_index"],
+                    "quality": row["quality"],
+                    "track_uuids": row["track_uuids"],
+                    "updated_at": row["updated_at"],
+                }
+        except Exception as e:
+            print(f"Error getting queue sync state: {e}")
+            return None
+
+    def delete_queue_sync_state(self, session_id: str) -> bool:
+        try:
+            with self._connection(commit=True) as conn:
+                cursor = conn.execute(
+                    "DELETE FROM queue_sync_state WHERE session_id = ?",
+                    (session_id,),
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error deleting queue sync state: {e}")
+            return False
 
 
 def prepare_fts_query(raw_query: str) -> str:

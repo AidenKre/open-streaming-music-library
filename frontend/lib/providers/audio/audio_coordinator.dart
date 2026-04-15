@@ -16,6 +16,8 @@ import 'package:frontend/providers/audio/queue_hydration_controller.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/services/queue_sync_service.dart';
+import 'package:frontend/services/settings_service.dart';
 
 class AudioCoordinator extends Notifier<AudioState> {
   static const _volumePreferenceKey = 'audioVolume';
@@ -40,6 +42,15 @@ class AudioCoordinator extends Notifier<AudioState> {
     _coverArtCache = ref.read(coverArtCacheProvider);
     _orderManager = QueueOrderManager(_queueRepo);
     _hydrationController = QueueHydrationController(_queueRepo, _player);
+
+    // Push stream quality changes into the player so newly-built sources use
+    // the user's current preset. The very first fire happens during build() —
+    // before `state` is initialised — so we only push the quality through and
+    // skip the prefetch on that initial call.
+    ref.listen<String>(streamQualityProvider, (previous, next) {
+      _player.setStreamQuality(next);
+      if (previous != null) _scheduleQueueSync();
+    }, fireImmediately: true);
 
     _bridge.onPlay = resume;
     _bridge.onPause = pause;
@@ -680,6 +691,20 @@ class AudioCoordinator extends Notifier<AudioState> {
       totalCount: state.queue.totalCount,
       currentPlayPosition: state.queue.currentPlayPosition,
     );
+    _scheduleQueueSync();
+  }
+
+  /// Syncs the current queue state to the backend so it can autonomously
+  /// manage its encoded-track cache. Debounced inside the service.
+  void _scheduleQueueSync() {
+    final sessionId = state.queue.sessionId;
+    if (sessionId == null) return;
+    final quality = ref.read(streamQualityProvider);
+    ref.read(queueSyncServiceProvider).scheduleSync(
+          sessionId: sessionId,
+          currentPlayPosition: state.queue.currentPlayPosition,
+          quality: quality,
+        );
   }
 
   Future<void> _onCurrentItemChanged(int? currentItemId) async {

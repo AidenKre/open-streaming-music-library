@@ -9,4 +9,6 @@ from .api_return_models import (
     GetArtistsResponse,
     GetAlbumsResponse,
     GetSearchResponse,
+    QueueSyncRequest,
+    QueueSyncResponse,
 )

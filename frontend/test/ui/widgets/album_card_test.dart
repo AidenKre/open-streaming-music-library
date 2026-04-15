@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/album_ui.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 
 const _kArtistId = 1;
@@ -31,13 +33,32 @@ const _singleAlbum = AlbumUI(
   isSingleGrouping: true,
 );
 
-Widget buildCard(AlbumUI album) {
-  return MaterialApp(
-    home: Scaffold(
-      body: SizedBox(
-        width: 200,
-        height: 280,
-        child: AlbumCard(album: album, onTap: () {}),
+Widget buildCard(
+  AlbumUI album, {
+  bool downloaded = false,
+  VoidCallback? onPlayNext,
+  VoidCallback? onAddToQueue,
+  VoidCallback? onDownload,
+  VoidCallback? onDeleteDownload,
+}) {
+  return ProviderScope(
+    overrides: [
+      albumDownloadedProvider.overrideWith((ref, albumId) async => downloaded),
+    ],
+    child: MaterialApp(
+      home: Scaffold(
+        body: SizedBox(
+          width: 200,
+          height: 280,
+          child: AlbumCard(
+            album: album,
+            onTap: () {},
+            onPlayNext: onPlayNext,
+            onAddToQueue: onAddToQueue,
+            onDownload: onDownload,
+            onDeleteDownload: onDeleteDownload,
+          ),
+        ),
       ),
     ),
   );
@@ -86,5 +107,66 @@ void main() {
         expect(find.text('Test Album'), findsOneWidget);
       },
     );
+  });
+
+  group('AlbumCard download state', () {
+    testWidgets('shows downloaded badge when fully downloaded', (tester) async {
+      await tester.pumpWidget(buildCard(_album, downloaded: true));
+      await tester.pumpAndSettle();
+
+      expect(find.byIcon(Icons.download_done), findsOneWidget);
+    });
+
+    testWidgets('omits downloaded badge when not fully downloaded',
+        (tester) async {
+      await tester.pumpWidget(buildCard(_album, downloaded: false));
+      await tester.pumpAndSettle();
+
+      expect(find.byIcon(Icons.download_done), findsNothing);
+    });
+
+    testWidgets('long-press menu shows Download for un-downloaded album',
+        (tester) async {
+      var downloaded = false;
+      await tester.pumpWidget(buildCard(
+        _album,
+        downloaded: false,
+        onDownload: () => downloaded = true,
+        onDeleteDownload: () {},
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.longPress(find.byType(AlbumCard));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Download'), findsOneWidget);
+      expect(find.text('Delete downloads'), findsNothing);
+
+      await tester.tap(find.text('Download'));
+      await tester.pumpAndSettle();
+      expect(downloaded, isTrue);
+    });
+
+    testWidgets('long-press menu shows Delete downloads when downloaded',
+        (tester) async {
+      var deleted = false;
+      await tester.pumpWidget(buildCard(
+        _album,
+        downloaded: true,
+        onDownload: () {},
+        onDeleteDownload: () => deleted = true,
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.longPress(find.byType(AlbumCard));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Delete downloads'), findsOneWidget);
+      expect(find.text('Download'), findsNothing);
+
+      await tester.tap(find.text('Delete downloads'));
+      await tester.pumpAndSettle();
+      expect(deleted, isTrue);
+    });
   });
 }

@@ -7,6 +7,8 @@ class TrackTile extends StatelessWidget {
   final VoidCallback? onTap;
   final VoidCallback? onPlayNext;
   final VoidCallback? onAddToQueue;
+  final VoidCallback? onDownload;
+  final VoidCallback? onDeleteDownload;
   final bool isHighlighted;
   final bool isDimmed;
   final Widget? trailing;
@@ -17,6 +19,8 @@ class TrackTile extends StatelessWidget {
     this.onTap,
     this.onPlayNext,
     this.onAddToQueue,
+    this.onDownload,
+    this.onDeleteDownload,
     this.isHighlighted = false,
     this.isDimmed = false,
     this.trailing,
@@ -45,6 +49,24 @@ class TrackTile extends StatelessWidget {
                 onTap: () {
                   Navigator.pop(ctx);
                   onAddToQueue!();
+                },
+              ),
+            if (track.isDownloaded && onDeleteDownload != null)
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Delete download'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDeleteDownload!();
+                },
+              )
+            else if (!track.isDownloaded && onDownload != null)
+              ListTile(
+                leading: const Icon(Icons.download),
+                title: const Text('Download'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDownload!();
                 },
               ),
           ],
@@ -134,6 +156,17 @@ class TrackTile extends StatelessWidget {
                     ),
                   ),
                   if (trailing != null) trailing!,
+                  if (trailing == null && track.isDownloaded) ...[
+                    const SizedBox(width: 8),
+                    Opacity(
+                      opacity: opacity,
+                      child: Icon(
+                        Icons.download_done,
+                        size: 16,
+                        color: colors.primary,
+                      ),
+                    ),
+                  ],
                   if (trailing == null &&
                       (onPlayNext != null || onAddToQueue != null)) ...[
                     const SizedBox(width: 8),

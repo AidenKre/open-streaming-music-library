@@ -15,12 +15,17 @@ class QueuePlaybackEntry {
   final int playPosition;
   final String uuidId;
 
+  /// Local download path for this track, if it has been downloaded. The
+  /// player consults this to prefer file:// playback over streaming.
+  final String? filePath;
+
   const QueuePlaybackEntry({
     required this.itemId,
     required this.queueType,
     required this.canonicalPosition,
     required this.playPosition,
     required this.uuidId,
+    this.filePath,
   });
 }
 
@@ -252,9 +257,10 @@ class QueueRepository {
 
     var sql =
         'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-        'po.play_position, qsi.uuid_id '
+        'po.play_position, qsi.uuid_id, t.file_path '
         'FROM queue_session_play_order AS po '
         'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+        'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
         'WHERE po.session_id = ? AND po.play_position >= ? '
         'ORDER BY po.play_position ASC';
 
@@ -278,9 +284,10 @@ class QueueRepository {
     final rows = await _db
         .customSelect(
           'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id '
+          'po.play_position, qsi.uuid_id, t.file_path '
           'FROM queue_session_play_order AS po '
           'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
           'WHERE po.session_id = ? AND po.item_id IN ($placeholders)',
           variables: [
             Variable.withInt(sessionId),
@@ -299,9 +306,10 @@ class QueueRepository {
     final row = await _db
         .customSelect(
           'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id '
+          'po.play_position, qsi.uuid_id, t.file_path '
           'FROM queue_session_play_order AS po '
           'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
           'WHERE po.session_id = ? AND po.item_id = ? '
           'LIMIT 1',
           variables: [Variable.withInt(sessionId), Variable.withInt(itemId)],
@@ -1013,6 +1021,7 @@ class QueueRepository {
       canonicalPosition: row.read<int>('canonical_position'),
       playPosition: row.read<int>('play_position'),
       uuidId: row.read<String>('uuid_id'),
+      filePath: row.readNullable<String>('file_path'),
     );
   }
 

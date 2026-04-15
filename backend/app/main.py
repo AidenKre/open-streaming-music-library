@@ -4,6 +4,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
+import time
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -28,16 +30,25 @@ from app.models import (
     GetArtistsResponse,
     GetSearchResponse,
     GetTracksResponse,
+    QueueSyncRequest,
+    QueueSyncResponse,
     Track,
 )
 from app.services import (
+    ORIGINAL_QUALITY,
+    QUALITY_BITRATES_KBPS,
     CoverArtContext,
     CoverArtManager,
+    EncodedCache,
+    EncodedCacheContext,
+    EncoderCoordinator,
     FileWatcher,
     Ingestor,
     IngestorContext,
     Organizer,
     OrganizerContext,
+    is_valid_quality,
+    normalize_quality,
 )
 
 
@@ -53,6 +64,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _resolve_track_source_path(database: Database, uuid_id: str) -> Optional[Path]:
+    rows = database.get_tracks(
+        search_parameters=[SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
+    )
+    if not rows:
+        return None
+    return rows[0].file_path
+
+
 def startup_event():
     # Set app.state classes to be None
     app.state.database = None
@@ -60,6 +80,8 @@ def startup_event():
     app.state.organizer = None
     app.state.ingestor = None
     app.state.file_watcher = None
+    app.state.encoded_cache = None
+    app.state.encoder_coordinator = None
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
     settings.music_library_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +112,23 @@ def startup_event():
 
     # Backfill cover_art_id for tracks ingested before cover art support
     cover_art_manager.backfill_cover_art()
+
+    # Set up the encoded-track cache + coordinator used by the streaming endpoint.
+    encoded_cache_dir = settings.app_data_dir / "encoded_cache"
+    encoded_cache_dir.mkdir(parents=True, exist_ok=True)
+    max_cache_bytes = int(settings.encoded_cache_size_gb * 1024 * 1024 * 1024)
+    encoded_cache = EncodedCache(
+        ctx=EncodedCacheContext(
+            cache_dir=encoded_cache_dir,
+            max_size_bytes=max_cache_bytes,
+        )
+    )
+    app.state.encoded_cache = encoded_cache
+    app.state.encoder_coordinator = EncoderCoordinator(
+        cache=encoded_cache,
+        source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
+        workers=max(1, settings.encoded_cache_prefetch_workers),
+    )
 
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
@@ -125,6 +164,9 @@ def shutdown_event():
     watcher = getattr(app.state, "file_watcher", None)
     if watcher:
         watcher.stop_file_watcher()
+    coordinator = getattr(app.state, "encoder_coordinator", None)
+    if coordinator:
+        coordinator.shutdown()
 
 
 @app.get("/tracks", response_model=GetTracksResponse)
@@ -305,8 +347,15 @@ _CODEC_MIME: dict[str, str] = {
 
 
 @app.get("/tracks/{uuid_id}/stream")
-def stream_track(uuid_id: str, request: Request):
+def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     CHUNK_SIZE = 1024 * 1024
+    if not is_valid_quality(quality):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported quality preset: {quality}",
+        )
+    quality_canonical = normalize_quality(quality)
+
     search_parameters = [SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
     track_list: List[Track] = app.state.database.get_tracks(
         search_parameters=search_parameters
@@ -316,7 +365,23 @@ def stream_track(uuid_id: str, request: Request):
             status_code=404, detail=f"Could not find track with uuid: {uuid_id}"
         )
     track: Track = track_list[0]
-    file_path = track.file_path
+
+    if quality_canonical == ORIGINAL_QUALITY:
+        file_path = track.file_path
+        media_type = _CODEC_MIME.get(
+            track.metadata.codec or "", f"audio/{track.metadata.codec}"
+        )
+    else:
+        coordinator: EncoderCoordinator = app.state.encoder_coordinator
+        encoded_path = coordinator.encode_for_stream(uuid_id, quality_canonical)
+        if encoded_path is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unable to encode track {uuid_id} at quality {quality_canonical}",
+            )
+        file_path = encoded_path
+        media_type = "audio/mp4"
+
     if not file_path.exists():
         raise HTTPException(
             status_code=404,
@@ -334,9 +399,7 @@ def stream_track(uuid_id: str, request: Request):
 
         return StreamingResponse(
             iterfile(),
-            media_type=_CODEC_MIME.get(
-                track.metadata.codec or "", f"audio/{track.metadata.codec}"
-            ),
+            media_type=media_type,
             headers={"Accept-ranges": "bytes", "Content-length": str(file_size)},
         )
 
@@ -375,9 +438,7 @@ def stream_track(uuid_id: str, request: Request):
     return StreamingResponse(
         iter_range(),
         status_code=206,
-        media_type=_CODEC_MIME.get(
-            track.metadata.codec or "", f"audio/{track.metadata.codec}"
-        ),
+        media_type=media_type,
         headers={
             "Accept-ranges": "bytes",
             "Content-range": f"bytes {start}-{end}/{file_size}",
@@ -623,6 +684,44 @@ def search(
         artists=results.artists,
         albums=results.albums,
     )
+
+
+_QUEUE_SYNC_MAX_UUIDS = 500
+
+
+@app.post("/queue/sync", response_model=QueueSyncResponse)
+def queue_sync(request: QueueSyncRequest):
+    if len(request.track_uuids) > _QUEUE_SYNC_MAX_UUIDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many track_uuids: max {_QUEUE_SYNC_MAX_UUIDS}",
+        )
+    if not is_valid_quality(request.quality):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported quality preset: {request.quality}",
+        )
+    quality_canonical = normalize_quality(request.quality)
+
+    database: Database = cast(Database, app.state.database)
+    database.upsert_queue_sync_state(
+        session_id=request.session_id,
+        current_index=request.current_index,
+        quality=quality_canonical,
+        track_uuids_json=json.dumps(request.track_uuids),
+        updated_at=time.time(),
+    )
+
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    lookahead = settings.prefetch_lookahead
+    start = request.current_index
+    end = min(start + lookahead, len(request.track_uuids))
+    prefetch_count = 0
+    for i in range(start, end):
+        if coordinator.enqueue_prefetch(request.track_uuids[i], quality_canonical):
+            prefetch_count += 1
+
+    return QueueSyncResponse(accepted=True, prefetch_queued=prefetch_count)
 
 
 @app.get("/")

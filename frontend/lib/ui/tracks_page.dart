@@ -4,7 +4,10 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
+import 'package:frontend/ui/settings_dialog.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
@@ -127,6 +130,8 @@ class TracksPageState extends ConsumerState<TracksPage>
                     ref.read(audioProvider.notifier).playNext([track]),
                 onAddToQueue: () =>
                     ref.read(audioProvider.notifier).addToQueue([track]),
+                onDownload: () => downloadTrack(ref, track),
+                onDeleteDownload: () => deleteTrackDownload(ref, track.uuidId),
               );
             },
           ),
@@ -138,17 +143,42 @@ class TracksPageState extends ConsumerState<TracksPage>
       return Scaffold(
         appBar: AppBar(
           title: const Text('OSML'),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.logout),
-              tooltip: 'Disconnect',
-              onPressed: widget.onDisconnect,
-            ),
-          ],
+          actions: buildTopBarActions(context, ref, widget.onDisconnect),
         ),
         body: body,
       );
     }
     return body;
   }
+}
+
+/// Standard top-bar action set used by every page that shows a top bar.
+/// Replaces the old standalone disconnect button with a downloads-page
+/// shortcut and a settings menu.
+List<Widget> buildTopBarActions(
+  BuildContext context,
+  WidgetRef ref,
+  VoidCallback? onDisconnect,
+) {
+  return [
+    IconButton(
+      icon: const Icon(Icons.download),
+      tooltip: 'Downloads',
+      onPressed: () {
+        Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => const DownloadingPage()),
+        );
+      },
+    ),
+    IconButton(
+      icon: const Icon(Icons.settings),
+      tooltip: 'Settings',
+      onPressed: () {
+        showDialog<void>(
+          context: context,
+          builder: (_) => SettingsDialog(onDisconnect: onDisconnect),
+        );
+      },
+    ),
+  ];
 }

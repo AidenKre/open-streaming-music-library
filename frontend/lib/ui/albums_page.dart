@@ -4,6 +4,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
@@ -158,6 +159,8 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                     ref.read(audioProvider.notifier).addToQueue(tracks);
                   }
                 },
+                onDownload: () => downloadAlbumTracks(ref, album.artistId, album.id),
+                onDeleteDownload: () => deleteAlbumDownloads(ref, album.artistId, album.id),
               );
             },
           ),
@@ -169,13 +172,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
       return Scaffold(
         appBar: AppBar(
           title: const Text('OSML'),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.logout),
-              tooltip: 'Disconnect',
-              onPressed: widget.onDisconnect,
-            ),
-          ],
+          actions: buildTopBarActions(context, ref, widget.onDisconnect),
         ),
         body: body,
       );
