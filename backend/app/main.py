@@ -50,6 +50,7 @@ from app.services import (
     is_valid_quality,
     normalize_quality,
 )
+from app.services.encoder_coordinator import EncodeResult
 
 
 @asynccontextmanager
@@ -334,6 +335,17 @@ def get_cover_art(cover_art_id: int):
     )
 
 
+_MIME_EXTENSION: dict[str, str] = {
+    "audio/mp4": "m4a",
+    "audio/mpeg": "mp3",
+    "audio/flac": "flac",
+    "audio/x-flac": "flac",
+    "audio/ogg": "ogg",
+    "audio/aac": "aac",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+}
+
 _CODEC_MIME: dict[str, str] = {
     "aac": "audio/mp4",
     "alac": "audio/mp4",
@@ -365,22 +377,33 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
             status_code=404, detail=f"Could not find track with uuid: {uuid_id}"
         )
     track: Track = track_list[0]
+    source_bitrate = int(track.metadata.bitrate_kbps or 0) or None
 
-    if quality_canonical == ORIGINAL_QUALITY:
-        file_path = track.file_path
-        media_type = _CODEC_MIME.get(
-            track.metadata.codec or "", f"audio/{track.metadata.codec}"
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    encode_result: Optional[EncodeResult] = coordinator.encode_for_stream(
+        uuid_id, quality_canonical, source_bitrate_kbps=source_bitrate
+    )
+    if encode_result is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to encode track {uuid_id} at quality {quality_canonical}",
         )
-    else:
-        coordinator: EncoderCoordinator = app.state.encoder_coordinator
-        encoded_path = coordinator.encode_for_stream(uuid_id, quality_canonical)
-        if encoded_path is None:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Unable to encode track {uuid_id} at quality {quality_canonical}",
-            )
-        file_path = encoded_path
+    file_path = encode_result.path
+
+    # Use audio/mp4 only when we actually transcoded; for passthrough (including
+    # ORIGINAL_QUALITY and bitrate-based passthrough) use the source codec's type
+    # so the MIME header always matches what is actually being served.
+    if encode_result.transcoded:
         media_type = "audio/mp4"
+    else:
+        media_type = _CODEC_MIME.get(
+            track.metadata.codec or "", f"audio/{track.metadata.codec or 'octet-stream'}"
+        )
+
+    extra_headers = {
+        "X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps),
+        "X-Audio-Extension": _MIME_EXTENSION.get(media_type, "audio"),
+    }
 
     if not file_path.exists():
         raise HTTPException(
@@ -400,7 +423,11 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
         return StreamingResponse(
             iterfile(),
             media_type=media_type,
-            headers={"Accept-ranges": "bytes", "Content-length": str(file_size)},
+            headers={
+                "Accept-ranges": "bytes",
+                "Content-length": str(file_size),
+                **extra_headers,
+            },
         )
 
     try:
@@ -443,6 +470,7 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
             "Accept-ranges": "bytes",
             "Content-range": f"bytes {start}-{end}/{file_size}",
             "Content-length": str(content_length),
+            **extra_headers,
         },
     )
 

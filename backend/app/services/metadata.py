@@ -20,6 +20,40 @@ def get_track_metadata(file_path: Path) -> TrackMetaData | None:
     return metadata
 
 
+def get_audio_bitrate_kbps(path: Path) -> int | None:
+    """Return the audio stream's bitrate in kbps, or None on failure.
+
+    Issues a targeted ffprobe query for only the bit_rate field — lighter than
+    the full metadata probe. Returns None when ffprobe is unavailable, the file
+    has no audio stream, or the value cannot be parsed. Callers should treat
+    None as "unknown" and proceed conservatively (e.g. allow transcoding).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "quiet",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=bit_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+
+    raw = result.stdout.decode("utf-8", errors="replace").strip()
+    if not raw or raw == "N/A":
+        return None
+    try:
+        return int(raw) // 1000
+    except ValueError:
+        return None
+
+
 def ffprobe_for_metadata(file_path: Path) -> dict | None:
     try:
         completed_process = subprocess.run(

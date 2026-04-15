@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.models import Track, TrackMetaData
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
-from app.services.encoder_coordinator import EncoderCoordinator
+from app.services.encoder_coordinator import EncoderCoordinator, EncodeResult
 
 
 def _fake_transcode_factory(payload_for_quality):
@@ -64,10 +64,16 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
-def _add_track_with_file(client, tmp_path: Path, name: str = "track.mp3"):
+def _add_track_with_file(
+    client,
+    tmp_path: Path,
+    name: str = "track.mp3",
+    bitrate_kbps: float = 0.0,
+    codec: str = "mp3",
+):
     track_path = tmp_path / name
     track_path.write_bytes(b"original-source-bytes" * 100)
-    metadata = TrackMetaData(title=name, duration=1.0, codec="mp3")
+    metadata = TrackMetaData(title=name, duration=1.0, codec=codec, bitrate_kbps=bitrate_kbps)
     track = Track(file_path=track_path, metadata=metadata)
     assert client.app.state.database.add_track(track=track)
     return track
@@ -132,6 +138,86 @@ class TestStreamQuality:
 
         assert seen_bitrates == [expected_bitrate]
         assert f"BR={expected_bitrate}-".encode("utf-8") in body
+
+    def test_stream__transcoded__returns_bitrate_and_extension_headers(
+        self, client, tmp_path
+    ):
+        track = _add_track_with_file(client, tmp_path)
+        _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"FAKE" * 20
+        )
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=192"
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["x-audio-bitrate-kbps"] == "192"
+            assert resp.headers["x-audio-extension"] == "m4a"
+            _ = b"".join(resp.iter_bytes())
+
+    def test_stream__original_quality__returns_source_extension_header(
+        self, client, tmp_path
+    ):
+        track = _add_track_with_file(client, tmp_path, codec="flac")
+        _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"FAKE" * 20
+        )
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=original"
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["x-audio-extension"] == "flac"
+            _ = b"".join(resp.iter_bytes())
+
+    def test_stream__passthrough__serves_source_when_bitrate_below_requested(
+        self, client, tmp_path
+    ):
+        """When source bitrate <= requested quality, source is served as-is."""
+        track = _add_track_with_file(
+            client, tmp_path, name="low.mp3", bitrate_kbps=96.0
+        )
+        original_bytes = track.file_path.read_bytes()
+        transcoded = {"calls": 0}
+
+        def payload(bitrate: int) -> bytes:
+            transcoded["calls"] += 1
+            return b"TRANSCODED" * 20
+
+        _install_fake_coordinator(client, payload_for_quality=payload)
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=320"
+        ) as resp:
+            assert resp.status_code == 200
+            # Source bitrate (96) <= requested (320) → passthrough, not audio/mp4
+            assert not resp.headers["content-type"].startswith("audio/mp4")
+            assert resp.headers["x-audio-bitrate-kbps"] == "96"
+            assert resp.headers["x-audio-extension"] == "mp3"
+            body = b"".join(resp.iter_bytes())
+
+        assert body == original_bytes
+        assert transcoded["calls"] == 0
+
+    def test_stream__passthrough__range_request_works(self, client, tmp_path):
+        """Passthrough still handles Range requests correctly."""
+        track = _add_track_with_file(
+            client, tmp_path, name="low.mp3", bitrate_kbps=64.0
+        )
+        _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"TRANSCODED" * 20
+        )
+
+        with client.stream(
+            "GET",
+            f"/tracks/{track.uuid_id}/stream?quality=256",
+            headers={"Range": "bytes=0-9"},
+        ) as resp:
+            assert resp.status_code == 206
+            assert resp.headers["x-audio-bitrate-kbps"] == "64"
+            body = b"".join(resp.iter_bytes())
+
+        assert len(body) == 10
 
     def test_stream__invalid_quality__returns_422(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
@@ -361,6 +447,104 @@ class TestQueueSync:
             _ = b"".join(resp.iter_bytes())
 
         assert encoded["calls"] == 1
+
+class TestBitratePassthrough:
+    """Unit tests for encode_for_stream passthrough behaviour."""
+
+    def _make_coordinator(self, tmp_path: Path, source: Path) -> tuple[EncoderCoordinator, list]:
+        cache = EncodedCache(
+            ctx=EncodedCacheContext(
+                cache_dir=tmp_path / "cache",
+                max_size_bytes=10 * 1024 * 1024,
+            )
+        )
+        transcode_calls: list[int] = []
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            transcode_calls.append(bitrate)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        coordinator = EncoderCoordinator(
+            cache=cache,
+            source_lookup=lambda _: source,
+            workers=2,
+            transcode_fn=fake_transcode,
+        )
+        return coordinator, transcode_calls
+
+    def test_passthrough_when_source_bitrate_below_requested(self, tmp_path):
+        source = tmp_path / "track.mp3"
+        source.write_bytes(b"original" * 100)
+        coordinator, calls = self._make_coordinator(tmp_path, source)
+
+        result = coordinator.encode_for_stream("uuid-a", "320", source_bitrate_kbps=96)
+
+        assert result is not None
+        assert result.transcoded is False
+        assert result.bitrate_kbps == 96
+        assert result.path == source
+        assert calls == []  # No transcode occurred
+
+    def test_passthrough_when_source_bitrate_equals_requested(self, tmp_path):
+        source = tmp_path / "track.mp3"
+        source.write_bytes(b"original" * 100)
+        coordinator, calls = self._make_coordinator(tmp_path, source)
+
+        result = coordinator.encode_for_stream("uuid-a", "192", source_bitrate_kbps=192)
+
+        assert result is not None
+        assert result.transcoded is False
+        assert calls == []
+
+    def test_transcodes_when_source_bitrate_above_requested(self, tmp_path):
+        source = tmp_path / "track.mp3"
+        source.write_bytes(b"original" * 100)
+        coordinator, calls = self._make_coordinator(tmp_path, source)
+
+        result = coordinator.encode_for_stream("uuid-a", "128", source_bitrate_kbps=320)
+
+        assert result is not None
+        assert result.transcoded is True
+        assert result.bitrate_kbps == 128
+        assert calls == [128]
+
+    def test_transcodes_when_source_bitrate_unknown(self, tmp_path):
+        """None source_bitrate_kbps + ffprobe fails → transcode proceeds."""
+        source = tmp_path / "track.mp3"
+        source.write_bytes(b"not-real-audio")  # ffprobe will fail on this
+        coordinator, calls = self._make_coordinator(tmp_path, source)
+
+        result = coordinator.encode_for_stream("uuid-a", "192", source_bitrate_kbps=None)
+
+        # ffprobe returns None → no passthrough → transcode runs
+        assert result is not None
+        assert result.transcoded is True
+        assert calls == [192]
+
+    def test_original_quality_returns_source_not_transcoded(self, tmp_path):
+        source = tmp_path / "track.mp3"
+        source.write_bytes(b"original" * 100)
+        coordinator, calls = self._make_coordinator(tmp_path, source)
+
+        result = coordinator.encode_for_stream("uuid-a", "original", source_bitrate_kbps=256)
+
+        assert result is not None
+        assert result.transcoded is False
+        assert result.path == source
+        assert result.bitrate_kbps == 256
+        assert calls == []
+
+    def test_passthrough_lock_cleaned_up(self, tmp_path):
+        source = tmp_path / "track.mp3"
+        source.write_bytes(b"original" * 100)
+        coordinator, _ = self._make_coordinator(tmp_path, source)
+
+        coordinator.encode_for_stream("uuid-a", "320", source_bitrate_kbps=64)
+
+        assert ("uuid-a", "320") not in coordinator._key_locks
+
 
 class TestEncoderCoordinatorLocks:
     """Unit tests for _key_locks memory-leak fix."""
