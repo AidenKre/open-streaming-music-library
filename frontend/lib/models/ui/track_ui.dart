@@ -24,6 +24,8 @@ class TrackUI {
   final int channels;
   final bool hasAlbumArt;
   final int? coverArtId;
+  // Bitrate of the file actually on disk. Null until a download completes.
+  final int? downloadedBitrateKbps;
 
   bool get isDownloaded => filePath != null;
 
@@ -53,6 +55,7 @@ class TrackUI {
     required this.channels,
     required this.hasAlbumArt,
     this.coverArtId,
+    this.downloadedBitrateKbps,
   });
 
   String get formattedDuration {
@@ -92,6 +95,7 @@ class TrackUI {
       channels: row.read<int>('channels'),
       hasAlbumArt: row.read<bool>('has_album_art'),
       coverArtId: row.readNullable<int>('cover_art_id'),
+      downloadedBitrateKbps: row.readNullable<int>('downloaded_bitrate_kbps'),
     );
   }
 
@@ -119,6 +123,7 @@ class TrackUI {
       channels: meta.channels,
       hasAlbumArt: meta.hasAlbumArt,
       coverArtId: meta.coverArtId,
+      downloadedBitrateKbps: track.downloadedBitrateKbps,
     );
   }
 }

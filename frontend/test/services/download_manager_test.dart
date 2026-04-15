@@ -118,7 +118,11 @@ void main() {
       client: MockClient((req) async {
         expect(req.url.path, '/tracks/abc/stream');
         expect(req.url.queryParameters['quality'], '320');
-        return http.Response.bytes([1, 2, 3, 4], 200);
+        return http.Response.bytes(
+          [1, 2, 3, 4],
+          200,
+          headers: {'x-audio-bitrate-kbps': '320'},
+        );
       }),
     );
     addTearDown(manager.dispose);
@@ -138,6 +142,8 @@ void main() {
     expect(await File(row.filePath!).readAsBytes(), [1, 2, 3, 4]);
     // Transcoded quality → always .m4a regardless of response headers.
     expect(row.filePath, endsWith('.m4a'));
+    // Bitrate from server header persisted.
+    expect(row.downloadedBitrateKbps, 320);
   });
 
   test('transcoded quality always saves as .m4a', () async {
@@ -178,6 +184,43 @@ void main() {
           ..where((t) => t.uuidId.equals('abc')))
         .getSingle();
     expect(row.filePath, endsWith('.flac'));
+  });
+
+  test('stores downloaded_bitrate_kbps from X-Audio-Bitrate-Kbps header',
+      () async {
+    await _insertTrack(db, 'abc');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes(
+        [1],
+        200,
+        headers: {'x-audio-bitrate-kbps': '96'},
+      )),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '320');
+    await _waitForFinish(manager);
+
+    final row = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals('abc')))
+        .getSingle();
+    expect(row.downloadedBitrateKbps, 96);
+  });
+
+  test('downloaded_bitrate_kbps is null when header absent', () async {
+    await _insertTrack(db, 'abc');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1], 200)),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '320');
+    await _waitForFinish(manager);
+
+    final row = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals('abc')))
+        .getSingle();
+    expect(row.downloadedBitrateKbps, isNull);
   });
 
   test('original quality falls back to .audio when header absent', () async {
@@ -419,5 +462,6 @@ extension on TrackUI {
         channels: channels,
         hasAlbumArt: hasAlbumArt,
         coverArtId: coverArtId,
+        downloadedBitrateKbps: downloadedBitrateKbps,
       );
 }

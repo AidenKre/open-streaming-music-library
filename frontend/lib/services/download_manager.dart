@@ -322,9 +322,17 @@ class DownloadManager extends ChangeNotifier {
       // fails — the audio is what matters for playback.
       await _downloadCoverArtForTrack(job.uuidId);
 
-      // Persist the local file path so playback can prefer it.
+      // Parse the actual bitrate the server served (may differ from source).
+      final bitrateHeader = response.headers['x-audio-bitrate-kbps'];
+      final downloadedBitrate =
+          bitrateHeader != null ? int.tryParse(bitrateHeader) : null;
+
+      // Persist the local file path and downloaded bitrate.
       await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(job.uuidId)))
-          .write(TracksCompanion(filePath: Value(destination.path)));
+          .write(TracksCompanion(
+            filePath: Value(destination.path),
+            downloadedBitrateKbps: Value(downloadedBitrate),
+          ));
 
       return true;
     } catch (e) {

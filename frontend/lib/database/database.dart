@@ -50,6 +50,11 @@ class Tracks extends Table {
   TextColumn get filePath => text().nullable()();
   IntColumn get createdAt => integer()();
   IntColumn get lastUpdated => integer()();
+  // Bitrate of the file actually stored on disk. Null until a download
+  // completes. May differ from trackmetadata.bitrate_kbps when downloaded at
+  // a lower quality than the server source (e.g. 128 kbps download from a
+  // 320 kbps source) or when bitrate passthrough serves the original.
+  IntColumn get downloadedBitrateKbps => integer().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -582,7 +587,8 @@ const trackSelectColumns =
     'tm.artist_id, tm.album_id, '
     'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
-    'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated';
+    'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
+    't.downloaded_bitrate_kbps';
 const _selectColumns = trackSelectColumns;
 
 // ── FTS5 virtual table creation statements ──────────────────────────────
@@ -622,7 +628,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -636,6 +642,11 @@ class AppDatabase extends _$AppDatabase {
       if (from < 2) {
         await customStatement(
           'ALTER TABLE trackmetadata ADD COLUMN cover_art_id INTEGER',
+        );
+      }
+      if (from < 3) {
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN downloaded_bitrate_kbps INTEGER',
         );
       }
     },
