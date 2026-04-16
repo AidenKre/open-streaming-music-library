@@ -37,8 +37,8 @@ class SettingsDialog extends ConsumerWidget {
                   DropdownMenuItem(value: q, child: Text(qualityLabel(q))),
               ],
               onChanged: (value) {
-                if (value != null) {
-                  ref.read(settingsProvider.notifier).setStreamQuality(value);
+                if (value != null && value != settings.streamQuality) {
+                  _showStreamQualityChoiceDialog(context, ref, value);
                 }
               },
             ),
@@ -81,6 +81,71 @@ class SettingsDialog extends ConsumerWidget {
           child: const Text('Close'),
         ),
       ],
+    );
+  }
+
+  void _showStreamQualityChoiceDialog(
+    BuildContext context,
+    WidgetRef ref,
+    String newQuality,
+  ) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Set stream quality to ${qualityLabel(newQuality)}?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: const [
+            Text(
+              'Set as default:',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 4),
+            Text(
+              'Persists across restarts and tells the server to pre-transcode '
+              'all tracks. Playback may experience brief startup delays until '
+              'the server finishes.',
+              style: TextStyle(fontSize: 12),
+            ),
+            SizedBox(height: 12),
+            Text(
+              'This session only:',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            SizedBox(height: 4),
+            Text(
+              'Reverts when the app is restarted. No server-side transcoding '
+              'is triggered.',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              ref
+                  .read(settingsProvider.notifier)
+                  .setStreamQualityTemporary(newQuality);
+            },
+            child: const Text('This session only'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              ref
+                  .read(settingsProvider.notifier)
+                  .setStreamQualityFull(newQuality);
+            },
+            child: const Text('Set as default'),
+          ),
+        ],
+      ),
     );
   }
 }

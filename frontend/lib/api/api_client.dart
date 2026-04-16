@@ -15,9 +15,9 @@ class ApiException implements Exception {
 
 class ApiClient {
   static final ApiClient instance = ApiClient._();
-  ApiClient._() : _http = http.Client();
+  ApiClient._() : _http = http.Client(), baseUrl = '';
 
-  late String baseUrl;
+  String baseUrl;
   http.Client _http;
 
   static void init(String url) {
@@ -47,6 +47,36 @@ class ApiClient {
       final response = await _http.get(
         uri,
         headers: {'Accept': 'application/json', ...?headers},
+      );
+      developer.log('${response.statusCode} ${response.body.length}B', name: 'ApiClient');
+      return _handleResponse(response);
+    } catch (e) {
+      developer.log('ERROR: $e', name: 'ApiClient');
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>> putJson(
+    List<String> pathSegments, {
+    Map<String, dynamic>? body,
+    Map<String, String>? headers,
+  }) async {
+    final baseUri = Uri.parse(baseUrl);
+    final basePath = baseUri.pathSegments.where((s) => s.isNotEmpty).toList();
+    final uri = baseUri.replace(
+      pathSegments: [...basePath, ...pathSegments],
+    );
+
+    developer.log('PUT $uri', name: 'ApiClient');
+    try {
+      final response = await _http.put(
+        uri,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          ...?headers,
+        },
+        body: body != null ? jsonEncode(body) : null,
       );
       developer.log('${response.statusCode} ${response.body.length}B', name: 'ApiClient');
       return _handleResponse(response);

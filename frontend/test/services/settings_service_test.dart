@@ -57,19 +57,68 @@ void main() {
     expect(settings.downloadQuality, originalQuality);
   });
 
-  test('setStreamQuality persists and updates state', () async {
+  test('setStreamQualityFull persists and updates state', () async {
     final prefs = await SharedPreferences.getInstance();
     final container = _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
-    await container.read(settingsProvider.notifier).setStreamQuality('192');
+    await container.read(settingsProvider.notifier).setStreamQualityFull('192');
 
     expect(prefs.getString('settings.streamQuality'), '192');
+    expect(container.read(settingsProvider).value!.streamQuality, '192');
     expect(
-      container.read(settingsProvider).value!.streamQuality,
-      '192',
+      container.read(settingsProvider).value!.streamQualityChangeKind,
+      QualityChangeKind.full,
     );
+  });
+
+  test('setStreamQualityFull clears any temporary override', () async {
+    final prefs = await SharedPreferences.getInstance();
+    final container = _containerWith(prefs);
+    addTearDown(container.dispose);
+
+    await container.read(settingsProvider.future);
+    container.read(settingsProvider.notifier).setStreamQualityTemporary('128');
+    expect(container.read(settingsProvider).value!.streamQuality, '128');
+
+    await container.read(settingsProvider.notifier).setStreamQualityFull('256');
+    expect(container.read(settingsProvider).value!.streamQuality, '256');
+    expect(
+      container.read(settingsProvider).value!.temporaryStreamQuality,
+      isNull,
+    );
+  });
+
+  test('setStreamQualityTemporary does not persist', () async {
+    final prefs = await SharedPreferences.getInstance();
+    final container = _containerWith(prefs);
+    addTearDown(container.dispose);
+
+    await container.read(settingsProvider.future);
+    container.read(settingsProvider.notifier).setStreamQualityTemporary('320');
+
+    // streamQuality reflects temporary value.
+    expect(container.read(settingsProvider).value!.streamQuality, '320');
+    // But SharedPreferences was not touched.
+    expect(prefs.getString('settings.streamQuality'), isNull);
+    expect(
+      container.read(settingsProvider).value!.streamQualityChangeKind,
+      QualityChangeKind.temporary,
+    );
+  });
+
+  test('setStreamQualityTemporary overrides persisted quality', () async {
+    SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
+    final prefs = await SharedPreferences.getInstance();
+    final container = _containerWith(prefs);
+    addTearDown(container.dispose);
+
+    await container.read(settingsProvider.future);
+    expect(container.read(streamQualityProvider), '256');
+
+    container.read(settingsProvider.notifier).setStreamQualityTemporary('128');
+    expect(container.read(streamQualityProvider), '128');
   });
 
   test('setDownloadQuality persists and updates state', () async {
@@ -87,14 +136,28 @@ void main() {
     );
   });
 
-  test('setStreamQuality rejects invalid values', () async {
+  test('setStreamQualityFull rejects invalid values', () async {
     final prefs = await SharedPreferences.getInstance();
     final container = _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
     expect(
-      () => container.read(settingsProvider.notifier).setStreamQuality('hi-res'),
+      () => container.read(settingsProvider.notifier).setStreamQualityFull('hi-res'),
+      throwsArgumentError,
+    );
+  });
+
+  test('setStreamQualityTemporary rejects invalid values', () async {
+    final prefs = await SharedPreferences.getInstance();
+    final container = _containerWith(prefs);
+    addTearDown(container.dispose);
+
+    await container.read(settingsProvider.future);
+    expect(
+      () => container
+          .read(settingsProvider.notifier)
+          .setStreamQualityTemporary('hi-res'),
       throwsArgumentError,
     );
   });
