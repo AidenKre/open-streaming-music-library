@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
+import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 
 class TrackTile extends StatelessWidget {
   final TrackUI track;
@@ -8,6 +9,7 @@ class TrackTile extends StatelessWidget {
   final VoidCallback? onPlayNext;
   final VoidCallback? onAddToQueue;
   final VoidCallback? onDownload;
+  final void Function(String quality)? onDownloadAtQuality;
   final VoidCallback? onDeleteDownload;
   final bool isHighlighted;
   final bool isDimmed;
@@ -20,6 +22,7 @@ class TrackTile extends StatelessWidget {
     this.onPlayNext,
     this.onAddToQueue,
     this.onDownload,
+    this.onDownloadAtQuality,
     this.onDeleteDownload,
     this.isHighlighted = false,
     this.isDimmed = false,
@@ -61,13 +64,17 @@ class TrackTile extends StatelessWidget {
                 },
               )
             else if (!track.isDownloaded && onDownload != null)
-              ListTile(
-                leading: const Icon(Icons.download),
-                title: const Text('Download'),
-                onTap: () {
+              SplitDownloadTile(
+                onDownload: () {
                   Navigator.pop(ctx);
                   onDownload!();
                 },
+                onDownloadAtQuality: onDownloadAtQuality != null
+                    ? (quality) {
+                        Navigator.pop(ctx);
+                        onDownloadAtQuality!(quality);
+                      }
+                    : (_) {},
               ),
           ],
         ),

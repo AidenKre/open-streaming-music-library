@@ -133,6 +133,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
                   }
                 },
                 onDownload: () => downloadArtistTracks(ref, artist.id),
+                onDownloadAtQuality: (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
                 onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
               );
             },

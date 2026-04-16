@@ -4,6 +4,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
+import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 TrackUI _track({
@@ -39,6 +40,7 @@ void main() {
     VoidCallback? onPlayNext,
     VoidCallback? onAddToQueue,
     VoidCallback? onDownload,
+    void Function(String)? onDownloadAtQuality,
     VoidCallback? onDeleteDownload,
   }) {
     return MaterialApp(
@@ -49,6 +51,7 @@ void main() {
           onPlayNext: onPlayNext,
           onAddToQueue: onAddToQueue,
           onDownload: onDownload,
+          onDownloadAtQuality: onDownloadAtQuality,
           onDeleteDownload: onDeleteDownload,
         ),
       ),
@@ -152,6 +155,45 @@ void main() {
       await tester.tap(find.text('Delete download'));
       await tester.pumpAndSettle();
       expect(deleteCalled, isTrue);
+    });
+
+    testWidgets('split tile shows chevron icon in track menu', (tester) async {
+      await tester.pumpWidget(buildTile(
+        _track(),
+        onPlayNext: () {},
+        onDownload: () {},
+        onDownloadAtQuality: (_) {},
+      ));
+
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(SplitDownloadTile), findsOneWidget);
+      expect(find.byIcon(Icons.chevron_right), findsOneWidget);
+    });
+
+    testWidgets('chevron in track menu opens quality sheet', (tester) async {
+      String? chosenQuality;
+      await tester.pumpWidget(buildTile(
+        _track(),
+        onPlayNext: () {},
+        onDownload: () {},
+        onDownloadAtQuality: (q) => chosenQuality = q,
+      ));
+
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byIcon(Icons.chevron_right));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Download quality'), findsOneWidget);
+      expect(find.text('Original'), findsOneWidget);
+
+      await tester.tap(find.text('Original'));
+      await tester.pumpAndSettle();
+
+      expect(chosenQuality, 'original');
     });
   });
 }

@@ -127,3 +127,29 @@ void downloadTrack(WidgetRef ref, TrackUI track) {
 void deleteTrackDownload(WidgetRef ref, String uuidId) {
   ref.read(downloadManagerProvider).deleteDownload(uuidId);
 }
+
+// ── Quality-specific download helpers ──────────────────────────────────────
+// Used by the split download tile's quality picker.
+
+Future<void> downloadAlbumTracksAtQuality(
+    WidgetRef ref, int? artistId, int albumId, String quality) async {
+  if (artistId == null) return;
+  final tracks = await ref.read(browseRepositoryProvider)
+      .getTracksForAlbum(artistId, albumId);
+  if (tracks.isNotEmpty) {
+    ref.read(downloadManagerProvider).enqueueTracks(tracks, quality: quality);
+  }
+}
+
+Future<void> downloadArtistTracksAtQuality(
+    WidgetRef ref, int artistId, String quality) async {
+  final tracks = await ref.read(browseRepositoryProvider)
+      .getTracksForArtist(artistId);
+  if (tracks.isNotEmpty) {
+    ref.read(downloadManagerProvider).enqueueTracks(tracks, quality: quality);
+  }
+}
+
+void downloadTrackAtQuality(WidgetRef ref, TrackUI track, String quality) {
+  ref.read(downloadManagerProvider).enqueueTracks([track], quality: quality);
+}

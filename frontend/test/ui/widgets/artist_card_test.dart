@@ -6,6 +6,7 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
+import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 
 const _artist = ArtistUI(id: 1, name: 'Test Artist');
 const _artistWithArt = ArtistUI(id: 1, name: 'Test Artist', coverArtId: 3);
@@ -18,6 +19,7 @@ Widget buildCard(
   VoidCallback? onPlayNext,
   VoidCallback? onAddToQueue,
   VoidCallback? onDownload,
+  void Function(String)? onDownloadAtQuality,
   VoidCallback? onDeleteDownload,
 }) {
   return ProviderScope(
@@ -35,6 +37,7 @@ Widget buildCard(
             onPlayNext: onPlayNext,
             onAddToQueue: onAddToQueue,
             onDownload: onDownload,
+            onDownloadAtQuality: onDownloadAtQuality,
             onDeleteDownload: onDeleteDownload,
           ),
         ),
@@ -148,6 +151,48 @@ void main() {
       await tester.tap(find.text('Delete downloads'));
       await tester.pumpAndSettle();
       expect(deleteCalled, isTrue);
+    });
+
+    testWidgets('split tile shows chevron icon', (tester) async {
+      await tester.pumpWidget(buildCard(
+        _artist,
+        downloaded: false,
+        onDownload: () {},
+        onDownloadAtQuality: (_) {},
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.longPress(find.byType(ArtistCard));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(SplitDownloadTile), findsOneWidget);
+      expect(find.byIcon(Icons.chevron_right), findsOneWidget);
+    });
+
+    testWidgets('chevron opens quality sheet and calls onDownloadAtQuality',
+        (tester) async {
+      String? chosenQuality;
+      await tester.pumpWidget(buildCard(
+        _artist,
+        downloaded: false,
+        onDownload: () {},
+        onDownloadAtQuality: (q) => chosenQuality = q,
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.longPress(find.byType(ArtistCard));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byIcon(Icons.chevron_right));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Download quality'), findsOneWidget);
+      expect(find.text('320 kbps'), findsOneWidget);
+
+      await tester.tap(find.text('320 kbps'));
+      await tester.pumpAndSettle();
+
+      expect(chosenQuality, '320');
     });
   });
 }

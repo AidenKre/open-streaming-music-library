@@ -175,6 +175,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                         }
                       },
                       onDownload: () => downloadArtistTracks(ref, artist.id),
+                      onDownloadAtQuality: (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
                       onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
                     ),
                   );
@@ -212,6 +213,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                         }
                       },
                       onDownload: () => downloadAlbumTracks(ref, album.artistId, album.id),
+                      onDownloadAtQuality: (q) => downloadAlbumTracksAtQuality(ref, album.artistId, album.id, q),
                       onDeleteDownload: () => deleteAlbumDownloads(ref, album.artistId, album.id),
                     ),
                   );
@@ -236,6 +238,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                 onAddToQueue: () =>
                     ref.read(audioProvider.notifier).addToQueue([track]),
                 onDownload: () => downloadTrack(ref, track),
+                onDownloadAtQuality: (q) => downloadTrackAtQuality(ref, track, q),
                 onDeleteDownload: () => deleteTrackDownload(ref, track.uuidId),
               ),
           ],

@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
+import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 
 class AlbumCard extends ConsumerWidget {
   final AlbumUI album;
@@ -10,6 +11,7 @@ class AlbumCard extends ConsumerWidget {
   final VoidCallback? onPlayNext;
   final VoidCallback? onAddToQueue;
   final VoidCallback? onDownload;
+  final void Function(String quality)? onDownloadAtQuality;
   final VoidCallback? onDeleteDownload;
 
   const AlbumCard({
@@ -19,6 +21,7 @@ class AlbumCard extends ConsumerWidget {
     this.onPlayNext,
     this.onAddToQueue,
     this.onDownload,
+    this.onDownloadAtQuality,
     this.onDeleteDownload,
   });
 
@@ -57,13 +60,17 @@ class AlbumCard extends ConsumerWidget {
                 },
               )
             else if (!isDownloaded && onDownload != null)
-              ListTile(
-                leading: const Icon(Icons.download),
-                title: const Text('Download'),
-                onTap: () {
+              SplitDownloadTile(
+                onDownload: () {
                   Navigator.pop(ctx);
                   onDownload!();
                 },
+                onDownloadAtQuality: onDownloadAtQuality != null
+                    ? (quality) {
+                        Navigator.pop(ctx);
+                        onDownloadAtQuality!(quality);
+                      }
+                    : (_) {},
               ),
           ],
         ),
