@@ -258,6 +258,16 @@ class Database:
                 )
                 conn.execute("PRAGMA user_version = 2")
 
+            if version < 3:
+                print("Migrating database to version 3: adding app_settings table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS app_settings ('
+                    'key TEXT PRIMARY KEY, '
+                    'value TEXT NOT NULL'
+                    ')'
+                )
+                conn.execute("PRAGMA user_version = 3")
+
     def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
         try:
             with self._connection() as conn:
@@ -1176,6 +1186,38 @@ class Database:
         except Exception as e:
             print(f"Error deleting queue sync state: {e}")
             return False
+
+    # ── App settings ──────────────────────────────────────────────────────
+
+    def get_setting(self, key: str) -> str | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT value FROM app_settings WHERE key = ?", (key,)
+                ).fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            print(f"Error reading setting {key!r}: {e}")
+            return None
+
+    def set_setting(self, key: str, value: str) -> None:
+        try:
+            with self._connection(commit=True) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+        except Exception as e:
+            print(f"Error writing setting {key!r}: {e}")
+
+    def get_all_track_uuids(self) -> list[str]:
+        try:
+            with self._connection() as conn:
+                rows = conn.execute("SELECT uuid_id FROM tracks").fetchall()
+                return [row[0] for row in rows]
+        except Exception as e:
+            print(f"Error fetching all track UUIDs: {e}")
+            return []
 
 
 def prepare_fts_query(raw_query: str) -> str:

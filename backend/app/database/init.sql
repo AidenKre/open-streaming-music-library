@@ -112,3 +112,8 @@ CREATE TABLE IF NOT EXISTS queue_sync_state (
     "track_uuids" TEXT NOT NULL,
     "updated_at" REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);

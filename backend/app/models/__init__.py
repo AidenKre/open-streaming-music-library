@@ -11,4 +11,7 @@ from .api_return_models import (
     GetSearchResponse,
     WarmRequest,
     WarmResponse,
+    QualitySettingResponse,
+    SetQualityRequest,
+    SetQualityResponse,
 )

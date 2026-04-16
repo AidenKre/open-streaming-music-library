@@ -36,3 +36,16 @@ class WarmRequest(BaseModel):
 class WarmResponse(BaseModel):
     accepted: bool
     prefetch_queued: int
+
+
+class QualitySettingResponse(BaseModel):
+    quality: str
+
+
+class SetQualityRequest(BaseModel):
+    quality: str
+
+
+class SetQualityResponse(BaseModel):
+    quality: str
+    warming: bool

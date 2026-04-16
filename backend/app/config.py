@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     encoded_cache_prefetch_workers: int = 2
     prefetch_lookahead: int = 20
 
+    # Default streaming quality preset served to all clients.
+    # Overridden by the value stored in app_settings at runtime.
+    default_streaming_quality: str = "original"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

@@ -30,6 +30,9 @@ from app.models import (
     GetTracksResponse,
     WarmRequest,
     WarmResponse,
+    QualitySettingResponse,
+    SetQualityRequest,
+    SetQualityResponse,
     Track,
 )
 from app.services import (
@@ -80,6 +83,7 @@ def startup_event():
     app.state.ingestor = None
     app.state.file_watcher = None
     app.state.encoded_cache = None
+    app.state.default_cache = None
     app.state.encoder_coordinator = None
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
@@ -122,11 +126,29 @@ def startup_event():
             max_size_bytes=max_cache_bytes,
         )
     )
+    # Unlimited cache for the server's default streaming quality — these files
+    # are never evicted by on-demand traffic.
+    default_cache_dir = settings.app_data_dir / "default_cache"
+    default_cache_dir.mkdir(parents=True, exist_ok=True)
+    default_cache = EncodedCache(
+        ctx=EncodedCacheContext(
+            cache_dir=default_cache_dir,
+            max_size_bytes=0,  # unlimited
+        )
+    )
+    # Load persisted default quality (fallback to config if not set yet).
+    persisted_quality = database.get_setting("default_streaming_quality")
+    default_quality = persisted_quality or settings.default_streaming_quality
+
     app.state.encoded_cache = encoded_cache
+    app.state.default_cache = default_cache
     app.state.encoder_coordinator = EncoderCoordinator(
         cache=encoded_cache,
         source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
         workers=max(1, settings.encoded_cache_prefetch_workers),
+        default_cache=default_cache,
+        default_quality=default_quality,
+        all_uuids_fn=lambda: database.get_all_track_uuids(),
     )
 
     if settings.enable_file_watcher:
@@ -739,6 +761,31 @@ def warm_tracks(request: WarmRequest):
             prefetch_count += 1
 
     return WarmResponse(accepted=True, prefetch_queued=prefetch_count)
+
+
+@app.get("/settings/quality", response_model=QualitySettingResponse)
+def get_quality_setting():
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    return QualitySettingResponse(quality=coordinator.default_quality)
+
+
+@app.put("/settings/quality", response_model=SetQualityResponse)
+def set_quality_setting(request: SetQualityRequest):
+    if not is_valid_quality(request.quality):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported quality preset: {request.quality}",
+        )
+    quality_canonical = normalize_quality(request.quality)
+
+    database: Database = cast(Database, app.state.database)
+    database.set_setting("default_streaming_quality", quality_canonical)
+
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    warming = quality_canonical != ORIGINAL_QUALITY and coordinator.all_uuids_fn is not None
+    coordinator.set_default_quality(quality_canonical)
+
+    return SetQualityResponse(quality=quality_canonical, warming=warming)
 
 
 @app.get("/")
