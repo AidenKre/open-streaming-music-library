@@ -200,6 +200,10 @@ class _FakePlayer implements ConcatenatingPlayerController {
   @override
   void setStreamQuality(String quality) {}
   @override
+  Future<void> rebuildCurrentSource(String quality, Duration seekTo) async {}
+  @override
+  Future<void> rebuildAllSources(String quality, Duration seekTo) async {}
+  @override
   void dispose() {}
 }
 

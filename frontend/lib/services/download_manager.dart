@@ -275,7 +275,15 @@ class DownloadManager extends ChangeNotifier {
       'GET',
       buildTrackStreamUri(job.uuidId, quality: job.quality),
     );
-    final response = await _client.send(request);
+
+    http.StreamedResponse response;
+    try {
+      response = await _client.send(request);
+    } catch (e) {
+      _markJobByUuid(job.uuidId, (j) => j.copyWith(errorMessage: e.toString()));
+      return false;
+    }
+
     if (response.statusCode < 200 || response.statusCode >= 300) {
       // Drain to avoid leaking the connection.
       await response.stream.drain<void>();

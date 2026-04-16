@@ -834,6 +834,12 @@ class FakeConcatenatingPlayerController
   }
 
   @override
+  Future<void> rebuildCurrentSource(String quality, Duration seekTo) async {}
+
+  @override
+  Future<void> rebuildAllSources(String quality, Duration seekTo) async {}
+
+  @override
   Future<void> setSeed(
     List<QueuePlaybackEntry> entries, {
     required int currentItemId,

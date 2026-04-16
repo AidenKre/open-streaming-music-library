@@ -251,6 +251,51 @@ class ConcatenatingPlayerController {
     _streamQuality = quality;
   }
 
+  /// Replace only the currently-playing source with one built at [quality]
+  /// and seek to [seekTo]. Used for temporary quality changes so the current
+  /// track rebuffers at the new quality without touching the rest of the queue.
+  Future<void> rebuildCurrentSource(String quality, Duration seekTo) async {
+    if (_isDisposed) return;
+    final currentItemId = _committedCurrentItemId;
+    if (currentItemId == null) return;
+    final localIndex = _localIndexFor(currentItemId);
+    if (localIndex == null) return;
+    final entry = _loadedEntries[localIndex];
+
+    await _runStructuralMutation(() async {
+      await _player.removeAudioSourceAt(localIndex);
+      final oldQuality = _streamQuality;
+      _streamQuality = quality;
+      await _player.insertAudioSource(localIndex, _sourceForEntry(entry));
+      _streamQuality = oldQuality;
+      await _player.seek(seekTo, index: localIndex);
+    }, preservedCurrentItemId: currentItemId);
+  }
+
+  /// Replace all loaded sources with ones built at [quality] and seek to
+  /// [seekTo] in the current track. Used for full quality changes so the entire
+  /// ahead-buffered window rebuffers at the new quality.
+  Future<void> rebuildAllSources(String quality, Duration seekTo) async {
+    if (_isDisposed) return;
+    final currentItemId = _committedCurrentItemId;
+    if (currentItemId == null) return;
+    final localIndex = _localIndexFor(currentItemId);
+    if (localIndex == null) return;
+
+    await _runStructuralMutation(() async {
+      final oldQuality = _streamQuality;
+      _streamQuality = quality;
+      for (var i = 0; i < _loadedEntries.length; i++) {
+        await _player.removeAudioSourceAt(0);
+      }
+      for (var i = 0; i < _loadedEntries.length; i++) {
+        await _player.insertAudioSource(i, _sourceForEntry(_loadedEntries[i]));
+      }
+      _streamQuality = oldQuality;
+      await _player.seek(seekTo, index: localIndex);
+    }, preservedCurrentItemId: currentItemId);
+  }
+
   ja.AudioSource _sourceForEntry(QueuePlaybackEntry entry) {
     final localPath = entry.filePath;
     if (localPath != null && File(localPath).existsSync()) {

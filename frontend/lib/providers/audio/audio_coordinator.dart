@@ -49,7 +49,19 @@ class AudioCoordinator extends Notifier<AudioState> {
     // skip the prefetch on that initial call.
     ref.listen<String>(streamQualityProvider, (previous, next) {
       _player.setStreamQuality(next);
-      if (previous != null) _scheduleQueueSync();
+      if (previous != null) {
+        _scheduleQueueSync();
+        // Rebuild playlist sources so in-flight buffered tracks switch to the
+        // new quality. Full change rebuilds all; temp change rebuilds only the
+        // current source (cheaper — avoids rebuffering the whole ahead window).
+        final kind = ref.read(streamQualityChangeKindProvider);
+        final seekTo = _player.position;
+        if (kind == QualityChangeKind.full) {
+          unawaited(_player.rebuildAllSources(next, seekTo));
+        } else if (kind == QualityChangeKind.temporary) {
+          unawaited(_player.rebuildCurrentSource(next, seekTo));
+        }
+      }
     }, fireImmediately: true);
 
     _bridge.onPlay = resume;
