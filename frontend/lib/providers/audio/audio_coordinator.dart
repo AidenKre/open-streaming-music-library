@@ -16,7 +16,7 @@ import 'package:frontend/providers/audio/queue_hydration_controller.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
-import 'package:frontend/services/queue_sync_service.dart';
+import 'package:frontend/services/queue_warm_service.dart';
 import 'package:frontend/services/settings_service.dart';
 
 class AudioCoordinator extends Notifier<AudioState> {
@@ -700,7 +700,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     final sessionId = state.queue.sessionId;
     if (sessionId == null) return;
     final quality = ref.read(streamQualityProvider);
-    ref.read(queueSyncServiceProvider).scheduleSync(
+    ref.read(queueWarmServiceProvider).scheduleWarm(
           sessionId: sessionId,
           currentPlayPosition: state.queue.currentPlayPosition,
           quality: quality,

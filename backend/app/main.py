@@ -4,8 +4,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
-import time
-
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -30,8 +28,8 @@ from app.models import (
     GetArtistsResponse,
     GetSearchResponse,
     GetTracksResponse,
-    QueueSyncRequest,
-    QueueSyncResponse,
+    WarmRequest,
+    WarmResponse,
     Track,
 )
 from app.services import (
@@ -714,15 +712,15 @@ def search(
     )
 
 
-_QUEUE_SYNC_MAX_UUIDS = 500
+_WARM_MAX_UUIDS = 500
 
 
-@app.post("/queue/sync", response_model=QueueSyncResponse)
-def queue_sync(request: QueueSyncRequest):
-    if len(request.track_uuids) > _QUEUE_SYNC_MAX_UUIDS:
+@app.post("/tracks/warm", response_model=WarmResponse)
+def warm_tracks(request: WarmRequest):
+    if len(request.track_uuids) > _WARM_MAX_UUIDS:
         raise HTTPException(
             status_code=422,
-            detail=f"Too many track_uuids: max {_QUEUE_SYNC_MAX_UUIDS}",
+            detail=f"Too many track_uuids: max {_WARM_MAX_UUIDS}",
         )
     if not is_valid_quality(request.quality):
         raise HTTPException(
@@ -730,15 +728,6 @@ def queue_sync(request: QueueSyncRequest):
             detail=f"Unsupported quality preset: {request.quality}",
         )
     quality_canonical = normalize_quality(request.quality)
-
-    database: Database = cast(Database, app.state.database)
-    database.upsert_queue_sync_state(
-        session_id=request.session_id,
-        current_index=request.current_index,
-        quality=quality_canonical,
-        track_uuids_json=json.dumps(request.track_uuids),
-        updated_at=time.time(),
-    )
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
     lookahead = settings.prefetch_lookahead
@@ -749,7 +738,7 @@ def queue_sync(request: QueueSyncRequest):
         if coordinator.enqueue_prefetch(request.track_uuids[i], quality_canonical):
             prefetch_count += 1
 
-    return QueueSyncResponse(accepted=True, prefetch_queued=prefetch_count)
+    return WarmResponse(accepted=True, prefetch_queued=prefetch_count)
 
 
 @app.get("/")

@@ -317,8 +317,8 @@ class TestEncodedCache:
         assert cache.total_size_bytes() == 0
 
 
-class TestQueueSync:
-    def test_sync__stores_state_and_prefetches(self, client, tmp_path):
+class TestWarmEndpoint:
+    def test_warm__prefetches_tracks(self, client, tmp_path):
         track1 = _add_track_with_file(client, tmp_path, name="t1.mp3")
         track2 = _add_track_with_file(client, tmp_path, name="t2.mp3")
 
@@ -336,7 +336,7 @@ class TestQueueSync:
             "quality": "192",
             "track_uuids": [track1.uuid_id, track2.uuid_id],
         }
-        r = client.post("/queue/sync", json=body)
+        r = client.post("/tracks/warm", json=body)
         assert r.status_code == 200, r.text
         data = r.json()
         assert data["accepted"] is True
@@ -348,17 +348,11 @@ class TestQueueSync:
         assert client.app.state.encoded_cache.has(track2.uuid_id, "192")
         assert encoded["calls"] == 2
 
-        # Verify state was persisted in DB.
-        state = client.app.state.database.get_queue_sync_state("sess-1")
-        assert state is not None
-        assert state["current_index"] == 0
-        assert state["quality"] == "192"
-
-    def test_sync__updates_existing_state(self, client, tmp_path):
+    def test_warm__idempotent(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
         _install_fake_coordinator(client, payload_for_quality=lambda br: b"x" * 10)
 
-        r = client.post("/queue/sync", json={
+        r = client.post("/tracks/warm", json={
             "session_id": "sess-1",
             "current_index": 0,
             "quality": "192",
@@ -366,23 +360,19 @@ class TestQueueSync:
         })
         assert r.status_code == 200
 
-        # Update with new current_index
-        r = client.post("/queue/sync", json={
+        # Second call with different index is also accepted.
+        r = client.post("/tracks/warm", json={
             "session_id": "sess-1",
             "current_index": 5,
             "quality": "256",
             "track_uuids": [track.uuid_id],
         })
         assert r.status_code == 200
+        assert r.json()["accepted"] is True
 
-        state = client.app.state.database.get_queue_sync_state("sess-1")
-        assert state is not None
-        assert state["current_index"] == 5
-        assert state["quality"] == "256"
-
-    def test_sync__invalid_quality__rejected(self, client, tmp_path):
+    def test_warm__invalid_quality__rejected(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
-        r = client.post("/queue/sync", json={
+        r = client.post("/tracks/warm", json={
             "session_id": "sess-1",
             "current_index": 0,
             "quality": "garbage",
@@ -390,7 +380,7 @@ class TestQueueSync:
         })
         assert r.status_code == 422, r.text
 
-    def test_sync__original_quality__no_encoding(self, client, tmp_path):
+    def test_warm__original_quality__no_encoding(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
         encoded = {"calls": 0}
 
@@ -400,7 +390,7 @@ class TestQueueSync:
 
         coordinator = _install_fake_coordinator(client, payload_for_quality=payload)
 
-        r = client.post("/queue/sync", json={
+        r = client.post("/tracks/warm", json={
             "session_id": "sess-1",
             "current_index": 0,
             "quality": "original",
@@ -410,9 +400,9 @@ class TestQueueSync:
         coordinator._executor.shutdown(wait=True)
         assert encoded["calls"] == 0
 
-    def test_sync__too_many_uuids__rejected(self, client):
+    def test_warm__too_many_uuids__rejected(self, client):
         uuids = [f"u-{i}" for i in range(501)]
-        r = client.post("/queue/sync", json={
+        r = client.post("/tracks/warm", json={
             "session_id": "sess-1",
             "current_index": 0,
             "quality": "192",
@@ -420,7 +410,7 @@ class TestQueueSync:
         })
         assert r.status_code == 422, r.text
 
-    def test_sync__prefetch_served_on_subsequent_stream(self, client, tmp_path):
+    def test_warm__prefetch_served_on_subsequent_stream(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
         encoded = {"calls": 0}
 
@@ -430,7 +420,7 @@ class TestQueueSync:
 
         coordinator = _install_fake_coordinator(client, payload_for_quality=payload)
 
-        r = client.post("/queue/sync", json={
+        r = client.post("/tracks/warm", json={
             "session_id": "sess-1",
             "current_index": 0,
             "quality": "256",
@@ -447,6 +437,34 @@ class TestQueueSync:
             _ = b"".join(resp.iter_bytes())
 
         assert encoded["calls"] == 1
+
+    def test_warm__current_index_skips_earlier_tracks(self, client, tmp_path):
+        track1 = _add_track_with_file(client, tmp_path, name="t1.mp3")
+        track2 = _add_track_with_file(client, tmp_path, name="t2.mp3")
+        track3 = _add_track_with_file(client, tmp_path, name="t3.mp3")
+
+        encoded = {"calls": 0}
+
+        def payload(bitrate: int) -> bytes:
+            encoded["calls"] += 1
+            return b"ENC" * 30
+
+        coordinator = _install_fake_coordinator(client, payload_for_quality=payload)
+
+        # current_index=1 means start prefetching from track2 onward.
+        r = client.post("/tracks/warm", json={
+            "session_id": "sess-1",
+            "current_index": 1,
+            "quality": "192",
+            "track_uuids": [track1.uuid_id, track2.uuid_id, track3.uuid_id],
+        })
+        assert r.status_code == 200
+        coordinator._executor.shutdown(wait=True)
+
+        # track1 should NOT be prefetched (before current_index).
+        assert not client.app.state.encoded_cache.has(track1.uuid_id, "192")
+        assert client.app.state.encoded_cache.has(track2.uuid_id, "192")
+        assert client.app.state.encoded_cache.has(track3.uuid_id, "192")
 
 class TestBitratePassthrough:
     """Unit tests for encode_for_stream passthrough behaviour."""
@@ -695,32 +713,3 @@ class TestEncoderCoordinatorLocks:
         assert result2[0] is not None
         assert result1[0] == result2[0]
         assert ("uuid-y", "192") not in coordinator._key_locks
-
-
-    def test_sync__current_index_skips_earlier_tracks(self, client, tmp_path):
-        track1 = _add_track_with_file(client, tmp_path, name="t1.mp3")
-        track2 = _add_track_with_file(client, tmp_path, name="t2.mp3")
-        track3 = _add_track_with_file(client, tmp_path, name="t3.mp3")
-
-        encoded = {"calls": 0}
-
-        def payload(bitrate: int) -> bytes:
-            encoded["calls"] += 1
-            return b"ENC" * 30
-
-        coordinator = _install_fake_coordinator(client, payload_for_quality=payload)
-
-        # current_index=1 means start prefetching from track2 onward.
-        r = client.post("/queue/sync", json={
-            "session_id": "sess-1",
-            "current_index": 1,
-            "quality": "192",
-            "track_uuids": [track1.uuid_id, track2.uuid_id, track3.uuid_id],
-        })
-        assert r.status_code == 200
-        coordinator._executor.shutdown(wait=True)
-
-        # track1 should NOT be prefetched (before current_index).
-        assert not client.app.state.encoded_cache.has(track1.uuid_id, "192")
-        assert client.app.state.encoded_cache.has(track2.uuid_id, "192")
-        assert client.app.state.encoded_cache.has(track3.uuid_id, "192")

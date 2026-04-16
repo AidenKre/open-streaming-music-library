@@ -26,13 +26,13 @@ class GetSearchResponse(BaseModel):
     albums: List[Album] = []
 
 
-class QueueSyncRequest(BaseModel):
+class WarmRequest(BaseModel):
     session_id: str
     current_index: int = Field(ge=0)
     quality: str
     track_uuids: List[str]
 
 
-class QueueSyncResponse(BaseModel):
+class WarmResponse(BaseModel):
     accepted: bool
     prefetch_queued: int
