@@ -7,6 +7,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/queue_warm_service.dart';
 import 'package:frontend/services/settings_service.dart';
 
 /// Initialised once at startup. The store is async because it touches the
@@ -21,6 +22,8 @@ final downloadManagerProvider = Provider<DownloadManager>((ref) {
   final manager = DownloadManager(
     db: ref.read(databaseProvider),
     coverArtStore: ref.read(localCoverArtStoreProvider),
+    warmService: ref.read(queueWarmServiceProvider),
+    streamQualityFn: () => ref.read(streamQualityProvider),
   );
   ref.onDispose(manager.dispose);
   return manager;

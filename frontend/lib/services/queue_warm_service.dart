@@ -80,6 +80,39 @@ class QueueWarmService {
     }
   }
 
+  /// Directly warm [trackUuids] at [quality] without going through the queue.
+  /// Used by the download manager to pre-transcode queued downloads on the server.
+  /// Debounced — rapid calls within the debounce window are coalesced.
+  void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {
+    if (trackUuids.isEmpty) return;
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(_debounce, () {
+      unawaited(_warmUuids(trackUuids, quality: quality));
+    });
+  }
+
+  Future<void> _warmUuids(
+    List<String> trackUuids, {
+    required String quality,
+  }) async {
+    if (trackUuids.isEmpty) return;
+    final url = _baseUrl('/tracks/warm');
+    try {
+      await _client.post(
+        url,
+        headers: const {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'session_id': 'download-manager',
+          'current_index': 0,
+          'quality': quality,
+          'track_uuids': trackUuids.take(_maxTrackUuids).toList(),
+        }),
+      );
+    } catch (e) {
+      developer.log('queue warm (uuids) failed: $e', name: 'QueueWarm');
+    }
+  }
+
   Uri _baseUrl(String path) {
     final base = Uri.parse(ApiClient.instance.baseUrl);
     final basePath = base.pathSegments.where((s) => s.isNotEmpty).toList();

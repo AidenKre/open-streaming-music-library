@@ -13,6 +13,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
+import 'package:frontend/services/queue_warm_service.dart';
 
 enum DownloadState { queued, active, completed, failed }
 
@@ -89,6 +90,11 @@ class DownloadManager extends ChangeNotifier {
   final http.Client _client;
   final bool _ownsClient;
   final Future<Directory> Function() _directoryProvider;
+  // Optional: if supplied, the server is asked to pre-transcode queued tracks
+  // at the current stream quality in parallel with downloading them.
+  final QueueWarmService? _warmService;
+  // Provides the current stream quality for server warm calls.
+  final String Function()? _streamQualityFn;
 
   DownloadQueueState _state = const DownloadQueueState();
   Directory? _downloadDir;
@@ -104,12 +110,16 @@ class DownloadManager extends ChangeNotifier {
     required LocalCoverArtStore coverArtStore,
     http.Client? client,
     Future<Directory> Function()? directoryProvider,
+    QueueWarmService? warmService,
+    String Function()? streamQualityFn,
   })  : _db = db,
         _coverArtStore = coverArtStore,
         _client = client ?? http.Client(),
         _ownsClient = client == null,
         _directoryProvider =
-            directoryProvider ?? getApplicationDocumentsDirectory;
+            directoryProvider ?? getApplicationDocumentsDirectory,
+        _warmService = warmService,
+        _streamQualityFn = streamQualityFn;
 
   DownloadQueueState get state => _state;
 
@@ -153,6 +163,19 @@ class DownloadManager extends ChangeNotifier {
 
     _state = DownloadQueueState(jobs: [..._state.jobs, ...additions]);
     notifyListeners();
+
+    // Ask the server to pre-transcode queued tracks at the current stream
+    // quality in parallel. This way, if the user streams a track before its
+    // download finishes, the encode may already be cached.
+    final warm = _warmService;
+    final qualityFn = _streamQualityFn;
+    if (warm != null && qualityFn != null) {
+      warm.scheduleWarmUuids(
+        additions.map((j) => j.uuidId).toList(growable: false),
+        quality: qualityFn(),
+      );
+    }
+
     _pump();
   }
 
