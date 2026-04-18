@@ -195,7 +195,7 @@ void main() {
   });
 
   group('syncQualityFromBackend', () {
-    http.Response _qualityResponse(String quality) => http.Response(
+    http.Response qualityResponse(String quality) => http.Response(
           jsonEncode({'quality': quality}),
           200,
           headers: {'content-type': 'application/json'},
@@ -214,7 +214,7 @@ void main() {
 
       ApiClient.initForTest(
         'http://localhost:8000',
-        MockClient((_) async => _qualityResponse('128')),
+        MockClient((_) async => qualityResponse('128')),
       );
 
       final container = _containerWith(prefs);
@@ -238,7 +238,7 @@ void main() {
         'http://localhost:8000',
         MockClient((_) async {
           calls++;
-          return _qualityResponse('128');
+          return qualityResponse('128');
         }),
       );
 
@@ -278,7 +278,7 @@ void main() {
 
       ApiClient.initForTest(
         'http://localhost:8000',
-        MockClient((_) async => _qualityResponse('128')),
+        MockClient((_) async => qualityResponse('128')),
       );
 
       final container = _containerWith(prefs);
@@ -300,7 +300,7 @@ void main() {
         '',
         MockClient((_) async {
           requestCount++;
-          return _qualityResponse('128');
+          return qualityResponse('128');
         }),
       );
 

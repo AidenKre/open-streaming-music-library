@@ -4,7 +4,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/providers/providers.dart';
-import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/settings_dialog.dart';
 
 Widget _wrap(SharedPreferences prefs, {VoidCallback? onDisconnect}) {

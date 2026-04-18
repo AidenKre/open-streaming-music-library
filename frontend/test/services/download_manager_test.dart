@@ -11,9 +11,11 @@ import 'package:path/path.dart' as p;
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
+import 'package:frontend/services/queue_warm_service.dart';
 
 TrackUI _track(String uuid, {String? title, String? artist, int? coverArtId}) {
   return TrackUI(
@@ -436,6 +438,68 @@ void main() {
     await manager.deleteDownload('abc');
     expect(manager.downloadStatusVersion.value, greaterThan(before));
   });
+
+  test('enqueueTracks calls scheduleWarmUuids when warmService is provided',
+      () async {
+    final capturedUuids = <List<String>>[];
+    final capturedQualities = <String>[];
+    final fakeWarm = _RecordingWarmService(
+      onWarmUuids: (uuids, quality) {
+        capturedUuids.add(uuids);
+        capturedQualities.add(quality);
+      },
+    );
+
+    final manager = DownloadManager(
+      db: db,
+      coverArtStore: coverStore,
+      client: MockClient((_) async => http.Response.bytes(
+            [1, 2, 3],
+            200,
+            headers: {
+              'content-type': 'audio/mp4',
+              'x-audio-extension': 'm4a',
+              'x-audio-bitrate-kbps': '128',
+            },
+          )),
+      directoryProvider: () async => tempDir,
+      warmService: fakeWarm,
+      streamQualityFn: () => '256',
+    );
+    addTearDown(manager.dispose);
+
+    final tracks = [_track('uuid-1'), _track('uuid-2')];
+    await manager.enqueueTracks(tracks, quality: '128');
+    await _waitForFinish(manager);
+
+    // scheduleWarmUuids should have been called once with both UUIDs and the
+    // stream quality (not the download quality).
+    expect(capturedUuids, hasLength(1));
+    expect(capturedUuids.first, containsAll(['uuid-1', 'uuid-2']));
+    expect(capturedQualities.first, '256');
+  });
+}
+
+/// A [QueueWarmService] subclass that records [scheduleWarmUuids] calls.
+class _RecordingWarmService extends QueueWarmService {
+  final void Function(List<String> uuids, String quality) onWarmUuids;
+
+  _RecordingWarmService({required this.onWarmUuids})
+      : super(
+          queueRepo: _NoopQueueRepo(),
+          client: MockClient((_) async => http.Response('', 200)),
+        );
+
+  @override
+  void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {
+    onWarmUuids(trackUuids, quality);
+  }
+}
+
+class _NoopQueueRepo implements QueueRepository {
+  @override
+  noSuchMethod(Invocation invocation) =>
+      throw UnimplementedError(invocation.memberName.toString());
 }
 
 extension on TrackUI {

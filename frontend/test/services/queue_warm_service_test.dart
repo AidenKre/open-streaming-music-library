@@ -181,6 +181,98 @@ void main() {
     // Should NOT throw.
     await Future<void>.delayed(const Duration(milliseconds: 700));
   });
+
+  group('scheduleWarmUuids', () {
+    test('POSTs to /tracks/warm with session_id download-manager after debounce',
+        () async {
+      Uri? capturedUrl;
+      Map<String, dynamic>? capturedBody;
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([]),
+        client: MockClient((req) async {
+          capturedUrl = req.url;
+          capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+          return http.Response('', 204);
+        }),
+      );
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['uuid-1', 'uuid-2'], quality: '256');
+
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+
+      expect(capturedUrl?.path, '/tracks/warm');
+      expect(capturedBody?['session_id'], 'download-manager');
+      expect(capturedBody?['quality'], '256');
+      expect(capturedBody?['track_uuids'], ['uuid-1', 'uuid-2']);
+    });
+
+    test('respects the 50-UUID cap', () async {
+      Map<String, dynamic>? capturedBody;
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([]),
+        client: MockClient((req) async {
+          capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+          return http.Response('', 204);
+        }),
+      );
+      addTearDown(service.dispose);
+
+      final sixtyUuids = List.generate(60, (i) => 'uuid-$i');
+      service.scheduleWarmUuids(sixtyUuids, quality: '128');
+
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+
+      expect((capturedBody!['track_uuids'] as List).length, 50);
+    });
+
+    test('debounces rapid calls into a single POST', () async {
+      var postCount = 0;
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([]),
+        client: MockClient((_) async {
+          postCount++;
+          return http.Response('', 204);
+        }),
+      );
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['a'], quality: '128');
+      service.scheduleWarmUuids(['b'], quality: '128');
+      service.scheduleWarmUuids(['c'], quality: '128');
+
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      expect(postCount, 1);
+    });
+
+    test('swallows POST errors', () async {
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([]),
+        client: MockClient((_) async => throw const SocketExceptionLite()),
+      );
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['uuid-1'], quality: '128');
+      // Should NOT throw.
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+    });
+
+    test('does nothing when list is empty', () async {
+      var postCount = 0;
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([]),
+        client: MockClient((_) async {
+          postCount++;
+          return http.Response('', 204);
+        }),
+      );
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids([], quality: '128');
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      expect(postCount, 0);
+    });
+  });
 }
 
 class SocketExceptionLite implements Exception {
