@@ -163,7 +163,7 @@ class TestTwoTierCache:
         assert result is not None
         assert calls == []
 
-    def test_migration_moves_default_files_to_stream_cache(self, tmp_path):
+    def test_quality_change_deletes_old_default_cache_files(self, tmp_path):
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
         c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
@@ -173,15 +173,14 @@ class TestTwoTierCache:
         assert c.default_cache.has("uuid-a", "192")
         assert not c.cache.has("uuid-a", "192")
 
-        # Change to a new default quality; migration runs in background.
+        # Change to a new default quality; deletion runs in background.
         old_default_cache = c.default_cache
         c.set_default_quality("320")
         c._executor.shutdown(wait=True)
 
-        # Old default-quality file should now be in stream_cache.
-        assert c.cache.has("uuid-a", "192")
-        # And removed from default_cache dir.
+        # Old default-quality file should be deleted (not migrated to stream cache).
         assert not old_default_cache.has("uuid-a", "192")
+        assert not c.cache.has("uuid-a", "192")
 
     def test_warm_all_tracks__empty_uuid_list__does_nothing(self, tmp_path):
         """_warm_all_tracks with an empty UUID list must not raise and must not encode."""
@@ -223,44 +222,25 @@ class TestTwoTierCache:
 
         assert encode_calls == []
 
-    def test_migrate_default_cache__same_dir__no_files_lost(self, tmp_path):
-        """_migrate_default_cache_to_stream with same-dir caches must not delete files."""
-        shared_dir = tmp_path / "shared_cache"
-        shared_dir.mkdir()
-
-        shared_cache = EncodedCache(
-            ctx=EncodedCacheContext(
-                cache_dir=shared_dir,
-                max_size_bytes=0,  # unlimited
-            )
-        )
+    def test_delete_default_cache_files__deletes_old_quality_only(self, tmp_path):
+        """_delete_default_cache_files removes files for old_quality and leaves others."""
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
+        c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
 
-        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"encoded" * 10)
-            return True
-
-        # Both cache and default_cache point at the same directory.
-        c = EncoderCoordinator(
-            cache=shared_cache,
-            source_lookup=lambda _: source,
-            workers=2,
-            transcode_fn=fake_transcode,
-            default_cache=shared_cache,
-            default_quality="192",
-        )
-
-        # Encode a track so there is a file in the shared cache.
+        # Encode at the current default quality (goes to default_cache).
         c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
         assert c.default_cache.has("uuid-a", "192")
 
-        # Run migration on the same cache object (old == new == shared_cache).
-        c._migrate_default_cache_to_stream(shared_cache, "192")
+        # Manually place a file with a different quality suffix in the same dir
+        # to verify _delete_default_cache_files only removes the target quality.
+        other_file = c.default_cache.ctx.cache_dir / "uuid-b__q320.m4a"
+        other_file.write_bytes(b"encoded" * 10)
 
-        # The file must still exist after the no-op rename (src == dst).
-        assert shared_cache.has("uuid-a", "192")
+        c._delete_default_cache_files(c.default_cache, "192")
+
+        assert not c.default_cache.has("uuid-a", "192")
+        assert other_file.exists()
 
     def test_set_default_quality__same_quality__returns_false_no_warm(self, tmp_path):
         source = tmp_path / "t.mp3"
@@ -605,3 +585,18 @@ class TestQualitySettingsAPI:
 
         assert r.status_code == 200
         assert r.json()["warming"] is False
+
+    def test_put_quality__same_quality__no_db_write(self, client):
+        """PUT with the current quality must not write to the database."""
+        # At startup, no quality has been persisted — get_setting returns None.
+        db = client.app.state.database
+        assert db.get_setting("default_streaming_quality") is None
+
+        # PUT the same quality that the coordinator already has in memory.
+        current = client.app.state.encoder_coordinator.default_quality
+        r = client.put("/settings/quality", json={"quality": current})
+
+        assert r.status_code == 200
+        assert r.json()["warming"] is False
+        # DB must remain untouched.
+        assert db.get_setting("default_streaming_quality") is None

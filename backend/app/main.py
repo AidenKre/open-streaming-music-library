@@ -777,10 +777,12 @@ def set_quality_setting(request: SetQualityRequest):
         )
     quality_canonical = normalize_quality(request.quality)
 
+    coordinator: EncoderCoordinator = app.state.encoder_coordinator
+    if quality_canonical == coordinator.default_quality:
+        return SetQualityResponse(quality=quality_canonical, warming=False)
+
     database: Database = cast(Database, app.state.database)
     database.set_setting("default_streaming_quality", quality_canonical)
-
-    coordinator: EncoderCoordinator = app.state.encoder_coordinator
     warming: bool = coordinator.set_default_quality(quality_canonical)
 
     return SetQualityResponse(quality=quality_canonical, warming=warming)

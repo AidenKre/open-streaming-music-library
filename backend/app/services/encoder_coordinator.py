@@ -367,7 +367,7 @@ class EncoderCoordinator:
 
         if old_default_cache is not None:
             self._executor.submit(
-                self._migrate_default_cache_to_stream, old_default_cache, old_quality,
+                self._delete_default_cache_files, old_default_cache, old_quality,
                 priority=_PriorityPool.PRIORITY_LOW,
             )
 
@@ -403,14 +403,11 @@ class EncoderCoordinator:
             except Exception:
                 continue
 
-    def _migrate_default_cache_to_stream(self, old_cache: EncodedCache, old_quality: str) -> None:
-        """Batch-rename files from the old default cache into the stream cache.
+    def _delete_default_cache_files(self, old_cache: EncodedCache, old_quality: str) -> None:
+        """Delete stale default-cache files for old_quality.
 
-        After a default-quality change, the old default-quality files are moved
-        to the stream (LRU) cache so they stay available but become evictable.
-        Only files for ``old_quality`` are moved — new-quality files that warm
-        tasks may have written concurrently are left untouched.
-        One prune pass is done at the end to enforce the size budget.
+        Safe to call while a file is open: on Unix the inode stays alive until
+        all file descriptors are closed, so in-flight streams finish normally.
         """
         old_suffix = f"__q{old_quality}{CACHE_FILE_SUFFIX}"
         try:
@@ -418,12 +415,9 @@ class EncoderCoordinator:
                 if not entry.is_file() or not entry.name.endswith(old_suffix):
                     continue
                 try:
-                    target = self.cache.ctx.cache_dir / entry.name
-                    os.rename(entry, target)
+                    entry.unlink()
                 except OSError:
                     continue
-            with self.cache._lock:
-                self.cache._prune_locked()
         except Exception:
             pass
 
