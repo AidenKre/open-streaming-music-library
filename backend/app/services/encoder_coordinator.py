@@ -25,12 +25,12 @@ New encodes always land in the cache that matches the quality:
 """
 
 import os
+import queue as _queue
 import threading
 import uuid as uuid_lib
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from app.services.encoded_cache import CACHE_FILE_SUFFIX, EncodedCache
 from app.services.metadata import get_audio_bitrate_kbps
@@ -61,6 +61,67 @@ class EncodeResult:
     transcoded: bool
 
 
+# ── Priority pool ─────────────────────────────────────────────────────────────
+
+@dataclass(order=True)
+class _Task:
+    priority: int
+    neg_seq: int          # negated seq so higher seq → wins within same priority (LIFO)
+    fn: Any = field(compare=False, default=None)   # None = shutdown sentinel
+    args: tuple = field(compare=False, default_factory=tuple)
+    kwargs: dict = field(compare=False, default_factory=dict)
+
+
+class _PriorityPool:
+    """Thread pool with two priority levels.
+
+    Priority 0 (PRIORITY_HIGH) — prefetch / queue-warm: encode tasks for tracks
+                                  the user is about to play (enqueue_prefetch,
+                                  enqueue_prefetch_batch).
+    Priority 1 (PRIORITY_LOW)  — background quality work: default-cache migration
+                                  and library-wide warming from set_default_quality.
+    Within each level the newest submitted task runs first (LIFO).
+    """
+    PRIORITY_HIGH = 0
+    PRIORITY_LOW = 1
+
+    def __init__(self, max_workers: int) -> None:
+        self._q: _queue.PriorityQueue[_Task] = _queue.PriorityQueue()
+        self._seq = 0
+        self._seq_lock = threading.Lock()
+        self._threads = [
+            threading.Thread(target=self._loop, daemon=True, name=f"encoder-{i}")
+            for i in range(max(1, max_workers))
+        ]
+        for t in self._threads:
+            t.start()
+
+    def submit(self, fn: Callable, *args: Any, priority: int = PRIORITY_LOW, **kwargs: Any) -> None:
+        with self._seq_lock:
+            seq = self._seq
+            self._seq += 1
+        self._q.put(_Task(priority=priority, neg_seq=-seq, fn=fn, args=args, kwargs=kwargs))
+
+    def _loop(self) -> None:
+        while True:
+            task = self._q.get()
+            if task.fn is None:   # shutdown sentinel
+                return
+            try:
+                task.fn(*task.args, **task.kwargs)
+            except Exception:
+                pass
+
+    def shutdown(self, wait: bool = True) -> None:
+        for _ in self._threads:
+            self._q.put(_Task(priority=10**9, neg_seq=0))  # fn=None → sentinel
+        if wait:
+            for t in self._threads:
+                t.join()
+
+
+# ── Coordinator ───────────────────────────────────────────────────────────────
+
 @dataclass
 class EncoderCoordinator:
     cache: EncodedCache
@@ -72,20 +133,54 @@ class EncoderCoordinator:
     default_cache: Optional[EncodedCache] = None
     default_quality: str = ORIGINAL_QUALITY
     # Optional callable that returns all track UUID strings; used by
-    # _warm_all_tracks to pre-encode every track at the new default quality.
+    # _submit_warm_tasks to pre-encode every track at the new default quality.
     all_uuids_fn: Optional[AllUuidsFn] = None
-    _executor: ThreadPoolExecutor = field(init=False)
+    _executor: _PriorityPool = field(init=False)
     _key_locks: dict[tuple[str, str], threading.Lock] = field(default_factory=dict)
     _key_locks_guard: threading.Lock = field(default_factory=threading.Lock)
     _scratch_dir: Path = field(init=False)
+    _warm_generation: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max(1, self.workers))
+        self._executor = _PriorityPool(max_workers=max(1, self.workers))
         self._scratch_dir = self.cache.ctx.cache_dir / "_scratch"
         self._scratch_dir.mkdir(parents=True, exist_ok=True)
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=False)
+
+    def startup(self) -> None:
+        """Called once at app startup before any requests are served.
+
+        1. Cleans up orphaned scratch files from interrupted transcodes.
+        2. Resumes warming: submits tasks only for tracks missing from the
+           default cache (diff-based, avoids spamming the pool with no-ops).
+        """
+        # 1. Clean orphaned scratch files from interrupted transcodes.
+        if self._scratch_dir.exists():
+            for f in self._scratch_dir.iterdir():
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        # 2. Resume warming only for tracks not already in the default cache.
+        if self.default_quality == ORIGINAL_QUALITY or self.all_uuids_fn is None:
+            return
+
+        all_uuids = set(self.all_uuids_fn())
+        if self.default_cache is not None:
+            cached = {uid for uid in all_uuids if self.default_cache.has(uid, self.default_quality)}
+        else:
+            cached = set()
+
+        missing = all_uuids - cached
+        gen = self._warm_generation
+        for uuid_id in missing:
+            self._executor.submit(
+                self._warm_one, uuid_id, self.default_quality, gen,
+                priority=_PriorityPool.PRIORITY_LOW,
+            )
 
     # ── Cache tier helpers ────────────────────────────────────────────────
 
@@ -220,7 +315,10 @@ class EncoderCoordinator:
             return False
         if self._has_cached(uuid_id, quality):
             return True
-        self._executor.submit(self._prefetch_one, uuid_id, quality, source_bitrate_kbps)
+        self._executor.submit(
+            self._prefetch_one, uuid_id, quality, source_bitrate_kbps,
+            priority=_PriorityPool.PRIORITY_HIGH,
+        )
         return True
 
     def enqueue_prefetch_batch(
@@ -244,26 +342,40 @@ class EncoderCoordinator:
             and not self._has_cached(uid, q)
         ]
         if to_encode:
-            self._executor.submit(self._prefetch_batch, to_encode, source_bitrates or {})
+            self._executor.submit(
+                self._prefetch_batch, to_encode, source_bitrates or {},
+                priority=_PriorityPool.PRIORITY_HIGH,
+            )
         return len(to_encode)
 
-    def set_default_quality(self, new_quality: str) -> None:
-        """Change the default streaming quality.
+    def set_default_quality(self, new_quality: str) -> bool:
+        """Change the default streaming quality. Returns True if warming was submitted.
 
-        Immediately updates ``default_quality`` so new requests use the new
-        quality. Submits two background tasks:
-        1. Migrate existing default-cache files to the stream (LRU) cache so
-           they remain available but become subject to eviction.
-        2. Warm all library tracks at the new default quality.
+        No-ops when ``new_quality`` equals the current default. Otherwise:
+        1. Bumps the warm generation counter to invalidate pending warm tasks.
+        2. Migrates existing default-cache files to the stream cache (background).
+        3. Submits one warm task per UUID (parallel, PRIORITY_LOW).
         """
+        if new_quality == self.default_quality:
+            return False
+
+        old_quality = self.default_quality
         old_default_cache = self.default_cache
         self.default_quality = new_quality
+        self._warm_generation += 1
+        gen = self._warm_generation
+
         if old_default_cache is not None:
             self._executor.submit(
-                self._migrate_default_cache_to_stream, old_default_cache
+                self._migrate_default_cache_to_stream, old_default_cache, old_quality,
+                priority=_PriorityPool.PRIORITY_LOW,
             )
+
         if new_quality != ORIGINAL_QUALITY and self.all_uuids_fn is not None:
-            self._executor.submit(self._warm_all_tracks, new_quality)
+            self._submit_warm_tasks(new_quality, gen)
+            return True
+
+        return False
 
     # ── Background workers ────────────────────────────────────────────────
 
@@ -291,16 +403,19 @@ class EncoderCoordinator:
             except Exception:
                 continue
 
-    def _migrate_default_cache_to_stream(self, old_cache: EncodedCache) -> None:
+    def _migrate_default_cache_to_stream(self, old_cache: EncodedCache, old_quality: str) -> None:
         """Batch-rename files from the old default cache into the stream cache.
 
         After a default-quality change, the old default-quality files are moved
         to the stream (LRU) cache so they stay available but become evictable.
+        Only files for ``old_quality`` are moved — new-quality files that warm
+        tasks may have written concurrently are left untouched.
         One prune pass is done at the end to enforce the size budget.
         """
+        old_suffix = f"__q{old_quality}{CACHE_FILE_SUFFIX}"
         try:
             for entry in old_cache.ctx.cache_dir.iterdir():
-                if not entry.is_file() or not entry.name.endswith(CACHE_FILE_SUFFIX):
+                if not entry.is_file() or not entry.name.endswith(old_suffix):
                     continue
                 try:
                     target = self.cache.ctx.cache_dir / entry.name
@@ -312,16 +427,28 @@ class EncoderCoordinator:
         except Exception:
             pass
 
-    def _warm_all_tracks(self, quality: str) -> None:
-        """Background: encode every library track at ``quality`` into the default cache."""
+    def _submit_warm_tasks(self, quality: str, generation: int) -> None:
+        """Submit one warm task per UUID to the pool (all workers run in parallel)."""
         if self.all_uuids_fn is None:
             return
         try:
-            uuids = self.all_uuids_fn()
-            for uuid_id in uuids:
-                try:
-                    self.encode_for_stream(uuid_id, quality)
-                except Exception:
-                    continue
+            for uuid_id in self.all_uuids_fn():
+                self._executor.submit(
+                    self._warm_one, uuid_id, quality, generation,
+                    priority=_PriorityPool.PRIORITY_LOW,
+                )
+        except Exception:
+            pass
+
+    def _warm_one(self, uuid_id: str, quality: str, generation: int) -> None:
+        """Encode one track at ``quality`` into the default cache.
+
+        Bails out immediately if the generation counter has moved on (i.e. the
+        default quality changed again while this task was pending).
+        """
+        if generation != self._warm_generation:
+            return
+        try:
+            self.encode_for_stream(uuid_id, quality)
         except Exception:
             pass

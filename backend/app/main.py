@@ -150,6 +150,7 @@ def startup_event():
         default_quality=default_quality,
         all_uuids_fn=lambda: database.get_all_track_uuids(),
     )
+    app.state.encoder_coordinator.startup()
 
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
@@ -782,8 +783,7 @@ def set_quality_setting(request: SetQualityRequest):
     database.set_setting("default_streaming_quality", quality_canonical)
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    warming = quality_canonical != ORIGINAL_QUALITY and coordinator.all_uuids_fn is not None
-    coordinator.set_default_quality(quality_canonical)
+    warming = coordinator.set_default_quality(quality_canonical)
 
     return SetQualityResponse(quality=quality_canonical, warming=warming)
 

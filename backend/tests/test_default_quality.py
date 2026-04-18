@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app.models import Track, TrackMetaData
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator
+from app.services.transcoder import ORIGINAL_QUALITY
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -217,7 +218,8 @@ class TestTwoTierCache:
         )
 
         # Should complete without error and without any transcode calls.
-        c._warm_all_tracks("256")
+        c._submit_warm_tasks("256", c._warm_generation)
+        c._executor.shutdown(wait=True)
 
         assert encode_calls == []
 
@@ -255,10 +257,259 @@ class TestTwoTierCache:
         assert c.default_cache.has("uuid-a", "192")
 
         # Run migration on the same cache object (old == new == shared_cache).
-        c._migrate_default_cache_to_stream(shared_cache)
+        c._migrate_default_cache_to_stream(shared_cache, "192")
 
         # The file must still exist after the no-op rename (src == dst).
         assert shared_cache.has("uuid-a", "192")
+
+    def test_set_default_quality__same_quality__returns_false_no_warm(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        c, calls = self._make_coordinator(tmp_path, source, default_quality="192")
+
+        first = c.set_default_quality("192")  # no-op: already "192"
+        assert first is False
+        assert calls == []
+
+    def test_set_default_quality__returns_true_when_warming_submitted(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
+        c.all_uuids_fn = lambda: ["uuid-a"]
+
+        result = c.set_default_quality("256")
+        c._executor.shutdown(wait=True)
+
+        assert result is True
+
+    def test_set_default_quality__returns_false_for_original_quality(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
+
+        result = c.set_default_quality(ORIGINAL_QUALITY)
+        c._executor.shutdown(wait=True)
+
+        assert result is False
+
+    def test_parallel_warming__all_uuids_encoded_with_multiple_workers(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        uuids = [f"uuid-{i}" for i in range(10)]
+
+        stream_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
+        )
+        default_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
+        )
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        c = EncoderCoordinator(
+            cache=stream_cache,
+            source_lookup=lambda _: source,
+            workers=4,
+            transcode_fn=fake_transcode,
+            default_cache=default_cache,
+            default_quality="original",
+            all_uuids_fn=lambda: uuids,
+        )
+
+        c.set_default_quality("192")
+        c._executor.shutdown(wait=True)
+
+        assert all(default_cache.has(uid, "192") for uid in uuids)
+
+    def test_generation_counter__stale_warm_tasks_skipped(self, tmp_path):
+        """Tasks queued for old quality bail out after quality changes."""
+        import threading as _threading
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        uuids = [f"uuid-{i}" for i in range(10)]
+        gate = _threading.Event()
+
+        stream_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
+        )
+        default_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
+        )
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            gate.wait()  # block until both quality changes have been submitted
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        c = EncoderCoordinator(
+            cache=stream_cache,
+            source_lookup=lambda _: source,
+            workers=2,
+            transcode_fn=fake_transcode,
+            default_cache=default_cache,
+            default_quality="original",
+            all_uuids_fn=lambda: uuids,
+        )
+
+        c.set_default_quality("128")   # generation=1, queues 10 tasks
+        c.set_default_quality("256")   # generation=2, queues 10 more tasks
+        gate.set()                     # let all tasks proceed
+        c._executor.shutdown(wait=True)
+
+        # "128" tasks bail (generation mismatch) or write to stream_cache (not default_cache)
+        assert not any(default_cache.has(uid, "128") for uid in uuids)
+        # "256" tasks complete and land in default_cache
+        assert all(default_cache.has(uid, "256") for uid in uuids)
+
+    def test_startup__cleans_orphaned_scratch_files(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+
+        stream_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
+        )
+        default_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
+        )
+        c = EncoderCoordinator(
+            cache=stream_cache,
+            source_lookup=lambda _: source,
+            workers=1,
+            default_cache=default_cache,
+            default_quality=ORIGINAL_QUALITY,
+        )
+
+        # Plant orphaned scratch files
+        c._scratch_dir.mkdir(parents=True, exist_ok=True)
+        (c._scratch_dir / "orphan1.m4a").write_bytes(b"partial")
+        (c._scratch_dir / "orphan2.m4a").write_bytes(b"partial")
+
+        c.startup()
+        c._executor.shutdown(wait=True)
+
+        remaining = list(c._scratch_dir.iterdir())
+        assert remaining == []
+
+    def test_startup__resumes_only_missing_tracks(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        uuids = ["uuid-0", "uuid-1", "uuid-2"]
+        encoded_uuids: list[str] = []
+
+        stream_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
+        )
+        default_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
+        )
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            # Figure out which uuid by reading its presence in encode_for_stream
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        c = EncoderCoordinator(
+            cache=stream_cache,
+            source_lookup=lambda _: source,
+            workers=2,
+            transcode_fn=fake_transcode,
+            default_cache=default_cache,
+            default_quality="192",
+            all_uuids_fn=lambda: uuids,
+        )
+
+        # Pre-warm uuid-0 so it's already in default_cache
+        c.encode_for_stream("uuid-0", "192", source_bitrate_kbps=320)
+        assert default_cache.has("uuid-0", "192")
+
+        # Track encodes via side-channel: count cache insertions after startup
+        calls_before = sum(1 for uid in uuids if default_cache.has(uid, "192"))
+
+        c.startup()
+        c._executor.shutdown(wait=True)
+
+        now_cached = [uid for uid in uuids if default_cache.has(uid, "192")]
+        assert len(now_cached) == 3  # all three cached after startup
+        # uuid-0 was pre-cached; only uuid-1 and uuid-2 should have been encoded by startup
+        new_encodes = len(now_cached) - calls_before
+        assert new_encodes == 2
+
+    def test_startup__no_op_when_all_cached(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        uuids = ["uuid-0", "uuid-1"]
+        encode_calls: list[int] = []
+
+        stream_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
+        )
+        default_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
+        )
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            encode_calls.append(bitrate)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        c = EncoderCoordinator(
+            cache=stream_cache,
+            source_lookup=lambda _: source,
+            workers=2,
+            transcode_fn=fake_transcode,
+            default_cache=default_cache,
+            default_quality="192",
+            all_uuids_fn=lambda: uuids,
+        )
+
+        # Pre-warm all tracks
+        for uid in uuids:
+            c.encode_for_stream(uid, "192", source_bitrate_kbps=320)
+        encode_calls.clear()
+
+        c.startup()
+        c._executor.shutdown(wait=True)
+
+        assert encode_calls == []  # nothing re-encoded
+
+    def test_startup__no_op_for_original_quality(self, tmp_path):
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        encode_calls: list[int] = []
+
+        stream_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
+        )
+        default_cache = EncodedCache(
+            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
+        )
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            encode_calls.append(bitrate)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        c = EncoderCoordinator(
+            cache=stream_cache,
+            source_lookup=lambda _: source,
+            workers=2,
+            transcode_fn=fake_transcode,
+            default_cache=default_cache,
+            default_quality=ORIGINAL_QUALITY,
+            all_uuids_fn=lambda: ["uuid-a"],
+        )
+
+        c.startup()
+        c._executor.shutdown(wait=True)
+
+        assert encode_calls == []
 
     def test_warm_all_tracks_encodes_at_new_default(self, tmp_path):
         source = tmp_path / "t.mp3"
@@ -344,3 +595,13 @@ class TestQualitySettingsAPI:
         client.put("/settings/quality", json={"quality": "320"})
 
         assert client.app.state.encoder_coordinator.default_quality == "320"
+
+    def test_put_quality__same_quality__warming_false(self, client):
+        """Sending the same quality twice returns warming: false on the second call."""
+        _install_fake_coordinator(client)
+
+        client.put("/settings/quality", json={"quality": "256"})
+        r = client.put("/settings/quality", json={"quality": "256"})
+
+        assert r.status_code == 200
+        assert r.json()["warming"] is False

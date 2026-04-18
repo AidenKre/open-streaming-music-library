@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Encoded tracks cache (used for transcoded streams)
     encoded_cache_size_gb: float = 5.0
-    encoded_cache_prefetch_workers: int = 2
+    encoded_cache_prefetch_workers: int = 4
     prefetch_lookahead: int = 20
 
     # Default streaming quality preset served to all clients.
