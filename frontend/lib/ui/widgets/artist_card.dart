@@ -70,7 +70,7 @@ class ArtistCard extends ConsumerWidget {
                         Navigator.pop(ctx);
                         onDownloadAtQuality!(quality);
                       }
-                    : (_) {},
+                    : null,
               ),
           ],
         ),

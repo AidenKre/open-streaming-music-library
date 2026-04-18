@@ -172,6 +172,22 @@ void main() {
       expect(deleted, isTrue);
     });
 
+    testWidgets('no chevron when onDownloadAtQuality is null', (tester) async {
+      await tester.pumpWidget(buildCard(
+        _album,
+        downloaded: false,
+        onDownload: () {},
+        // onDownloadAtQuality intentionally omitted (null)
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.longPress(find.byType(AlbumCard));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(SplitDownloadTile), findsOneWidget);
+      expect(find.byIcon(Icons.chevron_right), findsNothing);
+    });
+
     testWidgets('split tile shows chevron icon', (tester) async {
       await tester.pumpWidget(buildCard(
         _album,

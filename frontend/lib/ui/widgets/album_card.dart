@@ -70,7 +70,7 @@ class AlbumCard extends ConsumerWidget {
                         Navigator.pop(ctx);
                         onDownloadAtQuality!(quality);
                       }
-                    : (_) {},
+                    : null,
               ),
           ],
         ),

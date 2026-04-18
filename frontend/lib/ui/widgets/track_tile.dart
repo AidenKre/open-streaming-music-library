@@ -74,7 +74,7 @@ class TrackTile extends StatelessWidget {
                         Navigator.pop(ctx);
                         onDownloadAtQuality!(quality);
                       }
-                    : (_) {},
+                    : null,
               ),
           ],
         ),

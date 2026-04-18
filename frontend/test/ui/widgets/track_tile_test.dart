@@ -157,6 +157,21 @@ void main() {
       expect(deleteCalled, isTrue);
     });
 
+    testWidgets('no chevron when onDownloadAtQuality is null', (tester) async {
+      await tester.pumpWidget(buildTile(
+        _track(),
+        onPlayNext: () {},
+        onDownload: () {},
+        // onDownloadAtQuality intentionally omitted (null)
+      ));
+
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(SplitDownloadTile), findsOneWidget);
+      expect(find.byIcon(Icons.chevron_right), findsNothing);
+    });
+
     testWidgets('split tile shows chevron icon in track menu', (tester) async {
       await tester.pumpWidget(buildTile(
         _track(),

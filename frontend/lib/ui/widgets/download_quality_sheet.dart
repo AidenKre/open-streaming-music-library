@@ -35,12 +35,15 @@ Future<String?> showDownloadQualitySheet(BuildContext context) {
 /// [onDownloadAtQuality] with the chosen quality.
 class SplitDownloadTile extends StatelessWidget {
   final VoidCallback onDownload;
-  final void Function(String quality) onDownloadAtQuality;
+
+  /// When non-null, a chevron is shown that opens the quality picker sheet.
+  /// When null, the tile behaves as a plain download button (no chevron).
+  final void Function(String quality)? onDownloadAtQuality;
 
   const SplitDownloadTile({
     super.key,
     required this.onDownload,
-    required this.onDownloadAtQuality,
+    this.onDownloadAtQuality,
   });
 
   @override
@@ -54,20 +57,21 @@ class SplitDownloadTile extends StatelessWidget {
             onTap: onDownload,
           ),
         ),
-        SizedBox(
-          width: 48,
-          height: 48,
-          child: IconButton(
-            tooltip: 'Choose quality',
-            icon: const Icon(Icons.chevron_right),
-            onPressed: () async {
-              final quality = await showDownloadQualitySheet(context);
-              if (quality != null) {
-                onDownloadAtQuality(quality);
-              }
-            },
+        if (onDownloadAtQuality != null)
+          SizedBox(
+            width: 48,
+            height: 48,
+            child: IconButton(
+              tooltip: 'Choose quality',
+              icon: const Icon(Icons.chevron_right),
+              onPressed: () async {
+                final quality = await showDownloadQualitySheet(context);
+                if (quality != null) {
+                  onDownloadAtQuality!(quality);
+                }
+              },
+            ),
           ),
-        ),
       ],
     );
   }

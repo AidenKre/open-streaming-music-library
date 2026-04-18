@@ -27,7 +27,7 @@ class GetSearchResponse(BaseModel):
 
 
 class WarmRequest(BaseModel):
-    session_id: str
+    session_id: Optional[str] = None
     current_index: int = Field(ge=0)
     quality: str
     track_uuids: List[str]
