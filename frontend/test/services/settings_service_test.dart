@@ -1,9 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/settings_service.dart';
@@ -188,5 +192,149 @@ void main() {
     await container.read(settingsProvider.future);
     expect(container.read(streamQualityProvider), '256');
     expect(container.read(downloadQualityProvider), '320');
+  });
+
+  group('syncQualityFromBackend', () {
+    http.Response _qualityResponse(String quality) => http.Response(
+          jsonEncode({'quality': quality}),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+
+    tearDown(() {
+      // Reset ApiClient to empty state so other tests aren't affected.
+      ApiClient.init('');
+    });
+
+    test('backend returns different quality → state updated and persisted',
+        () async {
+      SharedPreferences.setMockInitialValues(
+          {'settings.streamQuality': originalQuality});
+      final prefs = await SharedPreferences.getInstance();
+
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async => _qualityResponse('128')),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      // Allow the fire-and-forget sync to complete.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(container.read(streamQualityProvider), '128');
+      expect(prefs.getString('settings.streamQuality'), '128');
+    });
+
+    test('backend returns same quality → no state change', () async {
+      SharedPreferences.setMockInitialValues(
+          {'settings.streamQuality': '128'});
+      final prefs = await SharedPreferences.getInstance();
+
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async {
+          calls++;
+          return _qualityResponse('128');
+        }),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      // Quality unchanged — no unnecessary state emission.
+      expect(container.read(streamQualityProvider), '128');
+      expect(calls, 1); // request was still made; just no state update
+    });
+
+    test('backend unreachable → local value kept', () async {
+      SharedPreferences.setMockInitialValues(
+          {'settings.streamQuality': '256'});
+      final prefs = await SharedPreferences.getInstance();
+
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async => throw Exception('network error')),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(container.read(streamQualityProvider), '256');
+    });
+
+    test('first-time launch (no pref) + backend returns "128"', () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async => _qualityResponse('128')),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(container.read(streamQualityProvider), '128');
+      expect(prefs.getString('settings.streamQuality'), '128');
+    });
+
+    test('no server URL configured → no HTTP request made', () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+
+      var requestCount = 0;
+      ApiClient.initForTest(
+        '',
+        MockClient((_) async {
+          requestCount++;
+          return _qualityResponse('128');
+        }),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(requestCount, 0);
+      expect(container.read(streamQualityProvider), originalQuality);
+    });
+
+    test('backend returns invalid quality string → local value kept', () async {
+      SharedPreferences.setMockInitialValues(
+          {'settings.streamQuality': '256'});
+      final prefs = await SharedPreferences.getInstance();
+
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async => http.Response(
+              jsonEncode({'quality': '999'}),
+              200,
+              headers: {'content-type': 'application/json'},
+            )),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(container.read(streamQualityProvider), '256');
+    });
   });
 }

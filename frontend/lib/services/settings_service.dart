@@ -87,10 +87,10 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     final prefs = await ref.read(sharedPreferencesProvider.future);
     final settings = _read(prefs);
 
-    // Fetch the backend's persisted default quality (informational — this
-    // lets the UI show what the server is set to, but the frontend pref
-    // drives actual stream URLs).
-    _fetchBackendQuality();
+    // Sync the backend's authoritative quality to local state. This keeps
+    // settings consistent across devices — the backend is the source of
+    // truth; SharedPreferences is an offline cache of the last known value.
+    _syncQualityFromBackend();
 
     return settings;
   }
@@ -105,17 +105,31 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     );
   }
 
-  void _fetchBackendQuality() {
+  void _syncQualityFromBackend() {
     if (ApiClient.instance.baseUrl.isEmpty) return;
     ApiClient.instance
         .getJson(['settings', 'quality'])
-        .then((_) {/* informational — no action needed */})
+        .then((data) async {
+          final quality = data['quality'];
+          if (!isValidQuality(quality)) return;
+          // Cache locally so offline restarts use the last known backend value.
+          final prefs = await ref.read(sharedPreferencesProvider.future);
+          await prefs.setString(_streamQualityKey, quality as String);
+          // Apply to state — intentionally do NOT set streamQualityChangeKind
+          // so the AudioCoordinator doesn't attempt a playlist rebuild at startup.
+          final current = state.value;
+          if (current == null) return;
+          if (current.persistedStreamQuality == quality) return;
+          state = AsyncData(
+            current.copyWith(persistedStreamQuality: quality),
+          );
+        })
         .catchError((Object e) {
-      developer.log(
-        'Could not fetch backend quality setting: $e',
-        name: 'SettingsNotifier',
-      );
-    });
+          developer.log(
+            'Could not sync quality from backend: $e',
+            name: 'SettingsNotifier',
+          );
+        });
   }
 
   /// Persists [quality] to SharedPreferences **and** sends it to the backend
