@@ -263,11 +263,9 @@ class ConcatenatingPlayerController {
     final entry = _loadedEntries[localIndex];
 
     await _runStructuralMutation(() async {
-      await _player.removeAudioSourceAt(localIndex);
-      final oldQuality = _streamQuality;
       _streamQuality = quality;
+      await _player.removeAudioSourceAt(localIndex);
       await _player.insertAudioSource(localIndex, _sourceForEntry(entry));
-      _streamQuality = oldQuality;
       await _player.seek(seekTo, index: localIndex);
     }, preservedCurrentItemId: currentItemId);
   }
@@ -283,7 +281,6 @@ class ConcatenatingPlayerController {
     if (localIndex == null) return;
 
     await _runStructuralMutation(() async {
-      final oldQuality = _streamQuality;
       _streamQuality = quality;
       for (var i = 0; i < _loadedEntries.length; i++) {
         await _player.removeAudioSourceAt(0);
@@ -291,7 +288,6 @@ class ConcatenatingPlayerController {
       for (var i = 0; i < _loadedEntries.length; i++) {
         await _player.insertAudioSource(i, _sourceForEntry(_loadedEntries[i]));
       }
-      _streamQuality = oldQuality;
       await _player.seek(seekTo, index: localIndex);
     }, preservedCurrentItemId: currentItemId);
   }

@@ -2702,7 +2702,7 @@ class TestDatabaseMigration:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         conn.close()
 
-        assert version == 2
+        assert version == 3
 
     def test_migrate__already_at_v1__does_not_fail(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
