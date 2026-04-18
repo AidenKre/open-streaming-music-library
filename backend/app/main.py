@@ -22,7 +22,6 @@ from app.database import (
 )
 from app.models import (
     Album,
-    Artist,
     ClientTrack,
     GetAlbumsResponse,
     GetArtistsResponse,
@@ -36,8 +35,6 @@ from app.models import (
     Track,
 )
 from app.services import (
-    ORIGINAL_QUALITY,
-    QUALITY_BITRATES_KBPS,
     CoverArtContext,
     CoverArtManager,
     EncodedCache,
@@ -55,7 +52,7 @@ from app.services.encoder_coordinator import EncodeResult
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     startup_event()
     yield
     shutdown_event()
@@ -142,7 +139,7 @@ def startup_event():
 
     app.state.encoded_cache = encoded_cache
     app.state.default_cache = default_cache
-    app.state.encoder_coordinator = EncoderCoordinator(
+    encoder_coordinator = EncoderCoordinator(
         cache=encoded_cache,
         source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
         workers=max(1, settings.encoded_cache_prefetch_workers),
@@ -150,7 +147,8 @@ def startup_event():
         default_quality=default_quality,
         all_uuids_fn=lambda: database.get_all_track_uuids(),
     )
-    app.state.encoder_coordinator.startup()
+    app.state.encoder_coordinator = encoder_coordinator
+    encoder_coordinator.startup()
 
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
@@ -783,7 +781,7 @@ def set_quality_setting(request: SetQualityRequest):
     database.set_setting("default_streaming_quality", quality_canonical)
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    warming = coordinator.set_default_quality(quality_canonical)
+    warming: bool = coordinator.set_default_quality(quality_canonical)
 
     return SetQualityResponse(quality=quality_canonical, warming=warming)
 
