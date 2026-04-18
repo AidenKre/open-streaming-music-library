@@ -255,9 +255,45 @@ class TestStreamQuality:
         ) as resp:
             assert resp.status_code == 206
             assert int(resp.headers["content-length"]) == 20
+            assert resp.headers["x-audio-bitrate-kbps"] == "128"
+            assert resp.headers["x-audio-extension"] == "m4a"
             body = b"".join(resp.iter_bytes())
 
         assert body == encoded_payload[10:30]
+
+    def test_stream__passthrough__ffprobe_fallback_when_db_bitrate_zero(
+        self, client, tmp_path
+    ):
+        """When DB bitrate_kbps is 0/unknown, coordinator ffprobes the source.
+
+        The source file here is not a real audio file so ffprobe returns None,
+        meaning the coordinator cannot confirm passthrough and will attempt to
+        transcode. We verify that (a) the request succeeds, (b) the fake
+        transcoder runs (since ffprobe returns None on a fake file, passthrough
+        won't trigger), and (c) the response headers are still present.
+        """
+        track = _add_track_with_file(
+            client, tmp_path, name="unknown_bitrate.mp3", bitrate_kbps=0.0
+        )
+        transcode_calls = {"n": 0}
+
+        def payload(bitrate: int) -> bytes:
+            transcode_calls["n"] += 1
+            return b"TRANSCODED" * 20
+
+        _install_fake_coordinator(client, payload_for_quality=payload)
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=320"
+        ) as resp:
+            assert resp.status_code == 200
+            assert "x-audio-bitrate-kbps" in resp.headers
+            assert "x-audio-extension" in resp.headers
+            _ = b"".join(resp.iter_bytes())
+
+        # ffprobe returns None on a fake file → coordinator falls through to
+        # transcoding (since it can't confirm source_bitrate <= requested).
+        assert transcode_calls["n"] == 1
 
 
 class TestEncodedCache:

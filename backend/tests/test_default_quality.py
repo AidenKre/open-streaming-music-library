@@ -182,6 +182,84 @@ class TestTwoTierCache:
         # And removed from default_cache dir.
         assert not old_default_cache.has("uuid-a", "192")
 
+    def test_warm_all_tracks__empty_uuid_list__does_nothing(self, tmp_path):
+        """_warm_all_tracks with an empty UUID list must not raise and must not encode."""
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        encode_calls: list[str] = []
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            encode_calls.append(str(bitrate))
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        stream_cache = EncodedCache(
+            ctx=EncodedCacheContext(
+                cache_dir=tmp_path / "stream",
+                max_size_bytes=10 * 1024 * 1024,
+            )
+        )
+        default_cache = EncodedCache(
+            ctx=EncodedCacheContext(
+                cache_dir=tmp_path / "default",
+                max_size_bytes=0,
+            )
+        )
+        c = EncoderCoordinator(
+            cache=stream_cache,
+            source_lookup=lambda _: source,
+            workers=2,
+            transcode_fn=fake_transcode,
+            default_cache=default_cache,
+            default_quality="192",
+            all_uuids_fn=lambda: [],  # empty library
+        )
+
+        # Should complete without error and without any transcode calls.
+        c._warm_all_tracks("256")
+
+        assert encode_calls == []
+
+    def test_migrate_default_cache__same_dir__no_files_lost(self, tmp_path):
+        """_migrate_default_cache_to_stream with same-dir caches must not delete files."""
+        shared_dir = tmp_path / "shared_cache"
+        shared_dir.mkdir()
+
+        shared_cache = EncodedCache(
+            ctx=EncodedCacheContext(
+                cache_dir=shared_dir,
+                max_size_bytes=0,  # unlimited
+            )
+        )
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+
+        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        # Both cache and default_cache point at the same directory.
+        c = EncoderCoordinator(
+            cache=shared_cache,
+            source_lookup=lambda _: source,
+            workers=2,
+            transcode_fn=fake_transcode,
+            default_cache=shared_cache,
+            default_quality="192",
+        )
+
+        # Encode a track so there is a file in the shared cache.
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
+        assert c.default_cache.has("uuid-a", "192")
+
+        # Run migration on the same cache object (old == new == shared_cache).
+        c._migrate_default_cache_to_stream(shared_cache)
+
+        # The file must still exist after the no-op rename (src == dst).
+        assert shared_cache.has("uuid-a", "192")
+
     def test_warm_all_tracks_encodes_at_new_default(self, tmp_path):
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
