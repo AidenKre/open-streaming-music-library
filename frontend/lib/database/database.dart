@@ -55,6 +55,7 @@ class Tracks extends Table {
   // a lower quality than the server source (e.g. 128 kbps download from a
   // 320 kbps source) or when bitrate passthrough serves the original.
   IntColumn get downloadedBitrateKbps => integer().nullable()();
+  IntColumn get fileSizeBytes => integer().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -588,7 +589,7 @@ const trackSelectColumns =
     'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
     'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
-    't.downloaded_bitrate_kbps';
+    't.downloaded_bitrate_kbps, t.file_size_bytes';
 const _selectColumns = trackSelectColumns;
 
 // ── FTS5 virtual table creation statements ──────────────────────────────
@@ -628,7 +629,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -649,6 +650,11 @@ class AppDatabase extends _$AppDatabase {
           'ALTER TABLE tracks ADD COLUMN downloaded_bitrate_kbps INTEGER',
         );
       }
+      if (from < 4) {
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
+        );
+      }
     },
   );
 
@@ -661,6 +667,7 @@ class AppDatabase extends _$AppDatabase {
     int? artistId,
     int? albumId,
     int? limit,
+    bool downloadedOnly = false,
   }) {
     if (albumId != null && artistId == null) {
       throw ArgumentError('Cannot filter by album without artist');
@@ -688,6 +695,10 @@ class AppDatabase extends _$AppDatabase {
     if (albumId != null) {
       whereClauses.add('tm."album_id" = ?');
       vars.add(Variable.withInt(albumId));
+    }
+
+    if (downloadedOnly) {
+      whereClauses.add('t.file_path IS NOT NULL');
     }
 
     // Cursor filter
@@ -735,6 +746,7 @@ class AppDatabase extends _$AppDatabase {
     int? artistId,
     int? albumId,
     int? limit,
+    bool downloadedOnly = false,
   }) {
     final (sql, vars) = _buildTrackQuery(
       searchParams: searchParams,
@@ -743,6 +755,7 @@ class AppDatabase extends _$AppDatabase {
       artistId: artistId,
       albumId: albumId,
       limit: limit,
+      downloadedOnly: downloadedOnly,
     );
     return customSelect(
       sql,
@@ -853,6 +866,7 @@ class AppDatabase extends _$AppDatabase {
     List<RowFilterParameter> cursorFilters = const [],
     int? artistId,
     int? albumId,
+    bool downloadedOnly = false,
   }) {
     if (albumId != null && artistId == null) {
       throw ArgumentError('Cannot filter by album without artist');
@@ -868,6 +882,10 @@ class AppDatabase extends _$AppDatabase {
     if (albumId != null) {
       whereClauses.add('tm."album_id" = ?');
       vars.add(Variable.withInt(albumId));
+    }
+
+    if (downloadedOnly) {
+      whereClauses.add('t.file_path IS NOT NULL');
     }
 
     // Inverse cursor: count rows at or before the cursor position
@@ -896,6 +914,39 @@ class AppDatabase extends _$AppDatabase {
       variables: vars,
       readsFrom: {trackmetadata, tracks},
     ).watch().map((rows) => rows.first.read<int>('c'));
+  }
+
+  Future<Map<String, ({String? filePath, int? downloadedBitrateKbps, int? fileSizeBytes})>>
+      getTrackDownloadStates(List<String> uuids) async {
+    if (uuids.isEmpty) return {};
+    final placeholders = List.filled(uuids.length, '?').join(', ');
+    final rows = await customSelect(
+      'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes '
+      'FROM tracks WHERE uuid_id IN ($placeholders)',
+      variables: uuids.map(Variable.withString).toList(),
+      readsFrom: {tracks},
+    ).get();
+    return {
+      for (final r in rows)
+        r.read<String>('uuid_id'): (
+          filePath: r.readNullable<String>('file_path'),
+          downloadedBitrateKbps: r.readNullable<int>('downloaded_bitrate_kbps'),
+          fileSizeBytes: r.readNullable<int>('file_size_bytes'),
+        ),
+    };
+  }
+
+  Stream<({int count, int totalBytes})> watchDownloadedStats() {
+    return customSelect(
+      'SELECT COUNT(*) AS c, COALESCE(SUM(file_size_bytes), 0) AS total_bytes '
+      'FROM tracks WHERE file_path IS NOT NULL',
+      readsFrom: {tracks},
+    ).watch().map(
+      (rows) => (
+        count: rows.first.read<int>('c'),
+        totalBytes: rows.first.read<int>('total_bytes'),
+      ),
+    );
   }
 
   // ── Artist queries ────────────────────────────────────────────────────

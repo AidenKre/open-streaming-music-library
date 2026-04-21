@@ -36,6 +36,12 @@ final downloadManagerListenableProvider = ChangeNotifierProvider<DownloadManager
   (ref) => ref.watch(downloadManagerProvider),
 );
 
+/// Live count and total size of downloaded tracks for the Downloads tab header.
+final downloadedStatsProvider =
+    StreamProvider<({int count, int totalBytes})>((ref) {
+  return ref.watch(databaseProvider).watchDownloadedStats();
+});
+
 /// Bumps every time a track is downloaded or deleted, so derived providers
 /// (album/artist downloaded badges) can revalidate.
 final downloadStatusVersionProvider = StreamProvider<int>((ref) {
@@ -73,6 +79,46 @@ final artistDownloadedProvider =
   final entry = counts[artistId];
   if (entry == null) return false;
   return entry.total > 0 && entry.downloaded == entry.total;
+});
+
+/// True iff any queued/active jobs belong to the given album.
+final albumIsDownloadingProvider = Provider.family<bool, int>((ref, albumId) {
+  final manager = ref.watch(downloadManagerListenableProvider);
+  return manager.state.jobs.any((j) =>
+      j.albumId == albumId &&
+      (j.state == DownloadState.queued || j.state == DownloadState.active));
+});
+
+/// True iff any queued/active jobs belong to the given artist.
+final artistIsDownloadingProvider = Provider.family<bool, int>((ref, artistId) {
+  final manager = ref.watch(downloadManagerListenableProvider);
+  return manager.state.jobs.any((j) =>
+      j.artistId == artistId &&
+      (j.state == DownloadState.queued || j.state == DownloadState.active));
+});
+
+/// DB-backed (downloaded, total) counts for an album; refreshes on each
+/// completed/deleted download.
+final albumDownloadCountsProvider =
+    FutureProvider.family<({int downloaded, int total}), int>(
+        (ref, albumId) async {
+  ref.watch(downloadStatusVersionProvider);
+  final db = ref.watch(databaseProvider);
+  final counts = await db.getAlbumDownloadCounts([albumId]);
+  final entry = counts[albumId];
+  return (downloaded: entry?.downloaded ?? 0, total: entry?.total ?? 0);
+});
+
+/// DB-backed (downloaded, total) counts for an artist; refreshes on each
+/// completed/deleted download.
+final artistDownloadCountsProvider =
+    FutureProvider.family<({int downloaded, int total}), int>(
+        (ref, artistId) async {
+  ref.watch(downloadStatusVersionProvider);
+  final db = ref.watch(databaseProvider);
+  final counts = await db.getArtistDownloadCounts([artistId]);
+  final entry = counts[artistId];
+  return (downloaded: entry?.downloaded ?? 0, total: entry?.total ?? 0);
 });
 
 // ── Download / delete helpers ───────────────────────────────────────────

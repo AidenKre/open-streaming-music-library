@@ -70,6 +70,7 @@ class BrowseRepository {
     int? artistId,
     int? albumId,
     int? limit,
+    bool downloadedOnly = false,
   }) async {
     final rows = await _db.getTracks(
       orderBy: orderBy,
@@ -77,6 +78,7 @@ class BrowseRepository {
       artistId: artistId,
       albumId: albumId,
       limit: limit,
+      downloadedOnly: downloadedOnly,
     );
     return rows.map(TrackUI.fromQueryRow).toList(growable: false);
   }
@@ -86,12 +88,14 @@ class BrowseRepository {
     List<RowFilterParameter> cursorFilters = const [],
     int? artistId,
     int? albumId,
+    bool downloadedOnly = false,
   }) {
     return _db.watchTrackCount(
       orderBy: orderBy,
       cursorFilters: cursorFilters,
       artistId: artistId,
       albumId: albumId,
+      downloadedOnly: downloadedOnly,
     );
   }
 

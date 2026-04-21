@@ -82,10 +82,13 @@ class _DownloadTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final subtitle =
-        job.state == DownloadState.failed && job.errorMessage != null
-            ? 'Failed: ${job.errorMessage}'
-            : (job.artist ?? '');
+    final artistPart = job.artist ?? '';
+    final sizePart = job.state == DownloadState.completed && job.fileSizeBytes != null
+        ? formatBytes(job.fileSizeBytes!)
+        : null;
+    final subtitle = job.state == DownloadState.failed && job.errorMessage != null
+        ? 'Failed: ${job.errorMessage}'
+        : [artistPart, sizePart].where((s) => s != null && s.isNotEmpty).join(' \u2022 ');
 
     return ListTile(
       title: Text(job.title ?? job.uuidId, maxLines: 1, overflow: TextOverflow.ellipsis),

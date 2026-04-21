@@ -84,10 +84,10 @@ class AlbumCard extends ConsumerWidget {
     final colorScheme = theme.colorScheme;
     final isSingle = album.isSingleGrouping;
     final isDownloaded =
-        ref.watch(albumDownloadedProvider(album.id)).maybeWhen(
-              data: (v) => v,
-              orElse: () => false,
-            );
+        ref.watch(albumDownloadedProvider(album.id)).value ?? false;
+    final isDownloading = ref.watch(albumIsDownloadingProvider(album.id));
+    final downloadCounts =
+        ref.watch(albumDownloadCountsProvider(album.id)).value;
 
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -133,6 +133,16 @@ class AlbumCard extends ConsumerWidget {
                       top: 4,
                       right: 4,
                       child: _DownloadedBadge(colorScheme: colorScheme),
+                    )
+                  else if (isDownloading && downloadCounts != null)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: _DownloadProgressBadge(
+                        downloaded: downloadCounts.downloaded,
+                        total: downloadCounts.total,
+                        colorScheme: colorScheme,
+                      ),
                     ),
                 ],
               ),
@@ -186,6 +196,36 @@ class _DownloadedBadge extends StatelessWidget {
         Icons.download_done,
         size: 14,
         color: colorScheme.onPrimary,
+      ),
+    );
+  }
+}
+
+class _DownloadProgressBadge extends StatelessWidget {
+  final int downloaded;
+  final int total;
+  final ColorScheme colorScheme;
+  const _DownloadProgressBadge({
+    required this.downloaded,
+    required this.total,
+    required this.colorScheme,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      decoration: BoxDecoration(
+        color: colorScheme.primary.withValues(alpha: 0.85),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        '$downloaded/$total',
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+          color: colorScheme.onPrimary,
+        ),
       ),
     );
   }

@@ -7,6 +7,7 @@ import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
@@ -35,6 +36,26 @@ class _SearchPageState extends ConsumerState<SearchPage> {
     _debounceTimer?.cancel();
     _controller.dispose();
     super.dispose();
+  }
+
+  void _patchDownloadStates() async {
+    if (!mounted) return;
+    final uuids = _tracks.map((t) => t.uuidId).toList();
+    if (uuids.isEmpty) return;
+    final db = ref.read(databaseProvider);
+    final states = await db.getTrackDownloadStates(uuids);
+    if (!mounted) return;
+    setState(() {
+      _tracks = _tracks.map((t) {
+        final s = states[t.uuidId];
+        if (s == null) return t;
+        return t.copyWith(
+          filePath: s.filePath,
+          downloadedBitrateKbps: s.downloadedBitrateKbps,
+          fileSizeBytes: s.fileSizeBytes,
+        );
+      }).toList();
+    });
   }
 
   void _onQueryChanged(String value) {
@@ -109,6 +130,9 @@ class _SearchPageState extends ConsumerState<SearchPage> {
 
   @override
   Widget build(BuildContext context) {
+    ref.listen(downloadStatusVersionProvider, (_, _) => _patchDownloadStates());
+    final manager = ref.watch(downloadManagerListenableProvider);
+
     final hasResults =
         _artists.isNotEmpty || _albums.isNotEmpty || _tracks.isNotEmpty;
 
@@ -224,22 +248,47 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           if (_tracks.isNotEmpty) ...[
             _buildSectionHeader('Songs'),
             for (final track in _tracks)
-              TrackTile(
-                track: track,
-                onTap: () => ref
-                    .read(audioProvider.notifier)
-                    .playFromTrackList(
-                      _tracks.map((t) => t.uuidId).toList(),
-                      track,
-                      sourceType: 'search',
-                    ),
-                onPlayNext: () =>
-                    ref.read(audioProvider.notifier).playNext([track]),
-                onAddToQueue: () =>
-                    ref.read(audioProvider.notifier).addToQueue([track]),
-                onDownload: () => downloadTrack(ref, track),
-                onDownloadAtQuality: (q) => downloadTrackAtQuality(ref, track, q),
-                onDeleteDownload: () => deleteTrackDownload(ref, track.uuidId),
+              Builder(
+                key: ValueKey(track.uuidId),
+                builder: (_) {
+                  final job = manager.state.jobs
+                      .where((j) => j.uuidId == track.uuidId)
+                      .firstOrNull;
+                  Widget? trailing;
+                  if (job != null) {
+                    trailing = switch (job.state) {
+                      DownloadState.active => SizedBox(
+                          width: 80,
+                          child: LinearProgressIndicator(
+                            value: job.progress > 0 ? job.progress : null,
+                          ),
+                        ),
+                      DownloadState.queued =>
+                        const Icon(Icons.schedule, size: 16),
+                      _ => null,
+                    };
+                  }
+                  return TrackTile(
+                    track: track,
+                    trailing: trailing,
+                    onTap: () => ref
+                        .read(audioProvider.notifier)
+                        .playFromTrackList(
+                          _tracks.map((t) => t.uuidId).toList(),
+                          track,
+                          sourceType: 'search',
+                        ),
+                    onPlayNext: () =>
+                        ref.read(audioProvider.notifier).playNext([track]),
+                    onAddToQueue: () =>
+                        ref.read(audioProvider.notifier).addToQueue([track]),
+                    onDownload: () => downloadTrack(ref, track),
+                    onDownloadAtQuality: (q) =>
+                        downloadTrackAtQuality(ref, track, q),
+                    onDeleteDownload: () =>
+                        deleteTrackDownload(ref, track.uuidId),
+                  );
+                },
               ),
           ],
         ],

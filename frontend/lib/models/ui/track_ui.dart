@@ -26,6 +26,8 @@ class TrackUI {
   final int? coverArtId;
   // Bitrate of the file actually on disk. Null until a download completes.
   final int? downloadedBitrateKbps;
+  // Size in bytes of the file on disk. Null until a download completes.
+  final int? fileSizeBytes;
 
   bool get isDownloaded => filePath != null;
 
@@ -56,7 +58,47 @@ class TrackUI {
     required this.hasAlbumArt,
     this.coverArtId,
     this.downloadedBitrateKbps,
+    this.fileSizeBytes,
   });
+
+  static const Object _sentinel = Object();
+
+  TrackUI copyWith({
+    Object? filePath = _sentinel,
+    Object? downloadedBitrateKbps = _sentinel,
+    Object? fileSizeBytes = _sentinel,
+  }) {
+    return TrackUI(
+      uuidId: uuidId,
+      filePath: filePath == _sentinel ? this.filePath : filePath as String?,
+      createdAt: createdAt,
+      lastUpdated: lastUpdated,
+      title: title,
+      artist: artist,
+      album: album,
+      albumArtist: albumArtist,
+      artistId: artistId,
+      albumId: albumId,
+      year: year,
+      date: date,
+      genre: genre,
+      trackNumber: trackNumber,
+      discNumber: discNumber,
+      codec: codec,
+      duration: duration,
+      bitrateKbps: bitrateKbps,
+      sampleRateHz: sampleRateHz,
+      channels: channels,
+      hasAlbumArt: hasAlbumArt,
+      coverArtId: coverArtId,
+      downloadedBitrateKbps: downloadedBitrateKbps == _sentinel
+          ? this.downloadedBitrateKbps
+          : downloadedBitrateKbps as int?,
+      fileSizeBytes: fileSizeBytes == _sentinel
+          ? this.fileSizeBytes
+          : fileSizeBytes as int?,
+    );
+  }
 
   String get formattedDuration {
     final totalSeconds = duration.truncate();
@@ -96,6 +138,7 @@ class TrackUI {
       hasAlbumArt: row.read<bool>('has_album_art'),
       coverArtId: row.readNullable<int>('cover_art_id'),
       downloadedBitrateKbps: row.readNullable<int>('downloaded_bitrate_kbps'),
+      fileSizeBytes: row.readNullable<int>('file_size_bytes'),
     );
   }
 
@@ -124,6 +167,7 @@ class TrackUI {
       hasAlbumArt: meta.hasAlbumArt,
       coverArtId: meta.coverArtId,
       downloadedBitrateKbps: track.downloadedBitrateKbps,
+      fileSizeBytes: track.fileSizeBytes,
     );
   }
 }

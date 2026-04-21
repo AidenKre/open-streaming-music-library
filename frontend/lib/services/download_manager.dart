@@ -17,6 +17,14 @@ import 'package:frontend/services/queue_warm_service.dart';
 
 enum DownloadState { queued, active, completed, failed }
 
+String formatBytes(int bytes) {
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  if (bytes < 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+  return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+}
+
 /// Snapshot of one download as exposed to the UI. The job IS the track —
 /// users can have at most one in-flight download per uuid.
 @immutable
@@ -24,10 +32,13 @@ class DownloadJob {
   final String uuidId;
   final String? title;
   final String? artist;
+  final int? albumId;
+  final int? artistId;
   final String quality;
   final DownloadState state;
   final double progress; // 0.0..1.0; only meaningful while active
   final String? errorMessage;
+  final int? fileSizeBytes;
 
   const DownloadJob({
     required this.uuidId,
@@ -35,23 +46,30 @@ class DownloadJob {
     required this.artist,
     required this.quality,
     required this.state,
+    this.albumId,
+    this.artistId,
     this.progress = 0.0,
     this.errorMessage,
+    this.fileSizeBytes,
   });
 
   DownloadJob copyWith({
     DownloadState? state,
     double? progress,
     String? errorMessage,
+    int? fileSizeBytes,
   }) {
     return DownloadJob(
       uuidId: uuidId,
       title: title,
       artist: artist,
+      albumId: albumId,
+      artistId: artistId,
       quality: quality,
       state: state ?? this.state,
       progress: progress ?? this.progress,
       errorMessage: errorMessage ?? this.errorMessage,
+      fileSizeBytes: fileSizeBytes ?? this.fileSizeBytes,
     );
   }
 }
@@ -154,6 +172,8 @@ class DownloadManager extends ChangeNotifier {
         uuidId: t.uuidId,
         title: t.title,
         artist: t.artist,
+        albumId: t.albumId,
+        artistId: t.artistId,
         quality: quality,
         state: DownloadState.queued,
       ));
@@ -358,12 +378,15 @@ class DownloadManager extends ChangeNotifier {
       final downloadedBitrate =
           bitrateHeader != null ? int.tryParse(bitrateHeader) : null;
 
-      // Persist the local file path and downloaded bitrate.
+      // Persist the local file path, downloaded bitrate, and file size.
       await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(job.uuidId)))
           .write(TracksCompanion(
             filePath: Value(destination.path),
             downloadedBitrateKbps: Value(downloadedBitrate),
+            fileSizeBytes: Value(received),
           ));
+
+      _markJobByUuid(job.uuidId, (j) => j.copyWith(fileSizeBytes: received));
 
       return true;
     } catch (e) {

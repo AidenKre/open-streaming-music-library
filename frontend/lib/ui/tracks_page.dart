@@ -4,6 +4,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
@@ -96,8 +97,32 @@ class TracksPageState extends ConsumerState<TracksPage>
     ];
   }
 
+  void _patchDownloadStates() async {
+    if (!mounted) return;
+    final uuids = paginatedItems.map((t) => t.uuidId).toList();
+    if (uuids.isEmpty) return;
+    final db = ref.read(databaseProvider);
+    final states = await db.getTrackDownloadStates(uuids);
+    if (!mounted) return;
+    setState(() {
+      paginatedItems = paginatedItems.map((t) {
+        final s = states[t.uuidId];
+        if (s == null) return t;
+        return t.copyWith(
+          filePath: s.filePath,
+          downloadedBitrateKbps: s.downloadedBitrateKbps,
+          fileSizeBytes: s.fileSizeBytes,
+        );
+      }).toList();
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    ref.listen(downloadStatusVersionProvider, (_, _) => _patchDownloadStates());
+
+    final manager = ref.watch(downloadManagerListenableProvider);
+
     final body = Column(
       children: [
         buildNewItemsBanner('tracks'),
@@ -113,8 +138,25 @@ class TracksPageState extends ConsumerState<TracksPage>
                 );
               }
               final track = paginatedItems[index];
+              final job = manager.state.jobs
+                  .where((j) => j.uuidId == track.uuidId)
+                  .firstOrNull;
+              Widget? trailing;
+              if (job != null) {
+                trailing = switch (job.state) {
+                  DownloadState.active => SizedBox(
+                      width: 80,
+                      child: LinearProgressIndicator(
+                        value: job.progress > 0 ? job.progress : null,
+                      ),
+                    ),
+                  DownloadState.queued => const Icon(Icons.schedule, size: 16),
+                  _ => null,
+                };
+              }
               return TrackTile(
                 track: track,
+                trailing: trailing,
                 onTap: () => ref.read(audioProvider.notifier).playFromQueue(
                   track: track,
                   sourceType: widget.albumId != null

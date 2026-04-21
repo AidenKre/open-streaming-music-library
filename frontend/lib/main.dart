@@ -10,8 +10,8 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
+import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
@@ -72,8 +72,8 @@ class _AppShellState extends ConsumerState<AppShell> {
 
   final _navigatorKeys = [
     GlobalKey<NavigatorState>(debugLabel: 'artists'),
-    GlobalKey<NavigatorState>(debugLabel: 'albums'),
     GlobalKey<NavigatorState>(debugLabel: 'tracks'),
+    GlobalKey<NavigatorState>(debugLabel: 'downloads'),
     GlobalKey<NavigatorState>(debugLabel: 'search'),
   ];
 
@@ -91,7 +91,7 @@ class _AppShellState extends ConsumerState<AppShell> {
       _navigatorKeys[index].currentState?.popUntil((r) => r.isFirst);
     } else {
       setState(() => _tabIndex = index);
-      if (index == 2) _tracksKey.currentState?.sync();
+      if (index == 1) _tracksKey.currentState?.sync();
     }
   }
 
@@ -119,14 +119,14 @@ class _AppShellState extends ConsumerState<AppShell> {
                   ),
                   _buildTabNavigator(
                     1,
-                    () => AlbumsPage(onDisconnect: widget.onDisconnect),
-                  ),
-                  _buildTabNavigator(
-                    2,
                     () => TracksPage(
                       key: _tracksKey,
                       onDisconnect: widget.onDisconnect,
                     ),
+                  ),
+                  _buildTabNavigator(
+                    2,
+                    () => const DownloadedTracksPage(),
                   ),
                   _buildTabNavigator(
                     3,
@@ -145,12 +145,12 @@ class _AppShellState extends ConsumerState<AppShell> {
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.home), label: "Artists"),
             BottomNavigationBarItem(
-              icon: Icon(Icons.library_music),
-              label: "Albums",
-            ),
-            BottomNavigationBarItem(
               icon: Icon(Icons.music_note),
               label: "Tracks",
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.download_done),
+              label: "Downloads",
             ),
             BottomNavigationBarItem(
               icon: Icon(Icons.search),
