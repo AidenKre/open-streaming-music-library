@@ -144,8 +144,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 
     // Tell the backend — failures are non-fatal (the local pref still applies).
     try {
-      await ApiClient.instance
-          .putJson(['settings', 'quality'], body: {'quality': quality});
+      await ApiClient.instance.putJson(
+        ['settings', 'quality'],
+        body: {'quality': quality},
+        retry: true,
+      );
     } catch (e) {
       developer.log(
         'Failed to update backend quality: $e',

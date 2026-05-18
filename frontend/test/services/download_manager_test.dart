@@ -78,26 +78,30 @@ void main() {
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     tempDir = await Directory.systemTemp.createTemp('download-manager-test');
-    ApiClient.init('http://test:8080');
+    // Default mock — overridden per-test via buildManager(client: ...).
+    ApiClient.initForTest(
+      'http://test:8080',
+      MockClient((_) async => http.Response.bytes([7], 200)),
+    );
     coverStore = await LocalCoverArtStore.create(
-      client: MockClient((_) async => http.Response.bytes([7], 200)),
       directoryProvider: () async => tempDir,
     );
   });
 
   tearDown(() async {
-    coverStore.close();
     await db.close();
     if (await tempDir.exists()) {
       await tempDir.delete(recursive: true);
     }
   });
 
+  /// Installs [client] as the ApiClient transport for this test and returns
+  /// a DownloadManager wired to it.
   DownloadManager buildManager({required http.Client client}) {
+    ApiClient.initForTest('http://test:8080', client);
     return DownloadManager(
       db: db,
       coverArtStore: coverStore,
-      client: client,
       directoryProvider: () async => tempDir,
     );
   }
@@ -270,6 +274,82 @@ void main() {
       quality: '320',
     );
     expect(manager.snapshot(), isEmpty);
+  });
+
+  test('recovers from a transient 503 on the audio stream', () async {
+    await _insertTrack(db, 'abc');
+    var calls = 0;
+    final manager = buildManager(
+      client: MockClient((req) async {
+        calls++;
+        expect(req.url.path, '/tracks/abc/stream');
+        if (calls == 1) return http.Response('try again', 503);
+        return http.Response.bytes(
+          [1, 2, 3, 4],
+          200,
+          headers: {'x-audio-bitrate-kbps': '320'},
+        );
+      }),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '320');
+    await _waitForFinish(manager);
+
+    expect(calls, 2,
+        reason: 'request factory must be invoked once per attempt');
+    final job = manager.snapshot().first;
+    expect(job.state, DownloadState.completed);
+
+    final row = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals('abc')))
+        .getSingle();
+    expect(row.filePath, isNotNull);
+    expect(File(row.filePath!).existsSync(), isTrue);
+    expect(await File(row.filePath!).readAsBytes(), [1, 2, 3, 4]);
+  });
+
+  test('cover-art FS failure does not fail the audio job', () async {
+    const coverArtId = 555;
+    await _insertTrack(db, 'abc',
+        coverArtId: coverArtId, hasAlbumArt: true);
+
+    // Pre-create a non-empty directory where the cover art file would land
+    // so the LocalCoverArtStore's rename throws FileSystemException.
+    final blockingDir =
+        Directory(p.join(coverStore.directory.path, '$coverArtId.bin'));
+    await blockingDir.create(recursive: true);
+    await File(p.join(blockingDir.path, 'inside')).writeAsBytes([0]);
+
+    final manager = buildManager(
+      client: MockClient((req) async {
+        if (req.url.path == '/tracks/abc/stream') {
+          return http.Response.bytes(
+            [1, 2, 3, 4],
+            200,
+            headers: {'x-audio-bitrate-kbps': '320'},
+          );
+        }
+        if (req.url.path == '/cover_art/$coverArtId') {
+          return http.Response.bytes([9, 9, 9], 200);
+        }
+        return http.Response('unexpected ${req.url.path}', 404);
+      }),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '320');
+    await _waitForFinish(manager);
+
+    final job = manager.snapshot().first;
+    expect(job.state, DownloadState.completed,
+        reason: 'cover-art FS failure must not fail the audio job');
+
+    final row = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals('abc')))
+        .getSingle();
+    expect(row.filePath, isNotNull);
+    expect(File(row.filePath!).existsSync(), isTrue);
   });
 
   test('failed downloads surface as failed jobs and leave file_path null',
@@ -450,10 +530,9 @@ void main() {
       },
     );
 
-    final manager = DownloadManager(
-      db: db,
-      coverArtStore: coverStore,
-      client: MockClient((_) async => http.Response.bytes(
+    ApiClient.initForTest(
+      'http://test:8080',
+      MockClient((_) async => http.Response.bytes(
             [1, 2, 3],
             200,
             headers: {
@@ -462,6 +541,10 @@ void main() {
               'x-audio-bitrate-kbps': '128',
             },
           )),
+    );
+    final manager = DownloadManager(
+      db: db,
+      coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
       warmService: fakeWarm,
       streamQualityFn: () => '256',
@@ -485,10 +568,7 @@ class _RecordingWarmService extends QueueWarmService {
   final void Function(List<String> uuids, String quality) onWarmUuids;
 
   _RecordingWarmService({required this.onWarmUuids})
-      : super(
-          queueRepo: _NoopQueueRepo(),
-          client: MockClient((_) async => http.Response('', 200)),
-        );
+      : super(queueRepo: _NoopQueueRepo());
 
   @override
   void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {

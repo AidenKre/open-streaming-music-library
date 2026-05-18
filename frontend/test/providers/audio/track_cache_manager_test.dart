@@ -16,8 +16,11 @@ void main() {
 
   setUp(() async {
     tempDirectory = await Directory.systemTemp.createTemp('track-cache-test');
-    ApiClient.init('http://test:8080');
   });
+
+  void installClient(http.Client client) {
+    ApiClient.initForTest('http://test:8080', client);
+  }
 
   tearDown(() async {
     await manager?.close();
@@ -27,12 +30,12 @@ void main() {
   });
 
   test('prefetch downloads a track and getCachedFile returns it', () async {
+    installClient(MockClient((request) async {
+      expect(request.method, 'GET');
+      expect(request.url.toString(), 'http://test:8080/tracks/a/stream');
+      return http.Response.bytes([1, 2, 3], 200);
+    }));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient((request) async {
-        expect(request.method, 'GET');
-        expect(request.url.toString(), 'http://test:8080/tracks/a/stream');
-        return http.Response.bytes([1, 2, 3], 200);
-      }),
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -49,8 +52,8 @@ void main() {
     await File(p.join(cacheDir.path, 'old.audio')).writeAsBytes([1, 2, 3]);
     await File(p.join(cacheDir.path, 'old.part')).writeAsBytes([4, 5]);
 
+    installClient(MockClient((request) async => http.Response('', 200)));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient((request) async => http.Response('', 200)),
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -60,10 +63,10 @@ void main() {
 
   test('cancelPrefetch cleans up a partial file', () async {
     final controller = StreamController<List<int>>();
+    installClient(MockClient.streaming((request, _) async {
+      return http.StreamedResponse(controller.stream, 200);
+    }));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient.streaming((request, _) async {
-        return http.StreamedResponse(controller.stream, 200);
-      }),
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -84,11 +87,11 @@ void main() {
   });
 
   test('clear and evict remove cached files', () async {
+    installClient(MockClient((request) async {
+      final uuid = request.url.pathSegments[1];
+      return http.Response.bytes(uuid.codeUnits, 200);
+    }));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient((request) async {
-        final uuid = request.url.pathSegments[1];
-        return http.Response.bytes(uuid.codeUnits, 200);
-      }),
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -109,10 +112,10 @@ void main() {
   test('cancel racing with post-download finalization preserves completed file',
       () async {
     final streamController = StreamController<List<int>>();
+    installClient(MockClient.streaming((request, _) async {
+      return http.StreamedResponse(streamController.stream, 200);
+    }));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient.streaming((request, _) async {
-        return http.StreamedResponse(streamController.stream, 200);
-      }),
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -154,10 +157,10 @@ void main() {
 
   test('cancelPrefetch waits for completed download to finalize', () async {
     final streamController = StreamController<List<int>>();
+    installClient(MockClient.streaming((request, _) async {
+      return http.StreamedResponse(streamController.stream, 200);
+    }));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient.streaming((request, _) async {
-        return http.StreamedResponse(streamController.stream, 200);
-      }),
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -193,15 +196,15 @@ void main() {
     final secondController = StreamController<List<int>>();
     var requestCount = 0;
 
+    installClient(MockClient.streaming((request, _) async {
+      requestCount++;
+      return switch (requestCount) {
+        1 => http.StreamedResponse(firstController.stream, 200),
+        2 => http.StreamedResponse(secondController.stream, 200),
+        _ => throw StateError('Unexpected request count'),
+      };
+    }));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient.streaming((request, _) async {
-        requestCount++;
-        return switch (requestCount) {
-          1 => http.StreamedResponse(firstController.stream, 200),
-          2 => http.StreamedResponse(secondController.stream, 200),
-          _ => throw StateError('Unexpected request count'),
-        };
-      }),
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -227,15 +230,44 @@ void main() {
       isFalse,
     );
   });
-  test('prefetch uses Content-Type header to determine file extension', () async {
+  test('prefetch recovers when a transient 503 is followed by a 200', () async {
+    var calls = 0;
+    installClient(MockClient((request) async {
+      calls++;
+      expect(request.url.toString(), 'http://test:8080/tracks/a/stream');
+      if (calls == 1) return http.Response('try again', 503);
+      return http.Response.bytes(
+        [4, 5, 6],
+        200,
+        headers: {'content-type': 'audio/mp4'},
+      );
+    }));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient((request) async {
-        return http.Response.bytes(
-          [1, 2, 3],
-          200,
-          headers: {'content-type': 'audio/flac'},
-        );
-      }),
+      tempDirectoryProvider: () async => tempDirectory,
+    );
+
+    await manager!.prefetch(_track('a'));
+
+    expect(calls, 2, reason: 'send() request factory must fire per attempt');
+    final file = manager!.getCachedFile('a');
+    expect(file, isNotNull);
+    expect(await file!.readAsBytes(), [4, 5, 6]);
+    expect(file.path, endsWith('.m4a'));
+    expect(
+      File(p.join(tempDirectory.path, 'track_cache', 'a.part')).existsSync(),
+      isFalse,
+    );
+  });
+
+  test('prefetch uses Content-Type header to determine file extension', () async {
+    installClient(MockClient((request) async {
+      return http.Response.bytes(
+        [1, 2, 3],
+        200,
+        headers: {'content-type': 'audio/flac'},
+      );
+    }));
+    manager = await HttpTrackCacheManager.create(
       tempDirectoryProvider: () async => tempDirectory,
     );
 
@@ -247,8 +279,8 @@ void main() {
   });
 
   test('getCachedFile finds files by UUID prefix regardless of extension', () async {
+    installClient(MockClient((request) async => http.Response('', 200)));
     manager = await HttpTrackCacheManager.create(
-      client: MockClient((request) async => http.Response('', 200)),
       tempDirectoryProvider: () async => tempDirectory,
     );
 

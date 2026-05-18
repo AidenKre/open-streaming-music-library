@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -15,29 +14,19 @@ import 'package:frontend/api/api_client.dart';
 /// response, and consumers read them back as raw bytes for decoding.
 class LocalCoverArtStore {
   final Directory _directory;
-  final http.Client _client;
-  final bool _ownsClient;
+  final ApiClient _apiClient;
 
-  LocalCoverArtStore._(
-    this._directory, {
-    required http.Client client,
-    required bool ownsClient,
-  })  : _client = client,
-        _ownsClient = ownsClient;
+  LocalCoverArtStore._(this._directory, this._apiClient);
 
   static Future<LocalCoverArtStore> create({
-    http.Client? client,
     Future<Directory> Function()? directoryProvider,
+    ApiClient? apiClient,
   }) async {
     final base =
         await (directoryProvider ?? getApplicationDocumentsDirectory)();
     final dir = Directory(p.join(base.path, 'cover_art'));
     await dir.create(recursive: true);
-    return LocalCoverArtStore._(
-      dir,
-      client: client ?? http.Client(),
-      ownsClient: client == null,
-    );
+    return LocalCoverArtStore._(dir, apiClient ?? ApiClient.instance);
   }
 
   @visibleForTesting
@@ -50,23 +39,31 @@ class LocalCoverArtStore {
 
   /// Downloads cover art bytes from the server and stores them locally.
   /// No-ops when the file already exists. Returns true on success (or already
-  /// present), false if the download failed.
+  /// present), false on any failure (network, HTTP, or filesystem).
+  /// ApiClient handles transient network retries internally; a returned
+  /// `false` means the failure survived retries or could not be persisted.
+  /// Cover art is best-effort — callers (e.g. DownloadManager) must not let
+  /// a failure here fail the parent operation.
   Future<bool> download(int coverArtId) async {
     final target = fileFor(coverArtId);
     if (target.existsSync()) return true;
 
-    final url = ApiClient.instance.coverArtUrl(coverArtId);
+    final tmp = File('${target.path}.partial');
     try {
-      final response = await _client.get(Uri.parse(url));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        return false;
-      }
+      final bytes = await _apiClient.getBytes(
+        ['cover_art', coverArtId.toString()],
+      );
       // Write to a temp file then rename so partial bytes are never visible.
-      final tmp = File('${target.path}.partial');
-      await tmp.writeAsBytes(response.bodyBytes, flush: true);
+      await tmp.writeAsBytes(bytes, flush: true);
       await tmp.rename(target.path);
       return true;
     } catch (_) {
+      // Any failure (ApiException, NetworkException, FileSystemException,
+      // etc.) is treated as a soft failure. Best-effort cleanup so failed
+      // downloads don't accumulate orphan `.partial` files.
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
       return false;
     }
   }
@@ -84,12 +81,6 @@ class LocalCoverArtStore {
       if (entity is File) {
         await entity.delete();
       }
-    }
-  }
-
-  void close() {
-    if (_ownsClient) {
-      _client.close();
     }
   }
 }

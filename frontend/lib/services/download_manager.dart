@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/track_cache_manager.dart';
@@ -105,14 +106,13 @@ class DownloadManager extends ChangeNotifier {
 
   final AppDatabase _db;
   final LocalCoverArtStore _coverArtStore;
-  final http.Client _client;
-  final bool _ownsClient;
   final Future<Directory> Function() _directoryProvider;
   // Optional: if supplied, the server is asked to pre-transcode queued tracks
   // at the current stream quality in parallel with downloading them.
   final QueueWarmService? _warmService;
   // Provides the current stream quality for server warm calls.
   final String Function()? _streamQualityFn;
+  final ApiClient _apiClient;
 
   DownloadQueueState _state = const DownloadQueueState();
   Directory? _downloadDir;
@@ -126,24 +126,22 @@ class DownloadManager extends ChangeNotifier {
   DownloadManager({
     required AppDatabase db,
     required LocalCoverArtStore coverArtStore,
-    http.Client? client,
     Future<Directory> Function()? directoryProvider,
     QueueWarmService? warmService,
     String Function()? streamQualityFn,
+    ApiClient? apiClient,
   })  : _db = db,
         _coverArtStore = coverArtStore,
-        _client = client ?? http.Client(),
-        _ownsClient = client == null,
         _directoryProvider =
             directoryProvider ?? getApplicationDocumentsDirectory,
         _warmService = warmService,
-        _streamQualityFn = streamQualityFn;
+        _streamQualityFn = streamQualityFn,
+        _apiClient = apiClient ?? ApiClient.instance;
 
   DownloadQueueState get state => _state;
 
   @override
   void dispose() {
-    if (_ownsClient) _client.close();
     downloadStatusVersion.dispose();
     super.dispose();
   }
@@ -314,24 +312,35 @@ class DownloadManager extends ChangeNotifier {
   Future<bool> _downloadOne(DownloadJob job) async {
     final dir = await _ensureDownloadDir();
 
-    final request = http.Request(
-      'GET',
-      buildTrackStreamUri(job.uuidId, quality: job.quality),
-    );
-
     http.StreamedResponse response;
     try {
-      response = await _client.send(request);
+      response = await _apiClient.send(
+        () => http.Request(
+          'GET',
+          buildTrackStreamUri(job.uuidId, quality: job.quality),
+        ),
+      );
+    } on ApiException catch (e) {
+      _markJobByUuid(
+        job.uuidId,
+        (j) => j.copyWith(errorMessage: 'HTTP ${e.statusCode}'),
+      );
+      return false;
+    } on NetworkException catch (e) {
+      _markJobByUuid(
+        job.uuidId,
+        (j) => j.copyWith(errorMessage: 'Connection failed: ${e.message}'),
+      );
+      return false;
     } catch (e) {
+      // Defensive fallback for unexpected exceptions that escape ApiClient's
+      // typed exceptions — without this, _runJob never marks the job failed
+      // and it stays stuck in `active`.
       _markJobByUuid(job.uuidId, (j) => j.copyWith(errorMessage: e.toString()));
       return false;
     }
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      // Drain to avoid leaking the connection.
-      await response.stream.drain<void>();
-      return false;
-    }
+    // ApiClient.send guarantees a 2xx response or throws — no defensive check needed.
 
     // Determine the file extension from the server's X-Audio-Extension header.
     // Transcoded files are always m4a; originals get their actual extension.

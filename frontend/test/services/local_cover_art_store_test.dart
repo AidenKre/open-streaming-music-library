@@ -14,7 +14,6 @@ void main() {
   setUp(() async {
     tempDirectory =
         await Directory.systemTemp.createTemp('local-cover-art-store-test');
-    ApiClient.init('http://test:8080');
   });
 
   tearDown(() async {
@@ -23,9 +22,13 @@ void main() {
     }
   });
 
+  void installClient(http.Client client) {
+    ApiClient.initForTest('http://test:8080', client);
+  }
+
   Future<LocalCoverArtStore> buildStore({http.Client? client}) {
+    installClient(client ?? MockClient((_) async => http.Response('', 404)));
     return LocalCoverArtStore.create(
-      client: client ?? MockClient((_) async => http.Response('', 404)),
       directoryProvider: () async => tempDirectory,
     );
   }
@@ -34,7 +37,6 @@ void main() {
     final store = await buildStore();
     expect(store.directory.existsSync(), isTrue);
     expect(p.basename(store.directory.path), 'cover_art');
-    store.close();
   });
 
   test('download writes the response bytes to {id}.bin', () async {
@@ -49,7 +51,6 @@ void main() {
     expect(ok, isTrue);
     expect(store.has(42), isTrue);
     expect(await store.fileFor(42).readAsBytes(), [1, 2, 3, 4]);
-    store.close();
   });
 
   test('download is a no-op when the file already exists', () async {
@@ -67,7 +68,6 @@ void main() {
 
     expect(requestCount, 1, reason: 'second download should not hit network');
     expect(await store.fileFor(7).readAsBytes(), beforeBytes);
-    store.close();
   });
 
   test('download returns false on non-2xx response', () async {
@@ -77,7 +77,6 @@ void main() {
 
     expect(await store.download(11), isFalse);
     expect(store.has(11), isFalse);
-    store.close();
   });
 
   test('download leaves no .partial file behind on failure', () async {
@@ -89,7 +88,42 @@ void main() {
     final partial = File(p.join(store.directory.path, '99.bin.partial'));
     expect(partial.existsSync(), isFalse);
     expect(store.has(99), isFalse);
-    store.close();
+  });
+
+  test('download recovers when a transient 503 is followed by a 200', () async {
+    var calls = 0;
+    final store = await buildStore(
+      client: MockClient((req) async {
+        calls++;
+        if (calls == 1) return http.Response('try again', 503);
+        return http.Response.bytes([5, 6, 7], 200);
+      }),
+    );
+
+    final ok = await store.download(42);
+    expect(ok, isTrue);
+    expect(calls, 2);
+    expect(store.has(42), isTrue);
+    expect(await store.fileFor(42).readAsBytes(), [5, 6, 7]);
+    final partial = File(p.join(store.directory.path, '42.bin.partial'));
+    expect(partial.existsSync(), isFalse);
+  });
+
+  test('download returns false and cleans up when persistence fails', () async {
+    final store = await buildStore(
+      client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+    );
+
+    // Pre-create a non-empty directory at the target path so `rename` fails.
+    final blockingDir = Directory(p.join(store.directory.path, '77.bin'));
+    await blockingDir.create();
+    await File(p.join(blockingDir.path, 'inside')).writeAsBytes([0]);
+
+    final ok = await store.download(77);
+    expect(ok, isFalse);
+    final partial = File(p.join(store.directory.path, '77.bin.partial'));
+    expect(partial.existsSync(), isFalse,
+        reason: '.partial must be cleaned up on filesystem failure');
   });
 
   test('remove deletes the on-disk file', () async {
@@ -101,7 +135,6 @@ void main() {
     expect(store.has(3), isTrue);
     await store.remove(3);
     expect(store.has(3), isFalse);
-    store.close();
   });
 
   test('clear removes every stored file', () async {
@@ -116,6 +149,5 @@ void main() {
 
     expect(store.directory.listSync(), isEmpty);
     expect(store.has(1), isFalse);
-    store.close();
   });
 }

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -43,20 +44,21 @@ QueuePlaybackEntry _entry(String uuid, int itemId) => QueuePlaybackEntry(
       uuidId: uuid,
     );
 
-void main() {
-  setUp(() => ApiClient.init('http://test:8080'));
+void _installMockClient(http.Client client) {
+  ApiClient.initForTest('http://test:8080', client);
+}
 
+void main() {
   test('scheduleWarm POSTs to /tracks/warm after the debounce', () async {
     Uri? capturedUrl;
     Map<String, dynamic>? capturedBody;
-    final client = MockClient((req) async {
+    _installMockClient(MockClient((req) async {
       capturedUrl = req.url;
       capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
       return http.Response('', 204);
-    });
+    }));
     final service = QueueWarmService(
       queueRepo: _FakeQueueRepo([_entry('a', 0), _entry('b', 1)]),
-      client: client,
     );
     addTearDown(service.dispose);
 
@@ -78,32 +80,28 @@ void main() {
       _entry('c', 2),
     ]);
     Map<String, dynamic>? capturedBody;
-    final service = QueueWarmService(
-      queueRepo: repo,
-      client: MockClient((req) async {
-        capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
-        return http.Response('', 204);
-      }),
-    );
+    _installMockClient(MockClient((req) async {
+      capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+      return http.Response('', 204);
+    }));
+    final service = QueueWarmService(queueRepo: repo);
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 1, quality: '192');
     await Future<void>.delayed(const Duration(milliseconds: 700));
 
     expect(repo.lastStartPlayPosition, 1);
-    // Should only contain entries from position 1 onward.
     expect(capturedBody?['track_uuids'], ['b', 'c']);
   });
 
   test('debounces rapid calls into a single POST', () async {
     var postCount = 0;
-    final client = MockClient((req) async {
+    _installMockClient(MockClient((req) async {
       postCount++;
       return http.Response('', 204);
-    });
+    }));
     final service = QueueWarmService(
       queueRepo: _FakeQueueRepo([_entry('a', 0)]),
-      client: client,
     );
     addTearDown(service.dispose);
 
@@ -118,13 +116,11 @@ void main() {
   test('does nothing when sessionId is null', () async {
     var postCount = 0;
     final repo = _FakeQueueRepo([_entry('a', 0)]);
-    final service = QueueWarmService(
-      queueRepo: repo,
-      client: MockClient((_) async {
-        postCount++;
-        return http.Response('', 204);
-      }),
-    );
+    _installMockClient(MockClient((_) async {
+      postCount++;
+      return http.Response('', 204);
+    }));
+    final service = QueueWarmService(queueRepo: repo);
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: null, currentPlayPosition: 0, quality: '320');
@@ -136,13 +132,11 @@ void main() {
 
   test('does not POST when the queue is empty', () async {
     var postCount = 0;
-    final service = QueueWarmService(
-      queueRepo: _FakeQueueRepo([]),
-      client: MockClient((_) async {
-        postCount++;
-        return http.Response('', 204);
-      }),
-    );
+    _installMockClient(MockClient((_) async {
+      postCount++;
+      return http.Response('', 204);
+    }));
+    final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
@@ -155,13 +149,11 @@ void main() {
     final repo = _FakeQueueRepo([
       for (var i = 0; i < 100; i++) _entry('uuid-$i', i),
     ]);
-    final service = QueueWarmService(
-      queueRepo: repo,
-      client: MockClient((req) async {
-        capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
-        return http.Response('', 204);
-      }),
-    );
+    _installMockClient(MockClient((req) async {
+      capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+      return http.Response('', 204);
+    }));
+    final service = QueueWarmService(queueRepo: repo);
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
@@ -171,14 +163,17 @@ void main() {
   });
 
   test('swallows POST errors so callers never see them', () async {
+    _installMockClient(MockClient((_) async {
+      throw const SocketException('simulated network failure');
+    }));
     final service = QueueWarmService(
       queueRepo: _FakeQueueRepo([_entry('a', 0)]),
-      client: MockClient((_) async => throw const SocketExceptionLite()),
     );
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
-    // Should NOT throw.
+    // Retries run instantly (delay mocked to no-op via initForTest), then the
+    // NetworkException is caught and swallowed inside the service.
     await Future<void>.delayed(const Duration(milliseconds: 700));
   });
 
@@ -187,14 +182,12 @@ void main() {
         () async {
       Uri? capturedUrl;
       Map<String, dynamic>? capturedBody;
-      final service = QueueWarmService(
-        queueRepo: _FakeQueueRepo([]),
-        client: MockClient((req) async {
-          capturedUrl = req.url;
-          capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
-          return http.Response('', 204);
-        }),
-      );
+      _installMockClient(MockClient((req) async {
+        capturedUrl = req.url;
+        capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1', 'uuid-2'], quality: '256');
@@ -209,13 +202,11 @@ void main() {
 
     test('respects the 50-UUID cap', () async {
       Map<String, dynamic>? capturedBody;
-      final service = QueueWarmService(
-        queueRepo: _FakeQueueRepo([]),
-        client: MockClient((req) async {
-          capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
-          return http.Response('', 204);
-        }),
-      );
+      _installMockClient(MockClient((req) async {
+        capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       final sixtyUuids = List.generate(60, (i) => 'uuid-$i');
@@ -228,13 +219,11 @@ void main() {
 
     test('debounces rapid calls into a single POST', () async {
       var postCount = 0;
-      final service = QueueWarmService(
-        queueRepo: _FakeQueueRepo([]),
-        client: MockClient((_) async {
-          postCount++;
-          return http.Response('', 204);
-        }),
-      );
+      _installMockClient(MockClient((_) async {
+        postCount++;
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['a'], quality: '128');
@@ -246,37 +235,64 @@ void main() {
     });
 
     test('swallows POST errors', () async {
-      final service = QueueWarmService(
-        queueRepo: _FakeQueueRepo([]),
-        client: MockClient((_) async => throw const SocketExceptionLite()),
-      );
+      _installMockClient(MockClient((_) async {
+        throw const SocketException('simulated network failure');
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1'], quality: '128');
-      // Should NOT throw.
       await Future<void>.delayed(const Duration(milliseconds: 700));
     });
 
     test('does nothing when list is empty', () async {
       var postCount = 0;
-      final service = QueueWarmService(
-        queueRepo: _FakeQueueRepo([]),
-        client: MockClient((_) async {
-          postCount++;
-          return http.Response('', 204);
-        }),
-      );
+      _installMockClient(MockClient((_) async {
+        postCount++;
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids([], quality: '128');
       await Future<void>.delayed(const Duration(milliseconds: 700));
       expect(postCount, 0);
     });
-  });
-}
 
-class SocketExceptionLite implements Exception {
-  const SocketExceptionLite();
-  @override
-  String toString() => 'simulated network failure';
+    test('does not retry on a transient 503 (warm is single-shot, advisory)',
+        () async {
+      var calls = 0;
+      _installMockClient(MockClient((_) async {
+        calls++;
+        return http.Response('try again', 503);
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['uuid-1'], quality: '128');
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+
+      // Warm POSTs do NOT opt into retry — a transient 503 surfaces once,
+      // is logged and swallowed by the service. The server may still warm
+      // on the next debounced schedule; we don't burn attempts here.
+      expect(calls, 1);
+    });
+
+    test('does not retry on SocketException; failure is swallowed', () async {
+      var calls = 0;
+      _installMockClient(MockClient((_) async {
+        calls++;
+        throw const SocketException('simulated network failure');
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['uuid-1'], quality: '128');
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+
+      // No retry on the warm path. NetworkException (attemptsMade: 1) is
+      // caught and swallowed inside the service's timer callback.
+      expect(calls, 1);
+    });
+  });
 }

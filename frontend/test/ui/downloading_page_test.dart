@@ -57,15 +57,16 @@ void main() {
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     tempDir = await Directory.systemTemp.createTemp('downloading-page-test');
-    ApiClient.init('http://test:8080');
+    ApiClient.initForTest(
+      'http://test:8080',
+      MockClient((_) async => http.Response.bytes([1], 200)),
+    );
     coverStore = await LocalCoverArtStore.create(
-      client: MockClient((_) async => http.Response.bytes([1], 200)),
       directoryProvider: () async => tempDir,
     );
   });
 
   tearDown(() async {
-    coverStore.close();
     await db.close();
     if (await tempDir.exists()) {
       await tempDir.delete(recursive: true);
@@ -73,10 +74,10 @@ void main() {
   });
 
   DownloadManager buildManager({required http.Client client}) {
+    ApiClient.initForTest('http://test:8080', client);
     return DownloadManager(
       db: db,
       coverArtStore: coverStore,
-      client: client,
       directoryProvider: () async => tempDir,
     );
   }
