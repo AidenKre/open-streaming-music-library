@@ -15,12 +15,14 @@ class BrowseRepository {
     List<AlbumOrderParameter> orderBy = const [],
     List<AlbumRowFilterParameter> cursorFilters = const [],
     int? limit,
+    bool downloadedOnly = false,
   }) async {
     final rows = await _db.getAlbums(
       artistId: artistId,
       orderBy: orderBy,
       cursorFilters: cursorFilters,
       limit: limit,
+      downloadedOnly: downloadedOnly,
     );
     return rows.map(AlbumUI.fromQueryRow).toList(growable: false);
   }
@@ -29,11 +31,13 @@ class BrowseRepository {
     int? artistId,
     List<AlbumOrderParameter> orderBy = const [],
     List<AlbumRowFilterParameter> cursorFilters = const [],
+    bool downloadedOnly = false,
   }) {
     return _db.watchAlbumsCount(
       artistId: artistId,
       orderBy: orderBy,
       cursorFilters: cursorFilters,
+      downloadedOnly: downloadedOnly,
     );
   }
 
@@ -43,11 +47,13 @@ class BrowseRepository {
     List<ArtistOrderParameter> orderBy = const [],
     List<ArtistRowFilterParameter> cursorFilters = const [],
     int? limit,
+    bool downloadedOnly = false,
   }) async {
     final rows = await _db.getArtists(
       orderBy: orderBy,
       cursorFilters: cursorFilters,
       limit: limit,
+      downloadedOnly: downloadedOnly,
     );
     return rows.map(ArtistUI.fromQueryRow).toList(growable: false);
   }
@@ -55,10 +61,12 @@ class BrowseRepository {
   Stream<int> watchArtistCount({
     List<ArtistOrderParameter> orderBy = const [],
     List<ArtistRowFilterParameter> cursorFilters = const [],
+    bool downloadedOnly = false,
   }) {
     return _db.watchArtistCount(
       orderBy: orderBy,
       cursorFilters: cursorFilters,
+      downloadedOnly: downloadedOnly,
     );
   }
 
@@ -121,10 +129,15 @@ class BrowseRepository {
   // ── Search ──────────────────────────────────────────────────────────────
 
   Future<({List<ArtistUI> artists, List<AlbumUI> albums, List<TrackUI> tracks})>
-  search(String query, {int limitPerType = 5}) async {
+  search(
+    String query, {
+    int limitPerType = 5,
+    bool downloadedOnly = false,
+  }) async {
     final results = await _db.getSearchResults(
       query,
       limitPerType: limitPerType,
+      downloadedOnly: downloadedOnly,
     );
     return (
       artists: results.artists

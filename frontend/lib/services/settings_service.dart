@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/quality_presets.dart';
 
@@ -107,6 +108,9 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 
   void _syncQualityFromBackend() {
     if (ApiClient.instance.baseUrl.isEmpty) return;
+    // Skip when offline — the request would just fail. The cached value in
+    // SharedPreferences remains in effect; next online startup will refresh.
+    if (ref.read(offlineModeProvider)) return;
     ApiClient.instance
         .getJson(['settings', 'quality'])
         .then((data) async {

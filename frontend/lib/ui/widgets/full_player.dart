@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
@@ -784,6 +785,7 @@ class _QueueViewState extends ConsumerState<_QueueView> {
     final totalCount = ref.watch(
       audioProvider.select((s) => s.queue.totalCount),
     );
+    final isOffline = ref.watch(offlineModeProvider);
     final colors = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
@@ -825,6 +827,10 @@ class _QueueViewState extends ConsumerState<_QueueView> {
         final entry = _tracks[index];
         final isCurrent = entry.itemId == currentItemId;
         final isPast = entry.playPosition < currentPlayPosition;
+        // Offline, the player skips streaming-only entries — grey them out so
+        // the queue matches what playback will actually do. The row stays
+        // tappable (a tap still advances to the next local entry).
+        final isUnavailableOffline = isOffline && !entry.track.isDownloaded;
         final showQueueTypeBoundary = _shouldShowQueueTypeBoundary(
           index,
           currentPlayPosition,
@@ -846,7 +852,7 @@ class _QueueViewState extends ConsumerState<_QueueView> {
             TrackTile(
               track: entry.track,
               isHighlighted: isCurrent,
-              isDimmed: isPast,
+              isDimmed: isPast || isUnavailableOffline,
               onTap: () =>
                   ref.read(audioProvider.notifier).skipToTrack(entry.itemId),
               trailing: !isCurrent

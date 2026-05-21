@@ -97,13 +97,33 @@ void main() {
 
   /// Installs [client] as the ApiClient transport for this test and returns
   /// a DownloadManager wired to it.
-  DownloadManager buildManager({required http.Client client}) {
+  DownloadManager buildManager({
+    required http.Client client,
+    bool Function()? isOfflineFn,
+    void Function()? onNetworkFailure,
+  }) {
     ApiClient.initForTest('http://test:8080', client);
     return DownloadManager(
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
+      isOfflineFn: isOfflineFn,
+      onNetworkFailure: onNetworkFailure,
     );
+  }
+
+  /// A response body stream that emits a chunk then fails — simulates a
+  /// connection dropping after the headers have already arrived.
+  Stream<List<int>> failingStream(Object error) async* {
+    yield const [1, 2, 3];
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+    throw error;
+  }
+
+  Future<void> waitUntilNotActive(DownloadManager m) async {
+    while (m.snapshot().any((j) => j.state == DownloadState.active)) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
   }
 
   test('enqueueTracks rejects invalid quality', () async {
@@ -370,6 +390,72 @@ void main() {
           ..where((t) => t.uuidId.equals('abc')))
         .getSingle();
     expect(row.filePath, isNull);
+  });
+
+  test('a mid-stream network failure re-queues the job and reports offline',
+      () async {
+    await _insertTrack(db, 'abc');
+    var offline = false;
+    final manager = buildManager(
+      client: MockClient.streaming((req, _) async => http.StreamedResponse(
+            failingStream(const SocketException('connection reset')),
+            200,
+            contentLength: 999,
+          )),
+      // Once offline is reported the pump pauses, so the re-queued job stays
+      // queued instead of being retried into a tight loop.
+      isOfflineFn: () => offline,
+      onNetworkFailure: () => offline = true,
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '320');
+    await waitUntilNotActive(manager);
+
+    expect(offline, isTrue);
+    final job = manager.snapshot().first;
+    expect(job.state, DownloadState.queued);
+    expect(job.errorMessage, isNull);
+    expect(job.progress, 0.0);
+  });
+
+  test('a non-network mid-stream failure fails the job', () async {
+    await _insertTrack(db, 'abc');
+    var networkReported = false;
+    final manager = buildManager(
+      client: MockClient.streaming((req, _) async => http.StreamedResponse(
+            failingStream(const FormatException('corrupt payload')),
+            200,
+            contentLength: 999,
+          )),
+      onNetworkFailure: () => networkReported = true,
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '320');
+    await _waitForFinish(manager);
+
+    expect(networkReported, isFalse);
+    expect(manager.snapshot().first.state, DownloadState.failed);
+  });
+
+  test('queued jobs wait while offline and resume on recovery', () async {
+    await _insertTrack(db, 'abc');
+    var offline = true;
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+      isOfflineFn: () => offline,
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks([_track('abc')], quality: '320');
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(manager.snapshot().first.state, DownloadState.queued);
+
+    offline = false;
+    manager.resumeIfPaused();
+    await _waitForFinish(manager);
+    expect(manager.snapshot().first.state, DownloadState.completed);
   });
 
   test('cancelQueued removes a queued job before it runs', () async {

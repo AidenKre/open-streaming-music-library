@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
@@ -25,7 +26,12 @@ class ArtistCard extends ConsumerWidget {
     this.onDeleteDownload,
   });
 
-  void _showArtistMenu(BuildContext context, bool isDownloaded) {
+  void _showArtistMenu(
+    BuildContext context, {
+    required bool hasAnyDownloaded,
+    required bool isFullyDownloaded,
+    required bool queueEnabled,
+  }) {
     showModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
@@ -36,30 +42,29 @@ class ArtistCard extends ConsumerWidget {
               ListTile(
                 leading: const Icon(Icons.playlist_play),
                 title: const Text('Play Next'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onPlayNext!();
-                },
+                enabled: queueEnabled,
+                onTap: queueEnabled
+                    ? () {
+                        Navigator.pop(ctx);
+                        onPlayNext!();
+                      }
+                    : null,
               ),
             if (onAddToQueue != null)
               ListTile(
                 leading: const Icon(Icons.queue_music),
                 title: const Text('Add to Queue'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onAddToQueue!();
-                },
+                enabled: queueEnabled,
+                onTap: queueEnabled
+                    ? () {
+                        Navigator.pop(ctx);
+                        onAddToQueue!();
+                      }
+                    : null,
               ),
-            if (isDownloaded && onDeleteDownload != null)
-              ListTile(
-                leading: const Icon(Icons.delete_outline),
-                title: const Text('Delete downloads'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onDeleteDownload!();
-                },
-              )
-            else if (!isDownloaded && onDownload != null)
+            // Download (for the missing tracks) and Delete are independent:
+            // a partially-downloaded artist shows both.
+            if (!isFullyDownloaded && onDownload != null)
               SplitDownloadTile(
                 onDownload: () {
                   Navigator.pop(ctx);
@@ -72,6 +77,15 @@ class ArtistCard extends ConsumerWidget {
                       }
                     : null,
               ),
+            if (hasAnyDownloaded && onDeleteDownload != null)
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Delete downloads'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDeleteDownload!();
+                },
+              ),
           ],
         ),
       ),
@@ -82,11 +96,18 @@ class ArtistCard extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
-    final isDownloaded =
-        ref.watch(artistDownloadedProvider(artist.id)).value ?? false;
     final isDownloading = ref.watch(artistIsDownloadingProvider(artist.id));
     final downloadCounts =
         ref.watch(artistDownloadCountsProvider(artist.id)).value;
+    final isOffline = ref.watch(offlineModeProvider);
+
+    final hasAnyDownloaded = (downloadCounts?.downloaded ?? 0) > 0;
+    final isFullyDownloaded = downloadCounts != null &&
+        downloadCounts.total > 0 &&
+        downloadCounts.downloaded == downloadCounts.total;
+    // Offline, a queue action must not enqueue streaming-only tracks, so it's
+    // allowed only when the whole artist is downloaded.
+    final queueEnabled = !isOffline || isFullyDownloaded;
 
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -99,7 +120,12 @@ class ArtistCard extends ConsumerWidget {
                 onAddToQueue != null ||
                 onDownload != null ||
                 onDeleteDownload != null)
-            ? () => _showArtistMenu(context, isDownloaded)
+            ? () => _showArtistMenu(
+                  context,
+                  hasAnyDownloaded: hasAnyDownloaded,
+                  isFullyDownloaded: isFullyDownloaded,
+                  queueEnabled: queueEnabled,
+                )
             : null,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -123,7 +149,7 @@ class ArtistCard extends ConsumerWidget {
                       ),
                     ),
                   ),
-                  if (isDownloaded)
+                  if (isFullyDownloaded)
                     Positioned(
                       top: 4,
                       right: 4,

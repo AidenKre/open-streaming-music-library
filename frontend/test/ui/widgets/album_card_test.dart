@@ -4,9 +4,19 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/album_ui.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
+
+/// Forces [offlineModeProvider] to a fixed value without starting the real
+/// health-poll timer.
+class _StubOffline extends OfflineModeNotifier {
+  _StubOffline(this._value);
+  final bool _value;
+  @override
+  bool build() => _value;
+}
 
 const _kArtistId = 1;
 const _kAlbumId = 1;
@@ -37,15 +47,24 @@ const _singleAlbum = AlbumUI(
 Widget buildCard(
   AlbumUI album, {
   bool downloaded = false,
+  bool offline = false,
+  ({int downloaded, int total})? counts,
   VoidCallback? onPlayNext,
   VoidCallback? onAddToQueue,
   VoidCallback? onDownload,
   void Function(String)? onDownloadAtQuality,
   VoidCallback? onDeleteDownload,
 }) {
+  final effectiveCounts =
+      counts ?? (downloaded: downloaded ? 10 : 0, total: 10);
   return ProviderScope(
     overrides: [
-      albumDownloadedProvider.overrideWith((ref, albumId) async => downloaded),
+      // Keep the card isolated — don't build the real download-manager graph.
+      albumIsDownloadingProvider.overrideWith((ref, albumId) => false),
+      albumDownloadCountsProvider.overrideWith(
+        (ref, albumId) async => effectiveCounts,
+      ),
+      offlineModeProvider.overrideWith(() => _StubOffline(offline)),
     ],
     child: MaterialApp(
       home: Scaffold(
@@ -229,6 +248,59 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(chosenQuality, '128');
+    });
+  });
+
+  group('AlbumCard offline mode', () {
+    testWidgets(
+      'partially downloaded: queue actions disabled, delete available',
+      (tester) async {
+        await tester.pumpWidget(buildCard(
+          _album,
+          offline: true,
+          counts: (downloaded: 3, total: 10),
+          onPlayNext: () {},
+          onAddToQueue: () {},
+          onDeleteDownload: () {},
+        ));
+        await tester.pumpAndSettle();
+
+        await tester.longPress(find.byType(AlbumCard));
+        await tester.pumpAndSettle();
+
+        final playNext = tester.widget<ListTile>(find.ancestor(
+          of: find.text('Play Next'),
+          matching: find.byType(ListTile),
+        ));
+        final addToQueue = tester.widget<ListTile>(find.ancestor(
+          of: find.text('Add to Queue'),
+          matching: find.byType(ListTile),
+        ));
+        expect(playNext.enabled, isFalse);
+        expect(addToQueue.enabled, isFalse);
+        expect(find.text('Delete downloads'), findsOneWidget);
+      },
+    );
+
+    testWidgets('fully downloaded: queue actions enabled', (tester) async {
+      await tester.pumpWidget(buildCard(
+        _album,
+        offline: true,
+        counts: (downloaded: 10, total: 10),
+        onPlayNext: () {},
+        onAddToQueue: () {},
+        onDeleteDownload: () {},
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.longPress(find.byType(AlbumCard));
+      await tester.pumpAndSettle();
+
+      final playNext = tester.widget<ListTile>(find.ancestor(
+        of: find.text('Play Next'),
+        matching: find.byType(ListTile),
+      ));
+      expect(playNext.enabled, isTrue);
     });
   });
 }

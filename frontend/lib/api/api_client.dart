@@ -36,9 +36,33 @@ class NetworkException implements Exception {
 
 typedef DelayFn = Future<void> Function(Duration);
 
+/// Result of a health check. `unreachable` means the network call itself
+/// failed (transport-level) — eligible for offline mode. `serverError` means
+/// the server answered with a non-2xx (e.g. 500) or an unexpected body — the
+/// server is up but misbehaving, so the user should see an inline error
+/// rather than enter offline mode.
+enum HealthStatus { ok, serverError, unreachable }
+
+class HealthResult {
+  final HealthStatus status;
+  final String? message;
+  const HealthResult(this.status, [this.message]);
+  bool get isOk => status == HealthStatus.ok;
+}
+
 class ApiClient {
   static final ApiClient instance = ApiClient._();
   ApiClient._() : _http = http.Client(), baseUrl = '';
+
+  /// Set by the app on startup so a `NetworkException` from a normal request
+  /// flips global offline mode on. Static so it's reachable from the
+  /// singleton without threading an extra dependency through every service.
+  /// Probe calls opt out via `triggerOfflineHook: false` (see [healthCheck]).
+  ///
+  /// There is deliberately no success counterpart: a received HTTP response
+  /// (even a 2xx) does not prove the backend is healthy enough to resume
+  /// normal work. Offline mode is exited only by a passing health check.
+  static void Function()? onNetworkFailure;
 
   String baseUrl;
   http.Client _http;
@@ -93,26 +117,40 @@ class ApiClient {
     );
   }
 
+  /// GET returning JSON. Retries transient failures by default; pass
+  /// `retry: false` for a single-attempt call (used by health polling, which
+  /// is its own retry loop).
   Future<Map<String, dynamic>> getJson(
     List<String> pathSegments, {
     Map<String, String>? query,
     Map<String, String>? headers,
+    bool retry = true,
+    bool triggerOfflineHook = true,
   }) async {
     final uri = _buildUri(pathSegments, query: query);
-    return _withRetry<Map<String, dynamic>>(
-      () async {
-        final response = await _http.get(
-          uri,
-          headers: {'Accept': 'application/json', ...?headers},
-        );
-        developer.log(
-          '${response.statusCode} ${response.body.length}B',
-          name: 'ApiClient',
-        );
-        return _handleJsonResponse(response);
-      },
-      label: 'GET $uri',
-    );
+    Future<Map<String, dynamic>> attempt() async {
+      final response = await _http.get(
+        uri,
+        headers: {'Accept': 'application/json', ...?headers},
+      );
+      developer.log(
+        '${response.statusCode} ${response.body.length}B',
+        name: 'ApiClient',
+      );
+      return _handleJsonResponse(response);
+    }
+    final label = 'GET $uri';
+    return retry
+        ? _withRetry<Map<String, dynamic>>(
+            attempt,
+            label: label,
+            triggerOfflineHook: triggerOfflineHook,
+          )
+        : _withoutRetry<Map<String, dynamic>>(
+            attempt,
+            label: label,
+            triggerOfflineHook: triggerOfflineHook,
+          );
   }
 
   /// PUT with JSON body. Defaults to a **single attempt** — pass `retry: true`
@@ -260,18 +298,25 @@ class ApiClient {
 
   bool _isSuccess(int code) => code >= 200 && code < 300;
 
-  /// Returns null if healthy, or an error message string.
-  Future<String?> healthCheck() async {
+  /// Pings `/`. Distinguishes "server unreachable" (eligible for offline
+  /// mode) from "server replied with an error" (not offline — surface as an
+  /// inline error). Pass `retry: false` when polling, so each poll is a
+  /// single fast attempt rather than the 3-attempt request loop.
+  Future<HealthResult> healthCheck({bool retry = true}) async {
     try {
-      final data = await getJson([]);
-      if (data['message'] == 'Healthy') return null;
-      return 'Unexpected response from server';
+      // A health check is a probe: its result is the HealthStatus returned
+      // below, which every caller handles explicitly. It must NOT also flip
+      // global offline mode via the transport-failure hook — that would let a
+      // failed manual connection attempt strand the app in offline mode.
+      final data = await getJson([], retry: retry, triggerOfflineHook: false);
+      if (data['message'] == 'Healthy') return const HealthResult(HealthStatus.ok);
+      return const HealthResult(HealthStatus.serverError, 'Unexpected response from server');
     } on ApiException catch (e) {
-      return 'Server error: ${e.statusCode}';
+      return HealthResult(HealthStatus.serverError, 'Server error: ${e.statusCode}');
     } on NetworkException catch (e) {
-      return 'Could not reach server: ${e.message}';
+      return HealthResult(HealthStatus.unreachable, 'Could not reach server: ${e.message}');
     } catch (e) {
-      return 'Could not reach server: $e';
+      return HealthResult(HealthStatus.unreachable, 'Could not reach server: $e');
     }
   }
 
@@ -330,6 +375,7 @@ class ApiClient {
   Future<T> _withRetry<T>(
     Future<T> Function() attempt, {
     required String label,
+    bool triggerOfflineHook = true,
   }) async {
     Object? lastNetworkCause;
     for (var attemptNumber = 1; attemptNumber <= _maxAttempts; attemptNumber++) {
@@ -387,6 +433,8 @@ class ApiClient {
         continue;
       }
     }
+    // All attempts exhausted on transport-level failures — signal offline.
+    if (triggerOfflineHook) onNetworkFailure?.call();
     throw NetworkException(
       lastNetworkCause?.toString() ?? 'unknown network error',
       cause: lastNetworkCause,
@@ -403,6 +451,7 @@ class ApiClient {
   Future<T> _withoutRetry<T>(
     Future<T> Function() attempt, {
     required String label,
+    bool triggerOfflineHook = true,
   }) async {
     try {
       return await _runAttempt(
@@ -414,12 +463,16 @@ class ApiClient {
     } on _HttpFailureSignal catch (status) {
       throw ApiException(status.statusCode, status.body);
     } on SocketException catch (e) {
+      if (triggerOfflineHook) onNetworkFailure?.call();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     } on TimeoutException catch (e) {
+      if (triggerOfflineHook) onNetworkFailure?.call();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     } on http.ClientException catch (e) {
+      if (triggerOfflineHook) onNetworkFailure?.call();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     } on ArgumentError catch (e) {
+      if (triggerOfflineHook) onNetworkFailure?.call();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     }
   }

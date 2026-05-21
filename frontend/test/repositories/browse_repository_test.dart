@@ -110,6 +110,71 @@ void main() {
     expect(results.albums, isEmpty);
     expect(results.tracks, isEmpty);
   });
+
+  test('search downloadedOnly filters before LIMIT, keeping a low-ranked match',
+      () async {
+    // 6 artists/albums/tracks all matching "Blue"; only the 6th is
+    // downloaded. With limitPerType 5 a naive post-filter on the top-5 FTS
+    // hits would miss the 6th — the filter must run inside the query.
+    for (var i = 1; i <= 6; i++) {
+      await fixture.insertAlbum(
+        artist: 'Blue Artist $i',
+        album: 'Blue Album $i',
+        uuids: ['blue$i'],
+        trackTitlePrefix: 'Blue Song',
+      );
+    }
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals('blue6')))
+        .write(const TracksCompanion(filePath: Value('/tmp/blue6.m4a')));
+    await _populateFts(db);
+
+    final results =
+        await repo.search('Blue', limitPerType: 5, downloadedOnly: true);
+
+    expect(results.tracks.map((t) => t.uuidId), ['blue6']);
+    expect(results.artists.map((a) => a.name), ['Blue Artist 6']);
+    expect(results.albums.map((a) => a.name), ['Blue Album 6']);
+  });
+
+  test('search without downloadedOnly is still capped at limitPerType',
+      () async {
+    for (var i = 1; i <= 6; i++) {
+      await fixture.insertAlbum(
+        artist: 'Blue Artist $i',
+        album: 'Blue Album $i',
+        uuids: ['blue$i'],
+        trackTitlePrefix: 'Blue Song',
+      );
+    }
+    await _populateFts(db);
+
+    final results = await repo.search('Blue', limitPerType: 5);
+
+    expect(results.tracks, hasLength(5));
+  });
+}
+
+/// Mirrors the FTS population the sync pipeline performs in production.
+Future<void> _populateFts(AppDatabase db) async {
+  await db.customStatement(
+      "INSERT INTO fts_tracks(fts_tracks) VALUES('delete-all')");
+  await db.customStatement(
+    'INSERT INTO fts_tracks(rowid, title, artist_name, album_name) '
+    "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), "
+    "COALESCE(album, '') FROM trackmetadata",
+  );
+  await db.customStatement(
+      "INSERT INTO fts_artists(fts_artists) VALUES('delete-all')");
+  await db.customStatement(
+    'INSERT INTO fts_artists(rowid, name) SELECT id, name FROM artists',
+  );
+  await db.customStatement(
+      "INSERT INTO fts_albums(fts_albums) VALUES('delete-all')");
+  await db.customStatement(
+    'INSERT INTO fts_albums(rowid, name, artist_name) '
+    "SELECT a.id, COALESCE(a.name, ''), ar.name "
+    'FROM albums a JOIN artists ar ON a.artist_id = ar.id',
+  );
 }
 
 class _LibraryFixture {

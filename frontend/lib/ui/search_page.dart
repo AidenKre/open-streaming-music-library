@@ -6,6 +6,7 @@ import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
@@ -80,8 +81,14 @@ class _SearchPageState extends ConsumerState<SearchPage> {
 
     setState(() => _isSearching = true);
 
-    final results = await ref.read(browseRepositoryProvider)
-        .search(_query, limitPerType: 5);
+    // Offline: the repository filters to locally-downloaded content inside the
+    // FTS query (before LIMIT), so a downloaded match ranked below the top 5
+    // is still returned.
+    final results = await ref.read(browseRepositoryProvider).search(
+          _query,
+          limitPerType: 5,
+          downloadedOnly: ref.read(offlineModeProvider),
+        );
 
     if (!mounted) return;
     setState(() {
@@ -131,7 +138,11 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   @override
   Widget build(BuildContext context) {
     ref.listen(downloadStatusVersionProvider, (_, _) => _patchDownloadStates());
+    ref.listen<bool>(offlineModeProvider, (prev, next) {
+      if (prev != next) _search();
+    });
     final manager = ref.watch(downloadManagerListenableProvider);
+    final isOffline = ref.watch(offlineModeProvider);
 
     final hasResults =
         _artists.isNotEmpty || _albums.isNotEmpty || _tracks.isNotEmpty;
@@ -198,8 +209,12 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                           ref.read(audioProvider.notifier).addToQueue(tracks);
                         }
                       },
-                      onDownload: () => downloadArtistTracks(ref, artist.id),
-                      onDownloadAtQuality: (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
+                      onDownload: isOffline
+                          ? null
+                          : () => downloadArtistTracks(ref, artist.id),
+                      onDownloadAtQuality: isOffline
+                          ? null
+                          : (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
                       onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
                     ),
                   );
@@ -236,8 +251,12 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                           ref.read(audioProvider.notifier).addToQueue(tracks);
                         }
                       },
-                      onDownload: () => downloadAlbumTracks(ref, album.artistId, album.id),
-                      onDownloadAtQuality: (q) => downloadAlbumTracksAtQuality(ref, album.artistId, album.id, q),
+                      onDownload: isOffline
+                          ? null
+                          : () => downloadAlbumTracks(ref, album.artistId, album.id),
+                      onDownloadAtQuality: isOffline
+                          ? null
+                          : (q) => downloadAlbumTracksAtQuality(ref, album.artistId, album.id, q),
                       onDeleteDownload: () => deleteAlbumDownloads(ref, album.artistId, album.id),
                     ),
                   );

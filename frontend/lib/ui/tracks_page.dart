@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
@@ -122,6 +123,7 @@ class TracksPageState extends ConsumerState<TracksPage>
     ref.listen(downloadStatusVersionProvider, (_, _) => _patchDownloadStates());
 
     final manager = ref.watch(downloadManagerListenableProvider);
+    final isOffline = ref.watch(offlineModeProvider);
 
     final body = Column(
       children: [
@@ -154,9 +156,15 @@ class TracksPageState extends ConsumerState<TracksPage>
                   _ => null,
                 };
               }
+              // Offline: keep all rows visible for visual consistency with
+              // the same album/artist viewed online, but dim and disable any
+              // track that isn't locally downloaded.
+              final isInteractive = !isOffline || track.isDownloaded;
               return TrackTile(
                 track: track,
                 trailing: trailing,
+                isDimmed: isOffline && !track.isDownloaded,
+                isInteractive: isInteractive,
                 onTap: () => ref.read(audioProvider.notifier).playFromQueue(
                   track: track,
                   sourceType: widget.albumId != null

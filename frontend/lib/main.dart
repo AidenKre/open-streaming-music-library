@@ -6,6 +6,7 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
@@ -16,6 +17,7 @@ import 'package:frontend/ui/startup_gate.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
+import 'package:frontend/ui/widgets/offline_banner.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -41,13 +43,44 @@ Future<void> main() async {
       audioServiceProvider.overrideWithValue(audioHandler),
       localCoverArtStoreProvider.overrideWithValue(coverArtStore),
     ],
-    child: Frontend(),
+    child: const Frontend(),
   ));
 }
 
-class Frontend extends StatelessWidget {
+class Frontend extends ConsumerStatefulWidget {
+  const Frontend({super.key});
+
+  @override
+  ConsumerState<Frontend> createState() => _FrontendState();
+}
+
+class _FrontendState extends ConsumerState<Frontend> {
+  @override
+  void initState() {
+    super.initState();
+    // Bridge ApiClient's transport-failure hook into the offline-mode notifier.
+    // Lives here (not in main()) because the notifier requires a ProviderScope.
+    ApiClient.onNetworkFailure =
+        ref.read(offlineModeProvider.notifier).enterOffline;
+  }
+
+  @override
+  void dispose() {
+    ApiClient.onNetworkFailure = null;
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
+    // Recovery side effects live here, not inside the offline notifier, so the
+    // notifier stays focused on local-only state. When the app leaves offline
+    // mode, kick the work that was paused while we were dark.
+    ref.listen<bool>(offlineModeProvider, (prev, next) {
+      if (prev == true && next == false) {
+        ref.read(trackSyncProvider.notifier).sync();
+        ref.read(downloadManagerProvider).resumeIfPaused();
+      }
+    });
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'OSML',
@@ -97,6 +130,7 @@ class _AppShellState extends ConsumerState<AppShell> {
 
   @override
   Widget build(BuildContext context) {
+    final isOffline = ref.watch(offlineModeProvider);
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
@@ -109,6 +143,7 @@ class _AppShellState extends ConsumerState<AppShell> {
       child: Scaffold(
         body: Column(
           children: [
+            if (isOffline) const OfflineBanner(),
             Expanded(
               child: IndexedStack(
                 index: _tabIndex,

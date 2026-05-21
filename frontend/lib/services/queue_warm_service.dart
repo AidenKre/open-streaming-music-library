@@ -4,6 +4,7 @@ import 'dart:developer' as developer;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
@@ -24,11 +25,16 @@ class QueueWarmService {
 
   final QueueRepository _queueRepo;
   final ApiClient _apiClient;
+  final bool Function() _isOfflineFn;
   Timer? _debounceTimer;
 
-  QueueWarmService({required QueueRepository queueRepo, ApiClient? apiClient})
-    : _queueRepo = queueRepo,
-      _apiClient = apiClient ?? ApiClient.instance;
+  QueueWarmService({
+    required QueueRepository queueRepo,
+    ApiClient? apiClient,
+    bool Function()? isOfflineFn,
+  })  : _queueRepo = queueRepo,
+        _apiClient = apiClient ?? ApiClient.instance,
+        _isOfflineFn = isOfflineFn ?? (() => false);
 
   void scheduleWarm({
     required int? sessionId,
@@ -53,6 +59,8 @@ class QueueWarmService {
     required String quality,
   }) async {
     if (sessionId == null) return;
+    // Warming is advisory and pure overhead while the network is down.
+    if (_isOfflineFn()) return;
     final entries = await _queueRepo.getPlaybackEntries(
       sessionId,
       startPlayPosition: currentPlayPosition,
@@ -94,6 +102,7 @@ class QueueWarmService {
     required String quality,
   }) async {
     if (trackUuids.isEmpty) return;
+    if (_isOfflineFn()) return;
     try {
       await _apiClient.postJson(
         ['tracks', 'warm'],
@@ -119,6 +128,7 @@ class QueueWarmService {
 final queueWarmServiceProvider = Provider<QueueWarmService>((ref) {
   final service = QueueWarmService(
     queueRepo: ref.read(queueRepositoryProvider),
+    isOfflineFn: () => ref.read(offlineModeProvider),
   );
   ref.onDispose(service.dispose);
   return service;

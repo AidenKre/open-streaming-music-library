@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
@@ -24,6 +25,9 @@ final downloadManagerProvider = Provider<DownloadManager>((ref) {
     coverArtStore: ref.read(localCoverArtStoreProvider),
     warmService: ref.read(queueWarmServiceProvider),
     streamQualityFn: () => ref.read(streamQualityProvider),
+    isOfflineFn: () => ref.read(offlineModeProvider),
+    onNetworkFailure: () =>
+        ref.read(offlineModeProvider.notifier).enterOffline(),
   );
   ref.onDispose(manager.dispose);
   return manager;
@@ -55,30 +59,6 @@ final downloadStatusVersionProvider = StreamProvider<int>((ref) {
     controller.close();
   });
   return controller.stream;
-});
-
-/// True iff EVERY track on the album has been downloaded. Watches the
-/// download-status version so the badge updates as downloads complete or
-/// get deleted.
-final albumDownloadedProvider =
-    FutureProvider.family<bool, int>((ref, albumId) async {
-  ref.watch(downloadStatusVersionProvider);
-  final db = ref.watch(databaseProvider);
-  final counts = await db.getAlbumDownloadCounts([albumId]);
-  final entry = counts[albumId];
-  if (entry == null) return false;
-  return entry.total > 0 && entry.downloaded == entry.total;
-});
-
-/// True iff EVERY track by the artist has been downloaded.
-final artistDownloadedProvider =
-    FutureProvider.family<bool, int>((ref, artistId) async {
-  ref.watch(downloadStatusVersionProvider);
-  final db = ref.watch(databaseProvider);
-  final counts = await db.getArtistDownloadCounts([artistId]);
-  final entry = counts[artistId];
-  if (entry == null) return false;
-  return entry.total > 0 && entry.downloaded == entry.total;
 });
 
 /// True iff any queued/active jobs belong to the given album.

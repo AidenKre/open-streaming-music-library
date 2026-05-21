@@ -17,20 +17,30 @@ class ConcatenatingPlayerController {
   int? _committedCurrentItemId;
   int _structuralMutationDepth = 0;
   bool _isDisposed = false;
+  /// Resolves the global offline-mode flag. When `true`, the controller will
+  /// skip past non-local entries as the player advances. Default `false` so
+  /// nothing changes for callers that don't wire offline mode (tests).
+  final bool Function() _isOfflineFn;
 
   /// Quality preset applied to NEW source URIs. Existing in-flight sources
   /// keep whatever quality they were created with — quality switches take
   /// effect at the next track boundary.
   String _streamQuality = originalQuality;
 
-  ConcatenatingPlayerController(this._player) {
+  ConcatenatingPlayerController(this._player, {bool Function()? isOfflineFn})
+      : _isOfflineFn = isOfflineFn ?? (() => false) {
     _currentIndexSubscription = _player.currentIndexStream.listen(
       _onCurrentIndexChanged,
     );
   }
 
-  factory ConcatenatingPlayerController.create() {
-    return ConcatenatingPlayerController(ja.AudioPlayer());
+  factory ConcatenatingPlayerController.create({
+    bool Function()? isOfflineFn,
+  }) {
+    return ConcatenatingPlayerController(
+      ja.AudioPlayer(),
+      isOfflineFn: isOfflineFn,
+    );
   }
 
   Future<void> setSeed(
@@ -333,7 +343,36 @@ class ConcatenatingPlayerController {
     if (_isDisposed || _structuralMutationDepth > 0) {
       return;
     }
+    // While offline, the player must not land on a streaming-only entry.
+    // We don't touch the currently-playing track (the user said "let it
+    // finish"); we only intercept when the player advances to a new index
+    // whose entry has no local file.
+    if (index != null && _isOfflineFn() && !_isIndexLocallyPlayable(index)) {
+      final nextPlayable = _findNextPlayableIndex(index);
+      if (nextPlayable != null) {
+        unawaited(_player.seek(Duration.zero, index: nextPlayable));
+      } else {
+        // No local entries ahead — nothing left we can play offline.
+        unawaited(_player.stop());
+      }
+      // Wait for the seek to drive another index-change event; don't commit
+      // this non-playable index as the "current" track.
+      return;
+    }
     _commitCurrentItem(_itemIdForIndex(index), emit: true);
+  }
+
+  bool _isIndexLocallyPlayable(int index) {
+    if (index < 0 || index >= _loadedEntries.length) return false;
+    final path = _loadedEntries[index].filePath;
+    return path != null && File(path).existsSync();
+  }
+
+  int? _findNextPlayableIndex(int from) {
+    for (var i = from + 1; i < _loadedEntries.length; i++) {
+      if (_isIndexLocallyPlayable(i)) return i;
+    }
+    return null;
   }
 
   Future<void> _runStructuralMutation(

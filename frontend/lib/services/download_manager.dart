@@ -18,6 +18,15 @@ import 'package:frontend/services/queue_warm_service.dart';
 
 enum DownloadState { queued, active, completed, failed }
 
+/// Why a single download attempt ended. Drives whether [DownloadManager]
+/// marks the job completed, re-queues it for retry, or fails it.
+enum _DownloadOutcome { success, networkFailure, otherFailure }
+
+/// Sentinel for [DownloadJob.copyWith] so a caller can pass `errorMessage:
+/// null` to genuinely clear the field (a plain `null` default is
+/// indistinguishable from "not supplied").
+const Object _sentinel = Object();
+
 String formatBytes(int bytes) {
   if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
   if (bytes < 1024 * 1024 * 1024) {
@@ -57,7 +66,7 @@ class DownloadJob {
   DownloadJob copyWith({
     DownloadState? state,
     double? progress,
-    String? errorMessage,
+    Object? errorMessage = _sentinel,
     int? fileSizeBytes,
   }) {
     return DownloadJob(
@@ -69,7 +78,9 @@ class DownloadJob {
       quality: quality,
       state: state ?? this.state,
       progress: progress ?? this.progress,
-      errorMessage: errorMessage ?? this.errorMessage,
+      errorMessage: errorMessage == _sentinel
+          ? this.errorMessage
+          : errorMessage as String?,
       fileSizeBytes: fileSizeBytes ?? this.fileSizeBytes,
     );
   }
@@ -113,10 +124,18 @@ class DownloadManager extends ChangeNotifier {
   // Provides the current stream quality for server warm calls.
   final String Function()? _streamQualityFn;
   final ApiClient _apiClient;
+  // When true, the pump won't dispatch new workers; queued jobs wait for
+  // resumeIfPaused() on recovery.
+  final bool Function() _isOfflineFn;
+  // Reports a transport failure so the app enters offline mode. Called when a
+  // download drops mid-stream — that failure happens after ApiClient handed us
+  // the response, so ApiClient's own onNetworkFailure hook never fires.
+  final void Function()? _onNetworkFailure;
 
   DownloadQueueState _state = const DownloadQueueState();
   Directory? _downloadDir;
   int _activeCount = 0;
+  bool _disposed = false;
 
   /// Notified once when the underlying tracks table changes such that
   /// downloaded-status checks may have new answers. Lets the UI invalidate
@@ -130,18 +149,27 @@ class DownloadManager extends ChangeNotifier {
     QueueWarmService? warmService,
     String Function()? streamQualityFn,
     ApiClient? apiClient,
+    bool Function()? isOfflineFn,
+    void Function()? onNetworkFailure,
   })  : _db = db,
         _coverArtStore = coverArtStore,
         _directoryProvider =
             directoryProvider ?? getApplicationDocumentsDirectory,
         _warmService = warmService,
         _streamQualityFn = streamQualityFn,
-        _apiClient = apiClient ?? ApiClient.instance;
+        _apiClient = apiClient ?? ApiClient.instance,
+        _isOfflineFn = isOfflineFn ?? (() => false),
+        _onNetworkFailure = onNetworkFailure;
 
   DownloadQueueState get state => _state;
 
   @override
   void dispose() {
+    // Idempotent: downloadManagerProvider registers a dispose hook and the
+    // ChangeNotifierProvider exposing the manager disposes it too, so this can
+    // be called twice when a ProviderScope tears down.
+    if (_disposed) return;
+    _disposed = true;
     downloadStatusVersion.dispose();
     super.dispose();
   }
@@ -278,7 +306,16 @@ class DownloadManager extends ChangeNotifier {
     _bumpVersion();
   }
 
+  /// Called by OfflineModeNotifier when the network returns. Re-dispatches
+  /// any jobs that were left queued while offline.
+  void resumeIfPaused() {
+    _pump();
+  }
+
   void _pump() {
+    // Paused while offline. Jobs sit in `queued` and get picked up by
+    // resumeIfPaused() on recovery.
+    if (_isOfflineFn()) return;
     while (_activeCount < maxConcurrent) {
       final idx =
           _state.jobs.indexWhere((j) => j.state == DownloadState.queued);
@@ -296,20 +333,39 @@ class DownloadManager extends ChangeNotifier {
       final idx = _state.jobs.indexWhere((j) => j.uuidId == uuidId);
       if (idx < 0) return;
       final job = _state.jobs[idx];
-      final ok = await _downloadOne(job);
-      final finalState = ok ? DownloadState.completed : DownloadState.failed;
-      _markJobByUuid(
-        uuidId,
-        (j) => j.copyWith(state: finalState, progress: ok ? 1.0 : j.progress),
-      );
-      if (ok) _bumpVersion();
+      final outcome = await _downloadOne(job);
+      switch (outcome) {
+        case _DownloadOutcome.success:
+          _markJobByUuid(
+            uuidId,
+            (j) => j.copyWith(state: DownloadState.completed, progress: 1.0),
+          );
+          _bumpVersion();
+        case _DownloadOutcome.networkFailure:
+          // Transport failure — revert to queued so the worker pool retries
+          // once we're back online. The download restarts from zero, so
+          // reset progress and clear the error.
+          _markJobByUuid(
+            uuidId,
+            (j) => j.copyWith(
+              state: DownloadState.queued,
+              progress: 0.0,
+              errorMessage: null,
+            ),
+          );
+        case _DownloadOutcome.otherFailure:
+          _markJobByUuid(
+            uuidId,
+            (j) => j.copyWith(state: DownloadState.failed),
+          );
+      }
     } finally {
       _activeCount--;
       _pump();
     }
   }
 
-  Future<bool> _downloadOne(DownloadJob job) async {
+  Future<_DownloadOutcome> _downloadOne(DownloadJob job) async {
     final dir = await _ensureDownloadDir();
 
     http.StreamedResponse response;
@@ -325,19 +381,22 @@ class DownloadManager extends ChangeNotifier {
         job.uuidId,
         (j) => j.copyWith(errorMessage: 'HTTP ${e.statusCode}'),
       );
-      return false;
+      return _DownloadOutcome.otherFailure;
     } on NetworkException catch (e) {
+      // ApiClient already fired its onNetworkFailure hook for the exhausted
+      // handshake; report defensively too in case it wasn't wired.
       _markJobByUuid(
         job.uuidId,
         (j) => j.copyWith(errorMessage: 'Connection failed: ${e.message}'),
       );
-      return false;
+      _onNetworkFailure?.call();
+      return _DownloadOutcome.networkFailure;
     } catch (e) {
       // Defensive fallback for unexpected exceptions that escape ApiClient's
       // typed exceptions — without this, _runJob never marks the job failed
       // and it stays stuck in `active`.
       _markJobByUuid(job.uuidId, (j) => j.copyWith(errorMessage: e.toString()));
-      return false;
+      return _DownloadOutcome.otherFailure;
     }
 
     // ApiClient.send guarantees a 2xx response or throws — no defensive check needed.
@@ -397,7 +456,7 @@ class DownloadManager extends ChangeNotifier {
 
       _markJobByUuid(job.uuidId, (j) => j.copyWith(fileSizeBytes: received));
 
-      return true;
+      return _DownloadOutcome.success;
     } catch (e) {
       _markJobByUuid(
         job.uuidId,
@@ -406,7 +465,17 @@ class DownloadManager extends ChangeNotifier {
       try {
         if (await partial.exists()) await partial.delete();
       } catch (_) {}
-      return false;
+      // A drop after headers arrived doesn't surface through ApiClient (the
+      // response stream was already handed to us), so classify it here: a
+      // transport error re-queues for retry, anything else (e.g. a disk
+      // write failure) is a genuine, permanent failure.
+      if (e is SocketException ||
+          e is http.ClientException ||
+          e is TimeoutException) {
+        _onNetworkFailure?.call();
+        return _DownloadOutcome.networkFailure;
+      }
+      return _DownloadOutcome.otherFailure;
     }
   }
 

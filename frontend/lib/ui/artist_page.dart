@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/albums_page.dart';
@@ -48,23 +49,27 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   @override
   Future<List<ArtistUI>> loadPage({required bool useCursor}) {
     final repo = ref.read(browseRepositoryProvider);
+    final downloadedOnly = ref.read(offlineModeProvider);
     return repo.getArtists(
       orderBy: _orderParams,
       cursorFilters: useCursor
           ? _buildCursorFromLast(paginatedItems.last)
           : [],
       limit: pageSize,
+      downloadedOnly: downloadedOnly,
     );
   }
 
   @override
   Stream<int> watchItemCount({required bool useCursor}) {
     final repo = ref.read(browseRepositoryProvider);
+    final downloadedOnly = ref.read(offlineModeProvider);
     return repo.watchArtistCount(
       orderBy: useCursor ? _orderParams : [],
       cursorFilters: useCursor
           ? _buildCursorFromLast(paginatedItems.last)
           : [],
+      downloadedOnly: downloadedOnly,
     );
   }
 
@@ -87,6 +92,12 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
 
   @override
   Widget build(BuildContext context) {
+    // Toggling offline mode flips the downloadedOnly filter, so we must
+    // re-fetch from page 1; the existing items came from a different filter.
+    ref.listen<bool>(offlineModeProvider, (prev, next) {
+      if (prev != next) refresh();
+    });
+    final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
         buildNewItemsBanner('artists'),
@@ -132,8 +143,10 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
                     ref.read(audioProvider.notifier).addToQueue(tracks);
                   }
                 },
-                onDownload: () => downloadArtistTracks(ref, artist.id),
-                onDownloadAtQuality: (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
+                onDownload: isOffline ? null : () => downloadArtistTracks(ref, artist.id),
+                onDownloadAtQuality: isOffline
+                    ? null
+                    : (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
                 onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
               );
             },

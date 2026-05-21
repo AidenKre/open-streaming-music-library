@@ -3,6 +3,7 @@ import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -48,6 +49,11 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
   }
 
   Future<void> sync({int? artistId, int? albumId}) async {
+    // Offline mode skips sync entirely — the network call would just fail.
+    // OfflineModeNotifier re-invokes this on recovery, so the next online
+    // tick will pick up everything that changed while we were dark.
+    if (ref.read(offlineModeProvider)) return;
+
     final current = state.value;
     if (current != null && current.isSyncing) return;
 

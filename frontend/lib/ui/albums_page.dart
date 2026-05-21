@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
@@ -59,6 +60,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
   @override
   Future<List<AlbumUI>> loadPage({required bool useCursor}) {
     final repo = ref.read(browseRepositoryProvider);
+    final downloadedOnly = ref.read(offlineModeProvider);
     return repo.getAlbums(
       artistId: widget.artistId,
       orderBy: _orderParams,
@@ -66,18 +68,21 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
           ? _buildCursorFromLast(paginatedItems.last)
           : [],
       limit: pageSize,
+      downloadedOnly: downloadedOnly,
     );
   }
 
   @override
   Stream<int> watchItemCount({required bool useCursor}) {
     final repo = ref.read(browseRepositoryProvider);
+    final downloadedOnly = ref.read(offlineModeProvider);
     return repo.watchAlbumsCount(
       artistId: widget.artistId,
       orderBy: useCursor ? _orderParams : [],
       cursorFilters: useCursor
           ? _buildCursorFromLast(paginatedItems.last)
           : [],
+      downloadedOnly: downloadedOnly,
     );
   }
 
@@ -114,6 +119,10 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
 
   @override
   Widget build(BuildContext context) {
+    ref.listen<bool>(offlineModeProvider, (prev, next) {
+      if (prev != next) refresh();
+    });
+    final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
         buildNewItemsBanner('albums'),
@@ -159,8 +168,12 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                     ref.read(audioProvider.notifier).addToQueue(tracks);
                   }
                 },
-                onDownload: () => downloadAlbumTracks(ref, album.artistId, album.id),
-                onDownloadAtQuality: (q) => downloadAlbumTracksAtQuality(ref, album.artistId, album.id, q),
+                onDownload: isOffline
+                    ? null
+                    : () => downloadAlbumTracks(ref, album.artistId, album.id),
+                onDownloadAtQuality: isOffline
+                    ? null
+                    : (q) => downloadAlbumTracksAtQuality(ref, album.artistId, album.id, q),
                 onDeleteDownload: () => deleteAlbumDownloads(ref, album.artistId, album.id),
               );
             },

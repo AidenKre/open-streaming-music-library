@@ -739,7 +739,7 @@ void main() {
   });
 
   group('ApiClient retry — G9: healthCheck on unreachable server', () {
-    test('healthCheck returns "Could not reach server:" after retries exhausted', () async {
+    test('healthCheck returns unreachable HealthResult after retries exhausted', () async {
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('no route')),
@@ -747,10 +747,11 @@ void main() {
 
       final result = await ApiClient.instance.healthCheck();
 
-      expect(result, startsWith('Could not reach server:'));
+      expect(result.status, HealthStatus.unreachable);
+      expect(result.message, startsWith('Could not reach server:'));
     });
 
-    test('healthCheck returns "Server error: 500" when backend is up but failing', () async {
+    test('healthCheck returns serverError HealthResult when backend is up but failing', () async {
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async => Response('boom', 500)),
@@ -758,7 +759,8 @@ void main() {
 
       final result = await ApiClient.instance.healthCheck();
 
-      expect(result, 'Server error: 500');
+      expect(result.status, HealthStatus.serverError);
+      expect(result.message, 'Server error: 500');
     });
   });
 
@@ -896,6 +898,56 @@ void main() {
 
       expect(calls, 2);
       expect(result['accepted'], true);
+    });
+  });
+
+  group('ApiClient — healthCheck does not flip global offline mode', () {
+    tearDown(() => ApiClient.onNetworkFailure = null);
+
+    test('healthCheck transport failure does NOT invoke onNetworkFailure', () async {
+      var hookCalls = 0;
+      ApiClient.onNetworkFailure = () => hookCalls++;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => throw const SocketException('down')),
+      );
+
+      final result = await ApiClient.instance.healthCheck();
+
+      expect(result.status, HealthStatus.unreachable);
+      expect(hookCalls, 0,
+          reason: 'a health-check probe must not enter offline mode');
+    });
+
+    test('healthCheck(retry: false) transport failure does NOT invoke onNetworkFailure',
+        () async {
+      var hookCalls = 0;
+      ApiClient.onNetworkFailure = () => hookCalls++;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => throw const SocketException('down')),
+      );
+
+      await ApiClient.instance.healthCheck(retry: false);
+
+      expect(hookCalls, 0);
+    });
+
+    test('a normal getJson transport failure DOES invoke onNetworkFailure',
+        () async {
+      var hookCalls = 0;
+      ApiClient.onNetworkFailure = () => hookCalls++;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => throw const SocketException('down')),
+      );
+
+      await expectLater(
+        ApiClient.instance.getJson(['tracks']),
+        throwsA(isA<NetworkException>()),
+      );
+      expect(hookCalls, 1,
+          reason: 'normal requests still drive offline mode on failure');
     });
   });
 

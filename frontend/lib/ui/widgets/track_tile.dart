@@ -13,6 +13,10 @@ class TrackTile extends StatelessWidget {
   final VoidCallback? onDeleteDownload;
   final bool isHighlighted;
   final bool isDimmed;
+  /// When `false`, the row swallows taps and the more-vert button is rendered
+  /// in a disabled state. Used by offline mode on the tracks page so the row
+  /// stays visible (visual consistency with album views) but inert.
+  final bool isInteractive;
   final Widget? trailing;
 
   const TrackTile({
@@ -26,6 +30,7 @@ class TrackTile extends StatelessWidget {
     this.onDeleteDownload,
     this.isHighlighted = false,
     this.isDimmed = false,
+    this.isInteractive = true,
     this.trailing,
   });
 
@@ -92,7 +97,7 @@ class TrackTile extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         InkWell(
-          onTap: onTap,
+          onTap: isInteractive ? onTap : null,
           child: Container(
             color: isHighlighted
                 ? colors.primaryContainer.withValues(alpha: 0.3)
@@ -193,8 +198,11 @@ class TrackTile extends StatelessWidget {
                         padding: EdgeInsets.zero,
                         icon: Icon(Icons.more_vert,
                             size: 20, color: colors.onSurfaceVariant),
-                        onPressed: () =>
-                            _showTrackMenu(context),
+                        // Null onPressed renders the button in Flutter's
+                        // built-in disabled style (grayed but visible).
+                        onPressed: isInteractive
+                            ? () => _showTrackMenu(context)
+                            : null,
                       ),
                     ),
                   ],
