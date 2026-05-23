@@ -165,42 +165,53 @@ class EncoderCoordinator:
                     pass
 
         # 2. Resume warming only for tracks not already in the default cache.
-        if self.default_quality == ORIGINAL_QUALITY or self.all_uuids_fn is None:
+        default_quality, default_cache, gen = self._snapshot_default_state()
+        if default_quality == ORIGINAL_QUALITY or self.all_uuids_fn is None:
             return
 
         all_uuids = set(self.all_uuids_fn())
-        if self.default_cache is not None:
-            cached = {uid for uid in all_uuids if self.default_cache.has(uid, self.default_quality)}
+        if default_cache is not None:
+            cached = {uid for uid in all_uuids if default_cache.has(uid, default_quality)}
         else:
             cached = set()
 
         missing = all_uuids - cached
-        gen = self._warm_generation
         for uuid_id in missing:
             self._executor.submit(
-                self._warm_one, uuid_id, self.default_quality, gen,
+                self._warm_one, uuid_id, default_quality, gen,
                 priority=_PriorityPool.PRIORITY_LOW,
             )
 
     # ── Cache tier helpers ────────────────────────────────────────────────
 
+    def _snapshot_default_state(self) -> tuple[str, Optional[EncodedCache], int]:
+        """Snapshot ``(default_quality, default_cache, _warm_generation)`` under the
+        guard lock so cache-tier decisions and warm-generation reads are
+        consistent across concurrent ``set_default_quality`` mutations.
+        """
+        with self._key_locks_guard:
+            return self.default_quality, self.default_cache, self._warm_generation
+
     def _write_cache(self, quality: str) -> EncodedCache:
         """Return the cache to write new encodes into for this quality."""
-        if self.default_cache is not None and quality == self.default_quality:
-            return self.default_cache
+        default_quality, default_cache, _ = self._snapshot_default_state()
+        if default_cache is not None and quality == default_quality:
+            return default_cache
         return self.cache
 
     def _lookup_cached(self, uuid_id: str, quality: str) -> Optional[Path]:
         """Check caches in priority order and return a hit, or None."""
-        if self.default_cache is not None and quality == self.default_quality:
-            hit = self.default_cache.get(uuid_id, quality)
+        default_quality, default_cache, _ = self._snapshot_default_state()
+        if default_cache is not None and quality == default_quality:
+            hit = default_cache.get(uuid_id, quality)
             if hit is not None:
                 return hit
         return self.cache.get(uuid_id, quality)
 
     def _has_cached(self, uuid_id: str, quality: str) -> bool:
-        if self.default_cache is not None and quality == self.default_quality:
-            if self.default_cache.has(uuid_id, quality):
+        default_quality, default_cache, _ = self._snapshot_default_state()
+        if default_cache is not None and quality == default_quality:
+            if default_cache.has(uuid_id, quality):
                 return True
         return self.cache.has(uuid_id, quality)
 
@@ -253,49 +264,50 @@ class EncoderCoordinator:
             return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
 
         lock = self._key_lock(uuid_id, quality)
-        with lock:
-            cached = self._lookup_cached(uuid_id, quality)
-            if cached is not None:
-                return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
+        try:
+            with lock:
+                cached = self._lookup_cached(uuid_id, quality)
+                if cached is not None:
+                    return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
 
-            source = self.source_lookup(uuid_id)
-            if source is None or not source.exists():
-                with self._key_locks_guard:
-                    self._key_locks.pop((uuid_id, quality), None)
-                return None
+                source = self.source_lookup(uuid_id)
+                if source is None or not source.exists():
+                    return None
 
-            # Resolve source bitrate: use caller-supplied hint if available,
-            # otherwise ffprobe. Runs inside the lock so we probe at most once
-            # per (uuid, quality) even under concurrent requests.
-            effective_source_bitrate = source_bitrate_kbps
-            if effective_source_bitrate is None:
-                effective_source_bitrate = get_audio_bitrate_kbps(source)
+                # Resolve source bitrate: use caller-supplied hint if available,
+                # otherwise ffprobe. Runs inside the lock so we probe at most once
+                # per (uuid, quality) even under concurrent requests.
+                effective_source_bitrate = source_bitrate_kbps
+                if effective_source_bitrate is None:
+                    effective_source_bitrate = get_audio_bitrate_kbps(source)
 
-            # Passthrough: source is already at or below the requested bitrate.
-            # Transcoding would not improve quality and would waste CPU + space.
-            if effective_source_bitrate and effective_source_bitrate <= bitrate:
-                with self._key_locks_guard:
-                    self._key_locks.pop((uuid_id, quality), None)
-                return EncodeResult(
-                    path=source,
-                    bitrate_kbps=effective_source_bitrate,
-                    transcoded=False,
-                )
+                # Passthrough: source is already at or below the requested bitrate.
+                # Transcoding would not improve quality and would waste CPU + space.
+                if effective_source_bitrate and effective_source_bitrate <= bitrate:
+                    return EncodeResult(
+                        path=source,
+                        bitrate_kbps=effective_source_bitrate,
+                        transcoded=False,
+                    )
 
-            scratch = self._scratch_dir / f"{uuid_lib.uuid4().hex}.m4a"
-            ok = self.transcode_fn(source, scratch, bitrate)
-            if not ok:
-                if scratch.exists():
-                    scratch.unlink(missing_ok=True)
-                with self._key_locks_guard:
-                    self._key_locks.pop((uuid_id, quality), None)
-                return None
+                scratch = self._scratch_dir / f"{uuid_lib.uuid4().hex}.m4a"
+                ok = self.transcode_fn(source, scratch, bitrate)
+                if not ok:
+                    if scratch.exists():
+                        scratch.unlink(missing_ok=True)
+                    return None
 
-            target_cache = self._write_cache(quality)
-            cached_path = target_cache.insert(uuid_id, quality, scratch)
+                target_cache = self._write_cache(quality)
+                cached_path = target_cache.insert(uuid_id, quality, scratch)
+                return EncodeResult(path=cached_path, bitrate_kbps=bitrate, transcoded=True)
+        finally:
+            # Pop after releasing the per-key lock. Doing this inside the
+            # ``with lock:`` block would race: another thread could call
+            # ``_key_lock``, acquire the existing entry, and then have it
+            # popped out from under it. The ``finally`` runs after ``with``
+            # exits, so any new caller after the pop creates a fresh lock.
             with self._key_locks_guard:
                 self._key_locks.pop((uuid_id, quality), None)
-            return EncodeResult(path=cached_path, bitrate_kbps=bitrate, transcoded=True)
 
     def enqueue_prefetch(
         self,
@@ -356,14 +368,17 @@ class EncoderCoordinator:
         2. Migrates existing default-cache files to the stream cache (background).
         3. Submits one warm task per UUID (parallel, PRIORITY_LOW).
         """
-        if new_quality == self.default_quality:
-            return False
-
-        old_quality = self.default_quality
-        old_default_cache = self.default_cache
-        self.default_quality = new_quality
-        self._warm_generation += 1
-        gen = self._warm_generation
+        # Mutate default_quality and _warm_generation atomically under the
+        # guard lock so concurrent encoders/readers cannot observe a partially
+        # updated state (e.g. new quality with stale generation).
+        with self._key_locks_guard:
+            if new_quality == self.default_quality:
+                return False
+            old_quality = self.default_quality
+            old_default_cache = self.default_cache
+            self.default_quality = new_quality
+            self._warm_generation += 1
+            gen = self._warm_generation
 
         if old_default_cache is not None:
             self._executor.submit(
@@ -440,7 +455,8 @@ class EncoderCoordinator:
         Bails out immediately if the generation counter has moved on (i.e. the
         default quality changed again while this task was pending).
         """
-        if generation != self._warm_generation:
+        _, _, current_generation = self._snapshot_default_state()
+        if generation != current_generation:
             return
         try:
             self.encode_for_stream(uuid_id, quality)
