@@ -12,6 +12,7 @@ import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:frontend/ui/artist_page.dart';
+import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 import 'package:frontend/ui/search_page.dart';
@@ -37,25 +38,65 @@ Future<void> main() async {
       androidNotificationOngoing: true,
     ),
   );
-  runApp(ProviderScope(
-    overrides: [
-      databaseProvider.overrideWithValue(db),
-      audioServiceProvider.overrideWithValue(audioHandler),
-      localCoverArtStoreProvider.overrideWithValue(coverArtStore),
-    ],
-    child: const Frontend(),
-  ));
+  runApp(
+    FrontendApp(
+      db: db,
+      audioHandler: audioHandler,
+      coverArtStore: coverArtStore,
+    ),
+  );
+}
+
+class FrontendApp extends StatefulWidget {
+  final AppDatabase db;
+  final AudioServiceBridge audioHandler;
+  final LocalCoverArtStore coverArtStore;
+
+  const FrontendApp({
+    super.key,
+    required this.db,
+    required this.audioHandler,
+    required this.coverArtStore,
+  });
+
+  @override
+  State<FrontendApp> createState() => _FrontendAppState();
+}
+
+class _FrontendAppState extends State<FrontendApp> {
+  int _providerGeneration = 0;
+
+  void _resetProviderScope() {
+    setState(() => _providerGeneration++);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ProviderScope(
+      key: ValueKey(_providerGeneration),
+      overrides: [
+        databaseProvider.overrideWithValue(widget.db),
+        audioServiceProvider.overrideWithValue(widget.audioHandler),
+        localCoverArtStoreProvider.overrideWithValue(widget.coverArtStore),
+      ],
+      child: Frontend(onLocalResetComplete: _resetProviderScope),
+    );
+  }
 }
 
 class Frontend extends ConsumerStatefulWidget {
-  const Frontend({super.key});
+  final VoidCallback? onLocalResetComplete;
+
+  const Frontend({super.key, this.onLocalResetComplete});
 
   @override
   ConsumerState<Frontend> createState() => _FrontendState();
 }
 
 class _FrontendState extends ConsumerState<Frontend> {
-  // Captured once so dispose can deregister exactly the same listener.
+  // Stored so dispose can deregister exactly the same listener. Doing
+  // `ref.read(...).enterOffline` twice yields equal tear-offs in practice,
+  // but capturing once removes any doubt.
   late final void Function() _offlineListener;
 
   @override
@@ -88,13 +129,13 @@ class _FrontendState extends ConsumerState<Frontend> {
       debugShowCheckedModeBanner: false,
       title: 'OSML',
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
-      home: const StartupGate(),
+      home: StartupGate(onLocalResetComplete: widget.onLocalResetComplete),
     );
   }
 }
 
 class AppShell extends ConsumerStatefulWidget {
-  final VoidCallback onDisconnect;
+  final DisconnectCallback onDisconnect;
 
   const AppShell({super.key, required this.onDisconnect});
 
@@ -116,9 +157,7 @@ class _AppShellState extends ConsumerState<AppShell> {
   Widget _buildTabNavigator(int index, Widget Function() rootBuilder) {
     return Navigator(
       key: _navigatorKeys[index],
-      onGenerateRoute: (_) => MaterialPageRoute(
-        builder: (_) => rootBuilder(),
-      ),
+      onGenerateRoute: (_) => MaterialPageRoute(builder: (_) => rootBuilder()),
     );
   }
 
@@ -162,14 +201,8 @@ class _AppShellState extends ConsumerState<AppShell> {
                       onDisconnect: widget.onDisconnect,
                     ),
                   ),
-                  _buildTabNavigator(
-                    2,
-                    () => const DownloadedTracksPage(),
-                  ),
-                  _buildTabNavigator(
-                    3,
-                    () => const SearchPage(),
-                  ),
+                  _buildTabNavigator(2, () => const DownloadedTracksPage()),
+                  _buildTabNavigator(3, () => const SearchPage()),
                 ],
               ),
             ),
@@ -190,10 +223,7 @@ class _AppShellState extends ConsumerState<AppShell> {
               icon: Icon(Icons.download_done),
               label: "Downloads",
             ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.search),
-              label: "Search",
-            ),
+            BottomNavigationBarItem(icon: Icon(Icons.search), label: "Search"),
           ],
         ),
       ),

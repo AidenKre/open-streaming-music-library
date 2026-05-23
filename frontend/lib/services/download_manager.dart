@@ -20,7 +20,9 @@ enum DownloadState { queued, active, completed, failed }
 
 /// Why a single download attempt ended. Drives whether [DownloadManager]
 /// marks the job completed, re-queues it for retry, or fails it.
-enum _DownloadOutcome { success, networkFailure, otherFailure }
+enum _DownloadOutcome { success, networkFailure, otherFailure, cancelled }
+
+class _DownloadCancelled implements Exception {}
 
 /// Sentinel for [DownloadJob.copyWith] so a caller can pass `errorMessage:
 /// null` to genuinely clear the field (a plain `null` default is
@@ -99,10 +101,9 @@ class DownloadQueueState {
   Iterable<DownloadJob> get queued =>
       jobs.where((j) => j.state == DownloadState.queued);
   Iterable<DownloadJob> get finished => jobs.where(
-        (j) =>
-            j.state == DownloadState.completed ||
-            j.state == DownloadState.failed,
-      );
+    (j) =>
+        j.state == DownloadState.completed || j.state == DownloadState.failed,
+  );
 }
 
 /// Coordinates concurrent track + cover-art downloads.
@@ -136,6 +137,21 @@ class DownloadManager extends ChangeNotifier {
   Directory? _downloadDir;
   int _activeCount = 0;
   bool _disposed = false;
+  int _resetGeneration = 0;
+  final Map<String, Future<void> Function()> _activeCancellers = {};
+  final Map<String, Future<void>> _activeWorkers = {};
+
+  /// Test seam fired immediately before the partial→destination rename. Lets a
+  /// test deterministically interleave [resetAndDeleteFiles] with the commit
+  /// step so the rename-race fix can be regressed.
+  @visibleForTesting
+  Future<void> Function(String uuidId)? testHookBeforeRename;
+
+  /// Test seam fired between the rename and the DB write. Exercises the
+  /// narrower window where a worker has produced a tracked file but not yet
+  /// recorded it.
+  @visibleForTesting
+  Future<void> Function(String uuidId)? testHookBeforeDbWrite;
 
   /// Notified once when the underlying tracks table changes such that
   /// downloaded-status checks may have new answers. Lets the UI invalidate
@@ -151,15 +167,15 @@ class DownloadManager extends ChangeNotifier {
     ApiClient? apiClient,
     bool Function()? isOfflineFn,
     void Function()? onNetworkFailure,
-  })  : _db = db,
-        _coverArtStore = coverArtStore,
-        _directoryProvider =
-            directoryProvider ?? getApplicationDocumentsDirectory,
-        _warmService = warmService,
-        _streamQualityFn = streamQualityFn,
-        _apiClient = apiClient ?? ApiClient.instance,
-        _isOfflineFn = isOfflineFn ?? (() => false),
-        _onNetworkFailure = onNetworkFailure;
+  }) : _db = db,
+       _coverArtStore = coverArtStore,
+       _directoryProvider =
+           directoryProvider ?? getApplicationDocumentsDirectory,
+       _warmService = warmService,
+       _streamQualityFn = streamQualityFn,
+       _apiClient = apiClient ?? ApiClient.instance,
+       _isOfflineFn = isOfflineFn ?? (() => false),
+       _onNetworkFailure = onNetworkFailure;
 
   DownloadQueueState get state => _state;
 
@@ -175,9 +191,13 @@ class DownloadManager extends ChangeNotifier {
   }
 
   /// Schedules [tracks] for download at [quality]. Tracks already downloaded
-  /// at any quality are skipped — the user explicitly requested that changing
-  /// the download quality does NOT redownload existing files.
-  Future<void> enqueueTracks(List<TrackUI> tracks, {required String quality}) async {
+  /// at any quality are skipped — the default-quality download path does NOT
+  /// redownload existing files. Callers wanting "give me this at quality X
+  /// even if I already have it at Y" should use [enqueueTracksAtQuality].
+  Future<void> enqueueTracks(
+    List<TrackUI> tracks, {
+    required String quality,
+  }) async {
     if (!isValidQuality(quality)) {
       throw ArgumentError('invalid download quality: $quality');
     }
@@ -185,7 +205,7 @@ class DownloadManager extends ChangeNotifier {
     final additions = <DownloadJob>[];
 
     for (final t in tracks) {
-      if (t.filePath != null && File(t.filePath!).existsSync()) {
+      if (t.filePath != null && await File(t.filePath!).exists()) {
         continue; // already downloaded
       }
       final existing = existingByUuid[t.uuidId];
@@ -194,15 +214,17 @@ class DownloadManager extends ChangeNotifier {
               existing.state == DownloadState.active)) {
         continue;
       }
-      additions.add(DownloadJob(
-        uuidId: t.uuidId,
-        title: t.title,
-        artist: t.artist,
-        albumId: t.albumId,
-        artistId: t.artistId,
-        quality: quality,
-        state: DownloadState.queued,
-      ));
+      additions.add(
+        DownloadJob(
+          uuidId: t.uuidId,
+          title: t.title,
+          artist: t.artist,
+          albumId: t.albumId,
+          artistId: t.artistId,
+          quality: quality,
+          state: DownloadState.queued,
+        ),
+      );
     }
 
     if (additions.isEmpty) return;
@@ -225,12 +247,69 @@ class DownloadManager extends ChangeNotifier {
     _pump();
   }
 
+  /// Schedules [tracks] for download at [quality], re-downloading any track
+  /// whose currently-stored file is at a different bitrate. Tracks whose
+  /// `downloadedBitrateKbps` already matches the requested kbps are skipped.
+  ///
+  /// This is the "explicit user intent" path: when someone picks
+  /// "Download at 320 kbps" from the split-download menu, they want a 320
+  /// kbps copy regardless of what's on disk. Compare with [enqueueTracks],
+  /// which preserves whatever copy already exists.
+  ///
+  /// Edge case: when [quality] is `original`, the requested-kbps lookup is
+  /// undefined (the source bitrate is unknown to the client). We treat that
+  /// as "always re-download" if a file is on disk — that's strictly better
+  /// than silently no-op'ing.
+  Future<void> enqueueTracksAtQuality(
+    List<TrackUI> tracks, {
+    required String quality,
+  }) async {
+    if (!isValidQuality(quality)) {
+      throw ArgumentError('invalid download quality: $quality');
+    }
+
+    final toEnqueue = <TrackUI>[];
+    for (final t in tracks) {
+      final hasFile = t.filePath != null && await File(t.filePath!).exists();
+      if (hasFile && _qualityMatches(t, quality)) {
+        continue; // already at the requested quality
+      }
+      if (hasFile) {
+        // Different quality — drop the stale local copy and queue a fresh
+        // download. deleteDownload also clears tracks.file_path so the
+        // skip-if-downloaded check in enqueueTracks doesn't fire.
+        await deleteDownload(t.uuidId);
+      }
+      // Strip the file path on the in-memory copy too, otherwise the
+      // skip-if-downloaded check in enqueueTracks would re-skip this track
+      // based on the stale value the caller passed in.
+      toEnqueue.add(hasFile ? t.copyWith(filePath: null) : t);
+    }
+
+    if (toEnqueue.isEmpty) return;
+    await enqueueTracks(toEnqueue, quality: quality);
+  }
+
+  /// True iff [track]'s stored downloaded bitrate matches [quality]. Returns
+  /// false for `original` (we don't know the source's true bitrate, so we
+  /// conservatively re-download) and false when `downloadedBitrateKbps` is
+  /// null.
+  bool _qualityMatches(TrackUI track, String quality) {
+    final stored = track.downloadedBitrateKbps;
+    if (stored == null) return false;
+    if (quality == originalQuality) return false;
+    final requested = int.tryParse(quality);
+    if (requested == null) return false;
+    return stored == requested;
+  }
+
   /// Drops the failed/completed history. Active and queued jobs are kept.
   void clearFinished() {
     final remaining = _state.jobs
         .where(
           (j) =>
-              j.state == DownloadState.queued || j.state == DownloadState.active,
+              j.state == DownloadState.queued ||
+              j.state == DownloadState.active,
         )
         .toList(growable: false);
     _state = DownloadQueueState(jobs: remaining);
@@ -250,13 +329,46 @@ class DownloadManager extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Full local-reset hook. It cancels in-flight workers, clears the in-memory
+  /// queue, deletes completed/partial files, and prevents stale workers from
+  /// writing DB state if they complete after the reset generation changes.
+  Future<void> resetAndDeleteFiles() async {
+    _resetGeneration++;
+
+    final workerSnapshot = Map<String, Future<void>>.from(_activeWorkers);
+    final cancellableUuids = _activeCancellers.keys.toList(growable: false);
+    for (final uuid in cancellableUuids) {
+      try {
+        await _activeCancellers[uuid]?.call();
+      } catch (_) {}
+    }
+
+    final cancellableWorkers = [
+      for (final uuid in cancellableUuids)
+        if (workerSnapshot[uuid] != null) workerSnapshot[uuid]!,
+    ];
+    if (cancellableWorkers.isNotEmpty) {
+      await Future.wait(cancellableWorkers);
+    }
+
+    _activeCount = 0;
+    _activeCancellers.clear();
+    _state = const DownloadQueueState();
+
+    await _deleteKnownDownloadedFiles();
+    await _deleteDownloadDirectory();
+
+    _bumpVersion();
+    notifyListeners();
+  }
+
   /// Removes the local file (if any) and clears `tracks.file_path` so the
   /// track reverts to streaming. Cover art is intentionally NOT deleted: it
   /// may be referenced by other tracks the user has downloaded.
   Future<void> deleteDownload(String uuidId) async {
-    final row = await (_db.select(_db.tracks)
-          ..where((t) => t.uuidId.equals(uuidId)))
-        .getSingleOrNull();
+    final row = await (_db.select(
+      _db.tracks,
+    )..where((t) => t.uuidId.equals(uuidId))).getSingleOrNull();
     if (row != null && row.filePath != null) {
       final f = File(row.filePath!);
       if (await f.exists()) {
@@ -265,8 +377,9 @@ class DownloadManager extends ChangeNotifier {
         } catch (_) {}
       }
     }
-    await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuidId)))
-        .write(const TracksCompanion(filePath: Value(null)));
+    await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuidId))).write(
+      const TracksCompanion(filePath: Value(null)),
+    );
     _bumpVersion();
   }
 
@@ -317,23 +430,30 @@ class DownloadManager extends ChangeNotifier {
     // resumeIfPaused() on recovery.
     if (_isOfflineFn()) return;
     while (_activeCount < maxConcurrent) {
-      final idx =
-          _state.jobs.indexWhere((j) => j.state == DownloadState.queued);
+      final idx = _state.jobs.indexWhere(
+        (j) => j.state == DownloadState.queued,
+      );
       if (idx < 0) return;
       _activeCount++;
       _markJob(idx, _state.jobs[idx].copyWith(state: DownloadState.active));
       // Don't await — let workers run concurrently. Errors are captured into
       // the job's failed state.
-      unawaited(_runJob(_state.jobs[idx].uuidId));
+      final generation = _resetGeneration;
+      final uuidId = _state.jobs[idx].uuidId;
+      final worker = _runJob(uuidId, generation);
+      _activeWorkers[uuidId] = worker;
+      unawaited(worker.whenComplete(() => _activeWorkers.remove(uuidId)));
     }
   }
 
-  Future<void> _runJob(String uuidId) async {
+  Future<void> _runJob(String uuidId, int generation) async {
     try {
+      if (generation != _resetGeneration) return;
       final idx = _state.jobs.indexWhere((j) => j.uuidId == uuidId);
       if (idx < 0) return;
       final job = _state.jobs[idx];
-      final outcome = await _downloadOne(job);
+      final outcome = await _downloadOne(job, generation);
+      if (generation != _resetGeneration) return;
       switch (outcome) {
         case _DownloadOutcome.success:
           _markJobByUuid(
@@ -358,15 +478,22 @@ class DownloadManager extends ChangeNotifier {
             uuidId,
             (j) => j.copyWith(state: DownloadState.failed),
           );
+        case _DownloadOutcome.cancelled:
+          return;
       }
     } finally {
-      _activeCount--;
-      _pump();
+      if (generation == _resetGeneration) {
+        _activeCount--;
+        _pump();
+      }
     }
   }
 
-  Future<_DownloadOutcome> _downloadOne(DownloadJob job) async {
+  Future<_DownloadOutcome> _downloadOne(DownloadJob job, int generation) async {
     final dir = await _ensureDownloadDir();
+    if (generation != _resetGeneration) {
+      return _DownloadOutcome.cancelled;
+    }
 
     http.StreamedResponse response;
     try {
@@ -398,6 +525,9 @@ class DownloadManager extends ChangeNotifier {
       _markJobByUuid(job.uuidId, (j) => j.copyWith(errorMessage: e.toString()));
       return _DownloadOutcome.otherFailure;
     }
+    if (generation != _resetGeneration) {
+      return _DownloadOutcome.cancelled;
+    }
 
     // ApiClient.send guarantees a 2xx response or throws — no defensive check needed.
 
@@ -418,50 +548,83 @@ class DownloadManager extends ChangeNotifier {
       final total = response.contentLength ?? 0;
       var received = 0;
       final sink = partial.openWrite();
-      try {
-        await for (final chunk in response.stream) {
-          sink.add(chunk);
-          received += chunk.length;
-          if (total > 0) {
-            _markJobByUuid(
-              job.uuidId,
-              (j) => j.copyWith(progress: received / total),
-            );
-          }
+      StreamSubscription<List<int>>? subscription;
+      final streamDone = Completer<void>();
+      _activeCancellers[job.uuidId] = () async {
+        await subscription?.cancel();
+        if (!streamDone.isCompleted) {
+          streamDone.completeError(_DownloadCancelled());
         }
+      };
+      try {
+        subscription = response.stream.listen(
+          (chunk) {
+            if (generation != _resetGeneration) {
+              return;
+            }
+            sink.add(chunk);
+            received += chunk.length;
+            if (total > 0) {
+              _markJobByUuid(
+                job.uuidId,
+                (j) => j.copyWith(progress: received / total),
+              );
+            }
+          },
+          onDone: () {
+            if (!streamDone.isCompleted) {
+              streamDone.complete();
+            }
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (!streamDone.isCompleted) {
+              streamDone.completeError(error, stackTrace);
+            }
+          },
+          cancelOnError: true,
+        );
+        await streamDone.future;
         await sink.flush();
       } finally {
+        _activeCancellers.remove(job.uuidId);
         await sink.close();
       }
 
-      if (await destination.exists()) await destination.delete();
-      await partial.rename(destination.path);
+      if (generation != _resetGeneration) {
+        await _deleteIfExists(partial);
+        return _DownloadOutcome.cancelled;
+      }
+
+      // Parse the actual bitrate the server served (may differ from source).
+      final bitrateHeader = response.headers['x-audio-bitrate-kbps'];
+      final downloadedBitrate = bitrateHeader != null
+          ? int.tryParse(bitrateHeader)
+          : null;
+
+      final committed = await _commitDownload(
+        uuidId: job.uuidId,
+        partial: partial,
+        destination: destination,
+        generation: generation,
+        downloadedBitrate: downloadedBitrate,
+        received: received,
+      );
+      if (!committed) return _DownloadOutcome.cancelled;
 
       // Try to grab the cover art too. We don't fail the whole job if this
       // fails — the audio is what matters for playback.
       await _downloadCoverArtForTrack(job.uuidId);
 
-      // Parse the actual bitrate the server served (may differ from source).
-      final bitrateHeader = response.headers['x-audio-bitrate-kbps'];
-      final downloadedBitrate =
-          bitrateHeader != null ? int.tryParse(bitrateHeader) : null;
-
-      // Persist the local file path, downloaded bitrate, and file size.
-      await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(job.uuidId)))
-          .write(TracksCompanion(
-            filePath: Value(destination.path),
-            downloadedBitrateKbps: Value(downloadedBitrate),
-            fileSizeBytes: Value(received),
-          ));
-
       _markJobByUuid(job.uuidId, (j) => j.copyWith(fileSizeBytes: received));
 
       return _DownloadOutcome.success;
+    } on _DownloadCancelled {
+      try {
+        if (await partial.exists()) await partial.delete();
+      } catch (_) {}
+      return _DownloadOutcome.cancelled;
     } catch (e) {
-      _markJobByUuid(
-        job.uuidId,
-        (j) => j.copyWith(errorMessage: e.toString()),
-      );
+      _markJobByUuid(job.uuidId, (j) => j.copyWith(errorMessage: e.toString()));
       try {
         if (await partial.exists()) await partial.delete();
       } catch (_) {}
@@ -477,6 +640,52 @@ class DownloadManager extends ChangeNotifier {
       }
       return _DownloadOutcome.otherFailure;
     }
+  }
+
+  /// Performs the partial→destination rename and the DB row update under a
+  /// generation guard. Returns true on commit, false if the reset generation
+  /// moved during the commit (in which case any state left on disk is cleaned
+  /// up so [resetAndDeleteFiles] doesn't leak files or DB rows).
+  Future<bool> _commitDownload({
+    required String uuidId,
+    required File partial,
+    required File destination,
+    required int generation,
+    required int? downloadedBitrate,
+    required int received,
+  }) async {
+    final beforeRename = testHookBeforeRename;
+    if (beforeRename != null) await beforeRename(uuidId);
+
+    if (generation != _resetGeneration) {
+      await _deleteIfExists(partial);
+      return false;
+    }
+
+    if (await destination.exists()) await destination.delete();
+    await partial.rename(destination.path);
+
+    final beforeDbWrite = testHookBeforeDbWrite;
+    if (beforeDbWrite != null) await beforeDbWrite(uuidId);
+
+    // Reset happened between rename and DB write. The destination file isn't
+    // referenced by any row yet, so resetAndDeleteFiles couldn't have deleted
+    // it — clean up here.
+    if (generation != _resetGeneration) {
+      await _deleteIfExists(destination);
+      return false;
+    }
+
+    await (_db.update(
+      _db.tracks,
+    )..where((t) => t.uuidId.equals(uuidId))).write(
+      TracksCompanion(
+        filePath: Value(destination.path),
+        downloadedBitrateKbps: Value(downloadedBitrate),
+        fileSizeBytes: Value(received),
+      ),
+    );
+    return true;
   }
 
   Future<void> _downloadCoverArtForTrack(String uuidId) async {
@@ -501,6 +710,40 @@ class DownloadManager extends ChangeNotifier {
     await dir.create(recursive: true);
     _downloadDir = dir;
     return dir;
+  }
+
+  Future<void> _deleteKnownDownloadedFiles() async {
+    final rows = await _db
+        .customSelect(
+          'SELECT file_path FROM tracks WHERE file_path IS NOT NULL',
+          readsFrom: {_db.tracks},
+        )
+        .get();
+    for (final row in rows) {
+      final path = row.readNullable<String>('file_path');
+      if (path == null) continue;
+      await _deleteIfExists(File(path));
+    }
+  }
+
+  Future<void> _deleteDownloadDirectory() async {
+    final dir =
+        _downloadDir ??
+        Directory(p.join((await _directoryProvider()).path, 'tracks'));
+    _downloadDir = null;
+    try {
+      if (await dir.exists()) {
+        await dir.delete(recursive: true);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _deleteIfExists(File file) async {
+    try {
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {}
   }
 
   void _markJob(int idx, DownloadJob updated) {
@@ -537,7 +780,7 @@ class DownloadManager extends ChangeNotifier {
     final result = <String>{};
     for (final r in rows) {
       final path = r.readNullable<String>('file_path');
-      if (path != null && File(path).existsSync()) {
+      if (path != null && await File(path).exists()) {
         result.add(r.read<String>('uuid_id'));
       }
     }

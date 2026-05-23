@@ -7,6 +7,7 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/settings_dialog.dart';
@@ -15,7 +16,7 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 class TracksPage extends ConsumerStatefulWidget {
   final int? artistId;
   final int? albumId;
-  final VoidCallback? onDisconnect;
+  final DisconnectCallback? onDisconnect;
 
   const TracksPage({super.key, this.artistId, this.albumId, this.onDisconnect});
 
@@ -66,9 +67,7 @@ class TracksPageState extends ConsumerState<TracksPage>
     final repo = ref.read(browseRepositoryProvider);
     return repo.getTracks(
       orderBy: _orderParams,
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
       artistId: widget.artistId,
       albumId: widget.albumId,
       limit: pageSize,
@@ -80,9 +79,7 @@ class TracksPageState extends ConsumerState<TracksPage>
     final repo = ref.read(browseRepositoryProvider);
     return repo.watchTrackCount(
       orderBy: useCursor ? _orderParams : [],
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
       artistId: widget.artistId,
       albumId: widget.albumId,
     );
@@ -147,11 +144,11 @@ class TracksPageState extends ConsumerState<TracksPage>
               if (job != null) {
                 trailing = switch (job.state) {
                   DownloadState.active => SizedBox(
-                      width: 80,
-                      child: LinearProgressIndicator(
-                        value: job.progress > 0 ? job.progress : null,
-                      ),
+                    width: 80,
+                    child: LinearProgressIndicator(
+                      value: job.progress > 0 ? job.progress : null,
                     ),
+                  ),
                   DownloadState.queued => const Icon(Icons.schedule, size: 16),
                   _ => null,
                 };
@@ -165,23 +162,26 @@ class TracksPageState extends ConsumerState<TracksPage>
                 trailing: trailing,
                 isDimmed: isOffline && !track.isDownloaded,
                 isInteractive: isInteractive,
-                onTap: () => ref.read(audioProvider.notifier).playFromQueue(
-                  track: track,
-                  sourceType: widget.albumId != null
-                      ? 'album'
-                      : widget.artistId != null
+                onTap: () => ref
+                    .read(audioProvider.notifier)
+                    .playFromQueue(
+                      track: track,
+                      sourceType: widget.albumId != null
+                          ? 'album'
+                          : widget.artistId != null
                           ? 'artist'
                           : 'library',
-                  artistId: widget.artistId,
-                  albumId: widget.albumId,
-                  orderParams: _orderParams,
-                ),
+                      artistId: widget.artistId,
+                      albumId: widget.albumId,
+                      orderParams: _orderParams,
+                    ),
                 onPlayNext: () =>
                     ref.read(audioProvider.notifier).playNext([track]),
                 onAddToQueue: () =>
                     ref.read(audioProvider.notifier).addToQueue([track]),
                 onDownload: () => downloadTrack(ref, track),
-                onDownloadAtQuality: (q) => downloadTrackAtQuality(ref, track, q),
+                onDownloadAtQuality: (q) =>
+                    downloadTrackAtQuality(ref, track, q),
                 onDeleteDownload: () => deleteTrackDownload(ref, track.uuidId),
               );
             },
@@ -209,16 +209,16 @@ class TracksPageState extends ConsumerState<TracksPage>
 List<Widget> buildTopBarActions(
   BuildContext context,
   WidgetRef ref,
-  VoidCallback? onDisconnect,
+  DisconnectCallback? onDisconnect,
 ) {
   return [
     IconButton(
       icon: const Icon(Icons.download),
       tooltip: 'Downloads',
       onPressed: () {
-        Navigator.of(context).push(
-          MaterialPageRoute(builder: (_) => const DownloadingPage()),
-        );
+        Navigator.of(
+          context,
+        ).push(MaterialPageRoute(builder: (_) => const DownloadingPage()));
       },
     ),
     IconButton(

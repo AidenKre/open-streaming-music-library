@@ -612,6 +612,10 @@ String prepareFtsQuery(String rawQuery) {
   return terms.map((t) => '"${t.replaceAll('"', '""')}"*').join(' ');
 }
 
+String _quoteSqlIdentifier(String identifier) {
+  return '"${identifier.replaceAll('"', '""')}"';
+}
+
 // ── Database ────────────────────────────────────────────────────────────
 
 @DriftDatabase(
@@ -657,6 +661,34 @@ class AppDatabase extends _$AppDatabase {
       }
     },
   );
+
+  Future<void> resetLocalData() async {
+    await transaction(() async {
+      final ftsTables = await customSelect(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' "
+        "AND sql LIKE 'CREATE VIRTUAL TABLE%USING fts5%'",
+        readsFrom: {},
+      ).get();
+      for (final row in ftsTables) {
+        final name = row.read<String>('name');
+        final quoted = _quoteSqlIdentifier(name);
+        await customStatement(
+          "INSERT INTO $quoted($quoted) VALUES('delete-all')",
+        );
+      }
+
+      for (final table in allTables.toList().reversed) {
+        await customStatement(
+          'DELETE FROM ${_quoteSqlIdentifier(table.actualTableName)}',
+        );
+      }
+
+      try {
+        await customStatement('DELETE FROM sqlite_sequence');
+      } catch (_) {}
+    });
+  }
 
   // ── Track queries ─────────────────────────────────────────────────────
 
@@ -916,8 +948,13 @@ class AppDatabase extends _$AppDatabase {
     ).watch().map((rows) => rows.first.read<int>('c'));
   }
 
-  Future<Map<String, ({String? filePath, int? downloadedBitrateKbps, int? fileSizeBytes})>>
-      getTrackDownloadStates(List<String> uuids) async {
+  Future<
+    Map<
+      String,
+      ({String? filePath, int? downloadedBitrateKbps, int? fileSizeBytes})
+    >
+  >
+  getTrackDownloadStates(List<String> uuids) async {
     if (uuids.isEmpty) return {};
     final placeholders = List.filled(uuids.length, '?').join(', ');
     final rows = await customSelect(
@@ -1306,18 +1343,18 @@ class AppDatabase extends _$AppDatabase {
     // dropped before we ever see it.
     final trackDownloadedFilter = downloadedOnly
         ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
-            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-            'WHERE tm.rowid = fts_tracks.rowid AND t.file_path IS NOT NULL)'
+              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+              'WHERE tm.rowid = fts_tracks.rowid AND t.file_path IS NOT NULL)'
         : '';
     final artistDownloadedFilter = downloadedOnly
         ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
-            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-            'WHERE tm.artist_id = fts_artists.rowid AND t.file_path IS NOT NULL)'
+              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+              'WHERE tm.artist_id = fts_artists.rowid AND t.file_path IS NOT NULL)'
         : '';
     final albumDownloadedFilter = downloadedOnly
         ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
-            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-            'WHERE tm.album_id = fts_albums.rowid AND t.file_path IS NOT NULL)'
+              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+              'WHERE tm.album_id = fts_albums.rowid AND t.file_path IS NOT NULL)'
         : '';
 
     if (searchTracks) {

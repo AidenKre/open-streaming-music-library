@@ -17,7 +17,14 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/queue_warm_service.dart';
 
-TrackUI _track(String uuid, {String? title, String? artist, int? coverArtId}) {
+TrackUI _track(
+  String uuid, {
+  String? title,
+  String? artist,
+  int? coverArtId,
+  String? filePath,
+  int? downloadedBitrateKbps,
+}) {
   return TrackUI(
     uuidId: uuid,
     createdAt: 0,
@@ -30,6 +37,8 @@ TrackUI _track(String uuid, {String? title, String? artist, int? coverArtId}) {
     channels: 2,
     hasAlbumArt: coverArtId != null,
     coverArtId: coverArtId,
+    filePath: filePath,
+    downloadedBitrateKbps: downloadedBitrateKbps,
   );
 }
 
@@ -39,16 +48,22 @@ Future<void> _insertTrack(
   int? coverArtId,
   bool hasAlbumArt = false,
   String? filePath,
+  int? downloadedBitrateKbps,
 }) async {
-  await db.into(db.tracks).insert(
+  await db
+      .into(db.tracks)
+      .insert(
         TracksCompanion.insert(
           uuidId: uuid,
           createdAt: 0,
           lastUpdated: 0,
           filePath: Value(filePath),
+          downloadedBitrateKbps: Value(downloadedBitrateKbps),
         ),
       );
-  await db.into(db.trackmetadata).insert(
+  await db
+      .into(db.trackmetadata)
+      .insert(
         TrackmetadataCompanion.insert(
           uuidId: uuid,
           duration: 120,
@@ -63,11 +78,36 @@ Future<void> _insertTrack(
 
 Future<DownloadManager> _waitForFinish(DownloadManager m) async {
   // Wait for all in-flight jobs to leave the active state.
-  while (m.snapshot().any((j) => j.state == DownloadState.active ||
-      j.state == DownloadState.queued)) {
+  while (m.snapshot().any(
+    (j) => j.state == DownloadState.active || j.state == DownloadState.queued,
+  )) {
     await Future<void>.delayed(const Duration(milliseconds: 5));
   }
   return m;
+}
+
+Future<void> _waitFor(bool Function() condition) async {
+  for (var i = 0; i < 300; i++) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  throw StateError('condition was not met in time');
+}
+
+class _StreamingClient extends http.BaseClient {
+  _StreamingClient(this.stream);
+
+  final Stream<List<int>> stream;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    return http.StreamedResponse(
+      stream,
+      200,
+      contentLength: 10,
+      headers: {'x-audio-extension': 'mp3'},
+    );
+  }
 }
 
 void main() {
@@ -160,9 +200,9 @@ void main() {
     expect(job.state, DownloadState.completed);
     expect(job.progress, 1.0);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, isNotNull);
     expect(File(row.filePath!).existsSync(), isTrue);
     expect(await File(row.filePath!).readAsBytes(), [1, 2, 3, 4]);
@@ -172,66 +212,269 @@ void main() {
     expect(row.downloadedBitrateKbps, 320);
   });
 
+  test(
+    'resetAndDeleteFiles deletes completed files and clears job history',
+    () async {
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await _waitForFinish(manager);
+      final path = (await db.select(db.tracks).getSingle()).filePath!;
+      expect(File(path).existsSync(), isTrue);
+      expect(manager.snapshot(), hasLength(1));
+
+      await manager.resetAndDeleteFiles();
+
+      expect(manager.snapshot(), isEmpty);
+      expect(File(path).existsSync(), isFalse);
+      expect(Directory(p.join(tempDir.path, 'tracks')).existsSync(), isFalse);
+    },
+  );
+
+  test(
+    'resetAndDeleteFiles cancels active workers before they persist',
+    () async {
+      await _insertTrack(db, 'active');
+      final stream = StreamController<List<int>>();
+      final manager = buildManager(client: _StreamingClient(stream.stream));
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracks([_track('active')], quality: originalQuality);
+      await _waitFor(() {
+        return manager.snapshot().any((j) => j.state == DownloadState.active);
+      });
+      stream.add([1, 2, 3]);
+      await _waitFor(() {
+        return manager.snapshot().any((j) => j.progress > 0);
+      });
+
+      await manager.resetAndDeleteFiles();
+      await stream.close();
+
+      final row = await db.select(db.tracks).getSingle();
+      expect(row.filePath, isNull);
+      expect(manager.snapshot(), isEmpty);
+      expect(Directory(p.join(tempDir.path, 'tracks')).existsSync(), isFalse);
+    },
+  );
+
+  test(
+    'reset before rename leaves no files and no file_path row',
+    () async {
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+      );
+      addTearDown(manager.dispose);
+
+      // Block the worker just before it renames the partial into place. Then
+      // trigger reset; once reset completes, release the worker so it observes
+      // the bumped generation and aborts the commit.
+      final hookEntered = Completer<void>();
+      final releaseHook = Completer<void>();
+      manager.testHookBeforeRename = (_) async {
+        if (!hookEntered.isCompleted) hookEntered.complete();
+        await releaseHook.future;
+      };
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await hookEntered.future;
+
+      // Kick off the reset; it must finish even though the worker is paused
+      // mid-commit (the partial download was already drained).
+      final resetFuture = manager.resetAndDeleteFiles();
+      // Yield once so resetAndDeleteFiles has a chance to bump the generation
+      // before we let the hook proceed.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      releaseHook.complete();
+      await resetFuture;
+      await _waitForFinish(manager);
+
+      final row = await db.select(db.tracks).getSingle();
+      expect(row.filePath, isNull);
+      expect(Directory(p.join(tempDir.path, 'tracks')).existsSync(), isFalse);
+    },
+  );
+
+  test(
+    'reset between rename and DB write deletes the orphan destination file',
+    () async {
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+      );
+      addTearDown(manager.dispose);
+
+      final hookEntered = Completer<void>();
+      final releaseHook = Completer<void>();
+      manager.testHookBeforeDbWrite = (_) async {
+        if (!hookEntered.isCompleted) hookEntered.complete();
+        await releaseHook.future;
+      };
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await hookEntered.future;
+
+      // At this point the rename has happened — the destination file exists
+      // but no DB row references it yet.
+      final tracksDir = Directory(p.join(tempDir.path, 'tracks'));
+      final renamed = tracksDir
+          .listSync()
+          .whereType<File>()
+          .where((f) => !f.path.endsWith('.partial'))
+          .toList();
+      expect(renamed, hasLength(1));
+      final destinationPath = renamed.first.path;
+
+      final resetFuture = manager.resetAndDeleteFiles();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      releaseHook.complete();
+      await resetFuture;
+      await _waitForFinish(manager);
+
+      // _deleteKnownDownloadedFiles couldn't have caught this file (it had no
+      // DB row at reset time). The commit guard must have cleaned it up.
+      expect(File(destinationPath).existsSync(), isFalse);
+      final row = await db.select(db.tracks).getSingle();
+      expect(row.filePath, isNull);
+    },
+  );
+
+  test('enqueueTracks yields the event loop before completing (async I/O)', () async {
+    // Proves the existence check is genuinely async: a microtask interleaved
+    // between calling enqueueTracks and awaiting it must observe the call as
+    // not-yet-complete. A blocking existsSync() would complete synchronously
+    // and the interleaved flag would already be true.
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1], 200)),
+    );
+    addTearDown(manager.dispose);
+
+    final tracks = <TrackUI>[];
+    for (var i = 0; i < 30; i++) {
+      final filePath = p.join(tempDir.path, 'present-$i.audio');
+      await File(filePath).writeAsBytes([1]);
+      await _insertTrack(db, 'present-$i', filePath: filePath);
+      tracks.add(_track('present-$i').copyWithFilePath(filePath));
+    }
+
+    var completed = false;
+    final future = manager.enqueueTracks(tracks, quality: '320')
+        .then((_) => completed = true);
+    // After kicking off enqueueTracks we yield exactly one microtask. If the
+    // body were synchronous-blocking, `completed` would already be true here.
+    await Future<void>.value();
+    expect(completed, isFalse,
+        reason: 'enqueueTracks must yield between sync setup and async I/O');
+    await future;
+    expect(completed, isTrue);
+    expect(manager.snapshot(), isEmpty);
+  });
+
+  test('downloadedUuidsForUuids uses async I/O for existence checks', () async {
+    // Same async-ness assertion as above, but for the second site that was
+    // converted from existsSync() to await file.exists().
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1], 200)),
+    );
+    addTearDown(manager.dispose);
+
+    final uuids = <String>[];
+    for (var i = 0; i < 10; i++) {
+      final filePath = p.join(tempDir.path, 'p-$i.audio');
+      await File(filePath).writeAsBytes([1]);
+      await _insertTrack(db, 'p-$i', filePath: filePath);
+      uuids.add('p-$i');
+    }
+
+    var completed = false;
+    final future = manager.downloadedUuidsForUuids(uuids)
+        .then((set) {
+      completed = true;
+      return set;
+    });
+    await Future<void>.value();
+    expect(completed, isFalse,
+        reason: 'downloadedUuidsForUuids must not block on existsSync');
+    final result = await future;
+    expect(result, equals(uuids.toSet()));
+  });
+
   test('transcoded quality always saves as .m4a', () async {
     await _insertTrack(db, 'abc');
     final manager = buildManager(
-      client: MockClient((_) async => http.Response.bytes(
-        [1],
-        200,
-        headers: {'x-audio-extension': 'flac'}, // header should be ignored
-      )),
+      client: MockClient(
+        (_) async => http.Response.bytes(
+          [1],
+          200,
+          headers: {'x-audio-extension': 'flac'}, // header should be ignored
+        ),
+      ),
     );
     addTearDown(manager.dispose);
 
     await manager.enqueueTracks([_track('abc')], quality: '128');
     await _waitForFinish(manager);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, endsWith('.m4a'));
   });
 
-  test('original quality uses X-Audio-Extension header for extension', () async {
-    await _insertTrack(db, 'abc');
-    final manager = buildManager(
-      client: MockClient((_) async => http.Response.bytes(
-        [1, 2],
-        200,
-        headers: {'x-audio-extension': 'flac'},
-      )),
-    );
-    addTearDown(manager.dispose);
+  test(
+    'original quality uses X-Audio-Extension header for extension',
+    () async {
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient(
+          (_) async => http.Response.bytes(
+            [1, 2],
+            200,
+            headers: {'x-audio-extension': 'flac'},
+          ),
+        ),
+      );
+      addTearDown(manager.dispose);
 
-    await manager.enqueueTracks([_track('abc')], quality: originalQuality);
-    await _waitForFinish(manager);
+      await manager.enqueueTracks([_track('abc')], quality: originalQuality);
+      await _waitForFinish(manager);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
-    expect(row.filePath, endsWith('.flac'));
-  });
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, endsWith('.flac'));
+    },
+  );
 
-  test('stores downloaded_bitrate_kbps from X-Audio-Bitrate-Kbps header',
-      () async {
-    await _insertTrack(db, 'abc');
-    final manager = buildManager(
-      client: MockClient((_) async => http.Response.bytes(
-        [1],
-        200,
-        headers: {'x-audio-bitrate-kbps': '96'},
-      )),
-    );
-    addTearDown(manager.dispose);
+  test(
+    'stores downloaded_bitrate_kbps from X-Audio-Bitrate-Kbps header',
+    () async {
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient(
+          (_) async => http.Response.bytes(
+            [1],
+            200,
+            headers: {'x-audio-bitrate-kbps': '96'},
+          ),
+        ),
+      );
+      addTearDown(manager.dispose);
 
-    await manager.enqueueTracks([_track('abc')], quality: '320');
-    await _waitForFinish(manager);
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await _waitForFinish(manager);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
-    expect(row.downloadedBitrateKbps, 96);
-  });
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.downloadedBitrateKbps, 96);
+    },
+  );
 
   test('downloaded_bitrate_kbps is null when header absent', () async {
     await _insertTrack(db, 'abc');
@@ -243,9 +486,9 @@ void main() {
     await manager.enqueueTracks([_track('abc')], quality: '320');
     await _waitForFinish(manager);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.downloadedBitrateKbps, isNull);
   });
 
@@ -259,9 +502,9 @@ void main() {
     await manager.enqueueTracks([_track('abc')], quality: originalQuality);
     await _waitForFinish(manager);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, endsWith('.audio'));
   });
 
@@ -289,12 +532,201 @@ void main() {
     );
     addTearDown(manager.dispose);
 
-    await manager.enqueueTracks(
-      [_track('abc').copyWithFilePath(existingPath)],
-      quality: '320',
-    );
+    await manager.enqueueTracks([
+      _track('abc').copyWithFilePath(existingPath),
+    ], quality: '320');
     expect(manager.snapshot(), isEmpty);
   });
+
+  test(
+    'enqueueTracks default path skips already-downloaded tracks regardless of '
+    'requested quality',
+    () async {
+      // Track is on disk at 128 kbps but the caller asks for 320 — the
+      // default-quality download path must preserve the existing file (this
+      // is the documented contract; the explicit-quality path is what
+      // re-downloads).
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 128,
+      );
+
+      var requestCount = 0;
+      final manager = buildManager(
+        client: MockClient((_) async {
+          requestCount++;
+          return http.Response.bytes([1], 200);
+        }),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracks([
+        _track(
+          'abc',
+          filePath: existingPath,
+          downloadedBitrateKbps: 128,
+        ),
+      ], quality: '320');
+
+      expect(manager.snapshot(), isEmpty);
+      expect(requestCount, 0);
+      // File and bitrate untouched.
+      expect(File(existingPath).existsSync(), isTrue);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, existingPath);
+      expect(row.downloadedBitrateKbps, 128);
+    },
+  );
+
+  test(
+    'enqueueTracksAtQuality skips when stored bitrate matches requested',
+    () async {
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 320,
+      );
+
+      var requestCount = 0;
+      final manager = buildManager(
+        client: MockClient((_) async {
+          requestCount++;
+          return http.Response.bytes([1], 200);
+        }),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality([
+        _track(
+          'abc',
+          filePath: existingPath,
+          downloadedBitrateKbps: 320,
+        ),
+      ], quality: '320');
+
+      expect(manager.snapshot(), isEmpty);
+      expect(requestCount, 0);
+      // File and bitrate untouched.
+      expect(File(existingPath).existsSync(), isTrue);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, existingPath);
+      expect(row.downloadedBitrateKbps, 320);
+    },
+  );
+
+  test(
+    'enqueueTracksAtQuality deletes stale file and re-downloads when bitrate '
+    'differs',
+    () async {
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([9, 9, 9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 128,
+      );
+
+      var requestCount = 0;
+      final manager = buildManager(
+        client: MockClient((req) async {
+          requestCount++;
+          expect(req.url.queryParameters['quality'], '320');
+          return http.Response.bytes(
+            [1, 2, 3, 4],
+            200,
+            headers: {'x-audio-bitrate-kbps': '320'},
+          );
+        }),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality([
+        _track(
+          'abc',
+          filePath: existingPath,
+          downloadedBitrateKbps: 128,
+        ),
+      ], quality: '320');
+      await _waitForFinish(manager);
+
+      // The stale 128 kbps file must be gone.
+      expect(File(existingPath).existsSync(), isFalse);
+      // The server was hit.
+      expect(requestCount, 1);
+      // The job completed and the row now points at the new 320 kbps file.
+      final job = manager.snapshot().first;
+      expect(job.state, DownloadState.completed);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, isNotNull);
+      expect(row.filePath, isNot(existingPath));
+      expect(File(row.filePath!).existsSync(), isTrue);
+      expect(row.downloadedBitrateKbps, 320);
+    },
+  );
+
+  test(
+    'enqueueTracksAtQuality always re-downloads when quality is original',
+    () async {
+      // The source's true bitrate isn't known to the client, so an
+      // already-downloaded file at any bitrate must NOT match a request for
+      // `original` — we conservatively re-download. Regressing this branch
+      // (returning true for original) would silently restore the old no-op
+      // bug for users picking "Download at Original" on a 320 kbps copy.
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([5, 5, 5]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 320,
+      );
+
+      var requestCount = 0;
+      final manager = buildManager(
+        client: MockClient((req) async {
+          requestCount++;
+          expect(req.url.queryParameters.containsKey('quality'), isFalse);
+          return http.Response.bytes(
+            [7, 7, 7],
+            200,
+            headers: {'x-audio-extension': 'flac'},
+          );
+        }),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality([
+        _track(
+          'abc',
+          filePath: existingPath,
+          downloadedBitrateKbps: 320,
+        ),
+      ], quality: originalQuality);
+      await _waitForFinish(manager);
+
+      expect(File(existingPath).existsSync(), isFalse);
+      expect(requestCount, 1);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, isNotNull);
+      expect(row.filePath, isNot(existingPath));
+    },
+  );
 
   test('recovers from a transient 503 on the audio stream', () async {
     await _insertTrack(db, 'abc');
@@ -316,14 +748,17 @@ void main() {
     await manager.enqueueTracks([_track('abc')], quality: '320');
     await _waitForFinish(manager);
 
-    expect(calls, 2,
-        reason: 'request factory must be invoked once per attempt');
+    expect(
+      calls,
+      2,
+      reason: 'request factory must be invoked once per attempt',
+    );
     final job = manager.snapshot().first;
     expect(job.state, DownloadState.completed);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, isNotNull);
     expect(File(row.filePath!).existsSync(), isTrue);
     expect(await File(row.filePath!).readAsBytes(), [1, 2, 3, 4]);
@@ -331,13 +766,13 @@ void main() {
 
   test('cover-art FS failure does not fail the audio job', () async {
     const coverArtId = 555;
-    await _insertTrack(db, 'abc',
-        coverArtId: coverArtId, hasAlbumArt: true);
+    await _insertTrack(db, 'abc', coverArtId: coverArtId, hasAlbumArt: true);
 
     // Pre-create a non-empty directory where the cover art file would land
     // so the LocalCoverArtStore's rename throws FileSystemException.
-    final blockingDir =
-        Directory(p.join(coverStore.directory.path, '$coverArtId.bin'));
+    final blockingDir = Directory(
+      p.join(coverStore.directory.path, '$coverArtId.bin'),
+    );
     await blockingDir.create(recursive: true);
     await File(p.join(blockingDir.path, 'inside')).writeAsBytes([0]);
 
@@ -362,72 +797,83 @@ void main() {
     await _waitForFinish(manager);
 
     final job = manager.snapshot().first;
-    expect(job.state, DownloadState.completed,
-        reason: 'cover-art FS failure must not fail the audio job');
+    expect(
+      job.state,
+      DownloadState.completed,
+      reason: 'cover-art FS failure must not fail the audio job',
+    );
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, isNotNull);
     expect(File(row.filePath!).existsSync(), isTrue);
   });
 
-  test('failed downloads surface as failed jobs and leave file_path null',
-      () async {
-    await _insertTrack(db, 'abc');
-    final manager = buildManager(
-      client: MockClient((_) async => http.Response('boom', 500)),
-    );
-    addTearDown(manager.dispose);
+  test(
+    'failed downloads surface as failed jobs and leave file_path null',
+    () async {
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response('boom', 500)),
+      );
+      addTearDown(manager.dispose);
 
-    await manager.enqueueTracks([_track('abc')], quality: '320');
-    await _waitForFinish(manager);
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await _waitForFinish(manager);
 
-    final job = manager.snapshot().first;
-    expect(job.state, DownloadState.failed);
+      final job = manager.snapshot().first;
+      expect(job.state, DownloadState.failed);
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
-    expect(row.filePath, isNull);
-  });
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, isNull);
+    },
+  );
 
-  test('a mid-stream network failure re-queues the job and reports offline',
-      () async {
-    await _insertTrack(db, 'abc');
-    var offline = false;
-    final manager = buildManager(
-      client: MockClient.streaming((req, _) async => http.StreamedResponse(
+  test(
+    'a mid-stream network failure re-queues the job and reports offline',
+    () async {
+      await _insertTrack(db, 'abc');
+      var offline = false;
+      final manager = buildManager(
+        client: MockClient.streaming(
+          (req, _) async => http.StreamedResponse(
             failingStream(const SocketException('connection reset')),
             200,
             contentLength: 999,
-          )),
-      // Once offline is reported the pump pauses, so the re-queued job stays
-      // queued instead of being retried into a tight loop.
-      isOfflineFn: () => offline,
-      onNetworkFailure: () => offline = true,
-    );
-    addTearDown(manager.dispose);
+          ),
+        ),
+        // Once offline is reported the pump pauses, so the re-queued job stays
+        // queued instead of being retried into a tight loop.
+        isOfflineFn: () => offline,
+        onNetworkFailure: () => offline = true,
+      );
+      addTearDown(manager.dispose);
 
-    await manager.enqueueTracks([_track('abc')], quality: '320');
-    await waitUntilNotActive(manager);
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await waitUntilNotActive(manager);
 
-    expect(offline, isTrue);
-    final job = manager.snapshot().first;
-    expect(job.state, DownloadState.queued);
-    expect(job.errorMessage, isNull);
-    expect(job.progress, 0.0);
-  });
+      expect(offline, isTrue);
+      final job = manager.snapshot().first;
+      expect(job.state, DownloadState.queued);
+      expect(job.errorMessage, isNull);
+      expect(job.progress, 0.0);
+    },
+  );
 
   test('a non-network mid-stream failure fails the job', () async {
     await _insertTrack(db, 'abc');
     var networkReported = false;
     final manager = buildManager(
-      client: MockClient.streaming((req, _) async => http.StreamedResponse(
-            failingStream(const FormatException('corrupt payload')),
-            200,
-            contentLength: 999,
-          )),
+      client: MockClient.streaming(
+        (req, _) async => http.StreamedResponse(
+          failingStream(const FormatException('corrupt payload')),
+          200,
+          contentLength: 999,
+        ),
+      ),
       onNetworkFailure: () => networkReported = true,
     );
     addTearDown(manager.dispose);
@@ -484,23 +930,25 @@ void main() {
     expect(manager.snapshot().any((j) => j.uuidId == 't5'), isFalse);
   });
 
-  test('cancelQueued is a no-op for an already-active or unknown uuid',
-      () async {
-    final manager = buildManager(
-      client: MockClient((_) async => http.Response.bytes([1], 200)),
-    );
-    addTearDown(manager.dispose);
+  test(
+    'cancelQueued is a no-op for an already-active or unknown uuid',
+    () async {
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response.bytes([1], 200)),
+      );
+      addTearDown(manager.dispose);
 
-    await _insertTrack(db, 'abc');
-    await manager.enqueueTracks([_track('abc')], quality: '320');
-    await _waitForFinish(manager);
+      await _insertTrack(db, 'abc');
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await _waitForFinish(manager);
 
-    // No throw on unknown id, no change to the snapshot.
-    final before = manager.snapshot().length;
-    manager.cancelQueued('unknown');
-    manager.cancelQueued('abc');
-    expect(manager.snapshot().length, before);
-  });
+      // No throw on unknown id, no change to the snapshot.
+      final before = manager.snapshot().length;
+      manager.cancelQueued('unknown');
+      manager.cancelQueued('abc');
+      expect(manager.snapshot().length, before);
+    },
+  );
 
   test('clearFinished drops completed jobs', () async {
     await _insertTrack(db, 'abc');
@@ -534,9 +982,9 @@ void main() {
     await manager.deleteDownload('abc');
 
     expect(File(localPath).existsSync(), isFalse);
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, isNull);
   });
 
@@ -551,30 +999,36 @@ void main() {
 
     await manager.deleteDownload('abc');
 
-    final row = await (db.select(db.tracks)
-          ..where((t) => t.uuidId.equals('abc')))
-        .getSingle();
+    final row = await (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, isNull);
   });
 
-  test('downloadedUuidsForUuids only includes uuids whose file is on disk',
-      () async {
-    final present = p.join(tempDir.path, 'present.audio');
-    final missing = p.join(tempDir.path, 'missing.audio');
-    await File(present).writeAsBytes([1]);
-    await _insertTrack(db, 'present', filePath: present);
-    await _insertTrack(db, 'missing', filePath: missing);
-    await _insertTrack(db, 'never');
+  test(
+    'downloadedUuidsForUuids only includes uuids whose file is on disk',
+    () async {
+      final present = p.join(tempDir.path, 'present.audio');
+      final missing = p.join(tempDir.path, 'missing.audio');
+      await File(present).writeAsBytes([1]);
+      await _insertTrack(db, 'present', filePath: present);
+      await _insertTrack(db, 'missing', filePath: missing);
+      await _insertTrack(db, 'never');
 
-    final manager = buildManager(
-      client: MockClient((_) async => http.Response('', 404)),
-    );
-    addTearDown(manager.dispose);
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response('', 404)),
+      );
+      addTearDown(manager.dispose);
 
-    final result = await manager
-        .downloadedUuidsForUuids(['present', 'missing', 'never', 'unknown']);
-    expect(result, {'present'});
-  });
+      final result = await manager.downloadedUuidsForUuids([
+        'present',
+        'missing',
+        'never',
+        'unknown',
+      ]);
+      expect(result, {'present'});
+    },
+  );
 
   test('successful downloads bump downloadStatusVersion', () async {
     await _insertTrack(db, 'abc');
@@ -605,20 +1059,22 @@ void main() {
     expect(manager.downloadStatusVersion.value, greaterThan(before));
   });
 
-  test('enqueueTracks calls scheduleWarmUuids when warmService is provided',
-      () async {
-    final capturedUuids = <List<String>>[];
-    final capturedQualities = <String>[];
-    final fakeWarm = _RecordingWarmService(
-      onWarmUuids: (uuids, quality) {
-        capturedUuids.add(uuids);
-        capturedQualities.add(quality);
-      },
-    );
+  test(
+    'enqueueTracks calls scheduleWarmUuids when warmService is provided',
+    () async {
+      final capturedUuids = <List<String>>[];
+      final capturedQualities = <String>[];
+      final fakeWarm = _RecordingWarmService(
+        onWarmUuids: (uuids, quality) {
+          capturedUuids.add(uuids);
+          capturedQualities.add(quality);
+        },
+      );
 
-    ApiClient.initForTest(
-      'http://test:8080',
-      MockClient((_) async => http.Response.bytes(
+      ApiClient.initForTest(
+        'http://test:8080',
+        MockClient(
+          (_) async => http.Response.bytes(
             [1, 2, 3],
             200,
             headers: {
@@ -626,27 +1082,29 @@ void main() {
               'x-audio-extension': 'm4a',
               'x-audio-bitrate-kbps': '128',
             },
-          )),
-    );
-    final manager = DownloadManager(
-      db: db,
-      coverArtStore: coverStore,
-      directoryProvider: () async => tempDir,
-      warmService: fakeWarm,
-      streamQualityFn: () => '256',
-    );
-    addTearDown(manager.dispose);
+          ),
+        ),
+      );
+      final manager = DownloadManager(
+        db: db,
+        coverArtStore: coverStore,
+        directoryProvider: () async => tempDir,
+        warmService: fakeWarm,
+        streamQualityFn: () => '256',
+      );
+      addTearDown(manager.dispose);
 
-    final tracks = [_track('uuid-1'), _track('uuid-2')];
-    await manager.enqueueTracks(tracks, quality: '128');
-    await _waitForFinish(manager);
+      final tracks = [_track('uuid-1'), _track('uuid-2')];
+      await manager.enqueueTracks(tracks, quality: '128');
+      await _waitForFinish(manager);
 
-    // scheduleWarmUuids should have been called once with both UUIDs and the
-    // stream quality (not the download quality).
-    expect(capturedUuids, hasLength(1));
-    expect(capturedUuids.first, containsAll(['uuid-1', 'uuid-2']));
-    expect(capturedQualities.first, '256');
-  });
+      // scheduleWarmUuids should have been called once with both UUIDs and the
+      // stream quality (not the download quality).
+      expect(capturedUuids, hasLength(1));
+      expect(capturedUuids.first, containsAll(['uuid-1', 'uuid-2']));
+      expect(capturedQualities.first, '256');
+    },
+  );
 }
 
 /// A [QueueWarmService] subclass that records [scheduleWarmUuids] calls.
@@ -654,7 +1112,7 @@ class _RecordingWarmService extends QueueWarmService {
   final void Function(List<String> uuids, String quality) onWarmUuids;
 
   _RecordingWarmService({required this.onWarmUuids})
-      : super(queueRepo: _NoopQueueRepo());
+    : super(queueRepo: _NoopQueueRepo());
 
   @override
   void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {
@@ -670,28 +1128,28 @@ class _NoopQueueRepo implements QueueRepository {
 
 extension on TrackUI {
   TrackUI copyWithFilePath(String? filePath) => TrackUI(
-        uuidId: uuidId,
-        filePath: filePath,
-        createdAt: createdAt,
-        lastUpdated: lastUpdated,
-        title: title,
-        artist: artist,
-        album: album,
-        albumArtist: albumArtist,
-        artistId: artistId,
-        albumId: albumId,
-        year: year,
-        date: date,
-        genre: genre,
-        trackNumber: trackNumber,
-        discNumber: discNumber,
-        codec: codec,
-        duration: duration,
-        bitrateKbps: bitrateKbps,
-        sampleRateHz: sampleRateHz,
-        channels: channels,
-        hasAlbumArt: hasAlbumArt,
-        coverArtId: coverArtId,
-        downloadedBitrateKbps: downloadedBitrateKbps,
-      );
+    uuidId: uuidId,
+    filePath: filePath,
+    createdAt: createdAt,
+    lastUpdated: lastUpdated,
+    title: title,
+    artist: artist,
+    album: album,
+    albumArtist: albumArtist,
+    artistId: artistId,
+    albumId: albumId,
+    year: year,
+    date: date,
+    genre: genre,
+    trackNumber: trackNumber,
+    discNumber: discNumber,
+    codec: codec,
+    duration: duration,
+    bitrateKbps: bitrateKbps,
+    sampleRateHz: sampleRateHz,
+    channels: channels,
+    hasAlbumArt: hasAlbumArt,
+    coverArtId: coverArtId,
+    downloadedBitrateKbps: downloadedBitrateKbps,
+  );
 }

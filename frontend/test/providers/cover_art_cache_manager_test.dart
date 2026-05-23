@@ -139,6 +139,20 @@ void main() {
     });
   });
 
+  group('clear', () {
+    test('empties the backing cache', () async {
+      when(() => mockCache.emptyCache()).thenAnswer((_) async {});
+
+      await manager.clear();
+
+      verify(() => mockCache.emptyCache()).called(1);
+    });
+
+    test('noop cache can be cleared', () async {
+      await CoverArtCacheManager.noop().clear();
+    });
+  });
+
   group('noop constructor', () {
     test('imageProvider returns NetworkImage', () {
       final noop = CoverArtCacheManager.noop();

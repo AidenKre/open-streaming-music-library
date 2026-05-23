@@ -6,6 +6,7 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
@@ -13,7 +14,7 @@ import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
-  final VoidCallback? onDisconnect;
+  final DisconnectCallback? onDisconnect;
   const ArtistsPage({super.key, this.onDisconnect});
 
   @override
@@ -52,9 +53,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     final downloadedOnly = ref.read(offlineModeProvider);
     return repo.getArtists(
       orderBy: _orderParams,
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
       limit: pageSize,
       downloadedOnly: downloadedOnly,
     );
@@ -66,17 +65,13 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     final downloadedOnly = ref.read(offlineModeProvider);
     return repo.watchArtistCount(
       orderBy: useCursor ? _orderParams : [],
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
       downloadedOnly: downloadedOnly,
     );
   }
 
   List<ArtistRowFilterParameter> _buildCursorFromLast(ArtistUI last) {
-    return [
-      ArtistRowFilterParameter(column: 'name', value: last.name),
-    ];
+    return [ArtistRowFilterParameter(column: 'name', value: last.name)];
   }
 
   void _onArtistTap(ArtistUI artist) {
@@ -130,20 +125,24 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
                 artist: artist,
                 onTap: () => _onArtistTap(artist),
                 onPlayNext: () async {
-                  final tracks = await ref.read(browseRepositoryProvider)
+                  final tracks = await ref
+                      .read(browseRepositoryProvider)
                       .getTracksForArtist(artist.id);
                   if (tracks.isNotEmpty) {
                     ref.read(audioProvider.notifier).playNext(tracks);
                   }
                 },
                 onAddToQueue: () async {
-                  final tracks = await ref.read(browseRepositoryProvider)
+                  final tracks = await ref
+                      .read(browseRepositoryProvider)
                       .getTracksForArtist(artist.id);
                   if (tracks.isNotEmpty) {
                     ref.read(audioProvider.notifier).addToQueue(tracks);
                   }
                 },
-                onDownload: isOffline ? null : () => downloadArtistTracks(ref, artist.id),
+                onDownload: isOffline
+                    ? null
+                    : () => downloadArtistTracks(ref, artist.id),
                 onDownloadAtQuality: isOffline
                     ? null
                     : (q) => downloadArtistTracksAtQuality(ref, artist.id, q),

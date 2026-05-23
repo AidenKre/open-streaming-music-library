@@ -3,11 +3,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/ui/login_page.dart';
 import 'package:frontend/main.dart';
 
 class StartupGate extends ConsumerStatefulWidget {
-  const StartupGate();
+  final VoidCallback? onLocalResetComplete;
+
+  const StartupGate({super.key, this.onLocalResetComplete});
 
   @override
   ConsumerState<StartupGate> createState() => _StartupGateState();
@@ -16,6 +19,7 @@ class StartupGate extends ConsumerStatefulWidget {
 class _StartupGateState extends ConsumerState<StartupGate> {
   bool _ready = false;
   bool _hasServerUrl = false;
+  bool _resetting = false;
   String? _connectError;
 
   @override
@@ -87,20 +91,34 @@ class _StartupGateState extends ConsumerState<StartupGate> {
   }
 
   Future<void> _onDisconnect() async {
-    final prefs = await ref.read(sharedPreferencesProvider.future);
-    await prefs.remove('serverUrl');
-    // No trusted server URL remains, so leave offline mode and stop the health
-    // poll — otherwise the poll keeps hitting the now-stale base URL.
-    ref.read(offlineModeProvider.notifier).exitOffline();
     setState(() {
-      _hasServerUrl = false;
+      _resetting = true;
       _connectError = null;
     });
+    try {
+      await ref.read(localResetServiceProvider).reset();
+      if (!mounted) return;
+      final onLocalResetComplete = widget.onLocalResetComplete;
+      if (onLocalResetComplete != null) {
+        onLocalResetComplete();
+        return;
+      }
+      setState(() {
+        _hasServerUrl = false;
+        _resetting = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _resetting = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Reset failed: $e')));
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_ready) {
+    if (!_ready || _resetting) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
     if (!_hasServerUrl) {

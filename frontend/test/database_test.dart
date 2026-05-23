@@ -1438,29 +1438,32 @@ void main() {
       expect(regular.first.readNullable<int>('cover_art_id'), 42);
     });
 
-    test('ignores tracks with has_album_art=false even if cover_art_id set', () async {
-      await insertTrack(
-        db,
-        uuid: '1',
-        artist: 'Artist',
-        album: 'Album',
-        year: 2020,
-      );
+    test(
+      'ignores tracks with has_album_art=false even if cover_art_id set',
+      () async {
+        await insertTrack(
+          db,
+          uuid: '1',
+          artist: 'Artist',
+          album: 'Album',
+          year: 2020,
+        );
 
-      // Set cover_art_id but leave has_album_art = false
-      await db.customUpdate(
-        'UPDATE trackmetadata SET cover_art_id = 42 '
-        'WHERE uuid_id = ?',
-        variables: [Variable.withString('1')],
-        updates: {db.trackmetadata},
-      );
+        // Set cover_art_id but leave has_album_art = false
+        await db.customUpdate(
+          'UPDATE trackmetadata SET cover_art_id = 42 '
+          'WHERE uuid_id = ?',
+          variables: [Variable.withString('1')],
+          updates: {db.trackmetadata},
+        );
 
-      final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
-      final regular = rows
-          .where((r) => r.read<int>('is_single_grouping') == 0)
-          .toList();
-      expect(regular.first.readNullable<int>('cover_art_id'), equals(null));
-    });
+        final rows = await db.getAlbums(artistId: artistIdFor('Artist'));
+        final regular = rows
+            .where((r) => r.read<int>('is_single_grouping') == 0)
+            .toList();
+        expect(regular.first.readNullable<int>('cover_art_id'), equals(null));
+      },
+    );
   });
 
   group('getArtists cover_art_id subquery', () {
@@ -1775,9 +1778,7 @@ void main() {
   group('cover_art_id', () {
     test('trackmetadataCompanionFromDto includes coverArtId when present', () {
       final dto = ClientTrackDto.fromJson(
-        _trackJson(
-          metadata: {..._fullMetadataJson(), 'cover_art_id': 42},
-        ),
+        _trackJson(metadata: {..._fullMetadataJson(), 'cover_art_id': 42}),
       );
 
       final companion = trackmetadataCompanionFromDto(dto);
@@ -1798,10 +1799,7 @@ void main() {
         'uuid_id': 'cover-art-test-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
-        'metadata': {
-          ..._fullMetadataJson(),
-          'cover_art_id': 7,
-        },
+        'metadata': {..._fullMetadataJson(), 'cover_art_id': 7},
       });
 
       await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
@@ -1883,5 +1881,81 @@ void main() {
     test('cover_art_id is accepted in allowedMetadataColumns', () {
       expect(allowedMetadataColumns.contains('cover_art_id'), isTrue);
     });
+  });
+
+  group('resetLocalData', () {
+    test(
+      'clears all app tables and FTS rows while leaving DB writable',
+      () async {
+        await db.customStatement(
+          "INSERT INTO artists (id, name) VALUES (1, 'Reset Artist')",
+        );
+        await db.customStatement(
+          "INSERT INTO albums "
+          "(id, name, artist_id, year, is_single_grouping) "
+          "VALUES (1, 'Reset Album', 1, 2024, 0)",
+        );
+        await db.customStatement(
+          "INSERT INTO tracks "
+          "(uuid_id, created_at, last_updated, file_path) "
+          "VALUES ('reset-track', 1, 2, '/tmp/reset-track.m4a')",
+        );
+        await db.customStatement(
+          "INSERT INTO trackmetadata "
+          "(uuid_id, title, artist, album, artist_id, album_id, duration, "
+          "bitrate_kbps, sample_rate_hz, channels, has_album_art) "
+          "VALUES ('reset-track', 'Reset Song', 'Reset Artist', "
+          "'Reset Album', 1, 1, 120, 320, 44100, 2, 0)",
+        );
+        await db.customStatement(
+          "INSERT INTO queue_sessions "
+          "(id, is_active, created_at, updated_at, source_type) "
+          "VALUES (1, 1, 1, 1, 'library')",
+        );
+        await db.customStatement(
+          "INSERT INTO queue_session_items "
+          "(item_id, session_id, queue_type, position, uuid_id) "
+          "VALUES (1, 1, 'main', 0, 'reset-track')",
+        );
+        await db.customStatement(
+          "INSERT INTO queue_session_play_order "
+          "(session_id, play_position, item_id) VALUES (1, 0, 1)",
+        );
+        await db.customStatement(
+          "INSERT INTO fts_tracks "
+          "(rowid, title, artist_name, album_name) "
+          "VALUES (1, 'Reset Song', 'Reset Artist', 'Reset Album')",
+        );
+        await db.customStatement(
+          "INSERT INTO fts_artists (rowid, name) VALUES (1, 'Reset Artist')",
+        );
+        await db.customStatement(
+          "INSERT INTO fts_albums "
+          "(rowid, name, artist_name) VALUES (1, 'Reset Album', 'Reset Artist')",
+        );
+
+        await db.resetLocalData();
+
+        expect(await db.select(db.queueSessionPlayOrder).get(), isEmpty);
+        expect(await db.select(db.queueSessionItems).get(), isEmpty);
+        expect(await db.select(db.queueSessions).get(), isEmpty);
+        expect(await db.select(db.trackmetadata).get(), isEmpty);
+        expect(await db.select(db.tracks).get(), isEmpty);
+        expect(await db.select(db.albums).get(), isEmpty);
+        expect(await db.select(db.artists).get(), isEmpty);
+
+        final ftsRows = await db
+            .customSelect(
+              "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Reset\"*'",
+            )
+            .get();
+        expect(ftsRows, isEmpty);
+
+        await db.customStatement(
+          "INSERT INTO artists (id, name) VALUES (2, 'After Reset')",
+        );
+        expect(await db.select(db.artists).get(), hasLength(1));
+      },
+    );
   });
 }

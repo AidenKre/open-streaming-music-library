@@ -41,7 +41,9 @@ Future<LoginPage> _pumpLoginPage(
 }
 
 void main() {
-  testWidgets('a successful manual connect clears offline mode', (tester) async {
+  testWidgets('a successful manual connect clears offline mode', (
+    tester,
+  ) async {
     SharedPreferences.setMockInitialValues({}); // no saved serverUrl
     ApiClient.initForTest(
       'http://localhost:8000',
@@ -57,12 +59,16 @@ void main() {
 
     await loginPage.onConnect('http://localhost:8000');
 
-    expect(container.read(offlineModeProvider), isFalse,
-        reason: 'a passing health check must clear offline mode on connect');
+    expect(
+      container.read(offlineModeProvider),
+      isFalse,
+      reason: 'a passing health check must clear offline mode on connect',
+    );
   });
 
-  testWidgets('a failed manual connect does not strand the app offline',
-      (tester) async {
+  testWidgets('a failed manual connect does not strand the app offline', (
+    tester,
+  ) async {
     SharedPreferences.setMockInitialValues({});
     ApiClient.initForTest(
       'http://localhost:8000',
@@ -77,7 +83,10 @@ void main() {
 
     await loginPage.onConnect('http://typo.invalid:9999');
 
-    expect(container.read(offlineModeProvider), isFalse,
-        reason: 'a failed connect attempt must not enter offline mode');
+    expect(
+      container.read(offlineModeProvider),
+      isFalse,
+      reason: 'a failed connect attempt must not enter offline mode',
+    );
   });
 }

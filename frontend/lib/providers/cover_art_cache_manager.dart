@@ -24,9 +24,11 @@ void initCoverArtCache([CoverArtCacheManager? manager]) {
 /// prefetch upcoming artwork, and resolve file-based URIs for the
 /// system media notification (audio service).
 class CoverArtCacheManager {
-  CoverArtCacheManager({BaseCacheManager? cache, LocalCoverArtStore? localStore})
-    : _cache = cache ?? DefaultCacheManager(),
-      _localStore = localStore;
+  CoverArtCacheManager({
+    BaseCacheManager? cache,
+    LocalCoverArtStore? localStore,
+  }) : _cache = cache ?? DefaultCacheManager(),
+       _localStore = localStore;
 
   /// Creates a [CoverArtCacheManager] without a backing cache.
   /// Only for use in tests where the cache is not exercised.
@@ -74,6 +76,11 @@ class CoverArtCacheManager {
     for (final id in coverArtIds) {
       cache.downloadFile(_url(id));
     }
+  }
+
+  Future<void> clear() async {
+    await _cache?.emptyCache();
+    await _localStore?.clear();
   }
 
   /// Resolves the best available [Uri] for [MediaItem.artUri].

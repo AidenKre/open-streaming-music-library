@@ -6,6 +6,7 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
@@ -13,7 +14,7 @@ import 'package:frontend/ui/widgets/album_card.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
   final int? artistId;
-  final VoidCallback? onDisconnect;
+  final DisconnectCallback? onDisconnect;
   const AlbumsPage({super.key, this.artistId, this.onDisconnect});
 
   @override
@@ -64,9 +65,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     return repo.getAlbums(
       artistId: widget.artistId,
       orderBy: _orderParams,
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
       limit: pageSize,
       downloadedOnly: downloadedOnly,
     );
@@ -79,9 +78,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     return repo.watchAlbumsCount(
       artistId: widget.artistId,
       orderBy: useCursor ? _orderParams : [],
-      cursorFilters: useCursor
-          ? _buildCursorFromLast(paginatedItems.last)
-          : [],
+      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
       downloadedOnly: downloadedOnly,
     );
   }
@@ -155,14 +152,16 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                 album: album,
                 onTap: () => _onAlbumTap(album),
                 onPlayNext: () async {
-                  final tracks = await ref.read(browseRepositoryProvider)
+                  final tracks = await ref
+                      .read(browseRepositoryProvider)
                       .getTracksForAlbum(album.artistId, album.id);
                   if (tracks.isNotEmpty) {
                     ref.read(audioProvider.notifier).playNext(tracks);
                   }
                 },
                 onAddToQueue: () async {
-                  final tracks = await ref.read(browseRepositoryProvider)
+                  final tracks = await ref
+                      .read(browseRepositoryProvider)
                       .getTracksForAlbum(album.artistId, album.id);
                   if (tracks.isNotEmpty) {
                     ref.read(audioProvider.notifier).addToQueue(tracks);
@@ -173,8 +172,14 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                     : () => downloadAlbumTracks(ref, album.artistId, album.id),
                 onDownloadAtQuality: isOffline
                     ? null
-                    : (q) => downloadAlbumTracksAtQuality(ref, album.artistId, album.id, q),
-                onDeleteDownload: () => deleteAlbumDownloads(ref, album.artistId, album.id),
+                    : (q) => downloadAlbumTracksAtQuality(
+                        ref,
+                        album.artistId,
+                        album.id,
+                        q,
+                      ),
+                onDeleteDownload: () =>
+                    deleteAlbumDownloads(ref, album.artistId, album.id),
               );
             },
           ),
