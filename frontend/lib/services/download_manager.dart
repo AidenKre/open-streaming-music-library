@@ -4,16 +4,14 @@ import 'dart:io';
 
 import 'package:drift/drift.dart' show Value, Variable;
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
-import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
+import 'package:frontend/services/download/track_downloader.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/queue_warm_service.dart';
@@ -29,34 +27,6 @@ export 'package:frontend/services/download/download_queue.dart'
         Completed,
         Failed,
         DownloadQueueState;
-
-/// Why a single download attempt ended. Drives whether [DownloadManager]
-/// marks the job completed, re-queues it for retry, or fails it.
-///
-/// On [success], [sizeBytes] holds the number of bytes received and is moved
-/// into the [Completed] status. On [otherFailure], [errorMessage] is the
-/// human-readable failure (used to build the [Failed] status).
-class _DownloadOutcome {
-  final _OutcomeKind kind;
-  final int sizeBytes;
-  final String? errorMessage;
-  const _DownloadOutcome._(
-    this.kind, {
-    this.sizeBytes = 0,
-    this.errorMessage,
-  });
-
-  static const cancelled = _DownloadOutcome._(_OutcomeKind.cancelled);
-  static const networkFailure = _DownloadOutcome._(_OutcomeKind.networkFailure);
-  static _DownloadOutcome success(int sizeBytes) =>
-      _DownloadOutcome._(_OutcomeKind.success, sizeBytes: sizeBytes);
-  static _DownloadOutcome otherFailure(String message) =>
-      _DownloadOutcome._(_OutcomeKind.otherFailure, errorMessage: message);
-}
-
-enum _OutcomeKind { success, networkFailure, otherFailure, cancelled }
-
-class _DownloadCancelled implements Exception {}
 
 String formatBytes(int bytes) {
   if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
@@ -77,24 +47,17 @@ class DownloadManager extends ChangeNotifier {
   static const int maxConcurrent = 4;
 
   final AppDatabase _db;
-  final LocalCoverArtStore _coverArtStore;
-  final Future<Directory> Function() _directoryProvider;
   // Optional: if supplied, the server is asked to pre-transcode queued tracks
   // at the current stream quality in parallel with downloading them.
   final QueueWarmService? _warmService;
   // Provides the current stream quality for server warm calls.
   final String Function()? _streamQualityFn;
-  final ApiClient _apiClient;
   // When true, the pump won't dispatch new workers; queued jobs wait for
   // resumeIfPaused() on recovery.
   final bool Function() _isOfflineFn;
-  // Reports a transport failure so the app enters offline mode. Called when a
-  // download drops mid-stream — that failure happens after ApiClient handed us
-  // the response, so ApiClient's own onNetworkFailure hook never fires.
-  final void Function()? _onNetworkFailure;
 
   late final DownloadQueue _queue;
-  Directory? _downloadDir;
+  late final TrackDownloader _downloader;
   int _activeCount = 0;
   bool _disposed = false;
   int _resetGeneration = 0;
@@ -103,15 +66,28 @@ class DownloadManager extends ChangeNotifier {
 
   /// Test seam fired immediately before the partial→destination rename. Lets a
   /// test deterministically interleave [resetAndDeleteFiles] with the commit
-  /// step so the rename-race fix can be regressed.
+  /// step so the rename-race fix can be regressed. Forwards to the inner
+  /// [TrackDownloader].
   @visibleForTesting
-  Future<void> Function(String uuidId)? testHookBeforeRename;
+  set testHookBeforeRename(Future<void> Function(String uuidId)? hook) {
+    _downloader.testHookBeforeRename = hook;
+  }
+
+  @visibleForTesting
+  Future<void> Function(String uuidId)? get testHookBeforeRename =>
+      _downloader.testHookBeforeRename;
 
   /// Test seam fired between the rename and the DB write. Exercises the
   /// narrower window where a worker has produced a tracked file but not yet
-  /// recorded it.
+  /// recorded it. Forwards to the inner [TrackDownloader].
   @visibleForTesting
-  Future<void> Function(String uuidId)? testHookBeforeDbWrite;
+  set testHookBeforeDbWrite(Future<void> Function(String uuidId)? hook) {
+    _downloader.testHookBeforeDbWrite = hook;
+  }
+
+  @visibleForTesting
+  Future<void> Function(String uuidId)? get testHookBeforeDbWrite =>
+      _downloader.testHookBeforeDbWrite;
 
   late final DownloadStatusReader _status;
 
@@ -130,17 +106,20 @@ class DownloadManager extends ChangeNotifier {
     bool Function()? isOfflineFn,
     void Function()? onNetworkFailure,
   }) : _db = db,
-       _coverArtStore = coverArtStore,
-       _directoryProvider =
-           directoryProvider ?? getApplicationDocumentsDirectory,
        _warmService = warmService,
        _streamQualityFn = streamQualityFn,
-       _apiClient = apiClient ?? ApiClient.instance,
-       _isOfflineFn = isOfflineFn ?? (() => false),
-       _onNetworkFailure = onNetworkFailure {
+       _isOfflineFn = isOfflineFn ?? (() => false) {
     _status = DownloadStatusReader(db: db);
     _queue = DownloadQueue();
     _queue.addListener(notifyListeners);
+    _downloader = TrackDownloader(
+      db: db,
+      coverArtStore: coverArtStore,
+      directoryProvider:
+          directoryProvider ?? getApplicationDocumentsDirectory,
+      apiClient: apiClient ?? ApiClient.instance,
+      onNetworkFailure: onNetworkFailure,
+    );
   }
 
   DownloadQueueState get state => _queue.state;
@@ -302,8 +281,8 @@ class DownloadManager extends ChangeNotifier {
     _activeCancellers.clear();
     _queue.clearAll();
 
-    await _deleteKnownDownloadedFiles();
-    await _deleteDownloadDirectory();
+    await _downloader.deleteKnownDownloadedFiles();
+    await _downloader.deleteDownloadDirectory();
 
     _bumpVersion();
   }
@@ -396,28 +375,43 @@ class DownloadManager extends ChangeNotifier {
       final idx = _queue.state.jobs.indexWhere((j) => j.uuidId == uuidId);
       if (idx < 0) return;
       final job = _queue.jobAt(idx);
-      final outcome = await _downloadOne(job, generation);
+      final outcome = await _downloader.download(
+        job: job,
+        generationCheck: () => generation == _resetGeneration,
+        onProgress: (progress) {
+          _queue.markJobByUuid(
+            job.uuidId,
+            (j) => j.withStatus(Active(progress: progress)),
+          );
+        },
+        registerCanceller: (canceller) {
+          _activeCancellers[job.uuidId] = canceller;
+        },
+        unregisterCanceller: () {
+          _activeCancellers.remove(job.uuidId);
+        },
+      );
       if (generation != _resetGeneration) return;
       switch (outcome.kind) {
-        case _OutcomeKind.success:
+        case DownloadOutcomeKind.success:
           _queue.markJobByUuid(
             uuidId,
             (j) => j.withStatus(Completed(sizeBytes: outcome.sizeBytes)),
           );
           _bumpVersion();
-        case _OutcomeKind.networkFailure:
+        case DownloadOutcomeKind.networkFailure:
           // Transport failure — revert to queued so the worker pool retries
           // once we're back online. The download restarts from zero, so the
           // status resets to a fresh Queued (no progress, no error).
           _queue.markJobByUuid(uuidId, (j) => j.withStatus(const Queued()));
-        case _OutcomeKind.otherFailure:
+        case DownloadOutcomeKind.otherFailure:
           _queue.markJobByUuid(
             uuidId,
             (j) => j.withStatus(
               Failed(message: outcome.errorMessage ?? 'unknown error'),
             ),
           );
-        case _OutcomeKind.cancelled:
+        case DownloadOutcomeKind.cancelled:
           return;
       }
     } finally {
@@ -426,251 +420,6 @@ class DownloadManager extends ChangeNotifier {
         _pump();
       }
     }
-  }
-
-  Future<_DownloadOutcome> _downloadOne(DownloadJob job, int generation) async {
-    final dir = await _ensureDownloadDir();
-    if (generation != _resetGeneration) {
-      return _DownloadOutcome.cancelled;
-    }
-
-    http.StreamedResponse response;
-    try {
-      response = await _apiClient.send(
-        () => http.Request(
-          'GET',
-          buildTrackStreamUri(job.uuidId, quality: job.quality),
-        ),
-      );
-    } on ApiException catch (e) {
-      return _DownloadOutcome.otherFailure('HTTP ${e.statusCode}');
-    } on NetworkException {
-      // ApiClient already fired its onNetworkFailure hook for the exhausted
-      // handshake; report defensively too in case it wasn't wired.
-      _onNetworkFailure?.call();
-      return _DownloadOutcome.networkFailure;
-    } catch (e) {
-      // Defensive fallback for unexpected exceptions that escape ApiClient's
-      // typed exceptions — without this, _runJob never marks the job failed
-      // and it stays stuck in `active`.
-      return _DownloadOutcome.otherFailure(e.toString());
-    }
-    if (generation != _resetGeneration) {
-      return _DownloadOutcome.cancelled;
-    }
-
-    // ApiClient.send guarantees a 2xx response or throws — no defensive check needed.
-
-    // Determine the file extension from the server's X-Audio-Extension header.
-    // Transcoded files are always m4a; originals get their actual extension.
-    // Fall back to 'audio' only as a last resort (AVFoundation rejects unknown
-    // extensions, but 'audio' is better than a silent failure from a wrong one).
-    final ext = job.quality != originalQuality
-        ? 'm4a'
-        : (response.headers['x-audio-extension'] ?? 'audio');
-
-    final destination = File(p.join(dir.path, '${job.uuidId}.$ext'));
-    final partial = File('${destination.path}.partial');
-
-    try {
-      if (await partial.exists()) await partial.delete();
-
-      final total = response.contentLength ?? 0;
-      var received = 0;
-      final sink = partial.openWrite();
-      StreamSubscription<List<int>>? subscription;
-      final streamDone = Completer<void>();
-      _activeCancellers[job.uuidId] = () async {
-        await subscription?.cancel();
-        if (!streamDone.isCompleted) {
-          streamDone.completeError(_DownloadCancelled());
-        }
-      };
-      try {
-        subscription = response.stream.listen(
-          (chunk) {
-            if (generation != _resetGeneration) {
-              return;
-            }
-            sink.add(chunk);
-            received += chunk.length;
-            if (total > 0) {
-              _queue.markJobByUuid(
-                job.uuidId,
-                (j) => j.withStatus(Active(progress: received / total)),
-              );
-            }
-          },
-          onDone: () {
-            if (!streamDone.isCompleted) {
-              streamDone.complete();
-            }
-          },
-          onError: (Object error, StackTrace stackTrace) {
-            if (!streamDone.isCompleted) {
-              streamDone.completeError(error, stackTrace);
-            }
-          },
-          cancelOnError: true,
-        );
-        await streamDone.future;
-        await sink.flush();
-      } finally {
-        _activeCancellers.remove(job.uuidId);
-        await sink.close();
-      }
-
-      if (generation != _resetGeneration) {
-        await _deleteIfExists(partial);
-        return _DownloadOutcome.cancelled;
-      }
-
-      // Parse the actual bitrate the server served (may differ from source).
-      final bitrateHeader = response.headers['x-audio-bitrate-kbps'];
-      final downloadedBitrate = bitrateHeader != null
-          ? int.tryParse(bitrateHeader)
-          : null;
-
-      final committed = await _commitDownload(
-        uuidId: job.uuidId,
-        partial: partial,
-        destination: destination,
-        generation: generation,
-        downloadedBitrate: downloadedBitrate,
-        received: received,
-      );
-      if (!committed) return _DownloadOutcome.cancelled;
-
-      // Try to grab the cover art too. We don't fail the whole job if this
-      // fails — the audio is what matters for playback.
-      await _downloadCoverArtForTrack(job.uuidId);
-
-      return _DownloadOutcome.success(received);
-    } on _DownloadCancelled {
-      try {
-        if (await partial.exists()) await partial.delete();
-      } catch (_) {}
-      return _DownloadOutcome.cancelled;
-    } catch (e) {
-      try {
-        if (await partial.exists()) await partial.delete();
-      } catch (_) {}
-      // A drop after headers arrived doesn't surface through ApiClient (the
-      // response stream was already handed to us), so classify it here: a
-      // transport error re-queues for retry, anything else (e.g. a disk
-      // write failure) is a genuine, permanent failure.
-      if (e is SocketException ||
-          e is http.ClientException ||
-          e is TimeoutException) {
-        _onNetworkFailure?.call();
-        return _DownloadOutcome.networkFailure;
-      }
-      return _DownloadOutcome.otherFailure(e.toString());
-    }
-  }
-
-  /// Performs the partial→destination rename and the DB row update under a
-  /// generation guard. Returns true on commit, false if the reset generation
-  /// moved during the commit (in which case any state left on disk is cleaned
-  /// up so [resetAndDeleteFiles] doesn't leak files or DB rows).
-  Future<bool> _commitDownload({
-    required String uuidId,
-    required File partial,
-    required File destination,
-    required int generation,
-    required int? downloadedBitrate,
-    required int received,
-  }) async {
-    final beforeRename = testHookBeforeRename;
-    if (beforeRename != null) await beforeRename(uuidId);
-
-    if (generation != _resetGeneration) {
-      await _deleteIfExists(partial);
-      return false;
-    }
-
-    if (await destination.exists()) await destination.delete();
-    await partial.rename(destination.path);
-
-    final beforeDbWrite = testHookBeforeDbWrite;
-    if (beforeDbWrite != null) await beforeDbWrite(uuidId);
-
-    // Reset happened between rename and DB write. The destination file isn't
-    // referenced by any row yet, so resetAndDeleteFiles couldn't have deleted
-    // it — clean up here.
-    if (generation != _resetGeneration) {
-      await _deleteIfExists(destination);
-      return false;
-    }
-
-    await (_db.update(
-      _db.tracks,
-    )..where((t) => t.uuidId.equals(uuidId))).write(
-      TracksCompanion(
-        filePath: Value(destination.path),
-        downloadedBitrateKbps: Value(downloadedBitrate),
-        fileSizeBytes: Value(received),
-      ),
-    );
-    return true;
-  }
-
-  Future<void> _downloadCoverArtForTrack(String uuidId) async {
-    final row = await _db
-        .customSelect(
-          'SELECT cover_art_id, has_album_art FROM trackmetadata WHERE uuid_id = ? LIMIT 1',
-          variables: [Variable.withString(uuidId)],
-        )
-        .getSingleOrNull();
-    if (row == null) return;
-    final coverArtId = row.readNullable<int>('cover_art_id');
-    final hasAlbumArt = row.read<bool>('has_album_art');
-    if (!hasAlbumArt || coverArtId == null) return;
-    if (_coverArtStore.has(coverArtId)) return;
-    await _coverArtStore.download(coverArtId);
-  }
-
-  Future<Directory> _ensureDownloadDir() async {
-    if (_downloadDir != null) return _downloadDir!;
-    final base = await _directoryProvider();
-    final dir = Directory(p.join(base.path, 'tracks'));
-    await dir.create(recursive: true);
-    _downloadDir = dir;
-    return dir;
-  }
-
-  Future<void> _deleteKnownDownloadedFiles() async {
-    final rows = await _db
-        .customSelect(
-          'SELECT file_path FROM tracks WHERE file_path IS NOT NULL',
-          readsFrom: {_db.tracks},
-        )
-        .get();
-    for (final row in rows) {
-      final path = row.readNullable<String>('file_path');
-      if (path == null) continue;
-      await _deleteIfExists(File(path));
-    }
-  }
-
-  Future<void> _deleteDownloadDirectory() async {
-    final dir =
-        _downloadDir ??
-        Directory(p.join((await _directoryProvider()).path, 'tracks'));
-    _downloadDir = null;
-    try {
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
-    } catch (_) {}
-  }
-
-  Future<void> _deleteIfExists(File file) async {
-    try {
-      if (await file.exists()) {
-        await file.delete();
-      }
-    } catch (_) {}
   }
 
   void _bumpVersion() {
