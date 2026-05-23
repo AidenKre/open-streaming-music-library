@@ -26,7 +26,10 @@ class QueueWarmService {
   final QueueRepository _queueRepo;
   final ApiClient _apiClient;
   final bool Function() _isOfflineFn;
-  Timer? _debounceTimer;
+  // Separate timers so queue-driven and download-driven warms never cancel
+  // each other. They're logically independent flows.
+  Timer? _queueWarmTimer;
+  Timer? _uuidsWarmTimer;
 
   QueueWarmService({
     required QueueRepository queueRepo,
@@ -41,8 +44,8 @@ class QueueWarmService {
     required int currentPlayPosition,
     required String quality,
   }) {
-    _debounceTimer?.cancel();
-    _debounceTimer = Timer(_debounce, () {
+    _queueWarmTimer?.cancel();
+    _queueWarmTimer = Timer(_debounce, () {
       unawaited(
         _warm(
           sessionId: sessionId,
@@ -91,8 +94,8 @@ class QueueWarmService {
   /// Debounced — rapid calls within the debounce window are coalesced.
   void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {
     if (trackUuids.isEmpty) return;
-    _debounceTimer?.cancel();
-    _debounceTimer = Timer(_debounce, () {
+    _uuidsWarmTimer?.cancel();
+    _uuidsWarmTimer = Timer(_debounce, () {
       unawaited(_warmUuids(trackUuids, quality: quality));
     });
   }
@@ -107,7 +110,10 @@ class QueueWarmService {
       await _apiClient.postJson(
         ['tracks', 'warm'],
         body: {
-          'session_id': 'download-manager',
+          // session_id is omitted (null) for the download-driven path: the
+          // backend doesn't read this field, and using a magic string here
+          // risked colliding with a real session id.
+          'session_id': null,
           'current_index': 0,
           'quality': quality,
           'track_uuids': trackUuids.take(_maxTrackUuids).toList(),
@@ -121,7 +127,8 @@ class QueueWarmService {
   }
 
   void dispose() {
-    _debounceTimer?.cancel();
+    _queueWarmTimer?.cancel();
+    _uuidsWarmTimer?.cancel();
   }
 }
 

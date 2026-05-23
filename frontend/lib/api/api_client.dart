@@ -54,15 +54,39 @@ class ApiClient {
   static final ApiClient instance = ApiClient._();
   ApiClient._() : _http = http.Client(), baseUrl = '';
 
-  /// Set by the app on startup so a `NetworkException` from a normal request
-  /// flips global offline mode on. Static so it's reachable from the
-  /// singleton without threading an extra dependency through every service.
-  /// Probe calls opt out via `triggerOfflineHook: false` (see [healthCheck]).
+  /// Listeners invoked when a normal request exhausts retries on a
+  /// transport-level failure. Static so they're reachable from the singleton
+  /// without threading an extra dependency through every service. Probe
+  /// calls opt out via `triggerOfflineHook: false` (see [healthCheck]).
+  ///
+  /// Multiple observers can register independently (e.g. offline-mode
+  /// notifier + telemetry breadcrumbs) without clobbering each other. Using
+  /// a Set means re-registering the same listener is a no-op.
   ///
   /// There is deliberately no success counterpart: a received HTTP response
   /// (even a 2xx) does not prove the backend is healthy enough to resume
   /// normal work. Offline mode is exited only by a passing health check.
-  static void Function()? onNetworkFailure;
+  static final Set<void Function()> _networkFailureListeners = {};
+
+  static void addNetworkFailureListener(void Function() listener) {
+    _networkFailureListeners.add(listener);
+  }
+
+  static void removeNetworkFailureListener(void Function() listener) {
+    _networkFailureListeners.remove(listener);
+  }
+
+  @visibleForTesting
+  static void clearNetworkFailureListenersForTest() {
+    _networkFailureListeners.clear();
+  }
+
+  static void _fireNetworkFailure() {
+    // Snapshot to tolerate listeners that remove themselves during dispatch.
+    for (final listener in _networkFailureListeners.toList()) {
+      listener();
+    }
+  }
 
   String baseUrl;
   http.Client _http;
@@ -222,26 +246,43 @@ class ApiClient {
   }
 
   /// Binary GET. Returns the raw response body as bytes.
+  ///
+  /// Defaults to retrying on transient failures and firing the offline hook
+  /// on exhaustion. Cover-art tiles are high-volume (one fetch per album/
+  /// artist tile) and a single failing thumbnail should not darken the
+  /// whole app — those callers should pass `retry: false` and
+  /// `triggerOfflineHook: false`.
   Future<Uint8List> getBytes(
     List<String> pathSegments, {
     Map<String, String>? query,
     Map<String, String>? headers,
+    bool retry = true,
+    bool triggerOfflineHook = true,
   }) async {
     final uri = _buildUri(pathSegments, query: query);
-    return _withRetry<Uint8List>(
-      () async {
-        final response = await _http.get(uri, headers: headers);
-        developer.log(
-          '${response.statusCode} ${response.bodyBytes.length}B',
-          name: 'ApiClient',
-        );
-        if (_isSuccess(response.statusCode)) {
-          return response.bodyBytes;
-        }
-        throw _HttpFailureSignal(response.statusCode, response.body, response.headers);
-      },
-      label: 'GET-bytes $uri',
-    );
+    Future<Uint8List> attempt() async {
+      final response = await _http.get(uri, headers: headers);
+      developer.log(
+        '${response.statusCode} ${response.bodyBytes.length}B',
+        name: 'ApiClient',
+      );
+      if (_isSuccess(response.statusCode)) {
+        return response.bodyBytes;
+      }
+      throw _HttpFailureSignal(response.statusCode, response.body, response.headers);
+    }
+    final label = 'GET-bytes $uri';
+    return retry
+        ? _withRetry<Uint8List>(
+            attempt,
+            label: label,
+            triggerOfflineHook: triggerOfflineHook,
+          )
+        : _withoutRetry<Uint8List>(
+            attempt,
+            label: label,
+            triggerOfflineHook: triggerOfflineHook,
+          );
   }
 
   /// Streaming send for callers that need a chunked response stream
@@ -434,7 +475,7 @@ class ApiClient {
       }
     }
     // All attempts exhausted on transport-level failures — signal offline.
-    if (triggerOfflineHook) onNetworkFailure?.call();
+    if (triggerOfflineHook) _fireNetworkFailure();
     throw NetworkException(
       lastNetworkCause?.toString() ?? 'unknown network error',
       cause: lastNetworkCause,
@@ -463,16 +504,16 @@ class ApiClient {
     } on _HttpFailureSignal catch (status) {
       throw ApiException(status.statusCode, status.body);
     } on SocketException catch (e) {
-      if (triggerOfflineHook) onNetworkFailure?.call();
+      if (triggerOfflineHook) _fireNetworkFailure();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     } on TimeoutException catch (e) {
-      if (triggerOfflineHook) onNetworkFailure?.call();
+      if (triggerOfflineHook) _fireNetworkFailure();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     } on http.ClientException catch (e) {
-      if (triggerOfflineHook) onNetworkFailure?.call();
+      if (triggerOfflineHook) _fireNetworkFailure();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     } on ArgumentError catch (e) {
-      if (triggerOfflineHook) onNetworkFailure?.call();
+      if (triggerOfflineHook) _fireNetworkFailure();
       throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
     }
   }

@@ -55,18 +55,21 @@ class Frontend extends ConsumerStatefulWidget {
 }
 
 class _FrontendState extends ConsumerState<Frontend> {
+  // Captured once so dispose can deregister exactly the same listener.
+  late final void Function() _offlineListener;
+
   @override
   void initState() {
     super.initState();
     // Bridge ApiClient's transport-failure hook into the offline-mode notifier.
     // Lives here (not in main()) because the notifier requires a ProviderScope.
-    ApiClient.onNetworkFailure =
-        ref.read(offlineModeProvider.notifier).enterOffline;
+    _offlineListener = ref.read(offlineModeProvider.notifier).enterOffline;
+    ApiClient.addNetworkFailureListener(_offlineListener);
   }
 
   @override
   void dispose() {
-    ApiClient.onNetworkFailure = null;
+    ApiClient.removeNetworkFailureListener(_offlineListener);
     super.dispose();
   }
 

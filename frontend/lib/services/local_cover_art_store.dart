@@ -40,10 +40,12 @@ class LocalCoverArtStore {
   /// Downloads cover art bytes from the server and stores them locally.
   /// No-ops when the file already exists. Returns true on success (or already
   /// present), false on any failure (network, HTTP, or filesystem).
-  /// ApiClient handles transient network retries internally; a returned
-  /// `false` means the failure survived retries or could not be persisted.
   /// Cover art is best-effort — callers (e.g. DownloadManager) must not let
-  /// a failure here fail the parent operation.
+  /// a failure here fail the parent operation. The request is intentionally
+  /// single-attempt and does NOT flip global offline mode: cover art is a
+  /// high-volume endpoint (one fetch per album/artist tile), so a flaky
+  /// thumbnail should fall back to its placeholder, not stall on 3 retries
+  /// or darken the whole UI by entering offline mode.
   Future<bool> download(int coverArtId) async {
     final target = fileFor(coverArtId);
     if (target.existsSync()) return true;
@@ -52,6 +54,8 @@ class LocalCoverArtStore {
     try {
       final bytes = await _apiClient.getBytes(
         ['cover_art', coverArtId.toString()],
+        retry: false,
+        triggerOfflineHook: false,
       );
       // Write to a temp file then rename so partial bytes are never visible.
       await tmp.writeAsBytes(bytes, flush: true);

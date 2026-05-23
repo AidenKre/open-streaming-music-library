@@ -90,21 +90,22 @@ void main() {
     expect(store.has(99), isFalse);
   });
 
-  test('download recovers when a transient 503 is followed by a 200', () async {
+  test('cover art download does not retry on a transient 503', () async {
+    // Cover art opts out of ApiClient's retry. A single failed thumbnail
+    // shouldn't trigger 3 attempts (× many tiles = thundering herd) or flip
+    // the whole app into offline mode via the network-failure hook.
     var calls = 0;
     final store = await buildStore(
       client: MockClient((req) async {
         calls++;
-        if (calls == 1) return http.Response('try again', 503);
-        return http.Response.bytes([5, 6, 7], 200);
+        return http.Response('try again', 503);
       }),
     );
 
     final ok = await store.download(42);
-    expect(ok, isTrue);
-    expect(calls, 2);
-    expect(store.has(42), isTrue);
-    expect(await store.fileFor(42).readAsBytes(), [5, 6, 7]);
+    expect(ok, isFalse);
+    expect(calls, 1);
+    expect(store.has(42), isFalse);
     final partial = File(p.join(store.directory.path, '42.bin.partial'));
     expect(partial.existsSync(), isFalse);
   });

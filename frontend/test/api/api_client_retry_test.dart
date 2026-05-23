@@ -902,11 +902,11 @@ void main() {
   });
 
   group('ApiClient — healthCheck does not flip global offline mode', () {
-    tearDown(() => ApiClient.onNetworkFailure = null);
+    tearDown(ApiClient.clearNetworkFailureListenersForTest);
 
-    test('healthCheck transport failure does NOT invoke onNetworkFailure', () async {
+    test('healthCheck transport failure does NOT invoke network-failure listeners', () async {
       var hookCalls = 0;
-      ApiClient.onNetworkFailure = () => hookCalls++;
+      ApiClient.addNetworkFailureListener(() => hookCalls++);
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
@@ -919,10 +919,10 @@ void main() {
           reason: 'a health-check probe must not enter offline mode');
     });
 
-    test('healthCheck(retry: false) transport failure does NOT invoke onNetworkFailure',
+    test('healthCheck(retry: false) transport failure does NOT invoke network-failure listeners',
         () async {
       var hookCalls = 0;
-      ApiClient.onNetworkFailure = () => hookCalls++;
+      ApiClient.addNetworkFailureListener(() => hookCalls++);
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
@@ -933,10 +933,10 @@ void main() {
       expect(hookCalls, 0);
     });
 
-    test('a normal getJson transport failure DOES invoke onNetworkFailure',
+    test('a normal getJson transport failure DOES invoke network-failure listeners',
         () async {
       var hookCalls = 0;
-      ApiClient.onNetworkFailure = () => hookCalls++;
+      ApiClient.addNetworkFailureListener(() => hookCalls++);
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
@@ -948,6 +948,171 @@ void main() {
       );
       expect(hookCalls, 1,
           reason: 'normal requests still drive offline mode on failure');
+    });
+  });
+
+  group('ApiClient.getBytes — retry / triggerOfflineHook opt-out', () {
+    tearDown(ApiClient.clearNetworkFailureListenersForTest);
+
+    test('getBytes(retry: false) makes exactly one attempt on a retryable 504', () async {
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          return Response('timeout', 504);
+        }),
+      );
+
+      await expectLater(
+        ApiClient.instance.getBytes(
+          ['cover_art', '7'],
+          retry: false,
+        ),
+        throwsA(isA<ApiException>()
+            .having((e) => e.statusCode, 'statusCode', 504)),
+      );
+      expect(calls, 1, reason: 'retry: false must not retry');
+    });
+
+    test('getBytes(retry: false) makes exactly one attempt on a SocketException', () async {
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          throw const SocketException('down');
+        }),
+      );
+
+      await expectLater(
+        ApiClient.instance.getBytes(
+          ['cover_art', '8'],
+          retry: false,
+        ),
+        throwsA(isA<NetworkException>()
+            .having((e) => e.attemptsMade, 'attemptsMade', 1)
+            .having((e) => e.cause, 'cause', isA<SocketException>())),
+      );
+      expect(calls, 1);
+    });
+
+    test('getBytes(triggerOfflineHook: false) does NOT fire listeners on SocketException exhaustion',
+        () async {
+      var hookCalls = 0;
+      ApiClient.addNetworkFailureListener(() => hookCalls++);
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => throw const SocketException('down')),
+      );
+
+      await expectLater(
+        ApiClient.instance.getBytes(
+          ['cover_art', '9'],
+          triggerOfflineHook: false,
+        ),
+        throwsA(isA<NetworkException>()),
+      );
+      expect(hookCalls, 0,
+          reason: 'cover-art callers opt out of flipping offline mode');
+    });
+
+    test('getBytes(retry: false, triggerOfflineHook: false) on SocketException: one attempt, no listener fired',
+        () async {
+      var hookCalls = 0;
+      var calls = 0;
+      ApiClient.addNetworkFailureListener(() => hookCalls++);
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          throw const SocketException('down');
+        }),
+      );
+
+      await expectLater(
+        ApiClient.instance.getBytes(
+          ['cover_art', '10'],
+          retry: false,
+          triggerOfflineHook: false,
+        ),
+        throwsA(isA<NetworkException>()),
+      );
+      expect(calls, 1);
+      expect(hookCalls, 0);
+    });
+  });
+
+  group('ApiClient.addNetworkFailureListener — multi-listener API', () {
+    tearDown(ApiClient.clearNetworkFailureListenersForTest);
+
+    test('two listeners both fire when a network failure exhausts retries', () async {
+      var aCalls = 0;
+      var bCalls = 0;
+      ApiClient.addNetworkFailureListener(() => aCalls++);
+      ApiClient.addNetworkFailureListener(() => bCalls++);
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => throw const SocketException('down')),
+      );
+
+      await expectLater(
+        ApiClient.instance.getJson(['tracks']),
+        throwsA(isA<NetworkException>()),
+      );
+
+      expect(aCalls, 1);
+      expect(bCalls, 1);
+    });
+
+    test('removing a listener stops it from firing; re-adding restores it', () async {
+      var calls = 0;
+      void listener() => calls++;
+
+      ApiClient.addNetworkFailureListener(listener);
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => throw const SocketException('down')),
+      );
+
+      await expectLater(
+        ApiClient.instance.getJson(['tracks']),
+        throwsA(isA<NetworkException>()),
+      );
+      expect(calls, 1);
+
+      ApiClient.removeNetworkFailureListener(listener);
+      await expectLater(
+        ApiClient.instance.getJson(['tracks']),
+        throwsA(isA<NetworkException>()),
+      );
+      expect(calls, 1, reason: 'removed listener must not fire');
+
+      ApiClient.addNetworkFailureListener(listener);
+      await expectLater(
+        ApiClient.instance.getJson(['tracks']),
+        throwsA(isA<NetworkException>()),
+      );
+      expect(calls, 2, reason: 'listener re-added → fires again');
+    });
+
+    test('adding the same listener twice does NOT double-fire (Set semantics)', () async {
+      var calls = 0;
+      void listener() => calls++;
+
+      ApiClient.addNetworkFailureListener(listener);
+      ApiClient.addNetworkFailureListener(listener);
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => throw const SocketException('down')),
+      );
+
+      await expectLater(
+        ApiClient.instance.getJson(['tracks']),
+        throwsA(isA<NetworkException>()),
+      );
+
+      expect(calls, 1, reason: 'Set dedupes identical listener registrations');
     });
   });
 

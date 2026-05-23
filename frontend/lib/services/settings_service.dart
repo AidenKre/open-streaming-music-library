@@ -1,5 +1,6 @@
 import 'dart:developer' as developer;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -83,17 +84,24 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   static const _downloadQualityKey = 'settings.downloadQuality';
   static const _defaultQuality = originalQuality;
 
+  /// Hard cap on how long `build()` waits for the backend to return its
+  /// authoritative quality. Kept tight so first-paint isn't held hostage by
+  /// a slow/unreachable server — on timeout we fall back to the cached pref
+  /// and the next online startup will refresh.
+  @visibleForTesting
+  static Duration backendSyncTimeout = const Duration(seconds: 3);
+
   @override
   Future<AppSettings> build() async {
     final prefs = await ref.read(sharedPreferencesProvider.future);
-    final settings = _read(prefs);
+    final local = _read(prefs);
 
-    // Sync the backend's authoritative quality to local state. This keeps
-    // settings consistent across devices — the backend is the source of
-    // truth; SharedPreferences is an offline cache of the last known value.
-    _syncQualityFromBackend();
-
-    return settings;
+    // Sync the backend's authoritative quality before returning. The backend
+    // is the source of truth; SharedPreferences is an offline cache of the
+    // last known value. We await (with a tight timeout) so a racing call to
+    // [setStreamQualityFull] cannot be clobbered by a late-resolving sync.
+    final synced = await _syncQualityFromBackend(local, prefs);
+    return synced;
   }
 
   AppSettings _read(SharedPreferences prefs) {
@@ -106,58 +114,69 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     );
   }
 
-  void _syncQualityFromBackend() {
-    if (ApiClient.instance.baseUrl.isEmpty) return;
+  /// Fetches the authoritative stream quality from the backend and folds it
+  /// into [local], returning the merged settings. On any failure (no URL,
+  /// offline, timeout, network error, invalid response), returns [local]
+  /// unchanged. Persists the fetched value so offline restarts use it.
+  Future<AppSettings> _syncQualityFromBackend(
+    AppSettings local,
+    SharedPreferences prefs,
+  ) async {
+    if (ApiClient.instance.baseUrl.isEmpty) return local;
     // Skip when offline — the request would just fail. The cached value in
     // SharedPreferences remains in effect; next online startup will refresh.
-    if (ref.read(offlineModeProvider)) return;
-    ApiClient.instance
-        .getJson(['settings', 'quality'])
-        .then((data) async {
-          final quality = data['quality'];
-          if (!isValidQuality(quality)) return;
-          // Cache locally so offline restarts use the last known backend value.
-          final prefs = await ref.read(sharedPreferencesProvider.future);
-          await prefs.setString(_streamQualityKey, quality as String);
-          // Apply to state — intentionally do NOT set streamQualityChangeKind
-          // so the AudioCoordinator doesn't attempt a playlist rebuild at startup.
-          final current = state.value;
-          if (current == null) return;
-          if (current.persistedStreamQuality == quality) return;
-          state = AsyncData(
-            current.copyWith(persistedStreamQuality: quality),
-          );
-        })
-        .catchError((Object e) {
-          developer.log(
-            'Could not sync quality from backend: $e',
-            name: 'SettingsNotifier',
-          );
-        });
+    if (ref.read(offlineModeProvider)) return local;
+    try {
+      final data = await ApiClient.instance
+          .getJson(['settings', 'quality'])
+          .timeout(backendSyncTimeout);
+      final quality = data['quality'];
+      if (!isValidQuality(quality)) return local;
+      // Cache locally so offline restarts use the last known backend value.
+      await prefs.setString(_streamQualityKey, quality as String);
+      if (local.persistedStreamQuality == quality) return local;
+      // Intentionally do NOT set streamQualityChangeKind so the
+      // AudioCoordinator doesn't attempt a playlist rebuild at startup.
+      return local.copyWith(persistedStreamQuality: quality);
+    } catch (e) {
+      developer.log(
+        'Could not sync quality from backend: $e',
+        name: 'SettingsNotifier',
+      );
+      return local;
+    }
   }
 
-  /// Persists [quality] to SharedPreferences **and** sends it to the backend
-  /// so the server warms all tracks at the new default. Rebuilds the full
-  /// playlist in the AudioCoordinator (via [streamQualityChangeKind]).
+  /// Sends [quality] to the backend so the server warms all tracks at the new
+  /// default. On success, persists to SharedPreferences and updates state.
+  /// On PUT failure, updates in-memory state (so the UI reflects the user's
+  /// choice for the session) but does NOT persist — the next online startup
+  /// will resync from the backend, keeping cross-device state consistent.
   Future<void> setStreamQualityFull(String quality) async {
     if (!isValidQuality(quality)) {
       throw ArgumentError('invalid stream quality: $quality');
     }
-    final prefs = await ref.read(sharedPreferencesProvider.future);
-    await prefs.setString(_streamQualityKey, quality);
 
-    // Tell the backend — failures are non-fatal (the local pref still applies).
+    // PUT first; only persist on success. A failed PUT must not leave prefs
+    // ahead of the backend — that breaks cross-device sync.
+    var backendOk = false;
     try {
       await ApiClient.instance.putJson(
         ['settings', 'quality'],
         body: {'quality': quality},
         retry: true,
       );
+      backendOk = true;
     } catch (e) {
       developer.log(
         'Failed to update backend quality: $e',
         name: 'SettingsNotifier',
       );
+    }
+
+    if (backendOk) {
+      final prefs = await ref.read(sharedPreferencesProvider.future);
+      await prefs.setString(_streamQualityKey, quality);
     }
 
     final current = state.value ??

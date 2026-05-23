@@ -178,7 +178,7 @@ void main() {
   });
 
   group('scheduleWarmUuids', () {
-    test('POSTs to /tracks/warm with session_id download-manager after debounce',
+    test('POSTs to /tracks/warm with null session_id after debounce',
         () async {
       Uri? capturedUrl;
       Map<String, dynamic>? capturedBody;
@@ -195,7 +195,11 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 700));
 
       expect(capturedUrl?.path, '/tracks/warm');
-      expect(capturedBody?['session_id'], 'download-manager');
+      // The download-driven path must NOT send a magic string here; the
+      // backend ignores session_id, and a literal like 'download-manager'
+      // could collide with a real session id.
+      expect(capturedBody?.containsKey('session_id'), isTrue);
+      expect(capturedBody?['session_id'], isNull);
       expect(capturedBody?['quality'], '256');
       expect(capturedBody?['track_uuids'], ['uuid-1', 'uuid-2']);
     });
@@ -276,6 +280,98 @@ void main() {
       // is logged and swallowed by the service. The server may still warm
       // on the next debounced schedule; we don't burn attempts here.
       expect(calls, 1);
+    });
+
+    test('queue warm scheduled first does not cancel a later uuids warm; both fire',
+        () async {
+      final captured = <Map<String, dynamic>>[];
+      _installMockClient(MockClient((req) async {
+        captured.add(jsonDecode(req.body) as Map<String, dynamic>);
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([_entry('a', 0)]),
+      );
+      addTearDown(service.dispose);
+
+      // Schedule a queue warm, then within the debounce window schedule a
+      // uuids warm. Both must fire — they use independent timers now.
+      service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '320');
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      service.scheduleWarmUuids(['dl-1', 'dl-2'], quality: '320');
+
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+
+      expect(captured.length, 2);
+      // Identify each by session_id: queue path stringifies its int, the
+      // uuids path sends null.
+      final queueBody = captured.firstWhere((b) => b['session_id'] == '7');
+      final uuidsBody = captured.firstWhere((b) => b['session_id'] == null);
+      expect(queueBody['track_uuids'], ['a']);
+      expect(uuidsBody['track_uuids'], ['dl-1', 'dl-2']);
+    });
+
+    test('uuids warm scheduled first does not cancel a later queue warm; both fire',
+        () async {
+      final captured = <Map<String, dynamic>>[];
+      _installMockClient(MockClient((req) async {
+        captured.add(jsonDecode(req.body) as Map<String, dynamic>);
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([_entry('a', 0)]),
+      );
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['dl-1'], quality: '320');
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      service.scheduleWarm(sessionId: 9, currentPlayPosition: 0, quality: '320');
+
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+
+      expect(captured.length, 2);
+      final queueBody = captured.firstWhere((b) => b['session_id'] == '9');
+      final uuidsBody = captured.firstWhere((b) => b['session_id'] == null);
+      expect(queueBody['track_uuids'], ['a']);
+      expect(uuidsBody['track_uuids'], ['dl-1']);
+    });
+
+    test('back-to-back queue warms still coalesce to one POST (debounce intact)',
+        () async {
+      var postCount = 0;
+      _installMockClient(MockClient((_) async {
+        postCount++;
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([_entry('a', 0)]),
+      );
+      addTearDown(service.dispose);
+
+      service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
+      service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
+      service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
+
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      expect(postCount, 1);
+    });
+
+    test('queue warm sends session_id as a stringified int (no magic source)',
+        () async {
+      Map<String, dynamic>? capturedBody;
+      _installMockClient(MockClient((req) async {
+        capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(
+        queueRepo: _FakeQueueRepo([_entry('a', 0)]),
+      );
+      addTearDown(service.dispose);
+
+      service.scheduleWarm(sessionId: 42, currentPlayPosition: 0, quality: '320');
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+
+      expect(capturedBody?['session_id'], '42');
     });
 
     test('does not retry on SocketException; failure is swallowed', () async {
