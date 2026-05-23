@@ -1122,4 +1122,111 @@ void main() {
       expect(e.toString(), 'NetworkException(3 attempts): host down');
     });
   });
+
+  group('ApiClient — explicit RetryPolicy parameter', () {
+    test('policy: RetryPolicy(maxAttempts: 5) drives 5 attempts end-to-end', () async {
+      // Proves the new opt-in `policy` parameter actually overrides the
+      // hardcoded 3-attempt default — i.e. RetryPolicy is wired through
+      // _request<T> all the way to the retry loop. Five attempts each
+      // returning a retryable 503; succeeds on attempt 5.
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          if (calls < 5) return Response('try again', 503);
+          return Response(jsonEncode({'ok': true, 'calls': calls}), 200);
+        }),
+      );
+
+      final result = await ApiClient.instance.getJson(
+        ['tracks'],
+        policy: const RetryPolicy(maxAttempts: 5),
+      );
+
+      expect(calls, 5);
+      expect(result['ok'], true);
+      expect(result['calls'], 5);
+    });
+
+    test('policy: RetryPolicy(maxAttempts: 5) drives 5 attempts before NetworkException on exhaustion', () async {
+      // Same idea but on the transport-error path: the NetworkException's
+      // attemptsMade must reflect the policy, not the legacy _maxAttempts=3.
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          throw const SocketException('persistently down');
+        }),
+      );
+
+      await expectLater(
+        ApiClient.instance.getJson(
+          ['tracks'],
+          policy: const RetryPolicy(maxAttempts: 5),
+        ),
+        throwsA(isA<NetworkException>().having(
+          (e) => e.attemptsMade,
+          'attemptsMade',
+          5,
+        )),
+      );
+      expect(calls, 5);
+    });
+
+    test('explicit policy on postJson overrides the legacy retry:false default', () async {
+      // postJson defaults to noRetry, but passing an explicit policy with
+      // maxAttempts > 1 wins. Confirms _resolvePolicy precedence.
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          if (calls < 2) return Response('try again', 503);
+          return Response(jsonEncode({'ok': true}), 200);
+        }),
+      );
+
+      final result = await ApiClient.instance.postJson(
+        ['warm'],
+        body: const {'session': '1'},
+        policy: const RetryPolicy(maxAttempts: 2),
+      );
+
+      expect(calls, 2);
+      expect(result['ok'], true);
+    });
+
+    test('legacy triggerOfflineHook:false still suppresses listeners when explicit policy is provided', () async {
+      // Combining `policy:` with `triggerOfflineHook: false` must keep the
+      // suppression — the boolean wins on this single field via copyWith.
+      var fired = 0;
+      void listener() => fired++;
+      ApiClient.addNetworkFailureListener(listener);
+      addTearDown(() => ApiClient.removeNetworkFailureListener(listener));
+
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          throw const SocketException('down');
+        }),
+      );
+
+      await expectLater(
+        ApiClient.instance.getJson(
+          ['tracks'],
+          triggerOfflineHook: false,
+          policy: const RetryPolicy(maxAttempts: 2),
+        ),
+        throwsA(isA<NetworkException>().having(
+          (e) => e.attemptsMade,
+          'attemptsMade',
+          2,
+        )),
+      );
+      expect(fired, 0,
+          reason: 'triggerOfflineHook:false must override the policy default');
+    });
+  });
 }

@@ -7,6 +7,10 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'retry_policy.dart';
+
+export 'retry_policy.dart';
+
 class ApiException implements Exception {
   final int statusCode;
   final String message;
@@ -50,6 +54,8 @@ class HealthResult {
   bool get isOk => status == HealthStatus.ok;
 }
 
+enum _HttpVerb { get, put, post }
+
 class ApiClient {
   static final ApiClient instance = ApiClient._();
   ApiClient._() : _http = http.Client(), baseUrl = '';
@@ -91,18 +97,17 @@ class ApiClient {
   String baseUrl;
   http.Client _http;
 
-  // Retry configuration. Centralized so all five request methods share it.
-  static const int _maxAttempts = 3;
-  static const Duration _baseDelay = Duration(milliseconds: 250);
-  static const Duration _maxRetryAfter = Duration(seconds: 10);
-  static const Duration _defaultPerAttemptTimeout = Duration(seconds: 10);
-  static const Set<int> _retryableStatusCodes = {408, 429, 502, 503, 504};
-
   // Test seams. Tests inject a no-op delay + short timeout to run in
-  // milliseconds; production uses Future.delayed and a 10s per-attempt limit.
+  // milliseconds; production uses Future.delayed and the policy's own
+  // per-attempt timeout (10s by default).
   DelayFn _delay = Future.delayed;
   math.Random _random = math.Random();
-  Duration _perAttemptTimeout = _defaultPerAttemptTimeout;
+
+  // Optional instance-level override for the per-attempt timeout. When set,
+  // it takes precedence over `policy.perAttemptTimeout` so tests can shrink
+  // a long hang into a millisecond-scale assertion without rebuilding every
+  // call site to pass a custom policy.
+  Duration? _perAttemptTimeoutOverride;
 
   static void init(String url) {
     instance.baseUrl = url;
@@ -114,7 +119,7 @@ class ApiClient {
     instance._http = httpClient;
     instance._delay = (_) async {};
     instance._random = math.Random(0);
-    instance._perAttemptTimeout = _defaultPerAttemptTimeout;
+    instance._perAttemptTimeoutOverride = null;
   }
 
   @visibleForTesting
@@ -126,7 +131,7 @@ class ApiClient {
   @visibleForTesting
   // ignore: use_setters_to_change_properties
   void setPerAttemptTimeoutForTest(Duration timeout) {
-    _perAttemptTimeout = timeout;
+    _perAttemptTimeoutOverride = timeout;
   }
 
   Uri _buildUri(
@@ -143,38 +148,29 @@ class ApiClient {
 
   /// GET returning JSON. Retries transient failures by default; pass
   /// `retry: false` for a single-attempt call (used by health polling, which
-  /// is its own retry loop).
+  /// is its own retry loop), or pass an explicit [policy] for full control.
   Future<Map<String, dynamic>> getJson(
     List<String> pathSegments, {
     Map<String, String>? query,
     Map<String, String>? headers,
     bool retry = true,
     bool triggerOfflineHook = true,
-  }) async {
-    final uri = _buildUri(pathSegments, query: query);
-    Future<Map<String, dynamic>> attempt() async {
-      final response = await _http.get(
-        uri,
-        headers: {'Accept': 'application/json', ...?headers},
-      );
-      developer.log(
-        '${response.statusCode} ${response.body.length}B',
-        name: 'ApiClient',
-      );
-      return _handleJsonResponse(response);
-    }
-    final label = 'GET $uri';
-    return retry
-        ? _withRetry<Map<String, dynamic>>(
-            attempt,
-            label: label,
-            triggerOfflineHook: triggerOfflineHook,
-          )
-        : _withoutRetry<Map<String, dynamic>>(
-            attempt,
-            label: label,
-            triggerOfflineHook: triggerOfflineHook,
-          );
+    RetryPolicy? policy,
+  }) {
+    return _request<Map<String, dynamic>>(
+      verb: _HttpVerb.get,
+      pathSegments: pathSegments,
+      query: query,
+      headers: headers,
+      decode: _handleJsonResponse,
+      acceptJson: true,
+      policy: _resolvePolicy(
+        explicit: policy,
+        retry: retry,
+        triggerOfflineHook: triggerOfflineHook,
+        defaultRetry: true,
+      ),
+    );
   }
 
   /// PUT with JSON body. Defaults to a **single attempt** — pass `retry: true`
@@ -186,29 +182,22 @@ class ApiClient {
     Map<String, dynamic>? body,
     Map<String, String>? headers,
     bool retry = false,
-  }) async {
-    final uri = _buildUri(pathSegments);
-    final encodedBody = body != null ? jsonEncode(body) : null;
-    Future<Map<String, dynamic>> attempt() async {
-      final response = await _http.put(
-        uri,
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          ...?headers,
-        },
-        body: encodedBody,
-      );
-      developer.log(
-        '${response.statusCode} ${response.body.length}B',
-        name: 'ApiClient',
-      );
-      return _handleJsonResponse(response);
-    }
-    final label = 'PUT $uri';
-    return retry
-        ? _withRetry<Map<String, dynamic>>(attempt, label: label)
-        : _withoutRetry<Map<String, dynamic>>(attempt, label: label);
+    RetryPolicy? policy,
+  }) {
+    return _request<Map<String, dynamic>>(
+      verb: _HttpVerb.put,
+      pathSegments: pathSegments,
+      headers: headers,
+      jsonBody: body,
+      decode: _handleJsonResponse,
+      acceptJson: true,
+      policy: _resolvePolicy(
+        explicit: policy,
+        retry: retry,
+        triggerOfflineHook: true,
+        defaultRetry: false,
+      ),
+    );
   }
 
   /// POST with JSON body. Defaults to a **single attempt** — pass `retry: true`
@@ -220,29 +209,22 @@ class ApiClient {
     Map<String, dynamic>? body,
     Map<String, String>? headers,
     bool retry = false,
-  }) async {
-    final uri = _buildUri(pathSegments);
-    final encodedBody = body != null ? jsonEncode(body) : null;
-    Future<Map<String, dynamic>> attempt() async {
-      final response = await _http.post(
-        uri,
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          ...?headers,
-        },
-        body: encodedBody,
-      );
-      developer.log(
-        '${response.statusCode} ${response.body.length}B',
-        name: 'ApiClient',
-      );
-      return _handleJsonResponse(response);
-    }
-    final label = 'POST $uri';
-    return retry
-        ? _withRetry<Map<String, dynamic>>(attempt, label: label)
-        : _withoutRetry<Map<String, dynamic>>(attempt, label: label);
+    RetryPolicy? policy,
+  }) {
+    return _request<Map<String, dynamic>>(
+      verb: _HttpVerb.post,
+      pathSegments: pathSegments,
+      headers: headers,
+      jsonBody: body,
+      decode: _handleJsonResponse,
+      acceptJson: true,
+      policy: _resolvePolicy(
+        explicit: policy,
+        retry: retry,
+        triggerOfflineHook: true,
+        defaultRetry: false,
+      ),
+    );
   }
 
   /// Binary GET. Returns the raw response body as bytes.
@@ -251,38 +233,61 @@ class ApiClient {
   /// on exhaustion. Cover-art tiles are high-volume (one fetch per album/
   /// artist tile) and a single failing thumbnail should not darken the
   /// whole app — those callers should pass `retry: false` and
-  /// `triggerOfflineHook: false`.
+  /// `triggerOfflineHook: false` (or `policy: RetryPolicy.coverArt`).
   Future<Uint8List> getBytes(
     List<String> pathSegments, {
     Map<String, String>? query,
     Map<String, String>? headers,
     bool retry = true,
     bool triggerOfflineHook = true,
-  }) async {
-    final uri = _buildUri(pathSegments, query: query);
-    Future<Uint8List> attempt() async {
-      final response = await _http.get(uri, headers: headers);
-      developer.log(
-        '${response.statusCode} ${response.bodyBytes.length}B',
-        name: 'ApiClient',
-      );
-      if (_isSuccess(response.statusCode)) {
-        return response.bodyBytes;
-      }
-      throw _HttpFailureSignal(response.statusCode, response.body, response.headers);
+    RetryPolicy? policy,
+  }) {
+    return _request<Uint8List>(
+      verb: _HttpVerb.get,
+      pathSegments: pathSegments,
+      query: query,
+      headers: headers,
+      decode: (response) {
+        if (_isSuccess(response.statusCode)) {
+          return response.bodyBytes;
+        }
+        throw _HttpFailureSignal(
+          response.statusCode,
+          response.body,
+          response.headers,
+        );
+      },
+      acceptJson: false,
+      policy: _resolvePolicy(
+        explicit: policy,
+        retry: retry,
+        triggerOfflineHook: triggerOfflineHook,
+        defaultRetry: true,
+      ),
+    );
+  }
+
+  /// Resolves the effective policy from the legacy `retry` / `triggerOfflineHook`
+  /// booleans and an optional explicit [explicit] override. When [explicit] is
+  /// provided it wins outright; otherwise we pick `standard` vs `noRetry`
+  /// based on the verb's default and apply the offline-hook opt-out via
+  /// `copyWith` so callers keep getting the well-known constants without
+  /// the boolean fork bleeding throughout the request methods.
+  RetryPolicy _resolvePolicy({
+    required RetryPolicy? explicit,
+    required bool retry,
+    required bool triggerOfflineHook,
+    required bool defaultRetry,
+  }) {
+    if (explicit != null) {
+      return triggerOfflineHook
+          ? explicit
+          : explicit.copyWith(triggerOfflineHook: false);
     }
-    final label = 'GET-bytes $uri';
-    return retry
-        ? _withRetry<Uint8List>(
-            attempt,
-            label: label,
-            triggerOfflineHook: triggerOfflineHook,
-          )
-        : _withoutRetry<Uint8List>(
-            attempt,
-            label: label,
-            triggerOfflineHook: triggerOfflineHook,
-          );
+    final base = retry ? RetryPolicy.standard : RetryPolicy.noRetry;
+    return triggerOfflineHook
+        ? base
+        : base.copyWith(triggerOfflineHook: false);
   }
 
   /// Streaming send for callers that need a chunked response stream
@@ -293,7 +298,7 @@ class ApiClient {
   Future<http.StreamedResponse> send(
     http.BaseRequest Function() requestFactory,
   ) async {
-    return _withRetry<http.StreamedResponse>(
+    return _runWithPolicy<http.StreamedResponse>(
       () async {
         final request = requestFactory();
         final response = await _http.send(request);
@@ -310,7 +315,103 @@ class ApiClient {
         throw _HttpFailureSignal(response.statusCode, '', response.headers);
       },
       label: 'SEND',
+      policy: RetryPolicy.standard,
     );
+  }
+
+  /// Central request method. All four verb wrappers funnel through here so
+  /// the retry loop, timeout, header handling, and offline-hook semantics
+  /// live in exactly one place.
+  ///
+  /// [acceptJson] controls whether `Accept: application/json` is auto-injected:
+  /// JSON wrappers want it (was the previous behaviour); `getBytes` does NOT
+  /// (cover-art etc. set no defaults, and a null `headers` map must remain
+  /// null to preserve the pre-refactor request shape exactly).
+  Future<T> _request<T>({
+    required _HttpVerb verb,
+    required List<String> pathSegments,
+    required T Function(http.Response) decode,
+    required bool acceptJson,
+    Map<String, String>? query,
+    Map<String, String>? headers,
+    Object? jsonBody,
+    RetryPolicy policy = RetryPolicy.standard,
+  }) {
+    final uri = _buildUri(pathSegments, query: query);
+    final encodedBody = jsonBody != null ? jsonEncode(jsonBody) : null;
+    final mergedHeaders = _mergeHeaders(verb, headers, acceptJson: acceptJson);
+
+    Future<T> attempt() async {
+      final http.Response response;
+      switch (verb) {
+        case _HttpVerb.get:
+          response = await _http.get(uri, headers: mergedHeaders);
+        case _HttpVerb.put:
+          response = await _http.put(
+            uri,
+            headers: mergedHeaders,
+            body: encodedBody,
+          );
+        case _HttpVerb.post:
+          response = await _http.post(
+            uri,
+            headers: mergedHeaders,
+            body: encodedBody,
+          );
+      }
+      // JSON-decoding callers see character-length; getBytes overrides the
+      // log via its decode callback if it needs byte-length. Keeping
+      // body.length here matches the pre-refactor log format exactly.
+      developer.log(
+        '${response.statusCode} ${response.body.length}B',
+        name: 'ApiClient',
+      );
+      return decode(response);
+    }
+
+    return _runWithPolicy<T>(
+      attempt,
+      label: '${_verbLabel(verb)} $uri',
+      policy: policy,
+    );
+  }
+
+  /// GET requests omit `Content-Type`; bytes-GETs additionally omit `Accept`
+  /// (callers pass their own when needed) and must preserve a null `headers`
+  /// map verbatim, since `package:http` distinguishes that from an empty map
+  /// in its outgoing request shape. Keeping the merge in one place means a
+  /// future header tweak — auth, tracing — touches a single function.
+  Map<String, String>? _mergeHeaders(
+    _HttpVerb verb,
+    Map<String, String>? headers, {
+    required bool acceptJson,
+  }) {
+    switch (verb) {
+      case _HttpVerb.get:
+        if (!acceptJson) {
+          // Bytes-GET path: leave the caller's headers (incl. null) untouched.
+          return headers;
+        }
+        return {'Accept': 'application/json', ...?headers};
+      case _HttpVerb.put:
+      case _HttpVerb.post:
+        return {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          ...?headers,
+        };
+    }
+  }
+
+  String _verbLabel(_HttpVerb verb) {
+    switch (verb) {
+      case _HttpVerb.get:
+        return 'GET';
+      case _HttpVerb.put:
+        return 'PUT';
+      case _HttpVerb.post:
+        return 'POST';
+    }
   }
 
   Map<String, dynamic> _handleJsonResponse(http.Response response) {
@@ -370,8 +471,8 @@ class ApiClient {
   /// Runs [attempt] exactly once, wrapped in the per-attempt timeout. Logs
   /// the attempt and rethrows the raw classification signals
   /// ([_HttpFailureSignal], [SocketException], [TimeoutException],
-  /// [http.ClientException], [ArgumentError]) for the layered helpers
-  /// ([_withRetry], [_withoutRetry]) to decide what to do with.
+  /// [http.ClientException], [ArgumentError]) for [_runWithPolicy] to
+  /// decide what to do with.
   ///
   /// `Future.timeout` abandons the wait but does NOT cancel the underlying
   /// HTTP request — `package:http` has no public abort API, and even with
@@ -386,55 +487,55 @@ class ApiClient {
     required String label,
     required int attemptNumber,
     required int totalAttempts,
+    required Duration perAttemptTimeout,
   }) async {
     developer.log(
       '$label (attempt $attemptNumber/$totalAttempts)',
       name: 'ApiClient',
     );
-    return await attempt().timeout(_perAttemptTimeout);
+    return await attempt().timeout(perAttemptTimeout);
   }
 
-  /// Runs [attempt] with retry on transient failures.
+  /// Runs [attempt] under [policy]. When `policy.maxAttempts == 1` this is
+  /// effectively a single shot that converts failures to typed exceptions;
+  /// otherwise it retries on transient signals with full-jitter exponential
+  /// backoff (honoring `Retry-After` up to `policy.maxRetryAfter`).
   ///
   /// Retries on:
-  ///   - HTTP 408, 429, 502, 503, 504 (via [_HttpFailureSignal])
+  ///   - HTTP codes in `policy.retryableStatusCodes` (via [_HttpFailureSignal])
   ///   - SocketException, TimeoutException, http.ClientException
   ///   - ArgumentError (treated as a transport failure — typically a
   ///     malformed URL caused by an empty/invalid baseUrl)
   ///
-  /// Honors `Retry-After` (seconds or HTTP-date) on any retryable status
-  /// response that carries the header, clamped to [_maxRetryAfter]. The
-  /// RFC defines Retry-After primarily for 429/503/3xx, but in practice
-  /// proxies emit it on other 5xx codes; honoring it broadly is safe.
-  /// Otherwise uses exponential backoff with full jitter:
-  /// `delay = random(0, _baseDelay * 2^(n-1))` where n is the
-  /// 1-indexed attempt number. Windows: 250ms, 500ms, 1000ms.
-  ///
   /// On exhaustion throws [ApiException] (HTTP) or [NetworkException]
   /// (transport). No raw SocketException/TimeoutException/ClientException/
   /// ArgumentError escapes ApiClient via the request methods.
-  Future<T> _withRetry<T>(
+  Future<T> _runWithPolicy<T>(
     Future<T> Function() attempt, {
     required String label,
-    bool triggerOfflineHook = true,
+    required RetryPolicy policy,
   }) async {
+    final maxAttempts = policy.maxAttempts;
+    final perAttemptTimeout =
+        _perAttemptTimeoutOverride ?? policy.perAttemptTimeout;
     Object? lastNetworkCause;
-    for (var attemptNumber = 1; attemptNumber <= _maxAttempts; attemptNumber++) {
+    for (var attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber++) {
       try {
         return await _runAttempt(
           attempt,
           label: label,
           attemptNumber: attemptNumber,
-          totalAttempts: _maxAttempts,
+          totalAttempts: maxAttempts,
+          perAttemptTimeout: perAttemptTimeout,
         );
       } on _HttpFailureSignal catch (status) {
-        if (!_retryableStatusCodes.contains(status.statusCode)) {
+        if (!policy.retryableStatusCodes.contains(status.statusCode)) {
           throw ApiException(status.statusCode, status.body);
         }
-        if (attemptNumber >= _maxAttempts) {
+        if (attemptNumber >= maxAttempts) {
           throw ApiException(status.statusCode, status.body);
         }
-        final delay = _delayForRetry(attemptNumber, status.headers);
+        final delay = _delayForRetry(attemptNumber, status.headers, policy);
         developer.log(
           '$label HTTP ${status.statusCode} — retrying in ${delay.inMilliseconds}ms',
           name: 'ApiClient',
@@ -443,22 +544,22 @@ class ApiClient {
         continue;
       } on SocketException catch (e) {
         lastNetworkCause = e;
-        if (attemptNumber >= _maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {});
+        if (attemptNumber >= maxAttempts) break;
+        final delay = _delayForRetry(attemptNumber, const {}, policy);
         developer.log('$label socket error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
         await _delay(delay);
         continue;
       } on TimeoutException catch (e) {
         lastNetworkCause = e;
-        if (attemptNumber >= _maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {});
+        if (attemptNumber >= maxAttempts) break;
+        final delay = _delayForRetry(attemptNumber, const {}, policy);
         developer.log('$label timeout — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
         await _delay(delay);
         continue;
       } on http.ClientException catch (e) {
         lastNetworkCause = e;
-        if (attemptNumber >= _maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {});
+        if (attemptNumber >= maxAttempts) break;
+        final delay = _delayForRetry(attemptNumber, const {}, policy);
         developer.log('$label client error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
         await _delay(delay);
         continue;
@@ -467,68 +568,37 @@ class ApiClient {
         // resulting Uri has no scheme/host. Treat as a transport-level error
         // so callers see a typed NetworkException rather than a raw throw.
         lastNetworkCause = e;
-        if (attemptNumber >= _maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {});
+        if (attemptNumber >= maxAttempts) break;
+        final delay = _delayForRetry(attemptNumber, const {}, policy);
         developer.log('$label argument error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
         await _delay(delay);
         continue;
       }
     }
     // All attempts exhausted on transport-level failures — signal offline.
-    if (triggerOfflineHook) _fireNetworkFailure();
+    if (policy.triggerOfflineHook) _fireNetworkFailure();
     throw NetworkException(
       lastNetworkCause?.toString() ?? 'unknown network error',
       cause: lastNetworkCause,
-      attemptsMade: _maxAttempts,
+      attemptsMade: maxAttempts,
     );
   }
 
-  /// Runs [attempt] exactly once and converts failures to the same typed
-  /// exceptions [_withRetry] produces — [ApiException] for HTTP failures
-  /// (retryable or not, since there's no second chance to take), and
-  /// [NetworkException]`(attemptsMade: 1)` for transport-layer errors.
-  /// Used by `postJson`/`putJson` when `retry: false` so callers handle a
-  /// uniform exception shape regardless of whether retries are enabled.
-  Future<T> _withoutRetry<T>(
-    Future<T> Function() attempt, {
-    required String label,
-    bool triggerOfflineHook = true,
-  }) async {
-    try {
-      return await _runAttempt(
-        attempt,
-        label: label,
-        attemptNumber: 1,
-        totalAttempts: 1,
-      );
-    } on _HttpFailureSignal catch (status) {
-      throw ApiException(status.statusCode, status.body);
-    } on SocketException catch (e) {
-      if (triggerOfflineHook) _fireNetworkFailure();
-      throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
-    } on TimeoutException catch (e) {
-      if (triggerOfflineHook) _fireNetworkFailure();
-      throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
-    } on http.ClientException catch (e) {
-      if (triggerOfflineHook) _fireNetworkFailure();
-      throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
-    } on ArgumentError catch (e) {
-      if (triggerOfflineHook) _fireNetworkFailure();
-      throw NetworkException(e.toString(), cause: e, attemptsMade: 1);
-    }
-  }
-
   /// Returns the wait time before the next attempt. If the response carried
-  /// a parseable Retry-After header, that wins (clamped to _maxRetryAfter).
-  /// Otherwise: full-jitter exponential backoff.
-  Duration _delayForRetry(int attemptNumber, Map<String, String> headers) {
+  /// a parseable Retry-After header, that wins (clamped to policy.maxRetryAfter).
+  /// Otherwise: full-jitter exponential backoff anchored on policy.baseDelay.
+  Duration _delayForRetry(
+    int attemptNumber,
+    Map<String, String> headers,
+    RetryPolicy policy,
+  ) {
     final retryAfter = _parseRetryAfter(_headerIgnoreCase(headers, 'retry-after'));
     if (retryAfter != null) {
-      return retryAfter > _maxRetryAfter ? _maxRetryAfter : retryAfter;
+      return retryAfter > policy.maxRetryAfter ? policy.maxRetryAfter : retryAfter;
     }
-    // attemptNumber is 1-based; for n=1, window is _baseDelay = 250ms.
+    // attemptNumber is 1-based; for n=1, window is baseDelay = 250ms.
     // Using 2^(n-1) gives 250/500/1000 windows starting at n=1.
-    final windowMs = _baseDelay.inMilliseconds * (1 << (attemptNumber - 1));
+    final windowMs = policy.baseDelay.inMilliseconds * (1 << (attemptNumber - 1));
     final jittered = _random.nextInt(windowMs + 1);
     return Duration(milliseconds: jittered);
   }
