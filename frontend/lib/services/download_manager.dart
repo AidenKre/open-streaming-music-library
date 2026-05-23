@@ -12,6 +12,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/track_cache_manager.dart';
+import 'package:frontend/services/download/download_status_reader.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/queue_warm_service.dart';
@@ -178,10 +179,12 @@ class DownloadManager extends ChangeNotifier {
   @visibleForTesting
   Future<void> Function(String uuidId)? testHookBeforeDbWrite;
 
+  late final DownloadStatusReader _status;
+
   /// Notified once when the underlying tracks table changes such that
   /// downloaded-status checks may have new answers. Lets the UI invalidate
   /// derived providers without polling the DB.
-  final ValueNotifier<int> downloadStatusVersion = ValueNotifier<int>(0);
+  ValueNotifier<int> get downloadStatusVersion => _status.downloadStatusVersion;
 
   DownloadManager({
     required AppDatabase db,
@@ -200,7 +203,9 @@ class DownloadManager extends ChangeNotifier {
        _streamQualityFn = streamQualityFn,
        _apiClient = apiClient ?? ApiClient.instance,
        _isOfflineFn = isOfflineFn ?? (() => false),
-       _onNetworkFailure = onNetworkFailure;
+       _onNetworkFailure = onNetworkFailure {
+    _status = DownloadStatusReader(db: db);
+  }
 
   DownloadQueueState get state => _state;
 
@@ -211,7 +216,7 @@ class DownloadManager extends ChangeNotifier {
     // be called twice when a ProviderScope tears down.
     if (_disposed) return;
     _disposed = true;
-    downloadStatusVersion.dispose();
+    _status.dispose();
     super.dispose();
   }
 
@@ -760,32 +765,14 @@ class DownloadManager extends ChangeNotifier {
   }
 
   void _bumpVersion() {
-    downloadStatusVersion.value += 1;
+    _status.bumpVersion();
   }
 
   /// Returns the set of uuid_ids that have a non-null `file_path` (and the
   /// file actually exists on disk). Used by aggregate "fully downloaded"
   /// queries for albums/artists.
-  Future<Set<String>> downloadedUuidsForUuids(Iterable<String> uuids) async {
-    final unique = uuids.toSet().toList(growable: false);
-    if (unique.isEmpty) return const <String>{};
-    final placeholders = List.filled(unique.length, '?').join(', ');
-    final rows = await _db
-        .customSelect(
-          'SELECT uuid_id, file_path FROM tracks '
-          'WHERE uuid_id IN ($placeholders) AND file_path IS NOT NULL',
-          variables: unique.map(Variable.withString).toList(),
-        )
-        .get();
-    final result = <String>{};
-    for (final r in rows) {
-      final path = r.readNullable<String>('file_path');
-      if (path != null && await File(path).exists()) {
-        result.add(r.read<String>('uuid_id'));
-      }
-    }
-    return result;
-  }
+  Future<Set<String>> downloadedUuidsForUuids(Iterable<String> uuids) =>
+      _status.downloadedUuidsForUuids(uuids);
 
   /// Stable, paginated view used by the downloading page.
   UnmodifiableListView<DownloadJob> snapshot() =>
