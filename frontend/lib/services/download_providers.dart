@@ -163,7 +163,9 @@ Future<void> downloadAlbumTracksAtQuality(
   final tracks = await ref.read(browseRepositoryProvider)
       .getTracksForAlbum(artistId, albumId);
   if (tracks.isNotEmpty) {
-    ref.read(downloadManagerProvider).enqueueTracks(tracks, quality: quality);
+    ref
+        .read(downloadManagerProvider)
+        .enqueueTracksAtQuality(tracks, quality: quality);
   }
 }
 
@@ -172,10 +174,14 @@ Future<void> downloadArtistTracksAtQuality(
   final tracks = await ref.read(browseRepositoryProvider)
       .getTracksForArtist(artistId);
   if (tracks.isNotEmpty) {
-    ref.read(downloadManagerProvider).enqueueTracks(tracks, quality: quality);
+    ref
+        .read(downloadManagerProvider)
+        .enqueueTracksAtQuality(tracks, quality: quality);
   }
 }
 
 void downloadTrackAtQuality(WidgetRef ref, TrackUI track, String quality) {
-  ref.read(downloadManagerProvider).enqueueTracks([track], quality: quality);
+  ref
+      .read(downloadManagerProvider)
+      .enqueueTracksAtQuality([track], quality: quality);
 }
