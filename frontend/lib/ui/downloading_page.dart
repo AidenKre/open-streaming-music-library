@@ -18,13 +18,9 @@ class DownloadingPage extends ConsumerWidget {
 
     // Active first, queued in the middle, finished last. Stable order
     // within each bucket: insertion order, since we don't reorder underneath.
-    final active = jobs.where((j) => j.state == DownloadState.active).toList();
-    final queued = jobs.where((j) => j.state == DownloadState.queued).toList();
-    final finished = jobs
-        .where((j) =>
-            j.state == DownloadState.completed ||
-            j.state == DownloadState.failed)
-        .toList();
+    final active = jobs.where((j) => j.isActive).toList();
+    final queued = jobs.where((j) => j.isQueued).toList();
+    final finished = jobs.where((j) => j.isCompleted || j.isFailed).toList();
 
     return Scaffold(
       appBar: AppBar(
@@ -83,11 +79,10 @@ class _DownloadTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final artistPart = job.artist ?? '';
-    final sizePart = job.state == DownloadState.completed && job.fileSizeBytes != null
-        ? formatBytes(job.fileSizeBytes!)
-        : null;
-    final subtitle = job.state == DownloadState.failed && job.errorMessage != null
-        ? 'Failed: ${job.errorMessage}'
+    final status = job.status;
+    final sizePart = status is Completed ? formatBytes(status.sizeBytes) : null;
+    final subtitle = status is Failed
+        ? 'Failed: ${status.message}'
         : [artistPart, sizePart].where((s) => s != null && s.isNotEmpty).join(' \u2022 ');
 
     return ListTile(
@@ -99,24 +94,22 @@ class _DownloadTile extends StatelessWidget {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
-      trailing: switch (job.state) {
-        DownloadState.active => SizedBox(
+      trailing: switch (status) {
+        Active(:final progress) => SizedBox(
             width: 80,
             child: LinearProgressIndicator(
-              value: job.progress > 0 ? job.progress : null,
+              value: progress > 0 ? progress : null,
             ),
           ),
-        DownloadState.queued => onCancel != null
+        Queued() => onCancel != null
             ? IconButton(
                 icon: const Icon(Icons.close),
                 onPressed: onCancel,
                 tooltip: 'Cancel',
               )
             : const Icon(Icons.schedule),
-        DownloadState.completed =>
-          Icon(Icons.check_circle, color: colors.primary),
-        DownloadState.failed =>
-          Icon(Icons.error_outline, color: colors.error),
+        Completed() => Icon(Icons.check_circle, color: colors.primary),
+        Failed() => Icon(Icons.error_outline, color: colors.error),
       },
     );
   }

@@ -275,16 +275,15 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                       .firstOrNull;
                   Widget? trailing;
                   if (job != null) {
-                    trailing = switch (job.state) {
-                      DownloadState.active => SizedBox(
+                    trailing = switch (job.status) {
+                      Active(:final progress) => SizedBox(
                           width: 80,
                           child: LinearProgressIndicator(
-                            value: job.progress > 0 ? job.progress : null,
+                            value: progress > 0 ? progress : null,
                           ),
                         ),
-                      DownloadState.queued =>
-                        const Icon(Icons.schedule, size: 16),
-                      _ => null,
+                      Queued() => const Icon(Icons.schedule, size: 16),
+                      Completed() || Failed() => null,
                     };
                   }
                   return TrackTile(

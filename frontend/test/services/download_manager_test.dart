@@ -78,9 +78,7 @@ Future<void> _insertTrack(
 
 Future<DownloadManager> _waitForFinish(DownloadManager m) async {
   // Wait for all in-flight jobs to leave the active state.
-  while (m.snapshot().any(
-    (j) => j.state == DownloadState.active || j.state == DownloadState.queued,
-  )) {
+  while (m.snapshot().any((j) => j.isActive || j.isQueued)) {
     await Future<void>.delayed(const Duration(milliseconds: 5));
   }
   return m;
@@ -161,7 +159,7 @@ void main() {
   }
 
   Future<void> waitUntilNotActive(DownloadManager m) async {
-    while (m.snapshot().any((j) => j.state == DownloadState.active)) {
+    while (m.snapshot().any((j) => j.isActive)) {
       await Future<void>.delayed(const Duration(milliseconds: 5));
     }
   }
@@ -197,8 +195,8 @@ void main() {
     await _waitForFinish(manager);
 
     final job = manager.snapshot().first;
-    expect(job.state, DownloadState.completed);
-    expect(job.progress, 1.0);
+    expect(job.isCompleted, isTrue);
+    expect((job.status as Completed).sizeBytes, 4);
 
     final row = await (db.select(
       db.tracks,
@@ -245,11 +243,14 @@ void main() {
 
       await manager.enqueueTracks([_track('active')], quality: originalQuality);
       await _waitFor(() {
-        return manager.snapshot().any((j) => j.state == DownloadState.active);
+        return manager.snapshot().any((j) => j.isActive);
       });
       stream.add([1, 2, 3]);
       await _waitFor(() {
-        return manager.snapshot().any((j) => j.progress > 0);
+        return manager.snapshot().any((j) {
+          final s = j.status;
+          return s is Active && s.progress > 0;
+        });
       });
 
       await manager.resetAndDeleteFiles();
@@ -667,7 +668,7 @@ void main() {
       expect(requestCount, 1);
       // The job completed and the row now points at the new 320 kbps file.
       final job = manager.snapshot().first;
-      expect(job.state, DownloadState.completed);
+      expect(job.isCompleted, isTrue);
       final row = await (db.select(
         db.tracks,
       )..where((t) => t.uuidId.equals('abc'))).getSingle();
@@ -754,7 +755,7 @@ void main() {
       reason: 'request factory must be invoked once per attempt',
     );
     final job = manager.snapshot().first;
-    expect(job.state, DownloadState.completed);
+    expect(job.isCompleted, isTrue);
 
     final row = await (db.select(
       db.tracks,
@@ -798,8 +799,8 @@ void main() {
 
     final job = manager.snapshot().first;
     expect(
-      job.state,
-      DownloadState.completed,
+      job.isCompleted,
+      isTrue,
       reason: 'cover-art FS failure must not fail the audio job',
     );
 
@@ -823,7 +824,7 @@ void main() {
       await _waitForFinish(manager);
 
       final job = manager.snapshot().first;
-      expect(job.state, DownloadState.failed);
+      expect(job.isFailed, isTrue);
 
       final row = await (db.select(
         db.tracks,
@@ -857,9 +858,7 @@ void main() {
 
       expect(offline, isTrue);
       final job = manager.snapshot().first;
-      expect(job.state, DownloadState.queued);
-      expect(job.errorMessage, isNull);
-      expect(job.progress, 0.0);
+      expect(job.isQueued, isTrue);
     },
   );
 
@@ -882,7 +881,7 @@ void main() {
     await _waitForFinish(manager);
 
     expect(networkReported, isFalse);
-    expect(manager.snapshot().first.state, DownloadState.failed);
+    expect(manager.snapshot().first.isFailed, isTrue);
   });
 
   test('queued jobs wait while offline and resume on recovery', () async {
@@ -896,12 +895,12 @@ void main() {
 
     await manager.enqueueTracks([_track('abc')], quality: '320');
     await Future<void>.delayed(const Duration(milliseconds: 20));
-    expect(manager.snapshot().first.state, DownloadState.queued);
+    expect(manager.snapshot().first.isQueued, isTrue);
 
     offline = false;
     manager.resumeIfPaused();
     await _waitForFinish(manager);
-    expect(manager.snapshot().first.state, DownloadState.completed);
+    expect(manager.snapshot().first.isCompleted, isTrue);
   });
 
   test('cancelQueued removes a queued job before it runs', () async {
@@ -961,7 +960,7 @@ void main() {
     await _waitForFinish(manager);
 
     expect(
-      manager.snapshot().where((j) => j.state == DownloadState.completed),
+      manager.snapshot().where((j) => j.isCompleted),
       isNotEmpty,
     );
 

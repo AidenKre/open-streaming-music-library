@@ -16,18 +16,60 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/queue_warm_service.dart';
 
-enum DownloadState { queued, active, completed, failed }
+/// Lifecycle state of a [DownloadJob], modelled as a sealed hierarchy so the
+/// state-only fields (`progress`, `errorMessage`, `fileSizeBytes`) live on the
+/// variants they belong to. Switching on `job.status` is exhaustively checked
+/// by the analyzer — adding a new variant forces every call site to handle it.
+sealed class DownloadStatus {
+  const DownloadStatus();
+}
+
+class Queued extends DownloadStatus {
+  const Queued();
+}
+
+class Active extends DownloadStatus {
+  final double progress; // 0.0..1.0
+  const Active({this.progress = 0.0});
+}
+
+class Completed extends DownloadStatus {
+  final int sizeBytes;
+  const Completed({required this.sizeBytes});
+}
+
+class Failed extends DownloadStatus {
+  final String message;
+  const Failed({required this.message});
+}
 
 /// Why a single download attempt ended. Drives whether [DownloadManager]
 /// marks the job completed, re-queues it for retry, or fails it.
-enum _DownloadOutcome { success, networkFailure, otherFailure, cancelled }
+///
+/// On [success], [sizeBytes] holds the number of bytes received and is moved
+/// into the [Completed] status. On [otherFailure], [errorMessage] is the
+/// human-readable failure (used to build the [Failed] status).
+class _DownloadOutcome {
+  final _OutcomeKind kind;
+  final int sizeBytes;
+  final String? errorMessage;
+  const _DownloadOutcome._(
+    this.kind, {
+    this.sizeBytes = 0,
+    this.errorMessage,
+  });
+
+  static const cancelled = _DownloadOutcome._(_OutcomeKind.cancelled);
+  static const networkFailure = _DownloadOutcome._(_OutcomeKind.networkFailure);
+  static _DownloadOutcome success(int sizeBytes) =>
+      _DownloadOutcome._(_OutcomeKind.success, sizeBytes: sizeBytes);
+  static _DownloadOutcome otherFailure(String message) =>
+      _DownloadOutcome._(_OutcomeKind.otherFailure, errorMessage: message);
+}
+
+enum _OutcomeKind { success, networkFailure, otherFailure, cancelled }
 
 class _DownloadCancelled implements Exception {}
-
-/// Sentinel for [DownloadJob.copyWith] so a caller can pass `errorMessage:
-/// null` to genuinely clear the field (a plain `null` default is
-/// indistinguishable from "not supplied").
-const Object _sentinel = Object();
 
 String formatBytes(int bytes) {
   if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
@@ -47,45 +89,32 @@ class DownloadJob {
   final int? albumId;
   final int? artistId;
   final String quality;
-  final DownloadState state;
-  final double progress; // 0.0..1.0; only meaningful while active
-  final String? errorMessage;
-  final int? fileSizeBytes;
+  final DownloadStatus status;
 
   const DownloadJob({
     required this.uuidId,
     required this.title,
     required this.artist,
     required this.quality,
-    required this.state,
+    required this.status,
     this.albumId,
     this.artistId,
-    this.progress = 0.0,
-    this.errorMessage,
-    this.fileSizeBytes,
   });
 
-  DownloadJob copyWith({
-    DownloadState? state,
-    double? progress,
-    Object? errorMessage = _sentinel,
-    int? fileSizeBytes,
-  }) {
-    return DownloadJob(
-      uuidId: uuidId,
-      title: title,
-      artist: artist,
-      albumId: albumId,
-      artistId: artistId,
-      quality: quality,
-      state: state ?? this.state,
-      progress: progress ?? this.progress,
-      errorMessage: errorMessage == _sentinel
-          ? this.errorMessage
-          : errorMessage as String?,
-      fileSizeBytes: fileSizeBytes ?? this.fileSizeBytes,
-    );
-  }
+  bool get isQueued => status is Queued;
+  bool get isActive => status is Active;
+  bool get isCompleted => status is Completed;
+  bool get isFailed => status is Failed;
+
+  DownloadJob withStatus(DownloadStatus status) => DownloadJob(
+    uuidId: uuidId,
+    title: title,
+    artist: artist,
+    albumId: albumId,
+    artistId: artistId,
+    quality: quality,
+    status: status,
+  );
 }
 
 /// In-memory list of jobs partitioned by state. The user requested that this
@@ -96,14 +125,10 @@ class DownloadQueueState {
   final List<DownloadJob> jobs;
   const DownloadQueueState({this.jobs = const []});
 
-  Iterable<DownloadJob> get active =>
-      jobs.where((j) => j.state == DownloadState.active);
-  Iterable<DownloadJob> get queued =>
-      jobs.where((j) => j.state == DownloadState.queued);
-  Iterable<DownloadJob> get finished => jobs.where(
-    (j) =>
-        j.state == DownloadState.completed || j.state == DownloadState.failed,
-  );
+  Iterable<DownloadJob> get active => jobs.where((j) => j.isActive);
+  Iterable<DownloadJob> get queued => jobs.where((j) => j.isQueued);
+  Iterable<DownloadJob> get finished =>
+      jobs.where((j) => j.isCompleted || j.isFailed);
 }
 
 /// Coordinates concurrent track + cover-art downloads.
@@ -209,9 +234,7 @@ class DownloadManager extends ChangeNotifier {
         continue; // already downloaded
       }
       final existing = existingByUuid[t.uuidId];
-      if (existing != null &&
-          (existing.state == DownloadState.queued ||
-              existing.state == DownloadState.active)) {
+      if (existing != null && (existing.isQueued || existing.isActive)) {
         continue;
       }
       additions.add(
@@ -222,7 +245,7 @@ class DownloadManager extends ChangeNotifier {
           albumId: t.albumId,
           artistId: t.artistId,
           quality: quality,
-          state: DownloadState.queued,
+          status: const Queued(),
         ),
       );
     }
@@ -306,11 +329,7 @@ class DownloadManager extends ChangeNotifier {
   /// Drops the failed/completed history. Active and queued jobs are kept.
   void clearFinished() {
     final remaining = _state.jobs
-        .where(
-          (j) =>
-              j.state == DownloadState.queued ||
-              j.state == DownloadState.active,
-        )
+        .where((j) => j.isQueued || j.isActive)
         .toList(growable: false);
     _state = DownloadQueueState(jobs: remaining);
     notifyListeners();
@@ -323,7 +342,7 @@ class DownloadManager extends ChangeNotifier {
     final idx = _state.jobs.indexWhere((j) => j.uuidId == uuidId);
     if (idx < 0) return;
     final job = _state.jobs[idx];
-    if (job.state != DownloadState.queued) return;
+    if (!job.isQueued) return;
     final updated = [..._state.jobs]..removeAt(idx);
     _state = DownloadQueueState(jobs: updated);
     notifyListeners();
@@ -430,12 +449,10 @@ class DownloadManager extends ChangeNotifier {
     // resumeIfPaused() on recovery.
     if (_isOfflineFn()) return;
     while (_activeCount < maxConcurrent) {
-      final idx = _state.jobs.indexWhere(
-        (j) => j.state == DownloadState.queued,
-      );
+      final idx = _state.jobs.indexWhere((j) => j.isQueued);
       if (idx < 0) return;
       _activeCount++;
-      _markJob(idx, _state.jobs[idx].copyWith(state: DownloadState.active));
+      _markJob(idx, _state.jobs[idx].withStatus(const Active()));
       // Don't await — let workers run concurrently. Errors are captured into
       // the job's failed state.
       final generation = _resetGeneration;
@@ -454,31 +471,26 @@ class DownloadManager extends ChangeNotifier {
       final job = _state.jobs[idx];
       final outcome = await _downloadOne(job, generation);
       if (generation != _resetGeneration) return;
-      switch (outcome) {
-        case _DownloadOutcome.success:
+      switch (outcome.kind) {
+        case _OutcomeKind.success:
           _markJobByUuid(
             uuidId,
-            (j) => j.copyWith(state: DownloadState.completed, progress: 1.0),
+            (j) => j.withStatus(Completed(sizeBytes: outcome.sizeBytes)),
           );
           _bumpVersion();
-        case _DownloadOutcome.networkFailure:
+        case _OutcomeKind.networkFailure:
           // Transport failure — revert to queued so the worker pool retries
-          // once we're back online. The download restarts from zero, so
-          // reset progress and clear the error.
+          // once we're back online. The download restarts from zero, so the
+          // status resets to a fresh Queued (no progress, no error).
+          _markJobByUuid(uuidId, (j) => j.withStatus(const Queued()));
+        case _OutcomeKind.otherFailure:
           _markJobByUuid(
             uuidId,
-            (j) => j.copyWith(
-              state: DownloadState.queued,
-              progress: 0.0,
-              errorMessage: null,
+            (j) => j.withStatus(
+              Failed(message: outcome.errorMessage ?? 'unknown error'),
             ),
           );
-        case _DownloadOutcome.otherFailure:
-          _markJobByUuid(
-            uuidId,
-            (j) => j.copyWith(state: DownloadState.failed),
-          );
-        case _DownloadOutcome.cancelled:
+        case _OutcomeKind.cancelled:
           return;
       }
     } finally {
@@ -504,26 +516,17 @@ class DownloadManager extends ChangeNotifier {
         ),
       );
     } on ApiException catch (e) {
-      _markJobByUuid(
-        job.uuidId,
-        (j) => j.copyWith(errorMessage: 'HTTP ${e.statusCode}'),
-      );
-      return _DownloadOutcome.otherFailure;
-    } on NetworkException catch (e) {
+      return _DownloadOutcome.otherFailure('HTTP ${e.statusCode}');
+    } on NetworkException {
       // ApiClient already fired its onNetworkFailure hook for the exhausted
       // handshake; report defensively too in case it wasn't wired.
-      _markJobByUuid(
-        job.uuidId,
-        (j) => j.copyWith(errorMessage: 'Connection failed: ${e.message}'),
-      );
       _onNetworkFailure?.call();
       return _DownloadOutcome.networkFailure;
     } catch (e) {
       // Defensive fallback for unexpected exceptions that escape ApiClient's
       // typed exceptions — without this, _runJob never marks the job failed
       // and it stays stuck in `active`.
-      _markJobByUuid(job.uuidId, (j) => j.copyWith(errorMessage: e.toString()));
-      return _DownloadOutcome.otherFailure;
+      return _DownloadOutcome.otherFailure(e.toString());
     }
     if (generation != _resetGeneration) {
       return _DownloadOutcome.cancelled;
@@ -567,7 +570,7 @@ class DownloadManager extends ChangeNotifier {
             if (total > 0) {
               _markJobByUuid(
                 job.uuidId,
-                (j) => j.copyWith(progress: received / total),
+                (j) => j.withStatus(Active(progress: received / total)),
               );
             }
           },
@@ -615,16 +618,13 @@ class DownloadManager extends ChangeNotifier {
       // fails — the audio is what matters for playback.
       await _downloadCoverArtForTrack(job.uuidId);
 
-      _markJobByUuid(job.uuidId, (j) => j.copyWith(fileSizeBytes: received));
-
-      return _DownloadOutcome.success;
+      return _DownloadOutcome.success(received);
     } on _DownloadCancelled {
       try {
         if (await partial.exists()) await partial.delete();
       } catch (_) {}
       return _DownloadOutcome.cancelled;
     } catch (e) {
-      _markJobByUuid(job.uuidId, (j) => j.copyWith(errorMessage: e.toString()));
       try {
         if (await partial.exists()) await partial.delete();
       } catch (_) {}
@@ -638,7 +638,7 @@ class DownloadManager extends ChangeNotifier {
         _onNetworkFailure?.call();
         return _DownloadOutcome.networkFailure;
       }
-      return _DownloadOutcome.otherFailure;
+      return _DownloadOutcome.otherFailure(e.toString());
     }
   }
 

@@ -64,17 +64,15 @@ final downloadStatusVersionProvider = StreamProvider<int>((ref) {
 /// True iff any queued/active jobs belong to the given album.
 final albumIsDownloadingProvider = Provider.family<bool, int>((ref, albumId) {
   final manager = ref.watch(downloadManagerListenableProvider);
-  return manager.state.jobs.any((j) =>
-      j.albumId == albumId &&
-      (j.state == DownloadState.queued || j.state == DownloadState.active));
+  return manager.state.jobs.any(
+      (j) => j.albumId == albumId && (j.isQueued || j.isActive));
 });
 
 /// True iff any queued/active jobs belong to the given artist.
 final artistIsDownloadingProvider = Provider.family<bool, int>((ref, artistId) {
   final manager = ref.watch(downloadManagerListenableProvider);
-  return manager.state.jobs.any((j) =>
-      j.artistId == artistId &&
-      (j.state == DownloadState.queued || j.state == DownloadState.active));
+  return manager.state.jobs.any(
+      (j) => j.artistId == artistId && (j.isQueued || j.isActive));
 });
 
 /// DB-backed (downloaded, total) counts for an album; refreshes on each

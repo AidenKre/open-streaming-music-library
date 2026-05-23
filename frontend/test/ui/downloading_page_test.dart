@@ -113,8 +113,7 @@ void main() {
     // Drain the manager outside the fake-async zone so Future.delayed fires.
     await tester.runAsync(() async {
       await manager.enqueueTracks([_track('abc')], quality: '320');
-      while (manager.snapshot().any((j) =>
-          j.state == DownloadState.queued || j.state == DownloadState.active)) {
+      while (manager.snapshot().any((j) => j.isQueued || j.isActive)) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
     });
@@ -141,8 +140,7 @@ void main() {
 
     await tester.runAsync(() async {
       await manager.enqueueTracks([_track('abc')], quality: '320');
-      while (manager.snapshot().any((j) =>
-          j.state == DownloadState.queued || j.state == DownloadState.active)) {
+      while (manager.snapshot().any((j) => j.isQueued || j.isActive)) {
         await Future<void>.delayed(const Duration(milliseconds: 5));
       }
     });
