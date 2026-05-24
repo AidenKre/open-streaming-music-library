@@ -12,6 +12,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
 import 'package:frontend/services/download/track_downloader.dart';
+import 'package:frontend/services/download/worker_pool.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/queue_warm_service.dart';
@@ -38,31 +39,31 @@ String formatBytes(int bytes) {
 
 /// Coordinates concurrent track + cover-art downloads.
 ///
-/// 4 workers process the queue. Active jobs sit at the top of the UI list,
-/// completed at the bottom (the natural ordering of the underlying list keeps
-/// these positions stable). The manager writes downloaded files to the app
-/// docs dir and updates `tracks.file_path` so playback can prefer the local
+/// Façade over four single-responsibility collaborators:
+/// * [DownloadQueue] — the in-memory job list + change notifications.
+/// * [TrackDownloader] — the per-job HTTP→file→DB pipeline.
+/// * [WorkerPool] — concurrency + generation gating.
+/// * [DownloadStatusReader] — DB read-side helpers + change-version.
+///
+/// The public API forwards to these — see each method for which one it
+/// delegates to. Active jobs sit at the top of the UI list, completed at
+/// the bottom (the natural ordering of the underlying queue keeps these
+/// positions stable). The manager writes downloaded files to the app docs
+/// dir and updates `tracks.file_path` so playback can prefer the local
 /// copy.
 class DownloadManager extends ChangeNotifier {
-  static const int maxConcurrent = 4;
-
   final AppDatabase _db;
   // Optional: if supplied, the server is asked to pre-transcode queued tracks
   // at the current stream quality in parallel with downloading them.
   final QueueWarmService? _warmService;
   // Provides the current stream quality for server warm calls.
   final String Function()? _streamQualityFn;
-  // When true, the pump won't dispatch new workers; queued jobs wait for
-  // resumeIfPaused() on recovery.
-  final bool Function() _isOfflineFn;
 
   late final DownloadQueue _queue;
   late final TrackDownloader _downloader;
-  int _activeCount = 0;
+  late final WorkerPool _pool;
+  late final DownloadStatusReader _status;
   bool _disposed = false;
-  int _resetGeneration = 0;
-  final Map<String, Future<void> Function()> _activeCancellers = {};
-  final Map<String, Future<void>> _activeWorkers = {};
 
   /// Test seam fired immediately before the partial→destination rename. Lets a
   /// test deterministically interleave [resetAndDeleteFiles] with the commit
@@ -89,8 +90,6 @@ class DownloadManager extends ChangeNotifier {
   Future<void> Function(String uuidId)? get testHookBeforeDbWrite =>
       _downloader.testHookBeforeDbWrite;
 
-  late final DownloadStatusReader _status;
-
   /// Notified once when the underlying tracks table changes such that
   /// downloaded-status checks may have new answers. Lets the UI invalidate
   /// derived providers without polling the DB.
@@ -107,8 +106,7 @@ class DownloadManager extends ChangeNotifier {
     void Function()? onNetworkFailure,
   }) : _db = db,
        _warmService = warmService,
-       _streamQualityFn = streamQualityFn,
-       _isOfflineFn = isOfflineFn ?? (() => false) {
+       _streamQualityFn = streamQualityFn {
     _status = DownloadStatusReader(db: db);
     _queue = DownloadQueue();
     _queue.addListener(notifyListeners);
@@ -119,6 +117,12 @@ class DownloadManager extends ChangeNotifier {
           directoryProvider ?? getApplicationDocumentsDirectory,
       apiClient: apiClient ?? ApiClient.instance,
       onNetworkFailure: onNetworkFailure,
+    );
+    _pool = WorkerPool(
+      queue: _queue,
+      downloader: _downloader,
+      isOffline: isOfflineFn ?? (() => false),
+      onCompleted: _status.bumpVersion,
     );
   }
 
@@ -188,7 +192,7 @@ class DownloadManager extends ChangeNotifier {
       );
     }
 
-    _pump();
+    _pool.pump();
   }
 
   /// Schedules [tracks] for download at [quality], re-downloading any track
@@ -255,36 +259,12 @@ class DownloadManager extends ChangeNotifier {
   /// stream cleanly is fiddly and the user didn't ask for it.
   void cancelQueued(String uuidId) => _queue.cancelQueued(uuidId);
 
-  /// Full local-reset hook. It cancels in-flight workers, clears the in-memory
+  /// Full local-reset hook. Cancels in-flight workers, clears the in-memory
   /// queue, deletes completed/partial files, and prevents stale workers from
   /// writing DB state if they complete after the reset generation changes.
   Future<void> resetAndDeleteFiles() async {
-    _resetGeneration++;
-
-    final workerSnapshot = Map<String, Future<void>>.from(_activeWorkers);
-    final cancellableUuids = _activeCancellers.keys.toList(growable: false);
-    for (final uuid in cancellableUuids) {
-      try {
-        await _activeCancellers[uuid]?.call();
-      } catch (_) {}
-    }
-
-    final cancellableWorkers = [
-      for (final uuid in cancellableUuids)
-        if (workerSnapshot[uuid] != null) workerSnapshot[uuid]!,
-    ];
-    if (cancellableWorkers.isNotEmpty) {
-      await Future.wait(cancellableWorkers);
-    }
-
-    _activeCount = 0;
-    _activeCancellers.clear();
-    _queue.clearAll();
-
-    await _downloader.deleteKnownDownloadedFiles();
-    await _downloader.deleteDownloadDirectory();
-
-    _bumpVersion();
+    await _pool.reset();
+    _status.bumpVersion();
   }
 
   /// Removes the local file (if any) and clears `tracks.file_path` so the
@@ -305,7 +285,7 @@ class DownloadManager extends ChangeNotifier {
     await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuidId))).write(
       const TracksCompanion(filePath: Value(null)),
     );
-    _bumpVersion();
+    _status.bumpVersion();
   }
 
   Future<void> deleteDownloadsForUuids(Iterable<String> uuids) async {
@@ -341,90 +321,12 @@ class DownloadManager extends ChangeNotifier {
       }
     });
 
-    _bumpVersion();
+    _status.bumpVersion();
   }
 
   /// Called by OfflineModeNotifier when the network returns. Re-dispatches
   /// any jobs that were left queued while offline.
-  void resumeIfPaused() {
-    _pump();
-  }
-
-  void _pump() {
-    // Paused while offline. Jobs sit in `queued` and get picked up by
-    // resumeIfPaused() on recovery.
-    if (_isOfflineFn()) return;
-    while (_activeCount < maxConcurrent) {
-      final idx = _queue.findFirstQueuedIndex();
-      if (idx < 0) return;
-      _activeCount++;
-      _queue.markJob(idx, _queue.jobAt(idx).withStatus(const Active()));
-      // Don't await — let workers run concurrently. Errors are captured into
-      // the job's failed state.
-      final generation = _resetGeneration;
-      final uuidId = _queue.jobAt(idx).uuidId;
-      final worker = _runJob(uuidId, generation);
-      _activeWorkers[uuidId] = worker;
-      unawaited(worker.whenComplete(() => _activeWorkers.remove(uuidId)));
-    }
-  }
-
-  Future<void> _runJob(String uuidId, int generation) async {
-    try {
-      if (generation != _resetGeneration) return;
-      final idx = _queue.state.jobs.indexWhere((j) => j.uuidId == uuidId);
-      if (idx < 0) return;
-      final job = _queue.jobAt(idx);
-      final outcome = await _downloader.download(
-        job: job,
-        generationCheck: () => generation == _resetGeneration,
-        onProgress: (progress) {
-          _queue.markJobByUuid(
-            job.uuidId,
-            (j) => j.withStatus(Active(progress: progress)),
-          );
-        },
-        registerCanceller: (canceller) {
-          _activeCancellers[job.uuidId] = canceller;
-        },
-        unregisterCanceller: () {
-          _activeCancellers.remove(job.uuidId);
-        },
-      );
-      if (generation != _resetGeneration) return;
-      switch (outcome.kind) {
-        case DownloadOutcomeKind.success:
-          _queue.markJobByUuid(
-            uuidId,
-            (j) => j.withStatus(Completed(sizeBytes: outcome.sizeBytes)),
-          );
-          _bumpVersion();
-        case DownloadOutcomeKind.networkFailure:
-          // Transport failure — revert to queued so the worker pool retries
-          // once we're back online. The download restarts from zero, so the
-          // status resets to a fresh Queued (no progress, no error).
-          _queue.markJobByUuid(uuidId, (j) => j.withStatus(const Queued()));
-        case DownloadOutcomeKind.otherFailure:
-          _queue.markJobByUuid(
-            uuidId,
-            (j) => j.withStatus(
-              Failed(message: outcome.errorMessage ?? 'unknown error'),
-            ),
-          );
-        case DownloadOutcomeKind.cancelled:
-          return;
-      }
-    } finally {
-      if (generation == _resetGeneration) {
-        _activeCount--;
-        _pump();
-      }
-    }
-  }
-
-  void _bumpVersion() {
-    _status.bumpVersion();
-  }
+  void resumeIfPaused() => _pool.pump();
 
   /// Returns the set of uuid_ids that have a non-null `file_path` (and the
   /// file actually exists on disk). Used by aggregate "fully downloaded"
