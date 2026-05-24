@@ -28,6 +28,10 @@ class TrackUI {
   final int? downloadedBitrateKbps;
   // Size in bytes of the file on disk. Null until a download completes.
   final int? fileSizeBytes;
+  // Quality preset that produced this download (e.g. 'original', '320').
+  // Distinct from `downloadedBitrateKbps`, which is the actual on-disk
+  // bitrate — for passthrough downloads the two can differ.
+  final String? downloadedQuality;
 
   bool get isDownloaded => filePath != null;
 
@@ -59,6 +63,7 @@ class TrackUI {
     this.coverArtId,
     this.downloadedBitrateKbps,
     this.fileSizeBytes,
+    this.downloadedQuality,
   });
 
   static const Object _sentinel = Object();
@@ -67,6 +72,7 @@ class TrackUI {
     Object? filePath = _sentinel,
     Object? downloadedBitrateKbps = _sentinel,
     Object? fileSizeBytes = _sentinel,
+    Object? downloadedQuality = _sentinel,
   }) {
     return TrackUI(
       uuidId: uuidId,
@@ -97,6 +103,9 @@ class TrackUI {
       fileSizeBytes: fileSizeBytes == _sentinel
           ? this.fileSizeBytes
           : fileSizeBytes as int?,
+      downloadedQuality: downloadedQuality == _sentinel
+          ? this.downloadedQuality
+          : downloadedQuality as String?,
     );
   }
 
@@ -139,6 +148,7 @@ class TrackUI {
       coverArtId: row.readNullable<int>('cover_art_id'),
       downloadedBitrateKbps: row.readNullable<int>('downloaded_bitrate_kbps'),
       fileSizeBytes: row.readNullable<int>('file_size_bytes'),
+      downloadedQuality: row.readNullable<String>('downloaded_quality'),
     );
   }
 
@@ -168,6 +178,7 @@ class TrackUI {
       coverArtId: meta.coverArtId,
       downloadedBitrateKbps: track.downloadedBitrateKbps,
       fileSizeBytes: track.fileSizeBytes,
+      downloadedQuality: track.downloadedQuality,
     );
   }
 }

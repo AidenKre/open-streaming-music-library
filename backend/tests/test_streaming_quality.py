@@ -296,6 +296,65 @@ class TestStreamQuality:
         assert transcode_calls["n"] == 1
 
 
+class TestRangeParsing:
+    """Direct tests for the HTTP Range parser used by /tracks/{uuid}/stream.
+
+    These pin down RFC 7233 semantics — especially suffix ranges (``bytes=-N``)
+    that the previous parser misread as ``bytes=0-N``.
+    """
+
+    def _parser(self):
+        # Re-import each call so a hot reload during a different test doesn't
+        # leak a stale parser reference.
+        from app.main import _parse_byte_range
+        return _parse_byte_range
+
+    def test_explicit_range_returns_inclusive_window(self):
+        assert self._parser()("bytes=0-99", file_size=1000) == (0, 99)
+
+    def test_open_ended_range_extends_to_eof(self):
+        assert self._parser()("bytes=100-", file_size=1000) == (100, 999)
+
+    def test_suffix_range_returns_last_n_bytes(self):
+        # The previous implementation returned (0, 99). Suffix ranges mean
+        # "the last N bytes", so for a 1000-byte file that is [900, 999].
+        assert self._parser()("bytes=-100", file_size=1000) == (900, 999)
+
+    def test_suffix_range_larger_than_file_clamps_to_zero(self):
+        assert self._parser()("bytes=-10000", file_size=1000) == (0, 999)
+
+    def test_empty_suffix_returns_416(self):
+        with pytest.raises(Exception) as exc:
+            self._parser()("bytes=-", file_size=1000)
+        assert getattr(exc.value, "status_code", None) == 416
+
+    def test_extra_separator_returns_416(self):
+        with pytest.raises(Exception) as exc:
+            self._parser()("bytes=1-2-3", file_size=1000)
+        assert getattr(exc.value, "status_code", None) == 416
+
+    def test_negative_start_returns_416(self):
+        with pytest.raises(Exception) as exc:
+            self._parser()("bytes=-5-10", file_size=1000)
+        # Either rejected by the count check or the negative-start check.
+        assert getattr(exc.value, "status_code", None) == 416
+
+    def test_unsatisfiable_range_returns_416(self):
+        with pytest.raises(Exception) as exc:
+            self._parser()("bytes=2000-3000", file_size=1000)
+        assert getattr(exc.value, "status_code", None) == 416
+
+    def test_multi_range_rejected(self):
+        with pytest.raises(Exception) as exc:
+            self._parser()("bytes=0-9,20-29", file_size=1000)
+        assert getattr(exc.value, "status_code", None) == 416
+
+    def test_garbage_value_returns_416(self):
+        with pytest.raises(Exception) as exc:
+            self._parser()("bytes=abc-def", file_size=1000)
+        assert getattr(exc.value, "status_code", None) == 416
+
+
 class TestEncodedCache:
     def _make_cache(self, tmp_path: Path, max_bytes: int) -> EncodedCache:
         return EncodedCache(
@@ -590,18 +649,38 @@ class TestBitratePassthrough:
         assert result.bitrate_kbps == 256
         assert calls == []
 
-    def test_passthrough_lock_cleaned_up(self, tmp_path):
+    def test_passthrough_path_releases_lock_for_subsequent_callers(
+        self, tmp_path
+    ):
+        """The passthrough early return inside the per-key lock must not
+        leave the lock held — a second caller for the same key must be
+        able to proceed.
+        """
         source = tmp_path / "track.mp3"
         source.write_bytes(b"original" * 100)
         coordinator, _ = self._make_coordinator(tmp_path, source)
 
-        coordinator.encode_for_stream("uuid-a", "320", source_bitrate_kbps=64)
+        first = coordinator.encode_for_stream(
+            "uuid-a", "320", source_bitrate_kbps=64
+        )
+        assert first is not None and first.transcoded is False
 
-        assert ("uuid-a", "320") not in coordinator._key_locks
+        # If the passthrough return path left the lock held, this would hang.
+        second = coordinator.encode_for_stream(
+            "uuid-a", "320", source_bitrate_kbps=64
+        )
+        assert second is not None and second.transcoded is False
 
 
 class TestEncoderCoordinatorLocks:
-    """Unit tests for _key_locks memory-leak fix."""
+    """Per-key lock contract: one transcode per (uuid, quality), no races.
+
+    The previous implementation tried to delete the lock from the map after
+    release, which raced — a new caller could create a fresh lock between a
+    waiter waking and the pop, letting two threads run the encode/cache-write
+    block in parallel. Locks now live for the process lifetime; the map is
+    bounded by (track count × quality count).
+    """
 
     def _make_coordinator(self, tmp_path: Path, source: Path) -> EncoderCoordinator:
         cache = EncodedCache(
@@ -623,18 +702,23 @@ class TestEncoderCoordinatorLocks:
             transcode_fn=fake_transcode,
         )
 
-    def test_lock_pruned_after_encode(self, tmp_path):
-        """_key_locks entry is removed once encode_for_stream returns."""
+    def test_lock_entry_persists_after_encode(self, tmp_path):
+        """Lock entries are retained for the process lifetime — the previous
+        "pop after release" approach raced (see class docstring). The map is
+        bounded by (track count × quality count), so this is fine.
+        """
         source = tmp_path / "track.mp3"
         source.write_bytes(b"audio")
         coordinator = self._make_coordinator(tmp_path, source)
 
         coordinator.encode_for_stream("uuid-a", "192")
 
-        assert ("uuid-a", "192") not in coordinator._key_locks
+        assert ("uuid-a", "192") in coordinator._key_locks
 
-    def test_locks_empty_after_multiple_encodes(self, tmp_path):
-        """_key_locks stays empty across many different (uuid, quality) pairs."""
+    def test_lock_map_size_bounded_by_distinct_keys(self, tmp_path):
+        """Distinct (uuid, quality) pairs each get one entry; repeated calls
+        for the same pair don't multiply entries.
+        """
         source = tmp_path / "track.mp3"
         source.write_bytes(b"audio")
         coordinator = self._make_coordinator(tmp_path, source)
@@ -643,7 +727,7 @@ class TestEncoderCoordinatorLocks:
             for q in ("128", "192", "256", "320"):
                 coordinator.encode_for_stream(f"uuid-{i}", q)
 
-        assert coordinator._key_locks == {}
+        assert len(coordinator._key_locks) == 10 * 4
 
     def test_concurrent_requests_encode_once(self, tmp_path):
         """Concurrent requests for the same (uuid, quality) only encode once.
@@ -693,10 +777,12 @@ class TestEncoderCoordinatorLocks:
 
         assert encode_count["n"] == 1
         assert all(r is not None for r in results)
-        assert ("uuid-x", "192") not in coordinator._key_locks
 
-    def test_lock_pruned_after_second_thread_finds_cache(self, tmp_path):
-        """A thread waiting on the lock finds the cached result and the lock is cleaned up."""
+    def test_second_thread_finds_cache_after_waiting_on_lock(self, tmp_path):
+        """A thread queued on the lock wakes up after the first encode
+        finishes, finds the cached result, and returns it without
+        re-transcoding.
+        """
         source = tmp_path / "track.mp3"
         source.write_bytes(b"audio")
 
@@ -748,4 +834,3 @@ class TestEncoderCoordinatorLocks:
         assert result1[0] is not None
         assert result2[0] is not None
         assert result1[0] == result2[0]
-        assert ("uuid-y", "192") not in coordinator._key_locks

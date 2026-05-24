@@ -252,126 +252,119 @@ class TestDefaultStateLocking:
 
 # ── Bug #2: per-key lock leak ─────────────────────────────────────────────────
 
-class TestKeyLockCleanup:
-    def test_pre_populated_cache__no_lock_entry_leaked(self, tmp_path):
-        """If the entry is already cached, the outer fast path returns and
-        never creates a key lock. ``_key_locks`` stays empty.
+class TestKeyLockDedup:
+    """Per-key lock contract: one transcode per (uuid, quality), even under
+    high concurrency. The previous implementation tried to remove the lock
+    from the map after release, which raced — a new caller arriving in the
+    gap between release and pop could create a *fresh* lock, letting two
+    threads simultaneously run the encode/cache-write block. Locks are now
+    kept for the process lifetime.
+    """
+
+    def test_lock_entry_persists_after_encode(self, tmp_path):
+        """The map keeps the lock alive after the encode finishes. The map
+        is bounded by (track count × quality count), so this is fine; the
+        previous "remove after use" strategy was the source of the bug.
         """
         c = _make_coordinator(tmp_path, default_quality="192")
-
-        # Prime the default cache via a normal encode.
         c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=500)
-        # Force any leaked entry from the first call to be popped: it was popped
-        # by the finally block. Confirm:
-        assert c._key_locks == {}
+        assert ("uuid-a", "192") in c._key_locks
 
-        # Second call must be a cache-hit fast path, no key lock involvement.
-        result = c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=500)
-        assert result is not None
-        assert c._key_locks == {}
-
-    def test_concurrent_first_encode__no_lock_entry_leaks_when_second_finds_cache(
-        self, tmp_path
-    ):
-        """Two concurrent calls for the same (uuid, quality). The second
-        thread enters ``with lock`` after the first wrote the cache and so
-        returns from the cached-after-lock path. Before the fix, that exit
-        skipped the ``pop`` and leaked an entry. After: ``_key_locks`` ends
-        empty regardless of which thread finishes first.
+    def test_concurrent_first_encode__transcode_runs_exactly_once(self, tmp_path):
+        """Many concurrent callers for the same (uuid, quality) must trigger
+        exactly one transcode. All callers must receive a usable result.
         """
-        enter_gate = threading.Event()
-        first_finished_write = threading.Event()
+        gate = threading.Event()
+        transcode_calls = []
+        transcode_lock = threading.Lock()
 
         def slow_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            # Block the first transcode until the second thread is queued
-            # behind the per-key lock. ``enter_gate`` is set by the test
-            # after both threads are launched.
-            enter_gate.wait(timeout=5)
+            with transcode_lock:
+                transcode_calls.append(1)
+            # Hold here long enough that every other thread queues on the
+            # per-key lock before this one finishes writing the cache.
+            gate.wait(timeout=5)
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"encoded" * 10)
             return True
 
-        c = _make_coordinator(tmp_path, default_quality="192",
-                              transcode_fn=slow_transcode)
+        c = _make_coordinator(
+            tmp_path, default_quality="192", transcode_fn=slow_transcode
+        )
 
-        results: list[object] = [None, None]
+        results: list[object | None] = [None] * 8
 
         def worker(idx: int) -> None:
-            results[idx] = c.encode_for_stream("uuid-a", "192",
-                                               source_bitrate_kbps=500)
+            results[idx] = c.encode_for_stream(
+                "uuid-a", "192", source_bitrate_kbps=500
+            )
 
-        t1 = threading.Thread(target=worker, args=(0,))
-        t2 = threading.Thread(target=worker, args=(1,))
-        t1.start()
-        # Give t1 a moment to acquire the per-key lock and call transcode.
-        # Polling: wait until exactly one entry is in _key_locks. The sleep
-        # forces GIL release so t1 can actually run between checks.
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        # Give all workers time to queue on the per-key lock.
         import time as _time
-        for _ in range(500):
-            if ("uuid-a", "192") in c._key_locks:
-                break
-            _time.sleep(0.002)
-        else:
-            enter_gate.set()  # release t1 so the test doesn't hang
-            pytest.fail("first thread never registered a key lock")
-        t2.start()
-        # Release the transcode so t1 completes; t2 then enters the lock,
-        # hits the cache re-check, and returns via the previously-leaky path.
-        enter_gate.set()
+        _time.sleep(0.1)
+        gate.set()
 
-        t1.join()
-        t2.join()
+        for t in threads:
+            t.join()
         c._executor.shutdown(wait=True)
 
-        assert results[0] is not None
-        assert results[1] is not None
-        # No lock entries should remain regardless of interleaving.
-        assert c._key_locks == {}
+        # Exactly one transcode, despite 8 concurrent callers.
+        assert sum(transcode_calls) == 1
+        # Every caller received a usable result pointing at the same file.
+        assert all(r is not None for r in results)
+        paths = {r.path for r in results}  # type: ignore[union-attr]
+        assert len(paths) == 1
 
-    def test_passthrough_path__no_lock_entry_leaks(self, tmp_path):
-        """The passthrough return (source bitrate ≤ requested bitrate) is one
-        of the early exits inside the lock; it must also clean up.
+    def test_passthrough_path_returns_correctly(self, tmp_path):
+        """The passthrough early return (source bitrate ≤ requested) still
+        works; nothing else to assert about lock map state.
         """
         c = _make_coordinator(tmp_path, default_quality="192")
-        # source_bitrate_kbps=64 ≤ 128 → passthrough.
         r = c.encode_for_stream("uuid-pass", "128", source_bitrate_kbps=64)
         assert r is not None
         assert r.transcoded is False
-        assert c._key_locks == {}
 
-    def test_transcode_failure_path__no_lock_entry_leaks(self, tmp_path):
-        """Failed transcodes must also pop the key lock entry."""
+    def test_transcode_failure_returns_none(self, tmp_path):
         def failing_transcode(src: Path, dst: Path, bitrate: int) -> bool:
             return False
 
-        c = _make_coordinator(tmp_path, default_quality="192",
-                              transcode_fn=failing_transcode)
-        result = c.encode_for_stream("uuid-fail", "192",
-                                     source_bitrate_kbps=500)
-        assert result is None
-        assert c._key_locks == {}
+        c = _make_coordinator(
+            tmp_path, default_quality="192", transcode_fn=failing_transcode
+        )
+        assert c.encode_for_stream("uuid-fail", "192", source_bitrate_kbps=500) is None
 
-    def test_missing_source_path__no_lock_entry_leaks(self, tmp_path):
-        """Missing source must also pop the key lock entry."""
+    def test_missing_source_returns_none(self, tmp_path):
         c = _make_coordinator(tmp_path, default_quality="192")
         c.source_lookup = lambda _: None
-        result = c.encode_for_stream("uuid-missing", "192",
-                                     source_bitrate_kbps=500)
-        assert result is None
-        assert c._key_locks == {}
+        assert (
+            c.encode_for_stream("uuid-missing", "192", source_bitrate_kbps=500)
+            is None
+        )
 
-    def test_transcode_raises_exception__no_lock_entry_leaks(self, tmp_path):
-        """The cleanup must survive transcode_fn raising. Without the
-        ``try/finally`` around the lock body, an exception escape would leave
-        the per-key entry forever. This is the path a contributor most likely
-        misses if they restructure encode_for_stream into per-return-path
-        pops instead of a single finally.
+    def test_transcode_raises_propagates_and_releases_lock(self, tmp_path):
+        """A raising transcode must NOT leave the per-key lock held — the
+        next caller for the same key must be able to acquire it.
         """
-        def raising_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            raise RuntimeError("ffmpeg blew up")
+        attempts = {"n": 0}
 
-        c = _make_coordinator(tmp_path, default_quality="192",
-                              transcode_fn=raising_transcode)
+        def maybe_raise(src: Path, dst: Path, bitrate: int) -> bool:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("ffmpeg blew up")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"ok" * 10)
+            return True
+
+        c = _make_coordinator(
+            tmp_path, default_quality="192", transcode_fn=maybe_raise
+        )
         with pytest.raises(RuntimeError):
             c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500)
-        assert c._key_locks == {}
+
+        # If the lock were stuck held, this second call would hang. The test
+        # framework will time out; if it returns, the lock was released.
+        result = c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500)
+        assert result is not None

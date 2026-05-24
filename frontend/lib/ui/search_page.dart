@@ -32,6 +32,14 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   List<AlbumUI> _albums = [];
   List<TrackUI> _tracks = [];
 
+  // Monotonically increases each time we start a new search. A completing
+  // request that captured an older generation drops its results rather than
+  // overwriting the UI — protects against:
+  //   * stale-query writes (older request finishes after a newer one),
+  //   * offline-mode flips (a request started before toggling offline must
+  //     not overwrite the offline-filtered results that started after).
+  int _searchGeneration = 0;
+
   @override
   void dispose() {
     _debounceTimer?.cancel();
@@ -69,6 +77,9 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   }
 
   Future<void> _search() async {
+    // Bump first so any in-flight older request is invalidated on completion.
+    final generation = ++_searchGeneration;
+
     if (_query.isEmpty) {
       setState(() {
         _isSearching = false;
@@ -91,6 +102,10 @@ class _SearchPageState extends ConsumerState<SearchPage> {
         );
 
     if (!mounted) return;
+    // Drop stale completions — a newer search started before this one
+    // returned, or the offline mode flipped (which also bumps the generation
+    // via the listener that calls _search).
+    if (generation != _searchGeneration) return;
     setState(() {
       _isSearching = false;
       _artists = results.artists;

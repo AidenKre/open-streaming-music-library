@@ -67,6 +67,7 @@ class QueueRepository {
     List<OrderParameter> orderBy = const [],
     String repeatMode = 'off',
     bool shuffleEnabled = false,
+    bool downloadedOnly = false,
   }) {
     return _db.transaction(() async {
       await deactivateAll();
@@ -84,6 +85,7 @@ class QueueRepository {
         orderBy: orderBy,
         artistId: sourceArtistId,
         albumId: sourceAlbumId,
+        downloadedOnly: downloadedOnly,
       );
       await _db.customStatement(sql, args);
 
@@ -967,6 +969,7 @@ class QueueRepository {
     required List<OrderParameter> orderBy,
     int? artistId,
     int? albumId,
+    bool downloadedOnly = false,
   }) {
     if (albumId != null && artistId == null) {
       throw ArgumentError('Cannot filter by album without artist');
@@ -982,6 +985,9 @@ class QueueRepository {
     if (albumId != null) {
       whereClauses.add('tm."album_id" = ?');
       args.add(albumId);
+    }
+    if (downloadedOnly) {
+      whereClauses.add('t.file_path IS NOT NULL');
     }
 
     final orderClause = _buildTrackOrderClause(orderBy);

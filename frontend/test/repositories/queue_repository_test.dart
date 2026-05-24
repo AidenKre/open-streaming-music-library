@@ -308,6 +308,28 @@ void main() {
   });
 
   test(
+    'createSessionFromQuery with downloadedOnly only inserts downloaded tracks',
+    () async {
+      // Two downloaded, three streaming-only.
+      await fixture.insertSingles(['dl-1', 'stream-1', 'dl-2', 'stream-2', 'stream-3']);
+      for (final uuid in const ['dl-1', 'dl-2']) {
+        await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+            .write(TracksCompanion(filePath: Value('/tmp/$uuid.audio')));
+      }
+
+      final sessionId = await repo.createSessionFromQuery(
+        sourceType: 'library',
+        currentUuid: 'dl-1',
+        orderBy: [OrderParameter(column: 'uuid_id')],
+        downloadedOnly: true,
+      );
+
+      final entries = await repo.getPlaybackEntries(sessionId);
+      expect(entries.map((e) => e.uuidId), ['dl-1', 'dl-2']);
+    },
+  );
+
+  test(
     'getSessionTracksPage returns a bounded page in effective order',
     () async {
       await fixture.insertSingles(List.generate(12, (i) => 'track-${i + 1}'));

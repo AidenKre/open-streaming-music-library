@@ -64,12 +64,15 @@ class AudioCoordinator extends Notifier<AudioState> {
       }
     }, fireImmediately: true);
 
-    _bridge.onPlay = resume;
-    _bridge.onPause = pause;
-    _bridge.onSkipToNext = skipNext;
-    _bridge.onSkipToPrevious = skipPrevious;
-    _bridge.onSeek = seek;
-    _bridge.onStop = stop;
+    _bridge.bindCallbacks(
+      owner: this,
+      onPlay: resume,
+      onPause: pause,
+      onSkipToNext: skipNext,
+      onSkipToPrevious: skipPrevious,
+      onSeek: seek,
+      onStop: stop,
+    );
 
     _subscriptions.add(_player.playerStateStream.listen(_onPlayerStateChanged));
     _subscriptions.add(_player.positionStream.listen(_onPositionChanged));
@@ -89,6 +92,11 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
 
     ref.onDispose(() {
+      // Clear bridge callbacks first so an OS notification tap firing during
+      // teardown can't reach the about-to-be-disposed player. clearCallbacks
+      // is owner-aware — a newer coordinator that already rebound the bridge
+      // is left intact.
+      _bridge.clearCallbacks(this);
       _hydrationController.dispose();
       for (final sub in _subscriptions) {
         sub.cancel();
@@ -119,6 +127,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     int? artistId,
     int? albumId,
     List<OrderParameter> orderParams = const [],
+    bool downloadedOnly = false,
   }) {
     return _serialize(() async {
       _setPlaybackStatus(PlayerStatus.loading);
@@ -130,6 +139,7 @@ class AudioCoordinator extends Notifier<AudioState> {
         orderBy: orderParams,
         repeatMode: state.queue.repeatMode.name,
         shuffleEnabled: false,
+        downloadedOnly: downloadedOnly,
       );
       await _startSession(sessionId, autoPlay: true);
       if (state.shuffle.shuffleOn) {

@@ -239,17 +239,32 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     await enqueueTracks(toEnqueue, quality: quality);
   }
 
-  /// True iff [track]'s stored downloaded bitrate matches [quality]. Returns
-  /// false for `original` (we don't know the source's true bitrate, so we
-  /// conservatively re-download) and false when `downloadedBitrateKbps` is
-  /// null.
+  /// True iff [track]'s file on disk was produced by a request for [quality].
+  ///
+  /// Uses the stored `downloadedQuality` (the preset that produced the file),
+  /// not the actual on-disk bitrate — these can differ when the backend
+  /// served a passthrough (e.g. requested 320 on a 96 kbps source returns
+  /// the original bytes, with `downloadedBitrateKbps=96` but
+  /// `downloadedQuality='320'`). Matching on the actual bitrate would cause
+  /// non-idempotent redownload loops in that case.
+  ///
+  /// Returns false when `downloadedQuality` is null, which happens for files
+  /// downloaded before this column existed; the explicit-quality path will
+  /// then re-download once to populate the field.
   bool _qualityMatches(TrackUI track, String quality) {
-    final stored = track.downloadedBitrateKbps;
-    if (stored == null) return false;
+    final stored = track.downloadedQuality;
+    if (stored != null) return stored == quality;
+    // Back-compat for files saved before downloadedQuality existed: keep the
+    // old bitrate-based check so we don't force a redownload of every
+    // pre-migration file the first time the user touches it. Original-quality
+    // requests still conservatively re-download (we can't know the source
+    // bitrate from the client).
     if (quality == originalQuality) return false;
+    final bitrate = track.downloadedBitrateKbps;
+    if (bitrate == null) return false;
     final requested = int.tryParse(quality);
     if (requested == null) return false;
-    return stored == requested;
+    return bitrate == requested;
   }
 
   /// Drops the failed/completed history. Active and queued jobs are kept.
@@ -295,7 +310,12 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       }
     }
     await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuidId))).write(
-      const TracksCompanion(filePath: Value(null)),
+      const TracksCompanion(
+        filePath: Value(null),
+        downloadedBitrateKbps: Value(null),
+        fileSizeBytes: Value(null),
+        downloadedQuality: Value(null),
+      ),
     );
     _status.bumpVersion();
   }
@@ -329,7 +349,12 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     await _db.transaction(() async {
       for (final uuid in uuidList) {
         await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuid)))
-            .write(const TracksCompanion(filePath: Value(null)));
+            .write(const TracksCompanion(
+          filePath: Value(null),
+          downloadedBitrateKbps: Value(null),
+          fileSizeBytes: Value(null),
+          downloadedQuality: Value(null),
+        ));
       }
     });
 

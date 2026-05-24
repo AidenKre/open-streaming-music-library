@@ -104,8 +104,30 @@ class TestDatabaseInitialize:
         assert "trackmetadata" in db_names
         assert "artists" in db_names
         assert "albums" in db_names
+        # app_settings ships in init.sql; a fresh install should already
+        # have it without needing the v3 migration to run.
+        assert "app_settings" in db_names
 
         conn.close()
+
+    def test_initialize__fresh_db__user_version_matches_latest_schema(
+        self, tmp_path: Path
+    ):
+        """init.sql already includes the v3 ``app_settings`` table, so
+        ``PRAGMA user_version`` on a fresh DB must report the version it
+        actually contains. Otherwise a future v3→v4 migration would
+        spuriously re-run v3 logic against a DB that already has it.
+        """
+        from app.database.database import Database
+
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path=database_path)
+        assert database.initialize()
+
+        conn = sqlite3.connect(database_path)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+        assert version == Database.LATEST_SCHEMA_VERSION
 
     def test_initialize__database_does_exist__does_not_overwrite(self, tmp_path: Path):
         database_path = tmp_path / "database.db"

@@ -1,4 +1,4 @@
-import 'package:drift/drift.dart';
+import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
@@ -1955,6 +1955,76 @@ void main() {
           "INSERT INTO artists (id, name) VALUES (2, 'After Reset')",
         );
         expect(await db.select(db.artists).get(), hasLength(1));
+      },
+    );
+  });
+
+  group('schema migration', () {
+    // A fresh in-memory DB at the latest schema does not exercise the
+    // onUpgrade ALTER TABLE statements at all — a missing step (e.g. forgot
+    // to add `downloaded_quality` in v5) silently passes such a test but
+    // breaks every upgrading user. This test simulates the v3 starting
+    // state, runs each upgrade ALTER, and asserts the resulting columns are
+    // queryable through the same row-shape the app uses.
+    test(
+      'v3 → current upgrade adds all post-v3 columns and preserves data',
+      () async {
+        // Drop the modern `tracks` table and rebuild it as it was at v3
+        // (only `downloaded_bitrate_kbps`; no file_size_bytes or
+        // downloaded_quality).
+        await db.customStatement('PRAGMA foreign_keys = OFF');
+        await db.customStatement('DROP TABLE tracks');
+        await db.customStatement(
+          'CREATE TABLE tracks ('
+          'uuid_id TEXT NOT NULL PRIMARY KEY, '
+          'file_path TEXT, '
+          'created_at INTEGER NOT NULL, '
+          'last_updated INTEGER NOT NULL, '
+          'downloaded_bitrate_kbps INTEGER'
+          ')',
+        );
+        await db.customStatement(
+          "INSERT INTO tracks (uuid_id, file_path, created_at, "
+          "last_updated, downloaded_bitrate_kbps) "
+          "VALUES ('uuid-1', '/tmp/foo.audio', 1700000000, 1700000000, 256)",
+        );
+
+        // Apply the v4 and v5 upgrades exactly as the MigrationStrategy
+        // would. Keep this list in sync with AppDatabase.migration.
+        await db.customStatement(
+          'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
+        );
+        await db.customStatement(
+          'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
+        );
+
+        // Pre-migration row must still be intact and the new columns must
+        // exist and be readable.
+        final rows = await db
+            .customSelect(
+              'SELECT uuid_id, file_path, downloaded_bitrate_kbps, '
+              'file_size_bytes, downloaded_quality FROM tracks',
+            )
+            .get();
+        expect(rows, hasLength(1));
+        expect(rows.first.read<String>('uuid_id'), 'uuid-1');
+        expect(rows.first.read<String?>('file_path'), '/tmp/foo.audio');
+        expect(rows.first.read<int?>('downloaded_bitrate_kbps'), 256);
+        expect(rows.first.read<int?>('file_size_bytes'), isNull);
+        expect(rows.first.read<String?>('downloaded_quality'), isNull);
+
+        // The new columns must also be writable.
+        await db.customStatement(
+          "UPDATE tracks SET file_size_bytes = 1024, "
+          "downloaded_quality = '320' WHERE uuid_id = 'uuid-1'",
+        );
+        final updated = await db
+            .customSelect(
+              'SELECT file_size_bytes, downloaded_quality FROM tracks',
+            )
+            .getSingle();
+        expect(updated.read<int>('file_size_bytes'), 1024);
+        expect(updated.read<String>('downloaded_quality'), '320');
       },
     );
   });

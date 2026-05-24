@@ -10,7 +10,6 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
-import 'package:frontend/services/quality_presets.dart';
 
 /// Why a single download attempt ended. Drives whether the caller marks the
 /// job completed, re-queues it for retry, or fails it.
@@ -134,13 +133,12 @@ class TrackDownloader {
       return DownloadOutcome.cancelled;
     }
 
-    // Determine the file extension from the server's X-Audio-Extension header.
-    // Transcoded files are always m4a; originals get their actual extension.
-    // Fall back to 'audio' only as a last resort (AVFoundation rejects unknown
-    // extensions, but 'audio' is better than a silent failure from a wrong one).
-    final ext = job.quality != originalQuality
-        ? 'm4a'
-        : (response.headers['x-audio-extension'] ?? 'audio');
+    // Always use the server's X-Audio-Extension header for the saved extension.
+    // The backend may return passthrough bytes even for a transcoded-quality
+    // request (e.g. source is already at or below the requested bitrate), so
+    // assuming `.m4a` for non-original would mislabel the file. Fall back to
+    // 'audio' only when the header is missing.
+    final ext = response.headers['x-audio-extension'] ?? 'audio';
 
     final destination = File(p.join(dir.path, '${job.uuidId}.$ext'));
     final partial = File('${destination.path}.partial');
@@ -207,6 +205,7 @@ class TrackDownloader {
         destination: destination,
         generationCheck: generationCheck,
         downloadedBitrate: downloadedBitrate,
+        downloadedQuality: job.quality,
         received: received,
       );
       if (!committed) return DownloadOutcome.cancelled;
@@ -249,6 +248,7 @@ class TrackDownloader {
     required File destination,
     required bool Function() generationCheck,
     required int? downloadedBitrate,
+    required String downloadedQuality,
     required int received,
   }) async {
     final beforeRename = testHookBeforeRename;
@@ -280,6 +280,7 @@ class TrackDownloader {
         filePath: Value(destination.path),
         downloadedBitrateKbps: Value(downloadedBitrate),
         fileSizeBytes: Value(received),
+        downloadedQuality: Value(downloadedQuality),
       ),
     );
     return true;

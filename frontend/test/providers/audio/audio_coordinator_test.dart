@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:audio_service/audio_service.dart';
-import 'package:drift/drift.dart' hide isNull;
+import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -768,6 +768,86 @@ void main() {
     expect(entries.map((entry) => entry.uuidId), ['a', 'x', 'y', 'b', 'c']);
     expect(c.read(currentTrackProvider)?.uuidId, 'a');
   });
+
+  test(
+    'bridge media callbacks no-op after the coordinator is disposed',
+    () async {
+      // Wire up a coordinator, then tear down its scope. An OS notification
+      // tap firing afterwards must NOT reach the disposed coordinator/player.
+      await fixture.insertSingles(['a']);
+      final c = createContainer();
+      c.read(audioProvider.notifier); // build the coordinator
+      // Let the build's Future.microtask(_restoreStartupState) complete
+      // before tearing the scope down; otherwise the in-flight restore
+      // throws ref-after-dispose noise unrelated to the assertion below.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(bridge.onPlay, isNotNull);
+
+      container?.dispose();
+      container = null;
+
+      expect(bridge.onPlay, isNull);
+      expect(bridge.onPause, isNull);
+      expect(bridge.onSkipToNext, isNull);
+      expect(bridge.onSkipToPrevious, isNull);
+      expect(bridge.onSeek, isNull);
+      expect(bridge.onStop, isNull);
+
+      // audio_service still routes media button events through the bridge.
+      // After clearCallbacks they must be no-ops, not throws — this would
+      // previously have called into a torn-down player.
+      await bridge.play();
+      await bridge.pause();
+      await bridge.skipToNext();
+      await bridge.skipToPrevious();
+      await bridge.seek(const Duration(seconds: 5));
+      await bridge.stop();
+    },
+  );
+
+  test(
+    'a newer coordinator rebinding the bridge survives the old one disposing',
+    () async {
+      // Two coordinators in sequence: scope A binds, scope B binds, then
+      // scope A disposes. Owner-aware clearCallbacks must leave B's
+      // callbacks intact.
+      await fixture.insertSingles(['a']);
+
+      final cA = createContainer();
+      cA.read(audioProvider.notifier);
+      // Wait for the first coordinator's startup-restore microtask.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final firstOnPlay = bridge.onPlay;
+      expect(firstOnPlay, isNotNull);
+
+      // Build a second container against the same bridge — its coordinator
+      // rebinds the callbacks.
+      final cB = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          concatenatingPlayerProvider.overrideWithValue(
+            FakeConcatenatingPlayerController(),
+          ),
+          audioServiceProvider.overrideWithValue(bridge),
+        ],
+      );
+      addTearDown(cB.dispose);
+      cB.read(audioProvider.notifier);
+      // Wait for the second coordinator's startup-restore microtask.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(
+        identical(bridge.onPlay, firstOnPlay),
+        isFalse,
+        reason: 'second coordinator should have rebound onPlay',
+      );
+
+      // Disposing scope A must NOT clear scope B's callbacks.
+      cA.dispose();
+      container = null;
+      expect(bridge.onPlay, isNotNull);
+      expect(bridge.onPause, isNotNull);
+    },
+  );
 
   test('seek persists playback cursor immediately', () async {
     await fixture.insertSingles(['a', 'b']);

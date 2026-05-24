@@ -196,6 +196,14 @@ class Database:
         finally:
             conn.close()
 
+    # Schema version a freshly-initialized database lands on. Keep in sync
+    # with the highest version handled in ``_migrate`` and the schema in
+    # ``init.sql``. The previous value of 2 left fresh DBs reporting an
+    # older version than they actually had (init.sql already creates the v3
+    # ``app_settings`` table), which would have made any future v3→v4
+    # migration spuriously re-create existing tables.
+    LATEST_SCHEMA_VERSION = 3
+
     def initialize(self) -> bool:
         if self.context.database_path.exists():
             print("Database already exists, running migrations")
@@ -206,7 +214,7 @@ class Database:
                 init_script = f.read()
             with self._connection(commit=True) as conn:
                 conn.executescript(init_script)
-                conn.execute("PRAGMA user_version = 2")
+                conn.execute(f"PRAGMA user_version = {self.LATEST_SCHEMA_VERSION}")
             return True
         except Exception as e:
             print(f"Error initializing database: {e}")

@@ -24,6 +24,7 @@ TrackUI _track(
   int? coverArtId,
   String? filePath,
   int? downloadedBitrateKbps,
+  String? downloadedQuality,
 }) {
   return TrackUI(
     uuidId: uuid,
@@ -39,6 +40,7 @@ TrackUI _track(
     coverArtId: coverArtId,
     filePath: filePath,
     downloadedBitrateKbps: downloadedBitrateKbps,
+    downloadedQuality: downloadedQuality,
   );
 }
 
@@ -49,6 +51,7 @@ Future<void> _insertTrack(
   bool hasAlbumArt = false,
   String? filePath,
   int? downloadedBitrateKbps,
+  String? downloadedQuality,
 }) async {
   await db
       .into(db.tracks)
@@ -59,6 +62,7 @@ Future<void> _insertTrack(
           lastUpdated: 0,
           filePath: Value(filePath),
           downloadedBitrateKbps: Value(downloadedBitrateKbps),
+          downloadedQuality: Value(downloadedQuality),
         ),
       );
   await db
@@ -204,8 +208,6 @@ void main() {
     expect(row.filePath, isNotNull);
     expect(File(row.filePath!).existsSync(), isTrue);
     expect(await File(row.filePath!).readAsBytes(), [1, 2, 3, 4]);
-    // Transcoded quality → always .m4a regardless of response headers.
-    expect(row.filePath, endsWith('.m4a'));
     // Bitrate from server header persisted.
     expect(row.downloadedBitrateKbps, 320);
   });
@@ -405,14 +407,14 @@ void main() {
     expect(result, equals(uuids.toSet()));
   });
 
-  test('transcoded quality always saves as .m4a', () async {
+  test('transcoded response (m4a header) saves as .m4a', () async {
     await _insertTrack(db, 'abc');
     final manager = buildManager(
       client: MockClient(
         (_) async => http.Response.bytes(
           [1],
           200,
-          headers: {'x-audio-extension': 'flac'}, // header should be ignored
+          headers: {'x-audio-extension': 'm4a'},
         ),
       ),
     );
@@ -426,6 +428,37 @@ void main() {
     )..where((t) => t.uuidId.equals('abc'))).getSingle();
     expect(row.filePath, endsWith('.m4a'));
   });
+
+  test(
+    'passthrough response on transcoded quality keeps the source extension',
+    () async {
+      // Backend returns the original MP3 when the source is already at or
+      // below the requested bitrate. The saved file must use the header's
+      // extension — assuming `.m4a` here would mislabel the bytes.
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient(
+          (_) async => http.Response.bytes(
+            [1, 2, 3],
+            200,
+            headers: {
+              'x-audio-extension': 'mp3',
+              'x-audio-bitrate-kbps': '96',
+            },
+          ),
+        ),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await _waitForFinish(manager);
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, endsWith('.mp3'));
+    },
+  );
 
   test(
     'original quality uses X-Audio-Extension header for extension',
@@ -726,6 +759,72 @@ void main() {
       )..where((t) => t.uuidId.equals('abc'))).getSingle();
       expect(row.filePath, isNotNull);
       expect(row.filePath, isNot(existingPath));
+    },
+  );
+
+  test(
+    'enqueueTracksAtQuality is idempotent for passthrough downloads',
+    () async {
+      // Source is 96 kbps; user asks for "Download at 320". The backend
+      // (correctly) returns the 96 kbps original, so the stored
+      // downloaded_bitrate_kbps is 96 but downloaded_quality is '320'. A
+      // second "Download at 320" must NOT delete and redownload — the file
+      // already represents what the user asked for.
+      await _insertTrack(db, 'abc');
+      var requestCount = 0;
+      final manager = buildManager(
+        client: MockClient((req) async {
+          requestCount++;
+          expect(req.url.queryParameters['quality'], '320');
+          return http.Response.bytes(
+            [1, 2, 3],
+            200,
+            headers: {
+              'x-audio-bitrate-kbps': '96',
+              'x-audio-extension': 'mp3',
+            },
+          );
+        }),
+      );
+      addTearDown(manager.dispose);
+
+      // First call downloads.
+      await manager.enqueueTracksAtQuality(
+        [_track('abc')],
+        quality: '320',
+      );
+      await _waitForFinish(manager);
+      expect(requestCount, 1);
+
+      final firstRow = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(firstRow.filePath, isNotNull);
+      expect(firstRow.downloadedBitrateKbps, 96);
+      expect(firstRow.downloadedQuality, '320');
+      final firstPath = firstRow.filePath!;
+
+      // Rehydrate the TrackUI from the DB so the second call sees the stored
+      // downloaded_quality (same path the UI uses).
+      final states = await db.getTrackDownloadStates(['abc']);
+      final rehydrated = _track(
+        'abc',
+        filePath: states['abc']!.filePath,
+        downloadedBitrateKbps: states['abc']!.downloadedBitrateKbps,
+        downloadedQuality: states['abc']!.downloadedQuality,
+      );
+      manager.clearFinished();
+
+      // Second call must be a no-op.
+      await manager.enqueueTracksAtQuality([rehydrated], quality: '320');
+      await _waitForFinish(manager);
+
+      expect(requestCount, 1, reason: 'no second download should fire');
+      expect(File(firstPath).existsSync(), isTrue);
+      final secondRow = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(secondRow.filePath, firstPath);
     },
   );
 
@@ -1150,5 +1249,6 @@ extension on TrackUI {
     hasAlbumArt: hasAlbumArt,
     coverArtId: coverArtId,
     downloadedBitrateKbps: downloadedBitrateKbps,
+    downloadedQuality: downloadedQuality,
   );
 }

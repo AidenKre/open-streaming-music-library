@@ -57,6 +57,12 @@ class Tracks extends Table {
   // 320 kbps source) or when bitrate passthrough serves the original.
   IntColumn get downloadedBitrateKbps => integer().nullable()();
   IntColumn get fileSizeBytes => integer().nullable()();
+  // The quality preset the user/server selected for this download (e.g.
+  // 'original', '320'). Independent of `downloadedBitrateKbps`, which is the
+  // bitrate actually written to disk. Storing both lets us answer
+  // "is the file at the requested quality?" idempotently even when the
+  // backend served a passthrough that didn't match the requested bitrate.
+  TextColumn get downloadedQuality => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -590,7 +596,7 @@ const trackSelectColumns =
     'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
     'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
-    't.downloaded_bitrate_kbps, t.file_size_bytes';
+    't.downloaded_bitrate_kbps, t.file_size_bytes, t.downloaded_quality';
 const _selectColumns = trackSelectColumns;
 
 // ── FTS5 virtual table creation statements ──────────────────────────────
@@ -634,7 +640,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 4;
+  int get schemaVersion => 5;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -658,6 +664,11 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       if (from < 4) {
         await customStatement(
           'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
+        );
+      }
+      if (from < 5) {
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
         );
       }
     },
@@ -959,14 +970,20 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   Future<
     Map<
       String,
-      ({String? filePath, int? downloadedBitrateKbps, int? fileSizeBytes})
+      ({
+        String? filePath,
+        int? downloadedBitrateKbps,
+        int? fileSizeBytes,
+        String? downloadedQuality,
+      })
     >
   >
   getTrackDownloadStates(List<String> uuids) async {
     if (uuids.isEmpty) return {};
     final placeholders = List.filled(uuids.length, '?').join(', ');
     final rows = await customSelect(
-      'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes '
+      'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes, '
+      'downloaded_quality '
       'FROM tracks WHERE uuid_id IN ($placeholders)',
       variables: uuids.map(Variable.withString).toList(),
       readsFrom: {tracks},
@@ -977,6 +994,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
           filePath: r.readNullable<String>('file_path'),
           downloadedBitrateKbps: r.readNullable<int>('downloaded_bitrate_kbps'),
           fileSizeBytes: r.readNullable<int>('file_size_bytes'),
+          downloadedQuality: r.readNullable<String>('downloaded_quality'),
         ),
     };
   }

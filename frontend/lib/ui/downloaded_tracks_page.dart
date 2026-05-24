@@ -176,6 +176,7 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
                           track: track,
                           sourceType: 'library',
                           orderParams: _orderParams,
+                          downloadedOnly: true,
                         ),
                         onPlayNext: () =>
                             ref.read(audioProvider.notifier).playNext([track]),

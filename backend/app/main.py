@@ -377,6 +377,82 @@ _CODEC_MIME: dict[str, str] = {
 }
 
 
+def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int]:
+    """Parse a single HTTP byte range and return ``(start, end)`` inclusive.
+
+    Supports the three single-range forms from RFC 7233:
+      ``bytes=start-end`` — explicit window
+      ``bytes=start-``    — from ``start`` to EOF
+      ``bytes=-N``        — the last ``N`` bytes (suffix range)
+
+    Anything else — multi-range requests, malformed values, ranges entirely
+    past EOF — raises 416. We treat 416 as the right answer for "could not
+    parse" too: returning a 200 with the whole file would silently mask a
+    bad client header.
+    """
+    if "," in range_header:
+        # Multi-range responses require multipart/byteranges; we only serve
+        # single ranges, so reject explicitly rather than serving the first.
+        raise HTTPException(
+            status_code=416,
+            detail=f"Multi-range requests are not supported: {range_header}",
+        )
+
+    if "=" not in range_header:
+        raise HTTPException(
+            status_code=416, detail=f"Invalid Range Header: {range_header}"
+        )
+
+    units, _, rng = range_header.partition("=")
+    if units.strip().lower() != "bytes":
+        raise HTTPException(
+            status_code=422,
+            detail=f"range must be in bytes. Instead {units} was used",
+        )
+
+    rng = rng.strip()
+    # Exactly one "-" separator; partition guarantees that. The earlier
+    # split("-") accepted "1-2-3" by silently dropping the tail.
+    if rng.count("-") != 1:
+        raise HTTPException(
+            status_code=416, detail=f"Invalid Range Header: {range_header}"
+        )
+    start_s, end_s = rng.split("-")
+
+    try:
+        if not start_s and not end_s:
+            # "bytes=-" — malformed.
+            raise ValueError("empty range")
+        if not start_s:
+            # Suffix range: last N bytes.
+            suffix_len = int(end_s)
+            if suffix_len <= 0:
+                raise ValueError("non-positive suffix length")
+            if suffix_len >= file_size:
+                start = 0
+            else:
+                start = file_size - suffix_len
+            end = file_size - 1
+        else:
+            start = int(start_s)
+            if start < 0:
+                raise ValueError("negative start")
+            end = int(end_s) if end_s else file_size - 1
+            if end < 0:
+                raise ValueError("negative end")
+    except ValueError:
+        raise HTTPException(
+            status_code=416, detail=f"Invalid Range Header: {range_header}"
+        )
+
+    if start >= file_size or end >= file_size or start > end:
+        raise HTTPException(
+            status_code=416, detail=f"Range not satisfiable: {range_header}"
+        )
+
+    return start, end
+
+
 @app.get("/tracks/{uuid_id}/stream")
 def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     CHUNK_SIZE = 1024 * 1024
@@ -449,26 +525,7 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
             },
         )
 
-    try:
-        units, rng = range_header.split("=")
-        if units.strip().lower() != "bytes":
-            raise HTTPException(
-                status_code=422,
-                detail=f"range must be in bytes. Instead {units} was used",
-            )
-
-        start_s, end_s = (rng.split("-") + [""])[:2]
-        start = int(start_s) if start_s else 0
-        end = int(end_s) if end_s else file_size - 1
-    except Exception:
-        raise HTTPException(
-            status_code=416, detail=f"Invalid Range Header: {range_header}"
-        )
-
-    if start < 0 or end >= file_size or start > end:
-        raise HTTPException(
-            status_code=416, detail=f"Range not satisfiable: {range_header}"
-        )
+    start, end = _parse_byte_range(range_header, file_size)
 
     content_length = end - start + 1
 
