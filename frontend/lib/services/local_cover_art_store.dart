@@ -6,13 +6,14 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/services/local_resettable.dart';
 
 /// Persists cover art on disk using only the cover-art id (no sha256/phash).
 ///
 /// Files are stored as `{coverArtId}.bin` under the app documents directory.
 /// The store is content-agnostic — bytes are written verbatim from the server
 /// response, and consumers read them back as raw bytes for decoding.
-class LocalCoverArtStore {
+class LocalCoverArtStore implements LocalResettable {
   final Directory _directory;
   final ApiClient _apiClient;
 
@@ -87,4 +88,11 @@ class LocalCoverArtStore {
       }
     }
   }
+
+  // --- LocalResettable -------------------------------------------------------
+  @override
+  int get resetPriority => ResetPriority.deleteFiles;
+
+  @override
+  Future<void> resetLocalState() => clear();
 }

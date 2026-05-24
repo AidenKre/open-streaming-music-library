@@ -6,6 +6,7 @@ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/local_resettable.dart';
 
 /// Global instance shared by all consumers. Initialised once at app startup
 /// via [initCoverArtCache] and read by the Riverpod provider, widgets, and
@@ -23,7 +24,7 @@ void initCoverArtCache([CoverArtCacheManager? manager]) {
 /// Consumers use this class to obtain image providers for widgets,
 /// prefetch upcoming artwork, and resolve file-based URIs for the
 /// system media notification (audio service).
-class CoverArtCacheManager {
+class CoverArtCacheManager implements LocalResettable {
   CoverArtCacheManager({
     BaseCacheManager? cache,
     LocalCoverArtStore? localStore,
@@ -82,6 +83,13 @@ class CoverArtCacheManager {
     await _cache?.emptyCache();
     await _localStore?.clear();
   }
+
+  // --- LocalResettable -------------------------------------------------------
+  @override
+  int get resetPriority => ResetPriority.clearCaches;
+
+  @override
+  Future<void> resetLocalState() => clear();
 
   /// Resolves the best available [Uri] for [MediaItem.artUri].
   ///

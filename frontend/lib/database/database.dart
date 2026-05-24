@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/services/local_resettable.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -629,7 +630,7 @@ String _quoteSqlIdentifier(String identifier) {
     QueueSessionPlayOrder,
   ],
 )
-class AppDatabase extends _$AppDatabase {
+class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
   @override
@@ -689,6 +690,13 @@ class AppDatabase extends _$AppDatabase {
       } catch (_) {}
     });
   }
+
+  // --- LocalResettable -------------------------------------------------------
+  @override
+  int get resetPriority => ResetPriority.wipeDatabase;
+
+  @override
+  Future<void> resetLocalState() => resetLocalData();
 
   // ── Track queries ─────────────────────────────────────────────────────
 

@@ -14,6 +14,7 @@ import 'package:frontend/services/download/download_status_reader.dart';
 import 'package:frontend/services/download/track_downloader.dart';
 import 'package:frontend/services/download/worker_pool.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/queue_warm_service.dart';
 
@@ -51,7 +52,7 @@ String formatBytes(int bytes) {
 /// positions stable). The manager writes downloaded files to the app docs
 /// dir and updates `tracks.file_path` so playback can prefer the local
 /// copy.
-class DownloadManager extends ChangeNotifier {
+class DownloadManager extends ChangeNotifier implements LocalResettable {
   final AppDatabase _db;
   // Optional: if supplied, the server is asked to pre-transcode queued tracks
   // at the current stream quality in parallel with downloading them.
@@ -266,6 +267,17 @@ class DownloadManager extends ChangeNotifier {
     await _pool.reset();
     _status.bumpVersion();
   }
+
+  // --- LocalResettable -------------------------------------------------------
+  // The manager owns both in-flight workers and on-disk files. Slot at
+  // [ResetPriority.cancelInFlight] (higher than file deletion) because the
+  // pool.reset() call itself stops workers _then_ deletes their files: we
+  // must run before the database step drops the rows that point at them.
+  @override
+  int get resetPriority => ResetPriority.cancelInFlight;
+
+  @override
+  Future<void> resetLocalState() => resetAndDeleteFiles();
 
   /// Removes the local file (if any) and clears `tracks.file_path` so the
   /// track reverts to streaming. Cover art is intentionally NOT deleted: it
