@@ -179,10 +179,10 @@ class TracksPageState extends ConsumerState<TracksPage>
                     ref.read(audioProvider.notifier).playNext([track]),
                 onAddToQueue: () =>
                     ref.read(audioProvider.notifier).addToQueue([track]),
-                onDownload: () => downloadTrack(ref, track),
+                onDownload: () => downloadScope(ref, TrackScope(track)),
                 onDownloadAtQuality: (q) =>
-                    downloadTrackAtQuality(ref, track, q),
-                onDeleteDownload: () => deleteTrackDownload(ref, track.uuidId),
+                    downloadScope(ref, TrackScope(track), quality: q),
+                onDeleteDownload: () => deleteScope(ref, TrackScope(track)),
               );
             },
           ),

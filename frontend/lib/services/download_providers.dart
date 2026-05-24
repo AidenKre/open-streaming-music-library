@@ -99,87 +99,82 @@ final artistDownloadCountsProvider =
   return (downloaded: entry?.downloaded ?? 0, total: entry?.total ?? 0);
 });
 
-// ── Download / delete helpers ───────────────────────────────────────────
-// Shared across albums_page, artist_page, search_page, and tracks_page so
-// the same logic isn't duplicated in every callback.
+// ── Sealed DownloadScope + unified entry points ─────────────────────────
+// Shared across albums_page, artist_page, search_page, tracks_page, and
+// downloaded_tracks_page. Adding a new download source (e.g. playlists)
+// is now a one-line `class PlaylistScope` constructor.
 
-Future<void> downloadAlbumTracks(WidgetRef ref, int? artistId, int albumId) async {
-  if (artistId == null) return;
-  final tracks = await ref.read(browseRepositoryProvider)
-      .getTracksForAlbum(artistId, albumId);
-  if (tracks.isNotEmpty) {
-    final quality = ref.read(downloadQualityProvider);
-    ref.read(downloadManagerProvider).enqueueTracks(tracks, quality: quality);
+sealed class DownloadScope {
+  const DownloadScope();
+}
+
+class AlbumScope extends DownloadScope {
+  final int artistId;
+  final int albumId;
+  const AlbumScope({required this.artistId, required this.albumId});
+}
+
+class ArtistScope extends DownloadScope {
+  final int artistId;
+  const ArtistScope({required this.artistId});
+}
+
+class TrackScope extends DownloadScope {
+  final TrackUI track;
+  const TrackScope(this.track);
+}
+
+class TracksScope extends DownloadScope {
+  final List<TrackUI> tracks;
+  const TracksScope(this.tracks);
+}
+
+Future<List<TrackUI>> _resolveTracks(WidgetRef ref, DownloadScope scope) {
+  switch (scope) {
+    case AlbumScope(:final artistId, :final albumId):
+      return ref
+          .read(browseRepositoryProvider)
+          .getTracksForAlbum(artistId, albumId);
+    case ArtistScope(:final artistId):
+      return ref.read(browseRepositoryProvider).getTracksForArtist(artistId);
+    case TrackScope(:final track):
+      return Future.value([track]);
+    case TracksScope(:final tracks):
+      return Future.value(tracks);
   }
 }
 
-Future<void> deleteAlbumDownloads(WidgetRef ref, int? artistId, int albumId) async {
-  if (artistId == null) return;
-  final tracks = await ref.read(browseRepositoryProvider)
-      .getTracksForAlbum(artistId, albumId);
-  if (tracks.isNotEmpty) {
-    await ref
-        .read(downloadManagerProvider)
-        .deleteDownloadsForUuids(tracks.map((t) => t.uuidId));
+/// Enqueue downloads for the given scope.
+///
+/// When [quality] is null the user's current default download quality (from
+/// `downloadQualityProvider`) is applied. When [quality] is non-null the
+/// manager's `enqueueTracksAtQuality` path is used so the per-call override
+/// wins regardless of the default.
+Future<void> downloadScope(
+  WidgetRef ref,
+  DownloadScope scope, {
+  String? quality,
+}) async {
+  final tracks = await _resolveTracks(ref, scope);
+  if (tracks.isEmpty) return;
+  final manager = ref.read(downloadManagerProvider);
+  if (quality == null) {
+    manager.enqueueTracks(tracks, quality: ref.read(downloadQualityProvider));
+  } else {
+    manager.enqueueTracksAtQuality(tracks, quality: quality);
   }
 }
 
-Future<void> downloadArtistTracks(WidgetRef ref, int artistId) async {
-  final tracks = await ref.read(browseRepositoryProvider)
-      .getTracksForArtist(artistId);
-  if (tracks.isNotEmpty) {
-    final quality = ref.read(downloadQualityProvider);
-    ref.read(downloadManagerProvider).enqueueTracks(tracks, quality: quality);
+/// Delete downloads for the given scope. `TrackScope` deletes a single
+/// track via `deleteDownload(uuidId)`; everything else delegates to
+/// `deleteDownloadsForUuids` on the resolved track list.
+Future<void> deleteScope(WidgetRef ref, DownloadScope scope) async {
+  final manager = ref.read(downloadManagerProvider);
+  if (scope is TrackScope) {
+    manager.deleteDownload(scope.track.uuidId);
+    return;
   }
-}
-
-Future<void> deleteArtistDownloads(WidgetRef ref, int artistId) async {
-  final tracks = await ref.read(browseRepositoryProvider)
-      .getTracksForArtist(artistId);
-  if (tracks.isNotEmpty) {
-    await ref
-        .read(downloadManagerProvider)
-        .deleteDownloadsForUuids(tracks.map((t) => t.uuidId));
-  }
-}
-
-void downloadTrack(WidgetRef ref, TrackUI track) {
-  final quality = ref.read(downloadQualityProvider);
-  ref.read(downloadManagerProvider).enqueueTracks([track], quality: quality);
-}
-
-void deleteTrackDownload(WidgetRef ref, String uuidId) {
-  ref.read(downloadManagerProvider).deleteDownload(uuidId);
-}
-
-// ── Quality-specific download helpers ──────────────────────────────────────
-// Used by the split download tile's quality picker.
-
-Future<void> downloadAlbumTracksAtQuality(
-    WidgetRef ref, int? artistId, int albumId, String quality) async {
-  if (artistId == null) return;
-  final tracks = await ref.read(browseRepositoryProvider)
-      .getTracksForAlbum(artistId, albumId);
-  if (tracks.isNotEmpty) {
-    ref
-        .read(downloadManagerProvider)
-        .enqueueTracksAtQuality(tracks, quality: quality);
-  }
-}
-
-Future<void> downloadArtistTracksAtQuality(
-    WidgetRef ref, int artistId, String quality) async {
-  final tracks = await ref.read(browseRepositoryProvider)
-      .getTracksForArtist(artistId);
-  if (tracks.isNotEmpty) {
-    ref
-        .read(downloadManagerProvider)
-        .enqueueTracksAtQuality(tracks, quality: quality);
-  }
-}
-
-void downloadTrackAtQuality(WidgetRef ref, TrackUI track, String quality) {
-  ref
-      .read(downloadManagerProvider)
-      .enqueueTracksAtQuality([track], quality: quality);
+  final tracks = await _resolveTracks(ref, scope);
+  if (tracks.isEmpty) return;
+  await manager.deleteDownloadsForUuids(tracks.map((t) => t.uuidId));
 }

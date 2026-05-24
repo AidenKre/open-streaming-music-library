@@ -211,11 +211,15 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                       },
                       onDownload: isOffline
                           ? null
-                          : () => downloadArtistTracks(ref, artist.id),
+                          : () => downloadScope(
+                              ref, ArtistScope(artistId: artist.id)),
                       onDownloadAtQuality: isOffline
                           ? null
-                          : (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
-                      onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
+                          : (q) => downloadScope(
+                              ref, ArtistScope(artistId: artist.id),
+                              quality: q),
+                      onDeleteDownload: () => deleteScope(
+                          ref, ArtistScope(artistId: artist.id)),
                     ),
                   );
                 },
@@ -253,11 +257,24 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                       },
                       onDownload: isOffline
                           ? null
-                          : () => downloadAlbumTracks(ref, album.artistId, album.id),
+                          : () => downloadScope(
+                              ref,
+                              AlbumScope(
+                                  artistId: album.artistId, albumId: album.id),
+                            ),
                       onDownloadAtQuality: isOffline
                           ? null
-                          : (q) => downloadAlbumTracksAtQuality(ref, album.artistId, album.id, q),
-                      onDeleteDownload: () => deleteAlbumDownloads(ref, album.artistId, album.id),
+                          : (q) => downloadScope(
+                              ref,
+                              AlbumScope(
+                                  artistId: album.artistId, albumId: album.id),
+                              quality: q,
+                            ),
+                      onDeleteDownload: () => deleteScope(
+                        ref,
+                        AlbumScope(
+                            artistId: album.artistId, albumId: album.id),
+                      ),
                     ),
                   );
                 },
@@ -300,11 +317,11 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                         ref.read(audioProvider.notifier).playNext([track]),
                     onAddToQueue: () =>
                         ref.read(audioProvider.notifier).addToQueue([track]),
-                    onDownload: () => downloadTrack(ref, track),
+                    onDownload: () => downloadScope(ref, TrackScope(track)),
                     onDownloadAtQuality: (q) =>
-                        downloadTrackAtQuality(ref, track, q),
+                        downloadScope(ref, TrackScope(track), quality: q),
                     onDeleteDownload: () =>
-                        deleteTrackDownload(ref, track.uuidId),
+                        deleteScope(ref, TrackScope(track)),
                   );
                 },
               ),

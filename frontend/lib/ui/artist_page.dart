@@ -142,11 +142,13 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
                 },
                 onDownload: isOffline
                     ? null
-                    : () => downloadArtistTracks(ref, artist.id),
+                    : () => downloadScope(ref, ArtistScope(artistId: artist.id)),
                 onDownloadAtQuality: isOffline
                     ? null
-                    : (q) => downloadArtistTracksAtQuality(ref, artist.id, q),
-                onDeleteDownload: () => deleteArtistDownloads(ref, artist.id),
+                    : (q) => downloadScope(
+                        ref, ArtistScope(artistId: artist.id), quality: q),
+                onDeleteDownload: () =>
+                    deleteScope(ref, ArtistScope(artistId: artist.id)),
               );
             },
           ),

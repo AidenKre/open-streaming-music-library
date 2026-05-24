@@ -169,17 +169,23 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                 },
                 onDownload: isOffline
                     ? null
-                    : () => downloadAlbumTracks(ref, album.artistId, album.id),
+                    : () => downloadScope(
+                        ref,
+                        AlbumScope(
+                            artistId: album.artistId, albumId: album.id),
+                      ),
                 onDownloadAtQuality: isOffline
                     ? null
-                    : (q) => downloadAlbumTracksAtQuality(
+                    : (q) => downloadScope(
                         ref,
-                        album.artistId,
-                        album.id,
-                        q,
+                        AlbumScope(
+                            artistId: album.artistId, albumId: album.id),
+                        quality: q,
                       ),
-                onDeleteDownload: () =>
-                    deleteAlbumDownloads(ref, album.artistId, album.id),
+                onDeleteDownload: () => deleteScope(
+                  ref,
+                  AlbumScope(artistId: album.artistId, albumId: album.id),
+                ),
               );
             },
           ),
