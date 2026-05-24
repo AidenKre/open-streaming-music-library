@@ -6,7 +6,6 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
-import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
@@ -14,8 +13,11 @@ import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
-  final DisconnectCallback? onDisconnect;
-  const ArtistsPage({super.key, this.onDisconnect});
+  /// True when rendered as a root tab inside [AppShell]; the page then owns
+  /// its own [Scaffold] + [AppBar]. False when pushed as a sub-route (the
+  /// parent route's Scaffold provides the chrome).
+  final bool isRoot;
+  const ArtistsPage({super.key, this.isRoot = false});
 
   @override
   ConsumerState<ArtistsPage> createState() => _ArtistPageState();
@@ -156,11 +158,11 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
       ],
     );
 
-    if (widget.onDisconnect != null) {
+    if (widget.isRoot) {
       return Scaffold(
         appBar: AppBar(
           title: const Text('OSML'),
-          actions: buildTopBarActions(context, ref, widget.onDisconnect),
+          actions: buildTopBarActions(context, ref),
         ),
         body: body,
       );

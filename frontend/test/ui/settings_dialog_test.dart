@@ -9,7 +9,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/settings_service.dart';
-import 'package:frontend/ui/disconnect_callback.dart';
+import 'package:frontend/ui/disconnect_controller.dart';
 import 'package:frontend/ui/settings_dialog.dart';
 
 /// Override that pins [offlineModeProvider] to a fixed value without running
@@ -23,16 +23,20 @@ class _StubOffline extends OfflineModeNotifier {
 
 Widget _wrap(
   SharedPreferences prefs, {
-  DisconnectCallback? onDisconnect,
+  Future<void> Function()? onDisconnect,
   bool offline = false,
 }) {
   return ProviderScope(
     overrides: [
       sharedPreferencesProvider.overrideWith((_) async => prefs),
       offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+      if (onDisconnect != null)
+        disconnectControllerProvider.overrideWithValue(
+          DisconnectController(onDisconnect),
+        ),
     ],
-    child: MaterialApp(
-      home: Scaffold(body: SettingsDialog(onDisconnect: onDisconnect)),
+    child: const MaterialApp(
+      home: Scaffold(body: SettingsDialog()),
     ),
   );
 }
@@ -177,7 +181,7 @@ void main() {
   ) async {
     final prefs = await SharedPreferences.getInstance();
     await tester.pumpWidget(
-      _wrap(prefs, onDisconnect: () {}),
+      _wrap(prefs, onDisconnect: () async {}),
     );
     await tester.pumpAndSettle();
 
@@ -193,7 +197,9 @@ void main() {
     var disconnectCalled = false;
     final prefs = await SharedPreferences.getInstance();
     await tester.pumpWidget(
-      _wrap(prefs, onDisconnect: () => disconnectCalled = true),
+      _wrap(prefs, onDisconnect: () async {
+        disconnectCalled = true;
+      }),
     );
     await tester.pumpAndSettle();
 
@@ -215,7 +221,9 @@ void main() {
     var disconnectCalled = false;
     final prefs = await SharedPreferences.getInstance();
     await tester.pumpWidget(
-      _wrap(prefs, onDisconnect: () => disconnectCalled = true),
+      _wrap(prefs, onDisconnect: () async {
+        disconnectCalled = true;
+      }),
     );
     await tester.pumpAndSettle();
 

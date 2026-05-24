@@ -131,7 +131,7 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
     return Scaffold(
       appBar: AppBar(
         title: const Text('OSML'),
-        actions: buildTopBarActions(context, ref, null),
+        actions: buildTopBarActions(context, ref),
       ),
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

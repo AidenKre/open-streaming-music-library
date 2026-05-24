@@ -6,7 +6,6 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
-import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
@@ -14,8 +13,7 @@ import 'package:frontend/ui/widgets/album_card.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
   final int? artistId;
-  final DisconnectCallback? onDisconnect;
-  const AlbumsPage({super.key, this.artistId, this.onDisconnect});
+  const AlbumsPage({super.key, this.artistId});
 
   @override
   ConsumerState<AlbumsPage> createState() => _AlbumsPageState();
@@ -193,15 +191,6 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
       ],
     );
 
-    if (widget.onDisconnect != null) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('OSML'),
-          actions: buildTopBarActions(context, ref, widget.onDisconnect),
-        ),
-        body: body,
-      );
-    }
     return body;
   }
 }

@@ -6,14 +6,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/settings_service.dart';
-import 'package:frontend/ui/disconnect_callback.dart';
+import 'package:frontend/ui/disconnect_controller.dart';
 
 /// Modal that lets the user pick stream + download quality presets and exit
 /// the session. Replaces the standalone disconnect button.
 class SettingsDialog extends ConsumerWidget {
-  final DisconnectCallback? onDisconnect;
-
-  const SettingsDialog({super.key, this.onDisconnect});
+  const SettingsDialog({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -23,6 +21,9 @@ class SettingsDialog extends ConsumerWidget {
     // the user staring at a spinner — so we disable the dropdowns entirely
     // and surface a tooltip explaining why.
     final isOffline = ref.watch(offlineModeProvider);
+    // Disconnect is unavailable outside the live-session scope (login screen,
+    // tests that don't set up the override). Hide the button in that case.
+    final disconnectController = ref.watch(disconnectControllerProvider);
 
     return AlertDialog(
       title: const Text('Settings'),
@@ -89,13 +90,13 @@ class SettingsDialog extends ConsumerWidget {
         ),
       ),
       actions: [
-        if (onDisconnect != null)
+        if (disconnectController != null)
           TextButton(
             onPressed: () async {
               final confirmed = await _confirmDisconnect(context);
               if (!confirmed || !context.mounted) return;
               Navigator.of(context).pop();
-              unawaited(Future.sync(onDisconnect!));
+              unawaited(disconnectController.disconnect());
             },
             child: const Text('Disconnect'),
           ),

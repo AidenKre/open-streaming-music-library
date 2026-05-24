@@ -12,7 +12,6 @@ import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:frontend/ui/artist_page.dart';
-import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 import 'package:frontend/ui/search_page.dart';
@@ -135,9 +134,7 @@ class _FrontendState extends ConsumerState<Frontend> {
 }
 
 class AppShell extends ConsumerStatefulWidget {
-  final DisconnectCallback onDisconnect;
-
-  const AppShell({super.key, required this.onDisconnect});
+  const AppShell({super.key});
 
   @override
   ConsumerState<AppShell> createState() => _AppShellState();
@@ -192,14 +189,11 @@ class _AppShellState extends ConsumerState<AppShell> {
                 children: [
                   _buildTabNavigator(
                     0,
-                    () => ArtistsPage(onDisconnect: widget.onDisconnect),
+                    () => const ArtistsPage(isRoot: true),
                   ),
                   _buildTabNavigator(
                     1,
-                    () => TracksPage(
-                      key: _tracksKey,
-                      onDisconnect: widget.onDisconnect,
-                    ),
+                    () => TracksPage(key: _tracksKey, isRoot: true),
                   ),
                   _buildTabNavigator(2, () => const DownloadedTracksPage()),
                   _buildTabNavigator(3, () => const SearchPage()),

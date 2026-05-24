@@ -4,6 +4,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/local_reset_service.dart';
+import 'package:frontend/ui/disconnect_controller.dart';
 import 'package:frontend/ui/login_page.dart';
 import 'package:frontend/main.dart';
 
@@ -124,6 +125,16 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     if (!_hasServerUrl) {
       return LoginPage(onConnect: _onConnect, error: _connectError);
     }
-    return AppShell(onDisconnect: _onDisconnect);
+    // Scope the disconnect controller to the live-session subtree only.
+    // Login and reset screens stay outside this override and (correctly) see
+    // disconnectControllerProvider == null.
+    return ProviderScope(
+      overrides: [
+        disconnectControllerProvider.overrideWithValue(
+          DisconnectController(_onDisconnect),
+        ),
+      ],
+      child: const AppShell(),
+    );
   }
 }

@@ -7,7 +7,6 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
-import 'package:frontend/ui/disconnect_callback.dart';
 import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/settings_dialog.dart';
@@ -16,9 +15,16 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 class TracksPage extends ConsumerStatefulWidget {
   final int? artistId;
   final int? albumId;
-  final DisconnectCallback? onDisconnect;
+  /// True when rendered as a root tab inside [AppShell]; the page then owns
+  /// its own [Scaffold] + [AppBar]. False when pushed as a sub-route.
+  final bool isRoot;
 
-  const TracksPage({super.key, this.artistId, this.albumId, this.onDisconnect});
+  const TracksPage({
+    super.key,
+    this.artistId,
+    this.albumId,
+    this.isRoot = false,
+  });
 
   @override
   ConsumerState<TracksPage> createState() => TracksPageState();
@@ -190,11 +196,11 @@ class TracksPageState extends ConsumerState<TracksPage>
       ],
     );
 
-    if (widget.onDisconnect != null) {
+    if (widget.isRoot) {
       return Scaffold(
         appBar: AppBar(
           title: const Text('OSML'),
-          actions: buildTopBarActions(context, ref, widget.onDisconnect),
+          actions: buildTopBarActions(context, ref),
         ),
         body: body,
       );
@@ -206,11 +212,7 @@ class TracksPageState extends ConsumerState<TracksPage>
 /// Standard top-bar action set used by every page that shows a top bar.
 /// Replaces the old standalone disconnect button with a downloads-page
 /// shortcut and a settings menu.
-List<Widget> buildTopBarActions(
-  BuildContext context,
-  WidgetRef ref,
-  DisconnectCallback? onDisconnect,
-) {
+List<Widget> buildTopBarActions(BuildContext context, WidgetRef ref) {
   return [
     IconButton(
       icon: const Icon(Icons.download),
@@ -227,7 +229,7 @@ List<Widget> buildTopBarActions(
       onPressed: () {
         showDialog<void>(
           context: context,
-          builder: (_) => SettingsDialog(onDisconnect: onDisconnect),
+          builder: (_) => const SettingsDialog(),
         );
       },
     ),
