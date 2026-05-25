@@ -15,6 +15,7 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 class TracksPage extends ConsumerStatefulWidget {
   final int? artistId;
   final int? albumId;
+
   /// True when rendered as a root tab inside [AppShell]; the page then owns
   /// its own [Scaffold] + [AppBar]. False when pushed as a sub-route.
   final bool isRoot;
@@ -229,6 +230,7 @@ List<Widget> buildTopBarActions(BuildContext context, WidgetRef ref) {
       onPressed: () {
         showDialog<void>(
           context: context,
+          useRootNavigator: false,
           builder: (_) => const SettingsDialog(),
         );
       },

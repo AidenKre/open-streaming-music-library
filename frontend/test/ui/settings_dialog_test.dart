@@ -11,6 +11,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/disconnect_controller.dart';
 import 'package:frontend/ui/settings_dialog.dart';
+import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
 
 /// Override that pins [offlineModeProvider] to a fixed value without running
 /// the real health-poll timer.
@@ -35,8 +36,41 @@ Widget _wrap(
           DisconnectController(onDisconnect),
         ),
     ],
-    child: const MaterialApp(
-      home: Scaffold(body: SettingsDialog()),
+    child: MaterialApp(
+      theme: ThemeData(splashFactory: NoSplash.splashFactory),
+      home: const Scaffold(body: SettingsDialog()),
+    ),
+  );
+}
+
+Widget _wrapNestedSettingsLauncher(
+  SharedPreferences prefs, {
+  required Future<void> Function() onDisconnect,
+}) {
+  return ProviderScope(
+    overrides: [
+      sharedPreferencesProvider.overrideWith((_) async => prefs),
+      offlineModeProvider.overrideWith(() => _StubOffline(false)),
+    ],
+    child: MaterialApp(
+      theme: ThemeData(splashFactory: NoSplash.splashFactory),
+      home: ProviderScope(
+        overrides: [
+          disconnectControllerProvider.overrideWithValue(
+            DisconnectController(onDisconnect),
+          ),
+        ],
+        child: Navigator(
+          onGenerateRoute: (_) => MaterialPageRoute<void>(
+            builder: (_) => Consumer(
+              builder: (context, ref, _) => Scaffold(
+                appBar: AppBar(actions: buildTopBarActions(context, ref)),
+                body: const SizedBox.shrink(),
+              ),
+            ),
+          ),
+        ),
+      ),
     ),
   );
 }
@@ -71,8 +105,13 @@ void main() {
     // Backend GET returns the same quality — no state change at build().
     ApiClient.initForTest(
       'http://localhost:8000',
-      MockClient((_) async => http.Response('{"quality":"256"}', 200,
-          headers: {'content-type': 'application/json'})),
+      MockClient(
+        (_) async => http.Response(
+          '{"quality":"256"}',
+          200,
+          headers: {'content-type': 'application/json'},
+        ),
+      ),
     );
 
     await tester.pumpWidget(_wrap(prefs));
@@ -180,9 +219,7 @@ void main() {
     tester,
   ) async {
     final prefs = await SharedPreferences.getInstance();
-    await tester.pumpWidget(
-      _wrap(prefs, onDisconnect: () async {}),
-    );
+    await tester.pumpWidget(_wrap(prefs, onDisconnect: () async {}));
     await tester.pumpAndSettle();
 
     await tester.tap(find.text('Disconnect'));
@@ -192,14 +229,34 @@ void main() {
     expect(find.text('Reset and disconnect?'), findsOneWidget);
   });
 
-  testWidgets('Cancelling the disconnect bottom sheet does NOT fire callback',
-      (tester) async {
+  testWidgets('Settings opened from tab navigator keeps disconnect available', (
+    tester,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await tester.pumpWidget(
+      _wrapNestedSettingsLauncher(prefs, onDisconnect: () async {}),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Settings'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Settings'), findsOneWidget);
+    expect(find.text('Disconnect'), findsOneWidget);
+  });
+
+  testWidgets('Cancelling the disconnect bottom sheet does NOT fire callback', (
+    tester,
+  ) async {
     var disconnectCalled = false;
     final prefs = await SharedPreferences.getInstance();
     await tester.pumpWidget(
-      _wrap(prefs, onDisconnect: () async {
-        disconnectCalled = true;
-      }),
+      _wrap(
+        prefs,
+        onDisconnect: () async {
+          disconnectCalled = true;
+        },
+      ),
     );
     await tester.pumpAndSettle();
 
@@ -216,14 +273,18 @@ void main() {
     expect(find.text('Settings'), findsOneWidget);
   });
 
-  testWidgets('Confirming the disconnect bottom sheet DOES fire callback',
-      (tester) async {
+  testWidgets('Confirming the disconnect bottom sheet DOES fire callback', (
+    tester,
+  ) async {
     var disconnectCalled = false;
     final prefs = await SharedPreferences.getInstance();
     await tester.pumpWidget(
-      _wrap(prefs, onDisconnect: () async {
-        disconnectCalled = true;
-      }),
+      _wrap(
+        prefs,
+        onDisconnect: () async {
+          disconnectCalled = true;
+        },
+      ),
     );
     await tester.pumpAndSettle();
 
@@ -254,28 +315,33 @@ void main() {
           .toList();
       expect(dropdowns, hasLength(2));
       for (final d in dropdowns) {
-        expect(d.onChanged, isNull,
-            reason: 'dropdown should be disabled while offline');
+        expect(
+          d.onChanged,
+          isNull,
+          reason: 'dropdown should be disabled while offline',
+        );
       }
       // The explanatory tooltip is present.
       expect(find.byType(Tooltip), findsWidgets);
     });
 
-    testWidgets('offline: tapping the dropdown does not open the choice sheet',
-        (tester) async {
-      final prefs = await SharedPreferences.getInstance();
-      await tester.pumpWidget(_wrap(prefs, offline: true));
-      await tester.pumpAndSettle();
+    testWidgets(
+      'offline: tapping the dropdown does not open the choice sheet',
+      (tester) async {
+        final prefs = await SharedPreferences.getInstance();
+        await tester.pumpWidget(_wrap(prefs, offline: true));
+        await tester.pumpAndSettle();
 
-      // Try to open the stream quality dropdown.
-      await tester.tap(find.text('Original').first);
-      await tester.pumpAndSettle();
+        // Try to open the stream quality dropdown.
+        await tester.tap(find.text('Original').first);
+        await tester.pumpAndSettle();
 
-      // Because onChanged is null the dropdown won't open its menu and the
-      // choice bottom sheet must never appear.
-      expect(find.text('Set as default'), findsNothing);
-      expect(find.text('This session only'), findsNothing);
-      expect(find.byType(BottomSheet), findsNothing);
-    });
+        // Because onChanged is null the dropdown won't open its menu and the
+        // choice bottom sheet must never appear.
+        expect(find.text('Set as default'), findsNothing);
+        expect(find.text('This session only'), findsNothing);
+        expect(find.byType(BottomSheet), findsNothing);
+      },
+    );
   });
 }
