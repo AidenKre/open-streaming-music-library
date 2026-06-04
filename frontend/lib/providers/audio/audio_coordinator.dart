@@ -14,6 +14,7 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
 import 'package:frontend/providers/audio/queue_hydration_controller.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/queue_warm_service.dart';
@@ -90,6 +91,11 @@ class AudioCoordinator extends Notifier<AudioState> {
         unawaited(_serialize(() => _onCurrentItemChanged(currentItemId)));
       }),
     );
+    _subscriptions.add(
+      _player.unavailableAdvanceStream.listen((event) {
+        unawaited(_serialize(() => _onUnavailableAdvance(event)));
+      }),
+    );
 
     ref.onDispose(() {
       // Clear bridge callbacks first so an OS notification tap firing during
@@ -117,7 +123,9 @@ class AudioCoordinator extends Notifier<AudioState> {
         repeatMode: state.queue.repeatMode.name,
         shuffleEnabled: false,
       );
-      await _startSession(sessionId, autoPlay: true);
+      if (!await _startSessionWithOfflinePolicy(sessionId, autoPlay: true)) {
+        return;
+      }
     });
   }
 
@@ -131,6 +139,11 @@ class AudioCoordinator extends Notifier<AudioState> {
   }) {
     return _serialize(() async {
       _setPlaybackStatus(PlayerStatus.loading);
+      // Offline forces the underlying DB filter so we never even insert
+      // streaming-only tracks into the queue; callers that explicitly asked
+      // for a downloaded-only queue (e.g. the downloaded-tracks page) get
+      // the same behaviour online.
+      final filterDownloadedOnly = downloadedOnly || _isOffline;
       final sessionId = await _queueRepo.createSessionFromQuery(
         sourceType: sourceType,
         sourceArtistId: artistId,
@@ -139,9 +152,11 @@ class AudioCoordinator extends Notifier<AudioState> {
         orderBy: orderParams,
         repeatMode: state.queue.repeatMode.name,
         shuffleEnabled: false,
-        downloadedOnly: downloadedOnly,
+        downloadedOnly: filterDownloadedOnly,
       );
-      await _startSession(sessionId, autoPlay: true);
+      if (!await _startSessionWithOfflinePolicy(sessionId, autoPlay: true)) {
+        return;
+      }
       if (state.shuffle.shuffleOn) {
         await _toggleShuffleInternal(forceEnable: true);
       }
@@ -163,7 +178,9 @@ class AudioCoordinator extends Notifier<AudioState> {
         repeatMode: state.queue.repeatMode.name,
         shuffleEnabled: false,
       );
-      await _startSession(sessionId, autoPlay: true);
+      if (!await _startSessionWithOfflinePolicy(sessionId, autoPlay: true)) {
+        return;
+      }
       if (state.shuffle.shuffleOn) {
         await _toggleShuffleInternal(forceEnable: true);
       }
@@ -182,23 +199,12 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
-      var targetPlayPosition = state.queue.currentPlayPosition + 1;
-      if (targetPlayPosition >= state.queue.totalCount) {
-        if (state.queue.repeatMode != QueueRepeatMode.all ||
-            state.queue.totalCount == 0) {
-          return;
-        }
-        targetPlayPosition = 0;
-      }
-
-      final targetEntries = await _queueRepo.getPlaybackEntries(
-        sessionId,
-        startPlayPosition: targetPlayPosition,
-        limit: 1,
+      final target = await _resolveAdvanceTarget(
+        sessionId: sessionId,
+        direction: PlayOrderDirection.forward,
       );
-      if (targetEntries.isEmpty) return;
+      if (target == null) return;
 
-      final target = targetEntries.first;
       await _hydrationController.ensureItemLoaded(sessionId, target);
       await _player.seekToItem(target.itemId);
       await _player.play();
@@ -225,24 +231,15 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
-      var targetPlayPosition = state.queue.currentPlayPosition - 1;
-      if (targetPlayPosition < 0) {
-        if (state.queue.repeatMode != QueueRepeatMode.all ||
-            state.queue.totalCount == 0) {
-          await _player.seek(Duration.zero);
-          return;
-        }
-        targetPlayPosition = state.queue.totalCount - 1;
+      final target = await _resolveAdvanceTarget(
+        sessionId: sessionId,
+        direction: PlayOrderDirection.backward,
+      );
+      if (target == null) {
+        await _player.seek(Duration.zero);
+        return;
       }
 
-      final targetEntries = await _queueRepo.getPlaybackEntries(
-        sessionId,
-        startPlayPosition: targetPlayPosition,
-        limit: 1,
-      );
-      if (targetEntries.isEmpty) return;
-
-      final target = targetEntries.first;
       await _hydrationController.ensureItemLoaded(sessionId, target);
       await _player.seekToItem(target.itemId);
       await _player.play();
@@ -254,11 +251,23 @@ class AudioCoordinator extends Notifier<AudioState> {
       final sessionId = state.queue.sessionId;
       if (sessionId == null) return;
 
-      final entry = await _queueRepo.getPlaybackEntryForItem(sessionId, itemId);
+      var entry = await _queueRepo.getPlaybackEntryForItem(sessionId, itemId);
       if (entry == null) return;
 
+      // Offline: if the user tapped a row whose file is no longer on disk,
+      // walk forward (then backward) to the nearest locally playable entry.
+      if (_isOffline) {
+        final playable = await _queueRepo.findLocallyPlayableFallback(
+          sessionId: sessionId,
+          preferredItemId: entry.itemId,
+          totalCount: state.queue.totalCount,
+        );
+        if (playable == null) return;
+        entry = playable;
+      }
+
       await _hydrationController.ensureItemLoaded(sessionId, entry);
-      await _player.seekToItem(itemId);
+      await _player.seekToItem(entry.itemId);
       await _player.play();
     });
   }
@@ -503,12 +512,32 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
+      // Offline restore must not seed the player on a streaming-only entry.
+      // Pick the nearest locally playable item before handing to _startSession.
+      final initialPosition = Duration(
+        milliseconds: snapshot.session.currentPositionMs,
+      );
+      if (_isOffline) {
+        final fallback = await _queueRepo.findLocallyPlayableFallback(
+          sessionId: snapshot.session.id,
+          preferredItemId: snapshot.currentItem!.itemId,
+          totalCount: snapshot.totalCount,
+        );
+        if (fallback == null) return;
+        final usePreferred = fallback.itemId == snapshot.currentItem!.itemId;
+        await _startSession(
+          snapshot.session.id,
+          autoPlay: false,
+          initialPosition: usePreferred ? initialPosition : Duration.zero,
+          overrideCurrentItem: usePreferred ? null : fallback,
+        );
+        return;
+      }
+
       await _startSession(
         snapshot.session.id,
         autoPlay: false,
-        initialPosition: Duration(
-          milliseconds: snapshot.session.currentPositionMs,
-        ),
+        initialPosition: initialPosition,
       );
     });
   }
@@ -517,9 +546,10 @@ class AudioCoordinator extends Notifier<AudioState> {
     int sessionId, {
     required bool autoPlay,
     Duration initialPosition = Duration.zero,
+    QueuePlaybackEntry? overrideCurrentItem,
   }) async {
     final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
-    final currentItem = snapshot?.currentItem;
+    final currentItem = overrideCurrentItem ?? snapshot?.currentItem;
     if (snapshot == null || currentItem == null || snapshot.totalCount == 0) {
       throw StateError('Cannot start an empty queue session');
     }
@@ -582,6 +612,109 @@ class AudioCoordinator extends Notifier<AudioState> {
     _bridge.updateNowPlaying(currentTrack.track, artUri: artUri);
     _updateBridgePlaybackState();
     _scheduleForwardHydration();
+  }
+
+  bool get _isOffline => ref.read(offlineModeProvider);
+
+  /// Starts the given session while honouring offline policy: if offline and
+  /// the snapshot's current item is not locally playable, swap it for the
+  /// nearest playable fallback before seeding. Returns `false` when offline
+  /// and no entry in the session is locally playable (the session is left
+  /// inactive; nothing has been played).
+  Future<bool> _startSessionWithOfflinePolicy(
+    int sessionId, {
+    required bool autoPlay,
+  }) async {
+    if (!_isOffline) {
+      await _startSession(sessionId, autoPlay: autoPlay);
+      return true;
+    }
+
+    final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
+    if (snapshot == null ||
+        snapshot.currentItem == null ||
+        snapshot.totalCount == 0) {
+      return false;
+    }
+
+    final fallback = await _queueRepo.findLocallyPlayableFallback(
+      sessionId: sessionId,
+      preferredItemId: snapshot.currentItem!.itemId,
+      totalCount: snapshot.totalCount,
+    );
+    if (fallback == null) {
+      _setPlaybackStatus(PlayerStatus.idle);
+      return false;
+    }
+    final usePreferred = fallback.itemId == snapshot.currentItem!.itemId;
+    await _startSession(
+      sessionId,
+      autoPlay: autoPlay,
+      overrideCurrentItem: usePreferred ? null : fallback,
+    );
+    return true;
+  }
+
+  /// Picks the next entry the player should land on for skipNext / skipPrev /
+  /// natural advance. Offline searches the FULL queue (not just the loaded
+  /// window) for the nearest entry with a verified local file in [direction];
+  /// online uses the immediate next/previous play position. Honours the
+  /// current repeat mode for wrapping.
+  Future<QueuePlaybackEntry?> _resolveAdvanceTarget({
+    required int sessionId,
+    required PlayOrderDirection direction,
+  }) async {
+    final repeatModeName = state.queue.repeatMode.name;
+    if (_isOffline) {
+      return _queueRepo.findNextLocallyPlayableEntry(
+        sessionId: sessionId,
+        fromPlayPosition: state.queue.currentPlayPosition,
+        direction: direction,
+        repeatMode: repeatModeName,
+        totalCount: state.queue.totalCount,
+      );
+    }
+
+    final step = direction == PlayOrderDirection.forward ? 1 : -1;
+    var targetPlayPosition = state.queue.currentPlayPosition + step;
+    if (targetPlayPosition < 0 || targetPlayPosition >= state.queue.totalCount) {
+      if (state.queue.repeatMode != QueueRepeatMode.all ||
+          state.queue.totalCount == 0) {
+        return null;
+      }
+      targetPlayPosition = direction == PlayOrderDirection.forward
+          ? 0
+          : state.queue.totalCount - 1;
+    }
+
+    final entries = await _queueRepo.getPlaybackEntries(
+      sessionId,
+      startPlayPosition: targetPlayPosition,
+      limit: 1,
+    );
+    if (entries.isEmpty) return null;
+    return entries.first;
+  }
+
+  Future<void> _onUnavailableAdvance(UnavailableAdvance event) async {
+    if (_stopInProgress) return;
+    final sessionId = state.queue.sessionId;
+    if (sessionId == null) return;
+
+    final target = await _queueRepo.findNextLocallyPlayableEntry(
+      sessionId: sessionId,
+      fromPlayPosition: event.playPosition,
+      direction: PlayOrderDirection.forward,
+      repeatMode: state.queue.repeatMode.name,
+      totalCount: state.queue.totalCount,
+    );
+    if (target == null) {
+      await _player.stop();
+      return;
+    }
+    await _hydrationController.ensureItemLoaded(sessionId, target);
+    await _player.seekToItem(target.itemId);
+    await _player.play();
   }
 
   bool get _hasHydratedSessionState =>

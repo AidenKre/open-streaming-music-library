@@ -8,18 +8,28 @@ import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/quality_presets.dart';
 
+class UnavailableAdvance {
+  final int itemId;
+  final int playPosition;
+
+  const UnavailableAdvance({required this.itemId, required this.playPosition});
+}
+
 class ConcatenatingPlayerController {
   final ja.AudioPlayer _player;
   final StreamController<int?> _currentItemIdController =
       StreamController<int?>.broadcast();
+  final StreamController<UnavailableAdvance> _unavailableAdvanceController =
+      StreamController<UnavailableAdvance>.broadcast();
   List<QueuePlaybackEntry> _loadedEntries = const [];
   StreamSubscription<int?>? _currentIndexSubscription;
   int? _committedCurrentItemId;
   int _structuralMutationDepth = 0;
   bool _isDisposed = false;
-  /// Resolves the global offline-mode flag. When `true`, the controller will
-  /// skip past non-local entries as the player advances. Default `false` so
-  /// nothing changes for callers that don't wire offline mode (tests).
+  /// Resolves the global offline-mode flag. When `true`, advances onto an
+  /// entry without a verified local file are reported via
+  /// [unavailableAdvanceStream] instead of being committed as the current
+  /// item; the coordinator decides what to do next.
   final bool Function() _isOfflineFn;
 
   /// Quality preset applied to NEW source URIs. Existing in-flight sources
@@ -245,12 +255,15 @@ class ConcatenatingPlayerController {
   Stream<Duration> get positionStream => _player.positionStream;
   Stream<Duration?> get durationStream => _player.durationStream;
   Stream<int?> get currentItemIdStream => _currentItemIdController.stream;
+  Stream<UnavailableAdvance> get unavailableAdvanceStream =>
+      _unavailableAdvanceController.stream;
 
   void dispose() {
     if (_isDisposed) return;
     _isDisposed = true;
     unawaited(_currentIndexSubscription?.cancel());
     unawaited(_currentItemIdController.close());
+    unawaited(_unavailableAdvanceController.close());
     unawaited(_player.dispose());
   }
 
@@ -343,20 +356,17 @@ class ConcatenatingPlayerController {
     if (_isDisposed || _structuralMutationDepth > 0) {
       return;
     }
-    // While offline, the player must not land on a streaming-only entry.
-    // We don't touch the currently-playing track (the user said "let it
-    // finish"); we only intercept when the player advances to a new index
-    // whose entry has no local file.
+    // Offline: don't commit an index whose source has no verified local file.
+    // Report it upward so the coordinator can search the full queue (not just
+    // what we currently have loaded) for the next locally playable entry.
     if (index != null && _isOfflineFn() && !_isIndexLocallyPlayable(index)) {
-      final nextPlayable = _findNextPlayableIndex(index);
-      if (nextPlayable != null) {
-        unawaited(_player.seek(Duration.zero, index: nextPlayable));
-      } else {
-        // No local entries ahead — nothing left we can play offline.
-        unawaited(_player.stop());
+      if (index >= 0 && index < _loadedEntries.length) {
+        final unavailable = _loadedEntries[index];
+        _unavailableAdvanceController.add(UnavailableAdvance(
+          itemId: unavailable.itemId,
+          playPosition: unavailable.playPosition,
+        ));
       }
-      // Wait for the seek to drive another index-change event; don't commit
-      // this non-playable index as the "current" track.
       return;
     }
     _commitCurrentItem(_itemIdForIndex(index), emit: true);
@@ -365,14 +375,7 @@ class ConcatenatingPlayerController {
   bool _isIndexLocallyPlayable(int index) {
     if (index < 0 || index >= _loadedEntries.length) return false;
     final path = _loadedEntries[index].filePath;
-    return path != null && File(path).existsSync();
-  }
-
-  int? _findNextPlayableIndex(int from) {
-    for (var i = from + 1; i < _loadedEntries.length; i++) {
-      if (_isIndexLocallyPlayable(i)) return i;
-    }
-    return null;
+    return path != null && path.isNotEmpty && File(path).existsSync();
   }
 
   Future<void> _runStructuralMutation(

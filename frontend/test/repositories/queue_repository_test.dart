@@ -1,4 +1,4 @@
-import 'package:drift/drift.dart' hide isNotNull;
+import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -328,6 +328,198 @@ void main() {
       expect(entries.map((e) => e.uuidId), ['dl-1', 'dl-2']);
     },
   );
+
+  group('locally playable lookup', () {
+    QueueRepository repoWithFs(Set<String> existing) {
+      return QueueRepository(db, localFileExists: existing.contains);
+    }
+
+    Future<void> markDownloaded(String uuid, String path) async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+          .write(TracksCompanion(filePath: Value(path)));
+    }
+
+    test(
+      'findNextLocallyPlayableEntry skips streaming-only entries forward',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+        await markDownloaded('a', '/tmp/a');
+        await markDownloaded('d', '/tmp/d');
+        final existing = {'/tmp/a', '/tmp/d'};
+
+        final localRepo = repoWithFs(existing);
+        final sessionId = await localRepo.createSessionFromExplicitList(
+          sourceType: 'custom',
+          trackUuids: const ['a', 'b', 'c', 'd', 'e'],
+          currentIndex: 0,
+        );
+
+        final next = await localRepo.findNextLocallyPlayableEntry(
+          sessionId: sessionId,
+          fromPlayPosition: 0,
+          direction: PlayOrderDirection.forward,
+          repeatMode: 'off',
+          totalCount: 5,
+        );
+
+        expect(next?.uuidId, 'd');
+      },
+    );
+
+    test(
+      'findNextLocallyPlayableEntry searches backward when going to previous',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+        await markDownloaded('a', '/tmp/a');
+        await markDownloaded('e', '/tmp/e');
+        final existing = {'/tmp/a', '/tmp/e'};
+
+        final localRepo = repoWithFs(existing);
+        final sessionId = await localRepo.createSessionFromExplicitList(
+          sourceType: 'custom',
+          trackUuids: const ['a', 'b', 'c', 'd', 'e'],
+          currentIndex: 4,
+        );
+
+        final prev = await localRepo.findNextLocallyPlayableEntry(
+          sessionId: sessionId,
+          fromPlayPosition: 4,
+          direction: PlayOrderDirection.backward,
+          repeatMode: 'off',
+          totalCount: 5,
+        );
+
+        expect(prev?.uuidId, 'a');
+      },
+    );
+
+    test(
+      'findNextLocallyPlayableEntry wraps when repeat mode is all',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/tmp/a');
+        final existing = {'/tmp/a'};
+
+        final localRepo = repoWithFs(existing);
+        final sessionId = await localRepo.createSessionFromExplicitList(
+          sourceType: 'custom',
+          trackUuids: const ['a', 'b', 'c'],
+          currentIndex: 0,
+        );
+
+        final wrapped = await localRepo.findNextLocallyPlayableEntry(
+          sessionId: sessionId,
+          fromPlayPosition: 0,
+          direction: PlayOrderDirection.forward,
+          repeatMode: 'all',
+          totalCount: 3,
+        );
+
+        expect(wrapped?.uuidId, 'a');
+      },
+    );
+
+    test(
+      'findNextLocallyPlayableEntry returns null when nothing is playable',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+
+        final localRepo = repoWithFs(const <String>{});
+        final sessionId = await localRepo.createSessionFromExplicitList(
+          sourceType: 'custom',
+          trackUuids: const ['a', 'b', 'c'],
+          currentIndex: 0,
+        );
+
+        final result = await localRepo.findNextLocallyPlayableEntry(
+          sessionId: sessionId,
+          fromPlayPosition: 0,
+          direction: PlayOrderDirection.forward,
+          repeatMode: 'all',
+          totalCount: 3,
+        );
+
+        expect(result, isNull);
+      },
+    );
+
+    test(
+      'findNextLocallyPlayableEntry treats a db-only file_path as not playable',
+      () async {
+        await fixture.insertSingles(['a', 'b']);
+        await markDownloaded('a', '/tmp/missing');
+        await markDownloaded('b', '/tmp/present');
+
+        final localRepo = repoWithFs({'/tmp/present'});
+        final sessionId = await localRepo.createSessionFromExplicitList(
+          sourceType: 'custom',
+          trackUuids: const ['a', 'b'],
+          currentIndex: 0,
+        );
+
+        final result = await localRepo.findNextLocallyPlayableEntry(
+          sessionId: sessionId,
+          fromPlayPosition: 0,
+          direction: PlayOrderDirection.forward,
+          repeatMode: 'off',
+          totalCount: 2,
+          includeStart: true,
+        );
+
+        expect(result?.uuidId, 'b');
+      },
+    );
+
+    test('findLocallyPlayableFallback returns requested when playable', () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await markDownloaded('b', '/tmp/b');
+      final existing = {'/tmp/b'};
+
+      final localRepo = repoWithFs(existing);
+      final sessionId = await localRepo.createSessionFromExplicitList(
+        sourceType: 'custom',
+        trackUuids: const ['a', 'b', 'c'],
+        currentIndex: 1,
+      );
+      final preferred = (await localRepo.getSessionSnapshot(sessionId))!
+          .currentItem!;
+
+      final result = await localRepo.findLocallyPlayableFallback(
+        sessionId: sessionId,
+        preferredItemId: preferred.itemId,
+        totalCount: 3,
+      );
+
+      expect(result?.uuidId, 'b');
+    });
+
+    test(
+      'findLocallyPlayableFallback picks nearest playable when requested missing',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+        await markDownloaded('a', '/tmp/a');
+        await markDownloaded('e', '/tmp/e');
+        final existing = {'/tmp/a', '/tmp/e'};
+
+        final localRepo = repoWithFs(existing);
+        final sessionId = await localRepo.createSessionFromExplicitList(
+          sourceType: 'custom',
+          trackUuids: const ['a', 'b', 'c', 'd', 'e'],
+          currentIndex: 2,
+        );
+        final preferred = (await localRepo.getSessionSnapshot(sessionId))!
+            .currentItem!;
+
+        final result = await localRepo.findLocallyPlayableFallback(
+          sessionId: sessionId,
+          preferredItemId: preferred.itemId,
+          totalCount: 5,
+        );
+
+        expect(result?.uuidId, 'e');
+      },
+    );
+  });
 
   test(
     'getSessionTracksPage returns a bounded page in effective order',

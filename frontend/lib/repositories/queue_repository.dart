@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:drift/drift.dart';
 
 import 'package:frontend/database/database.dart';
@@ -7,6 +9,9 @@ abstract final class QueueItemTypes {
   static const main = 'main';
   static const manual = 'manual';
 }
+
+/// Direction passed to [QueueRepository.findNextLocallyPlayableEntry].
+enum PlayOrderDirection { forward, backward }
 
 class QueuePlaybackEntry {
   final int itemId;
@@ -56,8 +61,20 @@ class QueueSessionSnapshot {
 
 class QueueRepository {
   final AppDatabase _db;
+  // Indirection so tests can drive the "is this file actually on disk?" check
+  // without touching the filesystem. Production stays a real existsSync().
+  final bool Function(String path) _localFileExists;
 
-  QueueRepository(this._db);
+  QueueRepository(
+    this._db, {
+    bool Function(String path)? localFileExists,
+  }) : _localFileExists =
+            localFileExists ?? ((path) => File(path).existsSync());
+
+  bool _isLocallyPlayable(QueuePlaybackEntry entry) {
+    final path = entry.filePath;
+    return path != null && path.isNotEmpty && _localFileExists(path);
+  }
 
   Future<int> createSessionFromQuery({
     required String sourceType,
@@ -319,6 +336,90 @@ class QueueRepository {
         .getSingleOrNull();
 
     return row == null ? null : _playbackEntryFromRow(row);
+  }
+
+  /// Returns the nearest entry whose local file is verified to exist on disk,
+  /// starting at [fromPlayPosition] and walking in [direction]. When
+  /// [includeStart] is true the entry at [fromPlayPosition] itself is eligible;
+  /// otherwise the search starts at the next position in [direction].
+  ///
+  /// Honours [repeatMode]: 'all' wraps once around the queue in [direction];
+  /// 'off' and 'one' do not wrap. Returns `null` if no playable entry exists.
+  Future<QueuePlaybackEntry?> findNextLocallyPlayableEntry({
+    required int sessionId,
+    required int fromPlayPosition,
+    required PlayOrderDirection direction,
+    required String repeatMode,
+    required int totalCount,
+    bool includeStart = false,
+  }) async {
+    if (totalCount <= 0) return null;
+
+    final entries = await getPlaybackEntries(sessionId);
+    if (entries.isEmpty) return null;
+
+    final byPlayPosition = <int, QueuePlaybackEntry>{
+      for (final entry in entries) entry.playPosition: entry,
+    };
+
+    final maxPosition = totalCount - 1;
+    final wrap = repeatMode == 'all';
+    final step = direction == PlayOrderDirection.forward ? 1 : -1;
+    final startPosition = includeStart ? fromPlayPosition : fromPlayPosition + step;
+
+    var position = startPosition;
+    var visited = 0;
+    while (visited < totalCount) {
+      if (position < 0 || position > maxPosition) {
+        if (!wrap) return null;
+        position = position < 0 ? maxPosition : 0;
+      }
+      final candidate = byPlayPosition[position];
+      if (candidate != null && _isLocallyPlayable(candidate)) {
+        return candidate;
+      }
+      position += step;
+      visited++;
+    }
+    return null;
+  }
+
+  /// Returns [preferredItemId] if its entry is locally playable; otherwise the
+  /// nearest locally playable entry, preferring forward over backward. Used
+  /// for offline session restore and for offline session creation when the
+  /// user-selected start track is no longer on disk.
+  Future<QueuePlaybackEntry?> findLocallyPlayableFallback({
+    required int sessionId,
+    required int preferredItemId,
+    required int totalCount,
+  }) async {
+    final preferred = await getPlaybackEntryForItem(sessionId, preferredItemId);
+    if (preferred != null && _isLocallyPlayable(preferred)) {
+      return preferred;
+    }
+    final basePosition = preferred?.playPosition ?? 0;
+    final forward = await findNextLocallyPlayableEntry(
+      sessionId: sessionId,
+      fromPlayPosition: basePosition,
+      direction: PlayOrderDirection.forward,
+      repeatMode: 'off',
+      totalCount: totalCount,
+    );
+    if (forward != null) return forward;
+    return findNextLocallyPlayableEntry(
+      sessionId: sessionId,
+      fromPlayPosition: basePosition,
+      direction: PlayOrderDirection.backward,
+      repeatMode: 'off',
+      totalCount: totalCount,
+    );
+  }
+
+  /// True when the given entry's local file is verified on disk.
+  Future<bool> isItemLocallyPlayable(int sessionId, int itemId) async {
+    final entry = await getPlaybackEntryForItem(sessionId, itemId);
+    if (entry == null) return false;
+    return _isLocallyPlayable(entry);
   }
 
   Future<Map<int, int>> getPlayPositionsForItemIds(

@@ -18,6 +18,7 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
@@ -29,12 +30,15 @@ void main() {
   late FakeConcatenatingPlayerController fakePlayer;
   late RecordingAudioServiceBridge bridge;
 
+  final Set<String> existingFiles = <String>{};
+
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     ApiClient.init('http://localhost:8080');
     initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
-    repo = QueueRepository(db);
+    existingFiles.clear();
+    repo = QueueRepository(db, localFileExists: existingFiles.contains);
     fixture = _LibraryFixture(db);
     fakePlayer = FakeConcatenatingPlayerController();
     bridge = RecordingAudioServiceBridge();
@@ -46,15 +50,23 @@ void main() {
     await db.close();
   });
 
-  ProviderContainer createContainer() {
+  ProviderContainer createContainer({bool offline = false}) {
     container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
         concatenatingPlayerProvider.overrideWithValue(fakePlayer),
         audioServiceProvider.overrideWithValue(bridge),
+        queueRepositoryProvider.overrideWithValue(repo),
+        if (offline) offlineModeProvider.overrideWith(() => _OfflineOn()),
       ],
     );
     return container!;
+  }
+
+  Future<void> markDownloaded(String uuid, String path) async {
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+        .write(TracksCompanion(filePath: Value(path)));
+    existingFiles.add(path);
   }
 
   test('playFromQueue seeds only a bounded initial player queue', () async {
@@ -849,6 +861,236 @@ void main() {
     },
   );
 
+  group('offline playback policy', () {
+    test(
+      'offline skipNext jumps past streaming-only entries to next downloaded',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('d', '/dl/d');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c', 'd', 'e'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        await notifier.skipNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+        expect(c.read(audioProvider).queue.currentPlayPosition, 3);
+      },
+    );
+
+    test('offline skipPrevious searches backward for a downloaded entry',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+      await markDownloaded('a', '/dl/a');
+      await markDownloaded('e', '/dl/e');
+
+      final c = createContainer(offline: true);
+      final notifier = c.read(audioProvider.notifier);
+      final startTrack = await fixture.track('e');
+      await notifier.playFromTrackList(
+        const ['a', 'b', 'c', 'd', 'e'],
+        startTrack,
+        sourceType: 'search',
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      await notifier.skipPrevious();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(audioProvider).queue.currentPlayPosition, 0);
+    });
+
+    test('offline repeat-all wraps to a downloaded entry on skipNext',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await markDownloaded('a', '/dl/a');
+
+      final c = createContainer(offline: true);
+      final notifier = c.read(audioProvider.notifier);
+      final startTrack = await fixture.track('a');
+      await notifier.playFromTrackList(
+        const ['a', 'b', 'c'],
+        startTrack,
+        sourceType: 'search',
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      await notifier.cycleQueueRepeatMode();
+      await Future<void>.delayed(Duration.zero);
+
+      await notifier.skipNext();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+    });
+
+    test(
+      'offline skipNext finds a downloaded target outside the loaded window',
+      () async {
+        final uuids = List.generate(120, (i) => 'track-${i + 1}');
+        await fixture.insertAlbum(
+          artist: 'Artist',
+          album: 'Album',
+          uuids: uuids,
+        );
+        await markDownloaded('track-1', '/dl/1');
+        await markDownloaded('track-119', '/dl/119');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('track-1');
+        await notifier.playFromQueue(
+          track: startTrack,
+          sourceType: 'album',
+          artistId: 1,
+          albumId: 1,
+          orderParams: [OrderParameter(column: 'track_number')],
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        // Confirm the loaded window doesn't already contain track-119 — the
+        // controller must consult the repository, not just its loaded entries.
+        expect(
+          fakePlayer.loadedItemIds.length,
+          lessThan(120),
+        );
+
+        await notifier.skipNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'track-119');
+      },
+    );
+
+    test(
+      'natural advance onto an unavailable entry rescues forward to downloaded',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('d', '/dl/d');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c', 'd'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        // Simulate just_audio naturally advancing into the streaming-only
+        // entry "b" — the controller surfaces the bad index to the coordinator
+        // which must hop the queue forward to "d".
+        final entries = await repo.getPlaybackEntries(
+          c.read(audioProvider).queue.sessionId!,
+        );
+        final bEntry = entries.firstWhere((e) => e.uuidId == 'b');
+        fakePlayer.emitUnavailableAdvance(
+          UnavailableAdvance(itemId: bEntry.itemId, playPosition: bEntry.playPosition),
+        );
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+      },
+    );
+
+    test(
+      'offline session restore lands on the nearest downloaded entry',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd']);
+        await markDownloaded('d', '/dl/d');
+
+        final sessionId = await repo.createSessionFromExplicitList(
+          sourceType: 'search',
+          trackUuids: const ['a', 'b', 'c', 'd'],
+          currentIndex: 0,
+        );
+        final snapshot = await repo.getSessionSnapshot(sessionId);
+        await repo.updatePlaybackCursor(
+          sessionId: sessionId,
+          currentItemId: snapshot!.currentItem!.itemId,
+          positionMs: 12345,
+        );
+
+        final c = createContainer(offline: true);
+        c.read(audioProvider);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(fakePlayer.seedCalls, hasLength(1));
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+        // Restoring onto a fallback resets the cursor to zero — the saved
+        // position belonged to the unavailable original track, not this one.
+        expect(c.read(audioPositionProvider), Duration.zero);
+      },
+    );
+
+    test(
+      'offline session restore skips when no entry is downloaded',
+      () async {
+        await fixture.insertSingles(['a', 'b']);
+        final sessionId = await repo.createSessionFromExplicitList(
+          sourceType: 'search',
+          trackUuids: const ['a', 'b'],
+          currentIndex: 0,
+        );
+        final snapshot = await repo.getSessionSnapshot(sessionId);
+        await repo.updatePlaybackCursor(
+          sessionId: sessionId,
+          currentItemId: snapshot!.currentItem!.itemId,
+          positionMs: 0,
+        );
+
+        final c = createContainer(offline: true);
+        c.read(audioProvider);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(fakePlayer.seedCalls, isEmpty);
+        expect(c.read(currentTrackProvider), isNull);
+      },
+    );
+
+    test(
+      'offline skipToTrack on an unavailable entry redirects to nearest downloaded',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c', 'd']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('d', '/dl/d');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c', 'd'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        final entries = await c.read(queueTracksProvider.future);
+        final unavailable = entries.firstWhere((e) => e.uuidId == 'b');
+
+        await notifier.skipToTrack(unavailable.itemId);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+      },
+    );
+  });
+
   test('seek persists playback cursor immediately', () async {
     await fixture.insertSingles(['a', 'b']);
     final startTrack = await fixture.track('a');
@@ -888,6 +1130,8 @@ class FakeConcatenatingPlayerController
   final _positionController = StreamController<Duration>.broadcast();
   final _durationController = StreamController<Duration?>.broadcast();
   final _currentItemIdController = StreamController<int?>.broadcast();
+  final _unavailableAdvanceController =
+      StreamController<UnavailableAdvance>.broadcast();
 
   List<QueuePlaybackEntry> _loadedEntries = const [];
   int? _currentLocalIndex;
@@ -1118,6 +1362,14 @@ class FakeConcatenatingPlayerController
   Stream<int?> get currentItemIdStream => _currentItemIdController.stream;
 
   @override
+  Stream<UnavailableAdvance> get unavailableAdvanceStream =>
+      _unavailableAdvanceController.stream;
+
+  void emitUnavailableAdvance(UnavailableAdvance event) {
+    _unavailableAdvanceController.add(event);
+  }
+
+  @override
   void dispose() {
     if (_disposed) return;
     _disposed = true;
@@ -1125,6 +1377,7 @@ class FakeConcatenatingPlayerController
     _positionController.close();
     _durationController.close();
     _currentItemIdController.close();
+    _unavailableAdvanceController.close();
   }
 
   static List<QueuePlaybackEntry> _sorted(List<QueuePlaybackEntry> entries) {
@@ -1174,6 +1427,11 @@ class RecordingAudioServiceBridge extends AudioServiceBridge {
     await _mediaSub.cancel();
     await _playbackSub.cancel();
   }
+}
+
+class _OfflineOn extends OfflineModeNotifier {
+  @override
+  bool build() => true;
 }
 
 class _LibraryFixture {

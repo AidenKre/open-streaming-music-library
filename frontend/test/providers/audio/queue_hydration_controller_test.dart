@@ -164,6 +164,9 @@ class _FakePlayer implements ConcatenatingPlayerController {
   Stream<Duration?> get durationStream => const Stream.empty();
   @override
   Stream<int?> get currentItemIdStream => const Stream.empty();
+  @override
+  Stream<UnavailableAdvance> get unavailableAdvanceStream =>
+      const Stream.empty();
 
   @override
   Future<void> setSeed(List<QueuePlaybackEntry> entries,
