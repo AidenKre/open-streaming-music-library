@@ -1104,6 +1104,143 @@ void main() {
   });
 
   test(
+    'deleteDownload removes a queued job before it can start',
+    () async {
+      // Saturate the worker pool with gated downloads so the 5th uuid sits
+      // queued. Deleting that uuid must drop the job from the queue and
+      // leave the DB row clean — no late commit can sneak in because the
+      // worker never ran.
+      final gate = Completer<void>();
+      final manager = buildManager(
+        client: MockClient.streaming((req, _) async {
+          await gate.future;
+          return http.StreamedResponse(Stream<List<int>>.empty(), 500);
+        }),
+      );
+      addTearDown(() async {
+        if (!gate.isCompleted) gate.complete();
+        await _waitForFinish(manager);
+        manager.dispose();
+      });
+
+      for (var i = 0; i < 5; i++) {
+        await _insertTrack(db, 'q$i');
+      }
+      final tracks = [for (var i = 0; i < 5; i++) _track('q$i')];
+      await manager.enqueueTracks(tracks, quality: '320');
+      // 4 workers busy; q4 should be the queued one.
+      await _waitFor(() => manager.snapshot().any((j) => j.uuidId == 'q4'));
+      final queued = manager.snapshot().firstWhere((j) => j.uuidId == 'q4');
+      expect(queued.isQueued, isTrue);
+
+      await manager.deleteDownload('q4');
+
+      expect(manager.snapshot().any((j) => j.uuidId == 'q4'), isFalse);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('q4'))).getSingle();
+      expect(row.filePath, isNull);
+    },
+  );
+
+  test(
+    'deleteDownload fences an active worker before rename',
+    () async {
+      // Active worker is parked just before the partial→destination rename.
+      // The fence must cause the commit to abort, no destination file is
+      // written, and the DB row stays cleared.
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+      );
+      addTearDown(manager.dispose);
+
+      final hookEntered = Completer<void>();
+      final releaseHook = Completer<void>();
+      manager.testHookBeforeRename = (_) async {
+        if (!hookEntered.isCompleted) hookEntered.complete();
+        await releaseHook.future;
+      };
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await hookEntered.future;
+
+      // Kick off delete; it must await the fenced worker. Yield once so the
+      // fence flag is set before we let the hook proceed.
+      final deleteFuture = manager.deleteDownload('abc');
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      releaseHook.complete();
+      await deleteFuture;
+      await _waitForFinish(manager);
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, isNull);
+      // The worker should have cleaned its partial on the cancellation path,
+      // and the rename never executed — the tracks dir should be empty of
+      // committed files.
+      final tracksDir = Directory(p.join(tempDir.path, 'tracks'));
+      if (tracksDir.existsSync()) {
+        final leftover = tracksDir
+            .listSync()
+            .whereType<File>()
+            .where((f) => !f.path.endsWith('.partial'))
+            .toList();
+        expect(leftover, isEmpty);
+      }
+    },
+  );
+
+  test(
+    'deleteDownload fences an active worker between rename and DB write',
+    () async {
+      // Worker has renamed the partial into place but hasn't written the DB
+      // row yet. The fence has to delete that orphan destination file too —
+      // deleteDownload's later DB read won't see a file_path to follow.
+      await _insertTrack(db, 'abc');
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+      );
+      addTearDown(manager.dispose);
+
+      final hookEntered = Completer<void>();
+      final releaseHook = Completer<void>();
+      manager.testHookBeforeDbWrite = (_) async {
+        if (!hookEntered.isCompleted) hookEntered.complete();
+        await releaseHook.future;
+      };
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await hookEntered.future;
+
+      final tracksDir = Directory(p.join(tempDir.path, 'tracks'));
+      final renamed = tracksDir
+          .listSync()
+          .whereType<File>()
+          .where((f) => !f.path.endsWith('.partial'))
+          .toList();
+      expect(renamed, hasLength(1));
+      final destinationPath = renamed.first.path;
+
+      final deleteFuture = manager.deleteDownload('abc');
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      releaseHook.complete();
+      await deleteFuture;
+      await _waitForFinish(manager);
+
+      // The downloader's between-rename-and-DB-write fence check must have
+      // cleaned this up; deleteDownload couldn't have seen the path because
+      // no DB row referenced it.
+      expect(File(destinationPath).existsSync(), isFalse);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, isNull);
+    },
+  );
+
+  test(
     'downloadedUuidsForUuids only includes uuids whose file is on disk',
     () async {
       final present = p.join(tempDir.path, 'present.audio');

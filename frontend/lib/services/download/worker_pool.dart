@@ -36,6 +36,17 @@ class WorkerPool {
   int _resetGeneration = 0;
   final Map<String, Future<void> Function()> _activeCancellers = {};
   final Map<String, Future<void>> _activeWorkers = {};
+  // Per-uuid tombstones held only for the duration of a [fenceUuid] call so
+  // an in-flight worker that's already past its last generation check can
+  // still observe the fence at the rename/DB-write boundaries (and clean up).
+  // Scoped this narrowly because a long-lived tombstone would block the
+  // immediate re-enqueue that callers like enqueueTracksAtQuality rely on.
+  final Set<String> _fencedUuids = {};
+
+  /// True iff [uuidId] is currently being fenced by [fenceUuid]. Workers
+  /// poll this at every commit checkpoint to bail out cleanly when their
+  /// download is being deleted out from under them.
+  bool isFenced(String uuidId) => _fencedUuids.contains(uuidId);
 
   /// Schedules queued jobs. Idempotent — safe to call repeatedly.
   void pump() {
@@ -54,6 +65,62 @@ class WorkerPool {
       final worker = _runJob(uuidId, generation);
       _activeWorkers[uuidId] = worker;
       unawaited(worker.whenComplete(() => _activeWorkers.remove(uuidId)));
+    }
+  }
+
+  /// Removes any queued job for [uuidId] and fences an active worker so it
+  /// abandons the in-flight download before committing. Awaits the active
+  /// worker (if any) so the caller can safely clear DB state afterward
+  /// without racing against a late `_commitDownload`.
+  ///
+  /// The fence is released once this future completes; callers that need the
+  /// uuid blocked for longer should hold the fence themselves.
+  Future<void> fenceUuid(String uuidId) async {
+    _fencedUuids.add(uuidId);
+    try {
+      _queue.removeJob(uuidId);
+      final canceller = _activeCancellers[uuidId];
+      if (canceller != null) {
+        try {
+          await canceller();
+        } catch (_) {}
+      }
+      final worker = _activeWorkers[uuidId];
+      if (worker != null) {
+        await worker;
+      }
+    } finally {
+      _fencedUuids.remove(uuidId);
+    }
+  }
+
+  /// Bulk variant of [fenceUuid] that cancels every active worker first so
+  /// the awaits below run in parallel rather than serialised one-at-a-time.
+  Future<void> fenceUuids(Iterable<String> uuids) async {
+    final list = uuids.toList(growable: false);
+    if (list.isEmpty) return;
+    _fencedUuids.addAll(list);
+    try {
+      for (final uuid in list) {
+        _queue.removeJob(uuid);
+      }
+      for (final uuid in list) {
+        final canceller = _activeCancellers[uuid];
+        if (canceller != null) {
+          try {
+            await canceller();
+          } catch (_) {}
+        }
+      }
+      final workers = [
+        for (final uuid in list)
+          if (_activeWorkers[uuid] != null) _activeWorkers[uuid]!,
+      ];
+      if (workers.isNotEmpty) {
+        await Future.wait(workers);
+      }
+    } finally {
+      _fencedUuids.removeAll(list);
     }
   }
 
@@ -93,9 +160,13 @@ class WorkerPool {
       final idx = _queue.state.jobs.indexWhere((j) => j.uuidId == uuidId);
       if (idx < 0) return;
       final job = _queue.jobAt(idx);
+      // A fenced uuid means a delete is in-flight; the downloader treats
+      // this exactly like a reset (skip rename, skip DB write, drop the
+      // partial file) so the deletion can't be undone by a late commit.
       final outcome = await _downloader.download(
         job: job,
-        generationCheck: () => generation == _resetGeneration,
+        generationCheck: () =>
+            generation == _resetGeneration && !_fencedUuids.contains(uuidId),
         onProgress: (progress) {
           _queue.markJobByUuid(
             job.uuidId,

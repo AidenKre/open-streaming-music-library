@@ -297,7 +297,11 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// Removes the local file (if any) and clears `tracks.file_path` so the
   /// track reverts to streaming. Cover art is intentionally NOT deleted: it
   /// may be referenced by other tracks the user has downloaded.
+  ///
+  /// Cancels any queued/active download for [uuidId] first so a late
+  /// `_commitDownload` can't restore the row after we null it out.
   Future<void> deleteDownload(String uuidId) async {
+    await _pool.fenceUuid(uuidId);
     final row = await (_db.select(
       _db.tracks,
     )..where((t) => t.uuidId.equals(uuidId))).getSingleOrNull();
@@ -323,6 +327,11 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   Future<void> deleteDownloadsForUuids(Iterable<String> uuids) async {
     final uuidList = uuids.toList(growable: false);
     if (uuidList.isEmpty) return;
+
+    // Cancel any queued/active downloads for these uuids before touching the
+    // DB so a worker that's already in its commit window can't write a new
+    // file_path after we null them out.
+    await _pool.fenceUuids(uuidList);
 
     // 1. Read current file paths in one query.
     final placeholders = List.filled(uuidList.length, '?').join(', ');

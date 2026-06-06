@@ -148,6 +148,18 @@ class DownloadQueue extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Removes the job with [uuidId] regardless of its state. Used by the
+  /// worker pool's fence path so a deleted track stops occupying a UI row
+  /// (and a queue slot) the instant the fence engages. No-op if the uuid
+  /// isn't in the queue.
+  void removeJob(String uuidId) {
+    final idx = _state.jobs.indexWhere((j) => j.uuidId == uuidId);
+    if (idx < 0) return;
+    final updated = [..._state.jobs]..removeAt(idx);
+    _state = DownloadQueueState(jobs: updated);
+    notifyListeners();
+  }
+
   /// Clears the queue entirely. Used by the worker pool when resetting.
   void clearAll() {
     _state = const DownloadQueueState();
