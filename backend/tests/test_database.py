@@ -609,6 +609,81 @@ class TestDatabaseDeleteTrack:
         conn.close()
 
 
+class TestDatabaseTombstones:
+    def test_delete_track__valid_uuid__inserts_tombstone(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        track = create_track(tmp_path / "t.mp3", "song", "artist")
+        track.uuid_id = "tomb_uuid"
+        assert database.add_track(track=track)
+
+        assert database.delete_track(uuid_id="tomb_uuid")
+
+        tombstones = database.get_track_tombstones()
+        assert "tomb_uuid" in tombstones
+
+    def test_delete_track__missing_uuid__no_tombstone(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        assert database.delete_track(uuid_id="never_existed") is False
+        assert database.get_track_tombstones() == []
+
+    def test_get_track_tombstones__time_window__filters_results(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        # Seed two tombstones at known timestamps; bypass delete_track to
+        # control the deleted_at values precisely.
+        with database._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT INTO track_tombstones (uuid_id, deleted_at) VALUES (?, ?)",
+                ("old_uuid", 100),
+            )
+            conn.execute(
+                "INSERT INTO track_tombstones (uuid_id, deleted_at) VALUES (?, ?)",
+                ("new_uuid", 200),
+            )
+
+        assert sorted(database.get_track_tombstones()) == ["new_uuid", "old_uuid"]
+        # newer_than is exclusive (>) — old_uuid at 100 must be excluded.
+        assert database.get_track_tombstones(newer_than=100) == ["new_uuid"]
+        # older_than is inclusive (<=) — new_uuid at 200 must be excluded
+        # when older_than=199, and included when older_than=200.
+        assert database.get_track_tombstones(older_than=199) == ["old_uuid"]
+        assert sorted(
+            database.get_track_tombstones(older_than=200)
+        ) == ["new_uuid", "old_uuid"]
+        # No tombstones strictly newer than the latest deletion.
+        assert database.get_track_tombstones(newer_than=200) == []
+
+    def test_delete_track__re_delete__bumps_tombstone_timestamp(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        # Manually seed an old tombstone, then re-add and re-delete the same
+        # uuid to verify INSERT OR REPLACE updates deleted_at.
+        with database._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT INTO track_tombstones (uuid_id, deleted_at) VALUES (?, ?)",
+                ("revived_uuid", 1),
+            )
+
+        track = create_track(tmp_path / "t.mp3", "song", "artist")
+        track.uuid_id = "revived_uuid"
+        assert database.add_track(track=track)
+        assert database.delete_track(uuid_id="revived_uuid")
+
+        with database._connection() as conn:
+            row = conn.execute(
+                "SELECT deleted_at FROM track_tombstones WHERE uuid_id = ?",
+                ("revived_uuid",),
+            ).fetchone()
+            assert row is not None
+            assert row[0] > 1
+
+
 class TestDatabaseGetTracks:
     def test_get_tracks__db_not_initialized__returns_empty_list(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
@@ -2724,7 +2799,7 @@ class TestDatabaseMigration:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         conn.close()
 
-        assert version == 3
+        assert version == Database.LATEST_SCHEMA_VERSION
 
     def test_migrate__already_at_v1__does_not_fail(self, tmp_path: Path):
         database_path = tmp_path / "database.db"

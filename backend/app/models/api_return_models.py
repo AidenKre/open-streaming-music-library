@@ -8,6 +8,11 @@ from .album import Album
 class GetTracksResponse(BaseModel):
     data: List[ClientTrack]
     nextCursor: Optional[str] = None
+    # uuids of tracks the server has hard-deleted within the request's
+    # time window. Only populated on the first page of an unscoped
+    # (no artist_id/album_id) sync — scoped requests cannot speak
+    # authoritatively about deletions outside their filter.
+    deleted_uuids: List[str] = Field(default_factory=list)
 
 
 class GetArtistsResponse(BaseModel):

@@ -117,3 +117,15 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Tombstones for tracks deleted from the server. The frontend's incremental
+-- sync only sees rows currently in `tracks`/`trackmetadata` (hard deletes leave
+-- no trace), so without a record of removed uuids the client cannot tell that
+-- something disappeared and stale rows linger until a full local reset.
+CREATE TABLE IF NOT EXISTS track_tombstones (
+    "uuid_id"    TEXT PRIMARY KEY,
+    "deleted_at" INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_track_tombstones_deleted_at
+    ON track_tombstones("deleted_at");

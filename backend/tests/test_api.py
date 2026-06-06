@@ -417,6 +417,67 @@ class TestGetTracks:
         assert gettracksresponse.nextCursor is None
 
 
+class TestGetTracksDeletedUuids:
+    def test_tracks__unscoped__returns_tombstones(self, client):
+        # Add and immediately delete a track so a tombstone exists.
+        tracks = add_tracks_to_client(client=client, amount_to_add=1)
+        deleted_uuid = tracks[0].uuid_id
+        assert client.app.state.database.delete_track(uuid_id=deleted_uuid)
+
+        r = client.get("/tracks")
+        assert r.status_code == 200, r.text
+
+        body = r.json()
+        assert deleted_uuid in body["deleted_uuids"]
+
+    def test_tracks__time_window_excludes_old_tombstones(self, client):
+        tracks = add_tracks_to_client(client=client, amount_to_add=1)
+        deleted_uuid = tracks[0].uuid_id
+        assert client.app.state.database.delete_track(uuid_id=deleted_uuid)
+
+        now = int(datetime.now(UTC).timestamp())
+
+        # Tombstone was just written (deleted_at ≈ now); a future newer_than
+        # must exclude it because the filter is strictly >.
+        r = client.get(f"/tracks?newer_than={now + 60}")
+        assert r.status_code == 200, r.text
+        assert deleted_uuid not in r.json()["deleted_uuids"]
+
+    def test_tracks__scoped_request__omits_tombstones(self, client):
+        # Tombstones aren't scoped, so a scoped request must not return them
+        # — clients cannot tell whether the deletion belongs to the filter.
+        tracks = add_tracks_to_client(client=client, amount_to_add=2)
+        deleted_uuid = tracks[0].uuid_id
+        assert client.app.state.database.delete_track(uuid_id=deleted_uuid)
+
+        # The remaining track gives us a real artist_id to scope by.
+        artist_id = get_artist_id(client, tracks[1].metadata.artist)
+
+        r = client.get(f"/tracks?artist_id={artist_id}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["deleted_uuids"] == []
+
+    def test_tracks__cursor_pages__do_not_repeat_tombstones(self, client):
+        # Adding many tracks forces pagination; tombstones must only appear on
+        # the first page so the client doesn't double-process them.
+        tracks = add_tracks_to_client(client=client, amount_to_add=3)
+        deleted_uuid = tracks[0].uuid_id
+        assert client.app.state.database.delete_track(uuid_id=deleted_uuid)
+
+        r = client.get("/tracks?limit=1")
+        assert r.status_code == 200, r.text
+        first_page = r.json()
+        assert deleted_uuid in first_page["deleted_uuids"]
+        assert first_page["nextCursor"] is not None
+
+        r = client.get(
+            "/tracks", params={"limit": 1, "cursor": first_page["nextCursor"]}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["deleted_uuids"] == []
+
+
 class TestGetTracksStream:
     def test_tracks_stream__invalid_uuid__fails(self, client):
         add_tracks_to_client(client=client, amount_to_add=5)

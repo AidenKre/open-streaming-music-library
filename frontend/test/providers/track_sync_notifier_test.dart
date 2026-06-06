@@ -355,6 +355,153 @@ void main() {
     });
 
     test(
+        'unscoped sync deletes tombstoned tracks from DB and removes them from FTS',
+        () async {
+      // Seed two existing tracks so we can verify one survives.
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          return Response(
+            jsonEncode({
+              'data': [
+                _richTrackJson(
+                  'uuid-keep',
+                  title: 'Keep Song',
+                  artist: 'Keep Artist',
+                  album: 'Keep Album',
+                  artistId: 10,
+                  albumId: 100,
+                  createdAt: 1000,
+                ),
+                _richTrackJson(
+                  'uuid-drop',
+                  title: 'Drop Song',
+                  artist: 'Drop Artist',
+                  album: 'Drop Album',
+                  artistId: 11,
+                  albumId: 101,
+                  createdAt: 1000,
+                ),
+              ],
+              'nextCursor': null,
+            }),
+            200,
+          );
+        }),
+      );
+
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+
+      // Pre-condition: both tracks landed locally and are searchable.
+      var tracks = await db.select(db.tracks).get();
+      expect(tracks.map((t) => t.uuidId).toSet(), {'uuid-keep', 'uuid-drop'});
+
+      var dropFts = await db.customSelect(
+        "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Drop\"*'",
+      ).get();
+      expect(dropFts.length, 1);
+
+      // Reset prefs so the second sync runs again.
+      SharedPreferences.setMockInitialValues({});
+
+      // Second sync: backend reports uuid-drop deleted via tombstone.
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          return Response(
+            jsonEncode({
+              'data': <Map<String, dynamic>>[],
+              'nextCursor': null,
+              'deleted_uuids': ['uuid-drop'],
+            }),
+            200,
+          );
+        }),
+      );
+
+      await notifier.sync();
+
+      // uuid-drop removed; uuid-keep still present.
+      tracks = await db.select(db.tracks).get();
+      expect(tracks.map((t) => t.uuidId).toSet(), {'uuid-keep'});
+
+      final metadata = await db.select(db.trackmetadata).get();
+      expect(metadata.map((m) => m.uuidId).toSet(), {'uuid-keep'});
+
+      // FTS must no longer match the deleted track.
+      dropFts = await db.customSelect(
+        "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Drop\"*'",
+      ).get();
+      expect(dropFts.length, 0, reason: 'Deleted track must be gone from FTS');
+
+      final keepFts = await db.customSelect(
+        "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Keep\"*'",
+      ).get();
+      expect(keepFts.length, 1, reason: 'Surviving track must remain in FTS');
+    });
+
+    test(
+        'scoped sync ignores deleted_uuids — only unscoped syncs may reconcile deletions',
+        () async {
+      // Seed a track.
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          return Response(
+            jsonEncode({
+              'data': [
+                _richTrackJson(
+                  'uuid-scoped',
+                  title: 'Scoped Song',
+                  artist: 'Scoped Artist',
+                  album: 'Scoped Album',
+                  artistId: 22,
+                  albumId: 222,
+                ),
+              ],
+              'nextCursor': null,
+            }),
+            200,
+          );
+        }),
+      );
+
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+
+      // A scoped response *should not* surface deleted_uuids in practice, but
+      // even if a misbehaving server returns them, a scoped sync must not act
+      // on them — the scope cannot authoritatively reconcile globally.
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          return Response(
+            jsonEncode({
+              'data': <Map<String, dynamic>>[],
+              'nextCursor': null,
+              'deleted_uuids': ['uuid-scoped'],
+            }),
+            200,
+          );
+        }),
+      );
+
+      await notifier.sync(artistId: 22);
+
+      final tracks = await db.select(db.tracks).get();
+      expect(
+        tracks.map((t) => t.uuidId).toSet(),
+        {'uuid-scoped'},
+        reason: 'Scoped sync must not delete based on deleted_uuids',
+      );
+    });
+
+    test(
         'scoped sync does not advance global watermark; later unscoped sync still imports excluded track',
         () async {
       // Seed an existing watermark from a prior unscoped sync.

@@ -202,6 +202,15 @@ def get_tracks(
 ):
     database: Database = cast(Database, app.state.database)
 
+    # Capture the original (uncursored) request shape so we can decide
+    # whether this call is an unscoped sync — only unscoped, first-page
+    # requests are allowed to return tombstones (see Issue #8 for why
+    # scoped requests are non-authoritative).
+    is_first_page = not cursor
+    request_is_scoped = artist_id is not None or album_id is not None
+    tombstone_newer_than = newer_than
+    tombstone_older_than = older_than
+
     search_parameters: List[SearchParameter]
     order_parameters: List[OrderParameter]
     if not cursor:
@@ -283,8 +292,22 @@ def get_tracks(
         raise HTTPException(
             status_code=500, detail="Unable to get count of remaining tracks"
         )
+
+    # Tombstones piggyback on the unscoped, first-page response so the client
+    # only has to make one call per sync. Scoped (artist/album) requests must
+    # not return them because they cannot tell whether a tombstone belongs to
+    # the scope; subsequent cursor pages skip them to avoid duplicate work.
+    deleted_uuids: List[str] = []
+    if is_first_page and not request_is_scoped:
+        deleted_uuids = database.get_track_tombstones(
+            newer_than=tombstone_newer_than,
+            older_than=tombstone_older_than,
+        )
+
     if remaining_track_count == 0 or offset >= remaining_track_count:
-        return GetTracksResponse(data=[], nextCursor=None)
+        return GetTracksResponse(
+            data=[], nextCursor=None, deleted_uuids=deleted_uuids
+        )
 
     gotten_tracks = database.get_tracks(
         search_parameters=search_parameters,
@@ -327,7 +350,11 @@ def get_tracks(
             }
         )
 
-    return GetTracksResponse(data=client_track_list, nextCursor=nextCursor)
+    return GetTracksResponse(
+        data=client_track_list,
+        nextCursor=nextCursor,
+        deleted_uuids=deleted_uuids,
+    )
 
 
 _IMAGE_MIME: dict[str, str] = {

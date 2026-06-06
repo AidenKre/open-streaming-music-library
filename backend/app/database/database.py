@@ -202,7 +202,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 3
+    LATEST_SCHEMA_VERSION = 4
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -275,6 +275,22 @@ class Database:
                     ')'
                 )
                 conn.execute("PRAGMA user_version = 3")
+
+            if version < 4:
+                print(
+                    "Migrating database to version 4: adding track_tombstones table"
+                )
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS track_tombstones ('
+                    '    "uuid_id"    TEXT PRIMARY KEY,'
+                    '    "deleted_at" INTEGER NOT NULL'
+                    ')'
+                )
+                conn.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_track_tombstones_deleted_at '
+                    'ON track_tombstones("deleted_at")'
+                )
+                conn.execute("PRAGMA user_version = 4")
 
     def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
         try:
@@ -583,6 +599,16 @@ class Database:
                     effective_artist = meta_row["artist"].strip()
 
                 fts_album = meta_row["album"] or ""
+
+                # Record a tombstone before the hard delete so incremental
+                # sync clients can reconcile the removal — the row is about to
+                # vanish from `tracks`/`trackmetadata`, leaving the frontend no
+                # other signal that it ever existed.
+                conn.execute(
+                    "INSERT OR REPLACE INTO track_tombstones (uuid_id, deleted_at) "
+                    "VALUES (?, unixepoch())",
+                    (uuid_id,),
+                )
 
                 # Delete trackmetadata and tracks
                 conn.execute(
@@ -1217,6 +1243,35 @@ class Database:
                 )
         except Exception as e:
             print(f"Error writing setting {key!r}: {e}")
+
+    def get_track_tombstones(
+        self,
+        newer_than: Optional[int] = None,
+        older_than: Optional[int] = None,
+    ) -> list[str]:
+        """Return uuids of tracks deleted in the given (exclusive/inclusive)
+        ``deleted_at`` window. ``newer_than`` is exclusive (>) and
+        ``older_than`` is inclusive (<=) — matching the semantics of the
+        ``last_updated`` filters used by ``get_tracks`` so the sync watermark
+        applies symmetrically to upserts and deletes."""
+        try:
+            with self._connection() as conn:
+                clauses: list[str] = []
+                values: list = []
+                if newer_than is not None:
+                    clauses.append("deleted_at > ?")
+                    values.append(newer_than)
+                if older_than is not None:
+                    clauses.append("deleted_at <= ?")
+                    values.append(older_than)
+                query = "SELECT uuid_id FROM track_tombstones"
+                if clauses:
+                    query += " WHERE " + " AND ".join(clauses)
+                rows = conn.execute(query, tuple(values)).fetchall()
+                return [row[0] for row in rows]
+        except Exception as e:
+            print(f"Error fetching track tombstones: {e}")
+            return []
 
     def get_all_track_uuids(self) -> list[str]:
         try:

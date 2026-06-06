@@ -76,10 +76,20 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       );
       await _upsertTracks(db, response.data);
 
+      // Tombstones only come back on the first page of an unscoped sync — the
+      // backend cannot tell which deletions belong to a scoped (artist/album)
+      // query, so it stays silent there. Apply them before rebuilding FTS so
+      // the rebuild's `SELECT FROM trackmetadata` excludes deleted rows.
+      final deletedUuids = response.deletedUuids;
+
       // Follow cursor for remaining pages
       while (response.nextCursor != null) {
         response = await api.getTracksPage(cursor: response.nextCursor);
         await _upsertTracks(db, response.data);
+      }
+
+      if (artistId == null && albumId == null && deletedUuids.isNotEmpty) {
+        await _deleteTracks(db, deletedUuids);
       }
 
       await _rebuildFts(db);
@@ -151,6 +161,31 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         batch.insert(db.trackmetadata, metaRow, onConflict: DoUpdate((_) => metaRow));
       }
     });
+  }
+
+  Future<void> _deleteTracks(AppDatabase db, List<String> uuids) async {
+    // FKs on trackmetadata.uuid_id → tracks.uuid_id (and queue_session_items)
+    // force child-first deletes. We chunk to keep the IN list bounded — SQLite
+    // accepts thousands of bind vars but huge bursts of deletes are rare and
+    // worth fragmenting for predictability.
+    const chunkSize = 200;
+    for (var i = 0; i < uuids.length; i += chunkSize) {
+      final chunk = uuids.sublist(
+        i,
+        i + chunkSize > uuids.length ? uuids.length : i + chunkSize,
+      );
+      await db.transaction(() async {
+        await (db.delete(
+          db.queueSessionItems,
+        )..where((t) => t.uuidId.isIn(chunk))).go();
+        await (db.delete(
+          db.trackmetadata,
+        )..where((t) => t.uuidId.isIn(chunk))).go();
+        await (db.delete(
+          db.tracks,
+        )..where((t) => t.uuidId.isIn(chunk))).go();
+      });
+    }
   }
 
   Future<void> _rebuildFts(AppDatabase db) async {
