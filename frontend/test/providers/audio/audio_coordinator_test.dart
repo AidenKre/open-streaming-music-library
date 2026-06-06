@@ -21,6 +21,7 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/services/download_providers.dart';
 
 void main() {
   late AppDatabase db;
@@ -31,6 +32,7 @@ void main() {
   late RecordingAudioServiceBridge bridge;
 
   final Set<String> existingFiles = <String>{};
+  late StreamController<int> downloadStatusController;
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
@@ -42,11 +44,13 @@ void main() {
     fixture = _LibraryFixture(db);
     fakePlayer = FakeConcatenatingPlayerController();
     bridge = RecordingAudioServiceBridge();
+    downloadStatusController = StreamController<int>.broadcast();
   });
 
   tearDown(() async {
     await bridge.disposeBridge();
     container?.dispose();
+    await downloadStatusController.close();
     await db.close();
   });
 
@@ -57,9 +61,16 @@ void main() {
         concatenatingPlayerProvider.overrideWithValue(fakePlayer),
         audioServiceProvider.overrideWithValue(bridge),
         queueRepositoryProvider.overrideWithValue(repo),
+        downloadStatusVersionProvider
+            .overrideWith((ref) => downloadStatusController.stream),
         if (offline) offlineModeProvider.overrideWith(() => _OfflineOn()),
       ],
     );
+    // Hold a long-lived listener on the audio notifier so its in-build
+    // ref.listen subscriptions stay active. Without this, riverpod 3 treats
+    // the notifier as paused once the test stops reading it, which silently
+    // suppresses downstream StreamProvider emissions.
+    container!.listen(audioProvider, (_, _) {});
     return container!;
   }
 
@@ -67,6 +78,12 @@ void main() {
     await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
         .write(TracksCompanion(filePath: Value(path)));
     existingFiles.add(path);
+  }
+
+  Future<void> markDeleted(String uuid, String path) async {
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+        .write(const TracksCompanion(filePath: Value(null)));
+    existingFiles.remove(path);
   }
 
   test('playFromQueue seeds only a bounded initial player queue', () async {
@@ -1064,6 +1081,100 @@ void main() {
     );
 
     test(
+      'hydrated stream rebuilds to file when download lands, then advances offline',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/dl/a');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        // 'b' is currently a streaming-only entry hydrated into the player.
+        final bEntryBefore = fakePlayer.loadedItemIds.contains(
+          (await repo.getPlaybackEntries(c.read(audioProvider).queue.sessionId!))
+              .firstWhere((e) => e.uuidId == 'b')
+              .itemId,
+        );
+        expect(bEntryBefore, isTrue);
+
+        // Seed the version stream with a baseline so the next emission is a
+        // genuine prev→next transition (the coordinator suppresses the
+        // synthetic loading→initial hop).
+        downloadStatusController.add(0);
+        await Future<void>.delayed(Duration.zero);
+
+        // 'b' is downloaded mid-playback; download-status bump must rebuild
+        // the in-flight source so the offline rescue picks 'b' next.
+        await markDownloaded('b', '/dl/b');
+        downloadStatusController.add(1);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(
+          fakePlayer.refreshedSources.any(
+            (r) => !r.oldHadFile && r.newHasFile,
+          ),
+          isTrue,
+          reason: 'refresh should report b flipping stream → file',
+        );
+
+        await notifier.skipNext();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      },
+    );
+
+    test(
+      'hydrated file rescues via UnavailableAdvance when current download is deleted',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('c', '/dl/c');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(audioProvider.notifier);
+        final startTrack = await fixture.track('a');
+        await notifier.playFromTrackList(
+          const ['a', 'b', 'c'],
+          startTrack,
+          sourceType: 'search',
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'a');
+
+        downloadStatusController.add(0);
+        await Future<void>.delayed(Duration.zero);
+
+        // Tell the fake to treat the next file→null transition on the
+        // current item as an offline rescue.
+        fakePlayer.offlineForRefresh = true;
+        await markDeleted('a', '/dl/a');
+        downloadStatusController.add(1);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(
+          fakePlayer.refreshedSources.any(
+            (r) => r.oldHadFile && !r.newHasFile,
+          ),
+          isTrue,
+          reason: 'refresh should report a flipping file → stream',
+        );
+        expect(c.read(currentTrackProvider)?.uuidId, 'c');
+      },
+    );
+
+    test(
       'offline skipToTrack on an unavailable entry redirects to nearest downloaded',
       () async {
         await fixture.insertSingles(['a', 'b', 'c', 'd']);
@@ -1216,6 +1327,57 @@ class FakeConcatenatingPlayerController
     _loadedEntries = _loadedEntries
         .map((entry) => byItemId[entry.itemId] ?? entry)
         .toList(growable: false);
+  }
+
+  /// Set by the test harness so the fake can decide, on a per-itemId basis,
+  /// whether the simulated local file is currently considered present. The
+  /// production controller goes through dart:io File.existsSync() — in tests
+  /// we steer it through the same external set the QueueRepository fixture
+  /// uses to decide playability.
+  bool Function(QueuePlaybackEntry entry) sourceAvailability =
+      (entry) => entry.filePath != null && entry.filePath!.isNotEmpty;
+
+  bool offlineForRefresh = false;
+
+  final List<RefreshedSource> refreshedSources = [];
+  final List<int> rescuedItemIds = [];
+
+  @override
+  Future<void> refreshLoadedSourcesForAvailabilityChanges(
+    List<QueuePlaybackEntry> updatedEntries,
+  ) async {
+    final byItemId = {for (final entry in updatedEntries) entry.itemId: entry};
+    final nextEntries = <QueuePlaybackEntry>[];
+    int? rescueItemId;
+    int? rescuePlayPosition;
+    for (final oldEntry in _loadedEntries) {
+      final newEntry = byItemId[oldEntry.itemId] ?? oldEntry;
+      nextEntries.add(newEntry);
+      final oldHadFile = sourceAvailability(oldEntry);
+      final newHasFile = sourceAvailability(newEntry);
+      if (oldHadFile == newHasFile && oldEntry.filePath == newEntry.filePath) {
+        continue;
+      }
+      refreshedSources.add(RefreshedSource(
+        itemId: newEntry.itemId,
+        oldHadFile: oldHadFile,
+        newHasFile: newHasFile,
+      ));
+      if (newEntry.itemId == _committedCurrentItemId &&
+          oldHadFile &&
+          !newHasFile &&
+          offlineForRefresh) {
+        rescueItemId = newEntry.itemId;
+        rescuePlayPosition = newEntry.playPosition;
+      }
+    }
+    _loadedEntries = nextEntries;
+    if (rescueItemId != null && rescuePlayPosition != null) {
+      rescuedItemIds.add(rescueItemId);
+      _unavailableAdvanceController.add(
+        UnavailableAdvance(itemId: rescueItemId, playPosition: rescuePlayPosition),
+      );
+    }
   }
 
   @override
@@ -1394,6 +1556,18 @@ class FakeConcatenatingPlayerController
     }
     return _loadedEntries.length;
   }
+}
+
+class RefreshedSource {
+  final int itemId;
+  final bool oldHadFile;
+  final bool newHasFile;
+
+  const RefreshedSource({
+    required this.itemId,
+    required this.oldHadFile,
+    required this.newHasFile,
+  });
 }
 
 class SeedCall {

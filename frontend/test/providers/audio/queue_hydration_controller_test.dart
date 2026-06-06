@@ -185,6 +185,9 @@ class _FakePlayer implements ConcatenatingPlayerController {
   @override
   void replaceLoadedEntriesMetadata(List<QueuePlaybackEntry> entries) {}
   @override
+  Future<void> refreshLoadedSourcesForAvailabilityChanges(
+      List<QueuePlaybackEntry> entries) async {}
+  @override
   Future<void> removeItem(int itemId) async {}
   @override
   Future<void> seekToItem(int itemId, {Duration position = Duration.zero}) async {}

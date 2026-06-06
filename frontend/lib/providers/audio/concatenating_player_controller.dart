@@ -199,6 +199,104 @@ class ConcatenatingPlayerController {
         .toList(growable: false);
   }
 
+  /// Refresh loaded entry metadata AND rebuild any sources whose local-vs-
+  /// streaming availability changed. Driven by `downloadStatusVersionProvider`
+  /// changes — when a queued-ahead track gets downloaded mid-playback its
+  /// already-built stream source has to flip to file://, and when a downloaded
+  /// track is deleted its file:// source has to flip back to a stream (or be
+  /// reported as unavailable if we're offline and it was the current item).
+  ///
+  /// Future-queue sources are replaced silently. The current source is only
+  /// rebuilt when both kinds are playable from the player's perspective; if
+  /// the current source was a local file that just disappeared and there's no
+  /// streaming fallback available (offline), an [UnavailableAdvance] event is
+  /// emitted so the coordinator can perform a full-queue rescue.
+  Future<void> refreshLoadedSourcesForAvailabilityChanges(
+    List<QueuePlaybackEntry> updatedEntries,
+  ) async {
+    if (_isDisposed || _loadedEntries.isEmpty) return;
+
+    final byItemId = {for (final entry in updatedEntries) entry.itemId: entry};
+    final currentItemId = _committedCurrentItemId;
+    final currentPosition = _player.position;
+
+    final changes = <_SourceAvailabilityChange>[];
+    final nextEntries = <QueuePlaybackEntry>[];
+    for (var i = 0; i < _loadedEntries.length; i++) {
+      final oldEntry = _loadedEntries[i];
+      final newEntry = byItemId[oldEntry.itemId] ?? oldEntry;
+      nextEntries.add(newEntry);
+
+      final oldKind = _sourceKindFor(oldEntry);
+      final newKind = _sourceKindFor(newEntry);
+      if (oldKind == newKind && oldEntry.filePath == newEntry.filePath) {
+        continue;
+      }
+      changes.add(_SourceAvailabilityChange(
+        index: i,
+        entry: newEntry,
+        oldKind: oldKind,
+        newKind: newKind,
+      ));
+    }
+
+    if (changes.isEmpty) {
+      _loadedEntries = nextEntries;
+      return;
+    }
+
+    // If the current source was a file that just disappeared and offline mode
+    // would refuse to play the streaming replacement, hand off to the
+    // coordinator's full-queue rescue rather than rebuilding to a stream that
+    // can't actually play.
+    final currentChange = currentItemId == null
+        ? null
+        : changes.where((c) => c.entry.itemId == currentItemId).firstOrNull;
+    final rescueTarget = (currentChange != null &&
+            currentChange.oldKind == _SourceKind.file &&
+            currentChange.newKind == _SourceKind.stream &&
+            _isOfflineFn())
+        ? currentChange
+        : null;
+
+    await _runStructuralMutation(() async {
+      _loadedEntries = nextEntries;
+      for (final change in changes) {
+        if (rescueTarget != null && change.entry.itemId == currentItemId) {
+          continue;
+        }
+        await _player.removeAudioSourceAt(change.index);
+        await _player.insertAudioSource(
+          change.index,
+          _sourceForEntry(change.entry),
+        );
+      }
+      if (rescueTarget == null &&
+          currentChange != null &&
+          currentItemId != null) {
+        final localIndex = _localIndexFor(currentItemId);
+        if (localIndex != null) {
+          await _player.seek(currentPosition, index: localIndex);
+        }
+      }
+    }, preservedCurrentItemId: currentItemId);
+
+    if (rescueTarget != null) {
+      _unavailableAdvanceController.add(UnavailableAdvance(
+        itemId: rescueTarget.entry.itemId,
+        playPosition: rescueTarget.entry.playPosition,
+      ));
+    }
+  }
+
+  _SourceKind _sourceKindFor(QueuePlaybackEntry entry) {
+    final localPath = entry.filePath;
+    if (localPath != null && localPath.isNotEmpty && File(localPath).existsSync()) {
+      return _SourceKind.file;
+    }
+    return _SourceKind.stream;
+  }
+
   Future<void> seekToItem(int itemId, {Duration position = Duration.zero}) {
     final localIndex = _localIndexFor(itemId);
     if (localIndex == null) {
@@ -407,4 +505,20 @@ class ConcatenatingPlayerController {
     }
     return _loadedEntries[index].itemId;
   }
+}
+
+enum _SourceKind { file, stream }
+
+class _SourceAvailabilityChange {
+  final int index;
+  final QueuePlaybackEntry entry;
+  final _SourceKind oldKind;
+  final _SourceKind newKind;
+
+  const _SourceAvailabilityChange({
+    required this.index,
+    required this.entry,
+    required this.oldKind,
+    required this.newKind,
+  });
 }

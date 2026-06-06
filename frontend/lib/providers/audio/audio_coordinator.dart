@@ -17,6 +17,7 @@ import 'package:frontend/providers/audio/queue_order_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/queue_warm_service.dart';
 import 'package:frontend/services/settings_service.dart';
 
@@ -64,6 +65,20 @@ class AudioCoordinator extends Notifier<AudioState> {
         }
       }
     }, fireImmediately: true);
+
+    // When a track is downloaded or deleted while it's already in the loaded
+    // player window, its in-flight just_audio source still points at the old
+    // stream/file URI. Refresh metadata and rebuild any source whose local
+    // file vs streaming availability changed. Skip the synthetic
+    // AsyncLoading → AsyncData(initial) transition that fires once on build —
+    // there's no real download-state change to reconcile yet.
+    ref.listen<AsyncValue<int>>(downloadStatusVersionProvider, (previous, next) {
+      final previousValue = previous?.value;
+      final nextValue = next.value;
+      if (previousValue == null || nextValue == null) return;
+      if (previousValue == nextValue) return;
+      unawaited(_serialize(_refreshLoadedSourcesForDownloadChange));
+    });
 
     _bridge.bindCallbacks(
       owner: this,
@@ -811,6 +826,19 @@ class AudioCoordinator extends Notifier<AudioState> {
       itemIds,
     );
     _player.replaceLoadedEntriesMetadata(entries);
+  }
+
+  Future<void> _refreshLoadedSourcesForDownloadChange() async {
+    final sessionId = state.queue.sessionId;
+    if (sessionId == null) return;
+    final itemIds = _player.loadedItemIds;
+    if (itemIds.isEmpty) return;
+
+    final entries = await _queueRepo.getPlaybackEntriesForItemIds(
+      sessionId,
+      itemIds,
+    );
+    await _player.refreshLoadedSourcesForAvailabilityChanges(entries);
   }
 
   Future<void> _replaceLoadedFutureSuffixForCurrent(
