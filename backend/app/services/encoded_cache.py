@@ -56,7 +56,7 @@ class EncodedCache:
         with self._lock:
             target.parent.mkdir(parents=True, exist_ok=True)
             os.replace(source_path, target)
-            self._prune_locked()
+            self._prune_locked(protect=target)
         return target
 
     def remove(self, uuid_id: str, quality: str) -> bool:
@@ -83,7 +83,7 @@ class EncodedCache:
                     continue
         return total
 
-    def _prune_locked(self) -> None:
+    def _prune_locked(self, protect: Optional[Path] = None) -> None:
         if self.ctx.max_size_bytes <= 0:
             return
         entries = []
@@ -105,6 +105,13 @@ class EncodedCache:
         for _, size, entry in entries:
             if total <= self.ctx.max_size_bytes:
                 break
+            if protect is not None and entry == protect:
+                # Keep the just-inserted file even when its size alone exceeds
+                # the cap — otherwise insert() would return a path to a file
+                # that was deleted before the caller could open it.
+                # TODO: when production-ready logging is implemented, log that
+                # this file exceeded the configured cache size cap.
+                continue
             try:
                 entry.unlink()
                 total -= size

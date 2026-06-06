@@ -520,6 +520,20 @@ class TestEncodedCache:
         cache.clear()
         assert cache.total_size_bytes() == 0
 
+    def test_cache_insert_protects_oversize_entry(self, tmp_path):
+        # Regression: insert() previously pruned the file it had just placed,
+        # leaving the caller holding a path to a non-existent file.
+        cache = self._make_cache(tmp_path, 100)
+        src = self._stage_source(tmp_path, "big.m4a", b"x" * 500)
+        path = cache.insert("uuid-big", "192", src)
+        assert path.exists()
+        assert cache.get("uuid-big", "192") is not None
+        # And a subsequent oversize insert evicts the prior entry but keeps itself.
+        src2 = self._stage_source(tmp_path, "big2.m4a", b"y" * 500)
+        path2 = cache.insert("uuid-big2", "192", src2)
+        assert path2.exists()
+        assert not cache.has("uuid-big", "192")
+
 
 class TestWarmEndpoint:
     def test_warm__prefetches_tracks(self, client, tmp_path):
