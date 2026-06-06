@@ -170,7 +170,11 @@ void main() {
       await container.read(localResetServiceProvider).reset();
 
       expect(audio.stopCalls, 1);
-      expect(container.read(offlineModeProvider), isFalse);
+      // Reset deliberately does NOT publish a `true → false` offline
+      // transition — that would fire the app-level recovery listener (sync,
+      // resume downloads) against state mid-wipe. The notifier itself is
+      // disposed when the ProviderScope is rebuilt after a successful reset.
+      expect(container.read(offlineModeProvider), isTrue);
       expect(ApiClient.instance.baseUrl, isEmpty);
       expect(prefs.getKeys(), isEmpty);
       expect(downloadManager.snapshot(), isEmpty);
@@ -189,6 +193,34 @@ void main() {
           .get();
       expect(ftsRows, isEmpty);
     });
+
+    test(
+      'reset while offline does not publish a true→false offline transition',
+      () async {
+        // A `true → false` transition is the signal the app-level recovery
+        // listener uses to kick off sync + resume-downloads. During reset
+        // that signal is a lie — the URL, prefs, DB, and downloads are all
+        // being wiped. So reset must not produce that transition.
+        container.read(offlineModeProvider.notifier).enterOffline();
+        expect(container.read(offlineModeProvider), isTrue);
+
+        final transitions = <(bool, bool)>[];
+        container.listen<bool>(offlineModeProvider, (prev, next) {
+          transitions.add((prev ?? false, next));
+        }, fireImmediately: false);
+
+        await container.read(localResetServiceProvider).reset();
+
+        final recoveryTransitions = transitions
+            .where((t) => t.$1 == true && t.$2 == false)
+            .toList();
+        expect(
+          recoveryTransitions,
+          isEmpty,
+          reason: 'reset must not look like a normal offline→online recovery',
+        );
+      },
+    );
 
     test('default registry advertises the expected real subsystems', () {
       final registered = container.read(localResettablesProvider);
@@ -246,23 +278,86 @@ void main() {
       },
     );
 
-    test('one failing resettable does not abort the rest', () async {
-      final log = <String>[];
-      final container = ProviderContainer(
-        overrides: [
-          localResettablesProvider.overrideWithValue(<LocalResettable>[
-            _Recording('first', 100, log),
-            _Throwing(50, log),
-            _Recording('last', 10, log),
-          ]),
-        ],
-      );
-      addTearDown(container.dispose);
+    test(
+      'one failing resettable does not abort the rest, but reset surfaces '
+      'the failure as a LocalResetException',
+      () async {
+        final log = <String>[];
+        final container = ProviderContainer(
+          overrides: [
+            localResettablesProvider.overrideWithValue(<LocalResettable>[
+              _Recording('first', 100, log),
+              _Throwing(50, log),
+              _Recording('last', 10, log),
+            ]),
+          ],
+        );
+        addTearDown(container.dispose);
 
-      await container.read(localResetServiceProvider).reset();
+        Object? thrown;
+        try {
+          await container.read(localResetServiceProvider).reset();
+        } catch (e) {
+          thrown = e;
+        }
 
-      expect(log, ['first', 'threw', 'last']);
-    });
+        // Every step still ran.
+        expect(log, ['first', 'threw', 'last']);
+        // And the partial-reset condition was surfaced, not swallowed.
+        expect(thrown, isA<LocalResetException>());
+        final ex = thrown as LocalResetException;
+        expect(ex.failures, hasLength(1));
+        expect(ex.failures.single.error, isA<StateError>());
+      },
+    );
+
+    test(
+      'multiple failing resettables are reported in one aggregate exception',
+      () async {
+        final log = <String>[];
+        final container = ProviderContainer(
+          overrides: [
+            localResettablesProvider.overrideWithValue(<LocalResettable>[
+              _Throwing(100, log),
+              _Recording('middle', 50, log),
+              _Throwing(10, log),
+            ]),
+          ],
+        );
+        addTearDown(container.dispose);
+
+        Object? thrown;
+        try {
+          await container.read(localResetServiceProvider).reset();
+        } catch (e) {
+          thrown = e;
+        }
+
+        expect(log, ['threw', 'middle', 'threw']);
+        expect(thrown, isA<LocalResetException>());
+        expect((thrown as LocalResetException).failures, hasLength(2));
+      },
+    );
+
+    test(
+      'reset completes normally (no throw) when every step succeeds',
+      () async {
+        final log = <String>[];
+        final container = ProviderContainer(
+          overrides: [
+            localResettablesProvider.overrideWithValue(<LocalResettable>[
+              _Recording('a', 100, log),
+              _Recording('b', 50, log),
+            ]),
+          ],
+        );
+        addTearDown(container.dispose);
+
+        await container.read(localResetServiceProvider).reset();
+
+        expect(log, ['a', 'b']);
+      },
+    );
 
     test('sort is stable for equal-priority resettables', () async {
       final log = <String>[];

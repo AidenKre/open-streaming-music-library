@@ -60,6 +60,19 @@ class OfflineModeNotifier extends Notifier<bool> {
     if (state) state = false;
   }
 
+  /// Cancel the recovery poll without changing the public offline flag.
+  ///
+  /// Used during a local reset, where the app is tearing down the server URL,
+  /// downloads, prefs, and DB. In that context any `true → false` transition
+  /// of [offlineModeProvider] would mislead app-level recovery listeners into
+  /// kicking off sync / resume-downloads against state that is mid-wipe. The
+  /// reset still nukes the underlying notifier when the provider scope is
+  /// rebuilt, so we only need to stop polling here.
+  void cancelOfflinePolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
   void _scheduleNextPoll() {
     _pollTimer?.cancel();
     _pollTimer = Timer(pollInterval, _poll);

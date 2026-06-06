@@ -96,25 +96,51 @@ class _StartupGateState extends ConsumerState<StartupGate> {
       _resetting = true;
       _connectError = null;
     });
+    LocalResetException? partialFailure;
     try {
       await ref.read(localResetServiceProvider).reset();
-      if (!mounted) return;
-      final onLocalResetComplete = widget.onLocalResetComplete;
-      if (onLocalResetComplete != null) {
-        onLocalResetComplete();
-        return;
-      }
-      setState(() {
-        _hasServerUrl = false;
-        _resetting = false;
-      });
+    } on LocalResetException catch (e) {
+      // A subset of subsystems failed to reset. Every step still ran (see
+      // LocalResetService.reset), but state is now partial — the live
+      // session is unusable. Surface the failure to the user, then still
+      // proceed with the scope rebuild so they land on a clean login
+      // instead of a half-wiped app shell.
+      partialFailure = e;
     } catch (e) {
-      if (!mounted) return;
-      setState(() => _resetting = false);
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Reset failed: $e')));
+      // Unexpected error from reset() itself (not a per-step failure). Treat
+      // the same way — show what happened, then fall through to rebuild.
+      partialFailure = LocalResetException([
+        LocalResetFailure(LocalResetService, e, StackTrace.current),
+      ]);
     }
+    if (!mounted) return;
+    if (partialFailure != null) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Reset incomplete'),
+          content: Text(
+            'Some local data could not be cleared:\n\n$partialFailure',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted) return;
+    }
+    final onLocalResetComplete = widget.onLocalResetComplete;
+    if (onLocalResetComplete != null) {
+      onLocalResetComplete();
+      return;
+    }
+    setState(() {
+      _hasServerUrl = false;
+      _resetting = false;
+    });
   }
 
   @override

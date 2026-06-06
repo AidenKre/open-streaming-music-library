@@ -24,18 +24,50 @@ class LocalResetService {
   Future<void> reset() async {
     final resettables = [..._ref.read(localResettablesProvider)]
       ..sort((a, b) => b.resetPriority.compareTo(a.resetPriority));
+    final failures = <LocalResetFailure>[];
     for (final r in resettables) {
       try {
         await r.resetLocalState();
       } catch (e, st) {
-        // Log and continue — one broken subsystem must not strand the
-        // rest in a half-reset state. We use `print` here rather than
-        // a logger to avoid pulling a new dependency into reset code.
-        // ignore: avoid_print
-        print('LocalResetService: ${r.runtimeType} reset failed: $e\n$st');
+        // Continue — one broken subsystem must not strand the rest in a
+        // half-reset state. Failures are aggregated and rethrown below so
+        // the caller can surface the partial-reset condition to the user.
+        failures.add(LocalResetFailure(r.runtimeType, e, st));
       }
     }
+    if (failures.isNotEmpty) {
+      throw LocalResetException(failures);
+    }
   }
+}
+
+/// One subsystem's failure during [LocalResetService.reset]. Kept as a
+/// distinct type so callers can introspect which steps failed without
+/// parsing strings.
+class LocalResetFailure {
+  LocalResetFailure(this.subsystem, this.error, this.stackTrace);
+
+  final Type subsystem;
+  final Object error;
+  final StackTrace stackTrace;
+
+  @override
+  String toString() => '$subsystem: $error';
+}
+
+/// Thrown by [LocalResetService.reset] when at least one subsystem failed
+/// to reset. All other subsystems still ran — a partial reset is the
+/// design, not a bug — but the caller MUST treat the overall reset as
+/// failed so it does not lie to the user about cleanup having succeeded.
+class LocalResetException implements Exception {
+  LocalResetException(this.failures);
+
+  final List<LocalResetFailure> failures;
+
+  @override
+  String toString() =>
+      'LocalResetException: ${failures.length} subsystem(s) failed to reset '
+      '(${failures.join('; ')})';
 }
 
 final localResetServiceProvider = Provider<LocalResetService>((ref) {
@@ -90,7 +122,11 @@ class _OfflineExitResettable implements LocalResettable {
 
   @override
   Future<void> resetLocalState() async {
-    _ref.read(offlineModeProvider.notifier).exitOffline();
+    // Cancel the health-poll timer without publishing an offline→online
+    // transition. A normal `exitOffline()` here would trigger the app-level
+    // recovery listener (sync + resume downloads) against state that is
+    // mid-wipe — see comment on [OfflineModeNotifier.cancelOfflinePolling].
+    _ref.read(offlineModeProvider.notifier).cancelOfflinePolling();
   }
 }
 

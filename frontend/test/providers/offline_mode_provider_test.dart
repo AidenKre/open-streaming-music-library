@@ -87,6 +87,38 @@ void main() {
     expect(container.read(offlineModeProvider), isFalse);
   });
 
+  test(
+    'cancelOfflinePolling stops polling without flipping the public flag',
+    () async {
+      var requests = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async {
+          requests++;
+          throw const SocketException('down');
+        }),
+      );
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final notifier = container.read(offlineModeProvider.notifier);
+
+      notifier.enterOffline();
+      expect(container.read(offlineModeProvider), isTrue);
+
+      notifier.cancelOfflinePolling();
+
+      // No `true → false` transition, so app-level recovery listeners stay
+      // silent. The poll timer is gone, so no further health checks happen.
+      expect(container.read(offlineModeProvider), isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(
+        requests,
+        0,
+        reason: 'no health poll should run after cancelOfflinePolling',
+      );
+    },
+  );
+
   test('exitOffline cancels the recovery poll timer', () async {
     var requests = 0;
     ApiClient.initForTest(
