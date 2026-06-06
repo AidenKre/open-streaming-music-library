@@ -117,6 +117,7 @@ class TracksPageState extends ConsumerState<TracksPage>
           filePath: s.filePath,
           downloadedBitrateKbps: s.downloadedBitrateKbps,
           fileSizeBytes: s.fileSizeBytes,
+          downloadedQuality: s.downloadedQuality,
         );
       }).toList();
     });

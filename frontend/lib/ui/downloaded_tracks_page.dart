@@ -94,6 +94,7 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
               filePath: s.filePath,
               downloadedBitrateKbps: s.downloadedBitrateKbps,
               fileSizeBytes: s.fileSizeBytes,
+              downloadedQuality: s.downloadedQuality,
             );
           })
           .where((t) => t.isDownloaded)

@@ -62,6 +62,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           filePath: s.filePath,
           downloadedBitrateKbps: s.downloadedBitrateKbps,
           fileSizeBytes: s.fileSizeBytes,
+          downloadedQuality: s.downloadedQuality,
         );
       }).toList();
     });
