@@ -40,6 +40,12 @@ class DownloadJob {
   final int? artistId;
   final String quality;
   final DownloadStatus status;
+  // When non-null, this job is a "replace" of an existing download at the
+  // given path. The downloader writes the replacement to a distinct file and
+  // only swaps it in (and deletes the old file) after the new copy has been
+  // fully written and the DB updated atomically. If the replacement fails or
+  // is cancelled, the old file and the DB row stay untouched.
+  final String? replacesFilePath;
 
   const DownloadJob({
     required this.uuidId,
@@ -49,6 +55,7 @@ class DownloadJob {
     required this.status,
     this.albumId,
     this.artistId,
+    this.replacesFilePath,
   });
 
   bool get isQueued => status is Queued;
@@ -64,6 +71,7 @@ class DownloadJob {
     artistId: artistId,
     quality: quality,
     status: status,
+    replacesFilePath: replacesFilePath,
   );
 }
 

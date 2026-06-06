@@ -140,7 +140,20 @@ class TrackDownloader {
     // 'audio' only when the header is missing.
     final ext = response.headers['x-audio-extension'] ?? 'audio';
 
-    final destination = File(p.join(dir.path, '${job.uuidId}.$ext'));
+    // For replacement jobs we write to a distinct filename so a same-extension
+    // replacement cannot disturb the old file before the DB swap commits.
+    // Repeated re-quality on an already-replaced row would otherwise collide
+    // on a fixed ".new" suffix, so include a microsecond stamp.
+    final replacesFilePath = job.replacesFilePath;
+    final isReplacement = replacesFilePath != null;
+    final destination = File(
+      p.join(
+        dir.path,
+        isReplacement
+            ? '${job.uuidId}.new-${DateTime.now().microsecondsSinceEpoch}.$ext'
+            : '${job.uuidId}.$ext',
+      ),
+    );
     final partial = File('${destination.path}.partial');
 
     try {
@@ -207,6 +220,7 @@ class TrackDownloader {
         downloadedBitrate: downloadedBitrate,
         downloadedQuality: job.quality,
         received: received,
+        replacesFilePath: job.replacesFilePath,
       );
       if (!committed) return DownloadOutcome.cancelled;
 
@@ -242,6 +256,13 @@ class TrackDownloader {
   /// generation guard. Returns true on commit, false if the reset generation
   /// moved during the commit (in which case any state left on disk is cleaned
   /// up so a reset doesn't leak files or DB rows).
+  ///
+  /// When [replacesFilePath] is non-null this is a two-phase replacement:
+  /// the old file and old DB row must survive any failure or cancellation
+  /// before the DB swap. Only once the DB row points at the new path do we
+  /// remove the old file. If a reset/fence fires between the DB swap and the
+  /// old-file delete, this method still removes the old file before returning
+  /// so the reset path doesn't leave a stranded sibling.
   Future<bool> _commitDownload({
     required String uuidId,
     required File partial,
@@ -250,6 +271,7 @@ class TrackDownloader {
     required int? downloadedBitrate,
     required String downloadedQuality,
     required int received,
+    String? replacesFilePath,
   }) async {
     final beforeRename = testHookBeforeRename;
     if (beforeRename != null) await beforeRename(uuidId);
@@ -265,9 +287,11 @@ class TrackDownloader {
     final beforeDbWrite = testHookBeforeDbWrite;
     if (beforeDbWrite != null) await beforeDbWrite(uuidId);
 
-    // Reset happened between rename and DB write. The destination file isn't
-    // referenced by any row yet, so the reset path couldn't have deleted it
-    // — clean up here.
+    // Reset/fence happened between rename and DB write. The destination file
+    // isn't referenced by any row yet, so the reset path couldn't have deleted
+    // it — clean up here. For replacement jobs we deliberately leave the OLD
+    // file and OLD DB row intact: callers rely on the invariant that a failed
+    // replacement preserves the working copy.
     if (!generationCheck()) {
       await _deleteIfExists(destination);
       return false;
@@ -283,6 +307,14 @@ class TrackDownloader {
         downloadedQuality: Value(downloadedQuality),
       ),
     );
+
+    // DB swap committed; the new file is the canonical copy. Remove the old
+    // file unconditionally — a fence/reset firing now must not strand it,
+    // because the row no longer references it. Best-effort delete: an orphan
+    // is harmless.
+    if (replacesFilePath != null && replacesFilePath != destination.path) {
+      await _deleteIfExists(File(replacesFilePath));
+    }
     return true;
   }
 

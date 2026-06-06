@@ -828,6 +828,186 @@ void main() {
     },
   );
 
+  test(
+    'enqueueTracksAtQuality replacement: success swaps DB and removes old file',
+    () async {
+      // Two-phase contract on the happy path. The replacement must write to a
+      // distinct file, swap the DB to point at it, and only then remove the
+      // old copy.
+      final existingPath = p.join(tempDir.path, 'tracks', 'abc.mp3');
+      await Directory(p.dirname(existingPath)).create(recursive: true);
+      await File(existingPath).writeAsBytes([9, 9, 9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 128,
+        downloadedQuality: '128',
+      );
+
+      final manager = buildManager(
+        client: MockClient(
+          (_) async => http.Response.bytes(
+            [1, 2, 3, 4, 5],
+            200,
+            headers: {
+              'x-audio-bitrate-kbps': '320',
+              'x-audio-extension': 'mp3',
+            },
+          ),
+        ),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality([
+        _track(
+          'abc',
+          filePath: existingPath,
+          downloadedBitrateKbps: 128,
+          downloadedQuality: '128',
+        ),
+      ], quality: '320');
+      await _waitForFinish(manager);
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, isNotNull);
+      expect(row.filePath, isNot(existingPath));
+      expect(File(row.filePath!).existsSync(), isTrue);
+      expect(await File(row.filePath!).readAsBytes(), [1, 2, 3, 4, 5]);
+      expect(row.downloadedBitrateKbps, 320);
+      expect(row.downloadedQuality, '320');
+      // Old file removed.
+      expect(File(existingPath).existsSync(), isFalse);
+      // No partial leaks.
+      final leftoverPartials = Directory(p.join(tempDir.path, 'tracks'))
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.endsWith('.partial'))
+          .toList();
+      expect(leftoverPartials, isEmpty);
+    },
+  );
+
+  test(
+    'enqueueTracksAtQuality replacement: failure preserves old file and DB row',
+    () async {
+      // Replacement download returns 500. The user's working copy and the DB
+      // row pointing at it must survive untouched, and no temp file may leak.
+      final existingPath = p.join(tempDir.path, 'tracks', 'abc.mp3');
+      await Directory(p.dirname(existingPath)).create(recursive: true);
+      await File(existingPath).writeAsBytes([9, 9, 9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 128,
+        downloadedQuality: '128',
+      );
+
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response('boom', 500)),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality([
+        _track(
+          'abc',
+          filePath: existingPath,
+          downloadedBitrateKbps: 128,
+          downloadedQuality: '128',
+        ),
+      ], quality: '320');
+      await _waitForFinish(manager);
+
+      // The job ends in failed but the user's working copy is untouched.
+      expect(manager.snapshot().single.isFailed, isTrue);
+      expect(File(existingPath).existsSync(), isTrue);
+      expect(await File(existingPath).readAsBytes(), [9, 9, 9, 9]);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, existingPath);
+      expect(row.downloadedBitrateKbps, 128);
+      expect(row.downloadedQuality, '128');
+
+      // No replacement file or partial left behind. The only file in the
+      // tracks dir should be the original.
+      final tracksDir = Directory(p.join(tempDir.path, 'tracks'));
+      final files = tracksDir
+          .listSync()
+          .whereType<File>()
+          .map((f) => f.path)
+          .toList();
+      expect(files, [existingPath]);
+    },
+  );
+
+  test(
+    'enqueueTracksAtQuality replacement: cancel before rename preserves old '
+    'file and DB row',
+    () async {
+      // The replacement worker is parked just before the partial→destination
+      // rename, then the user requests a delete on a DIFFERENT uuid (no-op
+      // for our subject) while we flip the worker's generation via the test
+      // hook. The contract under test: a replacement worker that bails before
+      // the DB swap must not mutate the OLD file or the OLD DB row.
+      //
+      // We force cancellation by writing a hook that throws — the downloader
+      // treats this as an error path, cleans up the partial, and never
+      // touches the destination or DB row.
+      final existingPath = p.join(tempDir.path, 'old-working-copy.mp3');
+      await File(existingPath).writeAsBytes([9, 9, 9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 128,
+        downloadedQuality: '128',
+      );
+
+      final manager = buildManager(
+        client: MockClient(
+          (_) async => http.Response.bytes(
+            [1, 2, 3],
+            200,
+            headers: {'x-audio-extension': 'mp3'},
+          ),
+        ),
+      );
+      addTearDown(manager.dispose);
+
+      // Throwing from the pre-rename hook is the cleanest deterministic way
+      // to abort the worker post-stream / pre-rename without involving the
+      // reset path (which would intentionally wipe known files).
+      manager.testHookBeforeRename = (_) async {
+        throw const FormatException('simulated mid-commit cancellation');
+      };
+
+      await manager.enqueueTracksAtQuality([
+        _track(
+          'abc',
+          filePath: existingPath,
+          downloadedBitrateKbps: 128,
+          downloadedQuality: '128',
+        ),
+      ], quality: '320');
+      await _waitForFinish(manager);
+
+      // The worker bailed before the swap. The user's working copy survives,
+      // and the DB row still points at it at the original quality.
+      expect(File(existingPath).existsSync(), isTrue);
+      expect(await File(existingPath).readAsBytes(), [9, 9, 9, 9]);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.filePath, existingPath);
+      expect(row.downloadedBitrateKbps, 128);
+      expect(row.downloadedQuality, '128');
+    },
+  );
+
   test('recovers from a transient 503 on the audio stream', () async {
     await _insertTrack(db, 'abc');
     var calls = 0;

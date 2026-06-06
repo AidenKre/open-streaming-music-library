@@ -153,11 +153,24 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     if (!isValidQuality(quality)) {
       throw ArgumentError('invalid download quality: $quality');
     }
+    return _enqueueInternal(tracks, quality: quality, replacements: const {});
+  }
+
+  Future<void> _enqueueInternal(
+    List<TrackUI> tracks, {
+    required String quality,
+    required Map<String, String> replacements,
+  }) async {
     final existingByUuid = {for (final j in _queue.state.jobs) j.uuidId: j};
     final additions = <DownloadJob>[];
 
     for (final t in tracks) {
-      if (t.filePath != null && await File(t.filePath!).exists()) {
+      final replaces = replacements[t.uuidId];
+      // Fresh (non-replacement) jobs skip when a file is already on disk;
+      // replacement jobs deliberately keep going — that's the whole point.
+      if (replaces == null &&
+          t.filePath != null &&
+          await File(t.filePath!).exists()) {
         continue; // already downloaded
       }
       final existing = existingByUuid[t.uuidId];
@@ -173,6 +186,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
           artistId: t.artistId,
           quality: quality,
           status: const Queued(),
+          replacesFilePath: replaces,
         ),
       );
     }
@@ -218,25 +232,27 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     }
 
     final toEnqueue = <TrackUI>[];
+    final replacements = <String, String>{};
     for (final t in tracks) {
       final hasFile = t.filePath != null && await File(t.filePath!).exists();
       if (hasFile && _qualityMatches(t, quality)) {
         continue; // already at the requested quality
       }
       if (hasFile) {
-        // Different quality — drop the stale local copy and queue a fresh
-        // download. deleteDownload also clears tracks.file_path so the
-        // skip-if-downloaded check in enqueueTracks doesn't fire.
-        await deleteDownload(t.uuidId);
+        // Different quality — schedule a two-phase replacement so the working
+        // copy survives a failed/cancelled redownload. The downloader writes
+        // to a distinct path, swaps the DB row, then removes the old file.
+        replacements[t.uuidId] = t.filePath!;
       }
-      // Strip the file path on the in-memory copy too, otherwise the
-      // skip-if-downloaded check in enqueueTracks would re-skip this track
-      // based on the stale value the caller passed in.
-      toEnqueue.add(hasFile ? t.copyWith(filePath: null) : t);
+      toEnqueue.add(t);
     }
 
     if (toEnqueue.isEmpty) return;
-    await enqueueTracks(toEnqueue, quality: quality);
+    await _enqueueInternal(
+      toEnqueue,
+      quality: quality,
+      replacements: replacements,
+    );
   }
 
   /// True iff [track]'s file on disk was produced by a request for [quality].
