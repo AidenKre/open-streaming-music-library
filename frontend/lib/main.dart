@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -92,7 +94,7 @@ class Frontend extends ConsumerStatefulWidget {
   ConsumerState<Frontend> createState() => _FrontendState();
 }
 
-class _FrontendState extends ConsumerState<Frontend> {
+class _FrontendState extends ConsumerState<Frontend> with WidgetsBindingObserver {
   // Stored so dispose can deregister exactly the same listener. Doing
   // `ref.read(...).enterOffline` twice yields equal tear-offs in practice,
   // but capturing once removes any doubt.
@@ -105,12 +107,25 @@ class _FrontendState extends ConsumerState<Frontend> {
     // Lives here (not in main()) because the notifier requires a ProviderScope.
     _offlineListener = ref.read(offlineModeProvider.notifier).enterOffline;
     ApiClient.addNetworkFailureListener(_offlineListener);
+    WidgetsBinding.instance.addObserver(this);
+    // Fire-and-forget: clears stale `tracks.file_path` rows whose underlying
+    // files were removed outside the app. UI consumers refresh through
+    // `downloadStatusVersionProvider` when something actually changes.
+    unawaited(ref.read(downloadReconciliationServiceProvider).reconcile());
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     ApiClient.removeNetworkFailureListener(_offlineListener);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(ref.read(downloadReconciliationServiceProvider).reconcile());
+    }
   }
 
   @override

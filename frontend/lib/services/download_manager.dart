@@ -96,6 +96,10 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// derived providers without polling the DB.
   ValueNotifier<int> get downloadStatusVersion => _status.downloadStatusVersion;
 
+  /// Exposed so reconciliation can bump the same change-version that download
+  /// completion uses; consumers should not depend on its members.
+  DownloadStatusReader get statusReader => _status;
+
   DownloadManager({
     required AppDatabase db,
     required LocalCoverArtStore coverArtStore,

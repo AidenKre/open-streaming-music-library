@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/legacy.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/download/download_reconciliation_service.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/queue_warm_service.dart';
@@ -39,6 +40,17 @@ final downloadManagerProvider = Provider<DownloadManager>((ref) {
 final downloadManagerListenableProvider = ChangeNotifierProvider<DownloadManager>(
   (ref) => ref.watch(downloadManagerProvider),
 );
+
+/// Reconciles stale local download paths against the filesystem. Triggered
+/// at app startup and on app resume — see `_FrontendState` in `main.dart`.
+final downloadReconciliationServiceProvider =
+    Provider<DownloadReconciliationService>((ref) {
+  final manager = ref.read(downloadManagerProvider);
+  return DownloadReconciliationService(
+    db: ref.read(databaseProvider),
+    statusReader: manager.statusReader,
+  );
+});
 
 /// Live count and total size of downloaded tracks for the Downloads tab header.
 final downloadedStatsProvider =
