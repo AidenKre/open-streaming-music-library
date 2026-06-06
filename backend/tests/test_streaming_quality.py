@@ -296,6 +296,115 @@ class TestStreamQuality:
         assert transcode_calls["n"] == 1
 
 
+class TestStreamCacheRace:
+    """Regressions for the cache-prune-during-stream race.
+
+    Issue #6: stream_track must open the cache file before returning the
+    StreamingResponse so EncodedCache pruning / default-quality cleanups
+    cannot unlink the path between the existence check and the first read.
+    """
+
+    def _payload_for(self, byte: bytes, size: int):
+        def payload(_bitrate: int) -> bytes:
+            return byte * size
+        return payload
+
+    def test_stream_survives_cache_clear_after_response_opens(
+        self, client, tmp_path
+    ):
+        track = _add_track_with_file(client, tmp_path)
+        expected = b"K" * 4096
+        _install_fake_coordinator(
+            client, payload_for_quality=self._payload_for(b"K", 4096)
+        )
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=192"
+        ) as resp:
+            assert resp.status_code == 200
+            # Mid-stream: wipe the entire encoded cache directory. The open
+            # file descriptor must keep the data alive.
+            client.app.state.encoded_cache.clear()
+            body = b"".join(resp.iter_bytes())
+
+        assert body == expected
+
+    def test_stream_survives_path_unlink_before_first_read(
+        self, client, tmp_path
+    ):
+        """Unlink the cache file after the endpoint returns but before any
+        bytes are read off the response. Demonstrates the fix: with eager
+        open the inode is pinned by the FD, so reads still succeed."""
+        track = _add_track_with_file(client, tmp_path)
+        expected = b"Z" * 2048
+        _install_fake_coordinator(
+            client, payload_for_quality=self._payload_for(b"Z", 2048)
+        )
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=128"
+        ) as resp:
+            assert resp.status_code == 200
+            # Unlink every encoded cache file directly via Path.unlink, the
+            # same mechanism EncodedCache._prune_locked uses.
+            cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
+            for entry in cache_dir.iterdir():
+                if entry.is_file():
+                    entry.unlink()
+            body = b"".join(resp.iter_bytes())
+
+        assert body == expected
+
+    def test_range_stream_survives_unlink(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path)
+        encoded = b"R" * 1000
+        _install_fake_coordinator(
+            client, payload_for_quality=lambda br: encoded
+        )
+
+        with client.stream(
+            "GET",
+            f"/tracks/{track.uuid_id}/stream?quality=192",
+            headers={"Range": "bytes=100-299"},
+        ) as resp:
+            assert resp.status_code == 206
+            cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
+            for entry in cache_dir.iterdir():
+                if entry.is_file():
+                    entry.unlink()
+            body = b"".join(resp.iter_bytes())
+
+        assert body == encoded[100:300]
+
+    def test_stream_survives_default_quality_change_cleanup(
+        self, client, tmp_path
+    ):
+        """A default-quality change wipes the old-quality default-cache
+        directory via Path.unlink; an active stream off that cache must
+        continue to read successfully."""
+        track = _add_track_with_file(client, tmp_path)
+        expected = b"D" * 3000
+        _install_fake_coordinator(
+            client, payload_for_quality=self._payload_for(b"D", 3000)
+        )
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=256"
+        ) as resp:
+            assert resp.status_code == 200
+            # Simulate the coordinator's default-quality cleanup loop which
+            # iterates the cache dir and unlinks every matching file.
+            cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
+            for entry in cache_dir.iterdir():
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+            body = b"".join(resp.iter_bytes())
+
+        assert body == expected
+
+
 class TestRangeParsing:
     """Direct tests for the HTTP Range parser used by /tracks/{uuid}/stream.
 

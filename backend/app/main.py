@@ -1,4 +1,5 @@
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -500,55 +501,76 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
         "X-Audio-Extension": _MIME_EXTENSION.get(media_type, "audio"),
     }
 
-    if not file_path.exists():
+    # Open the cache file eagerly (before returning the StreamingResponse) so
+    # the active file descriptor pins the inode. EncodedCache pruning and
+    # default-quality changes may unlink the path after we validate it but
+    # before a lazy generator would otherwise open it; on Unix the open
+    # handle keeps the data readable even after unlink, so streaming
+    # survives concurrent cache eviction.
+    try:
+        f = file_path.open("rb")
+    except FileNotFoundError:
         raise HTTPException(
             status_code=404,
             detail=f"file path for the track is now dead. Path: {file_path}",
         )
-    file_size = file_path.stat().st_size
-    range_header = request.headers.get("range")
 
-    if not range_header:
+    try:
+        file_size = os.fstat(f.fileno()).st_size
+        range_header = request.headers.get("range")
 
-        def iterfile():
-            with file_path.open("rb") as f:
-                while chunk := f.read(CHUNK_SIZE):
+        if not range_header:
+
+            def iterfile(handle):
+                try:
+                    while chunk := handle.read(CHUNK_SIZE):
+                        yield chunk
+                finally:
+                    handle.close()
+
+            response = StreamingResponse(
+                iterfile(f),
+                media_type=media_type,
+                headers={
+                    "Accept-ranges": "bytes",
+                    "Content-length": str(file_size),
+                    **extra_headers,
+                },
+            )
+            f = None  # ownership transferred to the generator
+            return response
+
+        start, end = _parse_byte_range(range_header, file_size)
+        content_length = end - start + 1
+        f.seek(start)
+
+        def iter_range(handle, remaining_bytes):
+            try:
+                while remaining_bytes:
+                    chunk = handle.read(min(CHUNK_SIZE, remaining_bytes))
+                    if not chunk:
+                        break
+                    remaining_bytes -= len(chunk)
                     yield chunk
+            finally:
+                handle.close()
 
-        return StreamingResponse(
-            iterfile(),
+        response = StreamingResponse(
+            iter_range(f, content_length),
+            status_code=206,
             media_type=media_type,
             headers={
                 "Accept-ranges": "bytes",
-                "Content-length": str(file_size),
+                "Content-range": f"bytes {start}-{end}/{file_size}",
+                "Content-length": str(content_length),
                 **extra_headers,
             },
         )
-
-    start, end = _parse_byte_range(range_header, file_size)
-
-    content_length = end - start + 1
-
-    def iter_range():
-        with file_path.open("rb") as f:
-            f.seek(start)
-            remaining_bytes = content_length
-            while remaining_bytes:
-                chunk = f.read(min(CHUNK_SIZE, remaining_bytes))
-                remaining_bytes -= len(chunk)
-                yield chunk
-
-    return StreamingResponse(
-        iter_range(),
-        status_code=206,
-        media_type=media_type,
-        headers={
-            "Accept-ranges": "bytes",
-            "Content-range": f"bytes {start}-{end}/{file_size}",
-            "Content-length": str(content_length),
-            **extra_headers,
-        },
-    )
+        f = None  # ownership transferred to the generator
+        return response
+    finally:
+        if f is not None:
+            f.close()
 
 
 @app.get("/artists", response_model=GetArtistsResponse)
