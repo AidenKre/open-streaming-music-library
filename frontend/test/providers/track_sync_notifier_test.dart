@@ -353,5 +353,93 @@ void main() {
       ).get();
       expect(ftsRows.length, 1, reason: 'Newly synced track should be searchable');
     });
+
+    test(
+        'scoped sync does not advance global watermark; later unscoped sync still imports excluded track',
+        () async {
+      // Seed an existing watermark from a prior unscoped sync.
+      const initialWatermark = 1000;
+      SharedPreferences.setMockInitialValues({
+        TrackSyncNotifier.lastFetchTimeKey: initialWatermark,
+      });
+
+      final requestUrls = <Uri>[];
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          requestUrls.add(req.url);
+          final params = req.url.queryParameters;
+          // Scoped call: artist_id=136 — the new track (artist_id=137) is
+          // inside the time window but excluded by the filter.
+          if (params['artist_id'] == '136') {
+            return Response(
+              jsonEncode({'data': <Map<String, dynamic>>[], 'nextCursor': null}),
+              200,
+            );
+          }
+          // Unscoped call: must return the new track that the scoped call
+          // could not see.
+          return Response(
+            jsonEncode({
+              'data': [
+                _richTrackJson(
+                  'uuid-new',
+                  title: 'Excluded Song',
+                  artist: 'Other Artist',
+                  album: 'Other Album',
+                  artistId: 137,
+                  albumId: 200,
+                  createdAt: 1500,
+                ),
+              ],
+              'nextCursor': null,
+            }),
+            200,
+          );
+        }),
+      );
+
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+
+      // 1. Scoped sync for artist 136 — excludes the new track.
+      await notifier.sync(artistId: 136);
+
+      expect(requestUrls.length, 1);
+      expect(requestUrls[0].queryParameters['artist_id'], '136');
+      expect(requestUrls[0].queryParameters['newer_than'], '$initialWatermark');
+
+      // 2. Scoped sync must NOT advance the global watermark.
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getInt(TrackSyncNotifier.lastFetchTimeKey),
+        initialWatermark,
+        reason: 'Scoped sync must not move the global watermark',
+      );
+
+      // 3. Later unscoped sync should still see the new track because
+      //    newer_than is still the original watermark.
+      await notifier.sync();
+
+      expect(requestUrls.length, 2);
+      expect(requestUrls[1].queryParameters.containsKey('artist_id'), false);
+      expect(
+        requestUrls[1].queryParameters['newer_than'],
+        '$initialWatermark',
+        reason: 'Unscoped sync must use the original watermark, not `now`',
+      );
+
+      // 4. New track was imported by the unscoped sync.
+      final tracks = await db.select(db.tracks).get();
+      expect(tracks.map((t) => t.uuidId).toSet(), {'uuid-new'});
+
+      // 5. Unscoped sync DID advance the watermark.
+      expect(
+        prefs.getInt(TrackSyncNotifier.lastFetchTimeKey)! > initialWatermark,
+        true,
+        reason: 'Unscoped sync must advance the global watermark',
+      );
+    });
   });
 }

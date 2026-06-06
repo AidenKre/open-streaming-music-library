@@ -83,7 +83,13 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       }
 
       await _rebuildFts(db);
-      await prefs.setInt(lastFetchTimeKey, now);
+      // Only fully unscoped syncs advance the global watermark. Scoped syncs
+      // apply an artist/album filter to the backend query, so rows outside the
+      // filter inside the same time window would be skipped forever if we
+      // moved lastFetchTime past them here.
+      if (artistId == null && albumId == null) {
+        await prefs.setInt(lastFetchTimeKey, now);
+      }
       state = AsyncData(const TrackSyncState());
     } catch (e) {
       state = AsyncData(TrackSyncState(error: e.toString()));
