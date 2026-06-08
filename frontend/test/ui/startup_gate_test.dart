@@ -89,4 +89,36 @@ void main() {
       reason: 'a failed connect attempt must not enter offline mode',
     );
   });
+
+  test('a failed manual-connect health check uses a single attempt', () async {
+    SharedPreferences.setMockInitialValues({});
+    var attempts = 0;
+    ApiClient.initForTest(
+      'http://hang.invalid:9999',
+      MockClient((_) async {
+        attempts++;
+        throw const SocketException('unreachable');
+      }),
+    );
+    // Drive the health check directly so we don't have to stub the full
+    // AppShell provider graph just to count attempts.
+    final sw = Stopwatch()..start();
+    final result = await ApiClient.instance.healthCheck(retry: false);
+    sw.stop();
+
+    expect(result.status, HealthStatus.unreachable);
+    expect(
+      attempts,
+      1,
+      reason: 'retry: false must collapse the default 3-attempt retry '
+          'policy to a single attempt — otherwise a hanging saved URL holds '
+          'the splash for ~30s before showing downloaded content',
+    );
+    expect(
+      sw.elapsed,
+      lessThan(const Duration(seconds: 5)),
+      reason: 'a single-attempt unreachable health check returns immediately, '
+          'far below the 3×10s retry budget',
+    );
+  });
 }

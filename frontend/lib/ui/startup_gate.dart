@@ -37,7 +37,9 @@ class _StartupGateState extends ConsumerState<StartupGate> {
       return;
     }
     ApiClient.init(url);
-    final result = await ApiClient.instance.healthCheck();
+    // Single-attempt probe: the default 3×10s retry would hold the splash
+    // for ~30s on a hanging saved URL before offline mode shows downloads.
+    final result = await ApiClient.instance.healthCheck(retry: false);
     switch (result.status) {
       case HealthStatus.ok:
         setState(() {
@@ -69,7 +71,10 @@ class _StartupGateState extends ConsumerState<StartupGate> {
   /// check; any failure keeps the user on the connect screen with an error.
   Future<void> _onConnect(String url) async {
     ApiClient.init(url);
-    final result = await ApiClient.instance.healthCheck();
+    // Single-attempt probe — same reasoning as the saved-URL path. The
+    // user is waiting on the connect button; a 30s wait before showing
+    // an error feels broken.
+    final result = await ApiClient.instance.healthCheck(retry: false);
     switch (result.status) {
       case HealthStatus.ok:
         final prefs = await ref.read(sharedPreferencesProvider.future);
