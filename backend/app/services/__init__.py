@@ -7,6 +7,5 @@ from .organizer import OrganizerContext, Organizer
 from .transcoder import (
     ORIGINAL_QUALITY,
     QUALITY_BITRATES_KBPS,
-    is_valid_quality,
     normalize_quality,
 )

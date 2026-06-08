@@ -46,7 +46,7 @@ from app.services import (
     IngestorContext,
     Organizer,
     OrganizerContext,
-    is_valid_quality,
+    ORIGINAL_QUALITY,
     normalize_quality,
 )
 from app.services.encoder_coordinator import EncodeResult
@@ -134,9 +134,29 @@ def startup_event():
             max_size_bytes=0,  # unlimited
         )
     )
-    # Load persisted default quality (fallback to config if not set yet).
+    # Resolve the startup default quality. Bad persisted/env values must not
+    # leak into EncoderCoordinator — fall through persisted → env → ORIGINAL.
     persisted_quality = database.get_setting("default_streaming_quality")
-    default_quality = persisted_quality or settings.default_streaming_quality
+    default_quality = ORIGINAL_QUALITY
+    for candidate, source_label in (
+        (persisted_quality, "persisted"),
+        (settings.default_streaming_quality, "env/config"),
+    ):
+        if candidate is None:
+            continue
+        try:
+            default_quality = normalize_quality(candidate)
+            break
+        except ValueError:
+            print(
+                f"Invalid {source_label} default_streaming_quality "
+                f"{candidate!r}; falling back."
+            )
+    else:
+        print(
+            f"No valid default_streaming_quality configured; using "
+            f"{ORIGINAL_QUALITY!r}."
+        )
 
     app.state.encoded_cache = encoded_cache
     app.state.default_cache = default_cache
@@ -484,12 +504,13 @@ def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int]:
 @app.get("/tracks/{uuid_id}/stream")
 def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     CHUNK_SIZE = 1024 * 1024
-    if not is_valid_quality(quality):
+    try:
+        quality_canonical = normalize_quality(quality)
+    except ValueError:
         raise HTTPException(
             status_code=422,
             detail=f"Unsupported quality preset: {quality}",
         )
-    quality_canonical = normalize_quality(quality)
 
     search_parameters = [SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
     track_list: List[Track] = app.state.database.get_tracks(
@@ -849,12 +870,13 @@ def warm_tracks(request: WarmRequest):
             status_code=422,
             detail=f"Too many track_uuids: max {_WARM_MAX_UUIDS}",
         )
-    if not is_valid_quality(request.quality):
+    try:
+        quality_canonical = normalize_quality(request.quality)
+    except ValueError:
         raise HTTPException(
             status_code=422,
             detail=f"Unsupported quality preset: {request.quality}",
         )
-    quality_canonical = normalize_quality(request.quality)
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
     lookahead = settings.prefetch_lookahead
@@ -876,12 +898,13 @@ def get_quality_setting():
 
 @app.put("/settings/quality", response_model=SetQualityResponse)
 def set_quality_setting(request: SetQualityRequest):
-    if not is_valid_quality(request.quality):
+    try:
+        quality_canonical = normalize_quality(request.quality)
+    except ValueError:
         raise HTTPException(
             status_code=422,
             detail=f"Unsupported quality preset: {request.quality}",
         )
-    quality_canonical = normalize_quality(request.quality)
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
     database: Database = cast(Database, app.state.database)

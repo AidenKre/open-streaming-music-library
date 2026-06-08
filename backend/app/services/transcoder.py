@@ -21,16 +21,11 @@ QUALITY_BITRATES_KBPS: dict[str, int] = {
 }
 
 
-def is_valid_quality(quality: Optional[str]) -> bool:
-    if quality is None:
-        return True
-    if quality == ORIGINAL_QUALITY:
-        return True
-    return quality in QUALITY_BITRATES_KBPS
-
-
 def normalize_quality(quality: Optional[str]) -> str:
-    """Return canonical name. None or 'original' both map to ORIGINAL_QUALITY."""
+    """Return canonical name. None or 'original' both map to ORIGINAL_QUALITY.
+
+    Raises ValueError for any other unrecognized preset.
+    """
     if quality is None or quality == ORIGINAL_QUALITY:
         return ORIGINAL_QUALITY
     if quality not in QUALITY_BITRATES_KBPS:

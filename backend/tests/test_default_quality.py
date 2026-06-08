@@ -561,6 +561,17 @@ class TestQualitySettingsAPI:
     def test_put_quality__invalid_rejected(self, client):
         r = client.put("/settings/quality", json={"quality": "lossless-MQA"})
         assert r.status_code == 422
+        assert "lossless-MQA" in r.json()["detail"]
+
+    def test_put_quality__invalid_does_not_change_coordinator(self, client):
+        _install_fake_coordinator(client)
+        coordinator = client.app.state.encoder_coordinator
+        original_quality = coordinator.default_quality
+
+        r = client.put("/settings/quality", json={"quality": "bogus"})
+
+        assert r.status_code == 422
+        assert coordinator.default_quality == original_quality
 
     def test_put_quality__original_warming_false(self, client):
         r = client.put("/settings/quality", json={"quality": "original"})
@@ -645,3 +656,68 @@ class TestQualitySettingsAPI:
 
         assert db.get_setting("default_streaming_quality") == coordinator.default_quality
         assert coordinator.default_quality in qualities
+
+
+class TestStartupQualityValidation:
+    def _boot_app(self, tmp_path, monkeypatch, env_quality=None):
+        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
+        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
+        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
+        if env_quality is not None:
+            monkeypatch.setenv("DEFAULT_STREAMING_QUALITY", env_quality)
+
+        sys.modules.pop("app.main", None)
+        sys.modules.pop("app.config", None)
+        import app.main
+        importlib.reload(app.main)
+        return app.main
+
+    def _seed_persisted_quality(self, tmp_path, value):
+        # Boot once to create the database schema, persist the bad value, shutdown.
+        import importlib as _il
+        sys.modules.pop("app.main", None)
+        sys.modules.pop("app.config", None)
+        import app.main as bootstrap_main
+        _il.reload(bootstrap_main)
+        with TestClient(bootstrap_main.app) as c:
+            c.app.state.database.set_setting("default_streaming_quality", value)
+
+    def test_startup__invalid_persisted_falls_back_to_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
+        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
+        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
+        monkeypatch.setenv("DEFAULT_STREAMING_QUALITY", "192")
+        self._seed_persisted_quality(tmp_path, "lossless-MQA")
+
+        app_main = self._boot_app(tmp_path, monkeypatch, env_quality="192")
+        with TestClient(app_main.app) as c:
+            assert c.app.state.encoder_coordinator.default_quality == "192"
+
+    def test_startup__invalid_persisted_and_env_falls_back_to_original(
+        self, tmp_path, monkeypatch
+    ):
+        from app.services.transcoder import ORIGINAL_QUALITY as _ORIG
+
+        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
+        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
+        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
+        monkeypatch.setenv("DEFAULT_STREAMING_QUALITY", "also-bogus")
+        self._seed_persisted_quality(tmp_path, "lossless-MQA")
+
+        app_main = self._boot_app(tmp_path, monkeypatch, env_quality="also-bogus")
+        with TestClient(app_main.app) as c:
+            assert c.app.state.encoder_coordinator.default_quality == _ORIG
+
+    def test_startup__valid_persisted_used(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
+        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
+        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
+        self._seed_persisted_quality(tmp_path, "320")
+
+        app_main = self._boot_app(tmp_path, monkeypatch)
+        with TestClient(app_main.app) as c:
+            assert c.app.state.encoder_coordinator.default_quality == "320"
