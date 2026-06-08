@@ -138,6 +138,7 @@ class EncoderCoordinator:
     _executor: _PriorityPool = field(init=False)
     _key_locks: dict[tuple[str, str], threading.Lock] = field(default_factory=dict)
     _key_locks_guard: threading.Lock = field(default_factory=threading.Lock)
+    _default_quality_update_lock: threading.Lock = field(default_factory=threading.Lock)
     _scratch_dir: Path = field(init=False)
     _warm_generation: int = field(init=False, default=0)
 
@@ -389,6 +390,31 @@ class EncoderCoordinator:
             return True
 
         return False
+
+    def persist_and_set_default_quality(
+        self,
+        new_quality: str,
+        persist: Callable[[str], None],
+    ) -> tuple[bool, bool]:
+        """Persist ``new_quality`` then update in-memory default, serialized.
+
+        Returns ``(changed, warming)``. ``changed`` is False when the new
+        quality already matches the current default (no persist, no warm).
+        ``warming`` mirrors :meth:`set_default_quality`.
+
+        ``persist`` is invoked under :attr:`_default_quality_update_lock`
+        before any in-memory mutation. If it raises, neither the persisted
+        store nor the coordinator's live state are updated for this call.
+        The update lock serializes compare/persist/live-update across
+        concurrent callers so the final live state always matches the last
+        successful persist.
+        """
+        with self._default_quality_update_lock:
+            if new_quality == self.default_quality:
+                return False, False
+            persist(new_quality)
+            warming = self.set_default_quality(new_quality)
+            return True, warming
 
     # ── Background workers ────────────────────────────────────────────────
 

@@ -368,3 +368,69 @@ class TestKeyLockDedup:
         # framework will time out; if it returns, the lock was released.
         result = c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500)
         assert result is not None
+
+
+# ── persist_and_set_default_quality ───────────────────────────────────────────
+
+class TestPersistAndSetDefaultQuality:
+    def test_persist_failure_leaves_live_state_unchanged(self, tmp_path):
+        c = _make_coordinator(tmp_path, default_quality="192")
+        c.all_uuids_fn = lambda: []
+
+        def persist(_q):
+            raise RuntimeError("db down")
+
+        with pytest.raises(RuntimeError):
+            c.persist_and_set_default_quality("256", persist)
+
+        assert c.default_quality == "192"
+        c._executor.shutdown(wait=True)
+
+    def test_no_op_when_quality_unchanged_skips_persist(self, tmp_path):
+        c = _make_coordinator(tmp_path, default_quality="192")
+        c.all_uuids_fn = lambda: []
+        persisted: list[str] = []
+
+        changed, warming = c.persist_and_set_default_quality(
+            "192", lambda q: persisted.append(q)
+        )
+
+        assert changed is False
+        assert warming is False
+        assert persisted == []
+        c._executor.shutdown(wait=True)
+
+    def test_concurrent_puts__persisted_matches_live(self, tmp_path):
+        """Final persisted value and live default_quality must agree after
+        many concurrent persist_and_set_default_quality calls."""
+        c = _make_coordinator(tmp_path, default_quality="192")
+        c.all_uuids_fn = lambda: []
+
+        persisted_store: dict[str, str] = {}
+        store_lock = threading.Lock()
+
+        def persist(q: str) -> None:
+            # Mirror the DB's serialized write semantics.
+            with store_lock:
+                persisted_store["q"] = q
+
+        qualities = [str(96 + 8 * i) for i in range(32)]
+        barrier = threading.Barrier(len(qualities))
+
+        def worker(q: str) -> None:
+            barrier.wait()
+            c.persist_and_set_default_quality(q, persist)
+
+        threads = [threading.Thread(target=worker, args=(q,)) for q in qualities]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        c._executor.shutdown(wait=True)
+
+        # Whichever caller serialized last, the persisted value MUST match the
+        # in-memory default. The interleaving "persist A, persist B, live=B,
+        # live=A" — where the live state diverges from what's on disk — must
+        # be impossible.
+        assert persisted_store["q"] == c.default_quality
+        assert c.default_quality in qualities

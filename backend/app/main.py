@@ -884,12 +884,18 @@ def set_quality_setting(request: SetQualityRequest):
     quality_canonical = normalize_quality(request.quality)
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    if quality_canonical == coordinator.default_quality:
-        return SetQualityResponse(quality=quality_canonical, warming=False)
-
     database: Database = cast(Database, app.state.database)
-    database.set_setting("default_streaming_quality", quality_canonical)
-    warming: bool = coordinator.set_default_quality(quality_canonical)
+
+    try:
+        _, warming = coordinator.persist_and_set_default_quality(
+            quality_canonical,
+            lambda q: database.set_setting("default_streaming_quality", q),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to persist default quality setting",
+        )
 
     return SetQualityResponse(quality=quality_canonical, warming=warming)
 

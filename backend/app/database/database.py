@@ -1235,14 +1235,13 @@ class Database:
             return None
 
     def set_setting(self, key: str, value: str) -> None:
-        try:
-            with self._connection(commit=True) as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
-                    (key, value),
-                )
-        except Exception as e:
-            print(f"Error writing setting {key!r}: {e}")
+        # Raises on failure so callers can keep in-memory state consistent
+        # with what is actually persisted.
+        with self._connection(commit=True) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
 
     def get_track_tombstones(
         self,

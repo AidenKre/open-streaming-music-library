@@ -600,3 +600,48 @@ class TestQualitySettingsAPI:
         assert r.json()["warming"] is False
         # DB must remain untouched.
         assert db.get_setting("default_streaming_quality") is None
+
+    def test_put_quality__db_write_failure__leaves_state_unchanged(self, client):
+        """If set_setting raises, the coordinator's default_quality must not
+        change and the response must surface an error."""
+        _install_fake_coordinator(client)
+        coordinator = client.app.state.encoder_coordinator
+        db = client.app.state.database
+        original_quality = coordinator.default_quality
+
+        def boom(_key, _value):
+            raise RuntimeError("simulated db failure")
+
+        original_set = db.set_setting
+        db.set_setting = boom
+        try:
+            r = client.put("/settings/quality", json={"quality": "256"})
+        finally:
+            db.set_setting = original_set
+
+        assert r.status_code == 500
+        assert coordinator.default_quality == original_quality
+
+    def test_put_quality__concurrent_puts__live_matches_persisted(self, client):
+        """Concurrent PUTs must leave the persisted setting equal to the
+        coordinator's live default_quality (no torn state)."""
+        import threading
+
+        _install_fake_coordinator(client)
+        db = client.app.state.database
+        coordinator = client.app.state.encoder_coordinator
+        qualities = ["96", "128", "192", "256", "320"]
+        barrier = threading.Barrier(len(qualities))
+
+        def worker(q):
+            barrier.wait()
+            client.put("/settings/quality", json={"quality": q})
+
+        threads = [threading.Thread(target=worker, args=(q,)) for q in qualities]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert db.get_setting("default_streaming_quality") == coordinator.default_quality
+        assert coordinator.default_quality in qualities
