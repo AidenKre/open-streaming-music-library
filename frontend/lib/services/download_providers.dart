@@ -171,9 +171,12 @@ Future<void> downloadScope(
   if (tracks.isEmpty) return;
   final manager = ref.read(downloadManagerProvider);
   if (quality == null) {
-    manager.enqueueTracks(tracks, quality: ref.read(downloadQualityProvider));
+    await manager.enqueueTracks(
+      tracks,
+      quality: ref.read(downloadQualityProvider),
+    );
   } else {
-    manager.enqueueTracksAtQuality(tracks, quality: quality);
+    await manager.enqueueTracksAtQuality(tracks, quality: quality);
   }
 }
 
@@ -183,7 +186,7 @@ Future<void> downloadScope(
 Future<void> deleteScope(WidgetRef ref, DownloadScope scope) async {
   final manager = ref.read(downloadManagerProvider);
   if (scope is TrackScope) {
-    manager.deleteDownload(scope.track.uuidId);
+    await manager.deleteDownload(scope.track.uuidId);
     return;
   }
   final tracks = await _resolveTracks(ref, scope);
