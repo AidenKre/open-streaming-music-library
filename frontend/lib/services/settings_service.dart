@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:developer' as developer;
 
 import 'package:flutter/foundation.dart';
@@ -84,24 +85,54 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   static const _downloadQualityKey = 'settings.downloadQuality';
   static const _defaultQuality = originalQuality;
 
-  /// Hard cap on how long `build()` waits for the backend to return its
-  /// authoritative quality. Kept tight so first-paint isn't held hostage by
-  /// a slow/unreachable server — on timeout we fall back to the cached pref
-  /// and the next online startup will refresh.
+  /// Hard cap on a single backend-sync attempt. The reconciliation runs
+  /// asynchronously after [build] returns, so this no longer gates first
+  /// paint — it just bounds how long any one network attempt blocks the
+  /// follow-up state update before we fall back to the cached pref.
   @visibleForTesting
   static Duration backendSyncTimeout = const Duration(seconds: 3);
+
+  /// Test seam: completes when the post-build backend reconciliation
+  /// settles (success or swallowed failure). Tests await this to assert on
+  /// the final state without races against the unawaited sync.
+  @visibleForTesting
+  Future<void> get debugBackendSyncDone => _syncDone.future;
+  Completer<void> _syncDone = Completer<void>();
 
   @override
   Future<AppSettings> build() async {
     final prefs = await ref.read(sharedPreferencesProvider.future);
     final local = _read(prefs);
 
-    // Sync the backend's authoritative quality before returning. The backend
-    // is the source of truth; SharedPreferences is an offline cache of the
-    // last known value. We await (with a tight timeout) so a racing call to
-    // [setStreamQualityFull] cannot be clobbered by a late-resolving sync.
-    final synced = await _syncQualityFromBackend(local, prefs);
-    return synced;
+    // Publish local prefs immediately so consumers (download default,
+    // restored playback quality, settings UI) don't sit on the `original`
+    // fallback while the backend sync is in flight. The backend remains
+    // the source of truth for stream quality and is reconciled below.
+    _syncDone = Completer<void>();
+    Future.microtask(() => _reconcileFromBackend(prefs, local));
+    return local;
+  }
+
+  Future<void> _reconcileFromBackend(
+    SharedPreferences prefs,
+    AppSettings initial,
+  ) async {
+    try {
+      final reconciled = await _syncQualityFromBackend(initial, prefs);
+      if (identical(reconciled, initial) || reconciled == initial) return;
+      // If the user changed stream quality while the sync was in flight,
+      // their choice wins — drop the late backend value.
+      final current = state.value;
+      if (current == null) return;
+      if (current.persistedStreamQuality != initial.persistedStreamQuality) {
+        return;
+      }
+      state = AsyncData(
+        current.copyWith(persistedStreamQuality: reconciled.persistedStreamQuality),
+      );
+    } finally {
+      if (!_syncDone.isCompleted) _syncDone.complete();
+    }
   }
 
   AppSettings _read(SharedPreferences prefs) {
@@ -127,9 +158,16 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     // SharedPreferences remains in effect; next online startup will refresh.
     if (ref.read(offlineModeProvider)) return local;
     try {
-      final data = await ApiClient.instance
-          .getJson(['settings', 'quality'])
-          .timeout(backendSyncTimeout);
+      // Single-attempt policy bounded by backendSyncTimeout: a slow or
+      // unreachable backend must not strand the reconcile forever, and
+      // exhaustion still goes through the offline hook so a real outage
+      // flips the app into offline mode like any other GET would.
+      final data = await ApiClient.instance.getJson(
+        ['settings', 'quality'],
+        policy: RetryPolicy.noRetry.copyWith(
+          perAttemptTimeout: backendSyncTimeout,
+        ),
+      );
       final quality = data['quality'];
       if (!isValidQuality(quality)) return local;
       // Cache locally so offline restarts use the last known backend value.
@@ -231,7 +269,10 @@ final settingsProvider =
     AsyncNotifierProvider<SettingsNotifier, AppSettings>(SettingsNotifier.new);
 
 /// Synchronous read of the current effective stream quality (temporary takes
-/// precedence over persisted). Falls back to `original` while loading.
+/// precedence over persisted). Falls back to `original` only while the
+/// SharedPreferences read is in flight — once [SettingsNotifier.build]
+/// returns, the local pref is published and the backend reconciliation
+/// runs asynchronously without holding this provider on `original`.
 final streamQualityProvider = Provider<String>((ref) {
   final settings = ref.watch(settingsProvider).value;
   return settings?.streamQuality ?? originalQuality;

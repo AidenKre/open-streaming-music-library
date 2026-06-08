@@ -21,8 +21,9 @@ ProviderContainer _containerWith(SharedPreferences prefs) {
 void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
-    // build() awaits the backend sync — keep it tight in tests so timeout
-    // cases run fast. Production default is 3s.
+    // build() no longer awaits the backend sync, but the per-attempt
+    // timeout still bounds the reconcile in flight — keep it tight in
+    // tests so timeout cases run fast. Production default is 3s.
     SettingsNotifier.backendSyncTimeout = const Duration(milliseconds: 200);
   });
 
@@ -269,15 +270,42 @@ void main() {
     });
   });
 
-  group('build awaits backend sync', () {
+  group('build publishes local prefs then reconciles backend', () {
     http.Response qualityResponse(String quality) => http.Response(
           jsonEncode({'quality': quality}),
           200,
           headers: {'content-type': 'application/json'},
         );
 
-    test('build uses backend value as initial state', () async {
-      // Local pref is "256"; backend says "128" — build() must return "128".
+    test('build returns local prefs immediately, before backend resolves',
+        () async {
+      // Local pref is "256"; backend will eventually say "128".
+      SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
+      final prefs = await SharedPreferences.getInstance();
+      final getCompleter = Completer<http.Response>();
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) => getCompleter.future),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      // build() must NOT wait on the GET — the local pref is published
+      // immediately, so downstream providers don't sit on `original`.
+      final settings = await container.read(settingsProvider.future);
+      expect(settings.streamQuality, '256');
+      expect(container.read(streamQualityProvider), '256');
+      expect(container.read(downloadQualityProvider), originalQuality);
+
+      // Release the GET; the reconcile then updates state to the backend value.
+      getCompleter.complete(qualityResponse('128'));
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+      expect(container.read(settingsProvider).value!.streamQuality, '128');
+      expect(prefs.getString('settings.streamQuality'), '128');
+    });
+
+    test('backend reconcile updates state to backend value', () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
       ApiClient.initForTest(
@@ -288,22 +316,23 @@ void main() {
       final container = _containerWith(prefs);
       addTearDown(container.dispose);
 
-      // The very first read of state after build() resolves should be "128",
-      // not "256" — i.e. the sync was awaited.
-      final settings = await container.read(settingsProvider.future);
-      expect(settings.streamQuality, '128');
+      await container.read(settingsProvider.future);
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+
+      expect(container.read(settingsProvider).value!.streamQuality, '128');
       expect(prefs.getString('settings.streamQuality'), '128');
     });
 
-    test('backend timeout falls back to cached pref', () async {
+    test('backend timeout leaves AppSettings on the cached pref, not loading',
+        () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '320'});
       final prefs = await SharedPreferences.getInstance();
-      // MockClient hangs forever — the timeout in build() must kick in.
+      // MockClient hangs forever — the per-attempt timeout in the
+      // RetryPolicy must kick in (the outer .timeout() is gone).
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((_) => Completer<http.Response>().future),
       );
-      // Use a very tight timeout so the test runs quickly.
       SettingsNotifier.backendSyncTimeout = const Duration(milliseconds: 50);
 
       final container = _containerWith(prefs);
@@ -311,9 +340,14 @@ void main() {
 
       final settings = await container.read(settingsProvider.future);
       expect(settings.streamQuality, '320');
+      // After the timeout fires the reconcile completes — the AsyncValue
+      // must not be left in AsyncLoading.
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+      expect(container.read(settingsProvider).hasValue, isTrue);
+      expect(container.read(settingsProvider).value!.streamQuality, '320');
     });
 
-    test('backend network failure falls back to cached pref', () async {
+    test('backend network failure leaves cached pref in place', () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
       ApiClient.initForTest(
@@ -326,6 +360,8 @@ void main() {
 
       final settings = await container.read(settingsProvider.future);
       expect(settings.streamQuality, '256');
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+      expect(container.read(settingsProvider).value!.streamQuality, '256');
     });
 
     test('backend returns invalid quality → local value kept', () async {
@@ -343,8 +379,9 @@ void main() {
       final container = _containerWith(prefs);
       addTearDown(container.dispose);
 
-      final settings = await container.read(settingsProvider.future);
-      expect(settings.streamQuality, '256');
+      await container.read(settingsProvider.future);
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+      expect(container.read(settingsProvider).value!.streamQuality, '256');
     });
 
     test('no server URL configured → no HTTP request made, local value kept',
@@ -365,16 +402,16 @@ void main() {
       addTearDown(container.dispose);
 
       final settings = await container.read(settingsProvider.future);
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
 
       expect(requestCount, 0);
       expect(settings.streamQuality, originalQuality);
     });
 
-    test('build does not race with a concurrent setStreamQualityFull',
+    test('late backend reconcile does not clobber concurrent user choice',
         () async {
-      // Regression for the prior fire-and-forget bug: the user changes
-      // quality before the build-time GET resolves. The late GET must not
-      // clobber the user's choice.
+      // Regression: the user changes quality while the post-build GET is
+      // still in flight. The late GET must not clobber the user's choice.
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
 
@@ -383,34 +420,65 @@ void main() {
         'http://localhost:8000',
         MockClient((req) async {
           if (req.method == 'PUT') return http.Response('{}', 200);
-          // GET resolves only when we release it.
           return getCompleter.future;
         }),
       );
-      // Long backend sync timeout so the GET stays pending while we test.
       SettingsNotifier.backendSyncTimeout = const Duration(seconds: 5);
 
       final container = _containerWith(prefs);
       addTearDown(container.dispose);
 
-      // Start build() but don't await it yet — kick it off.
-      final buildFuture = container.read(settingsProvider.future);
+      // build() publishes local prefs immediately.
+      final settings = await container.read(settingsProvider.future);
+      expect(settings.streamQuality, '256');
 
-      // While build() is awaiting the GET, the user picks "128" — the PUT
-      // succeeds and the in-memory state updates.
+      // User picks "128" before the build-time GET resolves.
       final notifier = container.read(settingsProvider.notifier);
       await notifier.setStreamQualityFull('128');
       expect(container.read(settingsProvider).value!.streamQuality, '128');
 
-      // Now the GET finally returns the OLD server value ("256"). In the
-      // old fire-and-forget code, this would clobber the user's "128".
+      // The build-time GET finally returns the OLD server value ("256").
       getCompleter.complete(qualityResponse('256'));
-      await buildFuture;
+      await notifier.debugBackendSyncDone;
 
-      // Because build() now awaits the GET as part of its return value
-      // (returning a merged snapshot) and the post-build user choice
-      // overwrites that snapshot, the user's choice survives.
+      // The user's choice survives — the reconcile detects the in-memory
+      // persistedStreamQuality moved off `initial` and aborts.
       expect(container.read(settingsProvider).value!.streamQuality, '128');
+    });
+
+    test('streamQualityProvider reflects local pref before backend resolves',
+        () async {
+      // Direct regression for issue #15: settings consumers must NOT see
+      // `original` while the backend sync is in flight.
+      SharedPreferences.setMockInitialValues({
+        'settings.streamQuality': '256',
+        'settings.downloadQuality': '320',
+      });
+      final prefs = await SharedPreferences.getInstance();
+      final getCompleter = Completer<http.Response>();
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) => getCompleter.future),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      // Backend still hanging — the providers must already reflect the
+      // cached prefs, not the `original` fallback.
+      expect(container.read(streamQualityProvider), '256');
+      expect(container.read(downloadQualityProvider), '320');
+
+      getCompleter.complete(http.Response(
+        jsonEncode({'quality': '192'}),
+        200,
+        headers: {'content-type': 'application/json'},
+      ));
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+      expect(container.read(streamQualityProvider), '192');
+      // Download quality is local-only — unaffected by the backend sync.
+      expect(container.read(downloadQualityProvider), '320');
     });
   });
 }
