@@ -257,7 +257,7 @@ class Database:
                 print("Migrating database to version 2: adding queue_sync_state table")
                 conn.execute(
                     'CREATE TABLE IF NOT EXISTS queue_sync_state ('
-                    '"session_id" TEXT PRIMARY KEY, '
+                    '"session_id" TEXT NOT NULL PRIMARY KEY, '
                     '"current_index" INTEGER NOT NULL, '
                     '"quality" TEXT NOT NULL, '
                     '"track_uuids" TEXT NOT NULL, '
@@ -270,7 +270,7 @@ class Database:
                 print("Migrating database to version 3: adding app_settings table")
                 conn.execute(
                     'CREATE TABLE IF NOT EXISTS app_settings ('
-                    'key TEXT PRIMARY KEY, '
+                    'key TEXT NOT NULL PRIMARY KEY, '
                     'value TEXT NOT NULL'
                     ')'
                 )

@@ -106,7 +106,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_albums USING fts5(
 );
 
 CREATE TABLE IF NOT EXISTS queue_sync_state (
-    "session_id" TEXT PRIMARY KEY,
+    "session_id" TEXT NOT NULL PRIMARY KEY,
     "current_index" INTEGER NOT NULL,
     "quality" TEXT NOT NULL,
     "track_uuids" TEXT NOT NULL,
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS queue_sync_state (
 );
 
 CREATE TABLE IF NOT EXISTS app_settings (
-    key   TEXT PRIMARY KEY,
+    key   TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
 );
 

@@ -108,6 +108,19 @@ class TestDatabaseInitialize:
         # have it without needing the v3 migration to run.
         assert "app_settings" in db_names
 
+        # Both single-text-PK tables must declare NOT NULL explicitly. SQLite
+        # treats a bare ``TEXT PRIMARY KEY`` as nullable (a historical quirk
+        # — only INTEGER PRIMARY KEY auto-rejects NULL), so without this an
+        # INSERT with NULL keys would succeed at the storage layer and only
+        # break later.
+        for table in ("queue_sync_state", "app_settings"):
+            cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            pk_cols = [c for c in cols if c["pk"] >= 1]
+            assert len(pk_cols) == 1, f"{table} should have a single PK column"
+            assert pk_cols[0]["notnull"] == 1, (
+                f"{table}.{pk_cols[0]['name']} must be declared NOT NULL"
+            )
+
         conn.close()
 
     def test_initialize__fresh_db__user_version_matches_latest_schema(
