@@ -154,7 +154,17 @@ class _SearchPageState extends ConsumerState<SearchPage> {
 
   @override
   Widget build(BuildContext context) {
-    ref.listen(downloadStatusVersionProvider, (_, _) => _patchDownloadStates());
+    ref.listen(downloadStatusVersionProvider, (_, _) {
+      // Online: just patch the existing rows with refreshed download fields.
+      // Offline: the visible result set is filtered by downloaded state, so
+      // a delete that removes the last downloaded match must re-run the FTS
+      // query — patching alone would leave the dead row on screen.
+      if (ref.read(offlineModeProvider)) {
+        _search();
+      } else {
+        _patchDownloadStates();
+      }
+    });
     ref.listen<bool>(offlineModeProvider, (prev, next) {
       if (prev != next) _search();
     });

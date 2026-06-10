@@ -95,6 +95,12 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     ref.listen<bool>(offlineModeProvider, (prev, next) {
       if (prev != next) refresh();
     });
+    // While offline, the downloaded-only filter is part of the query; a
+    // delete that removes the last downloaded item in the visible set must
+    // re-fetch from page 1 — without this the stale card stays on screen.
+    ref.listen(downloadStatusVersionProvider, (_, _) {
+      if (ref.read(offlineModeProvider)) refresh();
+    });
     final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
