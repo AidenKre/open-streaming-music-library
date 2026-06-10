@@ -14,6 +14,7 @@ import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
+import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class SearchPage extends ConsumerStatefulWidget {
@@ -167,6 +168,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
       appBar: AppBar(title: const Text('Search')),
       body: ListView(
         children: [
+          if (isOffline) const DownloadedOnlyBadge(),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: TextField(
@@ -192,9 +194,17 @@ class _SearchPageState extends ConsumerState<SearchPage> {
             ),
           ),
           if (_query.isNotEmpty && !hasResults && !_isSearching)
-            const Padding(
-              padding: EdgeInsets.all(32),
-              child: Center(child: Text('No results found')),
+            Padding(
+              padding: const EdgeInsets.all(32),
+              child: Center(
+                child: Text(
+                  isOffline
+                      ? 'No downloaded results match "$_query". '
+                          'Reconnect to the server to search the full library.'
+                      : 'No results found',
+                  textAlign: TextAlign.center,
+                ),
+              ),
             ),
           if (_artists.isNotEmpty) ...[
             _buildSectionHeader('Artists'),

@@ -10,6 +10,7 @@ import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
+import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
   final int? artistId;
@@ -120,6 +121,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
+        if (isOffline) const DownloadedOnlyBadge(),
         buildNewItemsBanner('albums'),
         Expanded(
           child: GridView.builder(

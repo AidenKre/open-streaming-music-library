@@ -11,6 +11,7 @@ import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
+import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
   /// True when rendered as a root tab inside [AppShell]; the page then owns
@@ -97,6 +98,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
+        if (isOffline) const DownloadedOnlyBadge(),
         buildNewItemsBanner('artists'),
         Expanded(
           child: GridView.builder(
