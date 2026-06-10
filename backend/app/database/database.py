@@ -1179,10 +1179,20 @@ class Database:
     ) -> None:
         try:
             with self._connection(commit=True) as conn:
+                # Conditional upsert: a late-arriving snapshot with an older
+                # updated_at must NOT clobber a newer one. INSERT OR REPLACE
+                # would happily overwrite — the ON CONFLICT WHERE clause keeps
+                # the existing row when the incoming updated_at is older.
                 conn.execute(
-                    "INSERT OR REPLACE INTO queue_sync_state "
+                    "INSERT INTO queue_sync_state "
                     "(session_id, current_index, quality, track_uuids, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET "
+                    "current_index = excluded.current_index, "
+                    "quality = excluded.quality, "
+                    "track_uuids = excluded.track_uuids, "
+                    "updated_at = excluded.updated_at "
+                    "WHERE excluded.updated_at >= queue_sync_state.updated_at",
                     (session_id, current_index, quality, track_uuids_json, updated_at),
                 )
         except Exception as e:

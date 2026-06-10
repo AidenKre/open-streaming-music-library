@@ -697,6 +697,48 @@ class TestDatabaseTombstones:
             assert row[0] > 1
 
 
+class TestUpsertQueueSyncState:
+    def test_upsert__newer_updated_at__overwrites(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        database.upsert_queue_sync_state("s1", 0, "320", '["a"]', 100.0)
+        database.upsert_queue_sync_state("s1", 5, "192", '["b","c"]', 200.0)
+
+        row = database.get_queue_sync_state("s1")
+        assert row is not None
+        assert row["current_index"] == 5
+        assert row["quality"] == "192"
+        assert row["track_uuids"] == '["b","c"]'
+        assert row["updated_at"] == 200.0
+
+    def test_upsert__older_updated_at__keeps_existing(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        database.upsert_queue_sync_state("s1", 5, "192", '["b","c"]', 200.0)
+        # A stale snapshot arriving late must not clobber the newer one.
+        database.upsert_queue_sync_state("s1", 0, "320", '["a"]', 100.0)
+
+        row = database.get_queue_sync_state("s1")
+        assert row is not None
+        assert row["current_index"] == 5
+        assert row["updated_at"] == 200.0
+
+    def test_upsert__equal_updated_at__overwrites(self, tmp_path: Path):
+        database = set_up_database(database_path=tmp_path / "database.db")
+        assert database.initialize()
+
+        database.upsert_queue_sync_state("s1", 0, "320", '["a"]', 100.0)
+        # Equal timestamps overwrite — the client may be replaying the same
+        # snapshot with corrected fields rather than a strictly newer one.
+        database.upsert_queue_sync_state("s1", 7, "192", '["b"]', 100.0)
+
+        row = database.get_queue_sync_state("s1")
+        assert row is not None
+        assert row["current_index"] == 7
+
+
 class TestDatabaseGetTracks:
     def test_get_tracks__db_not_initialized__returns_empty_list(self, tmp_path: Path):
         database_path = tmp_path / "database.db"
