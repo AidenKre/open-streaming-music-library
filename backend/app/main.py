@@ -49,7 +49,7 @@ from app.services import (
     ORIGINAL_QUALITY,
     normalize_quality,
 )
-from app.services.encoder_coordinator import EncodeResult
+from app.services.encoder_coordinator import EncodeResult, PrefetchOutcome
 
 
 @asynccontextmanager
@@ -882,12 +882,23 @@ def warm_tracks(request: WarmRequest):
     lookahead = settings.prefetch_lookahead
     start = request.current_index
     end = min(start + lookahead, len(request.track_uuids))
-    prefetch_count = 0
+    queued = 0
+    skipped = 0
     for i in range(start, end):
-        if coordinator.enqueue_prefetch(request.track_uuids[i], quality_canonical):
-            prefetch_count += 1
+        outcome = coordinator.enqueue_prefetch(
+            request.track_uuids[i], quality_canonical
+        )
+        if outcome == PrefetchOutcome.QUEUED:
+            queued += 1
+        elif outcome in (
+            PrefetchOutcome.ALREADY_CACHED,
+            PrefetchOutcome.SKIPPED_ORIGINAL,
+        ):
+            skipped += 1
 
-    return WarmResponse(accepted=True, prefetch_queued=prefetch_count)
+    return WarmResponse(
+        accepted=True, prefetch_queued=queued, prefetch_skipped=skipped
+    )
 
 
 @app.get("/settings/quality", response_model=QualitySettingResponse)

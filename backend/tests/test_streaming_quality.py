@@ -615,8 +615,38 @@ class TestWarmEndpoint:
             "track_uuids": [track.uuid_id],
         })
         assert r.status_code == 200
+        # Original-quality is a no-op for the encoder, so prefetch_queued must
+        # NOT count it — it goes to prefetch_skipped instead.
+        data = r.json()
+        assert data["prefetch_queued"] == 0
+        assert data["prefetch_skipped"] == 1
         coordinator._executor.shutdown(wait=True)
         assert encoded["calls"] == 0
+
+    def test_warm__already_cached__counted_as_skipped(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path)
+        coordinator = _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"CACHED" * 10
+        )
+
+        # First warm queues a real encode.
+        body = {
+            "session_id": "sess-1",
+            "current_index": 0,
+            "quality": "192",
+            "track_uuids": [track.uuid_id],
+        }
+        r = client.post("/tracks/warm", json=body)
+        assert r.status_code == 200
+        assert r.json()["prefetch_queued"] == 1
+        coordinator._executor.shutdown(wait=True)
+
+        # Second warm sees a cache hit — must NOT be counted as queued work.
+        r = client.post("/tracks/warm", json=body)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["prefetch_queued"] == 0
+        assert data["prefetch_skipped"] == 1
 
     def test_warm__too_many_uuids__rejected(self, client):
         uuids = [f"u-{i}" for i in range(501)]

@@ -40,7 +40,12 @@ class WarmRequest(BaseModel):
 
 class WarmResponse(BaseModel):
     accepted: bool
+    # Only background encodes that were actually scheduled. Cache hits and
+    # ORIGINAL_QUALITY pass-throughs count toward [prefetch_skipped], not
+    # this field — previously they were lumped in here, making metrics
+    # look like work happened when nothing was scheduled.
     prefetch_queued: int
+    prefetch_skipped: int = 0
 
 
 class QualitySettingResponse(BaseModel):

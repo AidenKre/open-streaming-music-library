@@ -24,6 +24,7 @@ New encodes always land in the cache that matches the quality:
   - otherwise                  → cache (stream cache, subject to LRU)
 """
 
+import enum
 import os
 import queue as _queue
 import threading
@@ -31,6 +32,20 @@ import uuid as uuid_lib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+
+class PrefetchOutcome(enum.Enum):
+    """Result of a single [EncoderCoordinator.enqueue_prefetch] call.
+
+    Distinguishes "really queued a background encode" from the no-op cases
+    (already cached, original-quality pass-through) so callers can report
+    accurate stats instead of overcounting work.
+    """
+
+    QUEUED = "queued"
+    ALREADY_CACHED = "already_cached"
+    SKIPPED_ORIGINAL = "skipped_original"
+    INVALID = "invalid"
 
 from app.services.encoded_cache import CACHE_FILE_SUFFIX, EncodedCache
 from app.services.metadata import get_audio_bitrate_kbps
@@ -313,24 +328,25 @@ class EncoderCoordinator:
         uuid_id: str,
         quality: str,
         source_bitrate_kbps: Optional[int] = None,
-    ) -> bool:
-        """Schedule a background encode. Returns False for invalid params.
+    ) -> "PrefetchOutcome":
+        """Schedule a background encode. Returns a [PrefetchOutcome] so
+        callers can distinguish "I actually queued work" from
+        "no-op because nothing was needed."
 
-        No-ops for ORIGINAL_QUALITY (no transcoding needed) or when the entry
-        already exists in cache. ``source_bitrate_kbps`` is threaded through to
-        the worker so it can skip transcoding for low-bitrate sources.
+        ``source_bitrate_kbps`` is threaded through to the worker so it can
+        skip transcoding for low-bitrate sources.
         """
         if quality == ORIGINAL_QUALITY:
-            return True
+            return PrefetchOutcome.SKIPPED_ORIGINAL
         if quality not in QUALITY_BITRATES_KBPS:
-            return False
+            return PrefetchOutcome.INVALID
         if self._has_cached(uuid_id, quality):
-            return True
+            return PrefetchOutcome.ALREADY_CACHED
         self._executor.submit(
             self._prefetch_one, uuid_id, quality, source_bitrate_kbps,
             priority=_PriorityPool.PRIORITY_HIGH,
         )
-        return True
+        return PrefetchOutcome.QUEUED
 
     def enqueue_prefetch_batch(
         self,
