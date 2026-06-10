@@ -544,9 +544,18 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
             track.metadata.codec or "", f"audio/{track.metadata.codec or 'octet-stream'}"
         )
 
+    # For passthrough/original responses, the source's own file extension is
+    # a better fallback than the literal string "audio" when the codec is not
+    # in [_MIME_EXTENSION] (e.g. opus, vorbis) — that name is what the client
+    # would have got had it downloaded the source directly.
+    extension = _MIME_EXTENSION.get(media_type)
+    if extension is None:
+        source_suffix = file_path.suffix.lstrip(".").lower() if not encode_result.transcoded else ""
+        extension = source_suffix or "audio"
+
     extra_headers = {
         "X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps),
-        "X-Audio-Extension": _MIME_EXTENSION.get(media_type, "audio"),
+        "X-Audio-Extension": extension,
     }
 
     # Open the cache file eagerly (before returning the StreamingResponse) so

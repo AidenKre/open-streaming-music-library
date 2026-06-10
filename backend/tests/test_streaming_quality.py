@@ -170,6 +170,28 @@ class TestStreamQuality:
             assert resp.headers["x-audio-extension"] == "flac"
             _ = b"".join(resp.iter_bytes())
 
+    def test_stream__passthrough_unknown_codec__uses_source_suffix(
+        self, client, tmp_path
+    ):
+        """Codec strings outside [_MIME_EXTENSION] (opus, vorbis, ...) used
+        to surface as ``X-Audio-Extension: audio`` because the lookup fell
+        through to a literal string fallback. The fix is to use the source
+        file's own suffix when the codec isn't mapped — that's what the
+        client would have got from a direct file download anyway."""
+        track = _add_track_with_file(
+            client, tmp_path, name="track.opus", codec="opus"
+        )
+        _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"FAKE" * 20
+        )
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream?quality=original"
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["x-audio-extension"] == "opus"
+            _ = b"".join(resp.iter_bytes())
+
     def test_stream__passthrough__serves_source_when_bitrate_below_requested(
         self, client, tmp_path
     ):
