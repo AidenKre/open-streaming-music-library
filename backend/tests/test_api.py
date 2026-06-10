@@ -313,6 +313,29 @@ class TestGetTracks:
         assert gettracksresponse.nextCursor is None
         assert len(gettracksresponse.data) == 0
 
+    def test_tracks__newer_than_zero__applied(self, client):
+        """``newer_than=0`` means "everything updated after epoch 0", i.e. a
+        full resync. A truthiness check would drop the parameter; the API
+        must use ``is not None`` so zero is honored as a valid bound."""
+        tracks = add_tracks_to_client(client=client, amount_to_add=3)
+
+        r = client.get("/tracks", params={"newer_than": 0})
+        assert r.status_code == 200, r.text
+        gotten = GetTracksResponse.model_validate(r.json()).data
+        assert sorted(t.uuid_id for t in gotten) == sorted(
+            t.uuid_id for t in tracks
+        )
+
+    def test_tracks__older_than_zero__excludes_all(self, client):
+        """``older_than=0`` is the symmetric boundary: ``last_updated <= 0``
+        excludes every real row since all of them have a positive timestamp."""
+        add_tracks_to_client(client=client, amount_to_add=3)
+
+        r = client.get("/tracks", params={"older_than": 0})
+        assert r.status_code == 200, r.text
+        gotten = GetTracksResponse.model_validate(r.json()).data
+        assert gotten == []
+
     def test_tracks__limit_offset__works(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=5)
 

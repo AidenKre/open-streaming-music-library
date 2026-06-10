@@ -253,13 +253,16 @@ def get_tracks(
         ]
         search_parameters = []
         row_filter_parameters = []
-        if newer_than:
+        # `is not None` rather than truthiness — a literal ``newer_than=0``
+        # means "give me everything updated after epoch 0", which is a valid
+        # full-resync query. A truthiness check would silently drop it.
+        if newer_than is not None:
             search_parameters.append(
                 SearchParameter(
                     column="last_updated", operator=">", value=str(newer_than)
                 )
             )
-        if older_than:
+        if older_than is not None:
             search_parameters.append(
                 SearchParameter(
                     column="last_updated", operator="<=", value=str(older_than)
