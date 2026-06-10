@@ -1023,14 +1023,28 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }) async {
     final vars = <Variable>[];
 
+    // When offline, the cover-art subquery must restrict candidate tracks to
+    // downloaded ones; otherwise the chosen `cover_art_id` may belong to a
+    // streaming-only track and resolving it requires a network round trip.
+    final coverArtSubquery = downloadedOnly
+        ? 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+            'WHERE tm.artist_id = artists.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'AND t.file_path IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1'
+        : 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'WHERE tm.artist_id = artists.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1';
+
     var query =
         'SELECT id, name, '
-        '(SELECT tm.cover_art_id FROM trackmetadata tm '
-        'WHERE tm.artist_id = artists.id '
-        'AND tm.has_album_art = 1 '
-        'AND tm.cover_art_id IS NOT NULL '
-        'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-        'LIMIT 1) AS cover_art_id '
+        '($coverArtSubquery) AS cover_art_id '
         'FROM artists';
 
     final whereClauses = <String>[];
@@ -1202,15 +1216,29 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }) {
     final vars = <Variable>[];
 
+    // See [getArtists] — when offline, restrict the cover-art subquery to
+    // tracks that are downloaded so the chosen `cover_art_id` resolves
+    // locally instead of triggering a streaming fallback.
+    final coverArtSubquery = downloadedOnly
+        ? 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+            'WHERE tm.album_id = a.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'AND t.file_path IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1'
+        : 'SELECT tm.cover_art_id FROM trackmetadata tm '
+            'WHERE tm.album_id = a.id '
+            'AND tm.has_album_art = 1 '
+            'AND tm.cover_art_id IS NOT NULL '
+            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+            'LIMIT 1';
+
     var sql =
         'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
         'a."year", a.is_single_grouping, '
-        '(SELECT tm.cover_art_id FROM trackmetadata tm '
-        'WHERE tm.album_id = a.id '
-        'AND tm.has_album_art = 1 '
-        'AND tm.cover_art_id IS NOT NULL '
-        'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-        'LIMIT 1) AS cover_art_id '
+        '($coverArtSubquery) AS cover_art_id '
         'FROM albums a '
         'JOIN artists ar ON a.artist_id = ar.id';
 

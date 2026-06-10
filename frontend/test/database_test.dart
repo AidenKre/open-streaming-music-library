@@ -1439,6 +1439,63 @@ void main() {
     });
 
     test(
+      'downloadedOnly restricts cover_art_id to downloaded tracks',
+      () async {
+        // Track 1 has the lowest track_number and has cover art, but is NOT
+        // downloaded. Track 2 has higher track_number, has different cover
+        // art, IS downloaded. Without the downloaded-only constraint on the
+        // cover-art subquery, an offline list would surface art belonging
+        // to a streaming-only track — and resolving that would require
+        // hitting the network.
+        await insertTrack(
+          db, uuid: 'tr-1', artist: 'Artist', album: 'Album',
+          year: 2020, trackNumber: 1,
+        );
+        await insertTrack(
+          db, uuid: 'tr-2', artist: 'Artist', album: 'Album',
+          year: 2020, trackNumber: 2,
+        );
+        await db.customUpdate(
+          'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 11 '
+          'WHERE uuid_id = ?',
+          variables: [Variable.withString('tr-1')],
+          updates: {db.trackmetadata},
+        );
+        await db.customUpdate(
+          'UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 22 '
+          'WHERE uuid_id = ?',
+          variables: [Variable.withString('tr-2')],
+          updates: {db.trackmetadata},
+        );
+        // Only track 2 is downloaded.
+        await db.customUpdate(
+          "UPDATE tracks SET file_path = '/tmp/tr-2.audio' WHERE uuid_id = ?",
+          variables: [Variable.withString('tr-2')],
+          updates: {db.tracks},
+        );
+
+        final unfiltered = await db.getAlbums(
+          artistId: artistIdFor('Artist'),
+        );
+        final unfilteredRegular = unfiltered
+            .where((r) => r.read<int>('is_single_grouping') == 0)
+            .toList();
+        // Without the filter, lowest track_number (tr-1) wins → 11.
+        expect(unfilteredRegular.first.readNullable<int>('cover_art_id'), 11);
+
+        final downloadedOnly = await db.getAlbums(
+          artistId: artistIdFor('Artist'),
+          downloadedOnly: true,
+        );
+        final downloadedRegular = downloadedOnly
+            .where((r) => r.read<int>('is_single_grouping') == 0)
+            .toList();
+        // With the filter, tr-1 is ineligible (not downloaded) → tr-2's 22.
+        expect(downloadedRegular.first.readNullable<int>('cover_art_id'), 22);
+      },
+    );
+
+    test(
       'ignores tracks with has_album_art=false even if cover_art_id set',
       () async {
         await insertTrack(
