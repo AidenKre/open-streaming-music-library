@@ -357,12 +357,27 @@ class Database:
             raise
 
     def clear_cover_art_references(self, cover_art_id: int) -> None:
-        """Set cover_art_id to NULL on all trackmetadata rows referencing this cover art."""
+        """Set cover_art_id to NULL on all trackmetadata rows referencing this cover art.
+
+        Also bumps ``tracks.last_updated`` for the affected rows so the
+        frontend's incremental sync sees the change — without this a
+        cover-art removal would never propagate to a client that synced
+        before the next "real" metadata edit.
+        """
         with self._connection(commit=True) as conn:
+            affected = conn.execute(
+                "SELECT uuid_id FROM trackmetadata WHERE cover_art_id = ?",
+                (cover_art_id,),
+            ).fetchall()
             conn.execute(
                 "UPDATE trackmetadata SET cover_art_id = NULL WHERE cover_art_id = ?",
                 (cover_art_id,),
             )
+            for row in affected:
+                conn.execute(
+                    "UPDATE tracks SET last_updated = unixepoch() WHERE uuid_id = ?",
+                    (row["uuid_id"],),
+                )
 
     def delete_cover_art(self, cover_art_id: int) -> bool:
         try:
@@ -396,13 +411,24 @@ class Database:
             return []
 
     def update_track_cover_art_id(self, uuid_id: str, cover_art_id: int) -> bool:
-        """Set cover_art_id for a specific track identified by uuid_id."""
+        """Set cover_art_id for a specific track identified by uuid_id.
+
+        Also bumps ``tracks.last_updated`` so the frontend's incremental
+        sync sees the cover-art assignment — without it, a backfill-only
+        change would never appear in a ``GET /tracks?newer_than=...`` page.
+        """
         try:
             with self._connection(commit=True) as conn:
                 cursor = conn.execute(
                     "UPDATE trackmetadata SET cover_art_id = ? WHERE uuid_id = ?",
                     (cover_art_id, uuid_id),
                 )
+                if cursor.rowcount > 0:
+                    conn.execute(
+                        "UPDATE tracks SET last_updated = unixepoch() "
+                        "WHERE uuid_id = ?",
+                        (uuid_id,),
+                    )
                 return cursor.rowcount > 0
         except Exception as e:
             print(f"Failed to update cover_art_id for track {uuid_id}: {e}")

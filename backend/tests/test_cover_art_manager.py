@@ -636,3 +636,36 @@ class TestUpdateTrackCoverArtId:
         result = db.update_track_cover_art_id("nonexistent-uuid", 1)
 
         assert result is False
+
+    def test_update_bumps_tracks_last_updated(self, tmp_path: Path):
+        """Cover-art backfill is a metadata-only change. Without bumping
+        ``tracks.last_updated`` the frontend's ``newer_than`` sync would
+        never see the assignment."""
+        import time
+        from app.models.track import Track
+        from app.models.track_meta_data import TrackMetaData
+
+        db = _create_database(tmp_path)
+        cover_art_id = db.insert_cover_art(
+            sha256="art_sha", phash="abc123", phash_prefix="abc1",
+            file_path=str(tmp_path / "art.jpg"),
+        )
+
+        metadata = TrackMetaData(
+            title="Song", artist="Artist", codec="mp3", duration=100.0,
+            bitrate_kbps=128.0, sample_rate_hz=44100, channels=2,
+            has_album_art=True,
+        )
+        track = Track(file_path=tmp_path / "song.mp3", metadata=metadata)
+        db.add_track(track)
+        original = db.get_tracks()[0].last_updated
+        # Force at least one second elapsed so unixepoch() advances. The
+        # add_track call set last_updated to the current second; without
+        # this sleep an immediate cover_art assignment could land in the
+        # same epoch second and the bump would be invisible.
+        time.sleep(1.1)
+
+        assert db.update_track_cover_art_id(track.uuid_id, cover_art_id) is True
+
+        bumped = db.get_tracks()[0].last_updated
+        assert bumped > original
