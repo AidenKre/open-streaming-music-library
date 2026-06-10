@@ -166,9 +166,17 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     required Map<String, String> replacements,
   }) async {
     final existingByUuid = {for (final j in _queue.state.jobs) j.uuidId: j};
+    // Tracks both pre-existing queued/active jobs AND uuids already added in
+    // this batch. Without this, a duplicate uuid in [tracks] would mint a
+    // second job writing the same partial/destination path as the first.
+    final seenUuids = <String>{
+      for (final j in _queue.state.jobs)
+        if (j.isQueued || j.isActive) j.uuidId,
+    };
     final additions = <DownloadJob>[];
 
     for (final t in tracks) {
+      if (seenUuids.contains(t.uuidId)) continue;
       final replaces = replacements[t.uuidId];
       // Fresh (non-replacement) jobs skip when a file is already on disk;
       // replacement jobs deliberately keep going — that's the whole point.
@@ -181,6 +189,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       if (existing != null && (existing.isQueued || existing.isActive)) {
         continue;
       }
+      seenUuids.add(t.uuidId);
       additions.add(
         DownloadJob(
           uuidId: t.uuidId,

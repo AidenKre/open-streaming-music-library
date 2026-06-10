@@ -556,6 +556,27 @@ void main() {
     await _waitForFinish(manager);
   });
 
+  test('enqueueTracks dedupes the same uuid within one batch', () async {
+    await _insertTrack(db, 'abc');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracks(
+      [_track('abc'), _track('abc'), _track('abc')],
+      quality: '320',
+    );
+
+    expect(
+      manager.snapshot(),
+      hasLength(1),
+      reason: 'duplicate uuids in a single batch must collapse to one job — '
+          'otherwise two workers would race on the same partial path',
+    );
+    await _waitForFinish(manager);
+  });
+
   test('skips tracks already downloaded', () async {
     final existingPath = p.join(tempDir.path, 'existing.audio');
     await File(existingPath).writeAsBytes([9, 9]);
