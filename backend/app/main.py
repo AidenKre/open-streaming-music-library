@@ -222,6 +222,16 @@ def get_tracks(
 ):
     database: Database = cast(Database, app.state.database)
 
+    # ``album_id`` is only meaningful when paired with ``artist_id`` — the
+    # query layer rejects album-only filters because album IDs are not
+    # globally unique across artists. Reject at the API boundary so the
+    # client gets a clear 422 instead of a 500 from a deeper layer.
+    if album_id is not None and artist_id is None and not cursor:
+        raise HTTPException(
+            status_code=422,
+            detail="album_id requires artist_id",
+        )
+
     # Capture the original (uncursored) request shape so we can decide
     # whether this call is an unscoped sync — only unscoped, first-page
     # requests are allowed to return tombstones (see Issue #8 for why

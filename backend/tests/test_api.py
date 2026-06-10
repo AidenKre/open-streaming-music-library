@@ -127,6 +127,15 @@ class TestGetTracks:
         r = client.get(f"/tracks?cursor={json.dumps(bad_cursor)}")
         assert r.status_code == 400, r.text
 
+    def test_tracks__album_id_without_artist_id__rejected(self, client):
+        """album_id is meaningful only when paired with artist_id (album IDs
+        are not globally unique across artists). The query layer used to
+        500 in this case; the API should reject it as 422 instead."""
+        add_tracks_to_client(client=client, amount_to_add=3)
+        r = client.get("/tracks", params={"album_id": 1})
+        assert r.status_code == 422, r.text
+        assert "album_id" in r.text and "artist_id" in r.text
+
     def test_tracks__full_library_cursor_logic__works(self, client):
         tracks = []
 
