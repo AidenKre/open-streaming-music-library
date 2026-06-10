@@ -9,7 +9,7 @@ class OfflineBanner extends StatelessWidget {
     return Material(
       color: colors.error,
       child: SafeArea(
-        bottom: false,
+        top: false,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           child: Row(

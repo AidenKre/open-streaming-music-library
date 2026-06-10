@@ -197,7 +197,6 @@ class _AppShellState extends ConsumerState<AppShell> {
       child: Scaffold(
         body: Column(
           children: [
-            if (isOffline) const OfflineBanner(),
             Expanded(
               child: IndexedStack(
                 index: _tabIndex,
@@ -215,6 +214,7 @@ class _AppShellState extends ConsumerState<AppShell> {
                 ],
               ),
             ),
+            if (isOffline) const OfflineBanner(),
             const MiniPlayer(),
           ],
         ),
