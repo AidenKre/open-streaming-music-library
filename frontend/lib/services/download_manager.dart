@@ -66,6 +66,16 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   late final DownloadStatusReader _status;
   bool _disposed = false;
 
+  /// Nulls every column that marks a track as downloaded. Kept in one place so
+  /// adding a downloaded-state column can't leave a row half-cleared. Must stay
+  /// in sync with the columns [TrackDownloader] writes on a successful commit.
+  static const _clearedDownloadColumns = TracksCompanion(
+    filePath: Value(null),
+    downloadedBitrateKbps: Value(null),
+    fileSizeBytes: Value(null),
+    downloadedQuality: Value(null),
+  );
+
   /// Test seam fired immediately before the partial→destination rename. Lets a
   /// test deterministically interleave [resetAndDeleteFiles] with the commit
   /// step so the rename-race fix can be regressed. Forwards to the inner
@@ -342,14 +352,8 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
         } catch (_) {}
       }
     }
-    await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuidId))).write(
-      const TracksCompanion(
-        filePath: Value(null),
-        downloadedBitrateKbps: Value(null),
-        fileSizeBytes: Value(null),
-        downloadedQuality: Value(null),
-      ),
-    );
+    await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuidId)))
+        .write(_clearedDownloadColumns);
     _status.bumpVersion();
   }
 
@@ -383,18 +387,9 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       }
     }
 
-    // 3. Null out all file_paths in a single transaction.
-    await _db.transaction(() async {
-      for (final uuid in uuidList) {
-        await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuid)))
-            .write(const TracksCompanion(
-          filePath: Value(null),
-          downloadedBitrateKbps: Value(null),
-          fileSizeBytes: Value(null),
-          downloadedQuality: Value(null),
-        ));
-      }
-    });
+    // 3. Null out the downloaded-state columns for all uuids in one statement.
+    await (_db.update(_db.tracks)..where((t) => t.uuidId.isIn(uuidList)))
+        .write(_clearedDownloadColumns);
 
     _status.bumpVersion();
   }

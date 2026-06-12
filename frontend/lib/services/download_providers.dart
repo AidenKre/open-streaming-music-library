@@ -73,43 +73,65 @@ final downloadStatusVersionProvider = StreamProvider<int>((ref) {
   return controller.stream;
 });
 
-/// True iff any queued/active jobs belong to the given album.
-final albumIsDownloadingProvider = Provider.family<bool, int>((ref, albumId) {
+/// True iff any queued/active job belongs to the scope picked by [scopeId]
+/// (e.g. `(j) => j.albumId`). One implementation shared by the album/artist
+/// variants so a fix can't land in one and miss the other.
+bool _isDownloading(Ref ref, int id, int? Function(DownloadJob) scopeId) {
   final manager = ref.watch(downloadManagerListenableProvider);
-  return manager.state.jobs.any(
-      (j) => j.albumId == albumId && (j.isQueued || j.isActive));
-});
+  return manager.state.jobs
+      .any((j) => scopeId(j) == id && (j.isQueued || j.isActive));
+}
+
+/// True iff any queued/active jobs belong to the given album.
+final albumIsDownloadingProvider = Provider.family<bool, int>(
+  (ref, albumId) => _isDownloading(ref, albumId, (j) => j.albumId),
+);
 
 /// True iff any queued/active jobs belong to the given artist.
-final artistIsDownloadingProvider = Provider.family<bool, int>((ref, artistId) {
-  final manager = ref.watch(downloadManagerListenableProvider);
-  return manager.state.jobs.any(
-      (j) => j.artistId == artistId && (j.isQueued || j.isActive));
+final artistIsDownloadingProvider = Provider.family<bool, int>(
+  (ref, artistId) => _isDownloading(ref, artistId, (j) => j.artistId),
+);
+
+/// Download counts for every album, batched into ONE grouped query and
+/// recomputed once per download-status change. Cards read their own slice via
+/// [albumDownloadCountsProvider] instead of each issuing its own query.
+final _albumDownloadCountsMapProvider =
+    FutureProvider<Map<int, ({int total, int downloaded})>>((ref) async {
+  ref.watch(downloadStatusVersionProvider);
+  return ref.watch(databaseProvider).getAllAlbumDownloadCounts();
 });
+
+final _artistDownloadCountsMapProvider =
+    FutureProvider<Map<int, ({int total, int downloaded})>>((ref) async {
+  ref.watch(downloadStatusVersionProvider);
+  return ref.watch(databaseProvider).getAllArtistDownloadCounts();
+});
+
+({int downloaded, int total}) _sliceCounts(
+  Map<int, ({int total, int downloaded})> map,
+  int id,
+) {
+  final entry = map[id];
+  return (downloaded: entry?.downloaded ?? 0, total: entry?.total ?? 0);
+}
 
 /// DB-backed (downloaded, total) counts for an album; refreshes on each
-/// completed/deleted download.
+/// completed/deleted download. Backed by the batched map provider.
 final albumDownloadCountsProvider =
-    FutureProvider.family<({int downloaded, int total}), int>(
-        (ref, albumId) async {
-  ref.watch(downloadStatusVersionProvider);
-  final db = ref.watch(databaseProvider);
-  final counts = await db.getAlbumDownloadCounts([albumId]);
-  final entry = counts[albumId];
-  return (downloaded: entry?.downloaded ?? 0, total: entry?.total ?? 0);
-});
+    Provider.family<AsyncValue<({int downloaded, int total})>, int>(
+  (ref, albumId) => ref
+      .watch(_albumDownloadCountsMapProvider)
+      .whenData((map) => _sliceCounts(map, albumId)),
+);
 
 /// DB-backed (downloaded, total) counts for an artist; refreshes on each
-/// completed/deleted download.
+/// completed/deleted download. Backed by the batched map provider.
 final artistDownloadCountsProvider =
-    FutureProvider.family<({int downloaded, int total}), int>(
-        (ref, artistId) async {
-  ref.watch(downloadStatusVersionProvider);
-  final db = ref.watch(databaseProvider);
-  final counts = await db.getArtistDownloadCounts([artistId]);
-  final entry = counts[artistId];
-  return (downloaded: entry?.downloaded ?? 0, total: entry?.total ?? 0);
-});
+    Provider.family<AsyncValue<({int downloaded, int total})>, int>(
+  (ref, artistId) => ref
+      .watch(_artistDownloadCountsMapProvider)
+      .whenData((map) => _sliceCounts(map, artistId)),
+);
 
 // ── Sealed DownloadScope + unified entry points ─────────────────────────
 // Shared across albums_page, artist_page, search_page, tracks_page, and

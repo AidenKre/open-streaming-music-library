@@ -359,6 +359,50 @@ void main() {
     OrderParameter(column: 'uuid_id'),
   ];
 
+  group('download counts', () {
+    Future<void> markDownloaded(String uuid) async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+          .write(TracksCompanion(filePath: Value('/local/$uuid')));
+    }
+
+    test('getAllAlbumDownloadCounts groups every album in one query', () async {
+      final (_, albumA) =
+          await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
+      await insertTrack(db, uuid: 'a2', artist: 'A', album: 'AL');
+      final (_, albumB) =
+          await insertTrack(db, uuid: 'b1', artist: 'B', album: 'BL');
+      await markDownloaded('a1');
+
+      final counts = await db.getAllAlbumDownloadCounts();
+      expect(counts[albumA!]!.total, 2);
+      expect(counts[albumA]!.downloaded, 1);
+      expect(counts[albumB!]!.total, 1);
+      expect(counts[albumB]!.downloaded, 0);
+    });
+
+    test('getAllAlbumDownloadCounts matches the per-id query', () async {
+      final (_, albumA) =
+          await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
+      await markDownloaded('a1');
+
+      final all = await db.getAllAlbumDownloadCounts();
+      final scoped = await db.getAlbumDownloadCounts([albumA!]);
+      expect(all[albumA], scoped[albumA]);
+    });
+
+    test('getAllArtistDownloadCounts groups every artist', () async {
+      final (artistA, _) =
+          await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
+      await insertTrack(db, uuid: 'a2', artist: 'A', album: 'AL');
+      await markDownloaded('a1');
+      await markDownloaded('a2');
+
+      final counts = await db.getAllArtistDownloadCounts();
+      expect(counts[artistA!]!.total, 2);
+      expect(counts[artistA]!.downloaded, 2);
+    });
+  });
+
   group('getTracks', () {
     test('getTracksByUuids preserves caller order', () async {
       await insertTrack(

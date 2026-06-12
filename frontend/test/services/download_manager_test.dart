@@ -168,6 +168,37 @@ void main() {
     }
   }
 
+  test('deleteDownloadsForUuids clears every download column for all uuids',
+      () async {
+    await _insertTrack(db, 'a',
+        filePath: p.join(tempDir.path, 'a.mp3'),
+        downloadedBitrateKbps: 320,
+        downloadedQuality: '320');
+    await _insertTrack(db, 'b',
+        filePath: p.join(tempDir.path, 'b.mp3'),
+        downloadedBitrateKbps: 256,
+        downloadedQuality: '256');
+    // file_size_bytes isn't covered by _insertTrack — set it so we can assert
+    // it is cleared too.
+    await (db.update(db.tracks)..where((t) => t.uuidId.isIn(['a', 'b'])))
+        .write(const TracksCompanion(fileSizeBytes: Value(1000)));
+
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1], 200)),
+    );
+    await manager.deleteDownloadsForUuids(['a', 'b']);
+
+    for (final uuid in ['a', 'b']) {
+      final row = await (db.select(db.tracks)
+            ..where((t) => t.uuidId.equals(uuid)))
+          .getSingle();
+      expect(row.filePath, isNull, reason: '$uuid file_path');
+      expect(row.downloadedBitrateKbps, isNull, reason: '$uuid bitrate');
+      expect(row.fileSizeBytes, isNull, reason: '$uuid size');
+      expect(row.downloadedQuality, isNull, reason: '$uuid quality');
+    }
+  });
+
   test('enqueueTracks rejects invalid quality', () async {
     final manager = buildManager(
       client: MockClient((_) async => http.Response.bytes([1], 200)),

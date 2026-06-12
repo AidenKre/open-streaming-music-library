@@ -41,7 +41,7 @@ Widget buildCard(
       // Keep the card isolated — don't build the real download-manager graph.
       artistIsDownloadingProvider.overrideWith((ref, artistId) => false),
       artistDownloadCountsProvider.overrideWith(
-        (ref, artistId) async => effectiveCounts,
+        (ref, artistId) => AsyncData(effectiveCounts),
       ),
       offlineModeProvider.overrideWith(() => _StubOffline(offline)),
     ],

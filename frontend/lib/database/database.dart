@@ -1155,45 +1155,52 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   /// is "fully downloaded" iff `downloaded == total && total > 0`.
   Future<Map<int, ({int total, int downloaded})>> getAlbumDownloadCounts(
     Iterable<int> albumIds,
-  ) async {
-    final ids = albumIds.toSet().toList(growable: false);
-    if (ids.isEmpty) return const {};
-    final placeholders = List.filled(ids.length, '?').join(', ');
-    final rows = await customSelect(
-      'SELECT tm.album_id AS aid, COUNT(*) AS total, '
-      'SUM(CASE WHEN t.file_path IS NOT NULL THEN 1 ELSE 0 END) AS downloaded '
-      'FROM trackmetadata tm '
-      'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-      'WHERE tm.album_id IN ($placeholders) '
-      'GROUP BY tm.album_id',
-      variables: ids.map(Variable.withInt).toList(),
-      readsFrom: {trackmetadata, tracks},
-    ).get();
-    return {
-      for (final r in rows)
-        r.read<int>('aid'): (
-          total: r.read<int>('total'),
-          downloaded: r.read<int>('downloaded'),
-        ),
-    };
-  }
+  ) => _downloadCountsByColumn('album_id', albumIds);
 
-  /// Same as above but per artist. Used by ArtistCard to show a "downloaded"
-  /// badge when ALL of the artist's tracks have been downloaded.
+  /// Same as [getAlbumDownloadCounts] but per artist. Used by ArtistCard to
+  /// show a "downloaded" badge when ALL of the artist's tracks are downloaded.
   Future<Map<int, ({int total, int downloaded})>> getArtistDownloadCounts(
     Iterable<int> artistIds,
+  ) => _downloadCountsByColumn('artist_id', artistIds);
+
+  /// Download counts for every album in one grouped query. Lets the UI batch
+  /// all visible album cards into a single read instead of one query per card.
+  Future<Map<int, ({int total, int downloaded})>> getAllAlbumDownloadCounts() =>
+      _downloadCountsByColumn('album_id', null);
+
+  /// Download counts for every artist in one grouped query.
+  Future<Map<int, ({int total, int downloaded})>>
+      getAllArtistDownloadCounts() =>
+          _downloadCountsByColumn('artist_id', null);
+
+  /// Grouped (total, downloaded) track counts by [groupColumn]. When [ids] is
+  /// null, counts every (non-null) group; otherwise restricts to [ids].
+  /// [groupColumn] is a hardcoded internal literal ('album_id'/'artist_id') —
+  /// never user input — so interpolating it is safe.
+  Future<Map<int, ({int total, int downloaded})>> _downloadCountsByColumn(
+    String groupColumn,
+    Iterable<int>? ids,
   ) async {
-    final ids = artistIds.toSet().toList(growable: false);
-    if (ids.isEmpty) return const {};
-    final placeholders = List.filled(ids.length, '?').join(', ');
+    final String whereClause;
+    final List<Variable> variables;
+    if (ids == null) {
+      whereClause = 'WHERE tm.$groupColumn IS NOT NULL ';
+      variables = const [];
+    } else {
+      final list = ids.toSet().toList(growable: false);
+      if (list.isEmpty) return const {};
+      final placeholders = List.filled(list.length, '?').join(', ');
+      whereClause = 'WHERE tm.$groupColumn IN ($placeholders) ';
+      variables = list.map(Variable.withInt).toList();
+    }
     final rows = await customSelect(
-      'SELECT tm.artist_id AS aid, COUNT(*) AS total, '
+      'SELECT tm.$groupColumn AS aid, COUNT(*) AS total, '
       'SUM(CASE WHEN t.file_path IS NOT NULL THEN 1 ELSE 0 END) AS downloaded '
       'FROM trackmetadata tm '
       'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-      'WHERE tm.artist_id IN ($placeholders) '
-      'GROUP BY tm.artist_id',
-      variables: ids.map(Variable.withInt).toList(),
+      '$whereClause'
+      'GROUP BY tm.$groupColumn',
+      variables: variables,
       readsFrom: {trackmetadata, tracks},
     ).get();
     return {

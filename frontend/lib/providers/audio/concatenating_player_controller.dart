@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:developer' as developer;
-import 'dart:io';
 
 import 'package:just_audio/just_audio.dart' as ja;
 
@@ -289,12 +288,20 @@ class ConcatenatingPlayerController {
     }
   }
 
-  _SourceKind _sourceKindFor(QueuePlaybackEntry entry) {
+  /// Whether [entry] should play from a local file. Decided purely from the
+  /// DB-provided `file_path`: the DownloadReconciliationService is the single
+  /// authority for whether a downloaded file is present (it nulls stale paths
+  /// on startup and on every app resume), and app-initiated deletes null the
+  /// path synchronously. Trusting it keeps this off the event loop — the old
+  /// per-build/per-transition `File.existsSync()` blocked the isolate and could
+  /// misclassify a present file as a stream on a transient stat failure.
+  bool _hasLocalFile(QueuePlaybackEntry entry) {
     final localPath = entry.filePath;
-    if (localPath != null && localPath.isNotEmpty && File(localPath).existsSync()) {
-      return _SourceKind.file;
-    }
-    return _SourceKind.stream;
+    return localPath != null && localPath.isNotEmpty;
+  }
+
+  _SourceKind _sourceKindFor(QueuePlaybackEntry entry) {
+    return _hasLocalFile(entry) ? _SourceKind.file : _SourceKind.stream;
   }
 
   Future<void> seekToItem(int itemId, {Duration position = Duration.zero}) {
@@ -414,11 +421,10 @@ class ConcatenatingPlayerController {
   }
 
   ja.AudioSource _sourceForEntry(QueuePlaybackEntry entry) {
-    final localPath = entry.filePath;
-    if (localPath != null && File(localPath).existsSync()) {
+    if (_hasLocalFile(entry)) {
       // Local file is always served verbatim — quality preset doesn't apply.
       return ja.AudioSource.uri(
-        Uri.file(localPath),
+        Uri.file(entry.filePath!),
         tag: entry.itemId,
       );
     }
@@ -472,8 +478,7 @@ class ConcatenatingPlayerController {
 
   bool _isIndexLocallyPlayable(int index) {
     if (index < 0 || index >= _loadedEntries.length) return false;
-    final path = _loadedEntries[index].filePath;
-    return path != null && path.isNotEmpty && File(path).existsSync();
+    return _hasLocalFile(_loadedEntries[index]);
   }
 
   Future<void> _runStructuralMutation(
