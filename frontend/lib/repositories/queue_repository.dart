@@ -253,15 +253,31 @@ class QueueRepository {
     if (session == null) return null;
 
     final totalCount = await _countItems(sessionId);
-    final currentItem = session.currentItemId == null
+    var currentItem = session.currentItemId == null
         ? null
         : await getPlaybackEntryForItem(sessionId, session.currentItemId!);
+
+    // current_item_id may be null (no current track yet) or dangle at a track
+    // that was tombstone-deleted server-side (the INNER JOIN on tracks then
+    // resolves it to null). Fall back to the first surviving entry so a queue
+    // with remaining tracks stays restorable instead of resolving to null.
+    if (currentItem == null && totalCount > 0) {
+      currentItem = await getFirstPlayableEntry(sessionId);
+    }
 
     return QueueSessionSnapshot(
       session: session,
       totalCount: totalCount,
       currentItem: currentItem,
     );
+  }
+
+  /// The lowest-play-position entry whose track row still exists. Used as a
+  /// recovery fallback when a session's `current_item_id` is null or points at
+  /// a deleted track.
+  Future<QueuePlaybackEntry?> getFirstPlayableEntry(int sessionId) async {
+    final entries = await getPlaybackEntries(sessionId, limit: 1);
+    return entries.isEmpty ? null : entries.first;
   }
 
   Future<List<QueuePlaybackEntry>> getPlaybackEntries(

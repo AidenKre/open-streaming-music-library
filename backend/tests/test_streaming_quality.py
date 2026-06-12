@@ -246,6 +246,41 @@ class TestStreamQuality:
         r = client.get(f"/tracks/{track.uuid_id}/stream?quality=999")
         assert r.status_code == 422, r.text
 
+    def test_stream__missing_source_file__returns_404_original(
+        self, client, tmp_path
+    ):
+        # Track row exists but its source file is gone: the client must get a
+        # 404 (drop it) rather than a 500 (retry forever).
+        track = _add_track_with_file(client, tmp_path)
+        track.file_path.unlink()
+        r = client.get(f"/tracks/{track.uuid_id}/stream?quality=original")
+        assert r.status_code == 404, r.text
+
+    def test_stream__missing_source_file__returns_404_transcode(
+        self, client, tmp_path
+    ):
+        track = _add_track_with_file(client, tmp_path)
+        _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"FAKE-ENCODED" * 10
+        )
+        track.file_path.unlink()
+        r = client.get(f"/tracks/{track.uuid_id}/stream?quality=192")
+        assert r.status_code == 404, r.text
+
+    def test_stream__transcode_failure__returns_500(self, client, tmp_path):
+        # A genuine encode failure (source present) is still a 500, not a 404.
+        track = _add_track_with_file(client, tmp_path)
+
+        def _failing_transcode(src, dst, bitrate):
+            return False
+
+        coordinator = _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"x" * 10
+        )
+        coordinator.transcode_fn = _failing_transcode
+        r = client.get(f"/tracks/{track.uuid_id}/stream?quality=192")
+        assert r.status_code == 500, r.text
+
     def test_stream__quality_uses_cache_on_repeat(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
         encode_count = {"n": 0}
@@ -733,6 +768,61 @@ class TestWarmEndpoint:
 
         # track1 should NOT be prefetched (before current_index).
         assert not client.app.state.encoded_cache.has(track1.uuid_id, "192")
+        assert client.app.state.encoded_cache.has(track2.uuid_id, "192")
+        assert client.app.state.encoded_cache.has(track3.uuid_id, "192")
+
+    def test_warm__without_count__limited_to_lookahead(
+        self, client, tmp_path, monkeypatch
+    ):
+        # Default behavior: only `prefetch_lookahead` uuids from current_index
+        # are warmed.
+        import app.main as app_main
+
+        monkeypatch.setattr(app_main.settings, "prefetch_lookahead", 1)
+        track1 = _add_track_with_file(client, tmp_path, name="t1.mp3")
+        track2 = _add_track_with_file(client, tmp_path, name="t2.mp3")
+        track3 = _add_track_with_file(client, tmp_path, name="t3.mp3")
+
+        coordinator = _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"ENC" * 30
+        )
+        r = client.post("/tracks/warm", json={
+            "current_index": 0,
+            "quality": "192",
+            "track_uuids": [track1.uuid_id, track2.uuid_id, track3.uuid_id],
+        })
+        assert r.status_code == 200
+        coordinator._executor.shutdown(wait=True)
+
+        assert client.app.state.encoded_cache.has(track1.uuid_id, "192")
+        assert not client.app.state.encoded_cache.has(track2.uuid_id, "192")
+        assert not client.app.state.encoded_cache.has(track3.uuid_id, "192")
+
+    def test_warm__count_warms_full_batch(
+        self, client, tmp_path, monkeypatch
+    ):
+        # The download-driven path passes count=len(uuids) so every queued
+        # download is warmed, even when it exceeds prefetch_lookahead.
+        import app.main as app_main
+
+        monkeypatch.setattr(app_main.settings, "prefetch_lookahead", 1)
+        track1 = _add_track_with_file(client, tmp_path, name="t1.mp3")
+        track2 = _add_track_with_file(client, tmp_path, name="t2.mp3")
+        track3 = _add_track_with_file(client, tmp_path, name="t3.mp3")
+
+        coordinator = _install_fake_coordinator(
+            client, payload_for_quality=lambda br: b"ENC" * 30
+        )
+        r = client.post("/tracks/warm", json={
+            "current_index": 0,
+            "quality": "192",
+            "count": 3,
+            "track_uuids": [track1.uuid_id, track2.uuid_id, track3.uuid_id],
+        })
+        assert r.status_code == 200
+        coordinator._executor.shutdown(wait=True)
+
+        assert client.app.state.encoded_cache.has(track1.uuid_id, "192")
         assert client.app.state.encoded_cache.has(track2.uuid_id, "192")
         assert client.app.state.encoded_cache.has(track3.uuid_id, "192")
 

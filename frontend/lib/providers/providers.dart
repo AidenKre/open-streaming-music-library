@@ -175,6 +175,30 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         i + chunkSize > uuids.length ? uuids.length : i + chunkSize,
       );
       await db.transaction(() async {
+        // The play_order rows and queue_sessions.current_item_id /
+        // resume_main_item_id reference queue_session_items by item_id. SQLite
+        // FK enforcement is off (no PRAGMA foreign_keys), so the
+        // QueueSessionPlayOrder cascade does not fire and current_item_id has
+        // no FK at all — both must be cleaned up explicitly before the items
+        // are deleted, or a saved session can be left pointing at a deleted
+        // track and become unrestorable.
+        final placeholders = List.filled(chunk.length, '?').join(', ');
+        final itemIdSubquery =
+            'SELECT item_id FROM queue_session_items WHERE uuid_id IN ($placeholders)';
+        await db.customStatement(
+          'DELETE FROM queue_session_play_order WHERE item_id IN ($itemIdSubquery)',
+          chunk,
+        );
+        await db.customStatement(
+          'UPDATE queue_sessions SET current_item_id = NULL '
+          'WHERE current_item_id IN ($itemIdSubquery)',
+          chunk,
+        );
+        await db.customStatement(
+          'UPDATE queue_sessions SET resume_main_item_id = NULL '
+          'WHERE resume_main_item_id IN ($itemIdSubquery)',
+          chunk,
+        );
         await (db.delete(
           db.queueSessionItems,
         )..where((t) => t.uuidId.isIn(chunk))).go();

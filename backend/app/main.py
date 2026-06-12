@@ -49,7 +49,11 @@ from app.services import (
     ORIGINAL_QUALITY,
     normalize_quality,
 )
-from app.services.encoder_coordinator import EncodeResult, PrefetchOutcome
+from app.services.encoder_coordinator import (
+    EncodeResult,
+    PrefetchOutcome,
+    SourceUnavailable,
+)
 
 
 @asynccontextmanager
@@ -537,9 +541,20 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     source_bitrate = int(track.metadata.bitrate_kbps or 0) or None
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    encode_result: Optional[EncodeResult] = coordinator.encode_for_stream(
-        uuid_id, quality_canonical, source_bitrate_kbps=source_bitrate
-    )
+    try:
+        encode_result: Optional[EncodeResult] = coordinator.encode_for_stream(
+            uuid_id,
+            quality_canonical,
+            source_bitrate_kbps=source_bitrate,
+            source_path=track.file_path,
+        )
+    except SourceUnavailable:
+        # Track row exists but its source file is gone — 404 so clients drop it
+        # instead of retrying a permanently-missing file as if it were transient.
+        raise HTTPException(
+            status_code=404,
+            detail=f"Source file for track {uuid_id} is no longer available",
+        )
     if encode_result is None:
         raise HTTPException(
             status_code=500,
@@ -901,9 +916,9 @@ def warm_tracks(request: WarmRequest):
         )
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    lookahead = settings.prefetch_lookahead
+    window = request.count if request.count is not None else settings.prefetch_lookahead
     start = request.current_index
-    end = min(start + lookahead, len(request.track_uuids))
+    end = min(start + window, len(request.track_uuids))
     queued = 0
     skipped = 0
     for i in range(start, end):

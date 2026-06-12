@@ -61,6 +61,14 @@ TranscodeFn = Callable[[Path, Path, int], bool]
 AllUuidsFn = Callable[[], list[str]]
 
 
+class SourceUnavailable(Exception):
+    """The track's source file could not be resolved or no longer exists.
+
+    Distinct from a transcode failure (which returns ``None``): callers can map
+    this to a 404 ("the source is gone, stop retrying") instead of a 500.
+    """
+
+
 @dataclass(frozen=True)
 class EncodeResult:
     """Outcome of encode_for_stream.
@@ -249,22 +257,29 @@ class EncoderCoordinator:
         uuid_id: str,
         quality: str,
         source_bitrate_kbps: Optional[int] = None,
+        source_path: Optional[Path] = None,
     ) -> Optional[EncodeResult]:
         """Return an EncodeResult for streaming, transcoding if needed.
 
-        Returns None when the source can't be found or transcoding fails.
+        Raises :class:`SourceUnavailable` when the source file can't be found or
+        no longer exists; returns ``None`` only when transcoding fails.
 
         ``source_bitrate_kbps`` is an optional hint used to skip transcoding
         when the source is already at or below the requested bitrate. Callers
         with the value in hand (e.g. from the DB) should pass it; background
         workers can pass None and the coordinator will ffprobe the source file.
 
+        ``source_path`` lets callers that already hold the source path (e.g. the
+        streaming endpoint, which just queried the track row) skip the redundant
+        ``source_lookup`` DB query. Background workers pass None and fall back to
+        ``source_lookup``.
+
         ORIGINAL_QUALITY always returns the source file directly.
         """
         if quality == ORIGINAL_QUALITY:
-            source = self.source_lookup(uuid_id)
+            source = source_path or self.source_lookup(uuid_id)
             if source is None or not source.exists():
-                return None
+                raise SourceUnavailable(uuid_id)
             return EncodeResult(
                 path=source,
                 bitrate_kbps=source_bitrate_kbps or 0,
@@ -292,9 +307,9 @@ class EncoderCoordinator:
             if cached is not None:
                 return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
 
-            source = self.source_lookup(uuid_id)
+            source = source_path or self.source_lookup(uuid_id)
             if source is None or not source.exists():
-                return None
+                raise SourceUnavailable(uuid_id)
 
             # Resolve source bitrate: use caller-supplied hint if available,
             # otherwise ffprobe. Runs inside the lock so we probe at most once

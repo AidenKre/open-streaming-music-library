@@ -73,6 +73,52 @@ void main() {
   );
 
   test(
+    'getSessionSnapshot falls back to first entry when current_item_id is null',
+    () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['a', 'b', 'c'],
+        currentIndex: 1,
+      );
+
+      await db.customStatement(
+        'UPDATE queue_sessions SET current_item_id = NULL WHERE id = ?',
+        [sessionId],
+      );
+
+      final snapshot = await repo.getSessionSnapshot(sessionId);
+      expect(snapshot!.totalCount, 3);
+      expect(snapshot.currentItem, isNotNull);
+      expect(snapshot.currentItem!.uuidId, 'a');
+    },
+  );
+
+  test(
+    'getSessionSnapshot recovers when current_item_id points at a deleted track',
+    () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['a', 'b', 'c'],
+        currentIndex: 0,
+      );
+
+      // Drop the current track's row (as a tombstone sync would). The INNER
+      // JOIN on tracks then resolves current_item_id to null; the snapshot must
+      // recover to the first surviving entry rather than returning null.
+      await db.customStatement("DELETE FROM tracks WHERE uuid_id = 'a'");
+
+      final entry = await repo.getFirstPlayableEntry(sessionId);
+      expect(entry!.uuidId, 'b');
+
+      final snapshot = await repo.getSessionSnapshot(sessionId);
+      expect(snapshot!.currentItem, isNotNull);
+      expect(snapshot.currentItem!.uuidId, 'b');
+    },
+  );
+
+  test(
     'replacePlayOrder changes effective order without rewriting canonical order',
     () async {
       await fixture.insertAlbum(

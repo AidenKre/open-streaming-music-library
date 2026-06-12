@@ -1,15 +1,25 @@
 import 'dart:convert';
 
+import 'package:drift/drift.dart' show Variable;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/queue_repository.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
+  final row = await db.customSelect(
+    'SELECT COUNT(*) AS c FROM queue_session_play_order WHERE session_id = ?',
+    variables: [Variable.withInt(sessionId)],
+  ).getSingle();
+  return row.read<int>('c');
+}
 
 Map<String, dynamic> _minimalMetadataJson() => {
   'duration': 0.0,
@@ -441,6 +451,77 @@ void main() {
         "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Keep\"*'",
       ).get();
       expect(keepFts.length, 1, reason: 'Surviving track must remain in FTS');
+    });
+
+    test(
+        'tombstone delete repairs queue sessions pointing at the deleted track',
+        () async {
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          return Response(
+            jsonEncode({
+              'data': [
+                _richTrackJson('uuid-keep',
+                    title: 'Keep', artist: 'A', album: 'AL',
+                    artistId: 10, albumId: 100, createdAt: 1000),
+                _richTrackJson('uuid-drop',
+                    title: 'Drop', artist: 'B', album: 'BL',
+                    artistId: 11, albumId: 101, createdAt: 1000),
+              ],
+              'nextCursor': null,
+            }),
+            200,
+          );
+        }),
+      );
+
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+
+      // Build a queue session whose CURRENT item is the track about to be
+      // tombstone-deleted.
+      final queueRepo = QueueRepository(db);
+      final sessionId = await queueRepo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['uuid-keep', 'uuid-drop'],
+        currentIndex: 1,
+      );
+      final before = await queueRepo.getSessionSnapshot(sessionId);
+      expect(before!.currentItem!.uuidId, 'uuid-drop');
+      expect(await _playOrderCount(db, sessionId), 2);
+
+      // Delete-sync removes uuid-drop.
+      SharedPreferences.setMockInitialValues({});
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          return Response(
+            jsonEncode({
+              'data': <Map<String, dynamic>>[],
+              'nextCursor': null,
+              'deleted_uuids': ['uuid-drop'],
+            }),
+            200,
+          );
+        }),
+      );
+      await notifier.sync();
+
+      // The play_order row for the deleted item is gone (no orphan), the
+      // session's current_item_id no longer dangles, and the snapshot recovers
+      // to the surviving track instead of resolving to null.
+      expect(await _playOrderCount(db, sessionId), 1);
+      final sessionRow = await (db.select(db.queueSessions)
+            ..where((s) => s.id.equals(sessionId)))
+          .getSingle();
+      expect(sessionRow.currentItemId, isNull);
+
+      final after = await queueRepo.getSessionSnapshot(sessionId);
+      expect(after!.totalCount, 1);
+      expect(after.currentItem!.uuidId, 'uuid-keep');
     });
 
     test(

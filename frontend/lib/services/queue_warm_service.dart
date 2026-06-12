@@ -30,6 +30,11 @@ class QueueWarmService {
   // each other. They're logically independent flows.
   Timer? _queueWarmTimer;
   Timer? _uuidsWarmTimer;
+  // Uuids pending a download-driven warm, accumulated across the debounce
+  // window and keyed by quality. Using a set (insertion-ordered) coalesces
+  // duplicates without dropping earlier batches when calls arrive in quick
+  // succession.
+  final Map<String, Set<String>> _pendingWarmUuids = {};
 
   QueueWarmService({
     required QueueRepository queueRepo,
@@ -91,13 +96,24 @@ class QueueWarmService {
 
   /// Directly warm [trackUuids] at [quality] without going through the queue.
   /// Used by the download manager to pre-transcode queued downloads on the server.
-  /// Debounced — rapid calls within the debounce window are coalesced.
+  /// Debounced — rapid calls within the window accumulate (per quality) so no
+  /// earlier batch is dropped.
   void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {
     if (trackUuids.isEmpty) return;
+    _pendingWarmUuids.putIfAbsent(quality, () => <String>{}).addAll(trackUuids);
     _uuidsWarmTimer?.cancel();
-    _uuidsWarmTimer = Timer(_debounce, () {
-      unawaited(_warmUuids(trackUuids, quality: quality));
-    });
+    _uuidsWarmTimer = Timer(_debounce, _flushWarmUuids);
+  }
+
+  void _flushWarmUuids() {
+    if (_pendingWarmUuids.isEmpty) return;
+    final batches = Map<String, Set<String>>.from(_pendingWarmUuids);
+    _pendingWarmUuids.clear();
+    for (final entry in batches.entries) {
+      unawaited(
+        _warmUuids(entry.value.toList(growable: false), quality: entry.key),
+      );
+    }
   }
 
   Future<void> _warmUuids(
@@ -106,6 +122,7 @@ class QueueWarmService {
   }) async {
     if (trackUuids.isEmpty) return;
     if (_isOfflineFn()) return;
+    final capped = trackUuids.take(_maxTrackUuids).toList(growable: false);
     try {
       await _apiClient.postJson(
         ['tracks', 'warm'],
@@ -115,8 +132,11 @@ class QueueWarmService {
           // risked colliding with a real session id.
           'session_id': null,
           'current_index': 0,
+          // Warm the whole batch, not just the server's default look-ahead
+          // window — every queued download should be pre-transcoded.
+          'count': capped.length,
           'quality': quality,
-          'track_uuids': trackUuids.take(_maxTrackUuids).toList(),
+          'track_uuids': capped,
         },
       );
     } on ApiException catch (e) {
@@ -129,6 +149,7 @@ class QueueWarmService {
   void dispose() {
     _queueWarmTimer?.cancel();
     _uuidsWarmTimer?.cancel();
+    _pendingWarmUuids.clear();
   }
 }
 

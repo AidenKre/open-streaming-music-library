@@ -36,6 +36,11 @@ class WarmRequest(BaseModel):
     current_index: int = Field(ge=0)
     quality: str
     track_uuids: List[str]
+    # How many uuids (from current_index) to warm. Defaults to the server's
+    # prefetch_lookahead window (the queue look-ahead use case). The
+    # download-driven path passes the full batch length so every queued
+    # download is warmed, not just the first look-ahead window.
+    count: Optional[int] = Field(default=None, ge=1)
 
 
 class WarmResponse(BaseModel):

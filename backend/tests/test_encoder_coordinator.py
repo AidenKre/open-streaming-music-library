@@ -19,7 +19,8 @@ from pathlib import Path
 import pytest
 
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
-from app.services.encoder_coordinator import EncoderCoordinator
+from app.services.encoder_coordinator import EncoderCoordinator, SourceUnavailable
+from app.services.transcoder import ORIGINAL_QUALITY
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -336,13 +337,36 @@ class TestKeyLockDedup:
         )
         assert c.encode_for_stream("uuid-fail", "192", source_bitrate_kbps=500) is None
 
-    def test_missing_source_returns_none(self, tmp_path):
+    def test_missing_source_raises_source_unavailable(self, tmp_path):
         c = _make_coordinator(tmp_path, default_quality="192")
         c.source_lookup = lambda _: None
-        assert (
+        with pytest.raises(SourceUnavailable):
             c.encode_for_stream("uuid-missing", "192", source_bitrate_kbps=500)
-            is None
+
+    def test_original_quality_missing_source_raises(self, tmp_path):
+        c = _make_coordinator(tmp_path, default_quality="192")
+        c.source_lookup = lambda _: None
+        with pytest.raises(SourceUnavailable):
+            c.encode_for_stream("uuid-missing", ORIGINAL_QUALITY)
+
+    def test_source_path_skips_source_lookup(self, tmp_path):
+        """When the caller supplies source_path, the redundant source_lookup DB
+        query must not run (hot streaming-endpoint path)."""
+        c = _make_coordinator(tmp_path, default_quality="192")
+        calls = {"n": 0}
+
+        def _lookup(_):
+            calls["n"] += 1
+            return None
+
+        c.source_lookup = _lookup
+        src = tmp_path / "source.mp3"
+        r = c.encode_for_stream(
+            "uuid-direct", "128", source_bitrate_kbps=64, source_path=src
         )
+        assert r is not None
+        assert r.transcoded is False
+        assert calls["n"] == 0
 
     def test_transcode_raises_propagates_and_releases_lock(self, tmp_path):
         """A raising transcode must NOT leave the per-key lock held — the

@@ -202,6 +202,9 @@ void main() {
       expect(capturedBody?['session_id'], isNull);
       expect(capturedBody?['quality'], '256');
       expect(capturedBody?['track_uuids'], ['uuid-1', 'uuid-2']);
+      // count tells the backend to warm the whole batch, not just its default
+      // look-ahead window.
+      expect(capturedBody?['count'], 2);
     });
 
     test('respects the 50-UUID cap', () async {
@@ -221,10 +224,13 @@ void main() {
       expect((capturedBody!['track_uuids'] as List).length, 50);
     });
 
-    test('debounces rapid calls into a single POST', () async {
+    test('debounces rapid calls into one POST that accumulates all uuids',
+        () async {
       var postCount = 0;
-      _installMockClient(MockClient((_) async {
+      Map<String, dynamic>? capturedBody;
+      _installMockClient(MockClient((req) async {
         postCount++;
+        capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
         return http.Response('', 204);
       }));
       final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
@@ -236,6 +242,46 @@ void main() {
 
       await Future<void>.delayed(const Duration(milliseconds: 700));
       expect(postCount, 1);
+      // Earlier batches must NOT be dropped — all three uuids are warmed.
+      expect(capturedBody?['track_uuids'], ['a', 'b', 'c']);
+      expect(capturedBody?['count'], 3);
+    });
+
+    test('dedupes repeated uuids across rapid calls', () async {
+      Map<String, dynamic>? capturedBody;
+      _installMockClient(MockClient((req) async {
+        capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['a', 'b'], quality: '128');
+      service.scheduleWarmUuids(['b', 'c'], quality: '128');
+
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      expect(capturedBody?['track_uuids'], ['a', 'b', 'c']);
+    });
+
+    test('accumulated uuids at different qualities fire one POST each',
+        () async {
+      final captured = <Map<String, dynamic>>[];
+      _installMockClient(MockClient((req) async {
+        captured.add(jsonDecode(req.body) as Map<String, dynamic>);
+        return http.Response('', 204);
+      }));
+      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      addTearDown(service.dispose);
+
+      service.scheduleWarmUuids(['a'], quality: '128');
+      service.scheduleWarmUuids(['b'], quality: '256');
+
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      expect(captured.length, 2);
+      final lo = captured.firstWhere((b) => b['quality'] == '128');
+      final hi = captured.firstWhere((b) => b['quality'] == '256');
+      expect(lo['track_uuids'], ['a']);
+      expect(hi['track_uuids'], ['b']);
     });
 
     test('swallows POST errors', () async {
