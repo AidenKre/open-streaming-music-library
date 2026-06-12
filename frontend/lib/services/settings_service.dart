@@ -51,6 +51,7 @@ class AppSettings {
     String? temporaryStreamQuality,
     QualityChangeKind? streamQualityChangeKind,
     bool clearTemporary = false,
+    bool clearStreamQualityChangeKind = false,
   }) {
     return AppSettings(
       persistedStreamQuality:
@@ -58,8 +59,9 @@ class AppSettings {
       downloadQuality: downloadQuality ?? this.downloadQuality,
       temporaryStreamQuality:
           clearTemporary ? null : (temporaryStreamQuality ?? this.temporaryStreamQuality),
-      streamQualityChangeKind:
-          streamQualityChangeKind ?? this.streamQualityChangeKind,
+      streamQualityChangeKind: clearStreamQualityChangeKind
+          ? null
+          : (streamQualityChangeKind ?? this.streamQualityChangeKind),
     );
   }
 
@@ -127,8 +129,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       if (current.persistedStreamQuality != initial.persistedStreamQuality) {
         return;
       }
+      // A backend reconcile is a silent sync — clear any pending change-kind so
+      // the AudioCoordinator's streamQualityProvider listener doesn't mistake
+      // it for a user-initiated full/temporary change and rebuild the playlist.
       state = AsyncData(
-        current.copyWith(persistedStreamQuality: reconciled.persistedStreamQuality),
+        current.copyWith(
+          persistedStreamQuality: reconciled.persistedStreamQuality,
+          clearStreamQualityChangeKind: true,
+        ),
       );
     } finally {
       if (!_syncDone.isCompleted) _syncDone.complete();
@@ -185,6 +193,15 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     }
   }
 
+  /// Current settings, or the default fallback when state hasn't loaded yet.
+  /// Shared by the mutators so the fallback construction lives in one place.
+  AppSettings get _current =>
+      state.value ??
+      const AppSettings(
+        persistedStreamQuality: _defaultQuality,
+        downloadQuality: _defaultQuality,
+      );
+
   /// Sends [quality] to the backend so the server warms all tracks at the new
   /// default. On success, persists to SharedPreferences and updates state.
   /// On PUT failure, updates in-memory state (so the UI reflects the user's
@@ -217,13 +234,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       await prefs.setString(_streamQualityKey, quality);
     }
 
-    final current = state.value ??
-        AppSettings(
-          persistedStreamQuality: _defaultQuality,
-          downloadQuality: _defaultQuality,
-        );
     state = AsyncData(
-      current.copyWith(
+      _current.copyWith(
         persistedStreamQuality: quality,
         streamQualityChangeKind: QualityChangeKind.full,
         clearTemporary: true,
@@ -237,13 +249,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     if (!isValidQuality(quality)) {
       throw ArgumentError('invalid stream quality: $quality');
     }
-    final current = state.value ??
-        AppSettings(
-          persistedStreamQuality: _defaultQuality,
-          downloadQuality: _defaultQuality,
-        );
     state = AsyncData(
-      current.copyWith(
+      _current.copyWith(
         temporaryStreamQuality: quality,
         streamQualityChangeKind: QualityChangeKind.temporary,
       ),
@@ -256,12 +263,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     }
     final prefs = await ref.read(sharedPreferencesProvider.future);
     await prefs.setString(_downloadQualityKey, quality);
-    final current = state.value ??
-        AppSettings(
-          persistedStreamQuality: _defaultQuality,
-          downloadQuality: _defaultQuality,
-        );
-    state = AsyncData(current.copyWith(downloadQuality: quality));
+    state = AsyncData(_current.copyWith(downloadQuality: quality));
   }
 }
 

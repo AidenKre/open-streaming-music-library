@@ -79,23 +79,13 @@ class WorkerPool {
     _fencedUuids.add(uuidId);
     try {
       _queue.removeJob(uuidId);
-      final canceller = _activeCancellers[uuidId];
-      if (canceller != null) {
-        try {
-          await canceller();
-        } catch (_) {}
-      }
-      final worker = _activeWorkers[uuidId];
-      if (worker != null) {
-        await worker;
-      }
+      await _cancelAndAwait([uuidId]);
     } finally {
       _fencedUuids.remove(uuidId);
     }
   }
 
-  /// Bulk variant of [fenceUuid] that cancels every active worker first so
-  /// the awaits below run in parallel rather than serialised one-at-a-time.
+  /// Bulk variant of [fenceUuid].
   Future<void> fenceUuids(Iterable<String> uuids) async {
     final list = uuids.toList(growable: false);
     if (list.isEmpty) return;
@@ -104,21 +94,7 @@ class WorkerPool {
       for (final uuid in list) {
         _queue.removeJob(uuid);
       }
-      for (final uuid in list) {
-        final canceller = _activeCancellers[uuid];
-        if (canceller != null) {
-          try {
-            await canceller();
-          } catch (_) {}
-        }
-      }
-      final workers = [
-        for (final uuid in list)
-          if (_activeWorkers[uuid] != null) _activeWorkers[uuid]!,
-      ];
-      if (workers.isNotEmpty) {
-        await Future.wait(workers);
-      }
+      await _cancelAndAwait(list);
     } finally {
       _fencedUuids.removeAll(list);
     }
@@ -130,21 +106,7 @@ class WorkerPool {
   Future<void> reset() async {
     _resetGeneration++;
 
-    final workerSnapshot = Map<String, Future<void>>.from(_activeWorkers);
-    final cancellableUuids = _activeCancellers.keys.toList(growable: false);
-    for (final uuid in cancellableUuids) {
-      try {
-        await _activeCancellers[uuid]?.call();
-      } catch (_) {}
-    }
-
-    final cancellableWorkers = [
-      for (final uuid in cancellableUuids)
-        if (workerSnapshot[uuid] != null) workerSnapshot[uuid]!,
-    ];
-    if (cancellableWorkers.isNotEmpty) {
-      await Future.wait(cancellableWorkers);
-    }
+    await _cancelAndAwait(_activeCancellers.keys.toList(growable: false));
 
     _activeCount = 0;
     _activeCancellers.clear();
@@ -152,6 +114,31 @@ class WorkerPool {
 
     await _downloader.deleteKnownDownloadedFiles();
     await _downloader.deleteDownloadDirectory();
+  }
+
+  /// Cancels the in-flight canceller (if any) for each uuid, then awaits the
+  /// matching active workers in parallel. Cancelling ALL workers before
+  /// awaiting any is the load-bearing ordering: awaiting one worker before
+  /// cancelling the rest would serialise the teardown. Workers are snapshotted
+  /// up front because a worker completing mid-call mutates [_activeWorkers].
+  Future<void> _cancelAndAwait(Iterable<String> uuids) async {
+    final list = uuids.toList(growable: false);
+    if (list.isEmpty) return;
+    final workers = [
+      for (final uuid in list)
+        if (_activeWorkers[uuid] != null) _activeWorkers[uuid]!,
+    ];
+    for (final uuid in list) {
+      final canceller = _activeCancellers[uuid];
+      if (canceller != null) {
+        try {
+          await canceller();
+        } catch (_) {}
+      }
+    }
+    if (workers.isNotEmpty) {
+      await Future.wait(workers);
+    }
   }
 
   Future<void> _runJob(String uuidId, int generation) async {

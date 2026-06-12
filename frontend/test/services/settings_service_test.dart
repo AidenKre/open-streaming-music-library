@@ -323,6 +323,30 @@ void main() {
       expect(prefs.getString('settings.streamQuality'), '128');
     });
 
+    test('backend reconcile leaves streamQualityChangeKind null (no rebuild)',
+        () async {
+      // A silent backend sync must not look like a user change-kind, or the
+      // AudioCoordinator would rebuild the whole playlist on startup.
+      SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
+      final prefs = await SharedPreferences.getInstance();
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async => qualityResponse('128')),
+      );
+
+      final container = _containerWith(prefs);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+
+      expect(container.read(settingsProvider).value!.streamQuality, '128');
+      expect(
+        container.read(settingsProvider).value!.streamQualityChangeKind,
+        isNull,
+      );
+    });
+
     test('backend timeout leaves AppSettings on the cached pref, not loading',
         () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '320'});
