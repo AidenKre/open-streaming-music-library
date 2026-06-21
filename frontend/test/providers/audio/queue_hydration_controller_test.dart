@@ -284,6 +284,7 @@ class _LibraryFixture {
       'uuid_id': uuid,
       'created_at': 1700000000 + trackNumber,
       'last_updated': 1700000100 + trackNumber,
+      'revision': 1700000000 + trackNumber,
       'metadata': {
         'title': 'Track $uuid',
         'artist': artist,

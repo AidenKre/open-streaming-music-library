@@ -107,10 +107,11 @@ Map<String, dynamic> _richMetadataJson({
   'cover_art_id': coverArtId,
 };
 
-Map<String, dynamic> _trackJson(String uuid) => {
+Map<String, dynamic> _trackJson(String uuid, {int revision = 1}) => {
   'uuid_id': uuid,
   'created_at': 1000,
   'last_updated': 2000,
+  'revision': revision,
   'metadata': _minimalMetadataJson(),
 };
 
@@ -128,6 +129,7 @@ Map<String, dynamic> _richTrackJson(
   'uuid_id': uuid,
   'created_at': createdAt,
   'last_updated': createdAt,
+  'revision': createdAt,
   'metadata': _richMetadataJson(
     title: title,
     artist: artist,
@@ -242,6 +244,46 @@ void main() {
 
         final prefs = await SharedPreferences.getInstance();
         expect(prefs.getInt(SyncService.lastRevisionKey), 2);
+      },
+    );
+
+    test(
+      'upsert stores the per-track revision from the payload, and a later '
+      'upsert overwrites it',
+      () async {
+        var call = 0;
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            call++;
+            // The envelope revision (sync watermark) is deliberately set
+            // different from the track-payload revision so this proves the
+            // stored value comes from the payload, not the envelope.
+            if (call == 1) {
+              return _changesResponse([
+                _upsert(1, _trackJson('uuid-1', revision: 7)),
+              ]);
+            }
+            return _changesResponse([
+              _upsert(2, _trackJson('uuid-1', revision: 9)),
+            ]);
+          }),
+        );
+
+        final c = createContainer();
+        await waitForBuild(c);
+
+        await c.read(trackSyncProvider.notifier).sync();
+        final afterFirst = await (db.select(
+          db.tracks,
+        )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
+        expect(afterFirst.revision, 7);
+
+        await c.read(trackSyncProvider.notifier).sync();
+        final afterSecond = await (db.select(
+          db.tracks,
+        )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
+        expect(afterSecond.revision, 9);
       },
     );
 

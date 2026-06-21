@@ -33,6 +33,7 @@ Map<String, dynamic> _trackJson(String uuid, Map<String, dynamic> metadata) => {
   'uuid_id': uuid,
   'created_at': 1700000000,
   'last_updated': 1700001000,
+  'revision': 42,
   'metadata': metadata,
 };
 
@@ -124,6 +125,7 @@ void main() {
       expect(dto.uuidId, 'abc-123');
       expect(dto.createdAt, 1700000000);
       expect(dto.lastUpdated, 1700001000);
+      expect(dto.revision, 42);
     });
 
     test('parses nested metadata', () {

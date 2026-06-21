@@ -51,6 +51,11 @@ class Tracks extends Table {
   TextColumn get filePath => text().nullable()();
   IntColumn get createdAt => integer()();
   IntColumn get lastUpdated => integer()();
+  // Monotonic per-track revision from the server, written on every `/changes`
+  // upsert. The conflict-detection base for edits (Option A). Nullable only
+  // for migration: rows that predate this column read NULL = "unknown base"
+  // until their next upsert. The server never sends null.
+  IntColumn get revision => integer().nullable()();
   // Bitrate of the file actually stored on disk. Null until a download
   // completes. May differ from trackmetadata.bitrate_kbps when downloaded at
   // a lower quality than the server source (e.g. 128 kbps download from a
@@ -640,7 +645,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 5;
+  int get schemaVersion => 6;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -669,6 +674,13 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       if (from < 5) {
         await customStatement(
           'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
+        );
+      }
+      if (from < 6) {
+        // Existing rows get NULL = "unknown base"; they pick up a real
+        // revision on their next `/changes` upsert.
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN revision INTEGER',
         );
       }
     },
@@ -1583,6 +1595,9 @@ TracksCompanion tracksCompanionFromDto(ClientTrackDto dto) {
     uuidId: Value(dto.uuidId),
     createdAt: Value(dto.createdAt),
     lastUpdated: Value(dto.lastUpdated),
+    revision: Value(dto.revision),
+    // `filePath` is local download state, never owned by the server, so leave
+    // it absent — the `/changes` upsert must not clobber it.
     filePath: Value.absent(),
   );
 }

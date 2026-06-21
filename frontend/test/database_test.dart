@@ -11,6 +11,7 @@ Map<String, dynamic> _trackJson({
   'uuid_id': uuid,
   'created_at': 1700000000,
   'last_updated': 1700001000,
+  'revision': 1,
   'metadata': metadata ?? _fullMetadataJson(),
 };
 
@@ -164,6 +165,7 @@ void main() {
         'uuid_id': 'round-trip-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {
           'title': 'Test Song',
           'artist': 'Test Artist',
@@ -297,6 +299,7 @@ void main() {
       'uuid_id': uuid,
       'created_at': 1700000000,
       'last_updated': 1700001000,
+      'revision': 1,
       'metadata': {
         if (title != null) 'title': title,
         if (artist != null) 'artist': artist,
@@ -1883,6 +1886,7 @@ void main() {
         'uuid_id': 'cover-art-test-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {..._fullMetadataJson(), 'cover_art_id': 7},
       });
 
@@ -1901,6 +1905,7 @@ void main() {
         'uuid_id': 'no-cover-art-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': _minimalMetadataJson(),
       });
 
@@ -1926,6 +1931,7 @@ void main() {
         'uuid_id': 'cover-select-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {
           ..._fullMetadataJson(),
           'artist_id': artistId,
@@ -1949,6 +1955,7 @@ void main() {
         'uuid_id': 'cover-select-null-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': _minimalMetadataJson(),
       });
 
@@ -2073,7 +2080,7 @@ void main() {
           "VALUES ('uuid-1', '/tmp/foo.audio', 1700000000, 1700000000, 256)",
         );
 
-        // Apply the v4 and v5 upgrades exactly as the MigrationStrategy
+        // Apply the v4, v5, and v6 upgrades exactly as the MigrationStrategy
         // would. Keep this list in sync with AppDatabase.migration.
         await db.customStatement(
           'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
@@ -2081,13 +2088,17 @@ void main() {
         await db.customStatement(
           'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
         );
+        await db.customStatement(
+          'ALTER TABLE tracks ADD COLUMN revision INTEGER',
+        );
 
         // Pre-migration row must still be intact and the new columns must
-        // exist and be readable.
+        // exist and be readable. `revision` is NULL on a row that predates
+        // it = "unknown base" (Option A) until the row's next /changes upsert.
         final rows = await db
             .customSelect(
               'SELECT uuid_id, file_path, downloaded_bitrate_kbps, '
-              'file_size_bytes, downloaded_quality FROM tracks',
+              'file_size_bytes, downloaded_quality, revision FROM tracks',
             )
             .get();
         expect(rows, hasLength(1));
@@ -2096,19 +2107,22 @@ void main() {
         expect(rows.first.read<int?>('downloaded_bitrate_kbps'), 256);
         expect(rows.first.read<int?>('file_size_bytes'), isNull);
         expect(rows.first.read<String?>('downloaded_quality'), isNull);
+        expect(rows.first.read<int?>('revision'), isNull);
 
         // The new columns must also be writable.
         await db.customStatement(
           "UPDATE tracks SET file_size_bytes = 1024, "
-          "downloaded_quality = '320' WHERE uuid_id = 'uuid-1'",
+          "downloaded_quality = '320', revision = 42 WHERE uuid_id = 'uuid-1'",
         );
         final updated = await db
             .customSelect(
-              'SELECT file_size_bytes, downloaded_quality FROM tracks',
+              'SELECT file_size_bytes, downloaded_quality, revision '
+              'FROM tracks',
             )
             .getSingle();
         expect(updated.read<int>('file_size_bytes'), 1024);
         expect(updated.read<String>('downloaded_quality'), '320');
+        expect(updated.read<int>('revision'), 42);
       },
     );
   });
