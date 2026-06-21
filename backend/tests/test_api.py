@@ -1277,7 +1277,10 @@ class TestPatchTrack:
         )
         assert r.status_code == 422, r.text
 
-    def test_patch__db_and_master__501_until_slice_4(self, client):
+    def test_patch__db_and_master__missing_master_degrades_to_db_only(self, client):
+        # The test track's file_path is a placeholder that doesn't exist on
+        # disk, so db_and_master degrades to DB-only: the edit applies but the
+        # response reports the master was not written.
         track = self._add_one(client)
         r = client.patch(
             f"/tracks/{track.uuid_id}",
@@ -1287,4 +1290,7 @@ class TestPatchTrack:
                 "title": "X",
             },
         )
-        assert r.status_code == 501, r.text
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["master_written"] is False
+        assert body["revision"] > track.revision

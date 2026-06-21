@@ -4,6 +4,77 @@ from pathlib import Path
 
 from app.models.track_meta_data import TrackMetaData
 
+
+class TagWriteError(Exception):
+    """Raised when writing tags to a master file fails (ffmpeg non-zero exit,
+    timeout, or the re-probe verification did not confirm the change)."""
+
+
+def is_wav(file_path: Path) -> bool:
+    """WAV master tagging is out of scope in Phase 1 (RIFF tag support is too
+    lossy), so the orchestration degrades a ``db_and_master`` WAV edit to
+    DB-only. Keyed off the extension — cheap and good enough for the gate."""
+    return file_path.suffix.lower() == ".wav"
+
+
+def write_metadata_tags(source: Path, dest: Path, tags: dict[str, str | None]) -> None:
+    """Copy ``source`` to ``dest`` with ``tags`` applied, audio bytes untouched.
+
+    ``tags`` maps ffmpeg metadata keys to values; ``None`` (or "") clears the
+    tag. Uses ``-map 0 -c copy -map_metadata 0`` so every stream — including the
+    attached-pic cover-art stream — and all unedited tags are preserved; only
+    the named tags are overwritten. Because the audio bytes are unchanged, the
+    ``(uuid, quality)``-keyed encoded cache stays valid across an edit. Verifies
+    by re-probing ``dest`` and raises ``TagWriteError`` on any failure.
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-i", str(source),
+        "-map", "0",
+        "-c", "copy",
+        "-map_metadata", "0",
+    ]
+    for key, value in tags.items():
+        cmd += ["-metadata", f"{key}={value if value is not None else ''}"]
+    cmd.append(str(dest))
+
+    # ~1s per MB on top of a 30s floor so large lossless files don't trip a
+    # fixed timeout; capped so a hang can't wedge a request forever.
+    try:
+        size_mb = source.stat().st_size / (1024 * 1024)
+    except OSError:
+        size_mb = 0
+    timeout = min(600, 30 + int(size_mb))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except FileNotFoundError as e:
+        raise TagWriteError("ffmpeg not found") from e
+    except (OSError, subprocess.TimeoutExpired) as e:
+        dest.unlink(missing_ok=True)
+        raise TagWriteError(f"ffmpeg failed: {e}") from e
+
+    if result.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+        dest.unlink(missing_ok=True)
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise TagWriteError(f"ffmpeg exited {result.returncode}: {stderr}")
+
+    # Verify the output is still a probe-able audio file (catches a silently
+    # corrupt remux). Field-level verification is intentionally light — ffmpeg
+    # normalizes some tag spellings, so we confirm probe-ability, not equality.
+    if ffprobe_for_metadata(dest) is None:
+        dest.unlink(missing_ok=True)
+        raise TagWriteError("re-probe of written file failed")
+
 # TODO: Handle non printable characters in metadata (remember the UniBe@t thingy where there were windows /r/n invisible characters...)
 # TODO: possible search database to see if artist/album already exists? and match capitalization? might be confusing...
 

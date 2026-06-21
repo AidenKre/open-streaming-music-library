@@ -108,6 +108,10 @@ class AppInfoResponse(BaseModel):
 class PatchTrackResponse(BaseModel):
     uuid_id: str
     revision: int
+    # Whether the master file's tags were rewritten. False for a db_only edit
+    # and for the db_and_master degradations (WAV / missing master), so the
+    # client can tell the user the file on disk was left untouched.
+    master_written: bool = False
 
 
 class QualitySettingResponse(BaseModel):

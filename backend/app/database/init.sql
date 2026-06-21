@@ -148,3 +148,18 @@ CREATE TABLE IF NOT EXISTS revision_counter (
 );
 
 INSERT OR IGNORE INTO revision_counter ("id", "value") VALUES (0, 0);
+
+-- Crash-safety journal for master-file edits. A row is written *before* the
+-- destructive filesystem step (a relocate move, or an in-place tag overwrite)
+-- so a crash in the move<->commit window is finished or reverted by an
+-- idempotent reconcile pass at startup. `intent` dispatches the recovery;
+-- Phase 2 adds an "intent='convert'" branch on this same table.
+CREATE TABLE IF NOT EXISTS edit_journal (
+    "id"         INTEGER PRIMARY KEY,
+    "intent"     TEXT NOT NULL,
+    "uuid_id"    TEXT NOT NULL,
+    "old_path"   TEXT,
+    "new_path"   TEXT,
+    "temp_path"  TEXT,
+    "created_at" INTEGER NOT NULL
+);

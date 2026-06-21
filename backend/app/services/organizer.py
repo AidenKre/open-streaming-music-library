@@ -2,10 +2,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from app.database.database import effective_artist
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services.cover_art_manager import CoverArtAddResult
 from app.services.metadata import extract_cover_art_bytes, get_track_metadata
+from app.services.path_sanitize import UnsafePathComponent, sanitize_path_component
 
 # TODO: implement copy_file
 # TODO: do not assume that move destination is on the same filesystem as the source aka atomic rename for moving
@@ -147,15 +149,48 @@ def rollback_move(destination_path: Path, original_path: Path) -> bool:
 
 
 def create_destination_dir(trackmetadata: TrackMetaData, root_dir: Path) -> Path:
+    # Use the same album_artist-vs-artist rule the DB identity uses so a
+    # track's on-disk folder and its DB artist node can never disagree.
     destination_dir = root_dir
-
-    if trackmetadata.album_artist:
-        destination_dir /= trackmetadata.album_artist
-    elif trackmetadata.artist:
-        destination_dir /= trackmetadata.artist
-
-    if trackmetadata.album_artist or trackmetadata.artist:
+    artist = effective_artist(trackmetadata.album_artist, trackmetadata.artist)
+    if artist:
+        destination_dir /= artist
         if trackmetadata.album:
             destination_dir /= trackmetadata.album
 
     return destination_dir
+
+
+def sanitized_destination_path(
+    filename: str, trackmetadata: TrackMetaData, root_dir: Path
+) -> Path:
+    """Where a track named ``filename`` belongs under ``root_dir`` given its
+    (new) metadata, with artist/album sanitized for on-disk use.
+
+    The DB row and the file's tags keep the **raw** artist/album; only the
+    folder names are sanitized — so ``AC/DC`` stays ``AC/DC`` in metadata but is
+    foldered as ``AC_DC``. Reuses ``create_destination_dir`` by feeding it a
+    sanitized copy of the metadata. The caller compares this against the current
+    path to decide in-place vs relocation, and uses ``move_file`` to place the
+    (already-tagged) staged file.
+    """
+    sanitized = trackmetadata.model_copy(
+        update={
+            "album_artist": _safe_component(trackmetadata.album_artist),
+            "artist": _safe_component(trackmetadata.artist),
+            "album": _safe_component(trackmetadata.album),
+        }
+    )
+    return create_destination_dir(sanitized, root_dir) / filename
+
+
+def _safe_component(value: str | None) -> str | None:
+    """Sanitize a folder-name component, collapsing an unusable value (empty,
+    ``.``/``..``, all-illegal) to ``None`` so the track simply isn't foldered
+    under it rather than raising mid-relocation."""
+    if value is None or not value.strip():
+        return None
+    try:
+        return sanitize_path_component(value)
+    except UnsafePathComponent:
+        return None

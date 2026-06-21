@@ -86,10 +86,11 @@ class RevisionConflict(Exception):
         )
 
 
-def _effective_artist(album_artist: Optional[str], artist: Optional[str]) -> Optional[str]:
+def effective_artist(album_artist: Optional[str], artist: Optional[str]) -> Optional[str]:
     """The artist that owns a track's library identity: album_artist wins, then
-    artist, else None. Shared by ``add_track`` and the metadata-edit spine so
-    DB identity is computed one way everywhere."""
+    artist, else None. Shared by ``add_track``, the metadata-edit spine, and the
+    organizer's ``create_destination_dir`` so DB identity and on-disk layout are
+    computed one way everywhere and can't diverge."""
     if album_artist and album_artist.strip():
         return album_artist.strip()
     if artist and artist.strip():
@@ -285,7 +286,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 5
+    LATEST_SCHEMA_VERSION = 6
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -461,6 +462,21 @@ class Database:
                 )
                 conn.execute("PRAGMA user_version = 5")
 
+            if version < 6:
+                print("Migrating database to version 6: adding edit_journal table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS edit_journal ('
+                    '    "id"         INTEGER PRIMARY KEY,'
+                    '    "intent"     TEXT NOT NULL,'
+                    '    "uuid_id"    TEXT NOT NULL,'
+                    '    "old_path"   TEXT,'
+                    '    "new_path"   TEXT,'
+                    '    "temp_path"  TEXT,'
+                    '    "created_at" INTEGER NOT NULL'
+                    ')'
+                )
+                conn.execute("PRAGMA user_version = 6")
+
     @staticmethod
     def _next_revision(conn) -> int:
         """Allocate the next monotonic revision on ``conn``'s open transaction.
@@ -631,23 +647,23 @@ class Database:
                 metadata = track.metadata
 
                 # Determine effective artist: album_artist takes priority
-                effective_artist = _effective_artist(
+                effective = effective_artist(
                     metadata.album_artist, metadata.artist
                 )
 
                 artist_id = None
-                if effective_artist:
-                    artist_id = self._upsert_artist(conn, effective_artist)
+                if effective:
+                    artist_id = self._upsert_artist(conn, effective)
 
                 # Determine album type
                 album_name = metadata.album
                 has_album = album_name is not None and album_name.strip() != ""
                 album_id = None
 
-                if artist_id is not None and effective_artist is not None:
+                if artist_id is not None and effective is not None:
                     album_id = self._upsert_album(
                         conn, album_name if has_album else None,
-                        artist_id, metadata.year, effective_artist,
+                        artist_id, metadata.year, effective,
                     )
 
                 # Clear any stale tombstone so a re-added uuid is not also
@@ -710,7 +726,7 @@ class Database:
 
                 # Insert into FTS for tracks
                 fts_title = metadata.title or ""
-                fts_artist = effective_artist or ""
+                fts_artist = effective or ""
                 fts_album = album_name if has_album else ""
                 conn.execute(
                     "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) VALUES (?, ?, ?, ?)",
@@ -857,12 +873,16 @@ class Database:
             (album_id, album_id),
         )
 
-    def _update_track_metadata(self, conn, uuid_id: str, fields: dict) -> None:
+    def _update_track_metadata(
+        self, conn, uuid_id: str, fields: dict, new_file_path: Optional[str] = None
+    ) -> None:
         """Pure-DB metadata edit — no file I/O. ``fields`` is the validated,
         present subset of ``EDITABLE_METADATA_COLUMNS`` (an explicit ``None``
         means "clear"). Reassigns artist/album identity, reconciles orphaned
-        parents + FTS, and bumps the track revision. Reused by the PATCH
-        orchestration and (future) bulk edit, all inside one caller txn."""
+        parents + FTS, and bumps the track revision. When ``new_file_path`` is
+        given (a master relocation already moved the file), the ``tracks.file_path``
+        is updated to match — still pure-DB. Reused by the PATCH orchestration
+        and (future) bulk edit, all inside one caller txn."""
         cur = conn.execute(
             "SELECT track_id, artist_id, album_id, title, artist, album, "
             'album_artist, "year", "date", genre, track_number, disc_number '
@@ -896,7 +916,7 @@ class Database:
         if _blank(new["title"]) and _blank(new["artist"]) and _blank(new["album"]):
             raise EmptyTrackEdit(uuid_id)
 
-        effective = _effective_artist(new["album_artist"], new["artist"])
+        effective = effective_artist(new["album_artist"], new["artist"])
         new_artist_id = None
         new_album_id = None
         if effective is not None:
@@ -936,7 +956,7 @@ class Database:
             self._recompute_named_album_year(conn, new_album_id)
 
         # Rewrite this track's own FTS row: delete old terms, insert new ones.
-        old_effective = _effective_artist(cur["album_artist"], cur["artist"])
+        old_effective = effective_artist(cur["album_artist"], cur["artist"])
         conn.execute(
             "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
             "VALUES('delete', ?, ?, ?, ?)",
@@ -949,6 +969,12 @@ class Database:
             (track_db_id, new["title"] or "", effective or "", new_fts_album),
         )
 
+        if new_file_path is not None:
+            conn.execute(
+                "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
+                (new_file_path, uuid_id),
+            )
+
         self._bump_track_revision(conn, uuid_id)
 
     def apply_track_metadata_edit(
@@ -956,14 +982,17 @@ class Database:
         uuid_id: str,
         fields: dict,
         base_revision: Optional[int],
+        new_file_path: Optional[str] = None,
         timeout: float = 5,
     ) -> int:
-        """DB-only orchestration for a track metadata edit. Opens one write
-        txn, enforces the Option-A 409 (``base_revision`` vs the stored
-        revision) *before* the bump, runs the pure-DB spine, and commits.
-        Returns the new revision. Raises ``TrackNotFound`` / ``RevisionConflict``;
-        lets ``sqlite3.OperationalError`` ("database is locked") propagate so
-        the caller can surface a retryable error rather than a silent failure."""
+        """DB orchestration for a track metadata edit. Opens one write txn,
+        enforces the Option-A 409 (``base_revision`` vs the stored revision)
+        *before* the bump, runs the pure-DB spine, and commits. ``new_file_path``
+        (set by the master-relocation path after it has moved the file) is
+        written to ``tracks.file_path`` in the same txn. Returns the new
+        revision. Raises ``TrackNotFound`` / ``RevisionConflict``; lets
+        ``sqlite3.OperationalError`` ("database is locked") propagate so the
+        caller can surface a retryable error rather than a silent failure."""
         with self._connection(commit=True, timeout=timeout) as conn:
             row = conn.execute(
                 "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
@@ -974,12 +1003,57 @@ class Database:
             if base_revision is None or base_revision != current_revision:
                 raise RevisionConflict(uuid_id, base_revision, current_revision)
 
-            self._update_track_metadata(conn, uuid_id, fields)
+            self._update_track_metadata(conn, uuid_id, fields, new_file_path)
 
             new_row = conn.execute(
                 "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
             ).fetchone()
             return new_row["revision"]
+
+    # ── Edit journal (crash-safety for master-file writes) ──────────────────
+
+    def insert_journal_entry(
+        self,
+        intent: str,
+        uuid_id: str,
+        old_path: Optional[str] = None,
+        new_path: Optional[str] = None,
+        temp_path: Optional[str] = None,
+    ) -> int:
+        """Record a pending destructive FS step *before* performing it. Returns
+        the journal row id so the caller can clear it once the step is durably
+        finished (or reverted)."""
+        with self._connection(commit=True) as conn:
+            cursor = conn.execute(
+                "INSERT INTO edit_journal "
+                "(intent, uuid_id, old_path, new_path, temp_path, created_at) "
+                "VALUES (?, ?, ?, ?, ?, unixepoch())",
+                (intent, uuid_id, old_path, new_path, temp_path),
+            )
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    def list_journal_entries(self) -> List[dict]:
+        """All outstanding journal rows, oldest first. Read once at startup by
+        the reconcile pass."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, intent, uuid_id, old_path, new_path, temp_path, "
+                "created_at FROM edit_journal ORDER BY id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_journal_entry(self, entry_id: int) -> None:
+        with self._connection(commit=True) as conn:
+            conn.execute("DELETE FROM edit_journal WHERE id = ?", (entry_id,))
+
+    def get_track_file_path(self, uuid_id: str) -> Optional[str]:
+        """Current ``tracks.file_path`` for a uuid, or None if the track is gone.
+        Used by journal reconcile to tell whether a relocate's DB commit landed."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT file_path FROM tracks WHERE uuid_id = ?", (uuid_id,)
+            ).fetchone()
+            return row["file_path"] if row is not None else None
 
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
         try:
