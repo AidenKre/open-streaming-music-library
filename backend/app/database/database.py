@@ -1,4 +1,5 @@
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Flag, auto
@@ -32,6 +33,23 @@ ALLOWED_METADATA_COLUMNS = [
     "cover_art_id",
 ]
 
+# Track tag fields a user may edit via Get Info / PATCH. Deliberately NOT
+# ``ALLOWED_METADATA_COLUMNS`` — that list includes audio-derived columns
+# (codec/duration/bitrate_kbps/sample_rate_hz/channels/has_album_art/
+# cover_art_id) which must never be hand-edited. This is the single source of
+# truth shared by ``GET /app/info`` (advertised) and ``PATCH`` (accepted).
+EDITABLE_METADATA_COLUMNS = [
+    "title",
+    "artist",
+    "album",
+    "album_artist",
+    "year",
+    "date",
+    "genre",
+    "track_number",
+    "disc_number",
+]
+
 ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
 
 ALLOWED_ALBUM_COLUMNS = ["id", "name", "artist", "artist_id", "year", "is_single_grouping"]
@@ -42,6 +60,41 @@ ALLOWED_ARTIST_COLUMNS = ["id", "name"]
 ARTIST_TEXT_COLUMNS = {"name"}
 
 ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
+
+
+class TrackNotFound(Exception):
+    """Raised when a metadata edit targets a uuid that no longer exists."""
+
+
+class EmptyTrackEdit(Exception):
+    """Raised when an edit would blank a track's whole identity (title, artist,
+    and album all empty). Distinct from ``add_track``'s ``is_empty`` audio-field
+    check — this guards the human-meaningful fields."""
+
+
+class RevisionConflict(Exception):
+    """Raised when an edit's ``base_revision`` no longer matches the stored
+    revision — the row moved on under the editor (Option A 409)."""
+
+    def __init__(self, uuid_id: str, base_revision: Optional[int], current_revision: int):
+        self.uuid_id = uuid_id
+        self.base_revision = base_revision
+        self.current_revision = current_revision
+        super().__init__(
+            f"revision conflict on {uuid_id}: base={base_revision} "
+            f"current={current_revision}"
+        )
+
+
+def _effective_artist(album_artist: Optional[str], artist: Optional[str]) -> Optional[str]:
+    """The artist that owns a track's library identity: album_artist wins, then
+    artist, else None. Shared by ``add_track`` and the metadata-edit spine so
+    DB identity is computed one way everywhere."""
+    if album_artist and album_artist.strip():
+        return album_artist.strip()
+    if artist and artist.strip():
+        return artist.strip()
+    return None
 
 
 class SearchEntityType(Flag):
@@ -578,11 +631,9 @@ class Database:
                 metadata = track.metadata
 
                 # Determine effective artist: album_artist takes priority
-                effective_artist = None
-                if metadata.album_artist and metadata.album_artist.strip():
-                    effective_artist = metadata.album_artist.strip()
-                elif metadata.artist and metadata.artist.strip():
-                    effective_artist = metadata.artist.strip()
+                effective_artist = _effective_artist(
+                    metadata.album_artist, metadata.artist
+                )
 
                 artist_id = None
                 if effective_artist:
@@ -742,6 +793,194 @@ class Database:
 
         return album_id
 
+    @staticmethod
+    def _orphan_gc_album(conn, album_id: Optional[int]) -> None:
+        """Delete ``album_id`` and its FTS row iff no trackmetadata references
+        it. The FTS ``'delete'`` values are derived from the album's own
+        artist join, so they always match what ``_upsert_album`` inserted."""
+        if album_id is None:
+            return
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM trackmetadata WHERE album_id = ?", (album_id,)
+        ).fetchone()[0]
+        if remaining != 0:
+            return
+        row = conn.execute(
+            "SELECT a.name AS album_name, ar.name AS artist_name "
+            "FROM albums a JOIN artists ar ON ar.id = a.artist_id "
+            "WHERE a.id = ?",
+            (album_id,),
+        ).fetchone()
+        album_name = (row["album_name"] or "") if row else ""
+        artist_name = (row["artist_name"] or "") if row else ""
+        conn.execute(
+            "INSERT INTO fts_albums(fts_albums, rowid, name, artist_name) "
+            "VALUES('delete', ?, ?, ?)",
+            (album_id, album_name, artist_name),
+        )
+        conn.execute("DELETE FROM albums WHERE id = ?", (album_id,))
+
+    @staticmethod
+    def _orphan_gc_artist(conn, artist_id: Optional[int]) -> None:
+        """Delete ``artist_id`` and its FTS row iff no trackmetadata references
+        it. Call after ``_orphan_gc_album`` — an album row references an artist."""
+        if artist_id is None:
+            return
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM trackmetadata WHERE artist_id = ?", (artist_id,)
+        ).fetchone()[0]
+        if remaining != 0:
+            return
+        row = conn.execute(
+            "SELECT name FROM artists WHERE id = ?", (artist_id,)
+        ).fetchone()
+        artist_name = (row["name"] or "") if row else ""
+        conn.execute(
+            "INSERT INTO fts_artists(fts_artists, rowid, name) VALUES('delete', ?, ?)",
+            (artist_id, artist_name),
+        )
+        conn.execute("DELETE FROM artists WHERE id = ?", (artist_id,))
+
+    @staticmethod
+    def _recompute_named_album_year(conn, album_id: Optional[int]) -> None:
+        """Reset a *named* album's year to MAX over its remaining members.
+        ``_upsert_album`` only ever raises an album's year, so a downward edit
+        (a member lowering/clearing its year, or leaving the album) needs this.
+        Single-grouping albums carry year as identity and are reconciled by the
+        normal upsert path, so they are excluded."""
+        if album_id is None:
+            return
+        conn.execute(
+            'UPDATE albums SET "year" = '
+            '(SELECT MAX("year") FROM trackmetadata WHERE album_id = ?) '
+            "WHERE id = ? AND is_single_grouping = 0",
+            (album_id, album_id),
+        )
+
+    def _update_track_metadata(self, conn, uuid_id: str, fields: dict) -> None:
+        """Pure-DB metadata edit — no file I/O. ``fields`` is the validated,
+        present subset of ``EDITABLE_METADATA_COLUMNS`` (an explicit ``None``
+        means "clear"). Reassigns artist/album identity, reconciles orphaned
+        parents + FTS, and bumps the track revision. Reused by the PATCH
+        orchestration and (future) bulk edit, all inside one caller txn."""
+        cur = conn.execute(
+            "SELECT track_id, artist_id, album_id, title, artist, album, "
+            'album_artist, "year", "date", genre, track_number, disc_number '
+            "FROM trackmetadata WHERE uuid_id = ?",
+            (uuid_id,),
+        ).fetchone()
+        if cur is None:
+            raise TrackNotFound(uuid_id)
+
+        track_db_id = cur["track_id"]
+        old_artist_id = cur["artist_id"]
+        old_album_id = cur["album_id"]
+
+        # Merge present edits over current values, then NFC-normalize the
+        # identity strings before they reach the LOWER()-keyed upsert
+        # (otherwise canonically-equivalent spellings won't dedup).
+        def pick(col):
+            return fields[col] if col in fields else cur[col]
+
+        new = {col: pick(col) for col in EDITABLE_METADATA_COLUMNS}
+        for col in ("artist", "album", "album_artist"):
+            if isinstance(new[col], str):
+                new[col] = unicodedata.normalize("NFC", new[col])
+
+        # Don't let an edit blank the whole track — checked on the *merged*
+        # post-edit state so a partial clear (e.g. just the title) is fine as
+        # long as artist or album survives.
+        def _blank(v):
+            return v is None or (isinstance(v, str) and not v.strip())
+
+        if _blank(new["title"]) and _blank(new["artist"]) and _blank(new["album"]):
+            raise EmptyTrackEdit(uuid_id)
+
+        effective = _effective_artist(new["album_artist"], new["artist"])
+        new_artist_id = None
+        new_album_id = None
+        if effective is not None:
+            new_artist_id = self._upsert_artist(conn, effective)
+            has_album = bool(new["album"] and new["album"].strip())
+            new_album_id = self._upsert_album(
+                conn,
+                new["album"] if has_album else None,
+                new_artist_id,
+                new["year"],
+                effective,
+            )
+        # effective is None ⇒ artist cleared; both ids stay None (an album row
+        # requires a non-null artist).
+
+        conn.execute(
+            "UPDATE trackmetadata SET title = ?, artist = ?, album = ?, "
+            'album_artist = ?, "year" = ?, "date" = ?, genre = ?, '
+            "track_number = ?, disc_number = ?, artist_id = ?, album_id = ? "
+            "WHERE uuid_id = ?",
+            (
+                new["title"], new["artist"], new["album"], new["album_artist"],
+                new["year"], new["date"], new["genre"], new["track_number"],
+                new["disc_number"], new_artist_id, new_album_id, uuid_id,
+            ),
+        )
+
+        # Reconcile parents with the row already reassigned: GC the old ones if
+        # now empty, then recompute year for any surviving named album whose
+        # membership changed.
+        if old_album_id != new_album_id:
+            self._orphan_gc_album(conn, old_album_id)
+        if old_artist_id != new_artist_id:
+            self._orphan_gc_artist(conn, old_artist_id)
+        self._recompute_named_album_year(conn, old_album_id)
+        if new_album_id != old_album_id:
+            self._recompute_named_album_year(conn, new_album_id)
+
+        # Rewrite this track's own FTS row: delete old terms, insert new ones.
+        old_effective = _effective_artist(cur["album_artist"], cur["artist"])
+        conn.execute(
+            "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
+            "VALUES('delete', ?, ?, ?, ?)",
+            (track_db_id, cur["title"] or "", old_effective or "", cur["album"] or ""),
+        )
+        new_fts_album = new["album"] if (new["album"] and new["album"].strip()) else ""
+        conn.execute(
+            "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+            "VALUES (?, ?, ?, ?)",
+            (track_db_id, new["title"] or "", effective or "", new_fts_album),
+        )
+
+        self._bump_track_revision(conn, uuid_id)
+
+    def apply_track_metadata_edit(
+        self,
+        uuid_id: str,
+        fields: dict,
+        base_revision: Optional[int],
+        timeout: float = 5,
+    ) -> int:
+        """DB-only orchestration for a track metadata edit. Opens one write
+        txn, enforces the Option-A 409 (``base_revision`` vs the stored
+        revision) *before* the bump, runs the pure-DB spine, and commits.
+        Returns the new revision. Raises ``TrackNotFound`` / ``RevisionConflict``;
+        lets ``sqlite3.OperationalError`` ("database is locked") propagate so
+        the caller can surface a retryable error rather than a silent failure."""
+        with self._connection(commit=True, timeout=timeout) as conn:
+            row = conn.execute(
+                "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
+            ).fetchone()
+            if row is None:
+                raise TrackNotFound(uuid_id)
+            current_revision = row["revision"]
+            if base_revision is None or base_revision != current_revision:
+                raise RevisionConflict(uuid_id, base_revision, current_revision)
+
+            self._update_track_metadata(conn, uuid_id, fields)
+
+            new_row = conn.execute(
+                "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
+            ).fetchone()
+            return new_row["revision"]
+
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
         try:
             with self._connection(commit=True, timeout=timeout) as conn:
@@ -793,43 +1032,11 @@ class Database:
                     (track_db_id, fts_title, effective_artist, fts_album),
                 )
 
-                # Cleanup orphaned album
-                if album_id is not None:
-                    remaining = conn.execute(
-                        "SELECT COUNT(*) FROM trackmetadata WHERE album_id = ?",
-                        (album_id,),
-                    ).fetchone()[0]
-                    if remaining == 0:
-                        album_row = conn.execute(
-                            "SELECT name FROM albums WHERE id = ?", (album_id,)
-                        ).fetchone()
-                        album_name_for_fts = album_row["name"] or "" if album_row else ""
-                        conn.execute(
-                            "INSERT INTO fts_albums(fts_albums, rowid, name, artist_name) "
-                            "VALUES('delete', ?, ?, ?)",
-                            (album_id, album_name_for_fts, effective_artist),
-                        )
-                        conn.execute("DELETE FROM albums WHERE id = ?", (album_id,))
-
-                # Cleanup orphaned artist
-                if artist_id is not None:
-                    remaining = conn.execute(
-                        "SELECT COUNT(*) FROM trackmetadata WHERE artist_id = ?",
-                        (artist_id,),
-                    ).fetchone()[0]
-                    if remaining == 0:
-                        artist_row = conn.execute(
-                            "SELECT name FROM artists WHERE id = ?", (artist_id,)
-                        ).fetchone()
-                        artist_name_for_fts = artist_row["name"] if artist_row else ""
-                        conn.execute(
-                            "INSERT INTO fts_artists(fts_artists, rowid, name) "
-                            "VALUES('delete', ?, ?)",
-                            (artist_id, artist_name_for_fts),
-                        )
-                        conn.execute(
-                            "DELETE FROM artists WHERE id = ?", (artist_id,)
-                        )
+                # Cleanup now-orphaned parents (album before artist — an album
+                # row references an artist). Shared with the metadata-edit
+                # spine so add/update/delete reconcile orphans one way.
+                self._orphan_gc_album(conn, album_id)
+                self._orphan_gc_artist(conn, artist_id)
 
             return True
         except Exception as e:

@@ -79,6 +79,37 @@ class WarmResponse(BaseModel):
     prefetch_skipped: int = 0
 
 
+class FieldDescriptor(BaseModel):
+    """One editable field advertised by ``/app/info``. ``valueType`` is an
+    intentionally open string set (text/int/year/enum/bool now, ``image`` later
+    for cover art) so a new type doesn't force a client refactor."""
+
+    key: str
+    label: str
+    valueType: str
+    editable: bool = True
+
+
+class EntityInfo(BaseModel):
+    fields: List[FieldDescriptor] = []
+    # Non-mutation operations (e.g. Phase 2 master-type conversion). Empty in
+    # Phase 1.
+    actions: List[str] = []
+
+
+class AppInfoResponse(BaseModel):
+    """App-level bootstrap blob. The home for app-global facts so later phases
+    extend it (Phase 2 adds a ``conversion`` block) rather than add endpoints.
+    Per-entity *live* data stays out of it; this is cached client-side."""
+
+    entities: dict[str, EntityInfo]
+
+
+class PatchTrackResponse(BaseModel):
+    uuid_id: str
+    revision: int
+
+
 class QualitySettingResponse(BaseModel):
     quality: str
 

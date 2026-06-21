@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -16,20 +17,28 @@ from app.database import (
     ArtistRowFilterParameter,
     Database,
     DatabaseContext,
+    EDITABLE_METADATA_COLUMNS,
+    EmptyTrackEdit,
     OrderParameter,
+    RevisionConflict,
     RowFilterParameter,
     SearchEntityType,
     SearchParameter,
+    TrackNotFound,
 )
 from app.models import (
     Album,
+    AppInfoResponse,
     ChangeEntry,
     ClientTrack,
+    EntityInfo,
+    FieldDescriptor,
     GetAlbumsResponse,
     GetArtistsResponse,
     GetChangesResponse,
     GetSearchResponse,
     GetTracksResponse,
+    PatchTrackResponse,
     WarmRequest,
     WarmResponse,
     QualitySettingResponse,
@@ -37,6 +46,12 @@ from app.models import (
     SetQualityResponse,
     Track,
 )
+from app.services.track_edit import (
+    EDITABLE_FIELD_META,
+    TrackPatchRequest,
+    WriteMode,
+)
+from app.services.track_locks import TrackLocks
 from app.services import (
     CoverArtContext,
     CoverArtManager,
@@ -89,6 +104,9 @@ def startup_event():
     app.state.encoded_cache = None
     app.state.default_cache = None
     app.state.encoder_coordinator = None
+    # Per-uuid edit lock. Built once here so slice 4's master-file staging and
+    # Phase 2's conversion worker share the identical instance.
+    app.state.track_locks = TrackLocks()
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
     settings.music_library_dir.mkdir(parents=True, exist_ok=True)
@@ -976,6 +994,72 @@ def set_quality_setting(request: SetQualityRequest):
         )
 
     return SetQualityResponse(quality=quality_canonical, warming=warming)
+
+
+@app.get("/app/info", response_model=AppInfoResponse)
+def get_app_info():
+    """App-level bootstrap: per-entity editable fields + actions. Backed by the
+    same edit allowlist that gates PATCH, so advertised == accepted. Cached
+    client-side; later phases extend this rather than add endpoints."""
+    track_fields = [
+        FieldDescriptor(
+            key=col,
+            label=EDITABLE_FIELD_META[col][0],
+            valueType=EDITABLE_FIELD_META[col][1],
+        )
+        for col in EDITABLE_METADATA_COLUMNS
+    ]
+    return AppInfoResponse(
+        entities={"track": EntityInfo(fields=track_fields, actions=[])}
+    )
+
+
+@app.patch("/tracks/{uuid_id}", response_model=PatchTrackResponse)
+def patch_track(uuid_id: str, request: TrackPatchRequest):
+    """Partial track metadata edit (DB-only in Phase 1). The non-allowlisted
+    field rejection and type/range checks happen in ``TrackPatchRequest`` (422);
+    here we enforce the write mode, serialize per-uuid, and map the DB layer's
+    typed conflicts to HTTP status codes."""
+    if request.write_mode is WriteMode.db_and_master:
+        # The master-file write path lands in slice 4.
+        raise HTTPException(
+            status_code=501,
+            detail="db_and_master writes are not supported yet",
+        )
+
+    database: Database = cast(Database, app.state.database)
+    track_locks: TrackLocks = app.state.track_locks
+
+    try:
+        with track_locks.lock(uuid_id):
+            new_revision = database.apply_track_metadata_edit(
+                uuid_id=uuid_id,
+                fields=request.edit_fields(),
+                base_revision=request.base_revision,
+            )
+    except TrackNotFound:
+        raise HTTPException(status_code=404, detail="Track not found")
+    except RevisionConflict as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "current_revision": e.current_revision,
+            },
+        )
+    except EmptyTrackEdit:
+        raise HTTPException(
+            status_code=422,
+            detail="Edit would leave the track with no title, artist, or album",
+        )
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            raise HTTPException(
+                status_code=503, detail="Database busy, retry"
+            )
+        raise
+
+    return PatchTrackResponse(uuid_id=uuid_id, revision=new_revision)
 
 
 @app.get("/")

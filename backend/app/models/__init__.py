@@ -5,12 +5,16 @@ from .artist import Artist
 from .album import Album
 from .cover_art import CoverArt
 from .api_return_models import (
+    AppInfoResponse,
     ChangeEntry,
+    EntityInfo,
+    FieldDescriptor,
     GetChangesResponse,
     GetTracksResponse,
     GetArtistsResponse,
     GetAlbumsResponse,
     GetSearchResponse,
+    PatchTrackResponse,
     WarmRequest,
     WarmResponse,
     QualitySettingResponse,
