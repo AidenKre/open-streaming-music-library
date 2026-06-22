@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/ui/get_info_page.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 
@@ -41,6 +42,16 @@ class TrackTile extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            ListTile(
+              leading: const Icon(Icons.info_outline),
+              title: const Text('Get Info'),
+              onTap: () {
+                Navigator.pop(ctx);
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => GetInfoPage(track: track)),
+                );
+              },
+            ),
             if (onPlayNext != null)
               ListTile(
                 leading: const Icon(Icons.playlist_play),

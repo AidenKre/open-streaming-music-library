@@ -2091,6 +2091,11 @@ void main() {
         await db.customStatement(
           'ALTER TABLE tracks ADD COLUMN revision INTEGER',
         );
+        // v7: NOCASE genre index for autocomplete prefix scans.
+        await db.customStatement(
+          'CREATE INDEX IF NOT EXISTS idx_genre_nocase '
+          'ON trackmetadata (genre COLLATE NOCASE)',
+        );
 
         // Pre-migration row must still be intact and the new columns must
         // exist and be readable. `revision` is NULL on a row that predates
@@ -2123,7 +2128,73 @@ void main() {
         expect(updated.read<int>('file_size_bytes'), 1024);
         expect(updated.read<String>('downloaded_quality'), '320');
         expect(updated.read<int>('revision'), 42);
+
+        // The v7 NOCASE genre index must now exist.
+        final indexes = await db
+            .customSelect(
+              "SELECT name FROM sqlite_master WHERE type='index' "
+              "AND name='idx_genre_nocase'",
+            )
+            .get();
+        expect(indexes, hasLength(1));
       },
     );
+  });
+
+  group('metadata autocomplete', () {
+    Future<void> seed() async {
+      await db.customStatement(
+        "INSERT INTO artists (id, name) VALUES "
+        "(1, 'Radiohead'), (2, 'radio star'), (3, 'Beatles')",
+      );
+      await db.customStatement(
+        "INSERT INTO albums (id, name, artist_id, is_single_grouping) VALUES "
+        "(1, 'OK Computer', 1, 0), (2, 'Okay', 1, 0), (3, 'Abbey Road', 3, 0)",
+      );
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated) VALUES "
+        "('u1', 0, 0), ('u2', 0, 0), ('u3', 0, 0)",
+      );
+      await db.customStatement(
+        "INSERT INTO trackmetadata "
+        "(uuid_id, genre, duration, bitrate_kbps, sample_rate_hz, channels, "
+        "has_album_art) VALUES "
+        "('u1', 'Rock', 1, 1, 1, 2, 0), "
+        "('u2', 'rock and roll', 1, 1, 1, 2, 0), "
+        "('u3', 'Jazz', 1, 1, 1, 2, 0)",
+      );
+    }
+
+    test('artistSuggestions is a case-insensitive prefix match', () async {
+      await seed();
+      expect(await db.artistSuggestions('rad'), ['Radiohead', 'radio star']);
+      expect(await db.artistSuggestions('BEAT'), ['Beatles']);
+      expect(await db.artistSuggestions('zzz'), isEmpty);
+    });
+
+    test('empty prefix yields no suggestions', () async {
+      await seed();
+      expect(await db.artistSuggestions('   '), isEmpty);
+    });
+
+    test('albumSuggestions matches album names', () async {
+      await seed();
+      expect(await db.albumSuggestions('ok'), ['OK Computer', 'Okay']);
+    });
+
+    test('genreSuggestions is distinct, case-insensitive, limited', () async {
+      await seed();
+      expect(await db.genreSuggestions('ro'), ['Rock', 'rock and roll']);
+      expect(await db.genreSuggestions('ja'), ['Jazz']);
+      expect(await db.artistSuggestions('rad', limit: 1), hasLength(1));
+    });
+
+    test('a typed % is a literal, not a wildcard', () async {
+      await db.customStatement(
+        "INSERT INTO artists (id, name) VALUES (1, '100% Pure')",
+      );
+      expect(await db.artistSuggestions('100%'), ['100% Pure']);
+      expect(await db.artistSuggestions('200'), isEmpty);
+    });
   });
 }
