@@ -2096,6 +2096,17 @@ void main() {
           'CREATE INDEX IF NOT EXISTS idx_genre_nocase '
           'ON trackmetadata (genre COLLATE NOCASE)',
         );
+        // v8: pending_edits outbox table.
+        await db.customStatement(
+          'CREATE TABLE IF NOT EXISTS pending_edits ('
+          'uuid_id TEXT NOT NULL PRIMARY KEY, '
+          'values_json TEXT NOT NULL, '
+          'write_mode TEXT NOT NULL, '
+          'base_revision INTEGER, '
+          "status TEXT NOT NULL DEFAULT 'pending', "
+          'server_revision INTEGER, '
+          'updated_at INTEGER NOT NULL)',
+        );
 
         // Pre-migration row must still be intact and the new columns must
         // exist and be readable. `revision` is NULL on a row that predates
@@ -2137,6 +2148,17 @@ void main() {
             )
             .get();
         expect(indexes, hasLength(1));
+
+        // The v8 pending_edits table must now exist and be writable.
+        await db.customStatement(
+          "INSERT INTO pending_edits "
+          "(uuid_id, values_json, write_mode, updated_at) "
+          "VALUES ('u1', '{}', 'db_only', 0)",
+        );
+        final pending = await db
+            .customSelect('SELECT status FROM pending_edits')
+            .getSingle();
+        expect(pending.read<String>('status'), 'pending'); // default applied
       },
     );
   });

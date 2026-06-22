@@ -22,6 +22,7 @@ import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/widgets/offline_banner.dart';
+import 'package:frontend/ui/widgets/pending_edits_banner.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -229,6 +230,7 @@ class _AppShellState extends ConsumerState<AppShell> {
                 ],
               ),
             ),
+            const PendingEditsBanner(),
             if (isOffline) const OfflineBanner(),
             const MiniPlayer(),
           ],

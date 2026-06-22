@@ -39,4 +39,15 @@ class TracksApi {
     final json = await _apiClient.getJson(['tracks'], query: query);
     return GetTracksResponseDto.fromJson(json);
   }
+
+  /// Applies a metadata edit. [body] carries the touched fields plus
+  /// `base_revision` and `write_mode`. Returns the parsed response
+  /// (`uuid_id`, `revision`, `master_written`). `retry: true` is transport-only;
+  /// 409 (conflict) / 404 / 410 surface as `ApiException` for the caller.
+  Future<Map<String, dynamic>> patchTrack(
+    String uuidId,
+    Map<String, dynamic> body,
+  ) {
+    return _apiClient.patchJson(['tracks', uuidId], body: body, retry: true);
+  }
 }

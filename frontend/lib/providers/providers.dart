@@ -4,6 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/services/edit_outbox.dart';
+import 'package:frontend/services/edit_sync_mutex.dart';
 import 'package:frontend/services/sync_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -93,7 +95,16 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         queueRepository: ref.read(queueRepositoryProvider),
         prefs: await ref.read(sharedPreferencesProvider.future),
       );
-      final result = await service.syncChanges();
+      // Flush pending edits, then pull — in one mutex-guarded critical section
+      // so a `/changes` pull can never clobber an unflushed optimistic edit
+      // (the pull does a blind full-row upsert). Flushing first also satisfies
+      // "flush before pull on reconnect" since this runs from the recovery edge.
+      final mutex = ref.read(editSyncMutexProvider);
+      final outbox = ref.read(editOutboxProvider);
+      final result = await mutex.run(() async {
+        await outbox.flushLocked();
+        return service.syncChanges();
+      });
       final nextQueueMutationVersion = result.affectedQueueSessionIds.isEmpty
           ? (current?.queueMutationVersion ?? 0)
           : (current?.queueMutationVersion ?? 0) + 1;

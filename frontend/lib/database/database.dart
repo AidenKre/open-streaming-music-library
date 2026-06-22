@@ -195,6 +195,34 @@ class QueueSessionPlayOrder extends Table {
   List<String> get customConstraints => const ['UNIQUE(session_id, item_id)'];
 }
 
+/// Outbox of unflushed track metadata edits, one coalesced row per track.
+class PendingEdits extends Table {
+  TextColumn get uuidId => text()();
+
+  /// The coalesced value-map as JSON: keys present = touched, a `null` value =
+  /// an explicit clear (so "cleared" is distinct from "untouched").
+  TextColumn get valuesJson => text()();
+
+  /// `db_only` or `db_and_master` — monotonically escalates, never downgrades.
+  TextColumn get writeMode => text()();
+
+  /// The track revision captured at the first edit of this batch (Option A
+  /// base). Nullable = "unknown base" → forces the conflict path on flush.
+  IntColumn get baseRevision => integer().nullable()();
+
+  /// `pending` (awaiting flush) or `conflicted` (server returned 409).
+  TextColumn get status => text().withDefault(const Constant('pending'))();
+
+  /// The server's current revision, recorded on a 409 so a "keep mine"
+  /// resolution can rebase onto it.
+  IntColumn get serverRevision => integer().nullable()();
+
+  IntColumn get updatedAt => integer()();
+
+  @override
+  Set<Column> get primaryKey => {uuidId};
+}
+
 // ── Column allowlists (mirrors backend database.py) ─────────────────────
 
 const allowedMetadataColumns = {
@@ -217,6 +245,20 @@ const allowedMetadataColumns = {
 };
 
 const allowedTrackColumns = {'uuid_id', 'created_at', 'last_updated'};
+
+/// Track tag columns a user may edit (mirrors the backend edit allowlist).
+/// Excludes audio-derived columns. Used to gate the optimistic local write.
+const editableMetadataColumns = {
+  'title',
+  'artist',
+  'album',
+  'album_artist',
+  'year',
+  'date',
+  'genre',
+  'track_number',
+  'disc_number',
+};
 
 const allowedAlbumColumns = {
   'id',
@@ -606,6 +648,7 @@ const trackSelectColumns =
     'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
     'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
+    't.revision, '
     't.downloaded_bitrate_kbps, t.file_size_bytes, t.downloaded_quality';
 const _selectColumns = trackSelectColumns;
 
@@ -644,13 +687,14 @@ String _quoteSqlIdentifier(String identifier) {
     QueueSessions,
     QueueSessionItems,
     QueueSessionPlayOrder,
+    PendingEdits,
   ],
 )
 class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 7;
+  int get schemaVersion => 8;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -694,6 +738,10 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
           'CREATE INDEX IF NOT EXISTS idx_genre_nocase '
           'ON trackmetadata (genre COLLATE NOCASE)',
         );
+      }
+      if (from < 8) {
+        // Outbox of unflushed metadata edits.
+        await m.createTable(pendingEdits);
       }
     },
   );
@@ -831,6 +879,79 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       .replaceAll('\\', '\\\\')
       .replaceAll('%', '\\%')
       .replaceAll('_', '\\_');
+
+  // ── Optimistic edit write (outbox) ────────────────────────────────────
+
+  /// Applies the touched fields of a pending edit to the local denormalized
+  /// `trackmetadata` text + a targeted single-row FTS update, so the edit shows
+  /// immediately. Deliberately does NOT repoint `artist_id`/`album_id` (that is
+  /// the server helper's job) — so after an artist rename the tile shows the new
+  /// text but the track stays under the old artist node until flush+sync.
+  Future<void> applyOptimisticTrackEdit(
+    String uuidId,
+    Map<String, Object?> values,
+  ) async {
+    final cols = values.keys.where(editableMetadataColumns.contains).toList();
+    if (cols.isEmpty) return;
+
+    await transaction(() async {
+      final before = await customSelect(
+        'SELECT rowid AS rid, title, artist, album '
+        'FROM trackmetadata WHERE uuid_id = ?',
+        variables: [Variable.withString(uuidId)],
+        readsFrom: {trackmetadata},
+      ).getSingleOrNull();
+      if (before == null) return;
+
+      final rowid = before.read<int>('rid');
+      final oldTitle = before.readNullable<String>('title') ?? '';
+      final oldArtist = before.readNullable<String>('artist') ?? '';
+      final oldAlbum = before.readNullable<String>('album') ?? '';
+
+      final setSql = cols.map((c) => '"$c" = ?').join(', ');
+      await customStatement(
+        'UPDATE trackmetadata SET $setSql WHERE uuid_id = ?',
+        [...cols.map((c) => values[c]), uuidId],
+      );
+
+      final after = await customSelect(
+        'SELECT title, artist, album FROM trackmetadata WHERE uuid_id = ?',
+        variables: [Variable.withString(uuidId)],
+        readsFrom: {trackmetadata},
+      ).getSingle();
+      final newTitle = after.readNullable<String>('title') ?? '';
+      final newArtist = after.readNullable<String>('artist') ?? '';
+      final newAlbum = after.readNullable<String>('album') ?? '';
+
+      // Contentless FTS: delete the old terms by rowid, insert the new ones —
+      // mirrors `rebuildFtsIndexes` (artist_name = the denormalized `artist`).
+      await customStatement(
+        "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
+        "VALUES('delete', ?, ?, ?, ?)",
+        [rowid, oldTitle, oldArtist, oldAlbum],
+      );
+      await customStatement(
+        'INSERT INTO fts_tracks(rowid, title, artist_name, album_name) '
+        'VALUES(?, ?, ?, ?)',
+        [rowid, newTitle, newArtist, newAlbum],
+      );
+    });
+  }
+
+  /// Live counts of outstanding edits for the pending-edits surface.
+  Stream<({int pending, int conflicted})> watchPendingEditCounts() {
+    return customSelect(
+      "SELECT "
+      "SUM(CASE WHEN status = 'conflicted' THEN 1 ELSE 0 END) AS conflicted, "
+      "COUNT(*) AS total FROM pending_edits",
+      readsFrom: {pendingEdits},
+    ).watch().map((rows) {
+      final row = rows.first;
+      final conflicted = row.readNullable<int>('conflicted') ?? 0;
+      final total = row.read<int>('total');
+      return (pending: total - conflicted, conflicted: conflicted);
+    });
+  }
 
   // ── Track queries ─────────────────────────────────────────────────────
 

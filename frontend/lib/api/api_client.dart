@@ -54,7 +54,7 @@ class HealthResult {
   bool get isOk => status == HealthStatus.ok;
 }
 
-enum _HttpVerb { get, put, post }
+enum _HttpVerb { get, put, post, patch }
 
 class ApiClient {
   static final ApiClient instance = ApiClient._();
@@ -186,6 +186,34 @@ class ApiClient {
   }) {
     return _request<Map<String, dynamic>>(
       verb: _HttpVerb.put,
+      pathSegments: pathSegments,
+      headers: headers,
+      jsonBody: body,
+      decode: _handleJsonResponse,
+      acceptJson: true,
+      policy: _resolvePolicy(
+        explicit: policy,
+        retry: retry,
+        triggerOfflineHook: true,
+        defaultRetry: false,
+      ),
+    );
+  }
+
+  /// PATCH with JSON body (partial update). Defaults to a **single attempt**;
+  /// the outbox flush opts into `retry: true` because the payload carries the
+  /// full desired state — but that only retries transport errors / 5xx in
+  /// [RetryPolicy.retryableStatusCodes], so 409/404/410 still bubble as
+  /// [ApiException] for the conflict / track-gone paths.
+  Future<Map<String, dynamic>> patchJson(
+    List<String> pathSegments, {
+    Map<String, dynamic>? body,
+    Map<String, String>? headers,
+    bool retry = false,
+    RetryPolicy? policy,
+  }) {
+    return _request<Map<String, dynamic>>(
+      verb: _HttpVerb.patch,
       pathSegments: pathSegments,
       headers: headers,
       jsonBody: body,
@@ -358,6 +386,12 @@ class ApiClient {
             headers: mergedHeaders,
             body: encodedBody,
           );
+        case _HttpVerb.patch:
+          response = await _http.patch(
+            uri,
+            headers: mergedHeaders,
+            body: encodedBody,
+          );
       }
       // JSON-decoding callers see character-length; getBytes overrides the
       // log via its decode callback if it needs byte-length. Keeping
@@ -395,6 +429,7 @@ class ApiClient {
         return {'Accept': 'application/json', ...?headers};
       case _HttpVerb.put:
       case _HttpVerb.post:
+      case _HttpVerb.patch:
         return {
           'Accept': 'application/json',
           'Content-Type': 'application/json',
@@ -411,6 +446,8 @@ class ApiClient {
         return 'PUT';
       case _HttpVerb.post:
         return 'POST';
+      case _HttpVerb.patch:
+        return 'PATCH';
     }
   }
 
