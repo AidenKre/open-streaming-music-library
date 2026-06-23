@@ -13,10 +13,9 @@ import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/ui/widgets/master_write_confirm_dialog.dart';
 import 'package:frontend/ui/widgets/metadata_form.dart';
 
-/// Schema-driven "Get Info" page for a track. Two tiers: editable metadata
-/// fields (capabilities ∩ client-safe, via [MetadataForm]) and display-only
-/// info rows (intrinsic audio facts + path). Reads work offline; the save path
-/// is wired onto the outbox in slice 6 (here it is a stub).
+/// Schema-driven "Get Info" page for a track. Metadata opens view-only, then
+/// becomes editable after the header Edit action. The Info tier remains
+/// display-only (intrinsic audio facts + path). Reads work offline.
 class GetInfoPage extends ConsumerStatefulWidget {
   const GetInfoPage({super.key, required this.track});
 
@@ -28,6 +27,7 @@ class GetInfoPage extends ConsumerStatefulWidget {
 
 class _GetInfoPageState extends ConsumerState<GetInfoPage> {
   MetadataEdit _edit = const MetadataEdit.empty();
+  bool _editing = false;
   bool _writeToFile = false;
 
   TrackUI get _track => widget.track;
@@ -73,11 +73,14 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
   }
 
   Future<void> _save() async {
+    if (!_editing) return;
     if (_edit.isEmpty) {
       _toast('No changes to save');
       return;
     }
-    final mode = _writeToFile ? EditWriteMode.dbAndMaster : EditWriteMode.dbOnly;
+    final mode = _writeToFile
+        ? EditWriteMode.dbAndMaster
+        : EditWriteMode.dbOnly;
     if (mode == EditWriteMode.dbAndMaster) {
       final confirmed = await showMasterWriteConfirmDialog(context);
       if (!confirmed) return;
@@ -106,22 +109,45 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
     if (Navigator.of(context).canPop()) Navigator.of(context).pop();
   }
 
+  void _startEditing() {
+    setState(() => _editing = true);
+  }
+
+  void _cancelEditing() {
+    setState(() {
+      _editing = false;
+      _edit = const MetadataEdit.empty();
+      _writeToFile = false;
+    });
+  }
+
   void _toast(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
   Widget build(BuildContext context) {
     final caps = ref.watch(appInfoProvider);
+    final fields = caps.maybeWhen(
+      data: (info) => editableFieldsFor(info, 'track'),
+      orElse: () => const <FieldDescriptor>[],
+    );
     return Scaffold(
       appBar: AppBar(
         title: const Text('Get Info'),
         actions: [
-          TextButton(
-            onPressed: _save,
-            child: const Text('Save'),
-          ),
+          if (fields.isNotEmpty)
+            if (_editing) ...[
+              TextButton(
+                onPressed: _cancelEditing,
+                child: const Text('Cancel'),
+              ),
+              TextButton(onPressed: _save, child: const Text('Save')),
+            ] else
+              TextButton(onPressed: _startEditing, child: const Text('Edit')),
         ],
       ),
       body: caps.when(
@@ -139,21 +165,26 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
         if (fields.isNotEmpty) ...[
           Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
-          MetadataForm(
-            fields: fields,
-            current: _currentValue,
-            edit: _edit,
-            onChanged: (e) => setState(() => _edit = e),
-            suggestionsFor: _suggestions,
-          ),
-          const SizedBox(height: 8),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Also write tags to the file on disk'),
-            subtitle: const Text('Permanent; may move the file'),
-            value: _writeToFile,
-            onChanged: (v) => setState(() => _writeToFile = v),
-          ),
+          if (_editing) ...[
+            MetadataForm(
+              fields: fields,
+              current: _currentValue,
+              edit: _edit,
+              onChanged: (e) => setState(() => _edit = e),
+              suggestionsFor: _suggestions,
+            ),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Update master file on server'),
+              subtitle: const Text(
+                'Rewrites tags on the backend server’s disk; may move the file.',
+              ),
+              value: _writeToFile,
+              onChanged: (v) => setState(() => _writeToFile = v),
+            ),
+          ] else
+            ..._metadataRows(fields),
           const Divider(height: 32),
         ],
         Text('Info', style: Theme.of(context).textTheme.titleMedium),
@@ -161,6 +192,36 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
         ..._infoRows(),
       ],
     );
+  }
+
+  List<Widget> _metadataRows(List<FieldDescriptor> fields) {
+    return [
+      for (final field in fields)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 110,
+                child: Text(
+                  field.label,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              Expanded(child: Text(_displayValue(_currentValue(field.key)))),
+            ],
+          ),
+        ),
+    ];
+  }
+
+  String _displayValue(Object? value) {
+    if (value == null) return '—';
+    final text = value.toString();
+    return text.isEmpty ? '—' : text;
   }
 
   List<Widget> _infoRows() {
@@ -181,9 +242,12 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
             children: [
               SizedBox(
                 width: 110,
-                child: Text(label,
-                    style: TextStyle(
-                        color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
               ),
               Expanded(child: Text(value ?? '—')),
             ],

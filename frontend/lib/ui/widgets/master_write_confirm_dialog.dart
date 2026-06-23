@@ -1,17 +1,18 @@
 import 'package:flutter/material.dart';
 
-/// Confirms a permanent write to the master file on disk (DB+master mode):
-/// rewriting its tags and possibly moving it to match the new artist/album
-/// folder. Returns `true` if the user confirms, `false`/`null` otherwise.
+/// Confirms a permanent write to the master file on the backend server's disk
+/// (DB+master mode): rewriting its tags and possibly moving it to match the
+/// new artist/album folder. Returns `true` if the user confirms,
+/// `false`/`null` otherwise.
 Future<bool> showMasterWriteConfirmDialog(BuildContext context) async {
   final confirmed = await showDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
-      title: const Text('Also edit the file on disk?'),
+      title: const Text('Update the master file on the server?'),
       content: const Text(
-        'This permanently rewrites the audio file’s tags, and moves the '
-        'file if the artist or album changed. The change cannot be undone from '
-        'the app.',
+        'This permanently rewrites the master audio file’s tags on the backend '
+        'server’s disk. If the artist or album changed, the server may move '
+        'the file. The app cannot undo this.',
       ),
       actions: [
         TextButton(

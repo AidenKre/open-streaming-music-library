@@ -61,37 +61,87 @@ Future<AppDatabase> _pump(WidgetTester tester, {AppInfo? caps}) async {
 Future<List<PendingEdit>> _pending(AppDatabase db) =>
     db.select(db.pendingEdits).get();
 
+Future<void> _enterEditMode(WidgetTester tester) async {
+  await tester.tap(find.widgetWithText(TextButton, 'Edit'));
+  await tester.pumpAndSettle();
+}
+
+Finder _dialogText(String text) =>
+    find.descendant(of: find.byType(AlertDialog), matching: find.text(text));
+
 void main() {
-  testWidgets('renders editable fields and display-only info rows',
-      (tester) async {
+  testWidgets('opens in view-only mode with metadata and info rows', (
+    tester,
+  ) async {
     await _pump(tester);
 
-    // Editable tier (labels from capabilities).
+    // Metadata tier (labels from capabilities, values from the track).
     expect(find.text('Title'), findsOneWidget);
     expect(find.text('Artist'), findsOneWidget);
     expect(find.text('Genre'), findsOneWidget);
+    expect(find.text('Old Title'), findsOneWidget);
+    expect(find.text('Old Artist'), findsOneWidget);
     // Info tier.
     expect(find.text('Codec'), findsOneWidget);
     expect(find.text('Path'), findsOneWidget);
     expect(find.text('44100 Hz'), findsOneWidget);
-    // Intrinsic audio fields never appear as editable inputs.
-    expect(find.widgetWithText(TextField, 'Bitrate'), findsNothing);
+    // Opens view-only: no editable fields or save controls yet.
+    expect(find.byType(TextField), findsNothing);
+    expect(find.widgetWithText(TextButton, 'Edit'), findsOneWidget);
+    expect(find.widgetWithText(TextButton, 'Save'), findsNothing);
+    expect(find.widgetWithText(TextButton, 'Cancel'), findsNothing);
   });
 
-  testWidgets('Save with no changes shows the no-changes notice',
-      (tester) async {
+  testWidgets('Edit enables fields and Save with no changes shows a notice', (
+    tester,
+  ) async {
     await _pump(tester);
-    await tester.tap(find.text('Save'));
+    await _enterEditMode(tester);
+
+    expect(find.byType(TextField), findsWidgets);
+    expect(find.widgetWithText(TextButton, 'Edit'), findsNothing);
+    expect(find.widgetWithText(TextButton, 'Cancel'), findsOneWidget);
+    expect(find.widgetWithText(TextButton, 'Save'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
     await tester.pump();
     expect(find.text('No changes to save'), findsOneWidget);
   });
 
-  testWidgets('editing a field then Save enqueues a db_only edit',
-      (tester) async {
+  testWidgets('Cancel exits edit mode and discards pending field edits', (
+    tester,
+  ) async {
     final db = await _pump(tester);
+    await _enterEditMode(tester);
     await tester.enterText(
-        find.byKey(const ValueKey('field_title')), 'New Title');
-    await tester.tap(find.text('Save'));
+      find.byKey(const ValueKey('field_title')),
+      'New Title',
+    );
+
+    await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(TextField), findsNothing);
+    expect(find.text('New Title'), findsNothing);
+    expect(find.widgetWithText(TextButton, 'Edit'), findsOneWidget);
+
+    await _enterEditMode(tester);
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
+    await tester.pump();
+    expect(find.text('No changes to save'), findsOneWidget);
+    expect(await _pending(db), isEmpty);
+  });
+
+  testWidgets('editing a field then Save enqueues a db_only edit', (
+    tester,
+  ) async {
+    final db = await _pump(tester);
+    await _enterEditMode(tester);
+    await tester.enterText(
+      find.byKey(const ValueKey('field_title')),
+      'New Title',
+    );
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
     await tester.pumpAndSettle();
 
     final rows = await _pending(db);
@@ -101,19 +151,37 @@ void main() {
     expect(rows.single.valuesJson, contains('New Title'));
   });
 
-  testWidgets('DB+master Save is gated by the confirmation dialog',
-      (tester) async {
+  testWidgets('DB+master Save is gated by the confirmation dialog', (
+    tester,
+  ) async {
     final db = await _pump(tester);
+    await _enterEditMode(tester);
     await tester.enterText(
-        find.byKey(const ValueKey('field_title')), 'New Title');
-    await tester.tap(find.text('Also write tags to the file on disk'));
+      find.byKey(const ValueKey('field_title')),
+      'New Title',
+    );
+    await tester.tap(find.text('Update master file on server'));
     await tester.pump();
+    expect(
+      find.text(
+        'Rewrites tags on the backend server’s disk; may move the file.',
+      ),
+      findsOneWidget,
+    );
 
-    await tester.tap(find.text('Save'));
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
     await tester.pumpAndSettle();
-    expect(find.text('Also edit the file on disk?'), findsOneWidget);
+    expect(find.text('Update the master file on the server?'), findsOneWidget);
+    expect(
+      find.text(
+        'This permanently rewrites the master audio file’s tags on the backend '
+        'server’s disk. If the artist or album changed, the server may move '
+        'the file. The app cannot undo this.',
+      ),
+      findsOneWidget,
+    );
 
-    await tester.tap(find.text('Edit file'));
+    await tester.tap(_dialogText('Edit file'));
     await tester.pumpAndSettle();
 
     final rows = await _pending(db);
@@ -121,17 +189,21 @@ void main() {
     expect(rows.single.writeMode, 'db_and_master');
   });
 
-  testWidgets('cancelling the confirmation dialog does not enqueue',
-      (tester) async {
+  testWidgets('cancelling the confirmation dialog does not enqueue', (
+    tester,
+  ) async {
     final db = await _pump(tester);
+    await _enterEditMode(tester);
     await tester.enterText(
-        find.byKey(const ValueKey('field_title')), 'New Title');
-    await tester.tap(find.text('Also write tags to the file on disk'));
+      find.byKey(const ValueKey('field_title')),
+      'New Title',
+    );
+    await tester.tap(find.text('Update master file on server'));
     await tester.pump();
-    await tester.tap(find.text('Save'));
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('Cancel'));
+    await tester.tap(_dialogText('Cancel'));
     await tester.pumpAndSettle();
     expect(await _pending(db), isEmpty);
   });
