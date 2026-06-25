@@ -2096,9 +2096,12 @@ void main() {
           'CREATE INDEX IF NOT EXISTS idx_genre_nocase '
           'ON trackmetadata (genre COLLATE NOCASE)',
         );
-        // v8: pending_edits outbox table.
+        // v8: pending_edits outbox table. Drop the latest-schema table the test
+        // harness already created so we re-create the v8 shape and genuinely
+        // exercise the v9 ALTER below.
+        await db.customStatement('DROP TABLE IF EXISTS pending_edits');
         await db.customStatement(
-          'CREATE TABLE IF NOT EXISTS pending_edits ('
+          'CREATE TABLE pending_edits ('
           'uuid_id TEXT NOT NULL PRIMARY KEY, '
           'values_json TEXT NOT NULL, '
           'write_mode TEXT NOT NULL, '
@@ -2106,6 +2109,10 @@ void main() {
           "status TEXT NOT NULL DEFAULT 'pending', "
           'server_revision INTEGER, '
           'updated_at INTEGER NOT NULL)',
+        );
+        // v9: snapshot column for reversible optimistic edits (take-server).
+        await db.customStatement(
+          'ALTER TABLE pending_edits ADD COLUMN original_values_json TEXT',
         );
 
         // Pre-migration row must still be intact and the new columns must
@@ -2159,6 +2166,19 @@ void main() {
             .customSelect('SELECT status FROM pending_edits')
             .getSingle();
         expect(pending.read<String>('status'), 'pending'); // default applied
+
+        // The v9 snapshot column must exist (nullable) and be writable.
+        await db.customStatement(
+          'UPDATE pending_edits '
+          "SET original_values_json = '{\"title\":\"Old\"}' WHERE uuid_id = 'u1'",
+        );
+        final snap = await db
+            .customSelect('SELECT original_values_json FROM pending_edits')
+            .getSingle();
+        expect(
+          snap.read<String>('original_values_json'),
+          '{"title":"Old"}',
+        );
       },
     );
   });

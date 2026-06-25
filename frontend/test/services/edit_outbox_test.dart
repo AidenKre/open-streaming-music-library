@@ -280,6 +280,49 @@ void main() {
     expect(remaining.map((r) => r.uuidId), ['u1']);
   });
 
+  test('take-server reverts the optimistic edit to the captured snapshot',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', artist: 'OldA', revision: 5);
+    final outbox =
+        _container(db, onPatch: (_) async => _conflict(9)).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'New'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    // Optimistic write took effect.
+    expect(
+      (await db
+              .customSelect("SELECT title FROM trackmetadata WHERE uuid_id='u1'")
+              .getSingle())
+          .read<String>('title'),
+      'New',
+    );
+    await outbox.flush(); // -> conflicted
+
+    await outbox.resolveTakeServer('u1');
+
+    // Reverted locally to the snapshot; the pending row is gone.
+    final meta = await db
+        .customSelect("SELECT title FROM trackmetadata WHERE uuid_id='u1'")
+        .getSingle();
+    expect(meta.read<String>('title'), 'Old');
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+    // FTS reflects the revert: the edited term is gone, the original is back.
+    final newHits = await db
+        .customSelect("SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH 'New'")
+        .get();
+    expect(newHits, isEmpty);
+    final oldHits = await db
+        .customSelect("SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH 'Old'")
+        .get();
+    expect(oldHits, hasLength(1));
+  });
+
   test('flush is a no-op while offline', () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);

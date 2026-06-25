@@ -217,6 +217,12 @@ class PendingEdits extends Table {
   /// resolution can rebase onto it.
   IntColumn get serverRevision => integer().nullable()();
 
+  /// Snapshot of the track's editable columns captured at the first edit of the
+  /// batch (JSON). Lets "take server"/discard revert the optimistic local write
+  /// without a network round-trip. Nullable: rows created before this column
+  /// existed fall back to the sync-only revert.
+  TextColumn get originalValuesJson => text().nullable()();
+
   IntColumn get updatedAt => integer()();
 
   @override
@@ -694,7 +700,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
   @override
-  int get schemaVersion => 8;
+  int get schemaVersion => 9;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -742,6 +748,13 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       if (from < 8) {
         // Outbox of unflushed metadata edits.
         await m.createTable(pendingEdits);
+      }
+      if (from < 9) {
+        // Snapshot column enabling a local revert of an optimistic edit
+        // (take-server / discard) without a network round-trip.
+        await customStatement(
+          'ALTER TABLE pending_edits ADD COLUMN original_values_json TEXT',
+        );
       }
     },
   );
@@ -936,6 +949,21 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
         [rowid, newTitle, newArtist, newAlbum],
       );
     });
+  }
+
+  /// Snapshot of a track's editable column values (the pre-edit state), used to
+  /// revert an optimistic edit locally on take-server/discard. Returns an empty
+  /// map if the track row is missing.
+  Future<Map<String, Object?>> readEditableColumns(String uuidId) async {
+    final cols = editableMetadataColumns.toList();
+    final select = cols.map((c) => '"$c"').join(', ');
+    final row = await customSelect(
+      'SELECT $select FROM trackmetadata WHERE uuid_id = ?',
+      variables: [Variable.withString(uuidId)],
+      readsFrom: {trackmetadata},
+    ).getSingleOrNull();
+    if (row == null) return {};
+    return {for (final c in cols) c: row.data[c]};
   }
 
   /// Live counts of outstanding edits for the pending-edits surface.

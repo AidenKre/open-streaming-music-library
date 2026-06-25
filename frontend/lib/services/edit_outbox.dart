@@ -52,11 +52,17 @@ class EditOutbox {
     // blind full-row upsert between the optimistic write and the queue write and
     // clobber the just-applied edit.
     await mutex.run(() async {
-      await db.applyOptimisticTrackEdit(uuidId, edit.toPayload());
-
       final existing = await (db.select(db.pendingEdits)
             ..where((t) => t.uuidId.equals(uuidId)))
           .getSingleOrNull();
+
+      // Snapshot the pre-edit state on the first edit of a batch — before the
+      // optimistic write mutates the columns — and preserve it across
+      // coalescing. This is what lets take-server/discard revert locally.
+      final original = existing?.originalValuesJson ??
+          jsonEncode(await db.readEditableColumns(uuidId));
+
+      await db.applyOptimisticTrackEdit(uuidId, edit.toPayload());
 
       var values = edit.toPayload();
       var mode = writeMode;
@@ -83,6 +89,7 @@ class EditOutbox {
               baseRevision: Value(base),
               status: const Value('pending'),
               serverRevision: const Value(null),
+              originalValuesJson: Value(original),
               updatedAt: Value(DateTime.now().millisecondsSinceEpoch),
             ),
           );
@@ -162,9 +169,19 @@ class EditOutbox {
     await flush();
   }
 
-  /// "Take server version": discard the local edit and pull server truth,
-  /// which overwrites the stale optimistic local row.
+  /// "Take server version": discard the local edit. Revert the optimistic write
+  /// to the captured pre-edit snapshot (so the already-synced server truth shows
+  /// immediately — `/changes` won't re-send a track at/below the watermark),
+  /// then pull to catch any not-yet-seen newer revision.
   Future<void> resolveTakeServer(String uuidId) async {
+    final row = await (db.select(db.pendingEdits)
+          ..where((t) => t.uuidId.equals(uuidId)))
+        .getSingleOrNull();
+    final snapshot = row?.originalValuesJson;
+    if (snapshot != null) {
+      final original = (jsonDecode(snapshot) as Map).cast<String, Object?>();
+      await mutex.run(() => db.applyOptimisticTrackEdit(uuidId, original));
+    }
     await _delete(uuidId);
     await ref.read(trackSyncProvider.notifier).sync();
   }
