@@ -27,6 +27,22 @@ class BrowseRepository {
     return rows.map(AlbumUI.fromQueryRow).toList(growable: false);
   }
 
+  Stream<List<AlbumUI>> watchAlbums({
+    int? artistId,
+    List<AlbumOrderParameter> orderBy = const [],
+    int? limit,
+    bool downloadedOnly = false,
+  }) {
+    return _db
+        .watchAlbums(
+          artistId: artistId,
+          orderBy: orderBy,
+          limit: limit,
+          downloadedOnly: downloadedOnly,
+        )
+        .map((rows) => rows.map(AlbumUI.fromQueryRow).toList(growable: false));
+  }
+
   Stream<int> watchAlbumsCount({
     int? artistId,
     List<AlbumOrderParameter> orderBy = const [],
@@ -56,6 +72,20 @@ class BrowseRepository {
       downloadedOnly: downloadedOnly,
     );
     return rows.map(ArtistUI.fromQueryRow).toList(growable: false);
+  }
+
+  Stream<List<ArtistUI>> watchArtists({
+    List<ArtistOrderParameter> orderBy = const [],
+    int? limit,
+    bool downloadedOnly = false,
+  }) {
+    return _db
+        .watchArtists(
+          orderBy: orderBy,
+          limit: limit,
+          downloadedOnly: downloadedOnly,
+        )
+        .map((rows) => rows.map(ArtistUI.fromQueryRow).toList(growable: false));
   }
 
   Stream<int> watchArtistCount({
@@ -89,6 +119,24 @@ class BrowseRepository {
       downloadedOnly: downloadedOnly,
     );
     return rows.map(TrackUI.fromQueryRow).toList(growable: false);
+  }
+
+  Stream<List<TrackUI>> watchTracks({
+    List<OrderParameter> orderBy = const [],
+    int? artistId,
+    int? albumId,
+    int? limit,
+    bool downloadedOnly = false,
+  }) {
+    return _db
+        .watchTracks(
+          orderBy: orderBy,
+          artistId: artistId,
+          albumId: albumId,
+          limit: limit,
+          downloadedOnly: downloadedOnly,
+        )
+        .map((rows) => rows.map(TrackUI.fromQueryRow).toList(growable: false));
   }
 
   Stream<int> watchTrackCount({

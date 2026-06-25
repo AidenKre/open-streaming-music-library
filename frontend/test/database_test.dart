@@ -2183,6 +2183,62 @@ void main() {
     );
   });
 
+  group('reactive browse', () {
+    Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
+
+    test('watchTracks re-emits an optimistic edit without a refresh', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated) VALUES ('u1',0,0)",
+      );
+      await db.customStatement(
+        'INSERT INTO trackmetadata (uuid_id, title, artist, album, duration, '
+        'bitrate_kbps, sample_rate_hz, channels, has_album_art) '
+        "VALUES ('u1','Old','A','Alb',1,1,1,2,0)",
+      );
+      final rowid = (await db
+              .customSelect("SELECT rowid AS r FROM trackmetadata WHERE uuid_id='u1'")
+              .getSingle())
+          .read<int>('r');
+      await db.customStatement(
+        "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+        "VALUES (?, 'Old', 'A', 'Alb')",
+        [rowid],
+      );
+
+      final titles = <String?>[];
+      final sub = db.watchTracks(limit: 50).listen(
+        (rows) =>
+            titles.add(rows.isEmpty ? null : rows.first.read<String?>('title')),
+      );
+      addTearDown(sub.cancel);
+      await settle();
+      expect(titles.last, 'Old');
+
+      // The real optimistic-write path (customUpdate) must notify watchers.
+      await db.applyOptimisticTrackEdit('u1', {'title': 'New'});
+      await settle();
+      expect(titles.last, 'New');
+    });
+
+    test('watchArtists re-emits when an artist row is removed', () async {
+      await db.customStatement(
+        "INSERT INTO artists (id, name) VALUES (1,'A'),(2,'B')",
+      );
+      final counts = <int>[];
+      final sub =
+          db.watchArtists(limit: 50).listen((rows) => counts.add(rows.length));
+      addTearDown(sub.cancel);
+      await settle();
+      expect(counts.last, 2);
+
+      // A typed delete (as the orphan sweep's sibling writes do) notifies the
+      // artists stream so the removed card disappears with no manual refresh.
+      await (db.delete(db.artists)..where((a) => a.id.equals(2))).go();
+      await settle();
+      expect(counts.last, 1);
+    });
+  });
+
   group('metadata autocomplete', () {
     Future<void> seed() async {
       await db.customStatement(

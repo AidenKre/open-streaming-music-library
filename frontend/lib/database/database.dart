@@ -922,9 +922,16 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       final oldAlbum = before.readNullable<String>('album') ?? '';
 
       final setSql = cols.map((c) => '"$c" = ?').join(', ');
-      await customStatement(
+      // customUpdate (not customStatement) so drift notifies `trackmetadata`
+      // stream watchers — the reactive browse lists must re-render on the edit.
+      await customUpdate(
         'UPDATE trackmetadata SET $setSql WHERE uuid_id = ?',
-        [...cols.map((c) => values[c]), uuidId],
+        variables: [
+          ...cols.map((c) => Variable(values[c])),
+          Variable.withString(uuidId),
+        ],
+        updates: {trackmetadata},
+        updateKind: UpdateKind.update,
       );
 
       final after = await customSelect(
@@ -1095,6 +1102,29 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       variables: vars,
       readsFrom: {trackmetadata, tracks},
     ).get();
+  }
+
+  /// Reactive window of the first [limit] tracks in display order. Re-emits on
+  /// any write to the read tables, so edits/sync reflect without a refresh.
+  Stream<List<QueryRow>> watchTracks({
+    List<OrderParameter> orderBy = const [],
+    int? artistId,
+    int? albumId,
+    int? limit,
+    bool downloadedOnly = false,
+  }) {
+    final (sql, vars) = _buildTrackQuery(
+      orderBy: orderBy,
+      artistId: artistId,
+      albumId: albumId,
+      limit: limit,
+      downloadedOnly: downloadedOnly,
+    );
+    return customSelect(
+      sql,
+      variables: vars,
+      readsFrom: {trackmetadata, tracks},
+    ).watch();
   }
 
   (String, List<Variable>) buildTrackUuidQuery({
@@ -1302,7 +1332,47 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     int? limit,
     int? offset,
     bool downloadedOnly = false,
-  }) async {
+  }) {
+    final (sql, vars) = _buildArtistQuery(
+      orderBy: orderBy,
+      cursorFilters: cursorFilters,
+      limit: limit,
+      offset: offset,
+      downloadedOnly: downloadedOnly,
+    );
+    return customSelect(
+      sql,
+      variables: vars,
+      readsFrom: {artists, trackmetadata, tracks},
+    ).get();
+  }
+
+  /// Reactive window of the first [limit] artists in display order. Re-emits on
+  /// any write to the read tables, so edits/sync reflect without a refresh.
+  Stream<List<QueryRow>> watchArtists({
+    List<ArtistOrderParameter> orderBy = const [],
+    int? limit,
+    bool downloadedOnly = false,
+  }) {
+    final (sql, vars) = _buildArtistQuery(
+      orderBy: orderBy,
+      limit: limit,
+      downloadedOnly: downloadedOnly,
+    );
+    return customSelect(
+      sql,
+      variables: vars,
+      readsFrom: {artists, trackmetadata, tracks},
+    ).watch();
+  }
+
+  (String, List<Variable>) _buildArtistQuery({
+    List<ArtistOrderParameter> orderBy = const [],
+    List<ArtistRowFilterParameter> cursorFilters = const [],
+    int? limit,
+    int? offset,
+    bool downloadedOnly = false,
+  }) {
     final vars = <Variable>[];
 
     // When offline, the cover-art subquery must restrict candidate tracks to
@@ -1382,11 +1452,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       }
     }
 
-    return customSelect(
-      query,
-      variables: vars,
-      readsFrom: {artists, trackmetadata, tracks},
-    ).get();
+    return (query, vars);
   }
 
   Stream<int> watchArtistCount({
@@ -1605,6 +1671,27 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       variables: vars,
       readsFrom: {albums, artists, trackmetadata, tracks},
     ).get();
+  }
+
+  /// Reactive window of the first [limit] albums in display order. Re-emits on
+  /// any write to the read tables, so edits/sync reflect without a refresh.
+  Stream<List<QueryRow>> watchAlbums({
+    int? artistId,
+    List<AlbumOrderParameter> orderBy = const [],
+    int? limit,
+    bool downloadedOnly = false,
+  }) {
+    final (sql, vars) = _buildAlbumQuery(
+      artistId: artistId,
+      orderBy: orderBy,
+      limit: limit,
+      downloadedOnly: downloadedOnly,
+    );
+    return customSelect(
+      sql,
+      variables: vars,
+      readsFrom: {albums, artists, trackmetadata, tracks},
+    ).watch();
   }
 
   Stream<int> watchAlbumsCount({

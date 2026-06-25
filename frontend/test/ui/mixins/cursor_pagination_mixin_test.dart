@@ -4,12 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 
-/// Minimal host that mixes in [CursorPaginationMixin] so the mixin can be
-/// driven directly, without standing up a full ConsumerState/widget tree.
+/// Minimal host that mixes in [CursorPaginationMixin] so the reactive window can
+/// be driven directly, without a full ConsumerState/widget tree.
 class _Host with CursorPaginationMixin<int> {
-  _Host(this._loadPage);
+  _Host(this._watchPage);
 
-  final Future<List<int>> Function({required bool useCursor}) _loadPage;
+  final Stream<List<int>> Function({required int limit}) _watchPage;
 
   @override
   bool mounted = true;
@@ -18,71 +18,85 @@ class _Host with CursorPaginationMixin<int> {
   final ScrollController scrollController = ScrollController();
 
   @override
-  int get pageSize => 50;
+  int get pageSize => 2;
 
   @override
   void setState(VoidCallback fn) => fn();
 
   @override
-  Future<List<int>> loadPage({required bool useCursor}) =>
-      _loadPage(useCursor: useCursor);
-
-  @override
-  Stream<int> watchItemCount({required bool useCursor}) =>
-      const Stream<int>.empty();
+  Stream<List<int>> watchPage({required int limit}) =>
+      _watchPage(limit: limit);
 }
 
+Future<void> _pump() => Future<void>.delayed(Duration.zero);
+
 void main() {
-  test('a load that completes after refresh() is discarded', () async {
-    final completers = <Completer<List<int>>>[];
-    final host = _Host(({required useCursor}) {
-      final c = Completer<List<int>>();
-      completers.add(c);
-      return c.future;
-    });
+  test('reactive window re-emits update the list with no refresh', () async {
+    final controller = StreamController<List<int>>.broadcast();
+    addTearDown(controller.close);
+    final host = _Host(
+      ({required limit}) =>
+          controller.stream.map((all) => all.take(limit).toList()),
+    );
     addTearDown(host.disposePagination);
     addTearDown(host.scrollController.dispose);
 
-    // Generation-0 load starts (e.g. an online, all-content page).
-    final firstLoad = host.loadMore();
-    expect(completers, hasLength(1));
+    host.initPagination(); // subscribes with limit == pageSize (2)
+    controller.add([1, 2]);
+    await _pump();
+    expect(host.paginatedItems, [1, 2]);
+    expect(host.hasMore, isTrue);
 
-    // A refresh runs while load 0 is still in flight — e.g. offline mode
-    // toggled, flipping the filter to downloaded-only (generation → 1).
-    host.refresh();
-    expect(completers, hasLength(2));
-
-    // The stale generation-0 load resolves with old-filter data.
-    completers[0].complete([1, 2, 3]);
-    await firstLoad;
-    expect(host.paginatedItems, isEmpty,
-        reason: 'stale load must not append into the refreshed list');
-
-    // The generation-1 load resolves with the new-filter data.
-    completers[1].complete([9, 8, 7]);
-    await Future<void>.delayed(Duration.zero);
-    expect(host.paginatedItems, [9, 8, 7]);
+    // An underlying edit changes a row; the stream re-emits and the list
+    // updates on its own — the core fix (no loadMore/refresh called).
+    controller.add([1, 20]);
+    await _pump();
+    expect(host.paginatedItems, [1, 20]);
   });
 
-  test('refresh() during an in-flight load still starts a fresh load', () async {
-    final completers = <Completer<List<int>>>[];
-    final host = _Host(({required useCursor}) {
-      final c = Completer<List<int>>();
-      completers.add(c);
-      return c.future;
-    });
+  test('loadMore grows the watched window by one page', () async {
+    final controller = StreamController<List<int>>.broadcast();
+    addTearDown(controller.close);
+    final host = _Host(
+      ({required limit}) =>
+          controller.stream.map((all) => all.take(limit).toList()),
+    );
     addTearDown(host.disposePagination);
     addTearDown(host.scrollController.dispose);
 
-    host.loadMore(); // generation 0 — isLoading is now true
-    expect(host.isLoading, isTrue);
+    host.initPagination();
+    controller.add([1, 2]);
+    await _pump();
 
-    host.refresh();
-    expect(completers, hasLength(2),
-        reason: 'refresh must not be skipped by the isLoading guard');
+    host.loadMore(); // limit -> 4, re-subscribes
+    controller.add([1, 2, 3, 4, 5]);
+    await _pump();
+    expect(host.paginatedItems, [1, 2, 3, 4]); // window of 4
+    expect(host.hasMore, isTrue); // full window → maybe more
+    expect(host.isLoading, isFalse);
+  });
 
-    completers[1].complete([5, 6]);
-    await Future<void>.delayed(Duration.zero);
-    expect(host.paginatedItems, [5, 6]);
+  test('refresh resets the window to the first page', () async {
+    final controller = StreamController<List<int>>.broadcast();
+    addTearDown(controller.close);
+    final host = _Host(
+      ({required limit}) =>
+          controller.stream.map((all) => all.take(limit).toList()),
+    );
+    addTearDown(host.disposePagination);
+    addTearDown(host.scrollController.dispose);
+
+    host.initPagination();
+    controller.add([1, 2]);
+    await _pump();
+    host.loadMore();
+    controller.add([1, 2, 3, 4]);
+    await _pump();
+    expect(host.paginatedItems, hasLength(4));
+
+    host.refresh(); // window back to pageSize (2)
+    controller.add([1, 2, 3, 4]);
+    await _pump();
+    expect(host.paginatedItems, [1, 2]);
   });
 }

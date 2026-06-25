@@ -192,15 +192,22 @@ class SyncService {
   }
 
   Future<void> _pruneOrphanParents() async {
-    await _db.customStatement(
+    // customUpdate (not customStatement) so the deletes notify the albums/
+    // artists stream watchers directly — the reactive browse lists drop the
+    // emptied cards without depending on a sibling write to trigger them.
+    await _db.customUpdate(
       'DELETE FROM albums WHERE NOT EXISTS ('
       'SELECT 1 FROM trackmetadata tm WHERE tm.album_id = albums.id'
       ')',
+      updates: {_db.albums},
+      updateKind: UpdateKind.delete,
     );
-    await _db.customStatement(
+    await _db.customUpdate(
       'DELETE FROM artists WHERE NOT EXISTS ('
       'SELECT 1 FROM trackmetadata tm WHERE tm.artist_id = artists.id'
       ')',
+      updates: {_db.artists},
+      updateKind: UpdateKind.delete,
     );
   }
 

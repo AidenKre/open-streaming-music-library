@@ -48,64 +48,17 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
   }
 
   @override
-  Future<List<TrackUI>> loadPage({required bool useCursor}) {
+  Stream<List<TrackUI>> watchPage({required int limit}) {
     final repo = ref.read(browseRepositoryProvider);
-    return repo.getTracks(
+    return repo.watchTracks(
       orderBy: _orderParams,
-      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
-      limit: pageSize,
+      limit: limit,
       downloadedOnly: true,
     );
-  }
-
-  @override
-  Stream<int> watchItemCount({required bool useCursor}) {
-    final repo = ref.read(browseRepositoryProvider);
-    return repo.watchTrackCount(
-      orderBy: useCursor ? _orderParams : [],
-      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
-      downloadedOnly: true,
-    );
-  }
-
-  List<RowFilterParameter> _buildCursorFromLast(TrackUI last) {
-    return [
-      RowFilterParameter(column: 'artist', value: last.artist),
-      RowFilterParameter(column: 'album', value: last.album),
-      RowFilterParameter(column: 'disc_number', value: last.discNumber),
-      RowFilterParameter(column: 'track_number', value: last.trackNumber),
-      RowFilterParameter(column: 'uuid_id', value: last.uuidId),
-    ];
-  }
-
-  void _patchDownloadStates() async {
-    if (!mounted) return;
-    final uuids = paginatedItems.map((t) => t.uuidId).toList();
-    if (uuids.isEmpty) return;
-    final db = ref.read(databaseProvider);
-    final states = await db.getTrackDownloadStates(uuids);
-    if (!mounted) return;
-    setState(() {
-      paginatedItems = paginatedItems
-          .map((t) {
-            final s = states[t.uuidId];
-            if (s == null) return t;
-            return t.copyWith(
-              filePath: s.filePath,
-              downloadedBitrateKbps: s.downloadedBitrateKbps,
-              fileSizeBytes: s.fileSizeBytes,
-              downloadedQuality: s.downloadedQuality,
-            );
-          })
-          .where((t) => t.isDownloaded)
-          .toList();
-    });
   }
 
   @override
   Widget build(BuildContext context) {
-    ref.listen(downloadStatusVersionProvider, (_, _) => _patchDownloadStates());
-
     final manager = ref.watch(downloadManagerListenableProvider);
     final statsAsync = ref.watch(downloadedStatsProvider);
 
