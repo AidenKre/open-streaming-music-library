@@ -280,6 +280,29 @@ void main() {
     expect(remaining.map((r) => r.uuidId), ['u1']);
   });
 
+  test('master-write toggle with no field edits queues an empty-field re-tag',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    final outbox =
+        _container(db, onPatch: (_) async => _ok()).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty(), // no field changes — just escalate mode
+      writeMode: EditWriteMode.dbAndMaster,
+      baseRevision: 5,
+    );
+    await outbox.flush();
+
+    final body = _patchCalls.single.body;
+    expect(body['write_mode'], 'db_and_master');
+    expect(body['base_revision'], 5);
+    // Only the control fields are sent — no field columns.
+    expect(body.keys.toSet(), {'base_revision', 'write_mode'});
+  });
+
   test('take-server reverts the optimistic edit to the captured snapshot',
       () async {
     final db = AppDatabase(NativeDatabase.memory());

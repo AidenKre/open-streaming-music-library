@@ -32,6 +32,21 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
 
   TrackUI get _track => widget.track;
 
+  @override
+  void initState() {
+    super.initState();
+    _loadPendingWriteMode();
+  }
+
+  /// Reflect a queued `db_and_master` edit so reopening Get Info shows the
+  /// master-write toggle already on — and re-saving can keep escalating to a
+  /// master-file write.
+  Future<void> _loadPendingWriteMode() async {
+    final mode = await ref.read(databaseProvider).pendingWriteMode(_track.uuidId);
+    if (!mounted) return;
+    if (mode == 'db_and_master') setState(() => _writeToFile = true);
+  }
+
   Object? _currentValue(String key) {
     switch (key) {
       case 'title':
@@ -74,13 +89,16 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
 
   Future<void> _save() async {
     if (!_editing) return;
-    if (_edit.isEmpty) {
-      _toast('No changes to save');
-      return;
-    }
     final mode = _writeToFile
         ? EditWriteMode.dbAndMaster
         : EditWriteMode.dbOnly;
+    // Enabling master-write is itself a saveable change (re-tag the file from
+    // the current DB values), so "no changes" only applies to a DB-only save
+    // with no edited fields.
+    if (_edit.isEmpty && mode == EditWriteMode.dbOnly) {
+      _toast('No changes to save');
+      return;
+    }
     if (mode == EditWriteMode.dbAndMaster) {
       final confirmed = await showMasterWriteConfirmDialog(context);
       if (!confirmed) return;

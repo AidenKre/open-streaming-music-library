@@ -184,6 +184,25 @@ class TestTrackEditorMaster:
         assert db.get_track_file_path(track.uuid_id) == str(audio)
         assert db.list_journal_entries() == []
 
+    def test_empty_field_master_write_retags_file(self, tmp_path):
+        # Enabling master-write with no field edits re-tags the file from the
+        # current DB metadata and bumps the revision (the "re-tag" flow). The
+        # empty-field edit must not trip EmptyTrackEdit (existing tags survive).
+        library = tmp_path / "music"
+        audio = library / "Art" / "song.m4a"
+        _make_audio(audio, title="Keep", artist="Art")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "Keep", "Art")
+
+        rev, master_written = self._editor(db, library).apply_edit(
+            track.uuid_id, {}, track.revision, WriteMode.db_and_master
+        )
+
+        assert master_written is True
+        assert rev > track.revision
+        assert audio.exists()  # artist unchanged → in-place re-tag
+        assert metadata_mod.get_track_metadata(audio).title == "Keep"
+
     def test_inplace_replace_failure_is_recoverable(self, tmp_path, monkeypatch):
         # A caught os.replace error (soft failure, not a hard crash) after the
         # DB commit + journal write must leave temp + journal row intact so

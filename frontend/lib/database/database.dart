@@ -966,6 +966,16 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     return {for (final c in cols) c: row.data[c]};
   }
 
+  /// The queued write mode (`db_only`/`db_and_master`) for a track's pending
+  /// edit, or null if none is queued. Lets Get Info reflect a queued master
+  /// write when it reopens.
+  Future<String?> pendingWriteMode(String uuidId) async {
+    final row = await (select(pendingEdits)
+          ..where((t) => t.uuidId.equals(uuidId)))
+        .getSingleOrNull();
+    return row?.writeMode;
+  }
+
   /// Live counts of outstanding edits for the pending-edits surface.
   Stream<({int pending, int conflicted})> watchPendingEditCounts() {
     return customSelect(

@@ -47,7 +47,9 @@ class EditOutbox {
     required EditWriteMode writeMode,
     required int? baseRevision,
   }) async {
-    if (edit.isEmpty) return;
+    // An empty edit is still queued when it escalates to a master-file write
+    // (re-tag the file from current DB values); only a no-op DB-only edit exits.
+    if (edit.isEmpty && writeMode == EditWriteMode.dbOnly) return;
     // Held under the shared mutex so a concurrent `/changes` pull can't land its
     // blind full-row upsert between the optimistic write and the queue write and
     // clobber the just-applied edit.
