@@ -93,24 +93,23 @@ class TrackEditor:
         self, uuid_id: str, fields: dict, base_revision: Optional[int],
         track: Track, source: Path,
     ) -> tuple[int, bool]:
-        self._staging.mkdir(parents=True, exist_ok=True)
-        # Stage the new-tags copy outside any watched tree; audio bytes are
-        # copied (-c copy) so the (uuid, quality) encoded cache stays valid.
-        temp = self._staging / f"{uuid_id}{source.suffix}"
-        write_metadata_tags(source, temp, _build_ffmpeg_tags(fields))
-
         merged = track.metadata.model_copy(update=fields)
         dest = sanitized_destination_path(source.name, merged, self._library)
 
-        try:
-            if dest == source:
-                rev = self._inplace(uuid_id, fields, base_revision, source, temp)
-            else:
-                rev = self._relocate(uuid_id, fields, base_revision, source, dest, temp)
-        finally:
-            # The success paths consume `temp` via an atomic move; clean up any
-            # leftover (e.g. the DB raised before the file step).
-            temp.unlink(missing_ok=True)
+        self._staging.mkdir(parents=True, exist_ok=True)
+        # Stage the new-tags copy outside any watched tree; audio bytes are
+        # copied (-c copy) so the (uuid, quality) encoded cache stays valid.
+        # `write_metadata_tags` removes `temp` itself on any failure, so a failed
+        # stage leaks nothing. Once it succeeds, ownership of `temp` passes to
+        # _inplace / _relocate, which clean it on pre-journal failures and
+        # otherwise hand it to the journal for reconcile to consume.
+        temp = self._staging / f"{uuid_id}{source.suffix}"
+        write_metadata_tags(source, temp, _build_ffmpeg_tags(fields))
+
+        if dest == source:
+            rev = self._inplace(uuid_id, fields, base_revision, source, temp)
+        else:
+            rev = self._relocate(uuid_id, fields, base_revision, source, dest, temp)
         return rev, True
 
     def _inplace(
@@ -118,15 +117,27 @@ class TrackEditor:
         source: Path, temp: Path,
     ) -> int:
         # Commit the DB first; a crash before the replace leaves file=old/DB=new
-        # — the same benign divergence as a DB-only edit. The journal (written
-        # after the commit, before the destructive replace) redoes the replace.
-        rev = self._db.apply_track_metadata_edit(uuid_id, fields, base_revision)
-        entry = self._db.insert_journal_entry(
-            "inplace", uuid_id, old_path=str(source), temp_path=str(temp)
-        )
-        os.replace(temp, source)
-        self._db.delete_journal_entry(entry)
-        return rev
+        # — the same benign divergence as a DB-only edit.
+        journaled = False
+        try:
+            rev = self._db.apply_track_metadata_edit(uuid_id, fields, base_revision)
+            # Journal AFTER the commit (a journal row implies the DB advanced)
+            # and BEFORE the destructive replace. From here the journal owns
+            # `temp`: a hard crash *or* a caught os.replace error leaves temp +
+            # row for reconcile_journal to redo, so we must not delete temp on
+            # the error path once journaled.
+            entry = self._db.insert_journal_entry(
+                "inplace", uuid_id, old_path=str(source), temp_path=str(temp)
+            )
+            journaled = True
+            os.replace(temp, source)
+            self._db.delete_journal_entry(entry)
+            return rev
+        except BaseException:
+            if not journaled:
+                # DB commit or journal insert failed — nothing references `temp`.
+                temp.unlink(missing_ok=True)
+            raise
 
     def _relocate(
         self, uuid_id: str, fields: dict, base_revision: Optional[int],
@@ -134,12 +145,17 @@ class TrackEditor:
     ) -> int:
         # Journal the move BEFORE doing it: a crash in the move↔commit window is
         # reverted (DB not advanced) or finished (DB advanced) at startup.
-        entry = self._db.insert_journal_entry(
-            "relocate", uuid_id,
-            old_path=str(source), new_path=str(dest), temp_path=str(temp),
-        )
+        try:
+            entry = self._db.insert_journal_entry(
+                "relocate", uuid_id,
+                old_path=str(source), new_path=str(dest), temp_path=str(temp),
+            )
+        except BaseException:
+            temp.unlink(missing_ok=True)  # nothing journaled yet
+            raise
         if not move_file(file_path=temp, destination_path=dest):
             self._db.delete_journal_entry(entry)
+            temp.unlink(missing_ok=True)  # move failed; drop the staged copy
             raise MasterWriteError(f"could not place master at {dest}")
         try:
             rev = self._db.apply_track_metadata_edit(

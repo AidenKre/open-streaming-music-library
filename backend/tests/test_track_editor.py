@@ -184,6 +184,45 @@ class TestTrackEditorMaster:
         assert db.get_track_file_path(track.uuid_id) == str(audio)
         assert db.list_journal_entries() == []
 
+    def test_inplace_replace_failure_is_recoverable(self, tmp_path, monkeypatch):
+        # A caught os.replace error (soft failure, not a hard crash) after the
+        # DB commit + journal write must leave temp + journal row intact so
+        # reconcile_journal can redo the replace. Regression: the old blanket
+        # `finally: temp.unlink()` deleted the temp the journal referenced,
+        # voiding the redo and stranding file=old/DB=new.
+        library = tmp_path / "music"
+        audio = library / "Art" / "song.m4a"
+        _make_audio(audio, title="Old", artist="Art")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "Old", "Art")
+        editor = self._editor(db, library)
+
+        def boom(src, dst):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            editor.apply_edit(
+                track.uuid_id, {"title": "New"}, track.revision,
+                WriteMode.db_and_master,
+            )
+
+        # DB advanced, but the file is untouched and the staged temp + its
+        # journal row survive for recovery.
+        temp = library / ".staging" / f"{track.uuid_id}.m4a"
+        assert temp.exists()
+        assert db.get_tracks()[0].revision > track.revision
+        assert metadata_mod.get_track_metadata(audio).title == "Old"
+        entries = db.list_journal_entries()
+        assert len(entries) == 1 and entries[0]["intent"] == "inplace"
+
+        # Recovery completes the replace and clears the journal.
+        monkeypatch.undo()
+        reconcile_journal(db)
+        assert metadata_mod.get_track_metadata(audio).title == "New"
+        assert not temp.exists()
+        assert db.list_journal_entries() == []
+
     def test_wav_degrades_to_db_only(self, tmp_path):
         library = tmp_path / "music"
         wav = library / "Art" / "song.wav"
