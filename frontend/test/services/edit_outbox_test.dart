@@ -217,6 +217,69 @@ void main() {
     expect(await db.select(db.pendingEdits).get(), isEmpty); // applied
   });
 
+  test('re-editing a conflicted row rebases base onto the server revision',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    final outbox =
+        _container(db, onPatch: (_) async => _conflict(9)).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'A'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush(); // -> conflicted, serverRevision 9
+
+    // A fresh edit on the conflicted row clears the conflict and rebases onto
+    // the server revision (not the stale 5) so the next flush won't re-conflict.
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'B'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'pending');
+    expect(row.baseRevision, 9);
+  });
+
+  test('a failing row does not block the rest of the outbox flush', () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, uuid: 'u1', revision: 5);
+    await _seedTrack(db,
+        uuid: 'u2', title: 'T2', artist: 'A2', album: 'Alb2', revision: 5);
+
+    // u1's PATCH always 500s (reaches the rethrow); u2 succeeds.
+    final outbox = _container(
+      db,
+      onPatch: (body) async =>
+          body['title'] == 'fail' ? http.Response('', 500) : _ok(),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'fail'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.enqueue(
+      uuidId: 'u2',
+      edit: const MetadataEdit.empty().set('title', 'ok'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush();
+
+    // u1 stays pending (stuck), but u2 flushed despite u1 failing first.
+    final remaining = await db.select(db.pendingEdits).get();
+    expect(remaining.map((r) => r.uuidId), ['u1']);
+  });
+
   test('flush is a no-op while offline', () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);

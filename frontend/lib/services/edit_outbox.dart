@@ -48,33 +48,45 @@ class EditOutbox {
     required int? baseRevision,
   }) async {
     if (edit.isEmpty) return;
-    await db.applyOptimisticTrackEdit(uuidId, edit.toPayload());
+    // Held under the shared mutex so a concurrent `/changes` pull can't land its
+    // blind full-row upsert between the optimistic write and the queue write and
+    // clobber the just-applied edit.
+    await mutex.run(() async {
+      await db.applyOptimisticTrackEdit(uuidId, edit.toPayload());
 
-    final existing = await (db.select(db.pendingEdits)
-          ..where((t) => t.uuidId.equals(uuidId)))
-        .getSingleOrNull();
+      final existing = await (db.select(db.pendingEdits)
+            ..where((t) => t.uuidId.equals(uuidId)))
+          .getSingleOrNull();
 
-    var values = edit.toPayload();
-    var mode = writeMode;
-    var base = baseRevision;
-    if (existing != null) {
-      final prev = (jsonDecode(existing.valuesJson) as Map).cast<String, Object?>();
-      values = {...prev, ...values}; // latest value per touched key wins
-      mode = _escalate(_parseMode(existing.writeMode), writeMode);
-      base = existing.baseRevision; // keep the first base of the batch
-    }
+      var values = edit.toPayload();
+      var mode = writeMode;
+      var base = baseRevision;
+      if (existing != null) {
+        final prev =
+            (jsonDecode(existing.valuesJson) as Map).cast<String, Object?>();
+        values = {...prev, ...values}; // latest value per touched key wins
+        mode = _escalate(_parseMode(existing.writeMode), writeMode);
+        // Re-editing a conflicted row rebases onto the server's revision so the
+        // next flush builds on server truth instead of 409-ing again on the
+        // stale base; otherwise keep the batch's first base.
+        base =
+            (existing.status == 'conflicted' && existing.serverRevision != null)
+                ? existing.serverRevision
+                : existing.baseRevision;
+      }
 
-    await db.into(db.pendingEdits).insertOnConflictUpdate(
-          PendingEditsCompanion(
-            uuidId: Value(uuidId),
-            valuesJson: Value(jsonEncode(values)),
-            writeMode: Value(mode.wire),
-            baseRevision: Value(base),
-            status: const Value('pending'),
-            serverRevision: const Value(null),
-            updatedAt: Value(DateTime.now().millisecondsSinceEpoch),
-          ),
-        );
+      await db.into(db.pendingEdits).insertOnConflictUpdate(
+            PendingEditsCompanion(
+              uuidId: Value(uuidId),
+              valuesJson: Value(jsonEncode(values)),
+              writeMode: Value(mode.wire),
+              baseRevision: Value(base),
+              status: const Value('pending'),
+              serverRevision: const Value(null),
+              updatedAt: Value(DateTime.now().millisecondsSinceEpoch),
+            ),
+          );
+    });
   }
 
   /// Flush all pending rows. Held under the shared mutex so a `/changes` pull
@@ -92,10 +104,10 @@ class EditOutbox {
       try {
         await _flushOne(row);
       } catch (e) {
-        // Network error / unexpected 5xx after retries: stop and leave the
-        // remaining rows pending for the next attempt.
-        developer.log('flush halted: $e', name: 'EditOutbox');
-        break;
+        // Network error / unexpected 5xx after retries: leave this row pending
+        // and move on, so one stuck track can't block the rest of the outbox.
+        developer.log('flush skipped ${row.uuidId}: $e', name: 'EditOutbox');
+        continue;
       }
     }
   }

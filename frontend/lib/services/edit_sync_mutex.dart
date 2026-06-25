@@ -2,10 +2,10 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-/// A minimal FIFO async mutex (we only need this one place, and `synchronized`
-/// is just a transitive dep). Serializes the outbox **flush** against the
-/// `/changes` **pull** so a pull's blind full-row upsert can never clobber an
-/// edit that is mid-flush, and vice versa.
+/// A minimal FIFO async mutex (we only need this one place). Serializes the
+/// outbox's local **optimistic write** and its **flush** against the `/changes`
+/// **pull**, so a pull's blind full-row upsert can never clobber an edit that is
+/// being applied or flushed, and vice versa.
 class AsyncMutex {
   Future<void> _tail = Future.value();
 
