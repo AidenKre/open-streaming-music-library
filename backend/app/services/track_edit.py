@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.database.database import EDITABLE_METADATA_COLUMNS
 
@@ -41,7 +41,13 @@ class TrackPatchRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    base_revision: int
+    # Required but NULLABLE: a client with an unknown local base (Option A)
+    # sends an explicit null, which must reach the DB layer's
+    # `base_revision is None -> RevisionConflict` branch and come back as a
+    # 409 conflict prompt — NOT a 422, which the client outbox treats as a
+    # permanent rejection and silently discards. A *missing* field is still a
+    # 422 (malformed request, not an unknown base).
+    base_revision: Optional[int] = Field(...)
     write_mode: WriteMode = WriteMode.db_only
 
     title: Optional[str] = None

@@ -1281,6 +1281,23 @@ class TestPatchTrack:
         r = client.patch(f"/tracks/{track.uuid_id}", json={"title": "X"})
         assert r.status_code == 422, r.text
 
+    def test_patch__null_base_revision__409_conflict_not_422(self, client):
+        # Option A: a NULL client-side revision means "unknown base" and must
+        # force the conflict-prompt path (do NOT treat NULL as 0). The client
+        # really sends null — e.g. resolveKeepMine rebasing onto an
+        # unparseable 409 body. A 422 would be fatal client-side: the outbox
+        # treats 422 as a permanent rejection and silently reverts + discards
+        # the user's edit, so null must get the 409 conflict shape instead.
+        track = self._add_one(client)
+        r = client.patch(
+            f"/tracks/{track.uuid_id}",
+            json={"base_revision": None, "title": "Renamed"},
+        )
+        assert r.status_code == 409, r.text
+        body = r.json()
+        assert body["detail"]["error"] == "revision_conflict"
+        assert body["detail"]["current_revision"] == track.revision
+
     def test_patch__blanks_whole_track__422(self, client):
         track = self._add_one(client)
         r = client.patch(
