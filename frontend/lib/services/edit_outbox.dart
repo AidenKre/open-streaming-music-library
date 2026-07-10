@@ -174,14 +174,26 @@ class EditOutbox {
   }
 
   /// Revert a track's optimistic write back to the pre-edit snapshot captured
-  /// at the first edit of the batch. Pure DB work — the caller decides whether
-  /// the shared mutex is held (the flush path holds it; [resolveTakeServer]
-  /// wraps the call itself).
+  /// at the first edit of the batch — but only the fields this batch touched,
+  /// and only where the current local value is still the batch's optimistic
+  /// value. If something newer overwrote a field (a `/changes` pull upserting
+  /// server truth while the row sat pending), that value is at/below the
+  /// watermark and would never be re-sent, so blindly resurrecting the stale
+  /// snapshot over it is unrepairable — leave it in place instead. Pure DB
+  /// work — the caller decides whether the shared mutex is held.
   Future<void> _revertToSnapshot(PendingEdit row) async {
-    final snapshot = row.originalValuesJson;
-    if (snapshot == null) return;
-    final original = (jsonDecode(snapshot) as Map).cast<String, Object?>();
-    await db.applyOptimisticTrackEdit(row.uuidId, original);
+    final snapshotJson = row.originalValuesJson;
+    if (snapshotJson == null) return;
+    final snapshot = (jsonDecode(snapshotJson) as Map).cast<String, Object?>();
+    final edited = (jsonDecode(row.valuesJson) as Map).cast<String, Object?>();
+    final current = await db.readEditableColumns(row.uuidId);
+    if (current.isEmpty) return; // track row already gone locally
+    final revert = <String, Object?>{
+      for (final entry in edited.entries)
+        if (current[entry.key] == entry.value) entry.key: snapshot[entry.key],
+    };
+    if (revert.isEmpty) return;
+    await db.applyOptimisticTrackEdit(row.uuidId, revert);
   }
 
   /// "Keep my edit": rebase onto the server's current revision and re-queue.

@@ -474,6 +474,43 @@ void main() {
     expect(await db.select(db.pendingEdits).get(), isEmpty);
   });
 
+  test('flush 422 must not revert over newer server truth pulled while pending',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', revision: 5);
+    final outbox = _container(db, onPatch: (_) async => http.Response('', 422))
+        .read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Mine'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    // While the row waits (e.g. its first flush hit a transient network
+    // error), a `/changes` pull lands: the blind full-row upsert overwrites
+    // the optimistic value with newer server truth and advances the
+    // watermark past it.
+    await db.customStatement(
+        "UPDATE trackmetadata SET title = 'ServerNew' WHERE uuid_id = 'u1'");
+    await db.customStatement(
+        "UPDATE tracks SET revision = 9 WHERE uuid_id = 'u1'");
+
+    await outbox.flush(); // -> 422, permanent rejection
+
+    // The revert must not resurrect the pre-edit snapshot over server truth
+    // that is at/below the watermark — no pull will ever re-send it.
+    final title = (await db
+            .customSelect(
+                "SELECT title FROM trackmetadata WHERE uuid_id = 'u1'")
+            .getSingle())
+        .read<String>('title');
+    expect(title, 'ServerNew',
+        reason: 'the 422 revert clobbered already-synced server truth with '
+            'the stale pre-edit snapshot');
+  });
+
   test('flush is a no-op while offline', () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
