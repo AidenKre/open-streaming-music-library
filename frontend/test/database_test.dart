@@ -2050,137 +2050,37 @@ void main() {
     );
   });
 
-  group('schema migration', () {
-    // A fresh in-memory DB at the latest schema does not exercise the
-    // onUpgrade ALTER TABLE statements at all — a missing step (e.g. forgot
-    // to add `downloaded_quality` in v5) silently passes such a test but
-    // breaks every upgrading user. This test simulates the v3 starting
-    // state, runs each upgrade ALTER, and asserts the resulting columns are
-    // queryable through the same row-shape the app uses.
-    test(
-      'v3 → current upgrade adds all post-v3 columns and preserves data',
-      () async {
-        // Drop the modern `tracks` table and rebuild it as it was at v3
-        // (only `downloaded_bitrate_kbps`; no file_size_bytes or
-        // downloaded_quality).
-        await db.customStatement('PRAGMA foreign_keys = OFF');
-        await db.customStatement('DROP TABLE tracks');
-        await db.customStatement(
-          'CREATE TABLE tracks ('
-          'uuid_id TEXT NOT NULL PRIMARY KEY, '
-          'file_path TEXT, '
-          'created_at INTEGER NOT NULL, '
-          'last_updated INTEGER NOT NULL, '
-          'downloaded_bitrate_kbps INTEGER'
-          ')',
-        );
-        await db.customStatement(
-          "INSERT INTO tracks (uuid_id, file_path, created_at, "
-          "last_updated, downloaded_bitrate_kbps) "
-          "VALUES ('uuid-1', '/tmp/foo.audio', 1700000000, 1700000000, 256)",
-        );
+  group('schema', () {
+    // Schema history was reset during beta: the current definitions are v1 and
+    // onCreate is the only creation path. This sanity check pins the reset —
+    // user_version lands at 1 and the newest columns exist from day one. When
+    // the first real migration is added, follow the ground rules documented on
+    // AppDatabase.migration (test it by opening a REAL previous-version file).
+    test('fresh database is created at version 1 with the full current shape',
+        () async {
+      final version = await db
+          .customSelect('PRAGMA user_version')
+          .getSingle();
+      expect(version.read<int>('user_version'), 1);
 
-        // Apply the v4, v5, and v6 upgrades exactly as the MigrationStrategy
-        // would. Keep this list in sync with AppDatabase.migration.
-        await db.customStatement(
-          'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
-        );
-        await db.customStatement(
-          'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
-        );
-        await db.customStatement(
-          'ALTER TABLE tracks ADD COLUMN revision INTEGER',
-        );
-        // v7: NOCASE genre index for autocomplete prefix scans.
-        await db.customStatement(
-          'CREATE INDEX IF NOT EXISTS idx_genre_nocase '
-          'ON trackmetadata (genre COLLATE NOCASE)',
-        );
-        // v8: pending_edits outbox table. Drop the latest-schema table the test
-        // harness already created so we re-create the v8 shape and genuinely
-        // exercise the v9 ALTER below.
-        await db.customStatement('DROP TABLE IF EXISTS pending_edits');
-        await db.customStatement(
-          'CREATE TABLE pending_edits ('
-          'uuid_id TEXT NOT NULL PRIMARY KEY, '
-          'values_json TEXT NOT NULL, '
-          'write_mode TEXT NOT NULL, '
-          'base_revision INTEGER, '
-          "status TEXT NOT NULL DEFAULT 'pending', "
-          'server_revision INTEGER, '
-          'updated_at INTEGER NOT NULL)',
-        );
-        // v9: snapshot column for reversible optimistic edits (take-server).
-        await db.customStatement(
-          'ALTER TABLE pending_edits ADD COLUMN original_values_json TEXT',
-        );
-
-        // Pre-migration row must still be intact and the new columns must
-        // exist and be readable. `revision` is NULL on a row that predates
-        // it = "unknown base" (Option A) until the row's next /changes upsert.
-        final rows = await db
+      for (final col in ['original_values_json', 'rejection_reason']) {
+        final hit = await db
             .customSelect(
-              'SELECT uuid_id, file_path, downloaded_bitrate_kbps, '
-              'file_size_bytes, downloaded_quality, revision FROM tracks',
+              "SELECT name FROM pragma_table_info('pending_edits') "
+              'WHERE name = ?',
+              variables: [Variable.withString(col)],
             )
             .get();
-        expect(rows, hasLength(1));
-        expect(rows.first.read<String>('uuid_id'), 'uuid-1');
-        expect(rows.first.read<String?>('file_path'), '/tmp/foo.audio');
-        expect(rows.first.read<int?>('downloaded_bitrate_kbps'), 256);
-        expect(rows.first.read<int?>('file_size_bytes'), isNull);
-        expect(rows.first.read<String?>('downloaded_quality'), isNull);
-        expect(rows.first.read<int?>('revision'), isNull);
-
-        // The new columns must also be writable.
-        await db.customStatement(
-          "UPDATE tracks SET file_size_bytes = 1024, "
-          "downloaded_quality = '320', revision = 42 WHERE uuid_id = 'uuid-1'",
-        );
-        final updated = await db
-            .customSelect(
-              'SELECT file_size_bytes, downloaded_quality, revision '
-              'FROM tracks',
-            )
-            .getSingle();
-        expect(updated.read<int>('file_size_bytes'), 1024);
-        expect(updated.read<String>('downloaded_quality'), '320');
-        expect(updated.read<int>('revision'), 42);
-
-        // The v7 NOCASE genre index must now exist.
-        final indexes = await db
-            .customSelect(
-              "SELECT name FROM sqlite_master WHERE type='index' "
-              "AND name='idx_genre_nocase'",
-            )
-            .get();
-        expect(indexes, hasLength(1));
-
-        // The v8 pending_edits table must now exist and be writable.
-        await db.customStatement(
-          "INSERT INTO pending_edits "
-          "(uuid_id, values_json, write_mode, updated_at) "
-          "VALUES ('u1', '{}', 'db_only', 0)",
-        );
-        final pending = await db
-            .customSelect('SELECT status FROM pending_edits')
-            .getSingle();
-        expect(pending.read<String>('status'), 'pending'); // default applied
-
-        // The v9 snapshot column must exist (nullable) and be writable.
-        await db.customStatement(
-          'UPDATE pending_edits '
-          "SET original_values_json = '{\"title\":\"Old\"}' WHERE uuid_id = 'u1'",
-        );
-        final snap = await db
-            .customSelect('SELECT original_values_json FROM pending_edits')
-            .getSingle();
-        expect(
-          snap.read<String>('original_values_json'),
-          '{"title":"Old"}',
-        );
-      },
-    );
+        expect(hit, hasLength(1), reason: 'pending_edits is missing $col');
+      }
+      final revision = await db
+          .customSelect(
+            "SELECT name FROM pragma_table_info('tracks') "
+            "WHERE name = 'revision'",
+          )
+          .get();
+      expect(revision, hasLength(1));
+    });
   });
 
   group('reactive browse', () {

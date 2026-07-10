@@ -219,9 +219,12 @@ class PendingEdits extends Table {
 
   /// Snapshot of the track's editable columns captured at the first edit of the
   /// batch (JSON). Lets "take server"/discard revert the optimistic local write
-  /// without a network round-trip. Nullable: rows created before this column
-  /// existed fall back to the sync-only revert.
+  /// without a network round-trip.
   TextColumn get originalValuesJson => text().nullable()();
+
+  /// Short human-readable reason recorded when a flush is permanently rejected
+  /// (422 / track gone), surfaced in the pending-edits banner until dismissed.
+  TextColumn get rejectionReason => text().nullable()();
 
   IntColumn get updatedAt => integer()();
 
@@ -699,8 +702,25 @@ String _quoteSqlIdentifier(String identifier) {
 class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
+  /// Schema history was reset during beta: the current table definitions ARE
+  /// version 1 and there is no upgrade path from the pre-reset versions (an
+  /// old-beta database must go through the local-reset flow once).
+  ///
+  /// Ground rules for the first post-reset migration (learned the hard way —
+  /// an unguarded ALTER once bricked every upgrading install):
+  ///
+  ///  1. `m.createTable(...)` always emits the table's CURRENT Dart shape.
+  ///     A column ALTER for a table introduced in version N must therefore be
+  ///     guarded `from >= N`, or upgraders that just created the table will
+  ///     crash on "duplicate column name".
+  ///  2. Every schema bump ships with a test that opens a real previous-version
+  ///     database file and runs the actual `onUpgrade` — never a hand-replayed
+  ///     statement list, which is exactly what masked the bug above.
+  ///  3. Once the schema stabilizes, adopt drift's exported-schema tooling
+  ///     (`drift_dev schema` + step-by-step migrations) so upgrades are
+  ///     generated against frozen snapshots instead of hand-written.
   @override
-  int get schemaVersion => 9;
+  int get schemaVersion => 1;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -708,53 +728,6 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       await m.createAll();
       for (final stmt in _ftsStatements) {
         await customStatement(stmt);
-      }
-    },
-    onUpgrade: (m, from, to) async {
-      if (from < 2) {
-        await customStatement(
-          'ALTER TABLE trackmetadata ADD COLUMN cover_art_id INTEGER',
-        );
-      }
-      if (from < 3) {
-        await customStatement(
-          'ALTER TABLE tracks ADD COLUMN downloaded_bitrate_kbps INTEGER',
-        );
-      }
-      if (from < 4) {
-        await customStatement(
-          'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
-        );
-      }
-      if (from < 5) {
-        await customStatement(
-          'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
-        );
-      }
-      if (from < 6) {
-        // Existing rows get NULL = "unknown base"; they pick up a real
-        // revision on their next `/changes` upsert.
-        await customStatement(
-          'ALTER TABLE tracks ADD COLUMN revision INTEGER',
-        );
-      }
-      if (from < 7) {
-        // NOCASE index backing genre autocomplete prefix scans.
-        await customStatement(
-          'CREATE INDEX IF NOT EXISTS idx_genre_nocase '
-          'ON trackmetadata (genre COLLATE NOCASE)',
-        );
-      }
-      if (from < 8) {
-        // Outbox of unflushed metadata edits.
-        await m.createTable(pendingEdits);
-      }
-      if (from < 9) {
-        // Snapshot column enabling a local revert of an optimistic edit
-        // (take-server / discard) without a network round-trip.
-        await customStatement(
-          'ALTER TABLE pending_edits ADD COLUMN original_values_json TEXT',
-        );
       }
     },
   );
