@@ -210,7 +210,9 @@ class PendingEdits extends Table {
   /// base). Nullable = "unknown base" → forces the conflict path on flush.
   IntColumn get baseRevision => integer().nullable()();
 
-  /// `pending` (awaiting flush) or `conflicted` (server returned 409).
+  /// `pending` (awaiting flush), `conflicted` (server returned 409), or
+  /// `take_server` (resolution chosen; the authoritative single-track refetch
+  /// hasn't succeeded yet — retried after each sync).
   TextColumn get status => text().withDefault(const Constant('pending'))();
 
   /// The server's current revision, recorded on a 409 so a "keep mine"

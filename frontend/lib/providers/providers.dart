@@ -76,10 +76,15 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     // so a `/changes` pull can never clobber an unflushed optimistic edit
     // (the pull does a blind full-row upsert). Flushing first also satisfies
     // "flush before pull on reconnect" since this runs from the recovery edge.
-    await _runGuarded((service) async {
+    final ran = await _runGuarded((service) async {
       await ref.read(editOutboxProvider).flushLocked();
       return service.syncChanges();
     });
+    // Finish take-server resolutions deferred while offline or mid-sync —
+    // outside the critical section; refreshTrack re-takes the guards itself.
+    if (ran) {
+      await ref.read(editOutboxProvider).retryTakeServerResolutions();
+    }
   }
 
   /// Reconcile a single track to current server truth (refetch + apply, or

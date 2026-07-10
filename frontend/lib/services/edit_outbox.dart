@@ -257,22 +257,47 @@ class EditOutbox {
     await flush();
   }
 
-  /// "Take server version": discard the local edit. Revert the optimistic write
-  /// to the captured pre-edit snapshot for instant feedback, drop the row, then
-  /// refetch this single track to land on *current* server truth. A plain pull
-  /// can't be trusted here: if a prior `/changes` already advanced the watermark
-  /// past the conflicting revision, it would fetch nothing and leave the stale
-  /// snapshot in place. The authoritative single-track refetch always overwrites
-  /// (or deletes the track if it's gone server-side).
+  /// "Take server version": discard the local edit and land on *current*
+  /// server truth via the authoritative single-track refetch. A plain pull
+  /// can't be trusted here: a prior `/changes` may already have advanced the
+  /// watermark past the conflicting revision and would fetch nothing.
+  ///
+  /// The row is marked `take_server` FIRST and deleted only after the refetch
+  /// succeeds. No snapshot revert: the refetch overwrites anyway, and while
+  /// the marker is outstanding (offline, transient failure, a sync in flight)
+  /// the local row honestly keeps the user's optimistic values instead of
+  /// reverting to a third state that nothing would ever repair.
+  /// [retryTakeServerResolutions] finishes outstanding markers after each
+  /// sync, so a resolution made offline self-heals on reconnect.
   Future<void> resolveTakeServer(String uuidId) async {
-    final row = await (db.select(db.pendingEdits)
-          ..where((t) => t.uuidId.equals(uuidId)))
-        .getSingleOrNull();
-    if (row != null) {
-      await mutex.run(() => _revertToSnapshot(row));
+    await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
+        .write(const PendingEditsCompanion(
+      status: Value('take_server'),
+      serverRevision: Value(null),
+    ));
+    await _refetchTakeServer(uuidId);
+  }
+
+  /// Refetch server truth for a take-server marker; the row is deleted only
+  /// when the refetch actually ran (refreshTrack returns false when offline,
+  /// when a sync is in flight, or on failure — the marker then survives for
+  /// the next retry).
+  Future<void> _refetchTakeServer(String uuidId) async {
+    final refreshed =
+        await ref.read(trackSyncProvider.notifier).refreshTrack(uuidId);
+    if (refreshed) await _delete(uuidId);
+  }
+
+  /// Finish take-server resolutions whose refetch couldn't run when the user
+  /// made them. Called after each sync completes, outside its critical
+  /// section (refreshTrack re-takes the shared guards itself).
+  Future<void> retryTakeServerResolutions() async {
+    final rows = await (db.select(db.pendingEdits)
+          ..where((t) => t.status.equals('take_server')))
+        .get();
+    for (final row in rows) {
+      await _refetchTakeServer(row.uuidId);
     }
-    await _delete(uuidId);
-    await ref.read(trackSyncProvider.notifier).refreshTrack(uuidId);
   }
 
   Stream<List<PendingEdit>> watchConflicts() {

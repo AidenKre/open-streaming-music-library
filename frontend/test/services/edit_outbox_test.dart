@@ -580,6 +580,66 @@ void main() {
     expect(rev, 6);
   });
 
+  test('take-server while offline must not permanently lose server truth',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', revision: 5);
+    // Simulate the state after a prior ONLINE session: the flush 409ed (row
+    // conflicted, server at revision 9) and the same session's `/changes`
+    // pull already upserted the server truth locally and advanced the
+    // watermark past 9 — so no future pull will ever re-send this track.
+    await db.customStatement(
+        "UPDATE trackmetadata SET title = 'Server' WHERE uuid_id = 'u1'");
+    await db.customStatement(
+        "UPDATE tracks SET revision = 9 WHERE uuid_id = 'u1'");
+    await db.customStatement(
+      'INSERT INTO pending_edits (uuid_id, values_json, write_mode, '
+      'base_revision, status, server_revision, original_values_json, '
+      'updated_at) VALUES '
+      '(\'u1\', \'{"title":"Mine"}\', \'db_only\', 5, \'conflicted\', 9, '
+      '\'{"title":"Old"}\', 0)',
+    );
+    final offlineOutbox =
+        _container(db, offline: true, onPatch: (_) async => _ok())
+            .read(editOutboxProvider);
+
+    await offlineOutbox.resolveTakeServer('u1');
+
+    // Offline, the authoritative refetch cannot run: the already-synced
+    // server truth must not be reverted to the stale pre-edit snapshot, and
+    // the resolution must survive as a retryable marker.
+    final titleOffline = (await db
+            .customSelect(
+                "SELECT title FROM trackmetadata WHERE uuid_id = 'u1'")
+            .getSingle())
+        .read<String>('title');
+    expect(titleOffline, 'Server',
+        reason: 'take-server offline reverted to the stale pre-edit snapshot');
+    final marker = await db.select(db.pendingEdits).getSingle();
+    expect(marker.status, 'take_server',
+        reason: 'the resolution was dropped — nothing would ever reconcile '
+            'this track back to server truth');
+
+    // Reconnect: the next sync finishes the deferred resolution via the
+    // single-track refetch (the server has meanwhile moved to rev 10, which
+    // proves the value came from the refetch, not local state).
+    final online = _container(
+      db,
+      onPatch: (_) async => _ok(),
+      onGetTrack: (_) async => _trackResponse(title: 'ServerV2', revision: 10),
+    );
+    await online.read(trackSyncProvider.notifier).sync();
+
+    final titleOnline = (await db
+            .customSelect(
+                "SELECT title FROM trackmetadata WHERE uuid_id = 'u1'")
+            .getSingle())
+        .read<String>('title');
+    expect(titleOnline, 'ServerV2');
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+  });
+
   test('flush is a no-op while offline', () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
