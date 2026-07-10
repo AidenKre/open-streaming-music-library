@@ -3485,6 +3485,28 @@ class TestUpdateTrackMetadata:
         with pytest.raises(TrackNotFound):
             database.apply_track_metadata_edit("does-not-exist", {"title": "x"}, 1)
 
+    def test_apply_edit__album_artist_carries_identity__not_an_empty_edit(self, tmp_path):
+        # effective_artist() prefers album_artist over artist, so a compilation
+        # track whose album_artist survives the edit keeps its full library
+        # identity (artist row, single-grouping album, FTS). The empty-edit
+        # guard must therefore consider album_artist: clearing title + artist +
+        # album on a 'Various Artists' track is a legitimate edit, not a blank.
+        database = self._db(tmp_path)
+        t1 = self._add(
+            database, tmp_path / "a.mp3", "s1", "TrackArt",
+            album="Comp", album_artist="Various Artists",
+        )
+
+        new_rev = database.apply_track_metadata_edit(
+            t1.uuid_id, {"title": "", "artist": "", "album": ""}, t1.revision
+        )
+
+        assert new_rev > t1.revision
+        row = self._meta_row(database, t1.uuid_id)
+        # Still identified by album_artist → the artist FK must survive.
+        assert row["artist_id"] is not None
+        assert get_artist_id(database, "Various Artists") == row["artist_id"]
+
     def test_apply_edit__blanks_whole_track__raises_empty(self, tmp_path):
         database = self._db(tmp_path)
         t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art", album="Alb")

@@ -1099,7 +1099,8 @@ def patch_track(uuid_id: str, request: TrackPatchRequest):
     except EmptyTrackEdit:
         raise HTTPException(
             status_code=422,
-            detail="Edit would leave the track with no title, artist, or album",
+            detail="Edit would leave the track with no title, artist, "
+            "album, or album artist",
         )
     except (TagWriteError, MasterWriteError) as e:
         raise HTTPException(status_code=500, detail=f"Master file write failed: {e}")

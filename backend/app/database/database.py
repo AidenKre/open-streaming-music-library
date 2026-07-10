@@ -909,11 +909,18 @@ class Database:
 
         # Don't let an edit blank the whole track — checked on the *merged*
         # post-edit state so a partial clear (e.g. just the title) is fine as
-        # long as artist or album survives.
+        # long as some identity survives. album_artist counts: effective_artist
+        # prefers it over artist, so a compilation track whose album_artist
+        # remains keeps full library identity.
         def _blank(v):
             return v is None or (isinstance(v, str) and not v.strip())
 
-        if _blank(new["title"]) and _blank(new["artist"]) and _blank(new["album"]):
+        if (
+            _blank(new["title"])
+            and _blank(new["artist"])
+            and _blank(new["album"])
+            and _blank(new["album_artist"])
+        ):
             raise EmptyTrackEdit(uuid_id)
 
         effective = effective_artist(new["album_artist"], new["artist"])
