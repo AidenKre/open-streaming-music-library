@@ -129,8 +129,16 @@ class EditOutbox {
       'write_mode': row.writeMode,
     };
     try {
-      await api.patchTrack(row.uuidId, body);
-      await _delete(row.uuidId); // 200: applied, drop the row
+      final resp = await api.patchTrack(row.uuidId, body);
+      // 200: record the revision this edit produced so the next edit's
+      // base_revision builds on server truth instead of the stale pre-flush
+      // value (which would 409 against this client's own edit), then drop the
+      // row. This path holds the shared mutex, so the write can't race a pull.
+      final newRevision = resp['revision'];
+      if (newRevision is int) {
+        await db.updateTrackRevision(row.uuidId, newRevision);
+      }
+      await _delete(row.uuidId);
     } on ApiException catch (e) {
       switch (e.statusCode) {
         case 409:
@@ -142,11 +150,20 @@ class EditOutbox {
           ));
         case 404:
         case 410:
-          await _delete(row.uuidId); // track gone server-side
+          // Track gone server-side: revert the optimistic write so no rejected
+          // value lingers, and drop the row. The now-stale local track is
+          // removed by the next `/changes` pull — the delete tombstone carries
+          // a revision above the watermark, so it always arrives.
+          await _revertToSnapshot(row);
+          await _delete(row.uuidId);
           developer.log('edit dropped — track gone: ${row.uuidId}',
               name: 'EditOutbox');
         case 422:
-          // Capability drift / locked field: refresh caps and drop the edit.
+          // Permanent rejection (capability drift / locked field / validation):
+          // revert the optimistic write to the pre-edit snapshot so the local
+          // DB doesn't keep a value the server refused, refresh caps, drop the
+          // row. We already hold the mutex here, so revert inline.
+          await _revertToSnapshot(row);
           ref.invalidate(appInfoProvider);
           await _delete(row.uuidId);
           developer.log('edit rejected (422): ${row.uuidId}', name: 'EditOutbox');
@@ -154,6 +171,17 @@ class EditOutbox {
           rethrow; // 5xx etc. — retry later
       }
     }
+  }
+
+  /// Revert a track's optimistic write back to the pre-edit snapshot captured
+  /// at the first edit of the batch. Pure DB work — the caller decides whether
+  /// the shared mutex is held (the flush path holds it; [resolveTakeServer]
+  /// wraps the call itself).
+  Future<void> _revertToSnapshot(PendingEdit row) async {
+    final snapshot = row.originalValuesJson;
+    if (snapshot == null) return;
+    final original = (jsonDecode(snapshot) as Map).cast<String, Object?>();
+    await db.applyOptimisticTrackEdit(row.uuidId, original);
   }
 
   /// "Keep my edit": rebase onto the server's current revision and re-queue.
@@ -172,20 +200,21 @@ class EditOutbox {
   }
 
   /// "Take server version": discard the local edit. Revert the optimistic write
-  /// to the captured pre-edit snapshot (so the already-synced server truth shows
-  /// immediately — `/changes` won't re-send a track at/below the watermark),
-  /// then pull to catch any not-yet-seen newer revision.
+  /// to the captured pre-edit snapshot for instant feedback, drop the row, then
+  /// refetch this single track to land on *current* server truth. A plain pull
+  /// can't be trusted here: if a prior `/changes` already advanced the watermark
+  /// past the conflicting revision, it would fetch nothing and leave the stale
+  /// snapshot in place. The authoritative single-track refetch always overwrites
+  /// (or deletes the track if it's gone server-side).
   Future<void> resolveTakeServer(String uuidId) async {
     final row = await (db.select(db.pendingEdits)
           ..where((t) => t.uuidId.equals(uuidId)))
         .getSingleOrNull();
-    final snapshot = row?.originalValuesJson;
-    if (snapshot != null) {
-      final original = (jsonDecode(snapshot) as Map).cast<String, Object?>();
-      await mutex.run(() => db.applyOptimisticTrackEdit(uuidId, original));
+    if (row != null) {
+      await mutex.run(() => _revertToSnapshot(row));
     }
     await _delete(uuidId);
-    await ref.read(trackSyncProvider.notifier).sync();
+    await ref.read(trackSyncProvider.notifier).refreshTrack(uuidId);
   }
 
   Stream<List<PendingEdit>> watchConflicts() {

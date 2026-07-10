@@ -1,9 +1,11 @@
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
 from app.database.database import (
     Database,
+    EDITABLE_METADATA_COLUMNS,
     RevisionConflict,
     SearchParameter,
     TrackNotFound,
@@ -16,6 +18,26 @@ from app.services.track_edit import WriteMode
 # DB column -> ffmpeg metadata key, for the columns whose tag name differs.
 _FFMPEG_TAG_KEY = {"track_number": "track", "disc_number": "disc"}
 
+# Leading 4-digit year prefix of a `date` string (e.g. "2019-05-01" -> "2019").
+_YEAR_PREFIX = re.compile(r"^\s*(\d{4})")
+
+
+def _normalize_temporal_fields(fields: dict) -> dict:
+    """Keep ``year`` and ``date`` consistent, with ``date`` canonical. Editing
+    ``date`` re-derives ``year`` from its leading 4 digits (unparseable / cleared
+    -> ``year`` cleared); editing only ``year`` sets ``date`` to the bare year.
+    Both DB columns and the single file ``date`` tag then agree. Returns a new
+    dict; an untouched temporal field is left untouched."""
+    out = dict(fields)
+    if "date" in out:
+        d = out["date"]
+        m = _YEAR_PREFIX.match(d) if isinstance(d, str) else None
+        out["year"] = int(m.group(1)) if m else None
+    elif "year" in out:
+        y = out["year"]
+        out["date"] = str(y) if y is not None else None
+    return out
+
 
 class MasterWriteError(Exception):
     """A ``db_and_master`` edit could not place the master on disk (staging or
@@ -23,9 +45,11 @@ class MasterWriteError(Exception):
 
 
 def _build_ffmpeg_tags(fields: dict) -> dict[str, Optional[str]]:
-    """Map the edited DB columns to ffmpeg metadata keys. Only edited fields are
-    written; an explicit ``None`` clears the tag. ``year``/``date`` both target
-    the file's ``date`` tag — an explicit ``date`` edit wins, else ``year``."""
+    """Map DB columns to ffmpeg metadata keys for the columns present in
+    ``fields``: a present ``None`` clears the tag, an absent column leaves the
+    file's tag untouched (the caller decides which columns to reconcile).
+    ``year``/``date`` both target the file's ``date`` tag — an explicit
+    ``date`` wins, else ``year``."""
     tags: dict[str, Optional[str]] = {}
     for col in ("title", "artist", "album", "album_artist", "genre"):
         if col in fields:
@@ -65,6 +89,9 @@ class TrackEditor:
         the file. ``db_and_master`` also rewrites the file's tags and relocates
         it when artist/album change — except for WAV or a missing master, which
         degrade to DB-only with ``master_written=False``."""
+        # Reconcile year/date before anything reads them, so the DB write and
+        # the file tags both see the same canonical pair.
+        fields = _normalize_temporal_fields(fields)
         if write_mode is WriteMode.db_only:
             return self._db.apply_track_metadata_edit(uuid_id, fields, base_revision), False
 
@@ -103,8 +130,21 @@ class TrackEditor:
         # stage leaks nothing. Once it succeeds, ownership of `temp` passes to
         # _inplace / _relocate, which clean it on pre-journal failures and
         # otherwise hand it to the journal for reconcile to consume.
+        # A master write reconciles the file to the merged DB metadata without
+        # destroying data the DB never captured: a field edited right now always
+        # lands (an explicit None clears the tag); an untouched field is
+        # rewritten only when the DB holds a value for it (repairing earlier
+        # db_only drift, including the no-field "re-tag from DB" save); an
+        # untouched NULL column is omitted — the DB cannot distinguish "cleared
+        # long ago" from "never captured" (ffprobe misses, external taggers),
+        # so the file tag is left alone rather than erased.
+        reconcile_fields = {
+            col: getattr(merged, col)
+            for col in EDITABLE_METADATA_COLUMNS
+            if col in fields or getattr(merged, col) is not None
+        }
         temp = self._staging / f"{uuid_id}{source.suffix}"
-        write_metadata_tags(source, temp, _build_ffmpeg_tags(fields))
+        write_metadata_tags(source, temp, _build_ffmpeg_tags(reconcile_fields))
 
         if dest == source:
             rev = self._inplace(uuid_id, fields, base_revision, source, temp)

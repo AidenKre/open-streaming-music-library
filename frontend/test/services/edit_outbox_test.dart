@@ -60,6 +60,7 @@ ProviderContainer _container(
   AppDatabase db, {
   bool offline = false,
   required Future<http.Response> Function(Map<String, dynamic> body) onPatch,
+  Future<http.Response> Function(String uuidId)? onGetTrack,
 }) {
   _patchCalls.clear();
   ApiClient.initForTest(
@@ -70,7 +71,12 @@ ProviderContainer _container(
         _patchCalls.add((method: req.method, body: body));
         return onPatch(body);
       }
-      // GET /changes (used by resolveTakeServer's sync) → empty page.
+      // GET /tracks/{uuid} — single-track refetch (resolveTakeServer / gone).
+      final segs = req.url.pathSegments;
+      if (req.method == 'GET' && segs.length == 2 && segs.first == 'tracks') {
+        return onGetTrack?.call(segs[1]) ?? http.Response('', 404);
+      }
+      // GET /changes (legacy fallback) → empty page.
       return http.Response(
         jsonEncode({'changes': [], 'latestRevision': 0, 'nextCursor': null}),
         200,
@@ -90,6 +96,35 @@ ProviderContainer _container(
 http.Response _ok() => http.Response(
     jsonEncode({'uuid_id': 'u1', 'revision': 6, 'master_written': false}), 200,
     headers: {'content-type': 'application/json'});
+
+/// A single-track GET payload (the `ClientTrack` shape) for refetch mocks.
+http.Response _trackResponse({
+  String uuid = 'u1',
+  String? title = 'Server',
+  String? artist = 'ServerA',
+  String? album = 'ServerAlb',
+  int revision = 9,
+}) =>
+    http.Response(
+      jsonEncode({
+        'uuid_id': uuid,
+        'created_at': 0,
+        'last_updated': 0,
+        'revision': revision,
+        'metadata': {
+          'title': title,
+          'artist': artist,
+          'album': album,
+          'duration': 1,
+          'bitrate_kbps': 1,
+          'sample_rate_hz': 1,
+          'channels': 2,
+          'has_album_art': false,
+        },
+      }),
+      200,
+      headers: {'content-type': 'application/json'},
+    );
 
 http.Response _conflict(int current) => http.Response(
     jsonEncode({
@@ -303,13 +338,21 @@ void main() {
     expect(body.keys.toSet(), {'base_revision', 'write_mode'});
   });
 
-  test('take-server reverts the optimistic edit to the captured snapshot',
+  test('take-server lands on current server truth via single-track refetch',
       () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
     await _seedTrack(db, title: 'Old', artist: 'OldA', revision: 5);
-    final outbox =
-        _container(db, onPatch: (_) async => _conflict(9)).read(editOutboxProvider);
+    // The server moved on to "Server" (revision 9) — exactly the value the
+    // refetch must converge to, NOT the pre-edit snapshot. This is robust even
+    // if a prior `/changes` pull had already advanced the watermark past 9,
+    // because the refetch ignores the watermark.
+    final outbox = _container(
+      db,
+      onPatch: (_) async => _conflict(9),
+      onGetTrack: (_) async =>
+          _trackResponse(title: 'Server', artist: 'ServerA', revision: 9),
+    ).read(editOutboxProvider);
 
     await outbox.enqueue(
       uuidId: 'u1',
@@ -317,33 +360,118 @@ void main() {
       writeMode: EditWriteMode.dbOnly,
       baseRevision: 5,
     );
-    // Optimistic write took effect.
+    await outbox.flush(); // -> conflicted
+
+    await outbox.resolveTakeServer('u1');
+
+    // Converged to the server's current value (not 'Old', not 'New'); the
+    // pending row is gone and the local revision matches the server.
+    final meta = await db
+        .customSelect(
+            "SELECT title FROM trackmetadata WHERE uuid_id='u1'")
+        .getSingle();
+    expect(meta.read<String>('title'), 'Server');
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+    final rev = (await db
+            .customSelect("SELECT revision AS r FROM tracks WHERE uuid_id='u1'")
+            .getSingle())
+        .read<int>('r');
+    expect(rev, 9);
+    // FTS reflects server truth: the edited term gone, the server term present.
+    final newHits = await db
+        .customSelect("SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH 'New'")
+        .get();
+    expect(newHits, isEmpty);
+    final serverHits = await db
+        .customSelect(
+            "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH 'Server'")
+        .get();
+    expect(serverHits, hasLength(1));
+  });
+
+  test('flush 200 records the returned revision so the next edit rebases',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    // Tiny server model: an edit succeeds only when base_revision matches, and
+    // bumps the revision it returns. A stale base would 409 here.
+    var serverRev = 5;
+    final outbox = _container(db, onPatch: (body) async {
+      if (body['base_revision'] != serverRev) return _conflict(serverRev);
+      serverRev += 1;
+      return http.Response(
+        jsonEncode(
+            {'uuid_id': 'u1', 'revision': serverRev, 'master_written': false}),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    }).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'A'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush();
+
+    // The 200 recorded the new revision locally.
+    final revAfterFirst = (await db
+            .customSelect("SELECT revision AS r FROM tracks WHERE uuid_id='u1'")
+            .getSingle())
+        .read<int>('r');
+    expect(revAfterFirst, 6);
+
+    // A second edit reads the fresh local revision as its base, so it flushes
+    // without 409-ing against this client's own prior edit.
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'B'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: revAfterFirst,
+    );
+    await outbox.flush();
+
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+    final revAfterSecond = (await db
+            .customSelect("SELECT revision AS r FROM tracks WHERE uuid_id='u1'")
+            .getSingle())
+        .read<int>('r');
+    expect(revAfterSecond, 7);
+  });
+
+  test('flush 422 reverts the optimistic write to the snapshot and drops the row',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', revision: 5);
+    final outbox = _container(db, onPatch: (_) async => http.Response('', 422))
+        .read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Rejected'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    // Optimistic write applied the (to-be-rejected) value.
     expect(
       (await db
               .customSelect("SELECT title FROM trackmetadata WHERE uuid_id='u1'")
               .getSingle())
           .read<String>('title'),
-      'New',
+      'Rejected',
     );
-    await outbox.flush(); // -> conflicted
 
-    await outbox.resolveTakeServer('u1');
+    await outbox.flush(); // -> 422, permanent rejection
 
-    // Reverted locally to the snapshot; the pending row is gone.
+    // The rejected value did not linger: reverted to the snapshot, row dropped.
     final meta = await db
         .customSelect("SELECT title FROM trackmetadata WHERE uuid_id='u1'")
         .getSingle();
     expect(meta.read<String>('title'), 'Old');
     expect(await db.select(db.pendingEdits).get(), isEmpty);
-    // FTS reflects the revert: the edited term is gone, the original is back.
-    final newHits = await db
-        .customSelect("SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH 'New'")
-        .get();
-    expect(newHits, isEmpty);
-    final oldHits = await db
-        .customSelect("SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH 'Old'")
-        .get();
-    expect(oldHits, hasLength(1));
   });
 
   test('flush is a no-op while offline', () async {

@@ -958,6 +958,24 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     });
   }
 
+  /// Record the server revision a successful edit produced, so the next edit's
+  /// `base_revision` builds on it instead of the stale pre-flush value (which
+  /// would 409 against this client's own prior edit). Only ever raised, never
+  /// lowered, so a concurrently-synced higher revision is not regressed.
+  Future<void> updateTrackRevision(String uuidId, int revision) async {
+    await customUpdate(
+      'UPDATE tracks SET revision = ? '
+      'WHERE uuid_id = ? AND (revision IS NULL OR revision < ?)',
+      variables: [
+        Variable.withInt(revision),
+        Variable.withString(uuidId),
+        Variable.withInt(revision),
+      ],
+      updates: {tracks},
+      updateKind: UpdateKind.update,
+    );
+  }
+
   /// Snapshot of a track's editable column values (the pre-edit state), used to
   /// revert an optimistic edit locally on take-server/discard. Returns an empty
   /// map if the track row is missing.

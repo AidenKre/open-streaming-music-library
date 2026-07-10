@@ -105,6 +105,23 @@ def add_tracks_to_client(
     return tracks
 
 
+class TestGetSingleTrack:
+    def test_returns_current_track_state(self, client):
+        tracks = add_tracks_to_client(client=client, amount_to_add=1)
+        uuid = tracks[0].uuid_id
+
+        r = client.get(f"/tracks/{uuid}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["uuid_id"] == uuid
+        assert isinstance(body["revision"], int)
+        assert body["metadata"]["title"] == "song_0"
+
+    def test_missing_track_404s(self, client):
+        r = client.get("/tracks/does-not-exist")
+        assert r.status_code == 404, r.text
+
+
 class TestGetTracks:
     def test_tracks__default__returns_track(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=5)

@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:drift/drift.dart';
+import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/change_entry_dto.dart';
@@ -85,6 +86,37 @@ class SyncService {
       }
     }
 
+    await _db.rebuildFtsIndexes();
+    return SyncResult(
+      affectedQueueSessionIds: affectedQueueSessionIds,
+      deletedTrackUuids: deletedTrackUuids,
+    );
+  }
+
+  /// Reconcile a single track to current server truth: refetch it and upsert
+  /// locally, or delete it locally if the server reports it gone (404/410).
+  /// Unlike [syncChanges] this does not consult the watermark, so it can
+  /// recover a track even after the watermark has advanced past the change
+  /// that needs re-applying (the conflict "take server" case). Does not move
+  /// the watermark — a later `/changes` pull is still authoritative.
+  Future<SyncResult> refetchAndApplyTrack(String uuidId) async {
+    final affectedQueueSessionIds = <int>{};
+    final deletedTrackUuids = <String>{};
+    try {
+      final dto = await _api.getTrack(uuidId);
+      await _upsertTracks([dto]);
+    } on ApiException catch (e) {
+      if (e.statusCode == 404 || e.statusCode == 410) {
+        await _deleteTracks(
+          [uuidId],
+          affectedQueueSessionIds: affectedQueueSessionIds,
+          deletedTrackUuids: deletedTrackUuids,
+        );
+      } else {
+        rethrow;
+      }
+    }
+    // _upsertTracks/_deleteTracks don't touch FTS; rebuild as syncChanges does.
     await _db.rebuildFtsIndexes();
     return SyncResult(
       affectedQueueSessionIds: affectedQueueSessionIds,

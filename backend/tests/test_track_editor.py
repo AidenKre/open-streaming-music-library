@@ -185,14 +185,16 @@ class TestTrackEditorMaster:
         assert db.list_journal_entries() == []
 
     def test_empty_field_master_write_retags_file(self, tmp_path):
-        # Enabling master-write with no field edits re-tags the file from the
-        # current DB metadata and bumps the revision (the "re-tag" flow). The
-        # empty-field edit must not trip EmptyTrackEdit (existing tags survive).
+        # Enabling master-write with no field edits reconciles the FILE to the
+        # current DB metadata (not a bare remux): on-disk tags that drifted from
+        # the DB — e.g. after an earlier db_only edit — are rewritten to match.
+        # Must not trip EmptyTrackEdit (the merged DB state still has a title).
         library = tmp_path / "music"
         audio = library / "Art" / "song.m4a"
-        _make_audio(audio, title="Keep", artist="Art")
+        # The file's title has drifted away from the DB's title.
+        _make_audio(audio, title="StaleFileTitle", artist="Art")
         db = _db(tmp_path)
-        track = _add_track(db, audio, "Keep", "Art")
+        track = _add_track(db, audio, "DbTitle", "Art")
 
         rev, master_written = self._editor(db, library).apply_edit(
             track.uuid_id, {}, track.revision, WriteMode.db_and_master
@@ -201,7 +203,50 @@ class TestTrackEditorMaster:
         assert master_written is True
         assert rev > track.revision
         assert audio.exists()  # artist unchanged → in-place re-tag
-        assert metadata_mod.get_track_metadata(audio).title == "Keep"
+        # The file now carries the DB's value, proving the full-DB retag (the
+        # old behavior left "StaleFileTitle" in place).
+        assert metadata_mod.get_track_metadata(audio).title == "DbTitle"
+
+    def test_master_write_pushes_full_db_metadata_to_file(self, tmp_path):
+        # A master write that edits ONE field still reconciles every field: the
+        # file ends up matching the full merged DB state, not just the edit.
+        library = tmp_path / "music"
+        audio = library / "Art" / "song.m4a"
+        _make_audio(audio, title="StaleTitle", artist="Art", genre="StaleGenre")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "DbTitle", "Art")
+
+        # Edit only the genre via master write.
+        self._editor(db, library).apply_edit(
+            track.uuid_id, {"genre": "Rock"}, track.revision,
+            WriteMode.db_and_master,
+        )
+
+        on_disk = metadata_mod.get_track_metadata(audio)
+        assert on_disk.genre == "Rock"        # the edit landed
+        assert on_disk.title == "DbTitle"     # and the drifted title was fixed
+
+    def test_master_write_must_not_erase_file_tags_unknown_to_db(self, tmp_path):
+        # A NULL DB column is not the same as "cleared by the user": ingest
+        # only captures what ffprobe surfaces (e.g. track numbers like "A1" or
+        # "1 of 12" parse to None, external taggers can add tags post-ingest).
+        # Reconciling the file to the DB must not blanket-clear those tags —
+        # here the file's genre was never in the DB and the edit never touched
+        # genre, so `-metadata genre=` destroys master-file data.
+        library = tmp_path / "music"
+        audio = library / "Art" / "song.m4a"
+        _make_audio(audio, title="T", artist="Art", genre="FileOnlyGenre")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "T", "Art")  # DB row: genre = NULL
+
+        self._editor(db, library).apply_edit(
+            track.uuid_id, {"title": "NewTitle"}, track.revision,
+            WriteMode.db_and_master,
+        )
+
+        on_disk = metadata_mod.get_track_metadata(audio)
+        assert on_disk.title == "NewTitle"          # the edit landed
+        assert on_disk.genre == "FileOnlyGenre"     # untouched tag survives
 
     def test_inplace_replace_failure_is_recoverable(self, tmp_path, monkeypatch):
         # A caught os.replace error (soft failure, not a hard crash) after the
@@ -256,6 +301,45 @@ class TestTrackEditorMaster:
 
         assert master_written is False  # WAV master left untouched
         assert rev > track.revision  # but the DB edit still applied
+
+
+# ── year/date normalization (no ffmpeg) ─────────────────────────────────────
+
+class TestTemporalNormalization:
+    def _editor(self, db, tmp_path):
+        return TrackEditor(db, tmp_path / "music", tmp_path / "music" / ".staging")
+
+    def test_editing_date_derives_year(self, tmp_path):
+        db = _db(tmp_path)
+        track = _add_track(db, tmp_path / "song.m4a", "T", "Art")
+        self._editor(db, tmp_path).apply_edit(
+            track.uuid_id, {"date": "2019-05-01"}, track.revision, WriteMode.db_only
+        )
+        meta = db.get_tracks()[0].metadata
+        assert meta.date == "2019-05-01"
+        assert meta.year == 2019  # derived from the date's leading digits
+
+    def test_editing_year_sets_date(self, tmp_path):
+        db = _db(tmp_path)
+        track = _add_track(db, tmp_path / "song.m4a", "T", "Art")
+        self._editor(db, tmp_path).apply_edit(
+            track.uuid_id, {"year": 2020}, track.revision, WriteMode.db_only
+        )
+        meta = db.get_tracks()[0].metadata
+        assert meta.year == 2020
+        assert meta.date == "2020"  # date column kept consistent
+
+    def test_normalize_helper_edge_cases(self):
+        from app.services.track_editor import _normalize_temporal_fields
+        # date is canonical and overrides a co-submitted year
+        assert _normalize_temporal_fields({"date": "1999", "year": 2000})["year"] == 1999
+        # unparseable / cleared date clears year
+        assert _normalize_temporal_fields({"date": None})["year"] is None
+        assert _normalize_temporal_fields({"date": "n/a"})["year"] is None
+        # clearing year clears the date column
+        assert _normalize_temporal_fields({"year": None})["date"] is None
+        # an untouched temporal field is left untouched
+        assert _normalize_temporal_fields({"title": "x"}) == {"title": "x"}
 
 
 # ── journal reconcile (no ffmpeg) ───────────────────────────────────────────

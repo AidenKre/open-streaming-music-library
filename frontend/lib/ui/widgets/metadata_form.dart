@@ -104,6 +104,9 @@ class _MetadataFormState extends State<MetadataForm> {
         key: ValueKey('field_${field.key}'),
         label: field.label,
         initial: _initialText(field),
+        // A year is capped at 4 digits (max 9999) to match the backend's
+        // accepted range, so an over-long year can't 422 on flush.
+        maxDigits: field.valueType == 'year' ? 4 : null,
         onChanged: (raw) => _setInt(field.key, raw),
       );
     }
@@ -134,18 +137,25 @@ class _IntField extends StatelessWidget {
     required this.label,
     required this.initial,
     required this.onChanged,
+    this.maxDigits,
   });
 
   final String label;
   final String initial;
   final ValueChanged<String> onChanged;
 
+  /// Optional hard cap on the number of digits accepted (e.g. 4 for a year).
+  final int? maxDigits;
+
   @override
   Widget build(BuildContext context) {
     return TextFormField(
       initialValue: initial,
       keyboardType: TextInputType.number,
-      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+      inputFormatters: [
+        FilteringTextInputFormatter.digitsOnly,
+        if (maxDigits != null) LengthLimitingTextInputFormatter(maxDigits),
+      ],
       decoration: InputDecoration(
         labelText: label,
         border: const OutlineInputBorder(),

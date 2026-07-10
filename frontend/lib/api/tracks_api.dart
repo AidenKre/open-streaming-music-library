@@ -1,9 +1,19 @@
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/dto/get_changes_response_dto.dart';
 import 'package:frontend/models/dto/get_tracks_response_dto.dart';
 
 class TracksApi {
   final ApiClient _apiClient = ApiClient.instance;
+
+  /// Fetches the authoritative current state of a single track. Used to
+  /// reconcile one track to server truth (e.g. conflict "take server") without
+  /// a watermark-driven `/changes` pull. Surfaces 404/410 as `ApiException` so
+  /// the caller can treat a gone track as a local delete.
+  Future<ClientTrackDto> getTrack(String uuidId) async {
+    final json = await _apiClient.getJson(['tracks', uuidId], retry: false);
+    return ClientTrackDto.fromJson(json);
+  }
 
   /// Fetches one page of the revision-based change stream for incremental
   /// sync. Pass the last applied revision as [afterRevision] (0 = full

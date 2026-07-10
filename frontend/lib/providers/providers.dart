@@ -129,6 +129,49 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       );
     }
   }
+
+  /// Reconcile a single track to current server truth (refetch + apply, or
+  /// local-delete if gone). Runs under the shared edit/sync mutex so it can't
+  /// interleave with a `/changes` pull or an optimistic edit. Used by conflict
+  /// "take server" resolution, where the watermark may already have advanced
+  /// past the conflicting revision so a `/changes` pull would fetch nothing.
+  Future<void> refreshTrack(String uuidId) async {
+    if (ref.read(offlineModeProvider)) return;
+    final current = state.value;
+    try {
+      final service = SyncService(
+        db: ref.read(databaseProvider),
+        api: ref.read(tracksApiProvider),
+        queueRepository: ref.read(queueRepositoryProvider),
+        prefs: await ref.read(sharedPreferencesProvider.future),
+      );
+      final mutex = ref.read(editSyncMutexProvider);
+      final result =
+          await mutex.run(() => service.refetchAndApplyTrack(uuidId));
+      state = AsyncData(
+        TrackSyncState(
+          queueMutationVersion: result.affectedQueueSessionIds.isEmpty
+              ? (current?.queueMutationVersion ?? 0)
+              : (current?.queueMutationVersion ?? 0) + 1,
+          downloadMutationVersion: result.deletedTrackUuids.isEmpty
+              ? (current?.downloadMutationVersion ?? 0)
+              : (current?.downloadMutationVersion ?? 0) + 1,
+          affectedQueueSessionIds: result.affectedQueueSessionIds,
+          deletedTrackUuids: result.deletedTrackUuids,
+        ),
+      );
+    } catch (e) {
+      // Best-effort: the pending row is already gone, so leave UI state as-is;
+      // the next full sync reconciles. Surface nothing to the user.
+      state = AsyncData(
+        TrackSyncState(
+          error: e.toString(),
+          queueMutationVersion: current?.queueMutationVersion ?? 0,
+          downloadMutationVersion: current?.downloadMutationVersion ?? 0,
+        ),
+      );
+    }
+  }
 }
 
 final trackSyncProvider =

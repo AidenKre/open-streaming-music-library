@@ -1050,6 +1050,23 @@ def get_app_info():
     )
 
 
+@app.get("/tracks/{uuid_id}", response_model=ClientTrack)
+def get_track(uuid_id: str):
+    """Authoritative current state of a single track. Lets a client reconcile
+    one track to server truth without a watermark-driven `/changes` pull — used
+    by edit-conflict "take server" resolution, where the watermark may already
+    have advanced past the conflicting revision. 404 if the track is gone."""
+    database: Database = cast(Database, app.state.database)
+    rows = database.get_tracks(
+        search_parameters=[
+            SearchParameter(column="uuid_id", operator="=", value=uuid_id)
+        ]
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return ClientTrack.from_track(track=rows[0])
+
+
 @app.patch("/tracks/{uuid_id}", response_model=PatchTrackResponse)
 def patch_track(uuid_id: str, request: TrackPatchRequest):
     """Partial track metadata edit. Non-allowlisted fields + type/range are
