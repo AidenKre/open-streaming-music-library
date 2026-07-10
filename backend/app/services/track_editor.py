@@ -1,5 +1,4 @@
 import os
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +8,7 @@ from app.database.database import (
     RevisionConflict,
     SearchParameter,
     TrackNotFound,
+    normalize_edit_fields,
 )
 from app.models.track import Track
 from app.services.metadata import is_wav, write_metadata_tags
@@ -17,26 +17,6 @@ from app.services.track_edit import WriteMode
 
 # DB column -> ffmpeg metadata key, for the columns whose tag name differs.
 _FFMPEG_TAG_KEY = {"track_number": "track", "disc_number": "disc"}
-
-# Leading 4-digit year prefix of a `date` string (e.g. "2019-05-01" -> "2019").
-_YEAR_PREFIX = re.compile(r"^\s*(\d{4})")
-
-
-def _normalize_temporal_fields(fields: dict) -> dict:
-    """Keep ``year`` and ``date`` consistent, with ``date`` canonical. Editing
-    ``date`` re-derives ``year`` from its leading 4 digits (unparseable / cleared
-    -> ``year`` cleared); editing only ``year`` sets ``date`` to the bare year.
-    Both DB columns and the single file ``date`` tag then agree. Returns a new
-    dict; an untouched temporal field is left untouched."""
-    out = dict(fields)
-    if "date" in out:
-        d = out["date"]
-        m = _YEAR_PREFIX.match(d) if isinstance(d, str) else None
-        out["year"] = int(m.group(1)) if m else None
-    elif "year" in out:
-        y = out["year"]
-        out["date"] = str(y) if y is not None else None
-    return out
 
 
 class MasterWriteError(Exception):
@@ -89,9 +69,11 @@ class TrackEditor:
         the file. ``db_and_master`` also rewrites the file's tags and relocates
         it when artist/album change — except for WAV or a missing master, which
         degrade to DB-only with ``master_written=False``."""
-        # Reconcile year/date before anything reads them, so the DB write and
-        # the file tags both see the same canonical pair.
-        fields = _normalize_temporal_fields(fields)
+        # Canonicalize up front (NFC + year/date reconciliation) so the merged
+        # state, the destination path, and the file tags are all derived from
+        # the same bytes the DB spine will store. The spine normalizes again
+        # itself (idempotent) for callers that skip this orchestrator.
+        fields = normalize_edit_fields(fields)
         if write_mode is WriteMode.db_only:
             return self._db.apply_track_metadata_edit(uuid_id, fields, base_revision), False
 

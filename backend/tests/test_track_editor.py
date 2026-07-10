@@ -248,6 +248,27 @@ class TestTrackEditorMaster:
         assert on_disk.title == "NewTitle"          # the edit landed
         assert on_disk.genre == "FileOnlyGenre"     # untouched tag survives
 
+    def test_relocation_uses_nfc_folder_for_decomposed_artist(self, tmp_path):
+        # The destination path must be derived from the same bytes the DB
+        # stores. A decomposed-Unicode artist edit ("e" + combining acute)
+        # NFC-normalizes before path computation, so the file lands in the
+        # composed folder instead of a byte-different duplicate.
+        library = tmp_path / "music"
+        audio = library / "Old" / "song.m4a"
+        _make_audio(audio, title="T", artist="Old")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "T", "Old")
+
+        self._editor(db, library).apply_edit(
+            # "Cafe" + combining acute (decomposed form)
+            track.uuid_id, {"artist": "Cafe\u0301"}, track.revision,
+            WriteMode.db_and_master,
+        )
+
+        composed = library / "Caf\u00e9" / "song.m4a"  # single-codepoint \u00e9
+        assert composed.exists()
+        assert db.get_track_file_path(track.uuid_id) == str(composed)
+
     def test_inplace_replace_failure_is_recoverable(self, tmp_path, monkeypatch):
         # A caught os.replace error (soft failure, not a hard crash) after the
         # DB commit + journal write must leave temp + journal row intact so
@@ -330,16 +351,18 @@ class TestTemporalNormalization:
         assert meta.date == "2020"  # date column kept consistent
 
     def test_normalize_helper_edge_cases(self):
-        from app.services.track_editor import _normalize_temporal_fields
+        from app.database.database import normalize_edit_fields
         # date is canonical and overrides a co-submitted year
-        assert _normalize_temporal_fields({"date": "1999", "year": 2000})["year"] == 1999
+        assert normalize_edit_fields({"date": "1999", "year": 2000})["year"] == 1999
         # unparseable / cleared date clears year
-        assert _normalize_temporal_fields({"date": None})["year"] is None
-        assert _normalize_temporal_fields({"date": "n/a"})["year"] is None
+        assert normalize_edit_fields({"date": None})["year"] is None
+        assert normalize_edit_fields({"date": "n/a"})["year"] is None
         # clearing year clears the date column
-        assert _normalize_temporal_fields({"year": None})["date"] is None
+        assert normalize_edit_fields({"year": None})["date"] is None
         # an untouched temporal field is left untouched
-        assert _normalize_temporal_fields({"title": "x"}) == {"title": "x"}
+        assert normalize_edit_fields({"title": "x"}) == {"title": "x"}
+        # every string value is NFC-normalized (e + combining acute -> é)
+        assert normalize_edit_fields({"artist": "Cafe\u0301"})["artist"] == "Caf\u00e9"
 
 
 # ── journal reconcile (no ffmpeg) ───────────────────────────────────────────

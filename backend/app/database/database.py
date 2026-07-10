@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import unicodedata
 from contextlib import contextmanager
@@ -84,6 +85,40 @@ class RevisionConflict(Exception):
             f"revision conflict on {uuid_id}: base={base_revision} "
             f"current={current_revision}"
         )
+
+
+# Leading 4-digit year prefix of a `date` string (e.g. "2019-05-01" -> "2019").
+_YEAR_PREFIX = re.compile(r"^\s*(\d{4})")
+
+
+def normalize_edit_fields(fields: dict) -> dict:
+    """Canonicalize a validated edit-field dict before it is applied or used to
+    derive file/tag/path state. Idempotent; returns a new dict; an untouched
+    field stays untouched.
+
+    - NFC-normalizes every string value: the identity upsert is keyed on
+      ``LOWER(name)`` (which doesn't fold Unicode composition), and the on-disk
+      layout must be derived from the same bytes the DB stores.
+    - Keeps ``year``/``date`` consistent, with ``date`` canonical: editing
+      ``date`` re-derives ``year`` from its leading 4 digits (unparseable /
+      cleared -> ``year`` cleared); editing only ``year`` sets ``date`` to the
+      bare year.
+
+    Lives in the spine so every caller of ``apply_track_metadata_edit`` (PATCH
+    today; conversion and bulk edit later) gets the invariants without knowing
+    about them."""
+    out = {
+        k: unicodedata.normalize("NFC", v) if isinstance(v, str) else v
+        for k, v in fields.items()
+    }
+    if "date" in out:
+        d = out["date"]
+        m = _YEAR_PREFIX.match(d) if isinstance(d, str) else None
+        out["year"] = int(m.group(1)) if m else None
+    elif "year" in out:
+        y = out["year"]
+        out["date"] = str(y) if y is not None else None
+    return out
 
 
 def effective_artist(album_artist: Optional[str], artist: Optional[str]) -> Optional[str]:
@@ -1000,6 +1035,7 @@ class Database:
         revision. Raises ``TrackNotFound`` / ``RevisionConflict``; lets
         ``sqlite3.OperationalError`` ("database is locked") propagate so the
         caller can surface a retryable error rather than a silent failure."""
+        fields = normalize_edit_fields(fields)
         with self._connection(commit=True, timeout=timeout) as conn:
             row = conn.execute(
                 "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)

@@ -3461,6 +3461,19 @@ class TestUpdateTrackMetadata:
         ]
         assert len(cafe) == 1  # both tracks collapsed onto one artist row
 
+    def test_apply_edit__year_only__derives_date_in_spine(self, tmp_path):
+        # The temporal invariant (date canonical, year derived) lives in the
+        # spine itself, not the PATCH orchestrator — a direct spine caller
+        # (Phase-2 conversion, bulk edit) must get consistent columns too.
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art")
+
+        database.apply_track_metadata_edit(t1.uuid_id, {"year": 2020}, t1.revision)
+
+        meta = database.get_tracks()[0].metadata
+        assert meta.year == 2020
+        assert meta.date == "2020"
+
     def test_edit__bumps_revision(self, tmp_path):
         database = self._db(tmp_path)
         t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art")
