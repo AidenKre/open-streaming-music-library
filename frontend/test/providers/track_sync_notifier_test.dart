@@ -435,6 +435,76 @@ void main() {
       expect(callCount, 1);
     });
 
+    test(
+      'refreshTrack cannot publish the same mutation version as a concurrent sync',
+      () async {
+        // Both operations locally delete a track, so each publishes a
+        // mutation-version bump. The audio coordinator drops any state whose
+        // version is <= the last one it saw, so two concurrent operations
+        // publishing the SAME version silently lose one reconciliation.
+        // refreshTrack must serialize with sync via the isSyncing guard.
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse([
+              _upsert(1, _trackJson('uuid-a')),
+              _upsert(2, _trackJson('uuid-b')),
+            ]),
+          ),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
+        final notifier = c.read(trackSyncProvider.notifier);
+        await notifier.sync();
+
+        // Every published version bump must be unique and increasing.
+        final publishedVersions = <int>[];
+        c.listen<AsyncValue<TrackSyncState>>(trackSyncProvider, (_, next) {
+          final v = next.value;
+          if (v != null && v.deletedTrackUuids.isNotEmpty) {
+            publishedVersions.add(v.downloadMutationVersion);
+          }
+        });
+
+        // Slow /changes carrying a delete; single-track GET reports gone.
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            if (req.url.path.endsWith('/changes')) {
+              await Future<void>.delayed(const Duration(milliseconds: 50));
+              return _changesResponse([_delete(3, 'uuid-a')]);
+            }
+            return Response('', 404);
+          }),
+        );
+
+        final syncFuture = notifier.sync();
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        final refreshedDuringSync = await notifier.refreshTrack('uuid-b');
+        await syncFuture;
+
+        // Serialized: the refresh is skipped while the sync is in flight
+        // (its take_server marker is retried after the sync).
+        expect(refreshedDuringSync, isFalse);
+        expect(
+          c.read(trackSyncProvider).value!.downloadMutationVersion,
+          1,
+        );
+
+        final refreshedAfterSync = await notifier.refreshTrack('uuid-b');
+        expect(refreshedAfterSync, isTrue);
+        expect(
+          c.read(trackSyncProvider).value!.downloadMutationVersion,
+          2,
+        );
+        expect(await db.getTrackByUuid('uuid-b'), isEmpty);
+
+        // No version was ever published twice.
+        expect(publishedVersions.toSet().length, publishedVersions.length);
+        expect(publishedVersions, [1, 2]);
+      },
+    );
+
     test('offline sync skip makes no API request', () async {
       var callCount = 0;
       ApiClient.initForTest(
