@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -142,6 +143,13 @@ class EditOutbox {
     } on ApiException catch (e) {
       switch (e.statusCode) {
         case 409:
+          // A 409 can be manufactured by our own transport retry: attempt 1
+          // committed server-side but its response was lost, so the retried
+          // base_revision was stale. Fetch server truth and value-compare —
+          // if every field this batch touched already holds our value, the
+          // edit IS applied: reconcile and drop the row instead of prompting
+          // the user to resolve a conflict against their own values.
+          if (await _resolveIfAlreadyApplied(row)) return;
           await (db.update(db.pendingEdits)
                 ..where((t) => t.uuidId.equals(row.uuidId)))
               .write(PendingEditsCompanion(
@@ -171,6 +179,44 @@ class EditOutbox {
           rethrow; // 5xx etc. — retry later
       }
     }
+  }
+
+  /// True when the server already holds exactly the values this batch wrote —
+  /// the "conflict" is against our own committed edit (lost response +
+  /// transport retry) or a value-identical concurrent edit. The local base
+  /// revision is raised to the server's and the row dropped. Best-effort: any
+  /// refetch failure returns false and the normal conflict path proceeds.
+  Future<bool> _resolveIfAlreadyApplied(PendingEdit row) async {
+    final ClientTrackDto dto;
+    try {
+      dto = await api.getTrack(row.uuidId);
+    } catch (_) {
+      return false;
+    }
+    final edited = (jsonDecode(row.valuesJson) as Map).cast<String, Object?>();
+    final m = dto.metadata;
+    final server = <String, Object?>{
+      'title': m.title,
+      'artist': m.artist,
+      'album': m.album,
+      'album_artist': m.albumArtist,
+      'year': m.year,
+      'date': m.date,
+      'genre': m.genre,
+      'track_number': m.trackNumber,
+      'disc_number': m.discNumber,
+    };
+    for (final entry in edited.entries) {
+      if (!server.containsKey(entry.key) ||
+          server[entry.key] != entry.value) {
+        return false;
+      }
+    }
+    await db.updateTrackRevision(row.uuidId, dto.revision);
+    await _delete(row.uuidId);
+    developer.log('409 was our own applied edit — resolved: ${row.uuidId}',
+        name: 'EditOutbox');
+    return true;
   }
 
   /// Revert a track's optimistic write back to the pre-edit snapshot captured

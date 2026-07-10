@@ -511,6 +511,75 @@ void main() {
             'the stale pre-edit snapshot');
   });
 
+  test('a committed PATCH whose response was lost must not conflict with itself',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    // Tiny server model: attempt 1 COMMITS (revision 5 -> 6) but the
+    // response is lost at transport level — the documented Future.timeout
+    // caveat: the server may finish although the client saw an error.
+    // ApiClient's retry (patchTrack passes retry: true) then re-sends the
+    // identical body with the now-stale base_revision 5 and gets a 409
+    // against the client's own already-applied edit.
+    var serverRev = 5;
+    var serverTitle = 'Old';
+    var attempts = 0;
+    final outbox = _container(
+      db,
+      onPatch: (body) async {
+        attempts += 1;
+        if (attempts == 1) {
+          serverRev += 1; // committed server-side...
+          serverTitle = body['title'] as String;
+          throw http.ClientException('connection reset'); // ...response lost
+        }
+        if (body['base_revision'] != serverRev) return _conflict(serverRev);
+        serverRev += 1;
+        serverTitle = body['title'] as String;
+        return http.Response(
+          jsonEncode({
+            'uuid_id': 'u1',
+            'revision': serverRev,
+            'master_written': false,
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      },
+      onGetTrack: (_) async => _trackResponse(
+        title: serverTitle,
+        artist: 'OldA',
+        album: 'OldAlb',
+        revision: serverRev,
+      ),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'A'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush();
+
+    // The edit IS applied server-side; the user must not be asked to resolve
+    // a conflict against their own values. The row resolves away and the
+    // local revision catches up to the server's.
+    final conflicted = await (db.select(db.pendingEdits)
+          ..where((t) => t.status.equals('conflicted')))
+        .get();
+    expect(conflicted, isEmpty,
+        reason: 'the transport-retried PATCH manufactured a 409 conflict '
+            'prompt against the client\'s own committed edit');
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+    final rev = (await db
+            .customSelect("SELECT revision AS r FROM tracks WHERE uuid_id='u1'")
+            .getSingle())
+        .read<int>('r');
+    expect(rev, 6);
+  });
+
   test('flush is a no-op while offline', () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
