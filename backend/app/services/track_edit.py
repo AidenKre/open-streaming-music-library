@@ -6,20 +6,12 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.database.database import EDITABLE_METADATA_COLUMNS
+from app.models.edit_fields import EDIT_FIELD_SPECS
 
-
-# (label, valueType) for each editable column, in display order. valueType is
-# the open set consumed by the client's schema-driven Get Info form.
+# (label, valueType) per editable column, in display order — derived from the
+# single field-spec table (app/models/edit_fields.py).
 EDITABLE_FIELD_META: dict[str, tuple[str, str]] = {
-    "title": ("Title", "text"),
-    "artist": ("Artist", "text"),
-    "album": ("Album", "text"),
-    "album_artist": ("Album Artist", "text"),
-    "year": ("Year", "year"),
-    "date": ("Date", "text"),
-    "genre": ("Genre", "text"),
-    "track_number": ("Track Number", "int"),
-    "disc_number": ("Disc Number", "int"),
+    spec.key: (spec.label, spec.value_type) for spec in EDIT_FIELD_SPECS
 }
 
 
@@ -83,3 +75,14 @@ class TrackPatchRequest(BaseModel):
             for col in EDITABLE_METADATA_COLUMNS
             if col in self.model_fields_set
         }
+
+
+# The request model's typed fields must exactly mirror the field-spec table:
+# a spec without a model field would be advertised by /app/info but 422 on
+# PATCH (extra='forbid'), and a model field without a spec would be accepted
+# but never advertised. Fail at import, not at request time.
+_CONTROL_FIELDS = {"base_revision", "write_mode"}
+assert (
+    set(TrackPatchRequest.model_fields) - _CONTROL_FIELDS
+    == {spec.key for spec in EDIT_FIELD_SPECS}
+), "TrackPatchRequest fields out of sync with EDIT_FIELD_SPECS"

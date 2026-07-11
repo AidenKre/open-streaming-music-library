@@ -17,7 +17,6 @@ from app.database import (
     ArtistRowFilterParameter,
     Database,
     DatabaseContext,
-    EDITABLE_METADATA_COLUMNS,
     EmptyTrackEdit,
     OrderParameter,
     RevisionConflict,
@@ -46,9 +45,9 @@ from app.models import (
     SetQualityResponse,
     Track,
 )
+from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.services.metadata import TagWriteError
 from app.services.track_edit import (
-    EDITABLE_FIELD_META,
     TrackPatchRequest,
     WriteMode,
 )
@@ -1038,12 +1037,8 @@ def get_app_info():
     same edit allowlist that gates PATCH, so advertised == accepted. Cached
     client-side; later phases extend this rather than add endpoints."""
     track_fields = [
-        FieldDescriptor(
-            key=col,
-            label=EDITABLE_FIELD_META[col][0],
-            valueType=EDITABLE_FIELD_META[col][1],
-        )
-        for col in EDITABLE_METADATA_COLUMNS
+        FieldDescriptor(key=spec.key, label=spec.label, valueType=spec.value_type)
+        for spec in EDIT_FIELD_SPECS
     ]
     return AppInfoResponse(
         entities={"track": EntityInfo(fields=track_fields, actions=[])}

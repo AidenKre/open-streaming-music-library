@@ -10,13 +10,17 @@ from app.database.database import (
     TrackNotFound,
     normalize_edit_fields,
 )
+from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track import Track
 from app.services.metadata import is_wav, write_metadata_tags
 from app.services.organizer import move_file, sanitized_destination_path
 from app.services.track_edit import WriteMode
 
-# DB column -> ffmpeg metadata key, for the columns whose tag name differs.
-_FFMPEG_TAG_KEY = {"track_number": "track", "disc_number": "disc"}
+# DB column -> ffmpeg metadata key, for the columns whose tag name differs —
+# derived from the single field-spec table.
+_FFMPEG_TAG_KEY = {
+    spec.key: spec.ffmpeg_key for spec in EDIT_FIELD_SPECS if spec.ffmpeg_key
+}
 
 
 class MasterWriteError(Exception):

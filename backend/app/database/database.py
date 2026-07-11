@@ -10,6 +10,7 @@ from typing import List, Literal, Optional
 from app.models.album import Album
 from app.models.artist import Artist
 from app.models.cover_art import CoverArt
+from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -34,22 +35,12 @@ ALLOWED_METADATA_COLUMNS = [
     "cover_art_id",
 ]
 
-# Track tag fields a user may edit via Get Info / PATCH. Deliberately NOT
+# Track tag fields a user may edit via Get Info / PATCH — derived from the
+# single field-spec table (see app/models/edit_fields.py). Deliberately NOT
 # ``ALLOWED_METADATA_COLUMNS`` — that list includes audio-derived columns
 # (codec/duration/bitrate_kbps/sample_rate_hz/channels/has_album_art/
-# cover_art_id) which must never be hand-edited. This is the single source of
-# truth shared by ``GET /app/info`` (advertised) and ``PATCH`` (accepted).
-EDITABLE_METADATA_COLUMNS = [
-    "title",
-    "artist",
-    "album",
-    "album_artist",
-    "year",
-    "date",
-    "genre",
-    "track_number",
-    "disc_number",
-]
+# cover_art_id) which must never be hand-edited.
+EDITABLE_METADATA_COLUMNS = [spec.key for spec in EDIT_FIELD_SPECS]
 
 ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
 
