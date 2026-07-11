@@ -977,17 +977,24 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }
 
   /// Live counts of outstanding edits for the pending-edits surface.
-  Stream<({int pending, int conflicted})> watchPendingEditCounts() {
+  Stream<({int pending, int conflicted, int rejected})>
+      watchPendingEditCounts() {
     return customSelect(
       "SELECT "
       "SUM(CASE WHEN status = 'conflicted' THEN 1 ELSE 0 END) AS conflicted, "
+      "SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected, "
       "COUNT(*) AS total FROM pending_edits",
       readsFrom: {pendingEdits},
     ).watch().map((rows) {
       final row = rows.first;
       final conflicted = row.readNullable<int>('conflicted') ?? 0;
+      final rejected = row.readNullable<int>('rejected') ?? 0;
       final total = row.read<int>('total');
-      return (pending: total - conflicted, conflicted: conflicted);
+      return (
+        pending: total - conflicted - rejected,
+        conflicted: conflicted,
+        rejected: rejected,
+      );
     });
   }
 

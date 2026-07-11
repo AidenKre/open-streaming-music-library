@@ -210,7 +210,7 @@ void main() {
     expect(row.serverRevision, 9);
   });
 
-  test('flush 404 drops the row (track gone server-side)', () async {
+  test('flush 404 marks the row rejected until dismissed (track gone)', () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
@@ -224,6 +224,16 @@ void main() {
       baseRevision: 5,
     );
     await outbox.flush();
+
+    // The edit didn't land — it stays visible as a rejection (the "Saved"
+    // toast already fired) until the user dismisses it; it never re-flushes.
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'rejected');
+    expect(row.rejectionReason, contains('no longer exists'));
+    await outbox.flush();
+    expect(_patchCalls, hasLength(1)); // rejected rows are not re-sent
+
+    await outbox.dismissRejected('u1');
     expect(await db.select(db.pendingEdits).get(), isEmpty);
   });
 
@@ -441,13 +451,21 @@ void main() {
     expect(revAfterSecond, 7);
   });
 
-  test('flush 422 reverts the optimistic write to the snapshot and drops the row',
+  test('flush 422 reverts the optimistic write and surfaces a rejection',
       () async {
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
     await _seedTrack(db, title: 'Old', revision: 5);
-    final outbox = _container(db, onPatch: (_) async => http.Response('', 422))
-        .read(editOutboxProvider);
+    // FastAPI-style string detail (e.g. the empty-track guard) — it becomes
+    // the user-visible reason.
+    final outbox = _container(
+      db,
+      onPatch: (_) async => http.Response(
+        jsonEncode({'detail': 'Edit would leave the track with no title'}),
+        422,
+        headers: {'content-type': 'application/json'},
+      ),
+    ).read(editOutboxProvider);
 
     await outbox.enqueue(
       uuidId: 'u1',
@@ -466,11 +484,18 @@ void main() {
 
     await outbox.flush(); // -> 422, permanent rejection
 
-    // The rejected value did not linger: reverted to the snapshot, row dropped.
+    // The rejected value did not linger: reverted to the snapshot — and the
+    // rejection is user-visible (row kept with the server's reason) instead
+    // of a silent developer.log.
     final meta = await db
         .customSelect("SELECT title FROM trackmetadata WHERE uuid_id='u1'")
         .getSingle();
     expect(meta.read<String>('title'), 'Old');
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'rejected');
+    expect(row.rejectionReason, contains('no title'));
+
+    await outbox.dismissRejected('u1');
     expect(await db.select(db.pendingEdits).get(), isEmpty);
   });
 

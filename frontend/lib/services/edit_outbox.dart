@@ -158,23 +158,21 @@ class EditOutbox {
           ));
         case 404:
         case 410:
-          // Track gone server-side: revert the optimistic write so no rejected
-          // value lingers, and drop the row. The now-stale local track is
-          // removed by the next `/changes` pull — the delete tombstone carries
-          // a revision above the watermark, so it always arrives.
+          // Track gone server-side: revert the (guarded) optimistic write and
+          // keep the row as a visible rejection — the user saw "Saved", so the
+          // save silently un-happening needs a surface. The stale local track
+          // itself is removed by the next `/changes` pull (the delete
+          // tombstone carries a revision above the watermark).
           await _revertToSnapshot(row);
-          await _delete(row.uuidId);
-          developer.log('edit dropped — track gone: ${row.uuidId}',
-              name: 'EditOutbox');
+          await _markRejected(row.uuidId, 'Track no longer exists on the server');
         case 422:
           // Permanent rejection (capability drift / locked field / validation):
           // revert the optimistic write to the pre-edit snapshot so the local
-          // DB doesn't keep a value the server refused, refresh caps, drop the
-          // row. We already hold the mutex here, so revert inline.
+          // DB doesn't keep a value the server refused, refresh caps, and keep
+          // the row as a visible rejection until the user dismisses it.
           await _revertToSnapshot(row);
           ref.invalidate(appInfoProvider);
-          await _delete(row.uuidId);
-          developer.log('edit rejected (422): ${row.uuidId}', name: 'EditOutbox');
+          await _markRejected(row.uuidId, _rejectionReasonFrom(e));
         default:
           rethrow; // 5xx etc. — retry later
       }
@@ -300,9 +298,44 @@ class EditOutbox {
     }
   }
 
+  /// Mark a permanently rejected edit: the optimistic write is already
+  /// reverted, the row stays visible (banner + sheet) with a short reason
+  /// until the user dismisses it. Rejected rows are never re-flushed
+  /// ([flushLocked] selects only `pending`).
+  Future<void> _markRejected(String uuidId, String reason) async {
+    await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
+        .write(PendingEditsCompanion(
+      status: const Value('rejected'),
+      rejectionReason: Value(reason),
+      serverRevision: const Value(null),
+    ));
+    developer.log('edit rejected: $uuidId — $reason', name: 'EditOutbox');
+  }
+
+  /// A short human-readable reason from the server's error body (the string
+  /// `detail` FastAPI sends for domain rejections like an empty-track edit);
+  /// generic fallback for shapes we can't parse (pydantic's list detail).
+  String _rejectionReasonFrom(ApiException e) {
+    try {
+      final body = jsonDecode(e.message);
+      final detail = body is Map ? body['detail'] : null;
+      if (detail is String && detail.isNotEmpty) return detail;
+    } catch (_) {}
+    return 'Rejected by the server (invalid or locked field)';
+  }
+
+  /// Dismiss a rejected edit from the banner/sheet.
+  Future<void> dismissRejected(String uuidId) => _delete(uuidId);
+
   Stream<List<PendingEdit>> watchConflicts() {
     return (db.select(db.pendingEdits)
           ..where((t) => t.status.equals('conflicted')))
+        .watch();
+  }
+
+  Stream<List<PendingEdit>> watchRejected() {
+    return (db.select(db.pendingEdits)
+          ..where((t) => t.status.equals('rejected')))
         .watch();
   }
 
@@ -330,13 +363,20 @@ final editOutboxProvider = Provider<EditOutbox>((ref) {
   );
 });
 
-/// Live (pending, conflicted) counts driving the global pending-edits surface.
+/// Live (pending, conflicted, rejected) counts driving the global
+/// pending-edits surface.
 final pendingEditCountsProvider =
-    StreamProvider<({int pending, int conflicted})>((ref) {
+    StreamProvider<({int pending, int conflicted, int rejected})>((ref) {
   return ref.watch(databaseProvider).watchPendingEditCounts();
 });
 
 /// Live list of conflicted edits for the resolution sheet.
 final conflictedEditsProvider = StreamProvider<List<PendingEdit>>((ref) {
   return ref.watch(editOutboxProvider).watchConflicts();
+});
+
+/// Live list of permanently rejected edits for the banner sheet (visible with
+/// their reason until dismissed).
+final rejectedEditsProvider = StreamProvider<List<PendingEdit>>((ref) {
+  return ref.watch(editOutboxProvider).watchRejected();
 });
