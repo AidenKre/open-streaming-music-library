@@ -48,11 +48,17 @@ class MetadataForm extends StatefulWidget {
 
 class _MetadataFormState extends State<MetadataForm> {
   final Map<String, Timer> _debounce = {};
+  final Map<String, Completer<Iterable<String>>> _pending = {};
 
   @override
   void dispose() {
     for (final t in _debounce.values) {
       t.cancel();
+    }
+    // Cancelled timers would otherwise abandon their completers pending
+    // forever, leaking one awaited Future per keystroke.
+    for (final c in _pending.values) {
+      if (!c.isCompleted) c.complete(const Iterable<String>.empty());
     }
     super.dispose();
   }
@@ -75,13 +81,23 @@ class _MetadataFormState extends State<MetadataForm> {
   }
 
   /// Debounced suggestion lookup so a fast typist doesn't issue a query per
-  /// keystroke. A superseded lookup resolves empty rather than leaking.
+  /// keystroke. Every returned Future terminates: a superseded or disposed
+  /// lookup completes empty (cancelling its timer alone would leave the
+  /// autocomplete awaiting a Future that never resolves — one leak per
+  /// keystroke).
   Future<Iterable<String>> _suggest(String key, String query) {
     _debounce[key]?.cancel();
+    final superseded = _pending.remove(key);
+    if (superseded != null && !superseded.isCompleted) {
+      superseded.complete(const Iterable<String>.empty());
+    }
     if (query.trim().isEmpty) return Future.value(const Iterable<String>.empty());
     final completer = Completer<Iterable<String>>();
+    _pending[key] = completer;
     _debounce[key] = Timer(const Duration(milliseconds: 250), () async {
-      completer.complete(await widget.suggestionsFor(key, query));
+      final result = await widget.suggestionsFor(key, query);
+      if (!completer.isCompleted) completer.complete(result);
+      if (identical(_pending[key], completer)) _pending.remove(key);
     });
     return completer.future;
   }

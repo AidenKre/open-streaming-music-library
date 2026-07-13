@@ -28,7 +28,10 @@ class _Host with CursorPaginationMixin<int> {
       _watchPage(limit: limit);
 }
 
-Future<void> _pump() => Future<void>.delayed(Duration.zero);
+/// Waits past the mixin's 150ms coalescing quiet window so a trailing-edge
+/// delivery (an emission that landed mid-burst) has flushed.
+Future<void> _pump() =>
+    Future<void>.delayed(const Duration(milliseconds: 200));
 
 void main() {
   test('reactive window re-emits update the list with no refresh', () async {
@@ -74,6 +77,35 @@ void main() {
     expect(host.paginatedItems, [1, 2, 3, 4]); // window of 4
     expect(host.hasMore, isTrue); // full window → maybe more
     expect(host.isLoading, isFalse);
+  });
+
+  test('a write burst coalesces into one rebuild on the latest window',
+      () async {
+    final controller = StreamController<List<int>>.broadcast();
+    addTearDown(controller.close);
+    final host = _Host(
+      ({required limit}) =>
+          controller.stream.map((all) => all.take(limit).toList()),
+    );
+    addTearDown(host.disposePagination);
+    addTearDown(host.scrollController.dispose);
+
+    host.initPagination();
+    controller.add([1, 2]);
+    await Future<void>.delayed(Duration.zero);
+    // Leading edge: the first emission renders immediately.
+    expect(host.paginatedItems, [1, 2]);
+
+    // Burst inside the quiet window (a paging sync re-firing the query):
+    // intermediate windows are held, not rendered...
+    controller.add([9, 2]);
+    controller.add([9, 9]);
+    await Future<void>.delayed(Duration.zero);
+    expect(host.paginatedItems, [1, 2]);
+
+    // ...and the trailing edge lands exactly on the latest rows.
+    await _pump();
+    expect(host.paginatedItems, [9, 9]);
   });
 
   test('refresh resets the window to the first page', () async {
