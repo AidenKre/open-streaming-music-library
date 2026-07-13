@@ -91,12 +91,8 @@ app = FastAPI(lifespan=lifespan)
 
 
 def _resolve_track_source_path(database: Database, uuid_id: str) -> Optional[Path]:
-    rows = database.get_tracks(
-        search_parameters=[SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
-    )
-    if not rows:
-        return None
-    return rows[0].file_path
+    track = database.get_track_by_uuid(uuid_id)
+    return track.file_path if track is not None else None
 
 
 def _assert_dirs_non_overlapping(import_dir: Path, library_dir: Path) -> None:
@@ -1052,14 +1048,10 @@ def get_track(uuid_id: str):
     by edit-conflict "take server" resolution, where the watermark may already
     have advanced past the conflicting revision. 404 if the track is gone."""
     database: Database = cast(Database, app.state.database)
-    rows = database.get_tracks(
-        search_parameters=[
-            SearchParameter(column="uuid_id", operator="=", value=uuid_id)
-        ]
-    )
-    if not rows:
+    track = database.get_track_by_uuid(uuid_id)
+    if track is None:
         raise HTTPException(status_code=404, detail="Track not found")
-    return ClientTrack.from_track(track=rows[0])
+    return ClientTrack.from_track(track=track)
 
 
 @app.patch("/tracks/{uuid_id}", response_model=PatchTrackResponse)

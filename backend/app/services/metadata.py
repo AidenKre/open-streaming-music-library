@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 from app.models.track_meta_data import TrackMetaData
+from app.services.ffmpeg_runner import FfmpegError, run_ffmpeg, scaled_timeout
 
 
 class TagWriteError(Exception):
@@ -41,32 +42,10 @@ def write_metadata_tags(source: Path, dest: Path, tags: dict[str, str | None]) -
         cmd += ["-metadata", f"{key}={value if value is not None else ''}"]
     cmd.append(str(dest))
 
-    # ~1s per MB on top of a 30s floor so large lossless files don't trip a
-    # fixed timeout; capped so a hang can't wedge a request forever.
     try:
-        size_mb = source.stat().st_size / (1024 * 1024)
-    except OSError:
-        size_mb = 0
-    timeout = min(600, 30 + int(size_mb))
-
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout,
-        )
-    except FileNotFoundError as e:
-        raise TagWriteError("ffmpeg not found") from e
-    except (OSError, subprocess.TimeoutExpired) as e:
-        dest.unlink(missing_ok=True)
-        raise TagWriteError(f"ffmpeg failed: {e}") from e
-
-    if result.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
-        dest.unlink(missing_ok=True)
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise TagWriteError(f"ffmpeg exited {result.returncode}: {stderr}")
+        run_ffmpeg(cmd, dest, timeout=scaled_timeout(source))
+    except FfmpegError as e:
+        raise TagWriteError(str(e)) from e
 
     # Verify the output is still a probe-able audio file (catches a silently
     # corrupt remux). Field-level verification is intentionally light — ffmpeg

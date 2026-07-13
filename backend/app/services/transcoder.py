@@ -5,10 +5,11 @@ The "original" quality preset bypasses transcoding entirely.
 """
 
 import concurrent.futures
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from app.services.ffmpeg_runner import FfmpegError, run_ffmpeg, scaled_timeout
 
 
 # Quality presets. The "original" preset means do not transcode.
@@ -49,7 +50,9 @@ def transcode_to_aac_m4a(
     # Write to a temp file first so partial outputs are never visible.
     tmp_path = destination_path.with_suffix(destination_path.suffix + ".partial")
     try:
-        result = subprocess.run(
+        # Shared runner: size-scaled timeout (this path previously had none,
+        # so a hung ffmpeg wedged a transcode forever) + stderr diagnostics.
+        run_ffmpeg(
             [
                 "ffmpeg",
                 "-hide_banner",
@@ -69,20 +72,11 @@ def transcode_to_aac_m4a(
                 "+faststart",
                 str(tmp_path),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
+            tmp_path,
+            timeout=scaled_timeout(source_path),
         )
-    except FileNotFoundError:
-        return False
-    except OSError:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        return False
-
-    if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size == 0:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    except FfmpegError as e:
+        print(f"transcode of {source_path} failed: {e}")
         return False
 
     tmp_path.replace(destination_path)

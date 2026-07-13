@@ -6,9 +6,9 @@ from app.services.track_locks import TrackLocks
 
 def test_same_uuid_returns_identical_lock_and_never_deletes():
     locks = TrackLocks()
-    first = locks._lock_for("a")
-    assert locks._lock_for("a") is first  # stable identity across calls
-    assert locks._lock_for("b") is not first  # distinct uuids, distinct locks
+    first = locks.lock_for("a")
+    assert locks.lock_for("a") is first  # stable identity across calls
+    assert locks.lock_for("b") is not first  # distinct uuids, distinct locks
 
 
 def test_lock_serializes_same_uuid():
@@ -47,6 +47,6 @@ def test_lock_serializes_same_uuid():
 def test_different_uuids_do_not_block_each_other():
     locks = TrackLocks()
     with locks.lock("a"):
-        other = locks._lock_for("b")
+        other = locks.lock_for("b")
         assert other.acquire(timeout=0.5)  # a different uuid is free
         other.release()

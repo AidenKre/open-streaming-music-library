@@ -517,12 +517,16 @@ class Database:
         ).fetchone()[0]
 
     @staticmethod
-    def _bump_track_revision(conn, uuid_id: str) -> None:
+    def _bump_track_revision(conn, uuid_id: str) -> int:
+        """Bump the track to the next monotonic revision; returns the value
+        written so callers don't need a redundant read-back."""
+        revision = Database._next_revision(conn)
         conn.execute(
             "UPDATE tracks SET revision = ?, last_updated = unixepoch() "
             "WHERE uuid_id = ?",
-            (Database._next_revision(conn), uuid_id),
+            (revision, uuid_id),
         )
+        return revision
 
     def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
         try:
@@ -901,7 +905,7 @@ class Database:
 
     def _update_track_metadata(
         self, conn, uuid_id: str, fields: dict, new_file_path: Optional[str] = None
-    ) -> None:
+    ) -> int:
         """Pure-DB metadata edit — no file I/O. ``fields`` is the validated,
         present subset of ``EDITABLE_METADATA_COLUMNS`` (an explicit ``None``
         means "clear"). Reassigns artist/album identity, reconciles orphaned
@@ -1008,7 +1012,7 @@ class Database:
                 (new_file_path, uuid_id),
             )
 
-        self._bump_track_revision(conn, uuid_id)
+        return self._bump_track_revision(conn, uuid_id)
 
     def apply_track_metadata_edit(
         self,
@@ -1037,12 +1041,7 @@ class Database:
             if base_revision is None or base_revision != current_revision:
                 raise RevisionConflict(uuid_id, base_revision, current_revision)
 
-            self._update_track_metadata(conn, uuid_id, fields, new_file_path)
-
-            new_row = conn.execute(
-                "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
-            ).fetchone()
-            return new_row["revision"]
+            return self._update_track_metadata(conn, uuid_id, fields, new_file_path)
 
     # ── Edit journal (crash-safety for master-file writes) ──────────────────
 
@@ -1079,6 +1078,16 @@ class Database:
     def delete_journal_entry(self, entry_id: int) -> None:
         with self._connection(commit=True) as conn:
             conn.execute("DELETE FROM edit_journal WHERE id = ?", (entry_id,))
+
+    def get_track_by_uuid(self, uuid_id: str) -> Optional[Track]:
+        """The hydrated track for a uuid, or None. The one lookup shared by
+        the editor, the streaming source resolver, and GET /tracks/{uuid}."""
+        rows = self.get_tracks(
+            search_parameters=[
+                SearchParameter(column="uuid_id", operator="=", value=uuid_id)
+            ]
+        )
+        return rows[0] if rows else None
 
     def get_track_file_path(self, uuid_id: str) -> Optional[str]:
         """Current ``tracks.file_path`` for a uuid, or None if the track is gone.

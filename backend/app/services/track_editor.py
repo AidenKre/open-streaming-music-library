@@ -6,7 +6,6 @@ from app.database.database import (
     Database,
     EDITABLE_METADATA_COLUMNS,
     RevisionConflict,
-    SearchParameter,
     TrackNotFound,
     normalize_edit_fields,
 )
@@ -84,6 +83,11 @@ class TrackEditor:
         track = self._current_track(uuid_id)
         if track is None:
             raise TrackNotFound(uuid_id)
+        # Fail a stale edit fast, before the full-file staging remux (and the
+        # relocate path's journal + move). We already hold the per-uuid lock;
+        # the in-transaction check remains the authoritative gate.
+        if base_revision is None or base_revision != track.revision:
+            raise RevisionConflict(uuid_id, base_revision, track.revision)
         source = Path(track.file_path)
 
         if is_wav(source) or not source.exists():
@@ -95,12 +99,7 @@ class TrackEditor:
         return self._apply_with_master(uuid_id, fields, base_revision, track, source)
 
     def _current_track(self, uuid_id: str) -> Optional[Track]:
-        rows = self._db.get_tracks(
-            search_parameters=[
-                SearchParameter(column="uuid_id", operator="=", value=uuid_id)
-            ]
-        )
-        return rows[0] if rows else None
+        return self._db.get_track_by_uuid(uuid_id)
 
     def _apply_with_master(
         self, uuid_id: str, fields: dict, base_revision: Optional[int],
