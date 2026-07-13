@@ -102,6 +102,7 @@ class SyncService {
   Future<SyncResult> refetchAndApplyTrack(String uuidId) async {
     final affectedQueueSessionIds = <int>{};
     final deletedTrackUuids = <String>{};
+    final before = await _db.readTrackFtsEntry(uuidId);
     try {
       final dto = await _api.getTrack(uuidId);
       await _upsertTracks([dto]);
@@ -116,8 +117,12 @@ class SyncService {
         rethrow;
       }
     }
-    // _upsertTracks/_deleteTracks don't touch FTS; rebuild as syncChanges does.
-    await _db.rebuildFtsIndexes();
+    // Targeted FTS maintenance: exactly one track row changed, so apply a
+    // per-row fts_tracks delta instead of the O(library) rebuild. The upsert
+    // may also have created/renamed/pruned parent rows, so re-derive just the
+    // two small parent indexes.
+    await _db.applyTrackFtsDelta(uuidId, before);
+    await _db.rebuildParentFtsIndexes();
     return SyncResult(
       affectedQueueSessionIds: affectedQueueSessionIds,
       deletedTrackUuids: deletedTrackUuids,

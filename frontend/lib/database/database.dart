@@ -261,6 +261,9 @@ const allowedTrackColumns = {'uuid_id', 'created_at', 'last_updated'};
 // The editable-column set lives in models/editable_fields.dart, derived from
 // the same descriptor list that drives the offline default form schema.
 
+/// FTS-relevant values of one trackmetadata row (see [AppDatabase.readTrackFtsEntry]).
+typedef TrackFtsEntry = ({int rowid, String title, String artist, String album});
+
 const allowedAlbumColumns = {
   'id',
   'name',
@@ -753,6 +756,22 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }
 
   Future<void> rebuildFtsIndexes() async {
+    await rebuildParentFtsIndexes();
+
+    await customStatement(
+      "INSERT INTO fts_tracks(fts_tracks) VALUES('delete-all')",
+    );
+    await customStatement(
+      "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+      "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
+      "FROM trackmetadata",
+    );
+  }
+
+  /// Rebuild only the artist/album FTS indexes — small tables, cheap to
+  /// re-derive. Single-track reconciliation pairs this with a per-row
+  /// [applyTrackFtsDelta] so it never pays the O(library) fts_tracks rebuild.
+  Future<void> rebuildParentFtsIndexes() async {
     await customStatement(
       "INSERT INTO fts_artists(fts_artists) VALUES('delete-all')",
     );
@@ -769,15 +788,49 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       "SELECT a.id, COALESCE(a.name, ''), ar.name "
       "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
     );
+  }
 
-    await customStatement(
-      "INSERT INTO fts_tracks(fts_tracks) VALUES('delete-all')",
+  /// A track's FTS-relevant values, or null if the row doesn't exist. Capture
+  /// BEFORE a write so [applyTrackFtsDelta] can delete the old contentless
+  /// terms (an FTS5 external-content 'delete' must be given the exact values
+  /// that were indexed).
+  Future<TrackFtsEntry?> readTrackFtsEntry(String uuidId) async {
+    final row = await customSelect(
+      "SELECT rowid AS rid, COALESCE(title, '') AS t, "
+      "COALESCE(artist, '') AS a, COALESCE(album, '') AS al "
+      'FROM trackmetadata WHERE uuid_id = ?',
+      variables: [Variable.withString(uuidId)],
+      readsFrom: {trackmetadata},
+    ).getSingleOrNull();
+    if (row == null) return null;
+    return (
+      rowid: row.read<int>('rid'),
+      title: row.read<String>('t'),
+      artist: row.read<String>('a'),
+      album: row.read<String>('al'),
     );
-    await customStatement(
-      "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
-      "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
-      "FROM trackmetadata",
-    );
+  }
+
+  /// Reconcile one track's `fts_tracks` entry after its row was updated,
+  /// upserted, or deleted: delete [before]'s terms (if the row existed) and
+  /// index the current ones (if it still exists). The shared per-row path
+  /// used by the optimistic edit write and single-track refetch.
+  Future<void> applyTrackFtsDelta(String uuidId, TrackFtsEntry? before) async {
+    final after = await readTrackFtsEntry(uuidId);
+    if (before != null) {
+      await customStatement(
+        "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
+        "VALUES('delete', ?, ?, ?, ?)",
+        [before.rowid, before.title, before.artist, before.album],
+      );
+    }
+    if (after != null) {
+      await customStatement(
+        'INSERT INTO fts_tracks(rowid, title, artist_name, album_name) '
+        'VALUES(?, ?, ?, ?)',
+        [after.rowid, after.title, after.artist, after.album],
+      );
+    }
   }
 
   // --- LocalResettable -------------------------------------------------------
@@ -873,18 +926,8 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     if (cols.isEmpty) return;
 
     await transaction(() async {
-      final before = await customSelect(
-        'SELECT rowid AS rid, title, artist, album '
-        'FROM trackmetadata WHERE uuid_id = ?',
-        variables: [Variable.withString(uuidId)],
-        readsFrom: {trackmetadata},
-      ).getSingleOrNull();
+      final before = await readTrackFtsEntry(uuidId);
       if (before == null) return;
-
-      final rowid = before.read<int>('rid');
-      final oldTitle = before.readNullable<String>('title') ?? '';
-      final oldArtist = before.readNullable<String>('artist') ?? '';
-      final oldAlbum = before.readNullable<String>('album') ?? '';
 
       final setSql = cols.map((c) => '"$c" = ?').join(', ');
       // customUpdate (not customStatement) so drift notifies `trackmetadata`
@@ -899,27 +942,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
         updateKind: UpdateKind.update,
       );
 
-      final after = await customSelect(
-        'SELECT title, artist, album FROM trackmetadata WHERE uuid_id = ?',
-        variables: [Variable.withString(uuidId)],
-        readsFrom: {trackmetadata},
-      ).getSingle();
-      final newTitle = after.readNullable<String>('title') ?? '';
-      final newArtist = after.readNullable<String>('artist') ?? '';
-      final newAlbum = after.readNullable<String>('album') ?? '';
-
-      // Contentless FTS: delete the old terms by rowid, insert the new ones —
-      // mirrors `rebuildFtsIndexes` (artist_name = the denormalized `artist`).
-      await customStatement(
-        "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
-        "VALUES('delete', ?, ?, ?, ?)",
-        [rowid, oldTitle, oldArtist, oldAlbum],
-      );
-      await customStatement(
-        'INSERT INTO fts_tracks(rowid, title, artist_name, album_name) '
-        'VALUES(?, ?, ?, ?)',
-        [rowid, newTitle, newArtist, newAlbum],
-      );
+      await applyTrackFtsDelta(uuidId, before);
     });
   }
 
