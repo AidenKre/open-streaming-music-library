@@ -190,6 +190,10 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
               edit: _edit,
               onChanged: (e) => setState(() => _edit = e),
               suggestionsFor: _suggestions,
+              // Keys _suggestions can actually resolve (drift-backed).
+              autocompleteKeys: const {
+                'artist', 'album_artist', 'album', 'genre',
+              },
             ),
             const SizedBox(height: 8),
             SwitchListTile(

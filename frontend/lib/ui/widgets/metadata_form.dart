@@ -9,10 +9,6 @@ import 'package:frontend/models/metadata_edit.dart';
 /// Resolves prefix suggestions for an autocomplete-backed field key.
 typedef SuggestionsFor = Future<List<String>> Function(String key, String query);
 
-/// Field keys whose text input is backed by library autocomplete.
-const _autocompleteKeys = {'artist', 'album_artist', 'album', 'genre'};
-const _intKeys = {'track_number', 'disc_number'};
-
 /// A persistence-neutral editor for a track's editable metadata fields.
 ///
 /// Driven entirely by [fields] (the capabilities-derived descriptors), a
@@ -28,6 +24,7 @@ class MetadataForm extends StatefulWidget {
     required this.edit,
     required this.onChanged,
     required this.suggestionsFor,
+    this.autocompleteKeys = const {},
   });
 
   final List<FieldDescriptor> fields;
@@ -38,6 +35,12 @@ class MetadataForm extends StatefulWidget {
   final MetadataEdit edit;
   final ValueChanged<MetadataEdit> onChanged;
   final SuggestionsFor suggestionsFor;
+
+  /// Field keys whose text input is backed by autocomplete — supplied by the
+  /// owning page alongside its [suggestionsFor] resolver, so the form itself
+  /// stays entity-agnostic (widget choice is otherwise driven purely by each
+  /// descriptor's valueType).
+  final Set<String> autocompleteKeys;
 
   @override
   State<MetadataForm> createState() => _MetadataFormState();
@@ -98,8 +101,7 @@ class _MetadataFormState extends State<MetadataForm> {
   }
 
   Widget _buildField(FieldDescriptor field) {
-    if (_intKeys.contains(field.key) || field.valueType == 'int' ||
-        field.valueType == 'year') {
+    if (field.valueType == 'int' || field.valueType == 'year') {
       return _IntField(
         key: ValueKey('field_${field.key}'),
         label: field.label,
@@ -110,7 +112,7 @@ class _MetadataFormState extends State<MetadataForm> {
         onChanged: (raw) => _setInt(field.key, raw),
       );
     }
-    if (_autocompleteKeys.contains(field.key)) {
+    if (widget.autocompleteKeys.contains(field.key)) {
       return _AutocompleteField(
         key: ValueKey('field_${field.key}'),
         label: field.label,

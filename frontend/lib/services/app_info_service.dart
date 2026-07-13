@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 
@@ -24,23 +25,12 @@ const intrinsicAudioFields = {
 };
 
 /// Conservative built-in default used on a cold-offline start (no server, no
-/// cache): exactly the Phase-1 advertised track tag fields. Keeps the Get Info
-/// form usable offline without ever advertising more than the server would.
+/// cache): exactly the Phase-1 advertised track tag fields, from the single
+/// client field list (which also derives the optimistic-write gate). Keeps
+/// the Get Info form usable offline without ever advertising more than the
+/// server would.
 AppInfo defaultAppInfo() => const AppInfo(entities: {
-      'track': EntityInfo(fields: [
-        FieldDescriptor(key: 'title', label: 'Title', valueType: 'text'),
-        FieldDescriptor(key: 'artist', label: 'Artist', valueType: 'text'),
-        FieldDescriptor(key: 'album', label: 'Album', valueType: 'text'),
-        FieldDescriptor(
-            key: 'album_artist', label: 'Album Artist', valueType: 'text'),
-        FieldDescriptor(key: 'year', label: 'Year', valueType: 'year'),
-        FieldDescriptor(key: 'date', label: 'Date', valueType: 'text'),
-        FieldDescriptor(key: 'genre', label: 'Genre', valueType: 'text'),
-        FieldDescriptor(
-            key: 'track_number', label: 'Track Number', valueType: 'int'),
-        FieldDescriptor(
-            key: 'disc_number', label: 'Disc Number', valueType: 'int'),
-      ]),
+      'track': EntityInfo(fields: defaultEditableTrackFields),
     });
 
 /// The fields a user may actually edit for [entity]: advertised-and-editable,

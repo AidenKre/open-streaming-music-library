@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -257,19 +258,8 @@ const allowedMetadataColumns = {
 
 const allowedTrackColumns = {'uuid_id', 'created_at', 'last_updated'};
 
-/// Track tag columns a user may edit (mirrors the backend edit allowlist).
-/// Excludes audio-derived columns. Used to gate the optimistic local write.
-const editableMetadataColumns = {
-  'title',
-  'artist',
-  'album',
-  'album_artist',
-  'year',
-  'date',
-  'genre',
-  'track_number',
-  'disc_number',
-};
+// The editable-column set lives in models/editable_fields.dart, derived from
+// the same descriptor list that drives the offline default form schema.
 
 const allowedAlbumColumns = {
   'id',
