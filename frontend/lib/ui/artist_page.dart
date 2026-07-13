@@ -82,7 +82,6 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     final body = Column(
       children: [
         if (isOffline) const DownloadedOnlyBadge(),
-        buildNewItemsBanner('artists'),
         Expanded(
           child: GridView.builder(
             controller: scrollController,

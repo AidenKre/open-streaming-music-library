@@ -94,7 +94,6 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     final body = Column(
       children: [
         if (isOffline) const DownloadedOnlyBadge(),
-        buildNewItemsBanner('albums'),
         Expanded(
           child: GridView.builder(
             controller: scrollController,

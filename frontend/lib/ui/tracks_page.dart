@@ -85,7 +85,6 @@ class TracksPageState extends ConsumerState<TracksPage>
 
     final body = Column(
       children: [
-        buildNewItemsBanner('tracks'),
         Expanded(
           child: ListView.builder(
             controller: scrollController,

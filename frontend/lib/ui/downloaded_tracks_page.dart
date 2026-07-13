@@ -91,7 +91,6 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           header,
-          buildNewItemsBanner('downloaded tracks'),
           Expanded(
             child: paginatedItems.isEmpty && !hasMore
                 ? const Center(child: Text('No downloaded tracks yet.'))

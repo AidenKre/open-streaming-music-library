@@ -1237,61 +1237,6 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     });
   }
 
-  Stream<int> watchTrackCount({
-    List<OrderParameter> orderBy = const [],
-    List<RowFilterParameter> cursorFilters = const [],
-    int? artistId,
-    int? albumId,
-    bool downloadedOnly = false,
-  }) {
-    if (albumId != null && artistId == null) {
-      throw ArgumentError('Cannot filter by album without artist');
-    }
-
-    final vars = <Variable>[];
-    final whereClauses = <String>[];
-
-    if (artistId != null) {
-      whereClauses.add('tm."artist_id" = ?');
-      vars.add(Variable.withInt(artistId));
-    }
-    if (albumId != null) {
-      whereClauses.add('tm."album_id" = ?');
-      vars.add(Variable.withInt(albumId));
-    }
-
-    if (downloadedOnly) {
-      whereClauses.add('t.file_path IS NOT NULL');
-    }
-
-    // Inverse cursor: count rows at or before the cursor position
-    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
-      final (cursorClause, cursorVars) = filterForCursor(
-        cursorFilters,
-        orderBy,
-      );
-      if (cursorClause.isNotEmpty) {
-        whereClauses.add('NOT ($cursorClause)');
-        vars.addAll(cursorVars);
-      }
-    }
-
-    var sql =
-        'SELECT COUNT(*) AS c '
-        'FROM trackmetadata AS tm '
-        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id';
-
-    if (whereClauses.isNotEmpty) {
-      sql += ' WHERE ${whereClauses.join(' AND ')}';
-    }
-
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {trackmetadata, tracks},
-    ).watch().map((rows) => rows.first.read<int>('c'));
-  }
-
   Future<
     Map<
       String,
@@ -1466,48 +1411,6 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
 
     return (query, vars);
-  }
-
-  Stream<int> watchArtistCount({
-    List<ArtistOrderParameter> orderBy = const [],
-    List<ArtistRowFilterParameter> cursorFilters = const [],
-    bool downloadedOnly = false,
-  }) {
-    final vars = <Variable>[];
-
-    var query = 'SELECT COUNT(*) AS c FROM artists';
-
-    final whereClauses = <String>[];
-
-    if (downloadedOnly) {
-      whereClauses.add(
-        'EXISTS (SELECT 1 FROM trackmetadata tm '
-        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-        'WHERE tm.artist_id = artists.id AND t.file_path IS NOT NULL)',
-      );
-    }
-
-    // Inverse cursor: count rows at or before cursor position
-    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
-      final (cursorClause, cursorVars) = filterForArtistCursor(
-        cursorFilters,
-        orderBy,
-      );
-      if (cursorClause.isNotEmpty) {
-        whereClauses.add('NOT ($cursorClause)');
-        vars.addAll(cursorVars);
-      }
-    }
-
-    if (whereClauses.isNotEmpty) {
-      query += ' WHERE ${whereClauses.join(' AND ')}';
-    }
-
-    return customSelect(
-      query,
-      variables: vars,
-      readsFrom: {artists, trackmetadata, tracks},
-    ).watch().map((rows) => rows.first.read<int>('c'));
   }
 
   // ── Download status aggregates ────────────────────────────────────────
@@ -1705,56 +1608,6 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       variables: vars,
       readsFrom: {albums, artists, trackmetadata, tracks},
     ).watch();
-  }
-
-  Stream<int> watchAlbumsCount({
-    int? artistId,
-    List<AlbumOrderParameter> orderBy = const [],
-    List<AlbumRowFilterParameter> cursorFilters = const [],
-    bool downloadedOnly = false,
-  }) {
-    final vars = <Variable>[];
-
-    var sql =
-        'SELECT COUNT(*) AS c FROM albums a '
-        'JOIN artists ar ON a.artist_id = ar.id';
-
-    final whereClauses = <String>[];
-
-    if (artistId != null) {
-      whereClauses.add('a.artist_id = ?');
-      vars.add(Variable.withInt(artistId));
-    }
-
-    if (downloadedOnly) {
-      whereClauses.add(
-        'EXISTS (SELECT 1 FROM trackmetadata tm '
-        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-        'WHERE tm.album_id = a.id AND t.file_path IS NOT NULL)',
-      );
-    }
-
-    // Inverse cursor
-    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
-      final (cursorClause, cursorVars) = filterForAlbumCursor(
-        cursorFilters,
-        orderBy,
-      );
-      if (cursorClause.isNotEmpty) {
-        whereClauses.add('NOT ($cursorClause)');
-        vars.addAll(cursorVars);
-      }
-    }
-
-    if (whereClauses.isNotEmpty) {
-      sql += ' WHERE ${whereClauses.join(' AND ')}';
-    }
-
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {albums, artists, trackmetadata, tracks},
-    ).watch().map((rows) => rows.first.read<int>('c'));
   }
 
   Future<

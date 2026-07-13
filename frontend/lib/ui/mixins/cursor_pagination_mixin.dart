@@ -73,7 +73,4 @@ mixin CursorPaginationMixin<T> {
     });
   }
 
-  /// Retained for call sites; the reactive window self-updates, so there is no
-  /// "new items available" prompt to show.
-  Widget buildNewItemsBanner(String itemName) => const SizedBox.shrink();
 }
