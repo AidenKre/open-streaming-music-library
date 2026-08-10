@@ -1803,6 +1803,31 @@ void main() {
     });
   });
 
+  group('watchPendingEditCounts', () {
+    test('take_server resolution markers are not counted as pending edits',
+        () async {
+      // One row per status. `take_server` is a resolution marker in the
+      // retry pipeline (the user already discarded that edit), not an
+      // outstanding edit — it must not surface in any banner bucket.
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_only', 5, 'pending', 0), "
+        "('u2', '{\"title\":\"b\"}', 'db_only', 5, 'conflicted', 0), "
+        "('u3', '{\"title\":\"c\"}', 'db_only', 5, 'rejected', 0), "
+        "('u4', '{\"title\":\"d\"}', 'db_only', 5, 'take_server', 0)",
+      );
+
+      final counts = await db.watchPendingEditCounts().first;
+      expect(counts.conflicted, 1);
+      expect(counts.rejected, 1);
+      expect(counts.pending, 1,
+          reason: "a 'take_server' marker was counted as a pending edit — "
+              'the banner would show a phantom row with no Review affordance');
+    });
+  });
+
   group('reactive browse', () {
     Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
 

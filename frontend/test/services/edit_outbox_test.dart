@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:drift/drift.dart' show Variable;
@@ -663,6 +664,97 @@ void main() {
         .read<String>('title');
     expect(titleOnline, 'ServerV2');
     expect(await db.select(db.pendingEdits).get(), isEmpty);
+  });
+
+  test('re-editing a track with an outstanding take-server marker starts fresh',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Mine', revision: 5); // optimistic value lingers
+    // A take-server resolution made offline: the refetch couldn't run, so the
+    // marker survives. Its values/base belong to the batch the user DISCARDED.
+    await db.customStatement(
+      'INSERT INTO pending_edits (uuid_id, values_json, write_mode, '
+      'base_revision, status, original_values_json, updated_at) VALUES '
+      '(\'u1\', \'{"title":"Mine"}\', \'db_and_master\', 5, \'take_server\', '
+      '\'{"title":"Old"}\', 0)',
+    );
+    final outbox = _container(db, offline: true, onPatch: (_) async => _ok())
+        .read(editOutboxProvider);
+
+    // The user edits the track again while the marker is outstanding.
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('artist', 'NewArtist'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 9,
+    );
+
+    // The new batch must not resurrect the discarded values, inherit the
+    // discarded batch's write mode, or coalesce onto its stale base.
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'pending');
+    expect(jsonDecode(row.valuesJson), {'artist': 'NewArtist'},
+        reason: 'values the user explicitly discarded via take-server were '
+            'coalesced into their new edit');
+    expect(row.baseRevision, 9,
+        reason: 'the new edit coalesced onto the discarded batch\'s stale base');
+    expect(row.writeMode, 'db_only',
+        reason: 'the discarded batch\'s master-write escalation leaked into '
+            'the new batch');
+  });
+
+  test('take-server marker reaping must not race a concurrent re-edit',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Mine', revision: 5);
+    await db.customStatement(
+      'INSERT INTO pending_edits (uuid_id, values_json, write_mode, '
+      'base_revision, status, original_values_json, updated_at) VALUES '
+      '(\'u1\', \'{"title":"Mine"}\', \'db_only\', 5, \'take_server\', '
+      '\'{"title":"Old"}\', 0)',
+    );
+    // Gate the single-track GET so the refetch holds the edit-sync mutex
+    // while we queue a concurrent enqueue behind it.
+    final getArrived = Completer<void>();
+    final releaseGet = Completer<void>();
+    final container = _container(
+      db,
+      onPatch: (_) async => _ok(),
+      onGetTrack: (_) async {
+        if (!getArrived.isCompleted) getArrived.complete();
+        await releaseGet.future;
+        return _trackResponse(title: 'Server', revision: 9);
+      },
+    );
+    final outbox = container.read(editOutboxProvider);
+
+    // The post-sync retry starts the refetch (mutex held during the GET)...
+    final retry = outbox.retryTakeServerResolutions();
+    await getArrived.future;
+    // ...and the user re-edits the same track meanwhile. A real enqueue
+    // queues behind the mutex and can land in the microtask window between
+    // the refetch releasing the mutex and the marker delete executing —
+    // which side wins is scheduler-dependent, so pin the losing-side state
+    // directly: by the time the reap runs, the row is a fresh pending edit,
+    // not the marker anymore.
+    await db.customStatement(
+      'UPDATE pending_edits SET values_json = \'{"artist":"NewArtist"}\', '
+      'write_mode = \'db_only\', base_revision = 9, status = \'pending\' '
+      'WHERE uuid_id = \'u1\'',
+    );
+    releaseGet.complete();
+    await retry;
+
+    // The fresh edit must survive the marker reap intact — deleting it here
+    // silently discards a save the user was already told succeeded.
+    final rows = await db.select(db.pendingEdits).get();
+    expect(rows, hasLength(1),
+        reason: 'the take-server reap deleted the user\'s fresh edit');
+    expect(rows.single.status, 'pending');
+    expect(jsonDecode(rows.single.valuesJson), {'artist': 'NewArtist'});
+    expect(rows.single.baseRevision, 9);
   });
 
   test('flush is a no-op while offline', () async {

@@ -12,7 +12,11 @@ from app.database.database import (
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track import Track
 from app.services.metadata import is_wav, write_metadata_tags
-from app.services.organizer import move_file, sanitized_destination_path
+from app.services.organizer import (
+    move_file,
+    prune_empty_dirs,
+    sanitized_destination_path,
+)
 from app.services.track_edit import WriteMode
 
 # DB column -> ffmpeg metadata key, for the columns whose tag name differs —
@@ -193,25 +197,26 @@ class TrackEditor:
             raise
         # Committed: DB now points at `dest`; the old master is redundant.
         source.unlink(missing_ok=True)
+        prune_empty_dirs(source.parent, self._library)
         self._db.delete_journal_entry(entry)
         return rev
 
 
-def reconcile_journal(database: Database) -> None:
+def reconcile_journal(database: Database, music_library_dir: Path) -> None:
     """Idempotent startup pass that finishes or reverts every outstanding
     ``edit_journal`` row, closing the move↔commit window. Safe to run on every
     boot; a clean shutdown leaves no rows."""
     for entry in database.list_journal_entries():
         try:
-            _reconcile_one(database, entry)
+            _reconcile_one(database, entry, music_library_dir)
         except Exception as e:  # never let one bad row block startup
             print(f"journal reconcile failed for entry {entry['id']}: {e}")
 
 
-def _reconcile_one(database: Database, entry: dict) -> None:
+def _reconcile_one(database: Database, entry: dict, music_library_dir: Path) -> None:
     intent = entry["intent"]
     if intent == "relocate":
-        _reconcile_relocate(database, entry)
+        _reconcile_relocate(database, entry, music_library_dir)
     elif intent == "inplace":
         _reconcile_inplace(database, entry)
     else:
@@ -219,7 +224,7 @@ def _reconcile_one(database: Database, entry: dict) -> None:
         database.delete_journal_entry(entry["id"])
 
 
-def _reconcile_relocate(database: Database, entry: dict) -> None:
+def _reconcile_relocate(database: Database, entry: dict, music_library_dir: Path) -> None:
     # Whether the DB commit landed is the source of truth: if file_path == the
     # journal's new_path the move is durable → finish (delete the old master);
     # otherwise the move never committed → revert (delete the new copy, keep old).
@@ -228,6 +233,7 @@ def _reconcile_relocate(database: Database, entry: dict) -> None:
     if current is not None and current == new_path:
         if old_path:
             Path(old_path).unlink(missing_ok=True)
+            prune_empty_dirs(Path(old_path).parent, music_library_dir)
     else:
         if new_path:
             Path(new_path).unlink(missing_ok=True)

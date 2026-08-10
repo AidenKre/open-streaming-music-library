@@ -62,6 +62,9 @@ class EditOutbox {
       // Snapshot the pre-edit state on the first edit of a batch — before the
       // optimistic write mutates the columns — and preserve it across
       // coalescing. This is what lets take-server/discard revert locally.
+      // Preserving it across a take_server marker matters too: the columns
+      // still hold the discarded batch's optimistic values, so re-reading
+      // them here would poison a later revert.
       final original = existing?.originalValuesJson ??
           jsonEncode(await db.readEditableColumns(uuidId));
 
@@ -70,7 +73,13 @@ class EditOutbox {
       var values = edit.toPayload();
       var mode = writeMode;
       var base = baseRevision;
-      if (existing != null) {
+      // A take_server marker is a batch the user explicitly discarded (its
+      // refetch just hasn't run yet) — a fresh edit replaces it outright.
+      // Coalescing would resurrect the discarded values, inherit the dead
+      // batch's write-mode escalation, and build on its stale base. Losing
+      // the marker is fine: this batch's own flush bumps the revision, so
+      // the next `/changes` pull re-sends the full row anyway.
+      if (existing != null && existing.status != 'take_server') {
         final prev =
             (jsonDecode(existing.valuesJson) as Map).cast<String, Object?>();
         values = {...prev, ...values}; // latest value per touched key wins
@@ -283,7 +292,17 @@ class EditOutbox {
   Future<void> _refetchTakeServer(String uuidId) async {
     final refreshed =
         await ref.read(trackSyncProvider.notifier).refreshTrack(uuidId);
-    if (refreshed) await _delete(uuidId);
+    if (!refreshed) return;
+    // Reap under the shared mutex, and only while the row is still a marker:
+    // a re-edit queued behind the refetch replaces the row with a fresh
+    // pending batch that must survive (deleting it would silently discard a
+    // save the user was already told succeeded).
+    await mutex.run(
+      () => (db.delete(db.pendingEdits)
+            ..where((t) => t.uuidId.equals(uuidId))
+            ..where((t) => t.status.equals('take_server')))
+          .go(),
+    );
   }
 
   /// Finish take-server resolutions whose refetch couldn't run when the user

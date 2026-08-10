@@ -155,7 +155,7 @@ def startup_event():
         staging_dir=staging_dir,
     )
     # Finish/revert any edit interrupted by a crash before serving requests.
-    reconcile_journal(database)
+    reconcile_journal(database, settings.music_library_dir)
 
     # Set up cover art manager
     cover_art_dir = settings.app_data_dir / "cover_art"

@@ -163,6 +163,72 @@ class TestTrackEditorMaster:
         assert metadata_mod.get_track_metadata(new_path).artist == "New"
         assert db.list_journal_entries() == []  # journal cleared
 
+    def test_relocation_leaves_orphaned_empty_source_directory(self, tmp_path):
+        # When a track is the LAST one under its artist and gets renamed to a
+        # different artist, `_relocate` (track_editor.py) moves the file into
+        # the new artist's directory and unlinks the old file — but it never
+        # looks at whether that removal just emptied "Old"'s directory.
+        # `move_file`/`organizer.py` only ever creates destination
+        # directories; nothing in this codebase ever prunes a source
+        # directory. The empty "Old" folder is left behind on disk forever —
+        # no sync, no restart, nothing currently cleans it up.
+        library = tmp_path / "music"
+        audio = library / "Old" / "song.m4a"
+        _make_audio(audio, title="T", artist="Old")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "T", "Old")
+
+        self._editor(db, library).apply_edit(
+            track.uuid_id, {"artist": "New"}, track.revision, WriteMode.db_and_master
+        )
+
+        new_path = library / "New" / "song.m4a"
+        assert new_path.exists()  # the track landed at its new home...
+        assert not audio.exists()  # ...and the old file itself is gone...
+        # ...but its now-empty parent directory should be too, and isn't.
+        assert not (library / "Old").exists(), (
+            "orphaned empty artist directory left behind after relocation"
+        )
+
+    def test_relocation_keeps_directory_when_sibling_track_remains(self, tmp_path):
+        # Two tracks share "Old"; only one relocates. Its sibling means "Old"
+        # is not actually empty and must survive.
+        library = tmp_path / "music"
+        moved = library / "Old" / "song1.m4a"
+        sibling = library / "Old" / "song2.m4a"
+        _make_audio(moved, title="T1", artist="Old")
+        _make_audio(sibling, title="T2", artist="Old")
+        db = _db(tmp_path)
+        track = _add_track(db, moved, "T1", "Old")
+
+        self._editor(db, library).apply_edit(
+            track.uuid_id, {"artist": "New"}, track.revision, WriteMode.db_and_master
+        )
+
+        assert (library / "New" / "song1.m4a").exists()
+        assert not moved.exists()
+        assert (library / "Old").exists(), "sibling's directory was pruned"
+        assert sibling.exists()
+
+    def test_relocation_prunes_multiple_empty_ancestor_levels(self, tmp_path):
+        # Artist+album relocation empties both the album dir and, since it
+        # was the only album, the artist dir above it too.
+        library = tmp_path / "music"
+        audio = library / "Old" / "Album" / "song.m4a"
+        _make_audio(audio, title="T", artist="Old", album="Album")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "T", "Old", album="Album")
+
+        self._editor(db, library).apply_edit(
+            track.uuid_id, {"artist": "New"}, track.revision, WriteMode.db_and_master
+        )
+
+        assert (library / "New" / "Album" / "song.m4a").exists()
+        assert not (library / "Old" / "Album").exists()
+        assert not (library / "Old").exists(), (
+            "emptied artist directory was left behind above the pruned album"
+        )
+
     def test_relocation_conflict_reverts_file(self, tmp_path):
         library = tmp_path / "music"
         audio = library / "Old" / "song.m4a"
@@ -303,7 +369,7 @@ class TestTrackEditorMaster:
 
         # Recovery completes the replace and clears the journal.
         monkeypatch.undo()
-        reconcile_journal(db)
+        reconcile_journal(db, library)
         assert metadata_mod.get_track_metadata(audio).title == "New"
         assert not temp.exists()
         assert db.list_journal_entries() == []
@@ -376,7 +442,7 @@ class TestReconcileJournal:
         uuid = db.get_tracks()[0].uuid_id
         db.insert_journal_entry("relocate", uuid, str(old), str(new), None)
 
-        reconcile_journal(db)
+        reconcile_journal(db, tmp_path)
 
         assert not old.exists()  # leftover old master removed
         assert new.exists()
@@ -390,7 +456,7 @@ class TestReconcileJournal:
         uuid = db.get_tracks()[0].uuid_id
         db.insert_journal_entry("relocate", uuid, str(old), str(new), None)
 
-        reconcile_journal(db)
+        reconcile_journal(db, tmp_path)
 
         assert old.exists()  # old master kept
         assert not new.exists()  # uncommitted new copy removed
@@ -404,7 +470,7 @@ class TestReconcileJournal:
         uuid = db.get_tracks()[0].uuid_id
         db.insert_journal_entry("inplace", uuid, str(target), None, str(temp))
 
-        reconcile_journal(db)
+        reconcile_journal(db, tmp_path)
 
         assert target.read_bytes() == b"fresh"  # replace completed
         assert not temp.exists()
@@ -412,6 +478,24 @@ class TestReconcileJournal:
 
     def test_idempotent_clean_run_is_noop(self, tmp_path):
         db = _db(tmp_path)
-        reconcile_journal(db)
-        reconcile_journal(db)
+        reconcile_journal(db, tmp_path)
+        reconcile_journal(db, tmp_path)
+        assert db.list_journal_entries() == []
+
+    def test_relocate_finish_prunes_emptied_source_directory(self, tmp_path):
+        db = _db(tmp_path)
+        old = tmp_path / "Old" / "old.m4a"; old.parent.mkdir(); old.write_bytes(b"old")
+        new = tmp_path / "New" / "new.m4a"; new.parent.mkdir(); new.write_bytes(b"new")
+        _add_track(db, new, "T", "Art")  # DB already points at new_path
+        uuid = db.get_tracks()[0].uuid_id
+        db.insert_journal_entry("relocate", uuid, str(old), str(new), None)
+
+        reconcile_journal(db, tmp_path)
+
+        assert not old.exists()
+        assert not old.parent.exists(), (
+            "orphaned empty source directory left behind after a "
+            "crash-recovered relocation"
+        )
+        assert new.exists()
         assert db.list_journal_entries() == []

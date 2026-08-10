@@ -990,13 +990,16 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }
 
   /// Live counts of outstanding edits for the pending-edits surface.
+  /// `take_server` rows are excluded at the source: they are resolution
+  /// markers awaiting their refetch, not user-visible outbox rows.
   Stream<({int pending, int conflicted, int rejected})>
       watchPendingEditCounts() {
     return customSelect(
       "SELECT "
       "SUM(CASE WHEN status = 'conflicted' THEN 1 ELSE 0 END) AS conflicted, "
       "SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected, "
-      "COUNT(*) AS total FROM pending_edits",
+      "COUNT(*) AS total FROM pending_edits "
+      "WHERE status IN ('pending', 'conflicted', 'rejected')",
       readsFrom: {pendingEdits},
     ).watch().map((rows) {
       final row = rows.first;

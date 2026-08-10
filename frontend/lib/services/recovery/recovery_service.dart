@@ -125,8 +125,12 @@ final recoverablesProvider = Provider<List<RecoverableService>>((ref) {
 // (Riverpod notifiers/services) rather than implementing [RecoverableService]
 // on the subsystem directly.
 
-/// Pulls `/changes` when the network returns. The notifier already no-ops
-/// while offline and self-guards against overlapping syncs via `isSyncing`.
+/// Pulls `/changes` when the network returns, and on every app resume — a
+/// server-side change made while backgrounded (an edit from another device,
+/// a rename that orphans a local card) is otherwise only caught up by
+/// whichever page happens to call `sync()` itself next. The notifier
+/// already no-ops while offline and self-guards against overlapping syncs
+/// via `isSyncing`.
 class _SyncRecoverable implements RecoverableService {
   _SyncRecoverable(this._ref);
   final Ref _ref;
@@ -135,7 +139,8 @@ class _SyncRecoverable implements RecoverableService {
   int get recoveryPriority => RecoveryPriority.sync;
 
   @override
-  Set<RecoveryTrigger> get triggers => const {RecoveryTrigger.networkRecovered};
+  Set<RecoveryTrigger> get triggers =>
+      const {RecoveryTrigger.networkRecovered, RecoveryTrigger.appResume};
 
   @override
   Future<void> recover(RecoveryTrigger trigger) =>

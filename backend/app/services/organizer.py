@@ -131,6 +131,22 @@ def move_file(file_path: Path, destination_path: Path) -> bool:
         return False
 
 
+def prune_empty_dirs(directory: Path, root: Path) -> None:
+    """Best-effort cleanup after a track leaves ``directory``: remove it and
+    walk upward removing now-empty ancestors, never touching ``root`` itself
+    or anything outside it. A directory holding even a hidden/junk file stops
+    the walk — mirrors this codebase's policy of never destroying data the
+    app didn't put there itself."""
+    root = root.resolve()
+    current = directory.resolve()
+    while current != root and current.is_relative_to(root):
+        try:
+            current.rmdir()
+        except OSError:
+            return  # not empty, already gone, or a permissions error — stop
+        current = current.parent
+
+
 def rollback_move(destination_path: Path, original_path: Path) -> bool:
     if not destination_path.exists():
         return False

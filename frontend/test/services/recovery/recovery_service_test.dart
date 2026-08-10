@@ -238,5 +238,39 @@ void main() {
         reason: 'reconcile also fires on resume',
       );
     });
+
+    test('sync also fires on app resume', () {
+      // A server-side change made while the app was backgrounded (an edit
+      // from this device or another, an artist rename that orphans a local
+      // card, etc.) is only ever caught up by a `/changes` pull. Resume is
+      // the ordinary "picked the phone back up" edge — the same rationale
+      // `_ReconcileDownloadsRecoverable` already uses for reconcile above —
+      // so sync should run there too, not only on `networkRecovered`.
+      //
+      // It currently doesn't: `_SyncRecoverable.triggers` is just
+      // `{networkRecovered}`. Until a resync happens to be triggered by some
+      // other page mounting (Artists/Albums/Tracks `initState`), a plain
+      // background-then-foreground cycle leaves stale/orphaned local state
+      // (e.g. an artist card with zero remaining tracks) on screen
+      // indefinitely.
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+
+      final syncMembers = container
+          .read(recoverablesProvider)
+          .where((r) => r.triggers.contains(RecoveryTrigger.networkRecovered))
+          .where((r) => r.recoveryPriority == RecoveryPriority.sync)
+          .toList();
+      expect(syncMembers, hasLength(1), reason: 'the sync adapter exists');
+      expect(
+        syncMembers.single.triggers,
+        contains(RecoveryTrigger.appResume),
+        reason:
+            'sync only runs on networkRecovered — resuming the app from '
+            'the background never re-pulls `/changes`, so server-side '
+            'changes (like an artist rename that orphans a local card) '
+            'are not reconciled just by foregrounding the app',
+      );
+    });
   });
 }

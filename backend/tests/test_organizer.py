@@ -34,7 +34,57 @@ class TestMoveFile:
         assert result is True
         assert destination_dir.is_dir()
         assert destination_path.is_file()
-    
+
+
+class TestPruneEmptyDirs:
+    def test_removes_a_single_empty_directory(self, tmp_path: Path):
+        empty = tmp_path / "root" / "Artist"
+        empty.mkdir(parents=True)
+
+        organizer.prune_empty_dirs(empty, tmp_path / "root")
+
+        assert not empty.exists()
+
+    def test_walks_up_removing_multiple_empty_ancestors(self, tmp_path: Path):
+        root = tmp_path / "root"
+        leaf = root / "Artist" / "Album"
+        leaf.mkdir(parents=True)
+
+        organizer.prune_empty_dirs(leaf, root)
+
+        assert not leaf.exists()
+        assert not (root / "Artist").exists()
+        assert root.exists()
+
+    def test_stops_at_the_first_non_empty_ancestor(self, tmp_path: Path):
+        root = tmp_path / "root"
+        leaf = root / "Artist" / "Album"
+        leaf.mkdir(parents=True)
+        (root / "Artist" / "other_album.txt").write_bytes(b"x")
+
+        organizer.prune_empty_dirs(leaf, root)
+
+        assert not leaf.exists()  # the empty leaf itself is still removed
+        assert (root / "Artist").exists()  # but its non-empty parent survives
+
+    def test_never_removes_root_even_when_passed_directly(self, tmp_path: Path):
+        root = tmp_path / "root"
+        root.mkdir()
+
+        organizer.prune_empty_dirs(root, root)
+
+        assert root.exists()
+
+    def test_tolerates_a_directory_that_is_already_gone(self, tmp_path: Path):
+        root = tmp_path / "root"
+        root.mkdir()
+        gone = root / "Artist"  # never created
+
+        organizer.prune_empty_dirs(gone, root)  # must not raise
+
+        assert root.exists()
+
+
 class TestOrganizer:
     def _create_organizing_moving_organizer(
         self,

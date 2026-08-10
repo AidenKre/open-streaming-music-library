@@ -8,12 +8,16 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/recovery/recoverable.dart';
+import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/services/sync_service.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
@@ -1481,6 +1485,115 @@ void main() {
         final after = await queueRepo.getSessionSnapshot(sessionId);
         expect(after!.currentItem!.uuidId, 'uuid-b');
         expect(after.currentItem!.playPosition, 0);
+      },
+    );
+  });
+
+  group('Artist-rename orphan reproduction', () {
+    test(
+      'flushing an artist rename, then resuming the app, still leaves the '
+      'old artist on the browse grid',
+      () async {
+        // Establish Artist "Old" (id 31) locally exactly like a freshly
+        // synced library: one track, one artist, one album.
+        var patched = false;
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            if (req.method == 'PATCH') {
+              patched = true;
+              // The server accepts the rename and reassigns the track
+              // server-side to a new Artist "New" (id 32), GC-ing Artist
+              // "Old" (31) — reflected below on the next `/changes` pull,
+              // which app-resume is what makes happen at all.
+              return Response(
+                jsonEncode({
+                  'uuid_id': 'uuid-moving',
+                  'revision': 2,
+                  'master_written': false,
+                }),
+                200,
+                headers: {'content-type': 'application/json'},
+              );
+            }
+            if (patched) {
+              return _changesResponse([
+                _upsert(
+                  2,
+                  _richTrackJson(
+                    'uuid-moving',
+                    title: 'Song',
+                    artist: 'New',
+                    album: 'Old Album',
+                    artistId: 32,
+                    albumId: 301,
+                  ),
+                ),
+              ]);
+            }
+            return _changesResponse([
+              _upsert(
+                1,
+                _richTrackJson(
+                  'uuid-moving',
+                  title: 'Song',
+                  artist: 'Old',
+                  album: 'Old Album',
+                  artistId: 31,
+                  albumId: 301,
+                ),
+              ),
+            ]);
+          }),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
+        await c.read(trackSyncProvider.notifier).sync();
+
+        // Sanity check: Artist "Old" is on the board after the initial sync.
+        expect(
+          await (db.select(db.artists)..where((a) => a.id.equals(31))).get(),
+          hasLength(1),
+        );
+
+        // The user renames the track's artist via the real edit outbox — the
+        // same seam Get Info uses — and the save completes successfully.
+        final outbox = c.read(editOutboxProvider);
+        await outbox.enqueue(
+          uuidId: 'uuid-moving',
+          edit: const MetadataEdit.empty().set('artist', 'New'),
+          writeMode: EditWriteMode.dbOnly,
+          baseRevision: 1,
+        );
+        await outbox.flush();
+        expect(patched, isTrue);
+        expect(await db.select(db.pendingEdits).get(), isEmpty);
+
+        // The app is backgrounded and resumed — no network flap, no manual
+        // navigation to a fresh Artists/Albums/Tracks page. Just the most
+        // ordinary "user put their phone away and picked it back up" edge.
+        await c
+            .read(recoveryServiceProvider)
+            .runFor(RecoveryTrigger.appResume);
+
+        // Desired: Artist "Old" has zero tracks left after the rename, so it
+        // should no longer show on the browse grid. Actual: nothing ever
+        // repointed the local artist_id FK or pruned the parent row — that
+        // only happens inside SyncService, and app resume never triggers a
+        // sync (`_SyncRecoverable` only fires on `networkRecovered`) — so the
+        // orphaned card survives resume entirely.
+        final oldArtist = await (db.select(
+          db.artists,
+        )..where((a) => a.id.equals(31))).get();
+        expect(
+          oldArtist,
+          isEmpty,
+          reason:
+              'Artist "Old" has no remaining tracks after the rename '
+              'flushed, but resuming the app never reconciles it — the '
+              'orphaned card survives indefinitely until some other page '
+              'happens to trigger a sync.',
+        );
       },
     );
   });
