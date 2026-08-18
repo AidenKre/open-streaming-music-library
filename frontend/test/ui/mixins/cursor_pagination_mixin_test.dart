@@ -131,4 +131,30 @@ void main() {
     await _pump();
     expect(host.paginatedItems, [1, 2]);
   });
+
+  test('refresh clears the previous filter\'s items before the new stream '
+      'emits', () async {
+    final controller = StreamController<List<int>>.broadcast();
+    addTearDown(controller.close);
+    final host = _Host(
+      ({required limit}) =>
+          controller.stream.map((all) => all.take(limit).toList()),
+    );
+    addTearDown(host.disposePagination);
+    addTearDown(host.scrollController.dispose);
+
+    host.initPagination();
+    controller.add([1, 2]);
+    await _pump();
+    expect(host.paginatedItems, [1, 2]);
+
+    // A query-parameter change (e.g. offline mode flipping) calls refresh()
+    // and the new stream's first emission hasn't landed yet — the grid must
+    // not still be showing the previous filter's rows in that window.
+    host.refresh();
+    expect(host.paginatedItems, isEmpty,
+        reason: 'stale rows from before refresh() were still visible until '
+            'the new reactive window emitted');
+    expect(host.hasMore, isTrue);
+  });
 }

@@ -58,8 +58,15 @@ mixin CursorPaginationMixin<T> {
 
   /// Re-subscribe from the first page. Needed when a query *parameter* changes
   /// (e.g. the offline → downloaded-only filter), which the stream can't observe
-  /// on its own.
+  /// on its own. Clears the current window immediately so the old parameter's
+  /// rows don't linger on screen until the new stream's first emission lands.
   void refresh() {
+    if (mounted) {
+      setState(() {
+        paginatedItems = [];
+        hasMore = true;
+      });
+    }
     _loadedCount = pageSize;
     isLoading = false;
     _subscribe();
