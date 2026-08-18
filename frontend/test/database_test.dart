@@ -1828,6 +1828,40 @@ void main() {
     });
   });
 
+  group('pendingWriteMode', () {
+    test('take_server and rejected rows do not leak their write mode',
+        () async {
+      // A take_server marker's write_mode is a leftover from the batch it's
+      // discarding; a rejected row's edit was already reverted. Neither
+      // should inform what a NEW edit's write-to-file toggle defaults to.
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_and_master', 5, 'take_server', 0)",
+      );
+      expect(await db.pendingWriteMode('u1'), isNull);
+
+      await db.customStatement("DELETE FROM pending_edits WHERE uuid_id='u1'");
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_and_master', 5, 'rejected', 0)",
+      );
+      expect(await db.pendingWriteMode('u1'), isNull);
+
+      await db.customStatement("DELETE FROM pending_edits WHERE uuid_id='u1'");
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_and_master', 5, 'pending', 0)",
+      );
+      expect(await db.pendingWriteMode('u1'), 'db_and_master');
+    });
+  });
+
   group('reactive browse', () {
     Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
 

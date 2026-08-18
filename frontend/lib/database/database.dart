@@ -981,10 +981,15 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
 
   /// The queued write mode (`db_only`/`db_and_master`) for a track's pending
   /// edit, or null if none is queued. Lets Get Info reflect a queued master
-  /// write when it reopens.
+  /// write when it reopens. Only `pending`/`conflicted` rows are active edits
+  /// whose write mode should inform a new save's default — a `take_server`
+  /// marker's write mode is a leftover from the batch it's discarding, and a
+  /// `rejected` row's edit was already reverted, so neither should leak into
+  /// a fresh save.
   Future<String?> pendingWriteMode(String uuidId) async {
     final row = await (select(pendingEdits)
-          ..where((t) => t.uuidId.equals(uuidId)))
+          ..where((t) => t.uuidId.equals(uuidId))
+          ..where((t) => t.status.isIn(const ['pending', 'conflicted'])))
         .getSingleOrNull();
     return row?.writeMode;
   }
