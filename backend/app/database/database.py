@@ -988,7 +988,13 @@ class Database:
             self._orphan_gc_album(conn, old_album_id)
         if old_artist_id != new_artist_id:
             self._orphan_gc_artist(conn, old_artist_id)
-        self._recompute_named_album_year(conn, old_album_id)
+        # Only recompute the old album's year when this edit could actually
+        # move it: membership changed, or year/date was itself touched.
+        if old_album_id is not None and (
+            old_album_id != new_album_id
+            or not fields.keys().isdisjoint(("year", "date"))
+        ):
+            self._recompute_named_album_year(conn, old_album_id)
         if new_album_id != old_album_id:
             self._recompute_named_album_year(conn, new_album_id)
 
