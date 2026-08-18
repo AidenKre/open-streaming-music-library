@@ -24,6 +24,20 @@ class _StubOffline extends OfflineModeNotifier {
   bool build() => _v;
 }
 
+/// Counts calls to the (small, cheap, but redundant-when-batched)
+/// parent-FTS rebuild so a test can assert it runs once per batch, not
+/// once per row.
+class _CountingDb extends AppDatabase {
+  _CountingDb() : super(NativeDatabase.memory());
+  int parentFtsRebuilds = 0;
+
+  @override
+  Future<void> rebuildParentFtsIndexes() {
+    parentFtsRebuilds++;
+    return super.rebuildParentFtsIndexes();
+  }
+}
+
 final _patchCalls = <({String method, Map<String, dynamic> body})>[];
 
 Future<void> _seedTrack(
@@ -702,6 +716,118 @@ void main() {
     expect(row.writeMode, 'db_only',
         reason: 'the discarded batch\'s master-write escalation leaked into '
             'the new batch');
+  });
+
+  test('re-editing a track with a rejected edit starts fresh', () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Mine', revision: 5);
+    // A permanently-rejected batch: the optimistic write was already
+    // reverted, but the row itself (with its stale, refused values) is left
+    // around as a visible rejection until dismissed.
+    await db.customStatement(
+      'INSERT INTO pending_edits (uuid_id, values_json, write_mode, '
+      'base_revision, status, rejection_reason, original_values_json, '
+      'updated_at) VALUES '
+      '(\'u1\', \'{"title":null,"artist":null}\', \'db_and_master\', 5, '
+      '\'rejected\', \'empty edit\', \'{"title":"Old","artist":"OldA"}\', 0)',
+    );
+    final outbox = _container(db, offline: true, onPatch: (_) async => _ok())
+        .read(editOutboxProvider);
+
+    // The user makes an unrelated edit on the same track.
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('album', 'Greatest Hits'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 9,
+    );
+
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'pending');
+    expect(jsonDecode(row.valuesJson), {'album': 'Greatest Hits'},
+        reason: 'the rejected batch\'s discarded title/artist:null values '
+            'were coalesced into a save the user never made');
+    expect(row.baseRevision, 9);
+    expect(row.writeMode, 'db_only',
+        reason: 'the rejected batch\'s master-write escalation leaked into '
+            'the new edit');
+  });
+
+  test(
+      'resolveTakeServer marker write cannot be raced by a concurrent enqueue',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Mine', revision: 5);
+    await db.customStatement(
+      'INSERT INTO pending_edits (uuid_id, values_json, write_mode, '
+      'base_revision, status, server_revision, original_values_json, '
+      'updated_at) VALUES '
+      '(\'u1\', \'{"title":"Mine"}\', \'db_only\', 5, \'conflicted\', 9, '
+      '\'{"title":"Old"}\', 0)',
+    );
+    final outbox = _container(
+      db,
+      onPatch: (_) async => _ok(),
+      onGetTrack: (_) async => _trackResponse(title: 'Server', revision: 9),
+    ).read(editOutboxProvider);
+
+    // Fire both without awaiting between them: resolveTakeServer's marker
+    // write and enqueue's read-modify-write both go through the shared
+    // mutex now, so — with the fix — enqueue's mutex.run() call (issued
+    // second, in this synchronous order) is guaranteed to be queued behind
+    // resolveTakeServer's, and so must observe the marker already written.
+    final resolve = outbox.resolveTakeServer('u1');
+    final enqueueFuture = outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('album', 'NewAlbum'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 9,
+    );
+    await enqueueFuture;
+    await resolve;
+
+    final rows = await db.select(db.pendingEdits).get();
+    expect(rows, hasLength(1));
+    expect(jsonDecode(rows.single.valuesJson), {'album': 'NewAlbum'},
+        reason: 'enqueue coalesced onto the pre-marker conflicted row '
+            'instead of observing the take_server marker already written');
+    expect(rows.single.baseRevision, 9,
+        reason: 'enqueue rebased onto the stale conflicted batch instead of '
+            'starting fresh');
+  });
+
+  test('retryTakeServerResolutions rebuilds parent FTS once, not per row',
+      () async {
+    final db = _CountingDb();
+    addTearDown(db.close);
+    await _seedTrack(db, uuid: 'u1', title: 'Mine', revision: 5);
+    await _seedTrack(db, uuid: 'u2', title: 'Yours', revision: 5);
+    await db.customStatement(
+      'INSERT INTO pending_edits (uuid_id, values_json, write_mode, '
+      'base_revision, status, original_values_json, updated_at) VALUES '
+      '(\'u1\', \'{"title":"Mine"}\', \'db_only\', 5, \'take_server\', '
+      '\'{"title":"Old1"}\', 0), '
+      '(\'u2\', \'{"title":"Yours"}\', \'db_only\', 5, \'take_server\', '
+      '\'{"title":"Old2"}\', 0)',
+    );
+    final outbox = _container(
+      db,
+      onPatch: (_) async => _ok(),
+      onGetTrack: (uuid) async => _trackResponse(
+        uuid: uuid,
+        title: 'Server$uuid',
+        revision: 9,
+      ),
+    ).read(editOutboxProvider);
+
+    await outbox.retryTakeServerResolutions();
+
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+    expect(db.parentFtsRebuilds, 1,
+        reason: 'each queued take-server row triggered its own redundant '
+            'parent-FTS rebuild instead of one rebuild for the whole batch');
   });
 
   test('take-server marker reaping must not race a concurrent re-edit',

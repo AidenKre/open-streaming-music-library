@@ -94,8 +94,13 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
   /// reconciled; false when skipped (offline, or a sync is in flight) or the
   /// refetch failed — the caller keeps its resolution marker and retries
   /// after the next sync.
-  Future<bool> refreshTrack(String uuidId) {
-    return _runGuarded((service) => service.refetchAndApplyTrack(uuidId));
+  Future<bool> refreshTrack(String uuidId, {bool rebuildParentFts = true}) {
+    return _runGuarded(
+      (service) => service.refetchAndApplyTrack(
+        uuidId,
+        rebuildParentFts: rebuildParentFts,
+      ),
+    );
   }
 
   /// Runs one sync operation with the shared guards: offline no-ops,

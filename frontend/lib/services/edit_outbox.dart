@@ -75,11 +75,15 @@ class EditOutbox {
       var base = baseRevision;
       // A take_server marker is a batch the user explicitly discarded (its
       // refetch just hasn't run yet) — a fresh edit replaces it outright.
-      // Coalescing would resurrect the discarded values, inherit the dead
-      // batch's write-mode escalation, and build on its stale base. Losing
-      // the marker is fine: this batch's own flush bumps the revision, so
-      // the next `/changes` pull re-sends the full row anyway.
-      if (existing != null && existing.status != 'take_server') {
+      // A rejected row is a batch the server permanently refused (already
+      // reverted locally) — same treatment: coalescing onto either would
+      // resurrect discarded/refused values, inherit the dead batch's
+      // write-mode escalation, and build on its stale base. Losing the row
+      // is fine: this batch's own flush bumps the revision, so the next
+      // `/changes` pull re-sends the full row anyway.
+      if (existing != null &&
+          existing.status != 'take_server' &&
+          existing.status != 'rejected') {
         final prev =
             (jsonDecode(existing.valuesJson) as Map).cast<String, Object?>();
         values = {...prev, ...values}; // latest value per touched key wins
@@ -119,16 +123,18 @@ class EditOutbox {
     final rows = await (db.select(db.pendingEdits)
           ..where((t) => t.status.equals('pending')))
         .get();
-    for (final row in rows) {
+    // Each row is an independent per-uuid PATCH with no shared mutable state
+    // or ordering dependency between tracks, so flush them concurrently
+    // rather than paying one round trip per row sequentially.
+    await Future.wait(rows.map((row) async {
       try {
         await _flushOne(row);
       } catch (e) {
         // Network error / unexpected 5xx after retries: leave this row pending
         // and move on, so one stuck track can't block the rest of the outbox.
         developer.log('flush skipped ${row.uuidId}: $e', name: 'EditOutbox');
-        continue;
       }
-    }
+    }));
   }
 
   Future<void> _flushOne(PendingEdit row) async {
@@ -251,17 +257,22 @@ class EditOutbox {
 
   /// "Keep my edit": rebase onto the server's current revision and re-queue.
   Future<void> resolveKeepMine(String uuidId) async {
-    final row = await (db.select(db.pendingEdits)
-          ..where((t) => t.uuidId.equals(uuidId)))
-        .getSingleOrNull();
-    if (row == null) return;
-    await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
-        .write(PendingEditsCompanion(
-      baseRevision: Value(row.serverRevision),
-      status: const Value('pending'),
-      serverRevision: const Value(null),
-    ));
-    await flush();
+    // Held under the shared mutex so this read-modify-write can't race a
+    // concurrent enqueue() reading stale (pre-rebase) row state.
+    final rebased = await mutex.run(() async {
+      final row = await (db.select(db.pendingEdits)
+            ..where((t) => t.uuidId.equals(uuidId)))
+          .getSingleOrNull();
+      if (row == null) return false;
+      await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
+          .write(PendingEditsCompanion(
+        baseRevision: Value(row.serverRevision),
+        status: const Value('pending'),
+        serverRevision: const Value(null),
+      ));
+      return true;
+    });
+    if (rebased) await flush();
   }
 
   /// "Take server version": discard the local edit and land on *current*
@@ -277,11 +288,17 @@ class EditOutbox {
   /// [retryTakeServerResolutions] finishes outstanding markers after each
   /// sync, so a resolution made offline self-heals on reconnect.
   Future<void> resolveTakeServer(String uuidId) async {
-    await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
-        .write(const PendingEditsCompanion(
-      status: Value('take_server'),
-      serverRevision: Value(null),
-    ));
+    // Held under the shared mutex so this marker write can't race a
+    // concurrent enqueue() reading the pre-marker row state — otherwise a
+    // fresh edit could coalesce onto the just-discarded batch before this
+    // write lands, silently undoing the "take server" choice.
+    await mutex.run(
+      () => (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
+          .write(const PendingEditsCompanion(
+        status: Value('take_server'),
+        serverRevision: Value(null),
+      )),
+    );
     await _refetchTakeServer(uuidId);
   }
 
@@ -289,9 +306,13 @@ class EditOutbox {
   /// when the refetch actually ran (refreshTrack returns false when offline,
   /// when a sync is in flight, or on failure — the marker then survives for
   /// the next retry).
-  Future<void> _refetchTakeServer(String uuidId) async {
-    final refreshed =
-        await ref.read(trackSyncProvider.notifier).refreshTrack(uuidId);
+  Future<void> _refetchTakeServer(
+    String uuidId, {
+    bool rebuildParentFts = true,
+  }) async {
+    final refreshed = await ref
+        .read(trackSyncProvider.notifier)
+        .refreshTrack(uuidId, rebuildParentFts: rebuildParentFts);
     if (!refreshed) return;
     // Reap under the shared mutex, and only while the row is still a marker:
     // a re-edit queued behind the refetch replaces the row with a fresh
@@ -312,9 +333,13 @@ class EditOutbox {
     final rows = await (db.select(db.pendingEdits)
           ..where((t) => t.status.equals('take_server')))
         .get();
+    if (rows.isEmpty) return;
+    // Defer the (small, cheap, but still redundant N times) parent-FTS
+    // rebuild to once after the whole batch instead of once per row.
     for (final row in rows) {
-      await _refetchTakeServer(row.uuidId);
+      await _refetchTakeServer(row.uuidId, rebuildParentFts: false);
     }
+    await db.rebuildParentFtsIndexes();
   }
 
   /// Mark a permanently rejected edit: the optimistic write is already
@@ -335,11 +360,8 @@ class EditOutbox {
   /// `detail` FastAPI sends for domain rejections like an empty-track edit);
   /// generic fallback for shapes we can't parse (pydantic's list detail).
   String _rejectionReasonFrom(ApiException e) {
-    try {
-      final body = jsonDecode(e.message);
-      final detail = body is Map ? body['detail'] : null;
-      if (detail is String && detail.isNotEmpty) return detail;
-    } catch (_) {}
+    final detail = _parseErrorBody(e)?['detail'];
+    if (detail is String && detail.isNotEmpty) return detail;
     return 'Rejected by the server (invalid or locked field)';
   }
 
@@ -362,11 +384,17 @@ class EditOutbox {
       (db.delete(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId))).go();
 
   int? _serverRevisionFrom(ApiException e) {
+    final detail = _parseErrorBody(e)?['detail'];
+    final rev = detail is Map ? detail['current_revision'] : null;
+    return rev is int ? rev : null;
+  }
+
+  /// Decodes `e.message` as a JSON object, or null if it isn't valid JSON /
+  /// isn't a JSON object.
+  Map<String, dynamic>? _parseErrorBody(ApiException e) {
     try {
       final body = jsonDecode(e.message);
-      final detail = body is Map ? body['detail'] : null;
-      final rev = detail is Map ? detail['current_revision'] : null;
-      return rev is int ? rev : null;
+      return body is Map ? body.cast<String, dynamic>() : null;
     } catch (_) {
       return null;
     }

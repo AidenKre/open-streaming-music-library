@@ -99,7 +99,14 @@ class SyncService {
   /// recover a track even after the watermark has advanced past the change
   /// that needs re-applying (the conflict "take server" case). Does not move
   /// the watermark — a later `/changes` pull is still authoritative.
-  Future<SyncResult> refetchAndApplyTrack(String uuidId) async {
+  /// [rebuildParentFts]: false lets a caller batching several single-track
+  /// refetches in a row (e.g. retrying multiple queued take-server markers)
+  /// defer this to one rebuild after the whole batch instead of paying it
+  /// once per track.
+  Future<SyncResult> refetchAndApplyTrack(
+    String uuidId, {
+    bool rebuildParentFts = true,
+  }) async {
     final affectedQueueSessionIds = <int>{};
     final deletedTrackUuids = <String>{};
     final before = await _db.readTrackFtsEntry(uuidId);
@@ -122,7 +129,7 @@ class SyncService {
     // may also have created/renamed/pruned parent rows, so re-derive just the
     // two small parent indexes.
     await _db.applyTrackFtsDelta(uuidId, before);
-    await _db.rebuildParentFtsIndexes();
+    if (rebuildParentFts) await _db.rebuildParentFtsIndexes();
     return SyncResult(
       affectedQueueSessionIds: affectedQueueSessionIds,
       deletedTrackUuids: deletedTrackUuids,
