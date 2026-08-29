@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 
 import 'package:drift/drift.dart' show Value;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:unorm_dart/unorm_dart.dart' as unorm;
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
@@ -207,6 +208,10 @@ class EditOutbox {
       return false;
     }
     final edited = (jsonDecode(row.valuesJson) as Map).cast<String, Object?>();
+    // An empty batch (the "re-tag master from current DB values" flow with no
+    // field edits) has no field to verify equality against, so it can never
+    // be soundly self-resolved — always fall through to the conflict path.
+    if (edited.isEmpty) return false;
     final m = dto.metadata;
     final server = <String, Object?>{
       'title': m.title,
@@ -220,10 +225,16 @@ class EditOutbox {
       'disc_number': m.discNumber,
     };
     for (final entry in edited.entries) {
-      if (!server.containsKey(entry.key) ||
-          server[entry.key] != entry.value) {
-        return false;
-      }
+      if (!server.containsKey(entry.key)) return false;
+      final serverValue = server[entry.key];
+      final editedValue = entry.value;
+      // The server NFC-normalizes string fields before storing; compare
+      // normalized so a decomposed-vs-composed Unicode value that was
+      // successfully applied doesn't read as a false conflict.
+      final equal = (serverValue is String && editedValue is String)
+          ? unorm.nfc(serverValue) == unorm.nfc(editedValue)
+          : serverValue == editedValue;
+      if (!equal) return false;
     }
     await db.updateTrackRevision(row.uuidId, dto.revision);
     await _delete(row.uuidId);

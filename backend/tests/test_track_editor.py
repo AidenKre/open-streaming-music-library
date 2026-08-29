@@ -250,6 +250,38 @@ class TestTrackEditorMaster:
         assert db.get_track_file_path(track.uuid_id) == str(audio)
         assert db.list_journal_entries() == []
 
+    def test_relocation_db_failure_after_move_prunes_new_directory(
+        self, tmp_path, monkeypatch
+    ):
+        # Unlike test_relocation_conflict_reverts_file (which fails the
+        # pre-flight revision check before move_file ever runs), this fails
+        # AFTER move_file has already created the new artist directory and
+        # placed the file — exercising _relocate's post-move except handler.
+        library = tmp_path / "music"
+        audio = library / "Old" / "song.m4a"
+        _make_audio(audio, title="T", artist="Old")
+        db = _db(tmp_path)
+        track = _add_track(db, audio, "T", "Old")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated db failure after move")
+
+        monkeypatch.setattr(db, "apply_track_metadata_edit", _boom)
+
+        with pytest.raises(RuntimeError):
+            self._editor(db, library).apply_edit(
+                track.uuid_id, {"artist": "New"}, track.revision,
+                WriteMode.db_and_master,
+            )
+
+        assert audio.exists(), "old master kept since the DB never advanced"
+        assert not (library / "New" / "song.m4a").exists()
+        assert not (library / "New").exists(), (
+            "orphaned empty artist directory left behind by move_file's mkdir"
+        )
+        assert db.get_track_file_path(track.uuid_id) == str(audio)
+        assert db.list_journal_entries() == []
+
     def test_empty_field_master_write_retags_file(self, tmp_path):
         # Enabling master-write with no field edits reconciles the FILE to the
         # current DB metadata (not a bare remux): on-disk tags that drifted from
@@ -498,4 +530,22 @@ class TestReconcileJournal:
             "crash-recovered relocation"
         )
         assert new.exists()
+        assert db.list_journal_entries() == []
+
+    def test_relocate_revert_prunes_emptied_new_directory(self, tmp_path):
+        db = _db(tmp_path)
+        old = tmp_path / "Old" / "old.m4a"; old.parent.mkdir(); old.write_bytes(b"old")
+        new = tmp_path / "New" / "new.m4a"; new.parent.mkdir(); new.write_bytes(b"new")
+        _add_track(db, old, "T", "Art")  # DB still points at old_path
+        uuid = db.get_tracks()[0].uuid_id
+        db.insert_journal_entry("relocate", uuid, str(old), str(new), None)
+
+        reconcile_journal(db, tmp_path)
+
+        assert old.exists()  # old master kept
+        assert not new.exists()  # uncommitted new copy removed
+        assert not new.parent.exists(), (
+            "orphaned empty destination directory left behind after a "
+            "reverted crash-recovered relocation"
+        )
         assert db.list_journal_entries() == []

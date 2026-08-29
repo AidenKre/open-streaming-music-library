@@ -193,6 +193,7 @@ class TrackEditor:
         except BaseException:
             # DB did not commit → revert: drop the new copy, keep the old master.
             dest.unlink(missing_ok=True)
+            prune_empty_dirs(dest.parent, self._library)
             self._db.delete_journal_entry(entry)
             raise
         # Committed: DB now points at `dest`; the old master is redundant.
@@ -237,6 +238,7 @@ def _reconcile_relocate(database: Database, entry: dict, music_library_dir: Path
     else:
         if new_path:
             Path(new_path).unlink(missing_ok=True)
+            prune_empty_dirs(Path(new_path).parent, music_library_dir)
     if temp_path:
         Path(temp_path).unlink(missing_ok=True)
     database.delete_journal_entry(entry["id"])

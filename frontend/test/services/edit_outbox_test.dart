@@ -620,6 +620,87 @@ void main() {
     expect(rev, 6);
   });
 
+  test(
+      'empty-edit master-retag batch that 409s must not be silently dropped',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    final outbox = _container(
+      db,
+      onPatch: (_) async => _conflict(9),
+      onGetTrack: (_) async => _trackResponse(revision: 9),
+    ).read(editOutboxProvider);
+
+    // The "flip 'Update master file on server', Save with no field edits"
+    // re-tag flow: an empty edit is still queued when write mode escalates
+    // to db_and_master (see `enqueue`'s isEmpty/dbOnly guard).
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty(),
+      writeMode: EditWriteMode.dbAndMaster,
+      baseRevision: 5,
+    );
+    await outbox.flush();
+
+    // An empty batch has no field to verify server-side, so a 409 on it must
+    // never be treated as "already applied" — that would silently drop the
+    // master retag with no visible surface. It must land in the normal
+    // conflict path instead.
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'conflicted');
+    expect(row.serverRevision, 9);
+  });
+
+  test('NFD edit applied server-side as NFC must not conflict with itself',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    const decomposed = 'Café'; // e + combining acute accent (NFD)
+    const composed = 'Café'; // single precomposed é (NFC)
+    var serverRev = 5;
+    var serverArtist = 'OldA';
+    var attempts = 0;
+    final outbox = _container(
+      db,
+      onPatch: (body) async {
+        attempts += 1;
+        if (attempts == 1) {
+          serverRev += 1; // committed server-side, NFC-normalized...
+          serverArtist = composed;
+          throw http.ClientException('connection reset'); // ...response lost
+        }
+        if (body['base_revision'] != serverRev) return _conflict(serverRev);
+        serverRev += 1;
+        serverArtist = body['artist'] as String;
+        return _ok();
+      },
+      onGetTrack: (_) async =>
+          _trackResponse(artist: serverArtist, revision: serverRev),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('artist', decomposed),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush();
+
+    // The server NFC-normalizes the artist on write; comparing raw code
+    // units without normalizing manufactures a false conflict against the
+    // client's own already-applied edit.
+    final conflicted = await (db.select(db.pendingEdits)
+          ..where((t) => t.status.equals('conflicted')))
+        .get();
+    expect(conflicted, isEmpty,
+        reason: 'byte comparison of NFD vs the server\'s NFC-normalized '
+            'value manufactured a false conflict against the client\'s own '
+            'applied edit');
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+  });
+
   test('take-server while offline must not permanently lose server truth',
       () async {
     final db = AppDatabase(NativeDatabase.memory());
