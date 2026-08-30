@@ -10,101 +10,56 @@ class BrowseRepository {
 
   // ── Albums ──────────────────────────────────────────────────────────────
 
-  Future<List<AlbumUI>> getAlbums({
+  Stream<List<AlbumUI>> watchAlbums({
     int? artistId,
     List<AlbumOrderParameter> orderBy = const [],
-    List<AlbumRowFilterParameter> cursorFilters = const [],
     int? limit,
     bool downloadedOnly = false,
-  }) async {
-    final rows = await _db.getAlbums(
-      artistId: artistId,
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return rows.map(AlbumUI.fromQueryRow).toList(growable: false);
-  }
-
-  Stream<int> watchAlbumsCount({
-    int? artistId,
-    List<AlbumOrderParameter> orderBy = const [],
-    List<AlbumRowFilterParameter> cursorFilters = const [],
-    bool downloadedOnly = false,
   }) {
-    return _db.watchAlbumsCount(
-      artistId: artistId,
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      downloadedOnly: downloadedOnly,
-    );
+    return _db
+        .watchAlbums(
+          artistId: artistId,
+          orderBy: orderBy,
+          limit: limit,
+          downloadedOnly: downloadedOnly,
+        )
+        .map((rows) => rows.map(AlbumUI.fromQueryRow).toList(growable: false));
   }
 
   // ── Artists ─────────────────────────────────────────────────────────────
 
-  Future<List<ArtistUI>> getArtists({
+  Stream<List<ArtistUI>> watchArtists({
     List<ArtistOrderParameter> orderBy = const [],
-    List<ArtistRowFilterParameter> cursorFilters = const [],
     int? limit,
     bool downloadedOnly = false,
-  }) async {
-    final rows = await _db.getArtists(
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return rows.map(ArtistUI.fromQueryRow).toList(growable: false);
-  }
-
-  Stream<int> watchArtistCount({
-    List<ArtistOrderParameter> orderBy = const [],
-    List<ArtistRowFilterParameter> cursorFilters = const [],
-    bool downloadedOnly = false,
   }) {
-    return _db.watchArtistCount(
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      downloadedOnly: downloadedOnly,
-    );
+    return _db
+        .watchArtists(
+          orderBy: orderBy,
+          limit: limit,
+          downloadedOnly: downloadedOnly,
+        )
+        .map((rows) => rows.map(ArtistUI.fromQueryRow).toList(growable: false));
   }
 
   // ── Tracks ──────────────────────────────────────────────────────────────
 
-  Future<List<TrackUI>> getTracks({
+  Stream<List<TrackUI>> watchTracks({
     List<OrderParameter> orderBy = const [],
-    List<RowFilterParameter> cursorFilters = const [],
     int? artistId,
     int? albumId,
     int? limit,
     bool downloadedOnly = false,
-  }) async {
-    final rows = await _db.getTracks(
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      artistId: artistId,
-      albumId: albumId,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return rows.map(TrackUI.fromQueryRow).toList(growable: false);
-  }
-
-  Stream<int> watchTrackCount({
-    List<OrderParameter> orderBy = const [],
-    List<RowFilterParameter> cursorFilters = const [],
-    int? artistId,
-    int? albumId,
-    bool downloadedOnly = false,
   }) {
-    return _db.watchTrackCount(
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      artistId: artistId,
-      albumId: albumId,
-      downloadedOnly: downloadedOnly,
-    );
+    return _db
+        .watchTracks(
+          orderBy: orderBy,
+          artistId: artistId,
+          albumId: albumId,
+          limit: limit,
+          downloadedOnly: downloadedOnly,
+        )
+        .map((rows) => rows.map(TrackUI.fromQueryRow).toList(growable: false));
   }
 
   // ── Track loading for queue operations ──────────────────────────────────

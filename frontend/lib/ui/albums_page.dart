@@ -56,40 +56,14 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
   }
 
   @override
-  Future<List<AlbumUI>> loadPage({required bool useCursor}) {
+  Stream<List<AlbumUI>> watchPage({required int limit}) {
     final repo = ref.read(browseRepositoryProvider);
-    final downloadedOnly = ref.read(offlineModeProvider);
-    return repo.getAlbums(
+    return repo.watchAlbums(
       artistId: widget.artistId,
       orderBy: _orderParams,
-      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
-      limit: pageSize,
-      downloadedOnly: downloadedOnly,
+      limit: limit,
+      downloadedOnly: ref.read(offlineModeProvider),
     );
-  }
-
-  @override
-  Stream<int> watchItemCount({required bool useCursor}) {
-    final repo = ref.read(browseRepositoryProvider);
-    final downloadedOnly = ref.read(offlineModeProvider);
-    return repo.watchAlbumsCount(
-      artistId: widget.artistId,
-      orderBy: useCursor ? _orderParams : [],
-      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
-      downloadedOnly: downloadedOnly,
-    );
-  }
-
-  List<AlbumRowFilterParameter> _buildCursorFromLast(AlbumUI last) {
-    return [
-      AlbumRowFilterParameter(column: 'artist', value: last.artist),
-      AlbumRowFilterParameter(column: 'year', value: last.year),
-      AlbumRowFilterParameter(
-        column: 'is_single_grouping',
-        value: last.isSingleGrouping ? 1 : 0,
-      ),
-      AlbumRowFilterParameter(column: 'name', value: last.name),
-    ];
   }
 
   void _onAlbumTap(AlbumUI album) {
@@ -116,17 +90,10 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     ref.listen<bool>(offlineModeProvider, (prev, next) {
       if (prev != next) refresh();
     });
-    // While offline, the downloaded-only filter is part of the query; a
-    // delete that removes the last downloaded item must re-fetch from
-    // page 1 so the stale card doesn't linger.
-    ref.listen(downloadStatusVersionProvider, (_, _) {
-      if (ref.read(offlineModeProvider)) refresh();
-    });
     final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
         if (isOffline) const DownloadedOnlyBadge(),
-        buildNewItemsBanner('albums'),
         Expanded(
           child: GridView.builder(
             controller: scrollController,

@@ -21,44 +21,17 @@ void main() {
     await db.close();
   });
 
-  test('getAlbums returns AlbumUI list in order', () async {
+  test('watchAlbums returns AlbumUI list in order', () async {
     await fixture.insertAlbum(artist: 'Zed', album: 'Zebra', uuids: ['z1']);
     await fixture.insertAlbum(artist: 'Ace', album: 'Alpha', uuids: ['a1']);
 
-    final albums = await repo.getAlbums(
-      orderBy: [AlbumOrderParameter(column: 'artist')],
-    );
+    final albums = await repo
+        .watchAlbums(orderBy: [AlbumOrderParameter(column: 'artist')])
+        .first;
 
     expect(albums, hasLength(2));
     expect(albums[0].name, 'Alpha');
     expect(albums[1].name, 'Zebra');
-  });
-
-  test('getAlbums cursor pagination returns next page', () async {
-    await fixture.insertAlbum(artist: 'A', album: 'Album A', uuids: ['a1']);
-    await fixture.insertAlbum(artist: 'B', album: 'Album B', uuids: ['b1']);
-    await fixture.insertAlbum(artist: 'C', album: 'Album C', uuids: ['c1']);
-
-    final firstPage = await repo.getAlbums(
-      orderBy: [AlbumOrderParameter(column: 'artist')],
-      limit: 2,
-    );
-    expect(firstPage, hasLength(2));
-
-    final lastAlbum = firstPage.last;
-    final secondPage = await repo.getAlbums(
-      orderBy: [AlbumOrderParameter(column: 'artist')],
-      cursorFilters: [
-        AlbumRowFilterParameter(
-          column: 'artist',
-          value: lastAlbum.artist,
-        ),
-      ],
-      limit: 2,
-    );
-
-    expect(secondPage, hasLength(1));
-    expect(secondPage[0].name, 'Album C');
   });
 
   test('getTracksForAlbum returns tracks for specific album', () async {
@@ -236,6 +209,7 @@ class _LibraryFixture {
       'uuid_id': uuid,
       'created_at': 1700000000 + trackNumber,
       'last_updated': 1700000100 + trackNumber,
+      'revision': 1700000000 + trackNumber,
       'metadata': {
         'title': title ?? 'Track $uuid',
         'artist': artist,

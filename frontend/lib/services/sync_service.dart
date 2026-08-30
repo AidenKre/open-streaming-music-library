@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:drift/drift.dart';
+import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/change_entry_dto.dart';
@@ -86,6 +87,49 @@ class SyncService {
     }
 
     await _db.rebuildFtsIndexes();
+    return SyncResult(
+      affectedQueueSessionIds: affectedQueueSessionIds,
+      deletedTrackUuids: deletedTrackUuids,
+    );
+  }
+
+  /// Reconcile a single track to current server truth: refetch it and upsert
+  /// locally, or delete it locally if the server reports it gone (404/410).
+  /// Unlike [syncChanges] this does not consult the watermark, so it can
+  /// recover a track even after the watermark has advanced past the change
+  /// that needs re-applying (the conflict "take server" case). Does not move
+  /// the watermark — a later `/changes` pull is still authoritative.
+  /// [rebuildParentFts]: false lets a caller batching several single-track
+  /// refetches in a row (e.g. retrying multiple queued take-server markers)
+  /// defer this to one rebuild after the whole batch instead of paying it
+  /// once per track.
+  Future<SyncResult> refetchAndApplyTrack(
+    String uuidId, {
+    bool rebuildParentFts = true,
+  }) async {
+    final affectedQueueSessionIds = <int>{};
+    final deletedTrackUuids = <String>{};
+    final before = await _db.readTrackFtsEntry(uuidId);
+    try {
+      final dto = await _api.getTrack(uuidId);
+      await _upsertTracks([dto]);
+    } on ApiException catch (e) {
+      if (e.statusCode == 404 || e.statusCode == 410) {
+        await _deleteTracks(
+          [uuidId],
+          affectedQueueSessionIds: affectedQueueSessionIds,
+          deletedTrackUuids: deletedTrackUuids,
+        );
+      } else {
+        rethrow;
+      }
+    }
+    // Targeted FTS maintenance: exactly one track row changed, so apply a
+    // per-row fts_tracks delta instead of the O(library) rebuild. The upsert
+    // may also have created/renamed/pruned parent rows, so re-derive just the
+    // two small parent indexes.
+    await _db.applyTrackFtsDelta(uuidId, before);
+    if (rebuildParentFts) await _db.rebuildParentFtsIndexes();
     return SyncResult(
       affectedQueueSessionIds: affectedQueueSessionIds,
       deletedTrackUuids: deletedTrackUuids,
@@ -192,15 +236,22 @@ class SyncService {
   }
 
   Future<void> _pruneOrphanParents() async {
-    await _db.customStatement(
+    // customUpdate (not customStatement) so the deletes notify the albums/
+    // artists stream watchers directly — the reactive browse lists drop the
+    // emptied cards without depending on a sibling write to trigger them.
+    await _db.customUpdate(
       'DELETE FROM albums WHERE NOT EXISTS ('
       'SELECT 1 FROM trackmetadata tm WHERE tm.album_id = albums.id'
       ')',
+      updates: {_db.albums},
+      updateKind: UpdateKind.delete,
     );
-    await _db.customStatement(
+    await _db.customUpdate(
       'DELETE FROM artists WHERE NOT EXISTS ('
       'SELECT 1 FROM trackmetadata tm WHERE tm.artist_id = artists.id'
       ')',
+      updates: {_db.artists},
+      updateKind: UpdateKind.delete,
     );
   }
 

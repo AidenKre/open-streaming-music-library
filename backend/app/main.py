@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -16,20 +17,27 @@ from app.database import (
     ArtistRowFilterParameter,
     Database,
     DatabaseContext,
+    EmptyTrackEdit,
     OrderParameter,
+    RevisionConflict,
     RowFilterParameter,
     SearchEntityType,
     SearchParameter,
+    TrackNotFound,
 )
 from app.models import (
     Album,
+    AppInfoResponse,
     ChangeEntry,
     ClientTrack,
+    EntityInfo,
+    FieldDescriptor,
     GetAlbumsResponse,
     GetArtistsResponse,
     GetChangesResponse,
     GetSearchResponse,
     GetTracksResponse,
+    PatchTrackResponse,
     WarmRequest,
     WarmResponse,
     QualitySettingResponse,
@@ -37,6 +45,18 @@ from app.models import (
     SetQualityResponse,
     Track,
 )
+from app.models.edit_fields import EDIT_FIELD_SPECS
+from app.services.metadata import TagWriteError
+from app.services.track_edit import (
+    TrackPatchRequest,
+    WriteMode,
+)
+from app.services.track_editor import (
+    MasterWriteError,
+    TrackEditor,
+    reconcile_journal,
+)
+from app.services.track_locks import TrackLocks
 from app.services import (
     CoverArtContext,
     CoverArtManager,
@@ -71,12 +91,20 @@ app = FastAPI(lifespan=lifespan)
 
 
 def _resolve_track_source_path(database: Database, uuid_id: str) -> Optional[Path]:
-    rows = database.get_tracks(
-        search_parameters=[SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
-    )
-    if not rows:
-        return None
-    return rows[0].file_path
+    track = database.get_track_by_uuid(uuid_id)
+    return track.file_path if track is not None else None
+
+
+def _assert_dirs_non_overlapping(import_dir: Path, library_dir: Path) -> None:
+    """Fail startup if import_dir and music_library_dir are the same or one is
+    nested in the other — otherwise edit staging (under the library) could be
+    re-ingested by the import watcher."""
+    a = import_dir.resolve()
+    b = library_dir.resolve()
+    if a == b or a in b.parents or b in a.parents:
+        raise RuntimeError(
+            f"import_dir ({a}) and music_library_dir ({b}) must not overlap"
+        )
 
 
 def startup_event():
@@ -89,10 +117,18 @@ def startup_event():
     app.state.encoded_cache = None
     app.state.default_cache = None
     app.state.encoder_coordinator = None
+    # Per-uuid edit lock. Built once here so slice 4's master-file staging and
+    # Phase 2's conversion worker share the identical instance.
+    app.state.track_locks = TrackLocks()
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
     settings.music_library_dir.mkdir(parents=True, exist_ok=True)
     settings.import_dir.mkdir(parents=True, exist_ok=True)
+
+    # The watcher ingests anything dropped in import_dir; edit staging lives
+    # under music_library_dir. If those trees overlapped, a staged temp could be
+    # re-ingested as a new track. Fail fast rather than corrupt the library.
+    _assert_dirs_non_overlapping(settings.import_dir, settings.music_library_dir)
 
     print(f"app data dir: {settings.app_data_dir}")
 
@@ -107,6 +143,19 @@ def startup_event():
     db_intialized = database.initialize()
     print(f"Database initialized: {db_intialized}")
     app.state.database = database
+
+    # Master-file edit orchestration. Staging lives under the library so a
+    # staged temp is on the same filesystem as its destination (atomic
+    # os.replace / rename) yet off the watched import tree.
+    staging_dir = settings.music_library_dir / ".staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    app.state.track_editor = TrackEditor(
+        database=database,
+        music_library_dir=settings.music_library_dir,
+        staging_dir=staging_dir,
+    )
+    # Finish/revert any edit interrupted by a crash before serving requests.
+    reconcile_journal(database, settings.music_library_dir)
 
     # Set up cover art manager
     cover_art_dir = settings.app_data_dir / "cover_art"
@@ -976,6 +1025,82 @@ def set_quality_setting(request: SetQualityRequest):
         )
 
     return SetQualityResponse(quality=quality_canonical, warming=warming)
+
+
+@app.get("/app/info", response_model=AppInfoResponse)
+def get_app_info():
+    """App-level bootstrap: per-entity editable fields + actions. Backed by the
+    same edit allowlist that gates PATCH, so advertised == accepted. Cached
+    client-side; later phases extend this rather than add endpoints."""
+    track_fields = [
+        FieldDescriptor(key=spec.key, label=spec.label, valueType=spec.value_type)
+        for spec in EDIT_FIELD_SPECS
+    ]
+    return AppInfoResponse(
+        entities={"track": EntityInfo(fields=track_fields, actions=[])}
+    )
+
+
+@app.get("/tracks/{uuid_id}", response_model=ClientTrack)
+def get_track(uuid_id: str):
+    """Authoritative current state of a single track. Lets a client reconcile
+    one track to server truth without a watermark-driven `/changes` pull — used
+    by edit-conflict "take server" resolution, where the watermark may already
+    have advanced past the conflicting revision. 404 if the track is gone."""
+    database: Database = cast(Database, app.state.database)
+    track = database.get_track_by_uuid(uuid_id)
+    if track is None:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return ClientTrack.from_track(track=track)
+
+
+@app.patch("/tracks/{uuid_id}", response_model=PatchTrackResponse)
+def patch_track(uuid_id: str, request: TrackPatchRequest):
+    """Partial track metadata edit. Non-allowlisted fields + type/range are
+    rejected by ``TrackPatchRequest`` (422). ``db_only`` writes the DB; the
+    confirmation-gated ``db_and_master`` also rewrites the file tags and
+    relocates the master when artist/album change (WAV / missing master degrade
+    to DB-only with ``master_written=False``). Per-uuid serialized; the DB
+    layer's typed conflicts map to HTTP status codes."""
+    track_editor: TrackEditor = app.state.track_editor
+    track_locks: TrackLocks = app.state.track_locks
+
+    try:
+        with track_locks.lock(uuid_id):
+            new_revision, master_written = track_editor.apply_edit(
+                uuid_id=uuid_id,
+                fields=request.edit_fields(),
+                base_revision=request.base_revision,
+                write_mode=request.write_mode,
+            )
+    except TrackNotFound:
+        raise HTTPException(status_code=404, detail="Track not found")
+    except RevisionConflict as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "current_revision": e.current_revision,
+            },
+        )
+    except EmptyTrackEdit:
+        raise HTTPException(
+            status_code=422,
+            detail="Edit would leave the track with no title, artist, "
+            "album, or album artist",
+        )
+    except (TagWriteError, MasterWriteError) as e:
+        raise HTTPException(status_code=500, detail=f"Master file write failed: {e}")
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            raise HTTPException(
+                status_code=503, detail="Database busy, retry"
+            )
+        raise
+
+    return PatchTrackResponse(
+        uuid_id=uuid_id, revision=new_revision, master_written=master_written
+    )
 
 
 @app.get("/")

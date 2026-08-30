@@ -48,6 +48,7 @@ class PrefetchOutcome(enum.Enum):
     INVALID = "invalid"
 
 from app.services.encoded_cache import CACHE_FILE_SUFFIX, EncodedCache
+from app.services.keyed_locks import KeyedLocks
 from app.services.metadata import get_audio_bitrate_kbps
 from app.services.transcoder import (
     ORIGINAL_QUALITY,
@@ -159,7 +160,10 @@ class EncoderCoordinator:
     # _submit_warm_tasks to pre-encode every track at the new default quality.
     all_uuids_fn: Optional[AllUuidsFn] = None
     _executor: _PriorityPool = field(init=False)
-    _key_locks: dict[tuple[str, str], threading.Lock] = field(default_factory=dict)
+    # Per-(uuid, quality) encode locks (shared keyed-lock utility). The guard
+    # below is NOT the lock registry's internal guard — it protects the
+    # default-quality/warm-generation state snapshots.
+    _key_locks: KeyedLocks[tuple[str, str]] = field(default_factory=KeyedLocks)
     _key_locks_guard: threading.Lock = field(default_factory=threading.Lock)
     _default_quality_update_lock: threading.Lock = field(default_factory=threading.Lock)
     _scratch_dir: Path = field(init=False)
@@ -242,13 +246,7 @@ class EncoderCoordinator:
     # ── Per-key lock helpers ──────────────────────────────────────────────
 
     def _key_lock(self, uuid_id: str, quality: str) -> threading.Lock:
-        key = (uuid_id, quality)
-        with self._key_locks_guard:
-            lock = self._key_locks.get(key)
-            if lock is None:
-                lock = threading.Lock()
-                self._key_locks[key] = lock
-            return lock
+        return self._key_locks.lock_for((uuid_id, quality))
 
     # ── Public API ────────────────────────────────────────────────────────
 

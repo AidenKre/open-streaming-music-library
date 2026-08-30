@@ -189,6 +189,7 @@ void main() {
         'uuid_id': 'qr-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {
           'title': 'My Song',
           'artist': 'Artist Name',
@@ -243,6 +244,7 @@ void main() {
         'uuid_id': 'qr-cover-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {
           'title': 'Cover Song',
           'artist': 'Artist',
@@ -270,6 +272,7 @@ void main() {
         'uuid_id': 'qr-no-cover-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {
           'duration': 100.0,
           'bitrate_kbps': 128.0,

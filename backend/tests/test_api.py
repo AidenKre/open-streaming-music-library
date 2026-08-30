@@ -20,6 +20,7 @@ from app.models import (
     TrackMetaData,
 )
 from app.models.client_track import ClientTrack
+from app.database.database import EDITABLE_METADATA_COLUMNS
 
 
 @pytest.fixture
@@ -102,6 +103,23 @@ def add_tracks_to_client(
         assert client.app.state.database.add_track(track)
 
     return tracks
+
+
+class TestGetSingleTrack:
+    def test_returns_current_track_state(self, client):
+        tracks = add_tracks_to_client(client=client, amount_to_add=1)
+        uuid = tracks[0].uuid_id
+
+        r = client.get(f"/tracks/{uuid}")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["uuid_id"] == uuid
+        assert isinstance(body["revision"], int)
+        assert body["metadata"]["title"] == "song_0"
+
+    def test_missing_track_404s(self, client):
+        r = client.get("/tracks/does-not-exist")
+        assert r.status_code == 404, r.text
 
 
 class TestGetTracks:
@@ -1197,3 +1215,116 @@ class TestSearch:
     def test_search__invalid_types__returns_error(self, client):
         r = client.get("/search", params={"q": "test", "types": "invalid"})
         assert r.status_code == 400, r.text
+
+
+class TestAppInfo:
+    def test_app_info__advertises_track_edit_fields(self, client):
+        r = client.get("/app/info")
+        assert r.status_code == 200, r.text
+        body = r.json()
+
+        track = body["entities"]["track"]
+        keys = [f["key"] for f in track["fields"]]
+        assert keys == EDITABLE_METADATA_COLUMNS  # advertised == accepted
+        assert track["actions"] == []  # no actions in Phase 1
+        assert all(f["editable"] for f in track["fields"])
+
+
+class TestPatchTrack:
+    def _add_one(self, client, **meta) -> Track:
+        return add_tracks_to_client(client=client, amount_to_add=1, **meta)[0]
+
+    def test_patch__db_only_edit__200_bumps_revision_and_shows_in_changes(self, client):
+        track = self._add_one(client)
+
+        r = client.patch(
+            f"/tracks/{track.uuid_id}",
+            json={"base_revision": track.revision, "title": "Renamed"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["uuid_id"] == track.uuid_id
+        assert body["revision"] > track.revision
+
+        changes = GetChangesResponse.model_validate(client.get("/changes").json())
+        edited = next(c for c in changes.changes if c.uuid_id == track.uuid_id)
+        assert edited.track is not None
+        assert edited.track.metadata.title == "Renamed"
+        assert edited.track.revision == body["revision"]
+
+    def test_patch__stale_base_revision__409(self, client):
+        track = self._add_one(client)
+        r = client.patch(
+            f"/tracks/{track.uuid_id}",
+            json={"base_revision": track.revision + 999, "title": "X"},
+        )
+        assert r.status_code == 409, r.text
+
+    def test_patch__missing_uuid__404(self, client):
+        r = client.patch(
+            "/tracks/does-not-exist",
+            json={"base_revision": 1, "title": "X"},
+        )
+        assert r.status_code == 404, r.text
+
+    def test_patch__non_allowlisted_field__422(self, client):
+        track = self._add_one(client)
+        # `codec` is audio-derived — not in the edit allowlist.
+        r = client.patch(
+            f"/tracks/{track.uuid_id}",
+            json={"base_revision": track.revision, "codec": "mp3"},
+        )
+        assert r.status_code == 422, r.text
+
+    def test_patch__missing_base_revision__422(self, client):
+        track = self._add_one(client)
+        r = client.patch(f"/tracks/{track.uuid_id}", json={"title": "X"})
+        assert r.status_code == 422, r.text
+
+    def test_patch__null_base_revision__409_conflict_not_422(self, client):
+        # Option A: a NULL client-side revision means "unknown base" and must
+        # force the conflict-prompt path (do NOT treat NULL as 0). The client
+        # really sends null — e.g. resolveKeepMine rebasing onto an
+        # unparseable 409 body. A 422 would be fatal client-side: the outbox
+        # treats 422 as a permanent rejection and silently reverts + discards
+        # the user's edit, so null must get the 409 conflict shape instead.
+        track = self._add_one(client)
+        r = client.patch(
+            f"/tracks/{track.uuid_id}",
+            json={"base_revision": None, "title": "Renamed"},
+        )
+        assert r.status_code == 409, r.text
+        body = r.json()
+        assert body["detail"]["error"] == "revision_conflict"
+        assert body["detail"]["current_revision"] == track.revision
+
+    def test_patch__blanks_whole_track__422(self, client):
+        track = self._add_one(client)
+        r = client.patch(
+            f"/tracks/{track.uuid_id}",
+            json={
+                "base_revision": track.revision,
+                "title": "",
+                "artist": "",
+                "album": "",
+            },
+        )
+        assert r.status_code == 422, r.text
+
+    def test_patch__db_and_master__missing_master_degrades_to_db_only(self, client):
+        # The test track's file_path is a placeholder that doesn't exist on
+        # disk, so db_and_master degrades to DB-only: the edit applies but the
+        # response reports the master was not written.
+        track = self._add_one(client)
+        r = client.patch(
+            f"/tracks/{track.uuid_id}",
+            json={
+                "base_revision": track.revision,
+                "write_mode": "db_and_master",
+                "title": "X",
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["master_written"] is False
+        assert body["revision"] > track.revision

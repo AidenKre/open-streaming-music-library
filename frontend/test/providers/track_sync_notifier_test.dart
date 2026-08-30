@@ -8,12 +8,16 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/recovery/recoverable.dart';
+import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/services/sync_service.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
@@ -107,10 +111,11 @@ Map<String, dynamic> _richMetadataJson({
   'cover_art_id': coverArtId,
 };
 
-Map<String, dynamic> _trackJson(String uuid) => {
+Map<String, dynamic> _trackJson(String uuid, {int revision = 1}) => {
   'uuid_id': uuid,
   'created_at': 1000,
   'last_updated': 2000,
+  'revision': revision,
   'metadata': _minimalMetadataJson(),
 };
 
@@ -128,6 +133,7 @@ Map<String, dynamic> _richTrackJson(
   'uuid_id': uuid,
   'created_at': createdAt,
   'last_updated': createdAt,
+  'revision': createdAt,
   'metadata': _richMetadataJson(
     title: title,
     artist: artist,
@@ -242,6 +248,46 @@ void main() {
 
         final prefs = await SharedPreferences.getInstance();
         expect(prefs.getInt(SyncService.lastRevisionKey), 2);
+      },
+    );
+
+    test(
+      'upsert stores the per-track revision from the payload, and a later '
+      'upsert overwrites it',
+      () async {
+        var call = 0;
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            call++;
+            // The envelope revision (sync watermark) is deliberately set
+            // different from the track-payload revision so this proves the
+            // stored value comes from the payload, not the envelope.
+            if (call == 1) {
+              return _changesResponse([
+                _upsert(1, _trackJson('uuid-1', revision: 7)),
+              ]);
+            }
+            return _changesResponse([
+              _upsert(2, _trackJson('uuid-1', revision: 9)),
+            ]);
+          }),
+        );
+
+        final c = createContainer();
+        await waitForBuild(c);
+
+        await c.read(trackSyncProvider.notifier).sync();
+        final afterFirst = await (db.select(
+          db.tracks,
+        )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
+        expect(afterFirst.revision, 7);
+
+        await c.read(trackSyncProvider.notifier).sync();
+        final afterSecond = await (db.select(
+          db.tracks,
+        )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
+        expect(afterSecond.revision, 9);
       },
     );
 
@@ -392,6 +438,76 @@ void main() {
 
       expect(callCount, 1);
     });
+
+    test(
+      'refreshTrack cannot publish the same mutation version as a concurrent sync',
+      () async {
+        // Both operations locally delete a track, so each publishes a
+        // mutation-version bump. The audio coordinator drops any state whose
+        // version is <= the last one it saw, so two concurrent operations
+        // publishing the SAME version silently lose one reconciliation.
+        // refreshTrack must serialize with sync via the isSyncing guard.
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse([
+              _upsert(1, _trackJson('uuid-a')),
+              _upsert(2, _trackJson('uuid-b')),
+            ]),
+          ),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
+        final notifier = c.read(trackSyncProvider.notifier);
+        await notifier.sync();
+
+        // Every published version bump must be unique and increasing.
+        final publishedVersions = <int>[];
+        c.listen<AsyncValue<TrackSyncState>>(trackSyncProvider, (_, next) {
+          final v = next.value;
+          if (v != null && v.deletedTrackUuids.isNotEmpty) {
+            publishedVersions.add(v.downloadMutationVersion);
+          }
+        });
+
+        // Slow /changes carrying a delete; single-track GET reports gone.
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            if (req.url.path.endsWith('/changes')) {
+              await Future<void>.delayed(const Duration(milliseconds: 50));
+              return _changesResponse([_delete(3, 'uuid-a')]);
+            }
+            return Response('', 404);
+          }),
+        );
+
+        final syncFuture = notifier.sync();
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        final refreshedDuringSync = await notifier.refreshTrack('uuid-b');
+        await syncFuture;
+
+        // Serialized: the refresh is skipped while the sync is in flight
+        // (its take_server marker is retried after the sync).
+        expect(refreshedDuringSync, isFalse);
+        expect(
+          c.read(trackSyncProvider).value!.downloadMutationVersion,
+          1,
+        );
+
+        final refreshedAfterSync = await notifier.refreshTrack('uuid-b');
+        expect(refreshedAfterSync, isTrue);
+        expect(
+          c.read(trackSyncProvider).value!.downloadMutationVersion,
+          2,
+        );
+        expect(await db.getTrackByUuid('uuid-b'), isEmpty);
+
+        // No version was ever published twice.
+        expect(publishedVersions.toSet().length, publishedVersions.length);
+        expect(publishedVersions, [1, 2]);
+      },
+    );
 
     test('offline sync skip makes no API request', () async {
       var callCount = 0;
@@ -1369,6 +1485,115 @@ void main() {
         final after = await queueRepo.getSessionSnapshot(sessionId);
         expect(after!.currentItem!.uuidId, 'uuid-b');
         expect(after.currentItem!.playPosition, 0);
+      },
+    );
+  });
+
+  group('Artist-rename orphan reproduction', () {
+    test(
+      'flushing an artist rename, then resuming the app, still leaves the '
+      'old artist on the browse grid',
+      () async {
+        // Establish Artist "Old" (id 31) locally exactly like a freshly
+        // synced library: one track, one artist, one album.
+        var patched = false;
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            if (req.method == 'PATCH') {
+              patched = true;
+              // The server accepts the rename and reassigns the track
+              // server-side to a new Artist "New" (id 32), GC-ing Artist
+              // "Old" (31) — reflected below on the next `/changes` pull,
+              // which app-resume is what makes happen at all.
+              return Response(
+                jsonEncode({
+                  'uuid_id': 'uuid-moving',
+                  'revision': 2,
+                  'master_written': false,
+                }),
+                200,
+                headers: {'content-type': 'application/json'},
+              );
+            }
+            if (patched) {
+              return _changesResponse([
+                _upsert(
+                  2,
+                  _richTrackJson(
+                    'uuid-moving',
+                    title: 'Song',
+                    artist: 'New',
+                    album: 'Old Album',
+                    artistId: 32,
+                    albumId: 301,
+                  ),
+                ),
+              ]);
+            }
+            return _changesResponse([
+              _upsert(
+                1,
+                _richTrackJson(
+                  'uuid-moving',
+                  title: 'Song',
+                  artist: 'Old',
+                  album: 'Old Album',
+                  artistId: 31,
+                  albumId: 301,
+                ),
+              ),
+            ]);
+          }),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
+        await c.read(trackSyncProvider.notifier).sync();
+
+        // Sanity check: Artist "Old" is on the board after the initial sync.
+        expect(
+          await (db.select(db.artists)..where((a) => a.id.equals(31))).get(),
+          hasLength(1),
+        );
+
+        // The user renames the track's artist via the real edit outbox — the
+        // same seam Get Info uses — and the save completes successfully.
+        final outbox = c.read(editOutboxProvider);
+        await outbox.enqueue(
+          uuidId: 'uuid-moving',
+          edit: const MetadataEdit.empty().set('artist', 'New'),
+          writeMode: EditWriteMode.dbOnly,
+          baseRevision: 1,
+        );
+        await outbox.flush();
+        expect(patched, isTrue);
+        expect(await db.select(db.pendingEdits).get(), isEmpty);
+
+        // The app is backgrounded and resumed — no network flap, no manual
+        // navigation to a fresh Artists/Albums/Tracks page. Just the most
+        // ordinary "user put their phone away and picked it back up" edge.
+        await c
+            .read(recoveryServiceProvider)
+            .runFor(RecoveryTrigger.appResume);
+
+        // Desired: Artist "Old" has zero tracks left after the rename, so it
+        // should no longer show on the browse grid. Actual: nothing ever
+        // repointed the local artist_id FK or pruned the parent row — that
+        // only happens inside SyncService, and app resume never triggers a
+        // sync (`_SyncRecoverable` only fires on `networkRecovered`) — so the
+        // orphaned card survives resume entirely.
+        final oldArtist = await (db.select(
+          db.artists,
+        )..where((a) => a.id.equals(31))).get();
+        expect(
+          oldArtist,
+          isEmpty,
+          reason:
+              'Artist "Old" has no remaining tracks after the rename '
+              'flushed, but resuming the app never reconciles it — the '
+              'orphaned card survives indefinitely until some other page '
+              'happens to trigger a sync.',
+        );
       },
     );
   });

@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import List
@@ -14,10 +16,13 @@ from app.database.database import (
     ArtistRowFilterParameter,
     Database,
     DatabaseContext,
+    EmptyTrackEdit,
     OrderParameter,
+    RevisionConflict,
     RowFilterParameter,
     SearchEntityType,
     SearchParameter,
+    TrackNotFound,
     prepare_fts_query,
 )
 from app.models.album import Album
@@ -3351,3 +3356,258 @@ class TestDatabaseCoverArtCrud:
 
         with pytest.raises(Exception):
             database.insert_cover_art(sha256="dup", phash="bbbb", phash_prefix="bb", file_path="/tmp/2.png")
+
+
+class TestUpdateTrackMetadata:
+    def _db(self, tmp_path):
+        database = set_up_database(tmp_path / "database.db")
+        assert database.initialize()
+        return database
+
+    def _add(self, database, path, title, artist, album=None, album_artist=None, year=None):
+        metadata = seed_metadata()
+        metadata.title = title
+        metadata.artist = artist
+        if album:
+            metadata.album = album
+        if album_artist:
+            metadata.album_artist = album_artist
+        if year is not None:
+            metadata.year = year
+        track = Track(file_path=path, metadata=metadata)
+        assert database.add_track(track)
+        return track
+
+    def _meta_row(self, database, uuid_id):
+        with database._connection() as conn:
+            return conn.execute(
+                "SELECT artist_id, album_id, artist, album, title "
+                "FROM trackmetadata WHERE uuid_id = ?",
+                (uuid_id,),
+            ).fetchone()
+
+    def test_edit_artist__old_artist_kept_when_other_tracks_use_it(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "ArtistA")
+        self._add(database, tmp_path / "b.mp3", "s2", "ArtistA")
+
+        database.apply_track_metadata_edit(t1.uuid_id, {"artist": "ArtistB"}, t1.revision)
+
+        assert get_artist_id(database, "ArtistA") is not None  # t2 still holds it
+        b_id = get_artist_id(database, "ArtistB")
+        assert b_id is not None
+        assert {t.uuid_id for t in database.get_tracks(artist_id=b_id)} == {t1.uuid_id}
+
+    def test_edit_artist__into_existing_artist__reuses_row_and_orphans_old(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "ArtA")
+        t2 = self._add(database, tmp_path / "b.mp3", "s2", "ArtB")
+
+        database.apply_track_metadata_edit(t1.uuid_id, {"artist": "ArtB"}, t1.revision)
+
+        assert get_artist_id(database, "ArtA") is None  # was t1's only artist
+        b_id = get_artist_id(database, "ArtB")
+        assert {t.uuid_id for t in database.get_tracks(artist_id=b_id)} == {
+            t1.uuid_id,
+            t2.uuid_id,
+        }
+
+    def test_edit_album__orphans_old_named_album(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art", album="AlbumX")
+
+        database.apply_track_metadata_edit(t1.uuid_id, {"album": "AlbumY"}, t1.revision)
+
+        art_id = get_artist_id(database, "Art")
+        names = {a.name for a in database.get_albums(artist_id=art_id)}
+        assert "AlbumX" not in names
+        assert "AlbumY" in names
+
+    def test_clear_artist__nulls_both_ids_and_orphans_parents(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "SoloArt", album="AlbX")
+
+        database.apply_track_metadata_edit(t1.uuid_id, {"artist": ""}, t1.revision)
+
+        row = self._meta_row(database, t1.uuid_id)
+        assert row["artist_id"] is None
+        assert row["album_id"] is None
+        assert get_artist_id(database, "SoloArt") is None
+
+    def test_single_grouping_year_move__is_an_identity_move(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art", year=2000)
+        art_id = get_artist_id(database, "Art")
+
+        database.apply_track_metadata_edit(t1.uuid_id, {"year": 2001}, t1.revision)
+
+        albums = database.get_albums(artist_id=art_id)
+        assert len(albums) == 1
+        assert albums[0].is_single_grouping
+        assert albums[0].year == 2001
+
+    def test_edit__nfc_normalizes_artist_for_dedup(self, tmp_path):
+        database = self._db(tmp_path)
+        composed = "Café"  # é as one codepoint
+        decomposed = "Café"  # e + combining acute (canonically equal)
+        self._add(database, tmp_path / "a.mp3", "s1", composed)
+        t2 = self._add(database, tmp_path / "b.mp3", "s2", "Other")
+
+        database.apply_track_metadata_edit(t2.uuid_id, {"artist": decomposed}, t2.revision)
+
+        cafe = [
+            a
+            for a in database.get_artists(limit=1000)
+            if unicodedata.normalize("NFC", a.name) == composed
+        ]
+        assert len(cafe) == 1  # both tracks collapsed onto one artist row
+
+    def test_apply_edit__year_only__derives_date_in_spine(self, tmp_path):
+        # The temporal invariant (date canonical, year derived) lives in the
+        # spine itself, not the PATCH orchestrator — a direct spine caller
+        # (Phase-2 conversion, bulk edit) must get consistent columns too.
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art")
+
+        database.apply_track_metadata_edit(t1.uuid_id, {"year": 2020}, t1.revision)
+
+        meta = database.get_tracks()[0].metadata
+        assert meta.year == 2020
+        assert meta.date == "2020"
+
+    def test_edit__bumps_revision(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art")
+
+        new_rev = database.apply_track_metadata_edit(
+            t1.uuid_id, {"title": "renamed"}, t1.revision
+        )
+
+        assert new_rev > t1.revision
+
+    def test_apply_edit__stale_base_revision__raises_conflict(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art")
+
+        with pytest.raises(RevisionConflict):
+            database.apply_track_metadata_edit(
+                t1.uuid_id, {"title": "x"}, t1.revision + 999
+            )
+
+    def test_apply_edit__missing_uuid__raises_not_found(self, tmp_path):
+        database = self._db(tmp_path)
+        with pytest.raises(TrackNotFound):
+            database.apply_track_metadata_edit("does-not-exist", {"title": "x"}, 1)
+
+    def test_apply_edit__album_artist_carries_identity__not_an_empty_edit(self, tmp_path):
+        # effective_artist() prefers album_artist over artist, so a compilation
+        # track whose album_artist survives the edit keeps its full library
+        # identity (artist row, single-grouping album, FTS). The empty-edit
+        # guard must therefore consider album_artist: clearing title + artist +
+        # album on a 'Various Artists' track is a legitimate edit, not a blank.
+        database = self._db(tmp_path)
+        t1 = self._add(
+            database, tmp_path / "a.mp3", "s1", "TrackArt",
+            album="Comp", album_artist="Various Artists",
+        )
+
+        new_rev = database.apply_track_metadata_edit(
+            t1.uuid_id, {"title": "", "artist": "", "album": ""}, t1.revision
+        )
+
+        assert new_rev > t1.revision
+        row = self._meta_row(database, t1.uuid_id)
+        # Still identified by album_artist → the artist FK must survive.
+        assert row["artist_id"] is not None
+        assert get_artist_id(database, "Various Artists") == row["artist_id"]
+
+    def test_apply_edit__blanks_whole_track__raises_empty(self, tmp_path):
+        database = self._db(tmp_path)
+        t1 = self._add(database, tmp_path / "a.mp3", "s1", "Art", album="Alb")
+
+        with pytest.raises(EmptyTrackEdit):
+            database.apply_track_metadata_edit(
+                t1.uuid_id,
+                {"title": "", "artist": "", "album": ""},
+                t1.revision,
+            )
+
+
+class TestApplyTrackMetadataEditConcurrency:
+    def _db(self, tmp_path):
+        database = set_up_database(tmp_path / "database.db")
+        assert database.initialize()
+        return database
+
+    def _add(self, database, path, title, artist):
+        metadata = seed_metadata()
+        metadata.title = title
+        metadata.artist = artist
+        track = Track(file_path=path, metadata=metadata)
+        assert database.add_track(track)
+        return track
+
+    def test_apply_track_metadata_edit__concurrent_calls__second_gets_conflict(
+        self, tmp_path, monkeypatch
+    ):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.mp3", "T", "Artist")
+        base_rev = track.revision
+
+        # Deterministic, no time.sleep: pause thread A at the exact vulnerable
+        # point -- after its own revision check has already passed but before
+        # it writes -- and only release it once thread B has genuinely begun
+        # its own call. The .wait()/.join() timeouts below are safety bounds
+        # against a hang if something is broken; the test's correctness never
+        # depends on their duration.
+        a_paused = threading.Event()
+        b_started = threading.Event()
+        release_a = threading.Event()
+
+        original_bump = Database._bump_track_revision
+
+        def paused_bump(conn, uuid_id):
+            a_paused.set()
+            assert release_a.wait(timeout=5), "test held A paused too long"
+            return original_bump(conn, uuid_id)
+
+        # _bump_track_revision is a staticmethod; wrap the replacement the
+        # same way so `self._bump_track_revision(conn, uuid_id)` doesn't bind
+        # `self` in as an extra leading positional argument.
+        monkeypatch.setattr(Database, "_bump_track_revision", staticmethod(paused_bump))
+
+        results = {}
+
+        def call_a():
+            try:
+                results["A"] = database.apply_track_metadata_edit(
+                    track.uuid_id, {"title": "TitleA"}, base_rev
+                )
+            except RevisionConflict as e:
+                results["A"] = e
+
+        def call_b():
+            b_started.set()
+            try:
+                results["B"] = database.apply_track_metadata_edit(
+                    track.uuid_id, {"title": "TitleB"}, base_rev
+                )
+            except RevisionConflict as e:
+                results["B"] = e
+
+        t_a = threading.Thread(target=call_a)
+        t_a.start()
+        assert a_paused.wait(timeout=5), "A never reached its paused write step"
+
+        t_b = threading.Thread(target=call_b)
+        t_b.start()
+        assert b_started.wait(timeout=5), "B's thread never started"
+
+        release_a.set()
+        t_a.join(timeout=5)
+        t_b.join(timeout=5)
+
+        successes = [v for v in results.values() if isinstance(v, int)]
+        conflicts = [v for v in results.values() if isinstance(v, RevisionConflict)]
+        assert len(successes) == 1
+        assert len(conflicts) == 1

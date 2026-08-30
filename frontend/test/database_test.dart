@@ -11,6 +11,7 @@ Map<String, dynamic> _trackJson({
   'uuid_id': uuid,
   'created_at': 1700000000,
   'last_updated': 1700001000,
+  'revision': 1,
   'metadata': metadata ?? _fullMetadataJson(),
 };
 
@@ -164,6 +165,7 @@ void main() {
         'uuid_id': 'round-trip-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {
           'title': 'Test Song',
           'artist': 'Test Artist',
@@ -297,6 +299,7 @@ void main() {
       'uuid_id': uuid,
       'created_at': 1700000000,
       'last_updated': 1700001000,
+      'revision': 1,
       'metadata': {
         if (title != null) 'title': title,
         if (artist != null) 'artist': artist,
@@ -713,89 +716,6 @@ void main() {
     });
   });
 
-  group('watchTrackCount', () {
-    test('emits count of all tracks when no cursor', () async {
-      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
-      await insertTrack(db, uuid: '2', artist: 'B', album: 'B', trackNumber: 1);
-
-      final count = await db.watchTrackCount().first;
-      expect(count, 2);
-    });
-
-    test('emits count of tracks at or before cursor position', () async {
-      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
-      await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
-      await insertTrack(db, uuid: '3', artist: 'B', album: 'B', trackNumber: 1);
-
-      // Cursor after track '2' — NOT(after '2') means tracks at or before '2'
-      final count = await db
-          .watchTrackCount(
-            orderBy: allTracksOrder,
-            cursorFilters: [
-              RowFilterParameter(column: 'artist', value: 'A'),
-              RowFilterParameter(column: 'album', value: 'A'),
-              RowFilterParameter(column: 'track_number', value: 2),
-              RowFilterParameter(column: 'uuid_id', value: '2'),
-            ],
-          )
-          .first;
-      expect(count, 2);
-    });
-
-    test('emits updated count when new track inserted before cursor', () async {
-      await insertTrack(db, uuid: '2', artist: 'B', album: 'B', trackNumber: 1);
-
-      final stream = db.watchTrackCount(
-        orderBy: allTracksOrder,
-        cursorFilters: [
-          RowFilterParameter(column: 'artist', value: 'B'),
-          RowFilterParameter(column: 'album', value: 'B'),
-          RowFilterParameter(column: 'track_number', value: 1),
-          RowFilterParameter(column: 'uuid_id', value: '2'),
-        ],
-      );
-
-      // First emission: 1 track (the cursor track itself)
-      expect(await stream.first, 1);
-
-      // Insert a track that sorts before the cursor
-      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
-
-      // Next emission should be 2
-      expect(await stream.first, 2);
-    });
-
-    test('returns 0 when no tracks match', () async {
-      final count = await db.watchTrackCount().first;
-      expect(count, 0);
-    });
-
-    test('respects artist/album filter', () async {
-      await insertTrack(
-        db,
-        uuid: '1',
-        artist: 'Artist A',
-        album: 'Album A',
-        trackNumber: 1,
-      );
-      await insertTrack(
-        db,
-        uuid: '2',
-        artist: 'Artist B',
-        album: 'Album B',
-        trackNumber: 1,
-      );
-
-      final count = await db
-          .watchTrackCount(
-            artistId: artistIdFor('Artist A'),
-            albumId: albumIdFor('Artist A', 'Album A'),
-          )
-          .first;
-      expect(count, 1);
-    });
-  });
-
   group('getArtists', () {
     test('returns distinct artists sorted alphabetically', () async {
       await insertTrack(db, uuid: '1', artist: 'Charlie');
@@ -925,43 +845,6 @@ void main() {
       final rows = await db.getArtists(orderBy: defaultArtistOrder);
       final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Alice', 'Bob', 'Charlie']);
-    });
-  });
-
-  group('watchArtistCount with cursor', () {
-    test('with cursor counts artists at or before cursor', () async {
-      await insertTrack(db, uuid: '1', artist: 'Alice');
-      await insertTrack(db, uuid: '2', artist: 'Bob');
-      await insertTrack(db, uuid: '3', artist: 'Charlie');
-
-      // Inverse cursor at Bob: NOT(after Bob) = Alice + Bob = 2
-      final count = await db
-          .watchArtistCount(
-            orderBy: defaultArtistOrder,
-            cursorFilters: [
-              ArtistRowFilterParameter(column: 'name', value: 'Bob'),
-            ],
-          )
-          .first;
-      expect(count, 2);
-    });
-
-    test('with cursor emits updated count on insert', () async {
-      await insertTrack(db, uuid: '2', artist: 'Bob');
-
-      final stream = db.watchArtistCount(
-        orderBy: defaultArtistOrder,
-        cursorFilters: [ArtistRowFilterParameter(column: 'name', value: 'Bob')],
-      );
-
-      // First: just Bob = 1
-      expect(await stream.first, 1);
-
-      // Insert before cursor
-      await insertTrack(db, uuid: '1', artist: 'Alice');
-
-      // Now Alice + Bob = 2
-      expect(await stream.first, 2);
     });
   });
 
@@ -1575,166 +1458,6 @@ void main() {
     });
   });
 
-  group('watchArtistCount', () {
-    test('returns count of distinct artists', () async {
-      await insertTrack(db, uuid: '1', artist: 'Artist A');
-      await insertTrack(db, uuid: '2', artist: 'Artist B');
-      await insertTrack(db, uuid: '3', artist: 'Artist C');
-
-      final count = await db.watchArtistCount().first;
-      expect(count, 3);
-    });
-
-    test('returns 0 when no artists exist', () async {
-      final count = await db.watchArtistCount().first;
-      expect(count, 0);
-    });
-
-    test('deduplicates case-insensitively', () async {
-      await insertTrack(db, uuid: '1', artist: 'Artist');
-      await insertTrack(db, uuid: '2', artist: 'artist');
-      await insertTrack(db, uuid: '3', artist: 'ARTIST');
-
-      final count = await db.watchArtistCount().first;
-      expect(count, 1);
-    });
-
-    test('counts albumArtist as artist', () async {
-      await insertTrack(
-        db,
-        uuid: '1',
-        artist: 'Feat',
-        albumArtist: 'Main Artist',
-      );
-
-      final count = await db.watchArtistCount().first;
-      // 'Main Artist' counted (via albumArtist), 'Feat' excluded (has albumArtist)
-      expect(count, 1);
-    });
-
-    test('excludes tracks with no artist', () async {
-      await insertTrack(db, uuid: '1');
-      await insertTrack(db, uuid: '2', artist: 'Real Artist');
-
-      final count = await db.watchArtistCount().first;
-      expect(count, 1);
-    });
-
-    test('emits updated count when track inserted', () async {
-      await insertTrack(db, uuid: '1', artist: 'Artist A');
-
-      final stream = db.watchArtistCount();
-      final first = await stream.first;
-      expect(first, 1);
-
-      await insertTrack(db, uuid: '2', artist: 'Artist B');
-
-      final second = await stream.first;
-      expect(second, 2);
-    });
-  });
-
-  group('watchAlbumsCount', () {
-    test(
-      'returns count of all albums and singles when artistId is null',
-      () async {
-        await insertTrack(db, uuid: '1', artist: 'Artist A', album: 'Album A');
-        await insertTrack(db, uuid: '2', artist: 'Artist B', album: 'album a');
-        await insertTrack(db, uuid: '3', artist: 'Artist C', album: 'Album B');
-
-        // 3 regular albums (same name, different artists = separate)
-        final count = await db.watchAlbumsCount().first;
-        expect(count, 3);
-      },
-    );
-
-    test('returns 0 when no tracks exist', () async {
-      final count = await db.watchAlbumsCount().first;
-      expect(count, 0);
-    });
-
-    test('respects artist filter with albumArtist precedence', () async {
-      await insertTrack(db, uuid: '1', artist: 'Main', album: 'Main Album');
-      await insertTrack(
-        db,
-        uuid: '2',
-        artist: 'Feat',
-        albumArtist: 'Main',
-        album: 'Collab Album',
-      );
-      await insertTrack(
-        db,
-        uuid: '3',
-        artist: 'Main',
-        albumArtist: 'Other',
-        album: 'Excluded Album',
-      );
-
-      final count = await db
-          .watchAlbumsCount(artistId: artistIdFor('Main'))
-          .first;
-      expect(count, 2);
-    });
-
-    test('counts single groupings for tracks without album', () async {
-      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Real Album');
-      await insertTrack(db, uuid: '2', artist: 'Artist'); // single grouping
-
-      final count = await db.watchAlbumsCount().first;
-      // 1 regular + 1 single grouping
-      expect(count, 2);
-    });
-
-    test('same album different artists counts separately', () async {
-      await insertTrack(
-        db,
-        uuid: '1',
-        artist: 'Artist A',
-        album: 'Greatest Hits',
-      );
-      await insertTrack(
-        db,
-        uuid: '2',
-        artist: 'Artist B',
-        album: 'Greatest Hits',
-      );
-
-      final count = await db.watchAlbumsCount().first;
-      expect(count, 2);
-    });
-
-    test('emits updated count when new album inserted', () async {
-      await insertTrack(db, uuid: '1', artist: 'Artist', album: 'Album A');
-
-      final stream = db.watchAlbumsCount();
-      expect(await stream.first, 1);
-
-      await insertTrack(db, uuid: '2', artist: 'Artist', album: 'Album B');
-
-      expect(await stream.first, 2);
-    });
-
-    test('inverse cursor counts rows at or before cursor', () async {
-      await insertTrack(db, uuid: '1', artist: 'A', album: 'Alpha', year: 2020);
-      await insertTrack(db, uuid: '2', artist: 'A', album: 'Beta', year: 2021);
-      await insertTrack(db, uuid: '3', artist: 'A', album: 'Gamma', year: 2022);
-
-      final count = await db
-          .watchAlbumsCount(
-            orderBy: defaultAlbumOrder,
-            cursorFilters: [
-              AlbumRowFilterParameter(column: 'name', value: 'Beta'),
-              AlbumRowFilterParameter(column: 'artist', value: 'A'),
-              AlbumRowFilterParameter(column: 'year', value: 2021),
-              AlbumRowFilterParameter(column: 'is_single_grouping', value: 0),
-            ],
-          )
-          .first;
-      // Alpha and Beta are at or before cursor
-      expect(count, 2);
-    });
-  });
-
   group('getSearchResults', () {
     test('returns matching tracks by title', () async {
       await insertTrack(
@@ -1883,6 +1606,7 @@ void main() {
         'uuid_id': 'cover-art-test-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {..._fullMetadataJson(), 'cover_art_id': 7},
       });
 
@@ -1901,6 +1625,7 @@ void main() {
         'uuid_id': 'no-cover-art-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': _minimalMetadataJson(),
       });
 
@@ -1926,6 +1651,7 @@ void main() {
         'uuid_id': 'cover-select-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': {
           ..._fullMetadataJson(),
           'artist_id': artistId,
@@ -1949,6 +1675,7 @@ void main() {
         'uuid_id': 'cover-select-null-1',
         'created_at': 1700000000,
         'last_updated': 1700001000,
+        'revision': 1,
         'metadata': _minimalMetadataJson(),
       });
 
@@ -2043,73 +1770,208 @@ void main() {
     );
   });
 
-  group('schema migration', () {
-    // A fresh in-memory DB at the latest schema does not exercise the
-    // onUpgrade ALTER TABLE statements at all — a missing step (e.g. forgot
-    // to add `downloaded_quality` in v5) silently passes such a test but
-    // breaks every upgrading user. This test simulates the v3 starting
-    // state, runs each upgrade ALTER, and asserts the resulting columns are
-    // queryable through the same row-shape the app uses.
-    test(
-      'v3 → current upgrade adds all post-v3 columns and preserves data',
-      () async {
-        // Drop the modern `tracks` table and rebuild it as it was at v3
-        // (only `downloaded_bitrate_kbps`; no file_size_bytes or
-        // downloaded_quality).
-        await db.customStatement('PRAGMA foreign_keys = OFF');
-        await db.customStatement('DROP TABLE tracks');
-        await db.customStatement(
-          'CREATE TABLE tracks ('
-          'uuid_id TEXT NOT NULL PRIMARY KEY, '
-          'file_path TEXT, '
-          'created_at INTEGER NOT NULL, '
-          'last_updated INTEGER NOT NULL, '
-          'downloaded_bitrate_kbps INTEGER'
-          ')',
-        );
-        await db.customStatement(
-          "INSERT INTO tracks (uuid_id, file_path, created_at, "
-          "last_updated, downloaded_bitrate_kbps) "
-          "VALUES ('uuid-1', '/tmp/foo.audio', 1700000000, 1700000000, 256)",
-        );
+  group('schema', () {
+    // Schema history was reset during beta: the current definitions are v1 and
+    // onCreate is the only creation path. This sanity check pins the reset —
+    // user_version lands at 1 and the newest columns exist from day one. When
+    // the first real migration is added, follow the ground rules documented on
+    // AppDatabase.migration (test it by opening a REAL previous-version file).
+    test('fresh database is created at version 1 with the full current shape',
+        () async {
+      final version = await db
+          .customSelect('PRAGMA user_version')
+          .getSingle();
+      expect(version.read<int>('user_version'), 1);
 
-        // Apply the v4 and v5 upgrades exactly as the MigrationStrategy
-        // would. Keep this list in sync with AppDatabase.migration.
-        await db.customStatement(
-          'ALTER TABLE tracks ADD COLUMN file_size_bytes INTEGER',
-        );
-        await db.customStatement(
-          'ALTER TABLE tracks ADD COLUMN downloaded_quality TEXT',
-        );
-
-        // Pre-migration row must still be intact and the new columns must
-        // exist and be readable.
-        final rows = await db
+      for (final col in ['original_values_json', 'rejection_reason']) {
+        final hit = await db
             .customSelect(
-              'SELECT uuid_id, file_path, downloaded_bitrate_kbps, '
-              'file_size_bytes, downloaded_quality FROM tracks',
+              "SELECT name FROM pragma_table_info('pending_edits') "
+              'WHERE name = ?',
+              variables: [Variable.withString(col)],
             )
             .get();
-        expect(rows, hasLength(1));
-        expect(rows.first.read<String>('uuid_id'), 'uuid-1');
-        expect(rows.first.read<String?>('file_path'), '/tmp/foo.audio');
-        expect(rows.first.read<int?>('downloaded_bitrate_kbps'), 256);
-        expect(rows.first.read<int?>('file_size_bytes'), isNull);
-        expect(rows.first.read<String?>('downloaded_quality'), isNull);
+        expect(hit, hasLength(1), reason: 'pending_edits is missing $col');
+      }
+      final revision = await db
+          .customSelect(
+            "SELECT name FROM pragma_table_info('tracks') "
+            "WHERE name = 'revision'",
+          )
+          .get();
+      expect(revision, hasLength(1));
+    });
+  });
 
-        // The new columns must also be writable.
-        await db.customStatement(
-          "UPDATE tracks SET file_size_bytes = 1024, "
-          "downloaded_quality = '320' WHERE uuid_id = 'uuid-1'",
-        );
-        final updated = await db
-            .customSelect(
-              'SELECT file_size_bytes, downloaded_quality FROM tracks',
-            )
-            .getSingle();
-        expect(updated.read<int>('file_size_bytes'), 1024);
-        expect(updated.read<String>('downloaded_quality'), '320');
-      },
-    );
+  group('watchPendingEditCounts', () {
+    test('take_server resolution markers are not counted as pending edits',
+        () async {
+      // One row per status. `take_server` is a resolution marker in the
+      // retry pipeline (the user already discarded that edit), not an
+      // outstanding edit — it must not surface in any banner bucket.
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_only', 5, 'pending', 0), "
+        "('u2', '{\"title\":\"b\"}', 'db_only', 5, 'conflicted', 0), "
+        "('u3', '{\"title\":\"c\"}', 'db_only', 5, 'rejected', 0), "
+        "('u4', '{\"title\":\"d\"}', 'db_only', 5, 'take_server', 0)",
+      );
+
+      final counts = await db.watchPendingEditCounts().first;
+      expect(counts.conflicted, 1);
+      expect(counts.rejected, 1);
+      expect(counts.pending, 1,
+          reason: "a 'take_server' marker was counted as a pending edit — "
+              'the banner would show a phantom row with no Review affordance');
+    });
+  });
+
+  group('pendingWriteMode', () {
+    test('take_server and rejected rows do not leak their write mode',
+        () async {
+      // A take_server marker's write_mode is a leftover from the batch it's
+      // discarding; a rejected row's edit was already reverted. Neither
+      // should inform what a NEW edit's write-to-file toggle defaults to.
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_and_master', 5, 'take_server', 0)",
+      );
+      expect(await db.pendingWriteMode('u1'), isNull);
+
+      await db.customStatement("DELETE FROM pending_edits WHERE uuid_id='u1'");
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_and_master', 5, 'rejected', 0)",
+      );
+      expect(await db.pendingWriteMode('u1'), isNull);
+
+      await db.customStatement("DELETE FROM pending_edits WHERE uuid_id='u1'");
+      await db.customStatement(
+        'INSERT INTO pending_edits '
+        '(uuid_id, values_json, write_mode, base_revision, status, updated_at) '
+        "VALUES "
+        "('u1', '{\"title\":\"a\"}', 'db_and_master', 5, 'pending', 0)",
+      );
+      expect(await db.pendingWriteMode('u1'), 'db_and_master');
+    });
+  });
+
+  group('reactive browse', () {
+    Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
+
+    test('watchTracks re-emits an optimistic edit without a refresh', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated) VALUES ('u1',0,0)",
+      );
+      await db.customStatement(
+        'INSERT INTO trackmetadata (uuid_id, title, artist, album, duration, '
+        'bitrate_kbps, sample_rate_hz, channels, has_album_art) '
+        "VALUES ('u1','Old','A','Alb',1,1,1,2,0)",
+      );
+      final rowid = (await db
+              .customSelect("SELECT rowid AS r FROM trackmetadata WHERE uuid_id='u1'")
+              .getSingle())
+          .read<int>('r');
+      await db.customStatement(
+        "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+        "VALUES (?, 'Old', 'A', 'Alb')",
+        [rowid],
+      );
+
+      final titles = <String?>[];
+      final sub = db.watchTracks(limit: 50).listen(
+        (rows) =>
+            titles.add(rows.isEmpty ? null : rows.first.read<String?>('title')),
+      );
+      addTearDown(sub.cancel);
+      await settle();
+      expect(titles.last, 'Old');
+
+      // The real optimistic-write path (customUpdate) must notify watchers.
+      await db.applyOptimisticTrackEdit('u1', {'title': 'New'});
+      await settle();
+      expect(titles.last, 'New');
+    });
+
+    test('watchArtists re-emits when an artist row is removed', () async {
+      await db.customStatement(
+        "INSERT INTO artists (id, name) VALUES (1,'A'),(2,'B')",
+      );
+      final counts = <int>[];
+      final sub =
+          db.watchArtists(limit: 50).listen((rows) => counts.add(rows.length));
+      addTearDown(sub.cancel);
+      await settle();
+      expect(counts.last, 2);
+
+      // A typed delete (as the orphan sweep's sibling writes do) notifies the
+      // artists stream so the removed card disappears with no manual refresh.
+      await (db.delete(db.artists)..where((a) => a.id.equals(2))).go();
+      await settle();
+      expect(counts.last, 1);
+    });
+  });
+
+  group('metadata autocomplete', () {
+    Future<void> seed() async {
+      await db.customStatement(
+        "INSERT INTO artists (id, name) VALUES "
+        "(1, 'Radiohead'), (2, 'radio star'), (3, 'Beatles')",
+      );
+      await db.customStatement(
+        "INSERT INTO albums (id, name, artist_id, is_single_grouping) VALUES "
+        "(1, 'OK Computer', 1, 0), (2, 'Okay', 1, 0), (3, 'Abbey Road', 3, 0)",
+      );
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated) VALUES "
+        "('u1', 0, 0), ('u2', 0, 0), ('u3', 0, 0)",
+      );
+      await db.customStatement(
+        "INSERT INTO trackmetadata "
+        "(uuid_id, genre, duration, bitrate_kbps, sample_rate_hz, channels, "
+        "has_album_art) VALUES "
+        "('u1', 'Rock', 1, 1, 1, 2, 0), "
+        "('u2', 'rock and roll', 1, 1, 1, 2, 0), "
+        "('u3', 'Jazz', 1, 1, 1, 2, 0)",
+      );
+    }
+
+    test('artistSuggestions is a case-insensitive prefix match', () async {
+      await seed();
+      expect(await db.artistSuggestions('rad'), ['Radiohead', 'radio star']);
+      expect(await db.artistSuggestions('BEAT'), ['Beatles']);
+      expect(await db.artistSuggestions('zzz'), isEmpty);
+    });
+
+    test('empty prefix yields no suggestions', () async {
+      await seed();
+      expect(await db.artistSuggestions('   '), isEmpty);
+    });
+
+    test('albumSuggestions matches album names', () async {
+      await seed();
+      expect(await db.albumSuggestions('ok'), ['OK Computer', 'Okay']);
+    });
+
+    test('genreSuggestions is distinct, case-insensitive, limited', () async {
+      await seed();
+      expect(await db.genreSuggestions('ro'), ['Rock', 'rock and roll']);
+      expect(await db.genreSuggestions('ja'), ['Jazz']);
+      expect(await db.artistSuggestions('rad', limit: 1), hasLength(1));
+    });
+
+    test('a typed % is a literal, not a wildcard', () async {
+      await db.customStatement(
+        "INSERT INTO artists (id, name) VALUES (1, '100% Pure')",
+      );
+      expect(await db.artistSuggestions('100%'), ['100% Pure']);
+      expect(await db.artistSuggestions('200'), isEmpty);
+    });
   });
 }

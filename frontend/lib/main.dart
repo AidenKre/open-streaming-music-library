@@ -12,6 +12,8 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/recovery/recoverable.dart';
+import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
@@ -20,6 +22,7 @@ import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/widgets/offline_banner.dart';
+import 'package:frontend/ui/widgets/pending_edits_banner.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -109,10 +112,13 @@ class _FrontendState extends ConsumerState<Frontend>
     _offlineListener = ref.read(offlineModeProvider.notifier).enterOffline;
     ApiClient.addNetworkFailureListener(_offlineListener);
     WidgetsBinding.instance.addObserver(this);
-    // Fire-and-forget: clears stale `tracks.file_path` rows whose underlying
-    // files were removed outside the app. UI consumers refresh through
-    // `downloadStatusVersionProvider` when something actually changes.
-    unawaited(ref.read(downloadReconciliationServiceProvider).reconcile());
+    // Cold-start recovery. On this edge that means reconciling stale
+    // `tracks.file_path` rows whose underlying files were removed outside the
+    // app; UI consumers refresh through `downloadStatusVersionProvider` when
+    // something actually changes. Fire-and-forget — recovery never throws.
+    unawaited(
+      ref.read(recoveryServiceProvider).runFor(RecoveryTrigger.coldStart),
+    );
   }
 
   @override
@@ -125,7 +131,9 @@ class _FrontendState extends ConsumerState<Frontend>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      unawaited(ref.read(downloadReconciliationServiceProvider).reconcile());
+      unawaited(
+        ref.read(recoveryServiceProvider).runFor(RecoveryTrigger.appResume),
+      );
     }
   }
 
@@ -133,13 +141,21 @@ class _FrontendState extends ConsumerState<Frontend>
   Widget build(BuildContext context) {
     // Recovery side effects live here, not inside the offline notifier, so the
     // notifier stays focused on local-only state. When the app leaves offline
-    // mode, kick the work that was paused while we were dark.
+    // mode, kick the work that was paused while we were dark (sync, then resume
+    // downloads) through the recovery registry.
+    //
+    // This `true → false` transition is the *only* firing of
+    // `networkRecovered`, which is what keeps the reset carve-out working: a
+    // local reset cancels health polling via `cancelOfflinePolling()` WITHOUT
+    // flipping the flag, so this listener never runs mid-wipe. See
+    // `_OfflineExitResettable` in `local_reset_service.dart`.
     ref.listen<bool>(offlineModeProvider, (prev, next) {
       if (prev == true && next == false) {
-        unawaited(() async {
-          await ref.read(trackSyncProvider.notifier).sync();
-          ref.read(downloadManagerProvider).resumeIfPaused();
-        }());
+        unawaited(
+          ref
+              .read(recoveryServiceProvider)
+              .runFor(RecoveryTrigger.networkRecovered),
+        );
       }
     });
     return MaterialApp(
@@ -214,6 +230,7 @@ class _AppShellState extends ConsumerState<AppShell> {
                 ],
               ),
             ),
+            const PendingEditsBanner(),
             if (isOffline) const OfflineBanner(),
             const MiniPlayer(),
           ],

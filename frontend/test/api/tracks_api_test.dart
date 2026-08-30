@@ -18,6 +18,7 @@ Map<String, dynamic> _trackJson(String uuid) => {
   'uuid_id': uuid,
   'created_at': 1000,
   'last_updated': 2000,
+  'revision': 1,
   'metadata': _minimalMetadataJson(),
 };
 

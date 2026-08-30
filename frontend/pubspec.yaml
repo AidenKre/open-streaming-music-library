@@ -21,6 +21,7 @@ dependencies:
   shared_preferences: ^2.5.4
   flutter_riverpod: ^3.2.1
   flutter_cache_manager: ^3.4.1
+  unorm_dart: ^0.3.0
 
 flutter:
   uses-material-design: true

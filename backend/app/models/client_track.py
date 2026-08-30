@@ -9,6 +9,10 @@ class ClientTrack(BaseModel):
     metadata: TrackMetaData
     created_at: int
     last_updated: int
+    # Monotonic per-track revision — the conflict-detection base for edits
+    # (Option A). Always a concrete int; the hydrated Track carries it, so it
+    # lights up wherever ClientTrack is built.
+    revision: int
 
     @classmethod
     def from_track(cls, track: Track) -> ClientTrack:
@@ -17,4 +21,5 @@ class ClientTrack(BaseModel):
             metadata=track.metadata,
             created_at=track.created_at,
             last_updated=track.last_updated,
+            revision=track.revision,
         )

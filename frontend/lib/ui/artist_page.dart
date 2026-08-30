@@ -51,30 +51,13 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   }
 
   @override
-  Future<List<ArtistUI>> loadPage({required bool useCursor}) {
+  Stream<List<ArtistUI>> watchPage({required int limit}) {
     final repo = ref.read(browseRepositoryProvider);
-    final downloadedOnly = ref.read(offlineModeProvider);
-    return repo.getArtists(
+    return repo.watchArtists(
       orderBy: _orderParams,
-      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
-      limit: pageSize,
-      downloadedOnly: downloadedOnly,
+      limit: limit,
+      downloadedOnly: ref.read(offlineModeProvider),
     );
-  }
-
-  @override
-  Stream<int> watchItemCount({required bool useCursor}) {
-    final repo = ref.read(browseRepositoryProvider);
-    final downloadedOnly = ref.read(offlineModeProvider);
-    return repo.watchArtistCount(
-      orderBy: useCursor ? _orderParams : [],
-      cursorFilters: useCursor ? _buildCursorFromLast(paginatedItems.last) : [],
-      downloadedOnly: downloadedOnly,
-    );
-  }
-
-  List<ArtistRowFilterParameter> _buildCursorFromLast(ArtistUI last) {
-    return [ArtistRowFilterParameter(column: 'name', value: last.name)];
   }
 
   void _onArtistTap(ArtistUI artist) {
@@ -95,17 +78,10 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     ref.listen<bool>(offlineModeProvider, (prev, next) {
       if (prev != next) refresh();
     });
-    // While offline, the downloaded-only filter is part of the query; a
-    // delete that removes the last downloaded item in the visible set must
-    // re-fetch from page 1 — without this the stale card stays on screen.
-    ref.listen(downloadStatusVersionProvider, (_, _) {
-      if (ref.read(offlineModeProvider)) refresh();
-    });
     final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
         if (isOffline) const DownloadedOnlyBadge(),
-        buildNewItemsBanner('artists'),
         Expanded(
           child: GridView.builder(
             controller: scrollController,

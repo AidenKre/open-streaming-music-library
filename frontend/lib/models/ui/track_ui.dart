@@ -6,6 +6,9 @@ class TrackUI {
   final String? filePath;
   final int createdAt;
   final int lastUpdated;
+  // Monotonic server revision (Option A conflict base). Null = "unknown base"
+  // (a row that predates the column) → an edit forces the conflict path.
+  final int? revision;
   final String? title;
   final String? artist;
   final String? album;
@@ -43,6 +46,7 @@ class TrackUI {
     this.filePath,
     required this.createdAt,
     required this.lastUpdated,
+    this.revision,
     this.title,
     this.artist,
     this.album,
@@ -79,6 +83,7 @@ class TrackUI {
       filePath: filePath == _sentinel ? this.filePath : filePath as String?,
       createdAt: createdAt,
       lastUpdated: lastUpdated,
+      revision: revision,
       title: title,
       artist: artist,
       album: album,
@@ -128,6 +133,7 @@ class TrackUI {
       filePath: row.readNullable<String>('file_path'),
       createdAt: row.read<int>('created_at'),
       lastUpdated: row.read<int>('last_updated'),
+      revision: row.readNullable<int>('revision'),
       title: row.readNullable<String>('title'),
       artist: row.readNullable<String>('artist'),
       album: row.readNullable<String>('album'),
@@ -158,6 +164,7 @@ class TrackUI {
       filePath: track.filePath,
       createdAt: track.createdAt,
       lastUpdated: track.lastUpdated,
+      revision: track.revision,
       title: meta.title,
       artist: meta.artist,
       album: meta.album,

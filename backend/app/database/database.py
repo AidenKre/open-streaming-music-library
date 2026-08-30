@@ -1,4 +1,6 @@
+import re
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Flag, auto
@@ -8,6 +10,7 @@ from typing import List, Literal, Optional
 from app.models.album import Album
 from app.models.artist import Artist
 from app.models.cover_art import CoverArt
+from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -32,6 +35,13 @@ ALLOWED_METADATA_COLUMNS = [
     "cover_art_id",
 ]
 
+# Track tag fields a user may edit via Get Info / PATCH — derived from the
+# single field-spec table (see app/models/edit_fields.py). Deliberately NOT
+# ``ALLOWED_METADATA_COLUMNS`` — that list includes audio-derived columns
+# (codec/duration/bitrate_kbps/sample_rate_hz/channels/has_album_art/
+# cover_art_id) which must never be hand-edited.
+EDITABLE_METADATA_COLUMNS = [spec.key for spec in EDIT_FIELD_SPECS]
+
 ALLOWED_TRACK_COLUMNS = ["uuid_id", "created_at", "last_updated"]
 
 ALLOWED_ALBUM_COLUMNS = ["id", "name", "artist", "artist_id", "year", "is_single_grouping"]
@@ -42,6 +52,76 @@ ALLOWED_ARTIST_COLUMNS = ["id", "name"]
 ARTIST_TEXT_COLUMNS = {"name"}
 
 ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
+
+
+class TrackNotFound(Exception):
+    """Raised when a metadata edit targets a uuid that no longer exists."""
+
+
+class EmptyTrackEdit(Exception):
+    """Raised when an edit would blank a track's whole identity (title, artist,
+    and album all empty). Distinct from ``add_track``'s ``is_empty`` audio-field
+    check — this guards the human-meaningful fields."""
+
+
+class RevisionConflict(Exception):
+    """Raised when an edit's ``base_revision`` no longer matches the stored
+    revision — the row moved on under the editor (Option A 409)."""
+
+    def __init__(self, uuid_id: str, base_revision: Optional[int], current_revision: int):
+        self.uuid_id = uuid_id
+        self.base_revision = base_revision
+        self.current_revision = current_revision
+        super().__init__(
+            f"revision conflict on {uuid_id}: base={base_revision} "
+            f"current={current_revision}"
+        )
+
+
+# Leading 4-digit year prefix of a `date` string (e.g. "2019-05-01" -> "2019").
+_YEAR_PREFIX = re.compile(r"^\s*(\d{4})")
+
+
+def normalize_edit_fields(fields: dict) -> dict:
+    """Canonicalize a validated edit-field dict before it is applied or used to
+    derive file/tag/path state. Idempotent; returns a new dict; an untouched
+    field stays untouched.
+
+    - NFC-normalizes every string value: the identity upsert is keyed on
+      ``LOWER(name)`` (which doesn't fold Unicode composition), and the on-disk
+      layout must be derived from the same bytes the DB stores.
+    - Keeps ``year``/``date`` consistent, with ``date`` canonical: editing
+      ``date`` re-derives ``year`` from its leading 4 digits (unparseable /
+      cleared -> ``year`` cleared); editing only ``year`` sets ``date`` to the
+      bare year.
+
+    Lives in the spine so every caller of ``apply_track_metadata_edit`` (PATCH
+    today; conversion and bulk edit later) gets the invariants without knowing
+    about them."""
+    out = {
+        k: unicodedata.normalize("NFC", v) if isinstance(v, str) else v
+        for k, v in fields.items()
+    }
+    if "date" in out:
+        d = out["date"]
+        m = _YEAR_PREFIX.match(d) if isinstance(d, str) else None
+        out["year"] = int(m.group(1)) if m else None
+    elif "year" in out:
+        y = out["year"]
+        out["date"] = str(y) if y is not None else None
+    return out
+
+
+def effective_artist(album_artist: Optional[str], artist: Optional[str]) -> Optional[str]:
+    """The artist that owns a track's library identity: album_artist wins, then
+    artist, else None. Shared by ``add_track``, the metadata-edit spine, and the
+    organizer's ``create_destination_dir`` so DB identity and on-disk layout are
+    computed one way everywhere and can't diverge."""
+    if album_artist and album_artist.strip():
+        return album_artist.strip()
+    if artist and artist.strip():
+        return artist.strip()
+    return None
 
 
 class SearchEntityType(Flag):
@@ -210,12 +290,22 @@ class Database:
         self.context = context
 
     @contextmanager
-    def _connection(self, *, commit: bool = False, timeout: float = 5):
+    def _connection(self, *, commit: bool = False, timeout: float = 5, immediate: bool = False):
         conn = sqlite3.connect(self.context.database_path, timeout=timeout)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = sqlite3.Row
+            if immediate:
+                # Acquire SQLite's write lock up front, before the caller reads
+                # anything: a plain SELECT (the default, non-immediate mode)
+                # holds no lock, so a check-then-write sequence built on it is
+                # not atomic across connections -- a second connection's own
+                # check can pass against the same stale value before the first
+                # connection's write lands. immediate=True closes that gap by
+                # making a concurrent caller's own BEGIN IMMEDIATE block until
+                # this transaction commits or rolls back.
+                conn.execute("BEGIN IMMEDIATE")
             yield conn
             if commit:
                 conn.commit()
@@ -232,7 +322,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 5
+    LATEST_SCHEMA_VERSION = 6
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -408,6 +498,21 @@ class Database:
                 )
                 conn.execute("PRAGMA user_version = 5")
 
+            if version < 6:
+                print("Migrating database to version 6: adding edit_journal table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS edit_journal ('
+                    '    "id"         INTEGER PRIMARY KEY,'
+                    '    "intent"     TEXT NOT NULL,'
+                    '    "uuid_id"    TEXT NOT NULL,'
+                    '    "old_path"   TEXT,'
+                    '    "new_path"   TEXT,'
+                    '    "temp_path"  TEXT,'
+                    '    "created_at" INTEGER NOT NULL'
+                    ')'
+                )
+                conn.execute("PRAGMA user_version = 6")
+
     @staticmethod
     def _next_revision(conn) -> int:
         """Allocate the next monotonic revision on ``conn``'s open transaction.
@@ -422,12 +527,16 @@ class Database:
         ).fetchone()[0]
 
     @staticmethod
-    def _bump_track_revision(conn, uuid_id: str) -> None:
+    def _bump_track_revision(conn, uuid_id: str) -> int:
+        """Bump the track to the next monotonic revision; returns the value
+        written so callers don't need a redundant read-back."""
+        revision = Database._next_revision(conn)
         conn.execute(
             "UPDATE tracks SET revision = ?, last_updated = unixepoch() "
             "WHERE uuid_id = ?",
-            (Database._next_revision(conn), uuid_id),
+            (revision, uuid_id),
         )
+        return revision
 
     def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
         try:
@@ -578,25 +687,23 @@ class Database:
                 metadata = track.metadata
 
                 # Determine effective artist: album_artist takes priority
-                effective_artist = None
-                if metadata.album_artist and metadata.album_artist.strip():
-                    effective_artist = metadata.album_artist.strip()
-                elif metadata.artist and metadata.artist.strip():
-                    effective_artist = metadata.artist.strip()
+                effective = effective_artist(
+                    metadata.album_artist, metadata.artist
+                )
 
                 artist_id = None
-                if effective_artist:
-                    artist_id = self._upsert_artist(conn, effective_artist)
+                if effective:
+                    artist_id = self._upsert_artist(conn, effective)
 
                 # Determine album type
                 album_name = metadata.album
                 has_album = album_name is not None and album_name.strip() != ""
                 album_id = None
 
-                if artist_id is not None and effective_artist is not None:
+                if artist_id is not None and effective is not None:
                     album_id = self._upsert_album(
                         conn, album_name if has_album else None,
-                        artist_id, metadata.year, effective_artist,
+                        artist_id, metadata.year, effective,
                     )
 
                 # Clear any stale tombstone so a re-added uuid is not also
@@ -659,7 +766,7 @@ class Database:
 
                 # Insert into FTS for tracks
                 fts_title = metadata.title or ""
-                fts_artist = effective_artist or ""
+                fts_artist = effective or ""
                 fts_album = album_name if has_album else ""
                 conn.execute(
                     "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) VALUES (?, ?, ?, ?)",
@@ -742,6 +849,275 @@ class Database:
 
         return album_id
 
+    @staticmethod
+    def _orphan_gc_album(conn, album_id: Optional[int]) -> None:
+        """Delete ``album_id`` and its FTS row iff no trackmetadata references
+        it. The FTS ``'delete'`` values are derived from the album's own
+        artist join, so they always match what ``_upsert_album`` inserted."""
+        if album_id is None:
+            return
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM trackmetadata WHERE album_id = ?", (album_id,)
+        ).fetchone()[0]
+        if remaining != 0:
+            return
+        row = conn.execute(
+            "SELECT a.name AS album_name, ar.name AS artist_name "
+            "FROM albums a JOIN artists ar ON ar.id = a.artist_id "
+            "WHERE a.id = ?",
+            (album_id,),
+        ).fetchone()
+        album_name = (row["album_name"] or "") if row else ""
+        artist_name = (row["artist_name"] or "") if row else ""
+        conn.execute(
+            "INSERT INTO fts_albums(fts_albums, rowid, name, artist_name) "
+            "VALUES('delete', ?, ?, ?)",
+            (album_id, album_name, artist_name),
+        )
+        conn.execute("DELETE FROM albums WHERE id = ?", (album_id,))
+
+    @staticmethod
+    def _orphan_gc_artist(conn, artist_id: Optional[int]) -> None:
+        """Delete ``artist_id`` and its FTS row iff no trackmetadata references
+        it. Call after ``_orphan_gc_album`` — an album row references an artist."""
+        if artist_id is None:
+            return
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM trackmetadata WHERE artist_id = ?", (artist_id,)
+        ).fetchone()[0]
+        if remaining != 0:
+            return
+        row = conn.execute(
+            "SELECT name FROM artists WHERE id = ?", (artist_id,)
+        ).fetchone()
+        artist_name = (row["name"] or "") if row else ""
+        conn.execute(
+            "INSERT INTO fts_artists(fts_artists, rowid, name) VALUES('delete', ?, ?)",
+            (artist_id, artist_name),
+        )
+        conn.execute("DELETE FROM artists WHERE id = ?", (artist_id,))
+
+    @staticmethod
+    def _recompute_named_album_year(conn, album_id: Optional[int]) -> None:
+        """Reset a *named* album's year to MAX over its remaining members.
+        ``_upsert_album`` only ever raises an album's year, so a downward edit
+        (a member lowering/clearing its year, or leaving the album) needs this.
+        Single-grouping albums carry year as identity and are reconciled by the
+        normal upsert path, so they are excluded."""
+        if album_id is None:
+            return
+        conn.execute(
+            'UPDATE albums SET "year" = '
+            '(SELECT MAX("year") FROM trackmetadata WHERE album_id = ?) '
+            "WHERE id = ? AND is_single_grouping = 0",
+            (album_id, album_id),
+        )
+
+    def _update_track_metadata(
+        self, conn, uuid_id: str, fields: dict, new_file_path: Optional[str] = None
+    ) -> int:
+        """Pure-DB metadata edit — no file I/O. ``fields`` is the validated,
+        present subset of ``EDITABLE_METADATA_COLUMNS`` (an explicit ``None``
+        means "clear"). Reassigns artist/album identity, reconciles orphaned
+        parents + FTS, and bumps the track revision. When ``new_file_path`` is
+        given (a master relocation already moved the file), the ``tracks.file_path``
+        is updated to match — still pure-DB. Reused by the PATCH orchestration
+        and (future) bulk edit, all inside one caller txn."""
+        cur = conn.execute(
+            "SELECT track_id, artist_id, album_id, title, artist, album, "
+            'album_artist, "year", "date", genre, track_number, disc_number '
+            "FROM trackmetadata WHERE uuid_id = ?",
+            (uuid_id,),
+        ).fetchone()
+        if cur is None:
+            raise TrackNotFound(uuid_id)
+
+        track_db_id = cur["track_id"]
+        old_artist_id = cur["artist_id"]
+        old_album_id = cur["album_id"]
+
+        # Merge present edits over current values, then NFC-normalize the
+        # identity strings before they reach the LOWER()-keyed upsert
+        # (otherwise canonically-equivalent spellings won't dedup).
+        def pick(col):
+            return fields[col] if col in fields else cur[col]
+
+        new = {col: pick(col) for col in EDITABLE_METADATA_COLUMNS}
+        for col in ("artist", "album", "album_artist"):
+            if isinstance(new[col], str):
+                new[col] = unicodedata.normalize("NFC", new[col])
+
+        # Don't let an edit blank the whole track — checked on the *merged*
+        # post-edit state so a partial clear (e.g. just the title) is fine as
+        # long as some identity survives. album_artist counts: effective_artist
+        # prefers it over artist, so a compilation track whose album_artist
+        # remains keeps full library identity.
+        def _blank(v):
+            return v is None or (isinstance(v, str) and not v.strip())
+
+        if (
+            _blank(new["title"])
+            and _blank(new["artist"])
+            and _blank(new["album"])
+            and _blank(new["album_artist"])
+        ):
+            raise EmptyTrackEdit(uuid_id)
+
+        effective = effective_artist(new["album_artist"], new["artist"])
+        new_artist_id = None
+        new_album_id = None
+        if effective is not None:
+            new_artist_id = self._upsert_artist(conn, effective)
+            has_album = bool(new["album"] and new["album"].strip())
+            new_album_id = self._upsert_album(
+                conn,
+                new["album"] if has_album else None,
+                new_artist_id,
+                new["year"],
+                effective,
+            )
+        # effective is None ⇒ artist cleared; both ids stay None (an album row
+        # requires a non-null artist).
+
+        conn.execute(
+            "UPDATE trackmetadata SET title = ?, artist = ?, album = ?, "
+            'album_artist = ?, "year" = ?, "date" = ?, genre = ?, '
+            "track_number = ?, disc_number = ?, artist_id = ?, album_id = ? "
+            "WHERE uuid_id = ?",
+            (
+                new["title"], new["artist"], new["album"], new["album_artist"],
+                new["year"], new["date"], new["genre"], new["track_number"],
+                new["disc_number"], new_artist_id, new_album_id, uuid_id,
+            ),
+        )
+
+        # Reconcile parents with the row already reassigned: GC the old ones if
+        # now empty, then recompute year for any surviving named album whose
+        # membership changed.
+        if old_album_id != new_album_id:
+            self._orphan_gc_album(conn, old_album_id)
+        if old_artist_id != new_artist_id:
+            self._orphan_gc_artist(conn, old_artist_id)
+        # Only recompute the old album's year when this edit could actually
+        # move it: membership changed, or year/date was itself touched.
+        if old_album_id is not None and (
+            old_album_id != new_album_id
+            or not fields.keys().isdisjoint(("year", "date"))
+        ):
+            self._recompute_named_album_year(conn, old_album_id)
+        if new_album_id != old_album_id:
+            self._recompute_named_album_year(conn, new_album_id)
+
+        # Rewrite this track's own FTS row: delete old terms, insert new ones.
+        old_effective = effective_artist(cur["album_artist"], cur["artist"])
+        conn.execute(
+            "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
+            "VALUES('delete', ?, ?, ?, ?)",
+            (track_db_id, cur["title"] or "", old_effective or "", cur["album"] or ""),
+        )
+        new_fts_album = new["album"] if (new["album"] and new["album"].strip()) else ""
+        conn.execute(
+            "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
+            "VALUES (?, ?, ?, ?)",
+            (track_db_id, new["title"] or "", effective or "", new_fts_album),
+        )
+
+        if new_file_path is not None:
+            conn.execute(
+                "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
+                (new_file_path, uuid_id),
+            )
+
+        return self._bump_track_revision(conn, uuid_id)
+
+    def apply_track_metadata_edit(
+        self,
+        uuid_id: str,
+        fields: dict,
+        base_revision: Optional[int],
+        new_file_path: Optional[str] = None,
+        timeout: float = 5,
+    ) -> int:
+        """DB orchestration for a track metadata edit. Opens one write txn
+        with ``BEGIN IMMEDIATE`` (so the revision check below actually holds
+        SQLite's write lock -- a plain read holds none, so without this a
+        second concurrent call could pass the same check against the same
+        stale revision before either has written), enforces the Option-A 409
+        (``base_revision`` vs the stored revision) *before* the bump, runs the
+        pure-DB spine, and commits. ``new_file_path`` (set by the
+        master-relocation path after it has moved the file) is written to
+        ``tracks.file_path`` in the same txn. Returns the new revision. Raises
+        ``TrackNotFound`` / ``RevisionConflict``; lets
+        ``sqlite3.OperationalError`` ("database is locked") propagate so the
+        caller can surface a retryable error rather than a silent failure."""
+        fields = normalize_edit_fields(fields)
+        with self._connection(commit=True, timeout=timeout, immediate=True) as conn:
+            row = conn.execute(
+                "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
+            ).fetchone()
+            if row is None:
+                raise TrackNotFound(uuid_id)
+            current_revision = row["revision"]
+            if base_revision is None or base_revision != current_revision:
+                raise RevisionConflict(uuid_id, base_revision, current_revision)
+
+            return self._update_track_metadata(conn, uuid_id, fields, new_file_path)
+
+    # ── Edit journal (crash-safety for master-file writes) ──────────────────
+
+    def insert_journal_entry(
+        self,
+        intent: str,
+        uuid_id: str,
+        old_path: Optional[str] = None,
+        new_path: Optional[str] = None,
+        temp_path: Optional[str] = None,
+    ) -> int:
+        """Record a pending destructive FS step *before* performing it. Returns
+        the journal row id so the caller can clear it once the step is durably
+        finished (or reverted)."""
+        with self._connection(commit=True) as conn:
+            cursor = conn.execute(
+                "INSERT INTO edit_journal "
+                "(intent, uuid_id, old_path, new_path, temp_path, created_at) "
+                "VALUES (?, ?, ?, ?, ?, unixepoch())",
+                (intent, uuid_id, old_path, new_path, temp_path),
+            )
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    def list_journal_entries(self) -> List[dict]:
+        """All outstanding journal rows, oldest first. Read once at startup by
+        the reconcile pass."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, intent, uuid_id, old_path, new_path, temp_path, "
+                "created_at FROM edit_journal ORDER BY id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_journal_entry(self, entry_id: int) -> None:
+        with self._connection(commit=True) as conn:
+            conn.execute("DELETE FROM edit_journal WHERE id = ?", (entry_id,))
+
+    def get_track_by_uuid(self, uuid_id: str) -> Optional[Track]:
+        """The hydrated track for a uuid, or None. The one lookup shared by
+        the editor, the streaming source resolver, and GET /tracks/{uuid}."""
+        rows = self.get_tracks(
+            search_parameters=[
+                SearchParameter(column="uuid_id", operator="=", value=uuid_id)
+            ]
+        )
+        return rows[0] if rows else None
+
+    def get_track_file_path(self, uuid_id: str) -> Optional[str]:
+        """Current ``tracks.file_path`` for a uuid, or None if the track is gone.
+        Used by journal reconcile to tell whether a relocate's DB commit landed."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT file_path FROM tracks WHERE uuid_id = ?", (uuid_id,)
+            ).fetchone()
+            return row["file_path"] if row is not None else None
+
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
         try:
             with self._connection(commit=True, timeout=timeout) as conn:
@@ -793,43 +1169,11 @@ class Database:
                     (track_db_id, fts_title, effective_artist, fts_album),
                 )
 
-                # Cleanup orphaned album
-                if album_id is not None:
-                    remaining = conn.execute(
-                        "SELECT COUNT(*) FROM trackmetadata WHERE album_id = ?",
-                        (album_id,),
-                    ).fetchone()[0]
-                    if remaining == 0:
-                        album_row = conn.execute(
-                            "SELECT name FROM albums WHERE id = ?", (album_id,)
-                        ).fetchone()
-                        album_name_for_fts = album_row["name"] or "" if album_row else ""
-                        conn.execute(
-                            "INSERT INTO fts_albums(fts_albums, rowid, name, artist_name) "
-                            "VALUES('delete', ?, ?, ?)",
-                            (album_id, album_name_for_fts, effective_artist),
-                        )
-                        conn.execute("DELETE FROM albums WHERE id = ?", (album_id,))
-
-                # Cleanup orphaned artist
-                if artist_id is not None:
-                    remaining = conn.execute(
-                        "SELECT COUNT(*) FROM trackmetadata WHERE artist_id = ?",
-                        (artist_id,),
-                    ).fetchone()[0]
-                    if remaining == 0:
-                        artist_row = conn.execute(
-                            "SELECT name FROM artists WHERE id = ?", (artist_id,)
-                        ).fetchone()
-                        artist_name_for_fts = artist_row["name"] if artist_row else ""
-                        conn.execute(
-                            "INSERT INTO fts_artists(fts_artists, rowid, name) "
-                            "VALUES('delete', ?, ?)",
-                            (artist_id, artist_name_for_fts),
-                        )
-                        conn.execute(
-                            "DELETE FROM artists WHERE id = ?", (artist_id,)
-                        )
+                # Cleanup now-orphaned parents (album before artist — an album
+                # row references an artist). Shared with the metadata-edit
+                # spine so add/update/delete reconcile orphans one way.
+                self._orphan_gc_album(conn, album_id)
+                self._orphan_gc_artist(conn, artist_id)
 
             return True
         except Exception as e:
