@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -30,10 +31,57 @@ class TestMoveFile:
         destination_dir = Path(tmp_path / "music")
         destination_path = Path(destination_dir / "file.mp3")
         result = organizer.move_file(file_path, destination_path)
-        
+
         assert result is True
         assert destination_dir.is_dir()
         assert destination_path.is_file()
+
+    def test_move_file__blocked_while_directory_lock_is_held__then_succeeds(self, tmp_path: Path):
+        dest_parent = tmp_path / "music"
+        src = tmp_path / "b.mp3"
+        src.write_bytes(b"B")
+        dest = dest_parent / "b.mp3"
+
+        lock = organizer._directory_locks.lock_for(dest_parent.resolve())
+        lock.acquire()
+        results = {}
+        t = threading.Thread(
+            target=lambda: results.update(ok=organizer.move_file(src, dest))
+        )
+        t.start()
+        t.join(timeout=0.2)
+        assert t.is_alive(), "move_file proceeded without acquiring the directory lock"
+        lock.release()
+
+        t.join(timeout=5)
+        assert results["ok"] is True
+        assert dest.read_bytes() == b"B"
+
+    def test_move_file__concurrent_calls_to_same_destination__second_call_refuses(self, tmp_path: Path):
+        src_a = tmp_path / "a.mp3"
+        src_a.write_bytes(b"AAAA")
+        dest = tmp_path / "music" / "song.mp3"
+
+        # Simulates a concurrent move_file already in its critical section.
+        lock = organizer._directory_locks.lock_for(dest.parent.resolve())
+        lock.acquire()
+        results = {}
+        t = threading.Thread(
+            target=lambda: results.update(a=organizer.move_file(src_a, dest))
+        )
+        t.start()
+        t.join(timeout=0.2)
+        assert t.is_alive()
+
+        # The "other" concurrent call places a file at dest while holding the lock.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"WINNER")
+        lock.release()
+
+        t.join(timeout=5)
+        assert results["a"] is False  # correctly refuses -- dest now exists
+        assert dest.read_bytes() == b"WINNER"  # untouched by the losing call
+        assert src_a.exists()  # loser's source file preserved, not consumed
 
 
 class TestPruneEmptyDirs:
@@ -83,6 +131,18 @@ class TestPruneEmptyDirs:
         organizer.prune_empty_dirs(gone, root)  # must not raise
 
         assert root.exists()
+
+
+class TestSanitizedDestinationPath:
+    def test_sanitized_destination_path__unsafe_album_artist__does_not_fall_back_to_artist(self, tmp_path: Path):
+        meta = TrackMetaData(album_artist="...", artist="Real Artist", album="A")
+        result = organizer.sanitized_destination_path("f.mp3", meta, tmp_path)
+        # Raw effective_artist picks album_artist ("..."), which
+        # sanitize_path_component cannot represent as a folder name (it strips
+        # entirely to dots). Must NOT silently substitute "artist" instead --
+        # that would misrepresent the DB's chosen identity. Falls back to the
+        # library root instead.
+        assert result == tmp_path / "f.mp3"
 
 
 class TestOrganizer:

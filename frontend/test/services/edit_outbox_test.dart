@@ -277,6 +277,32 @@ void main() {
     expect(await db.select(db.pendingEdits).get(), isEmpty); // applied
   });
 
+  test('resolveKeepMine is idempotent — a stale second call is a no-op',
+      () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 9);
+    // Seed an already-conflicted row directly (rather than via enqueue+flush)
+    // so the container can run fully offline — resolveKeepMine's own internal
+    // flush() then no-ops, leaving the row exactly as resolveKeepMine's
+    // rebase left it, for inspection.
+    await db.customStatement(
+      "INSERT INTO pending_edits (uuid_id, values_json, write_mode, "
+      "base_revision, status, server_revision, original_values_json, updated_at) "
+      "VALUES ('u1', '{\"title\":\"A\"}', 'db_only', 5, 'conflicted', 9, "
+      "'{\"title\":\"Old\"}', 0)",
+    );
+    final outbox = _container(db, offline: true, onPatch: (_) async => _ok())
+        .read(editOutboxProvider);
+
+    await outbox.resolveKeepMine('u1'); // rebase: baseRevision=9, status=pending
+    await outbox.resolveKeepMine('u1'); // stale duplicate call
+
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.baseRevision, 9);
+    expect(row.status, 'pending');
+  });
+
   test('re-editing a conflicted row rebases base onto the server revision',
       () async {
     final db = AppDatabase(NativeDatabase.memory());

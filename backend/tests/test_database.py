@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
@@ -3530,3 +3531,83 @@ class TestUpdateTrackMetadata:
                 {"title": "", "artist": "", "album": ""},
                 t1.revision,
             )
+
+
+class TestApplyTrackMetadataEditConcurrency:
+    def _db(self, tmp_path):
+        database = set_up_database(tmp_path / "database.db")
+        assert database.initialize()
+        return database
+
+    def _add(self, database, path, title, artist):
+        metadata = seed_metadata()
+        metadata.title = title
+        metadata.artist = artist
+        track = Track(file_path=path, metadata=metadata)
+        assert database.add_track(track)
+        return track
+
+    def test_apply_track_metadata_edit__concurrent_calls__second_gets_conflict(
+        self, tmp_path, monkeypatch
+    ):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.mp3", "T", "Artist")
+        base_rev = track.revision
+
+        # Deterministic, no time.sleep: pause thread A at the exact vulnerable
+        # point -- after its own revision check has already passed but before
+        # it writes -- and only release it once thread B has genuinely begun
+        # its own call. The .wait()/.join() timeouts below are safety bounds
+        # against a hang if something is broken; the test's correctness never
+        # depends on their duration.
+        a_paused = threading.Event()
+        b_started = threading.Event()
+        release_a = threading.Event()
+
+        original_bump = Database._bump_track_revision
+
+        def paused_bump(conn, uuid_id):
+            a_paused.set()
+            assert release_a.wait(timeout=5), "test held A paused too long"
+            return original_bump(conn, uuid_id)
+
+        # _bump_track_revision is a staticmethod; wrap the replacement the
+        # same way so `self._bump_track_revision(conn, uuid_id)` doesn't bind
+        # `self` in as an extra leading positional argument.
+        monkeypatch.setattr(Database, "_bump_track_revision", staticmethod(paused_bump))
+
+        results = {}
+
+        def call_a():
+            try:
+                results["A"] = database.apply_track_metadata_edit(
+                    track.uuid_id, {"title": "TitleA"}, base_rev
+                )
+            except RevisionConflict as e:
+                results["A"] = e
+
+        def call_b():
+            b_started.set()
+            try:
+                results["B"] = database.apply_track_metadata_edit(
+                    track.uuid_id, {"title": "TitleB"}, base_rev
+                )
+            except RevisionConflict as e:
+                results["B"] = e
+
+        t_a = threading.Thread(target=call_a)
+        t_a.start()
+        assert a_paused.wait(timeout=5), "A never reached its paused write step"
+
+        t_b = threading.Thread(target=call_b)
+        t_b.start()
+        assert b_started.wait(timeout=5), "B's thread never started"
+
+        release_a.set()
+        t_a.join(timeout=5)
+        t_b.join(timeout=5)
+
+        successes = [v for v in results.values() if isinstance(v, int)]
+        conflicts = [v for v in results.values() if isinstance(v, RevisionConflict)]
+        assert len(successes) == 1
+        assert len(conflicts) == 1

@@ -89,21 +89,32 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
 
   Future<void> _save() async {
     if (!_editing) return;
-    final mode = _writeToFile
+    final localMode = _writeToFile
         ? EditWriteMode.dbAndMaster
         : EditWriteMode.dbOnly;
     // Enabling master-write is itself a saveable change (re-tag the file from
     // the current DB values), so "no changes" only applies to a DB-only save
     // with no edited fields.
-    if (_edit.isEmpty && mode == EditWriteMode.dbOnly) {
+    if (_edit.isEmpty && localMode == EditWriteMode.dbOnly) {
       _toast('No changes to save');
       return;
     }
-    if (mode == EditWriteMode.dbAndMaster) {
+    // enqueue() monotonically escalates the persisted write mode against any
+    // existing pending/conflicted row for this track and never downgrades —
+    // so if db_and_master is already queued, this save will still perform a
+    // master write even with the toggle off. Gate the confirmation dialog on
+    // that effective mode, not just the local toggle, or the user could save
+    // a permanent file write with no confirmation shown for this action.
+    final persisted =
+        await ref.read(databaseProvider).pendingWriteMode(_track.uuidId);
+    final effectiveMode = persisted == 'db_and_master'
+        ? EditWriteMode.dbAndMaster
+        : localMode;
+    if (effectiveMode == EditWriteMode.dbAndMaster) {
       final confirmed = await showMasterWriteConfirmDialog(context);
       if (!confirmed) return;
     }
-    await _submit(_edit, mode);
+    await _submit(_edit, localMode); // enqueue() still performs its own escalation
   }
 
   /// Optimistic local write + outbox enqueue, then a best-effort flush if

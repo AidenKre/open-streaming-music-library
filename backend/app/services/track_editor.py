@@ -88,8 +88,12 @@ class TrackEditor:
         if track is None:
             raise TrackNotFound(uuid_id)
         # Fail a stale edit fast, before the full-file staging remux (and the
-        # relocate path's journal + move). We already hold the per-uuid lock;
-        # the in-transaction check remains the authoritative gate.
+        # relocate path's journal + move). This is a pure optimization: the
+        # in-transaction check inside apply_track_metadata_edit's own
+        # BEGIN IMMEDIATE is authoritative on its own (independent of the
+        # per-uuid TrackLocks held by the caller), so a stale edit that slips
+        # past this fast-path check still can't corrupt the DB -- it just pays
+        # for the staging work before getting the same RevisionConflict.
         if base_revision is None or base_revision != track.revision:
             raise RevisionConflict(uuid_id, base_revision, track.revision)
         source = Path(track.file_path)

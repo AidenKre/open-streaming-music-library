@@ -108,6 +108,31 @@ void main() {
     expect(host.paginatedItems, [9, 9]);
   });
 
+  test(
+      'refresh cancels a stale quiet-timer so the new subscription delivers '
+      'immediately', () async {
+    final controller = StreamController<List<int>>.broadcast();
+    addTearDown(controller.close);
+    final host = _Host(
+      ({required limit}) =>
+          controller.stream.map((all) => all.take(limit).toList()),
+    );
+    addTearDown(host.disposePagination);
+    addTearDown(host.scrollController.dispose);
+
+    host.initPagination();
+    controller.add([1, 2]);
+    await Future<void>.delayed(Duration.zero);
+    // Leading edge delivered; the 150ms quiet timer is now armed.
+    expect(host.paginatedItems, [1, 2]);
+
+    host.refresh(); // called while that timer is still running
+    controller.add([5, 6]);
+    await Future<void>.delayed(Duration.zero); // deliberately not out to 150ms
+
+    expect(host.paginatedItems, [5, 6]);
+  });
+
   test('refresh resets the window to the first page', () async {
     final controller = StreamController<List<int>>.broadcast();
     addTearDown(controller.close);

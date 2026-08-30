@@ -61,6 +61,10 @@ mixin CursorPaginationMixin<T> {
   /// on its own. Clears the current window immediately so the old parameter's
   /// rows don't linger on screen until the new stream's first emission lands.
   void refresh() {
+    // A burst-coalescing quiet timer from before this refresh must not
+    // suppress the new subscription's leading-edge delivery.
+    _quietTimer?.cancel();
+    _quietTimer = null;
     if (mounted) {
       setState(() {
         paginatedItems = [];

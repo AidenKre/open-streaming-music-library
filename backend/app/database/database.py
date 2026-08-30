@@ -290,12 +290,22 @@ class Database:
         self.context = context
 
     @contextmanager
-    def _connection(self, *, commit: bool = False, timeout: float = 5):
+    def _connection(self, *, commit: bool = False, timeout: float = 5, immediate: bool = False):
         conn = sqlite3.connect(self.context.database_path, timeout=timeout)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = sqlite3.Row
+            if immediate:
+                # Acquire SQLite's write lock up front, before the caller reads
+                # anything: a plain SELECT (the default, non-immediate mode)
+                # holds no lock, so a check-then-write sequence built on it is
+                # not atomic across connections -- a second connection's own
+                # check can pass against the same stale value before the first
+                # connection's write lands. immediate=True closes that gap by
+                # making a concurrent caller's own BEGIN IMMEDIATE block until
+                # this transaction commits or rolls back.
+                conn.execute("BEGIN IMMEDIATE")
             yield conn
             if commit:
                 conn.commit()
@@ -1028,16 +1038,20 @@ class Database:
         new_file_path: Optional[str] = None,
         timeout: float = 5,
     ) -> int:
-        """DB orchestration for a track metadata edit. Opens one write txn,
-        enforces the Option-A 409 (``base_revision`` vs the stored revision)
-        *before* the bump, runs the pure-DB spine, and commits. ``new_file_path``
-        (set by the master-relocation path after it has moved the file) is
-        written to ``tracks.file_path`` in the same txn. Returns the new
-        revision. Raises ``TrackNotFound`` / ``RevisionConflict``; lets
+        """DB orchestration for a track metadata edit. Opens one write txn
+        with ``BEGIN IMMEDIATE`` (so the revision check below actually holds
+        SQLite's write lock -- a plain read holds none, so without this a
+        second concurrent call could pass the same check against the same
+        stale revision before either has written), enforces the Option-A 409
+        (``base_revision`` vs the stored revision) *before* the bump, runs the
+        pure-DB spine, and commits. ``new_file_path`` (set by the
+        master-relocation path after it has moved the file) is written to
+        ``tracks.file_path`` in the same txn. Returns the new revision. Raises
+        ``TrackNotFound`` / ``RevisionConflict``; lets
         ``sqlite3.OperationalError`` ("database is locked") propagate so the
         caller can surface a retryable error rather than a silent failure."""
         fields = normalize_edit_fields(fields)
-        with self._connection(commit=True, timeout=timeout) as conn:
+        with self._connection(commit=True, timeout=timeout, immediate=True) as conn:
             row = conn.execute(
                 "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,)
             ).fetchone()

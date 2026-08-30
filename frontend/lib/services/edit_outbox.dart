@@ -60,6 +60,13 @@ class EditOutbox {
             ..where((t) => t.uuidId.equals(uuidId)))
           .getSingleOrNull();
 
+      // A conflicted row is resolved only via resolveKeepMine/resolveTakeServer
+      // (explicit, user-driven) — an edit touching no fields must not silently
+      // coalesce onto it and clear the conflict as a side effect of
+      // re-escalating write mode (e.g. reopening Get Info on a conflicted
+      // db_and_master track and saving with no field changes).
+      if (edit.isEmpty && existing?.status == 'conflicted') return;
+
       // Snapshot the pre-edit state on the first edit of a batch — before the
       // optimistic write mutates the columns — and preserve it across
       // coalescing. This is what lets take-server/discard revert locally.
@@ -272,7 +279,8 @@ class EditOutbox {
     // concurrent enqueue() reading stale (pre-rebase) row state.
     final rebased = await mutex.run(() async {
       final row = await (db.select(db.pendingEdits)
-            ..where((t) => t.uuidId.equals(uuidId)))
+            ..where((t) => t.uuidId.equals(uuidId))
+            ..where((t) => t.status.equals('conflicted')))
           .getSingleOrNull();
       if (row == null) return false;
       await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))

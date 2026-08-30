@@ -33,7 +33,11 @@ const _track = TrackUI(
   hasAlbumArt: false,
 );
 
-Future<AppDatabase> _pump(WidgetTester tester, {AppInfo? caps}) async {
+Future<AppDatabase> _pump(
+  WidgetTester tester, {
+  AppInfo? caps,
+  Future<void> Function(AppDatabase db)? seed,
+}) async {
   // Tall surface so the whole form + info rows build (the ListView is lazy, so
   // off-screen widgets wouldn't be in the tree on the default 800x600).
   tester.view.physicalSize = const Size(1200, 4000);
@@ -43,6 +47,7 @@ Future<AppDatabase> _pump(WidgetTester tester, {AppInfo? caps}) async {
 
   final db = AppDatabase(NativeDatabase.memory());
   addTearDown(db.close);
+  if (seed != null) await seed(db);
   await tester.pumpWidget(
     ProviderScope(
       overrides: [
@@ -206,5 +211,58 @@ void main() {
     await tester.tap(_dialogText('Cancel'));
     await tester.pumpAndSettle();
     expect(await _pending(db), isEmpty);
+  });
+
+  testWidgets(
+      'toggling the switch off does not skip the confirm dialog '
+      'when db_and_master is already queued for this track', (tester) async {
+    final db = await _pump(
+      tester,
+      seed: (db) => db.customStatement(
+        "INSERT INTO pending_edits (uuid_id, values_json, write_mode, "
+        "base_revision, status, server_revision, original_values_json, updated_at) "
+        "VALUES ('u1', '{\"title\":\"Queued\"}', 'db_and_master', 5, 'pending', "
+        "NULL, '{\"title\":\"Old Title\"}', 0)",
+      ),
+    );
+    await _enterEditMode(tester);
+    await tester.tap(find.text('Update master file on server')); // toggled OFF
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const ValueKey('field_artist')),
+      'New Artist',
+    );
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Update the master file on the server?'), findsOneWidget);
+    final rows = await _pending(db);
+    expect(rows.single.writeMode, 'db_and_master');
+  });
+
+  testWidgets(
+      'saving with no field changes on a conflicted row must not '
+      'silently resolve the conflict', (tester) async {
+    final db = await _pump(
+      tester,
+      seed: (db) => db.customStatement(
+        "INSERT INTO pending_edits (uuid_id, values_json, write_mode, "
+        "base_revision, status, server_revision, original_values_json, updated_at) "
+        "VALUES ('u1', '{\"title\":\"Mine\"}', 'db_and_master', 5, 'conflicted', 9, "
+        "'{\"title\":\"Old Title\"}', 0)",
+      ),
+    );
+    await _enterEditMode(tester);
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
+    await tester.pumpAndSettle();
+    if (find.text('Update the master file on the server?').evaluate().isNotEmpty) {
+      await tester.tap(_dialogText('Edit file'));
+      await tester.pumpAndSettle();
+    }
+    final row = await (db.select(db.pendingEdits)
+          ..where((t) => t.uuidId.equals('u1')))
+        .getSingle();
+    expect(row.status, 'conflicted');
+    expect(row.baseRevision, 5);
   });
 }

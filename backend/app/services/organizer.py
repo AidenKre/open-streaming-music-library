@@ -6,8 +6,17 @@ from app.database.database import effective_artist
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services.cover_art_manager import CoverArtAddResult
+from app.services.keyed_locks import KeyedLocks
 from app.services.metadata import extract_cover_art_bytes, get_track_metadata
 from app.services.path_sanitize import UnsafePathComponent, sanitize_path_component
+
+# Per-directory mutual exclusion for move_file/prune_empty_dirs: without it,
+# one track's prune of a now-empty shared album directory can race another
+# track's move into that same directory (removing it out from under a
+# concurrent mkdir+replace), and two concurrent moves to the same destination
+# can race the exists()-then-replace() check-then-act into a silent clobber.
+# Mirrors TrackLocks' "never delete the entry" KeyedLocks pattern.
+_directory_locks = KeyedLocks[Path]()
 
 # TODO: implement copy_file
 # TODO: do not assume that move destination is on the same filesystem as the source aka atomic rename for moving
@@ -110,25 +119,27 @@ class Organizer:
 def move_file(file_path: Path, destination_path: Path) -> bool:
     if not file_path.is_file():
         return False
-    # Currently only supporting atomic move, so if file exists, return false
-    if destination_path.exists():
-        print(f"Destination {destination_path} already exists.")
-        return False
-
     parent = destination_path.parent
 
-    if parent.exists() and not parent.is_dir():
-        print(f"Destination parent is not a directory: {parent}")
-        return False
-
-    try:
-        parent.mkdir(parents=True, exist_ok=True)
-        # Fails if moving to a different filesystem, since it is an atomic move
-        file_path.replace(destination_path)
-        return True
-    except (PermissionError, FileExistsError, OSError) as e:
-        print(f"Exception trying to move {file_path} to {destination_path}: {e}")
-        return False
+    # Held for the whole exists-check + mkdir + replace sequence so a
+    # concurrent move_file to the same destination, or a concurrent
+    # prune_empty_dirs on this same directory, can't interleave with it.
+    with _directory_locks.lock(parent.resolve()):
+        if parent.exists() and not parent.is_dir():
+            print(f"Destination parent is not a directory: {parent}")
+            return False
+        # Currently only supporting atomic move, so if file exists, return false
+        if destination_path.exists():
+            print(f"Destination {destination_path} already exists.")
+            return False
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            # Fails if moving to a different filesystem, since it is an atomic move
+            file_path.replace(destination_path)
+            return True
+        except (PermissionError, FileExistsError, OSError) as e:
+            print(f"Exception trying to move {file_path} to {destination_path}: {e}")
+            return False
 
 
 def prune_empty_dirs(directory: Path, root: Path) -> None:
@@ -140,10 +151,14 @@ def prune_empty_dirs(directory: Path, root: Path) -> None:
     root = root.resolve()
     current = directory.resolve()
     while current != root and current.is_relative_to(root):
-        try:
-            current.rmdir()
-        except OSError:
-            return  # not empty, already gone, or a permissions error — stop
+        # One directory's lock at a time (acquired, used, released before
+        # moving to the parent) so this can never race move_file's own
+        # per-directory lock into a deadlock.
+        with _directory_locks.lock(current):
+            try:
+                current.rmdir()
+            except OSError:
+                return  # not empty, already gone, or a permissions error — stop
         current = current.parent
 
 
@@ -190,10 +205,16 @@ def sanitized_destination_path(
     path to decide in-place vs relocation, and uses ``move_file`` to place the
     (already-tagged) staged file.
     """
+    # Pick the winning raw artist first (matching the DB identity layer's
+    # priority exactly), then sanitize only that winner -- sanitizing each
+    # candidate independently before choosing would let the two layers pick
+    # different artists whenever the raw winner collapses under sanitization
+    # but the loser doesn't.
+    raw_artist = effective_artist(trackmetadata.album_artist, trackmetadata.artist)
     sanitized = trackmetadata.model_copy(
         update={
-            "album_artist": _safe_component(trackmetadata.album_artist),
-            "artist": _safe_component(trackmetadata.artist),
+            "album_artist": _safe_component(raw_artist),
+            "artist": None,
             "album": _safe_component(trackmetadata.album),
         }
     )
