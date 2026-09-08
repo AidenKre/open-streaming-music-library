@@ -45,6 +45,7 @@ from app.models import (
     SetQualityResponse,
     Track,
 )
+from app.core.media_types import CODEC_MIME, MIME_EXTENSION
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.services.metadata import TagWriteError
 from app.services.track_edit import (
@@ -475,28 +476,6 @@ def get_cover_art(cover_art_id: int):
     )
 
 
-_MIME_EXTENSION: dict[str, str] = {
-    "audio/mp4": "m4a",
-    "audio/mpeg": "mp3",
-    "audio/flac": "flac",
-    "audio/x-flac": "flac",
-    "audio/ogg": "ogg",
-    "audio/aac": "aac",
-    "audio/wav": "wav",
-    "audio/x-wav": "wav",
-}
-
-_CODEC_MIME: dict[str, str] = {
-    "aac": "audio/mp4",
-    "alac": "audio/mp4",
-    "mp3": "audio/mpeg",
-    "flac": "audio/flac",
-    "wav": "audio/wav",
-    "pcm_s16le": "audio/wav",
-    "pcm_s24le": "audio/wav",
-    "pcm_f32le": "audio/wav",
-}
-
 
 def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int]:
     """Parse a single HTTP byte range and return ``(start, end)`` inclusive.
@@ -624,15 +603,15 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     if encode_result.transcoded:
         media_type = "audio/mp4"
     else:
-        media_type = _CODEC_MIME.get(
+        media_type = CODEC_MIME.get(
             track.metadata.codec or "", f"audio/{track.metadata.codec or 'octet-stream'}"
         )
 
     # For passthrough/original responses, the source's own file extension is
     # a better fallback than the literal string "audio" when the codec is not
-    # in [_MIME_EXTENSION] (e.g. opus, vorbis) — that name is what the client
+    # in [MIME_EXTENSION] (e.g. opus, vorbis) — that name is what the client
     # would have got had it downloaded the source directly.
-    extension = _MIME_EXTENSION.get(media_type)
+    extension = MIME_EXTENSION.get(media_type)
     if extension is None:
         source_suffix = file_path.suffix.lstrip(".").lower() if not encode_result.transcoded else ""
         extension = source_suffix or "audio"
