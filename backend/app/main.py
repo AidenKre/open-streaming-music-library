@@ -71,6 +71,7 @@ from app.services import (
     OrganizerContext,
     ORIGINAL_QUALITY,
     normalize_quality,
+    probe_available_encoders,
 )
 from app.services.encoder_coordinator import (
     EncodeResult,
@@ -226,6 +227,11 @@ def startup_event():
     )
     app.state.encoder_coordinator = encoder_coordinator
     encoder_coordinator.startup()
+
+    # One-time probe of which ffmpeg encoders this build actually has
+    # (libmp3lame/alac are build-dependent). Not consumed anywhere yet — the
+    # conversion bootstrap block and job-enqueue guard read it once they land.
+    app.state.available_encoders = probe_available_encoders()
 
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
