@@ -67,6 +67,20 @@ class EncodedCache:
         except FileNotFoundError:
             return False
 
+    def remove_all_for_uuid(self, uuid_id: str) -> None:
+        """Remove every cached quality for a single uuid (e.g. after that
+        track's master changed and all its encodes are now stale)."""
+        safe_uuid = uuid_id.replace("/", "_")
+        prefix = f"{safe_uuid}__q"
+        with self._lock:
+            for entry in self.ctx.cache_dir.iterdir():
+                if (
+                    entry.is_file()
+                    and entry.name.startswith(prefix)
+                    and entry.name.endswith(CACHE_FILE_SUFFIX)
+                ):
+                    entry.unlink(missing_ok=True)
+
     def clear(self) -> None:
         with self._lock:
             for entry in self.ctx.cache_dir.iterdir():

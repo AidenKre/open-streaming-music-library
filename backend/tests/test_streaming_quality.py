@@ -173,7 +173,7 @@ class TestStreamQuality:
     def test_stream__passthrough_unknown_codec__uses_source_suffix(
         self, client, tmp_path
     ):
-        """Codec strings outside [_MIME_EXTENSION] (opus, vorbis, ...) used
+        """Codec strings outside [MIME_EXTENSION] (opus, vorbis, ...) used
         to surface as ``X-Audio-Extension: audio`` because the lookup fell
         through to a literal string fallback. The fix is to use the source
         file's own suffix when the codec isn't mapped — that's what the
@@ -590,6 +590,20 @@ class TestEncodedCache:
         path2 = cache.insert("uuid-big2", "192", src2)
         assert path2.exists()
         assert not cache.has("uuid-big", "192")
+
+    def test_remove_all_for_uuid__removes_only_matching_uuid_across_qualities(self, tmp_path):
+        cache = self._make_cache(tmp_path, 10 * 1024 * 1024)
+        for quality in ("192", "320"):
+            src = self._stage_source(tmp_path, f"target-{quality}.m4a", b"x" * 10)
+            cache.insert("uuid-target", quality, src)
+        other_src = self._stage_source(tmp_path, "other.m4a", b"y" * 10)
+        cache.insert("uuid-other", "192", other_src)
+
+        cache.remove_all_for_uuid("uuid-target")
+
+        assert not cache.has("uuid-target", "192")
+        assert not cache.has("uuid-target", "320")
+        assert cache.has("uuid-other", "192")
 
 
 class TestWarmEndpoint:
