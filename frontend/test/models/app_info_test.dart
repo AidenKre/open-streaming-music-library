@@ -31,6 +31,75 @@ void main() {
       expect(back.entity('track')!.fields.map((f) => f.key),
           info.entity('track')!.fields.map((f) => f.key));
     });
+
+    test('parses the conversion block', () {
+      final info = AppInfo.fromJson({
+        'entities': {'track': {'fields': [], 'actions': ['convert']}},
+        'conversion': {
+          'targets': [
+            {'codec': 'aac', 'is_lossless': false},
+            {'codec': 'flac', 'is_lossless': true},
+          ],
+          'bitrate_presets': [320, 256, 192, 128],
+        },
+      });
+
+      expect(info.conversion.targets.map((t) => t.codec), ['aac', 'flac']);
+      expect(info.conversion.targets[1].isLossless, isTrue);
+      expect(info.conversion.bitratePresets, [320, 256, 192, 128]);
+      expect(info.entity('track')!.actions, ['convert']);
+    });
+
+    test('missing conversion block defaults to empty capabilities', () {
+      final info = AppInfo.fromJson({'entities': {}});
+      expect(info.conversion.targets, isEmpty);
+      expect(info.conversion.bitratePresets, isEmpty);
+    });
+
+    test('conversion block round-trips through toJson', () {
+      const original = ConversionCapabilities(
+        targets: [
+          ConversionTargetInfo(codec: 'mp3', isLossless: false),
+          ConversionTargetInfo(codec: 'alac', isLossless: true),
+        ],
+        bitratePresets: [320, 192],
+      );
+      final back = ConversionCapabilities.fromJson(original.toJson());
+      expect(back.targets.map((t) => t.codec), ['mp3', 'alac']);
+      expect(back.bitratePresets, [320, 192]);
+    });
+  });
+
+  group('ConversionCapabilities.allowedFor', () {
+    const capabilities = ConversionCapabilities(
+      targets: [
+        ConversionTargetInfo(codec: 'aac', isLossless: false),
+        ConversionTargetInfo(codec: 'alac', isLossless: true),
+        ConversionTargetInfo(codec: 'flac', isLossless: true),
+        ConversionTargetInfo(codec: 'mp3', isLossless: false),
+      ],
+      bitratePresets: [320, 256, 192, 128],
+    );
+
+    test('excludes only the lossless-same-codec no-op', () {
+      final allowed = capabilities.allowedFor('flac');
+      expect(allowed.map((t) => t.codec), ['aac', 'alac', 'mp3']);
+    });
+
+    test('lossy same-codec is NOT excluded (warn-only, not blocked)', () {
+      final allowed = capabilities.allowedFor('mp3');
+      expect(allowed.map((t) => t.codec), contains('mp3'));
+    });
+
+    test('a source codec outside the target list excludes nothing', () {
+      final allowed = capabilities.allowedFor('wav');
+      expect(allowed.length, capabilities.targets.length);
+    });
+
+    test('a null source codec returns every target', () {
+      final allowed = capabilities.allowedFor(null);
+      expect(allowed.length, capabilities.targets.length);
+    });
   });
 
   group('editableFieldsFor', () {
