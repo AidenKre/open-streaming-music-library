@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 
@@ -115,6 +116,7 @@ final recoverablesProvider = Provider<List<RecoverableService>>((ref) {
   return <RecoverableService>[
     _SyncRecoverable(ref),
     _ResumeDownloadsRecoverable(ref),
+    _ResumeConversionsRecoverable(ref),
     _ReconcileDownloadsRecoverable(ref),
   ];
 });
@@ -163,6 +165,26 @@ class _ResumeDownloadsRecoverable implements RecoverableService {
   Future<void> recover(RecoveryTrigger trigger) async {
     _ref.read(downloadManagerProvider).resumeIfPaused();
   }
+}
+
+/// Resumes polling any conversion job still queued/running server-side --
+/// across a reconnect (the poll timer never started if the app was offline
+/// when the job was enqueued elsewhere) or an app restart (no poll timer
+/// survives a process restart, but the backend job can still be mid-flight).
+class _ResumeConversionsRecoverable implements RecoverableService {
+  _ResumeConversionsRecoverable(this._ref);
+  final Ref _ref;
+
+  @override
+  int get recoveryPriority => RecoveryPriority.resumeConversions;
+
+  @override
+  Set<RecoveryTrigger> get triggers =>
+      const {RecoveryTrigger.networkRecovered, RecoveryTrigger.coldStart};
+
+  @override
+  Future<void> recover(RecoveryTrigger trigger) =>
+      _ref.read(conversionJobsProvider.notifier).refreshAll();
 }
 
 /// Clears `tracks.file_path` rows whose file vanished outside the app. Fires

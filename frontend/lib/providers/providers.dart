@@ -1,3 +1,4 @@
+import 'package:frontend/api/jobs_api.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -18,6 +19,8 @@ final sharedPreferencesProvider = FutureProvider<SharedPreferences>((ref) {
 });
 
 final tracksApiProvider = Provider<TracksApi>((ref) => TracksApi());
+
+final jobsApiProvider = Provider<JobsApi>((ref) => JobsApi());
 
 final queueRepositoryProvider = Provider<QueueRepository>((ref) {
   return QueueRepository(ref.read(databaseProvider));

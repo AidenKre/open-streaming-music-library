@@ -55,6 +55,9 @@ class RecoveryPriority {
   /// Re-dispatch downloads that were left queued while offline.
   static const resumeDownloads = 80;
 
+  /// Resume polling any conversion jobs still queued/running server-side.
+  static const resumeConversions = 70;
+
   /// Reconcile `tracks.file_path` against the filesystem (cold start / resume).
   static const reconcileDownloads = 60;
 }

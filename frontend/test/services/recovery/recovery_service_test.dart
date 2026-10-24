@@ -213,31 +213,41 @@ void main() {
   });
 
   group('recoverablesProvider default registration', () {
-    test('advertises sync, resume-downloads, and reconcile adapters', () {
-      // No member overrides — exercises the real default list. The adapters
-      // are private, so assert by count + trigger coverage rather than type.
-      final container = ProviderContainer();
-      addTearDown(container.dispose);
+    test(
+      'advertises sync, resume-downloads, resume-conversions, and reconcile adapters',
+      () {
+        // No member overrides — exercises the real default list. The adapters
+        // are private, so assert by count + trigger coverage rather than type.
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
 
-      final registered = container.read(recoverablesProvider);
-      expect(registered, hasLength(3));
+        final registered = container.read(recoverablesProvider);
+        expect(registered, hasLength(4));
 
-      final networkMembers = registered
-          .where((r) => r.triggers.contains(RecoveryTrigger.networkRecovered))
-          .toList();
-      expect(networkMembers, hasLength(2),
-          reason: 'sync + resume-downloads fire on network recovery');
+        final networkMembers = registered
+            .where((r) => r.triggers.contains(RecoveryTrigger.networkRecovered))
+            .toList();
+        expect(networkMembers, hasLength(3),
+            reason: 'sync + resume-downloads + resume-conversions fire on '
+                'network recovery');
 
-      final coldMembers = registered
-          .where((r) => r.triggers.contains(RecoveryTrigger.coldStart))
-          .toList();
-      expect(coldMembers, hasLength(1), reason: 'reconcile fires on cold start');
-      expect(
-        coldMembers.single.triggers,
-        contains(RecoveryTrigger.appResume),
-        reason: 'reconcile also fires on resume',
-      );
-    });
+        final coldMembers = registered
+            .where((r) => r.triggers.contains(RecoveryTrigger.coldStart))
+            .toList();
+        expect(coldMembers, hasLength(2),
+            reason: 'reconcile + resume-conversions fire on cold start');
+
+        final reconcileMembers = coldMembers
+            .where((r) => r.recoveryPriority == RecoveryPriority.reconcileDownloads)
+            .toList();
+        expect(reconcileMembers, hasLength(1));
+        expect(
+          reconcileMembers.single.triggers,
+          contains(RecoveryTrigger.appResume),
+          reason: 'reconcile also fires on resume',
+        );
+      },
+    );
 
     test('sync also fires on app resume', () {
       // A server-side change made while the app was backgrounded (an edit
