@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/get_info_page.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
@@ -12,6 +13,16 @@ class TrackTile extends StatelessWidget {
   final VoidCallback? onDownload;
   final void Function(String quality)? onDownloadAtQuality;
   final VoidCallback? onDeleteDownload;
+  /// Starts a master-type conversion for this track. Null hides the menu
+  /// entry entirely (e.g. no capability, offline, or a pending edit).
+  final VoidCallback? onConvert;
+  /// Cancels this track's in-flight conversion job. Shown instead of
+  /// [onConvert] while [conversionJob] is active.
+  final VoidCallback? onCancelConvert;
+  /// This track's current conversion job, if any (caller-supplied -- the
+  /// tile stays a plain StatelessWidget, same as `isHighlighted`/`isDimmed`;
+  /// the page watches `conversionJobsProvider` and passes the result down).
+  final ConversionJob? conversionJob;
   final bool isHighlighted;
   final bool isDimmed;
   /// When `false`, the row swallows taps and the more-vert button is rendered
@@ -29,6 +40,9 @@ class TrackTile extends StatelessWidget {
     this.onDownload,
     this.onDownloadAtQuality,
     this.onDeleteDownload,
+    this.onConvert,
+    this.onCancelConvert,
+    this.conversionJob,
     this.isHighlighted = false,
     this.isDimmed = false,
     this.isInteractive = true,
@@ -91,6 +105,26 @@ class TrackTile extends StatelessWidget {
                         onDownloadAtQuality!(quality);
                       }
                     : null,
+              ),
+            if (conversionJob?.isActive ?? false)
+              ListTile(
+                leading: const Icon(Icons.close),
+                title: const Text('Cancel conversion'),
+                onTap: onCancelConvert == null
+                    ? null
+                    : () {
+                        Navigator.pop(ctx);
+                        onCancelConvert!();
+                      },
+              )
+            else if (onConvert != null)
+              ListTile(
+                leading: const Icon(Icons.transform),
+                title: const Text('Convert…'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onConvert!();
+                },
               ),
           ],
         ),
@@ -179,6 +213,17 @@ class TrackTile extends StatelessWidget {
                     ),
                   ),
                   if (trailing != null) trailing!,
+                  if (trailing == null && (conversionJob?.isActive ?? false)) ...[
+                    const SizedBox(width: 8),
+                    Opacity(
+                      opacity: opacity,
+                      child: Icon(
+                        Icons.sync,
+                        size: 16,
+                        color: colors.primary,
+                      ),
+                    ),
+                  ],
                   if (trailing == null && track.isDownloaded) ...[
                     const SizedBox(width: 8),
                     Opacity(
