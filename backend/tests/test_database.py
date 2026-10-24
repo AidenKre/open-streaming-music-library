@@ -3611,3 +3611,154 @@ class TestApplyTrackMetadataEditConcurrency:
         conflicts = [v for v in results.values() if isinstance(v, RevisionConflict)]
         assert len(successes) == 1
         assert len(conflicts) == 1
+
+
+class TestConversionJobs:
+    def _db(self, tmp_path):
+        database = set_up_database(tmp_path / "database.db")
+        assert database.initialize()
+        return database
+
+    def _add(self, database, path):
+        track = create_track(path, "s1", "Artist")
+        assert database.add_track(track)
+        return track
+
+    def test_insert_conversion_job__starts_queued(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+
+        job_id = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+
+        job = database.get_conversion_job(job_id)
+        assert job["status"] == "queued"
+        assert job["uuid_id"] == track.uuid_id
+        assert job["target_codec"] == "aac"
+        assert job["target_container"] == "m4a"
+        assert job["target_bitrate"] == 192
+
+    def test_get_conversion_job__missing_id__returns_none(self, tmp_path):
+        database = self._db(tmp_path)
+        assert database.get_conversion_job(999) is None
+
+    def test_mark_conversion_job_running__from_queued__succeeds_once(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+        job_id = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+
+        assert database.mark_conversion_job_running(job_id) is True
+        assert database.get_conversion_job(job_id)["status"] == "running"
+        # Second attempt loses the race -- already running, not queued.
+        assert database.mark_conversion_job_running(job_id) is False
+
+    def test_mark_conversion_job_failed__requires_running__noop_if_not(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+        job_id = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+
+        # Still queued, not running -- failing it should no-op.
+        assert database.mark_conversion_job_failed(job_id, "boom") is False
+        assert database.get_conversion_job(job_id)["status"] == "queued"
+
+        database.mark_conversion_job_running(job_id)
+        assert database.mark_conversion_job_failed(job_id, "boom") is True
+        job = database.get_conversion_job(job_id)
+        assert job["status"] == "failed"
+        assert job["error_text"] == "boom"
+
+    def test_mark_conversion_job_cancelled__from_queued_or_running__succeeds(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+
+        queued_job = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+        assert database.mark_conversion_job_cancelled(queued_job) is True
+        assert database.get_conversion_job(queued_job)["status"] == "cancelled"
+
+        running_job = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+        database.mark_conversion_job_running(running_job)
+        assert database.mark_conversion_job_cancelled(running_job) is True
+        assert database.get_conversion_job(running_job)["status"] == "cancelled"
+
+    def test_mark_conversion_job_cancelled__already_terminal__returns_false(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+        job_id = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+        database.mark_conversion_job_cancelled(job_id)
+
+        assert database.mark_conversion_job_cancelled(job_id) is False
+
+    def test_complete_conversion_job__writes_intrinsic_fields_and_bumps_revision(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+        job_id = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+        database.mark_conversion_job_running(job_id)
+
+        new_revision = database.complete_conversion_job(
+            job_id, track.uuid_id, "aac", 192.0, 44100, 2,
+            file_path=str(tmp_path / "a.m4a"),
+        )
+
+        assert new_revision > track.revision
+        assert database.get_conversion_job(job_id)["status"] == "done"
+        updated = database.get_track_by_uuid(track.uuid_id)
+        assert updated.metadata.codec == "aac"
+        assert updated.metadata.bitrate_kbps == 192.0
+        assert updated.metadata.sample_rate_hz == 44100
+        assert updated.metadata.channels == 2
+        assert str(updated.file_path) == str(tmp_path / "a.m4a")
+        assert updated.revision == new_revision
+
+    def test_complete_conversion_job__no_file_path__leaves_path_unchanged(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.mp3")
+        job_id = database.insert_conversion_job(track.uuid_id, "mp3", "mp3", 320)
+        database.mark_conversion_job_running(job_id)
+
+        database.complete_conversion_job(job_id, track.uuid_id, "mp3", 320.0, 44100, 2)
+
+        updated = database.get_track_by_uuid(track.uuid_id)
+        assert str(updated.file_path) == str(tmp_path / "a.mp3")
+
+    def test_complete_conversion_job__job_already_cancelled__does_not_reset_to_done(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+        job_id = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+        database.mark_conversion_job_running(job_id)
+        database.mark_conversion_job_cancelled(job_id)
+
+        # The DB write still lands (the worker doesn't know it lost the race
+        # until it checks), but the job's terminal status is never clobbered.
+        database.complete_conversion_job(
+            job_id, track.uuid_id, "aac", 192.0, 44100, 2,
+            file_path=str(tmp_path / "a.m4a"),
+        )
+
+        assert database.get_conversion_job(job_id)["status"] == "cancelled"
+
+    def test_list_running_conversion_jobs__returns_only_running(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+        queued = database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+        running = database.insert_conversion_job(track.uuid_id, "flac", "flac", None)
+        database.mark_conversion_job_running(running)
+
+        running_jobs = database.list_running_conversion_jobs()
+
+        assert {j["id"] for j in running_jobs} == {running}
+        assert queued not in {j["id"] for j in running_jobs}
+
+    def test_apply_conversion_result__unknown_uuid__raises_track_not_found(self, tmp_path):
+        database = self._db(tmp_path)
+        with pytest.raises(TrackNotFound):
+            with database._connection(commit=True) as conn:
+                database._apply_conversion_result(
+                    conn, "no-such-uuid", "aac", 192.0, 44100, 2
+                )
+
+    def test_conversion_jobs_table__is_created_at_latest_schema_version(self, tmp_path):
+        database = self._db(tmp_path)
+        with database._connection() as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version == Database.LATEST_SCHEMA_VERSION == 7
+            # Table must actually exist and be queryable, not just declared.
+            conn.execute("SELECT * FROM conversion_jobs LIMIT 0")

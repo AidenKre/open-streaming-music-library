@@ -163,3 +163,24 @@ CREATE TABLE IF NOT EXISTS edit_journal (
     "temp_path"  TEXT,
     "created_at" INTEGER NOT NULL
 );
+
+-- Durable master-type conversion jobs (Phase 2). `status` is one of
+-- queued/running/done/failed/cancelled; the actual FS/DB commit for a
+-- conversion is guarded by an "intent='convert'" edit_journal row, not this
+-- table -- this table is job lifecycle/visibility, not crash-safety.
+-- `batch_id` is a nullable hook for a future bulk-conversion feature.
+CREATE TABLE IF NOT EXISTS conversion_jobs (
+    "id"               INTEGER PRIMARY KEY,
+    "uuid_id"          TEXT NOT NULL,
+    "target_codec"     TEXT NOT NULL,
+    "target_container" TEXT NOT NULL,
+    "target_bitrate"   INTEGER,
+    "status"           TEXT NOT NULL DEFAULT 'queued',
+    "error_text"       TEXT,
+    "batch_id"         TEXT,
+    "created_at"       INTEGER NOT NULL DEFAULT (unixepoch()),
+    "updated_at"       INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversion_jobs_uuid ON conversion_jobs("uuid_id");
+CREATE INDEX IF NOT EXISTS idx_conversion_jobs_status ON conversion_jobs("status");

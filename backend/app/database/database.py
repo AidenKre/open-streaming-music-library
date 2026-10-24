@@ -322,7 +322,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 6
+    LATEST_SCHEMA_VERSION = 7
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -512,6 +512,32 @@ class Database:
                     ')'
                 )
                 conn.execute("PRAGMA user_version = 6")
+
+            if version < 7:
+                print("Migrating database to version 7: adding conversion_jobs table")
+                conn.execute(
+                    'CREATE TABLE IF NOT EXISTS conversion_jobs ('
+                    '    "id"               INTEGER PRIMARY KEY,'
+                    '    "uuid_id"          TEXT NOT NULL,'
+                    '    "target_codec"     TEXT NOT NULL,'
+                    '    "target_container" TEXT NOT NULL,'
+                    '    "target_bitrate"   INTEGER,'
+                    '    "status"           TEXT NOT NULL DEFAULT \'queued\','
+                    '    "error_text"       TEXT,'
+                    '    "batch_id"         TEXT,'
+                    '    "created_at"       INTEGER NOT NULL DEFAULT (unixepoch()),'
+                    '    "updated_at"       INTEGER NOT NULL DEFAULT (unixepoch())'
+                    ')'
+                )
+                conn.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_conversion_jobs_uuid '
+                    'ON conversion_jobs("uuid_id")'
+                )
+                conn.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_conversion_jobs_status '
+                    'ON conversion_jobs("status")'
+                )
+                conn.execute("PRAGMA user_version = 7")
 
     @staticmethod
     def _next_revision(conn) -> int:
@@ -1117,6 +1143,145 @@ class Database:
                 "SELECT file_path FROM tracks WHERE uuid_id = ?", (uuid_id,)
             ).fetchone()
             return row["file_path"] if row is not None else None
+
+    # ── Conversion jobs (Phase 2 master-type conversion) ─────────────────────
+
+    def insert_conversion_job(
+        self,
+        uuid_id: str,
+        target_codec: str,
+        target_container: str,
+        target_bitrate: Optional[int],
+    ) -> int:
+        """Persist a new queued conversion job. Returns its id."""
+        with self._connection(commit=True) as conn:
+            cursor = conn.execute(
+                "INSERT INTO conversion_jobs "
+                "(uuid_id, target_codec, target_container, target_bitrate, "
+                "status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'queued', unixepoch(), unixepoch())",
+                (uuid_id, target_codec, target_container, target_bitrate),
+            )
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    def get_conversion_job(self, job_id: int) -> Optional[dict]:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT id, uuid_id, target_codec, target_container, "
+                "target_bitrate, status, error_text, batch_id, created_at, "
+                "updated_at FROM conversion_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def list_running_conversion_jobs(self) -> List[dict]:
+        """Every job still ``running`` — read once at startup. No worker
+        thread survives a process restart, so any such row is orphaned."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, uuid_id, target_codec, target_container, "
+                "target_bitrate, status, error_text, batch_id, created_at, "
+                "updated_at FROM conversion_jobs WHERE status = 'running'"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_conversion_job_running(self, job_id: int) -> bool:
+        """Transition queued->running. Returns False if the job already lost
+        a race (e.g. cancelled while queued) -- the caller should no-op."""
+        with self._connection(commit=True) as conn:
+            cursor = conn.execute(
+                "UPDATE conversion_jobs SET status = 'running', "
+                "updated_at = unixepoch() WHERE id = ? AND status = 'queued'",
+                (job_id,),
+            )
+            return cursor.rowcount > 0
+
+    def mark_conversion_job_failed(self, job_id: int, error_text: str) -> bool:
+        """Transition running->failed. Conditioned on 'running' so a job
+        already marked cancelled by an external cancel request is never
+        clobbered back to failed."""
+        with self._connection(commit=True) as conn:
+            cursor = conn.execute(
+                "UPDATE conversion_jobs SET status = 'failed', "
+                "error_text = ?, updated_at = unixepoch() "
+                "WHERE id = ? AND status = 'running'",
+                (error_text, job_id),
+            )
+            return cursor.rowcount > 0
+
+    def mark_conversion_job_cancelled(self, job_id: int) -> bool:
+        """Transition queued or running -> cancelled. Returns False if the
+        job was already terminal (done/failed/cancelled)."""
+        with self._connection(commit=True) as conn:
+            cursor = conn.execute(
+                "UPDATE conversion_jobs SET status = 'cancelled', "
+                "updated_at = unixepoch() "
+                "WHERE id = ? AND status IN ('queued', 'running')",
+                (job_id,),
+            )
+            return cursor.rowcount > 0
+
+    def complete_conversion_job(
+        self,
+        job_id: int,
+        uuid_id: str,
+        codec: str,
+        bitrate_kbps: float,
+        sample_rate_hz: int,
+        channels: int,
+        file_path: Optional[str] = None,
+    ) -> int:
+        """One transaction: write the probed intrinsic fields (+ file_path if
+        the extension changed) and mark the job done. Conditioned on the job
+        still being 'running' so a job already cancelled out-of-band is never
+        clobbered back to done. A crash between these two writes is
+        impossible since they share a commit -- reconciliation never sees a
+        converted master paired with a still-'running' job."""
+        with self._connection(commit=True) as conn:
+            revision = self._apply_conversion_result(
+                conn, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels, file_path
+            )
+            conn.execute(
+                "UPDATE conversion_jobs SET status = 'done', "
+                "updated_at = unixepoch() WHERE id = ? AND status = 'running'",
+                (job_id,),
+            )
+            return revision
+
+    def _apply_conversion_result(
+        self,
+        conn,
+        uuid_id: str,
+        codec: str,
+        bitrate_kbps: float,
+        sample_rate_hz: int,
+        channels: int,
+        file_path: Optional[str] = None,
+    ) -> int:
+        """Pure-DB sibling of ``_update_track_metadata``: writes only the
+        intrinsic audio fields a conversion (re)probed, plus ``file_path`` if
+        the extension changed. Shares ``_bump_track_revision`` but does no
+        artist/album reconciliation and no FTS update (codec/bitrate aren't
+        FTS-indexed) -- those columns are untouched by a conversion. These
+        columns are deliberately NOT part of ``EDITABLE_METADATA_COLUMNS``;
+        only ingestion or conversion may (re)write them."""
+        row = conn.execute(
+            "SELECT track_id FROM trackmetadata WHERE uuid_id = ?", (uuid_id,)
+        ).fetchone()
+        if row is None:
+            raise TrackNotFound(uuid_id)
+
+        conn.execute(
+            "UPDATE trackmetadata SET codec = ?, bitrate_kbps = ?, "
+            "sample_rate_hz = ?, channels = ? WHERE uuid_id = ?",
+            (codec, bitrate_kbps, sample_rate_hz, channels, uuid_id),
+        )
+        if file_path is not None:
+            conn.execute(
+                "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
+                (file_path, uuid_id),
+            )
+        return self._bump_track_revision(conn, uuid_id)
 
     def delete_track(self, uuid_id: str, timeout: float = 5) -> bool:
         try:
