@@ -54,7 +54,7 @@ class HealthResult {
   bool get isOk => status == HealthStatus.ok;
 }
 
-enum _HttpVerb { get, put, post, patch }
+enum _HttpVerb { get, put, post, patch, delete }
 
 class ApiClient {
   static final ApiClient instance = ApiClient._();
@@ -228,6 +228,33 @@ class ApiClient {
     );
   }
 
+  /// DELETE with no body. Defaults to **retrying** transient failures (unlike
+  /// PUT/POST/PATCH) because a DELETE is remove-pending-work, not mint-new-work
+  /// -- re-sending it after a dropped response is safe: the first attempt
+  /// either hadn't taken effect yet (retry finishes the job) or had already
+  /// taken effect (retry is a 200 no-op on an already-terminal/missing
+  /// resource), never a duplicate side effect the way a retried POST would be.
+  Future<Map<String, dynamic>> deleteJson(
+    List<String> pathSegments, {
+    Map<String, String>? headers,
+    bool retry = true,
+    RetryPolicy? policy,
+  }) {
+    return _request<Map<String, dynamic>>(
+      verb: _HttpVerb.delete,
+      pathSegments: pathSegments,
+      headers: headers,
+      decode: _handleJsonResponse,
+      acceptJson: true,
+      policy: _resolvePolicy(
+        explicit: policy,
+        retry: retry,
+        triggerOfflineHook: true,
+        defaultRetry: true,
+      ),
+    );
+  }
+
   /// POST with JSON body. Defaults to a **single attempt** — pass `retry: true`
   /// only when the endpoint is idempotent or advisory (failures are
   /// acceptable; duplicate execution does no harm). See the note at
@@ -392,6 +419,8 @@ class ApiClient {
             headers: mergedHeaders,
             body: encodedBody,
           );
+        case _HttpVerb.delete:
+          response = await _http.delete(uri, headers: mergedHeaders);
       }
       // JSON-decoding callers see character-length; getBytes overrides the
       // log via its decode callback if it needs byte-length. Keeping
@@ -435,6 +464,9 @@ class ApiClient {
           'Content-Type': 'application/json',
           ...?headers,
         };
+      case _HttpVerb.delete:
+        // DELETE has no body, so no Content-Type -- just Accept, same as GET.
+        return {'Accept': 'application/json', ...?headers};
     }
   }
 
@@ -448,6 +480,8 @@ class ApiClient {
         return 'POST';
       case _HttpVerb.patch:
         return 'PATCH';
+      case _HttpVerb.delete:
+        return 'DELETE';
     }
   }
 
