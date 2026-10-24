@@ -69,6 +69,22 @@ class Tracks extends Table {
   // "is the file at the requested quality?" idempotently even when the
   // backend served a passthrough that didn't match the requested bitrate.
   TextColumn get downloadedQuality => text().nullable()();
+  // The track's `revision` at the moment this download committed. Compared
+  // against the live `revision` to detect a stale download (the server
+  // master changed since -- e.g. a Phase 2 conversion -- but the local file
+  // is untouched). Null for files downloaded before this column existed.
+  IntColumn get downloadedAtRevision => integer().nullable()();
+  // The codec actually written to disk: the source codec when downloaded at
+  // `original` quality (no transcoding happens), else `aac` (every other
+  // quality preset transcodes to AAC today). Derived client-side at commit
+  // time from `quality` + the source `codec` -- not from a response header,
+  // since there isn't one; mirrors `downloadedBitrateKbps`'s "what actually
+  // landed on disk" intent, just computed instead of read off the wire.
+  TextColumn get downloadedCodec => text().nullable()();
+  // Re-arms (not a bool) when `revision` climbs again after a dismiss, so a
+  // SECOND server-side change re-surfaces the stale warning even if the
+  // first one was dismissed.
+  IntColumn get staleDismissedAtRevision => integer().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -653,7 +669,8 @@ const trackSelectColumns =
     'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
     'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
     't.revision, '
-    't.downloaded_bitrate_kbps, t.file_size_bytes, t.downloaded_quality';
+    't.downloaded_bitrate_kbps, t.file_size_bytes, t.downloaded_quality, '
+    't.downloaded_at_revision, t.downloaded_codec, t.stale_dismissed_at_revision';
 const _selectColumns = trackSelectColumns;
 
 // ── FTS5 virtual table creation statements ──────────────────────────────

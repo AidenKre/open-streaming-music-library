@@ -304,4 +304,71 @@ void main() {
       expect(ui.coverArtId, isNull);
     });
   });
+
+  group('isStaleDownload', () {
+    TrackUI downloaded({
+      int? revision,
+      int? downloadedAtRevision,
+      int? staleDismissedAtRevision,
+    }) => TrackUI(
+      uuidId: 'abc',
+      filePath: '/local/path/song.flac',
+      createdAt: 0,
+      lastUpdated: 0,
+      revision: revision,
+      duration: 1.0,
+      bitrateKbps: 320.0,
+      sampleRateHz: 44100,
+      channels: 2,
+      hasAlbumArt: false,
+      downloadedAtRevision: downloadedAtRevision,
+      staleDismissedAtRevision: staleDismissedAtRevision,
+    );
+
+    test('false when not downloaded', () {
+      final ui = TrackUI(
+        uuidId: 'abc',
+        createdAt: 0,
+        lastUpdated: 0,
+        revision: 5,
+        duration: 1.0,
+        bitrateKbps: 320.0,
+        sampleRateHz: 44100,
+        channels: 2,
+        hasAlbumArt: false,
+        downloadedAtRevision: 1,
+      );
+      expect(ui.isStaleDownload, isFalse);
+    });
+
+    test('false when revision or downloadedAtRevision is unknown', () {
+      expect(downloaded(revision: null, downloadedAtRevision: 1).isStaleDownload, isFalse);
+      expect(downloaded(revision: 5, downloadedAtRevision: null).isStaleDownload, isFalse);
+    });
+
+    test('false when revision has not advanced past downloadedAtRevision', () {
+      expect(downloaded(revision: 5, downloadedAtRevision: 5).isStaleDownload, isFalse);
+      expect(downloaded(revision: 4, downloadedAtRevision: 5).isStaleDownload, isFalse);
+    });
+
+    test('true when revision advanced past downloadedAtRevision', () {
+      expect(downloaded(revision: 6, downloadedAtRevision: 5).isStaleDownload, isTrue);
+    });
+
+    test('false once dismissed at the current revision', () {
+      expect(
+        downloaded(revision: 6, downloadedAtRevision: 5, staleDismissedAtRevision: 6)
+            .isStaleDownload,
+        isFalse,
+      );
+    });
+
+    test('re-arms when revision climbs again after a dismiss', () {
+      expect(
+        downloaded(revision: 7, downloadedAtRevision: 5, staleDismissedAtRevision: 6)
+            .isStaleDownload,
+        isTrue,
+      );
+    });
+  });
 }

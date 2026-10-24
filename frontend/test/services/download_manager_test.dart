@@ -784,6 +784,42 @@ void main() {
   );
 
   test(
+    'enqueueTracksAtQuality force:true re-downloads even when quality matches '
+    '(stale-refresh use case)',
+    () async {
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 320,
+      );
+
+      var requestCount = 0;
+      final manager = buildManager(
+        client: MockClient((_) async {
+          requestCount++;
+          return http.Response.bytes([1], 200);
+        }),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality(
+        [_track('abc', filePath: existingPath, downloadedBitrateKbps: 320)],
+        quality: '320',
+        force: true,
+      );
+      await _waitForFinish(manager);
+
+      expect(requestCount, 1, reason: 'force:true must trigger a real request');
+      final job = manager.snapshot().first;
+      expect(job.replacesFilePath, existingPath);
+      expect(job.isCompleted, isTrue);
+    },
+  );
+
+  test(
     'enqueueTracksAtQuality deletes stale file and re-downloads when bitrate '
     'differs',
     () async {

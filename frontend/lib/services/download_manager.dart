@@ -74,6 +74,9 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     downloadedBitrateKbps: Value(null),
     fileSizeBytes: Value(null),
     downloadedQuality: Value(null),
+    downloadedAtRevision: Value(null),
+    downloadedCodec: Value(null),
+    staleDismissedAtRevision: Value(null),
   );
 
   /// Test seam fired immediately before the partial→destination rename. Lets a
@@ -205,6 +208,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
           uuidId: t.uuidId,
           title: t.title,
           artist: t.artist,
+          codec: t.codec,
           albumId: t.albumId,
           artistId: t.artistId,
           quality: quality,
@@ -250,6 +254,12 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   Future<void> enqueueTracksAtQuality(
     List<TrackUI> tracks, {
     required String quality,
+    // Bypasses the "already at this quality" skip below. Used to force a
+    // redownload at the SAME quality when the file itself is known to be
+    // stale for a reason the quality check can't see (the server master
+    // changed, e.g. a Phase 2 conversion) -- not a new re-download pathway,
+    // just this one existing check made optional.
+    bool force = false,
   }) async {
     if (!isValidQuality(quality)) {
       throw ArgumentError('invalid download quality: $quality');
@@ -259,7 +269,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     final replacements = <String, String>{};
     for (final t in tracks) {
       final hasFile = t.filePath != null && await File(t.filePath!).exists();
-      if (hasFile && _qualityMatches(t, quality)) {
+      if (hasFile && !force && _qualityMatches(t, quality)) {
         continue; // already at the requested quality
       }
       if (hasFile) {

@@ -10,6 +10,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/quality_presets.dart';
 
 /// Why a single download attempt ended. Drives whether the caller marks the
 /// job completed, re-queues it for retry, or fails it.
@@ -75,6 +76,9 @@ class TrackDownloader {
     downloadedBitrateKbps: Value(null),
     fileSizeBytes: Value(null),
     downloadedQuality: Value(null),
+    downloadedAtRevision: Value(null),
+    downloadedCodec: Value(null),
+    staleDismissedAtRevision: Value(null),
   );
 
   /// Test seam fired immediately before the partial→destination rename. Lets
@@ -230,6 +234,11 @@ class TrackDownloader {
         generationCheck: generationCheck,
         downloadedBitrate: downloadedBitrate,
         downloadedQuality: job.quality,
+        // Original quality never transcodes, so the file keeps the source
+        // codec; every other preset transcodes to AAC today. See the
+        // `downloadedCodec` column's doc comment on `Tracks`.
+        downloadedCodec:
+            job.quality == originalQuality ? job.codec : 'aac',
         received: received,
         replacesFilePath: job.replacesFilePath,
       );
@@ -281,6 +290,7 @@ class TrackDownloader {
     required bool Function() generationCheck,
     required int? downloadedBitrate,
     required String downloadedQuality,
+    required String? downloadedCodec,
     required int received,
     String? replacesFilePath,
   }) async {
@@ -308,6 +318,14 @@ class TrackDownloader {
       return false;
     }
 
+    // Stamp the track's CURRENT revision (not one captured at enqueue time,
+    // which could be stale by the time a queued download actually commits)
+    // as the watermark this download is fresh as of.
+    final currentRevisionRow = await (_db.select(
+      _db.tracks,
+    )..where((t) => t.uuidId.equals(uuidId))).getSingleOrNull();
+    final currentRevision = currentRevisionRow?.revision;
+
     final updatedRows =
         await (_db.update(
           _db.tracks,
@@ -317,6 +335,9 @@ class TrackDownloader {
             downloadedBitrateKbps: Value(downloadedBitrate),
             fileSizeBytes: Value(received),
             downloadedQuality: Value(downloadedQuality),
+            downloadedAtRevision: Value(currentRevision),
+            downloadedCodec: Value(downloadedCodec),
+            staleDismissedAtRevision: const Value(null),
           ),
         );
     if (updatedRows == 0) {

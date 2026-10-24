@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -11,17 +12,28 @@ import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/track_downloader.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 
-Future<void> _insertTrack(AppDatabase db, String uuid) async {
+Future<void> _insertTrack(
+  AppDatabase db,
+  String uuid, {
+  int? revision,
+  String? codec,
+}) async {
   await db
       .into(db.tracks)
       .insert(
-        TracksCompanion.insert(uuidId: uuid, createdAt: 0, lastUpdated: 0),
+        TracksCompanion.insert(
+          uuidId: uuid,
+          createdAt: 0,
+          lastUpdated: 0,
+          revision: Value(revision),
+        ),
       );
   await db
       .into(db.trackmetadata)
       .insert(
         TrackmetadataCompanion.insert(
           uuidId: uuid,
+          codec: Value(codec),
           duration: 120,
           bitrateKbps: 320,
           sampleRateHz: 44100,
@@ -30,13 +42,15 @@ Future<void> _insertTrack(AppDatabase db, String uuid) async {
       );
 }
 
-DownloadJob _job(String uuidId, {String quality = '320'}) => DownloadJob(
-  uuidId: uuidId,
-  title: 'title',
-  artist: 'artist',
-  quality: quality,
-  status: const Queued(),
-);
+DownloadJob _job(String uuidId, {String quality = '320', String? codec}) =>
+    DownloadJob(
+      uuidId: uuidId,
+      title: 'title',
+      artist: 'artist',
+      codec: codec,
+      quality: quality,
+      status: const Queued(),
+    );
 
 void main() {
   late AppDatabase db;
@@ -104,6 +118,81 @@ void main() {
     expect(row.downloadedBitrateKbps, 320);
     expect(row.fileSizeBytes, 5);
   });
+
+  test(
+    'commit stamps downloadedAtRevision from the track\'s current revision',
+    () async {
+      await _insertTrack(db, 'abc', revision: 7, codec: 'flac');
+      final downloader = buildDownloader(
+        MockClient((req) async => http.Response.bytes([1, 2, 3], 200)),
+      );
+
+      await downloader.download(
+        job: _job('abc', quality: 'original', codec: 'flac'),
+        generationCheck: () => true,
+        onProgress: (_) {},
+        registerCanceller: (_) {},
+        unregisterCanceller: () {},
+      );
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.downloadedAtRevision, 7);
+    },
+  );
+
+  test(
+    'original quality keeps the source codec as downloadedCodec',
+    () async {
+      await _insertTrack(db, 'abc', revision: 1, codec: 'flac');
+      final downloader = buildDownloader(
+        MockClient((req) async => http.Response.bytes([1, 2, 3], 200)),
+      );
+
+      await downloader.download(
+        job: _job('abc', quality: 'original', codec: 'flac'),
+        generationCheck: () => true,
+        onProgress: (_) {},
+        registerCanceller: (_) {},
+        unregisterCanceller: () {},
+      );
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.downloadedCodec, 'flac');
+    },
+  );
+
+  test(
+    'a non-original quality always transcodes to aac regardless of source codec',
+    () async {
+      await _insertTrack(db, 'abc', revision: 1, codec: 'flac');
+      final downloader = buildDownloader(
+        MockClient(
+          (req) async => http.Response.bytes(
+            [1, 2, 3],
+            200,
+            headers: {'x-audio-bitrate-kbps': '192'},
+          ),
+        ),
+      );
+
+      await downloader.download(
+        job: _job('abc', quality: '192', codec: 'flac'),
+        generationCheck: () => true,
+        onProgress: (_) {},
+        registerCanceller: (_) {},
+        unregisterCanceller: () {},
+      );
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.downloadedCodec, 'aac');
+    },
+  );
 
   test(
     'generation-check turning false before headers cancels the download',

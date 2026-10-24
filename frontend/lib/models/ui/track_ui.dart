@@ -35,8 +35,29 @@ class TrackUI {
   // Distinct from `downloadedBitrateKbps`, which is the actual on-disk
   // bitrate — for passthrough downloads the two can differ.
   final String? downloadedQuality;
+  // The track's `revision` when this download committed. Compared against
+  // `revision` to detect a server-side master change (e.g. a conversion)
+  // the local file hasn't picked up yet.
+  final int? downloadedAtRevision;
+  // The codec actually written to disk (see the column's doc comment on
+  // `Tracks` for how it's derived).
+  final String? downloadedCodec;
+  // Re-arms when `revision` climbs past this value again after a dismiss.
+  final int? staleDismissedAtRevision;
 
   bool get isDownloaded => filePath != null;
+
+  /// A downloaded file whose server master has since changed (its revision
+  /// moved past the one this file was downloaded at) and the user hasn't
+  /// dismissed this particular change.
+  bool get isStaleDownload {
+    if (!isDownloaded || revision == null || downloadedAtRevision == null) {
+      return false;
+    }
+    if (revision! <= downloadedAtRevision!) return false;
+    if (staleDismissedAtRevision == null) return true;
+    return revision! > staleDismissedAtRevision!;
+  }
 
   String get subtitle =>
       [artist ?? 'Unknown Artist', album].whereType<String>().join(' \u2014 ');
@@ -68,6 +89,9 @@ class TrackUI {
     this.downloadedBitrateKbps,
     this.fileSizeBytes,
     this.downloadedQuality,
+    this.downloadedAtRevision,
+    this.downloadedCodec,
+    this.staleDismissedAtRevision,
   });
 
   static const Object _sentinel = Object();
@@ -77,6 +101,9 @@ class TrackUI {
     Object? downloadedBitrateKbps = _sentinel,
     Object? fileSizeBytes = _sentinel,
     Object? downloadedQuality = _sentinel,
+    Object? downloadedAtRevision = _sentinel,
+    Object? downloadedCodec = _sentinel,
+    Object? staleDismissedAtRevision = _sentinel,
   }) {
     return TrackUI(
       uuidId: uuidId,
@@ -111,6 +138,15 @@ class TrackUI {
       downloadedQuality: downloadedQuality == _sentinel
           ? this.downloadedQuality
           : downloadedQuality as String?,
+      downloadedAtRevision: downloadedAtRevision == _sentinel
+          ? this.downloadedAtRevision
+          : downloadedAtRevision as int?,
+      downloadedCodec: downloadedCodec == _sentinel
+          ? this.downloadedCodec
+          : downloadedCodec as String?,
+      staleDismissedAtRevision: staleDismissedAtRevision == _sentinel
+          ? this.staleDismissedAtRevision
+          : staleDismissedAtRevision as int?,
     );
   }
 
@@ -155,6 +191,10 @@ class TrackUI {
       downloadedBitrateKbps: row.readNullable<int>('downloaded_bitrate_kbps'),
       fileSizeBytes: row.readNullable<int>('file_size_bytes'),
       downloadedQuality: row.readNullable<String>('downloaded_quality'),
+      downloadedAtRevision: row.readNullable<int>('downloaded_at_revision'),
+      downloadedCodec: row.readNullable<String>('downloaded_codec'),
+      staleDismissedAtRevision:
+          row.readNullable<int>('stale_dismissed_at_revision'),
     );
   }
 
@@ -186,6 +226,9 @@ class TrackUI {
       downloadedBitrateKbps: track.downloadedBitrateKbps,
       fileSizeBytes: track.fileSizeBytes,
       downloadedQuality: track.downloadedQuality,
+      downloadedAtRevision: track.downloadedAtRevision,
+      downloadedCodec: track.downloadedCodec,
+      staleDismissedAtRevision: track.staleDismissedAtRevision,
     );
   }
 }
