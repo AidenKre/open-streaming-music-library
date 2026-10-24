@@ -15,13 +15,28 @@ from app.services.transcoder import (
 )
 
 
+class _FakeProc:
+    def __init__(self, returncode, stderr=b"", output_path=None):
+        self.returncode = returncode
+        self._stderr = stderr
+        self._output_path = output_path
+        self.pid = 4242
+
+    def communicate(self, timeout=None):
+        if self._output_path is not None:
+            self._output_path.write_bytes(b"fake-audio")
+        return (b"", self._stderr)
+
+    def kill(self):
+        pass
+
+
 def _fake_ffmpeg_success(cmd, **kwargs):
-    Path(cmd[-1]).write_bytes(b"fake-audio")
-    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+    return _FakeProc(returncode=0, output_path=Path(cmd[-1]))
 
 
 def _fake_ffmpeg_failure(cmd, **kwargs):
-    return subprocess.CompletedProcess(args=cmd, returncode=1, stdout=b"", stderr=b"boom")
+    return _FakeProc(returncode=1, stderr=b"boom")
 
 
 class TestTranscode:
@@ -37,7 +52,7 @@ class TestTranscode:
         source = tmp_path / "src.wav"
         source.write_bytes(b"x")
         dest = tmp_path / "dst.flac"
-        with patch("app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_success):
+        with patch("app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success):
             result = transcode(source, dest, "flac")
         assert result == TranscodeResult(ok=True)
         assert dest.exists()
@@ -46,7 +61,7 @@ class TestTranscode:
         source = tmp_path / "src.flac"
         source.write_bytes(b"x")
         dest = tmp_path / "dst.m4a"
-        with patch("app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_success):
+        with patch("app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success):
             result = transcode(source, dest, "aac", bitrate_kbps=192)
         assert result.ok is True
         assert dest.exists()
@@ -56,7 +71,7 @@ class TestTranscode:
         source = tmp_path / "src.flac"
         source.write_bytes(b"x")
         dest = tmp_path / "dst.mp3"
-        with patch("app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_failure):
+        with patch("app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_failure):
             result = transcode(source, dest, "mp3", bitrate_kbps=320)
         assert result.ok is False
         assert "boom" in result.stderr
@@ -66,7 +81,7 @@ class TestTranscode:
         source.write_bytes(b"x")
         dest = tmp_path / "dst.m4a"
         with patch(
-            "app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_success
+            "app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success
         ) as run:
             transcode(source, dest, "aac", bitrate_kbps=192, strip_video=True)
         cmd = run.call_args[0][0]
@@ -77,7 +92,7 @@ class TestTranscode:
         source.write_bytes(b"x")
         dest = tmp_path / "dst.m4a"
         with patch(
-            "app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_success
+            "app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success
         ) as run:
             transcode(source, dest, "aac", bitrate_kbps=192, strip_video=False)
         cmd = run.call_args[0][0]
@@ -89,7 +104,7 @@ class TestTranscode:
         dest = tmp_path / "dst.flac"
         params = SourceAudioParams(sample_fmt="s32", sample_rate_hz=48000, channels=2)
         with patch(
-            "app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_success
+            "app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success
         ) as run:
             transcode(source, dest, "flac", source_params=params)
         cmd = run.call_args[0][0]
@@ -102,7 +117,7 @@ class TestTranscode:
         source.write_bytes(b"x")
         dest = tmp_path / "dst.flac"
         with patch(
-            "app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_success
+            "app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success
         ) as run:
             transcode(source, dest, "flac")
         cmd = run.call_args[0][0]
@@ -117,7 +132,7 @@ class TestTranscodeToAacM4a:
         source.write_bytes(b"x")
         dest = tmp_path / "dst.m4a"
         with patch(
-            "app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_success
+            "app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success
         ) as run:
             ok = transcode_to_aac_m4a(source, dest, 192)
         assert ok is True
@@ -129,7 +144,7 @@ class TestTranscodeToAacM4a:
         source = tmp_path / "src.flac"
         source.write_bytes(b"x")
         dest = tmp_path / "dst.m4a"
-        with patch("app.services.ffmpeg_runner.subprocess.run", side_effect=_fake_ffmpeg_failure):
+        with patch("app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_failure):
             ok = transcode_to_aac_m4a(source, dest, 192)
         assert ok is False
 

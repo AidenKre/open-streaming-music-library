@@ -1,14 +1,51 @@
 import json
 import subprocess
 from pathlib import Path
+from typing import Any, Optional
 
+from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track_meta_data import TrackMetaData
-from app.services.ffmpeg_runner import FfmpegError, run_ffmpeg, scaled_timeout
+from app.services.ffmpeg_runner import (
+    FfmpegError,
+    FfmpegProcessRegistry,
+    run_ffmpeg,
+    scaled_timeout,
+)
+
+# DB column -> ffmpeg metadata key, for the columns whose tag name differs —
+# derived from the single field-spec table.
+_FFMPEG_TAG_KEY = {
+    spec.key: spec.ffmpeg_key for spec in EDIT_FIELD_SPECS if spec.ffmpeg_key
+}
 
 
 class TagWriteError(Exception):
     """Raised when writing tags to a master file fails (ffmpeg non-zero exit,
     timeout, or the re-probe verification did not confirm the change)."""
+
+
+def build_ffmpeg_tags(fields: dict) -> dict[str, Optional[str]]:
+    """Map DB columns to ffmpeg metadata keys for the columns present in
+    ``fields``: a present ``None`` clears the tag, an absent column leaves the
+    file's tag untouched (the caller decides which columns to reconcile).
+    ``year``/``date`` both target the file's ``date`` tag — an explicit
+    ``date`` wins, else ``year``. Shared by the PATCH tag-reconcile path and
+    Phase 2's conversion tag-baking (which reconciles every editable column,
+    not just the ones a PATCH touched)."""
+    tags: dict[str, Optional[str]] = {}
+    for col in ("title", "artist", "album", "album_artist", "genre"):
+        if col in fields:
+            tags[col] = fields[col]
+    for col in ("track_number", "disc_number"):
+        if col in fields:
+            v = fields[col]
+            tags[_FFMPEG_TAG_KEY[col]] = str(v) if v is not None else None
+    if "date" in fields:
+        tags["date"] = fields["date"]
+    elif "year" in fields:
+        v = fields["year"]
+        tags["date"] = str(v) if v is not None else None
+    return tags
 
 
 def is_wav(file_path: Path) -> bool:
@@ -18,7 +55,13 @@ def is_wav(file_path: Path) -> bool:
     return file_path.suffix.lower() == ".wav"
 
 
-def write_metadata_tags(source: Path, dest: Path, tags: dict[str, str | None]) -> None:
+def write_metadata_tags(
+    source: Path,
+    dest: Path,
+    tags: dict[str, str | None],
+    registry: Optional[FfmpegProcessRegistry] = None,
+    job_id: Optional[Any] = None,
+) -> None:
     """Copy ``source`` to ``dest`` with ``tags`` applied, audio bytes untouched.
 
     ``tags`` maps ffmpeg metadata keys to values; ``None`` (or "") clears the
@@ -27,6 +70,8 @@ def write_metadata_tags(source: Path, dest: Path, tags: dict[str, str | None]) -
     the named tags are overwritten. Because the audio bytes are unchanged, the
     ``(uuid, quality)``-keyed encoded cache stays valid across an edit. Verifies
     by re-probing ``dest`` and raises ``TagWriteError`` on any failure.
+    ``registry``/``job_id`` (both required together) allow a conversion job's
+    tag-baking pass to be cancelled — see ``FfmpegProcessRegistry``.
     """
     cmd = [
         "ffmpeg",
@@ -43,7 +88,10 @@ def write_metadata_tags(source: Path, dest: Path, tags: dict[str, str | None]) -
     cmd.append(str(dest))
 
     try:
-        run_ffmpeg(cmd, dest, timeout=scaled_timeout(source))
+        run_ffmpeg(
+            cmd, dest, timeout=scaled_timeout(source),
+            registry=registry, job_id=job_id,
+        )
     except FfmpegError as e:
         raise TagWriteError(str(e)) from e
 

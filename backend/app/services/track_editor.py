@@ -9,9 +9,8 @@ from app.database.database import (
     TrackNotFound,
     normalize_edit_fields,
 )
-from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track import Track
-from app.services.metadata import is_wav, write_metadata_tags
+from app.services.metadata import build_ffmpeg_tags, is_wav, write_metadata_tags
 from app.services.organizer import (
     move_file,
     prune_empty_dirs,
@@ -19,38 +18,10 @@ from app.services.organizer import (
 )
 from app.services.track_edit import WriteMode
 
-# DB column -> ffmpeg metadata key, for the columns whose tag name differs —
-# derived from the single field-spec table.
-_FFMPEG_TAG_KEY = {
-    spec.key: spec.ffmpeg_key for spec in EDIT_FIELD_SPECS if spec.ffmpeg_key
-}
-
 
 class MasterWriteError(Exception):
     """A ``db_and_master`` edit could not place the master on disk (staging or
     move failed). The DB is left unchanged so the caller can surface a 5xx."""
-
-
-def _build_ffmpeg_tags(fields: dict) -> dict[str, Optional[str]]:
-    """Map DB columns to ffmpeg metadata keys for the columns present in
-    ``fields``: a present ``None`` clears the tag, an absent column leaves the
-    file's tag untouched (the caller decides which columns to reconcile).
-    ``year``/``date`` both target the file's ``date`` tag — an explicit
-    ``date`` wins, else ``year``."""
-    tags: dict[str, Optional[str]] = {}
-    for col in ("title", "artist", "album", "album_artist", "genre"):
-        if col in fields:
-            tags[col] = fields[col]
-    for col in ("track_number", "disc_number"):
-        if col in fields:
-            v = fields[col]
-            tags[_FFMPEG_TAG_KEY[col]] = str(v) if v is not None else None
-    if "date" in fields:
-        tags["date"] = fields["date"]
-    elif "year" in fields:
-        v = fields["year"]
-        tags["date"] = str(v) if v is not None else None
-    return tags
 
 
 class TrackEditor:
@@ -137,7 +108,7 @@ class TrackEditor:
             if col in fields or getattr(merged, col) is not None
         }
         temp = self._staging / f"{uuid_id}{source.suffix}"
-        write_metadata_tags(source, temp, _build_ffmpeg_tags(reconcile_fields))
+        write_metadata_tags(source, temp, build_ffmpeg_tags(reconcile_fields))
 
         if dest == source:
             rev = self._inplace(uuid_id, fields, base_revision, source, temp)

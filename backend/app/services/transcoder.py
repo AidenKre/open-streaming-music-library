@@ -8,9 +8,14 @@ entirely.
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import FrozenSet, Optional
+from typing import Any, FrozenSet, Optional
 
-from app.services.ffmpeg_runner import FfmpegError, run_ffmpeg, scaled_timeout
+from app.services.ffmpeg_runner import (
+    FfmpegError,
+    FfmpegProcessRegistry,
+    run_ffmpeg,
+    scaled_timeout,
+)
 
 
 # Quality presets. The "original" preset means do not transcode.
@@ -67,6 +72,11 @@ _CODEC_FLAGS: dict[str, tuple[list[str], bool]] = {
     "mp3": (["-c:a", "libmp3lame", "-f", "mp3"], True),
 }
 
+# Codecs transcode() can actually produce. Deliberately narrower than
+# media_types.CODEC_TO_EXT, which also has wav/pcm_* entries for passthrough
+# MIME lookups — WAV is source-only, never a conversion target.
+SUPPORTED_TARGET_CODECS: FrozenSet[str] = frozenset(_CODEC_FLAGS.keys())
+
 # ffmpeg encoder name (as printed by `ffmpeg -encoders`) -> the codec name we
 # key everything else by. libmp3lame/alac are build-dependent.
 _ENCODER_NAME_TO_CODEC: dict[str, str] = {
@@ -95,13 +105,17 @@ def transcode(
     bitrate_kbps: Optional[int] = None,
     source_params: Optional[SourceAudioParams] = None,
     strip_video: bool = False,
+    registry: Optional[FfmpegProcessRegistry] = None,
+    job_id: Optional[Any] = None,
 ) -> TranscodeResult:
     """Transcode ``source`` to ``target_codec``, writing ``dest``.
 
     Writes to a temp file first and atomically renames onto ``dest`` so a
     partial output is never visible. ``strip_video`` should be True for the
     streaming path (which never wants embedded cover art in the response) and
-    False for conversion (which must carry cover art through).
+    False for conversion (which must carry cover art through). ``registry``/
+    ``job_id`` (both required together) let a conversion job be cancelled
+    mid-transcode — see ``FfmpegProcessRegistry``.
     """
     if target_codec not in _CODEC_FLAGS:
         raise ValueError(f"unsupported target codec: {target_codec}")
@@ -125,7 +139,10 @@ def transcode(
 
     try:
         # Shared runner: size-scaled timeout + stderr diagnostics.
-        run_ffmpeg(cmd, tmp_path, timeout=scaled_timeout(source))
+        run_ffmpeg(
+            cmd, tmp_path, timeout=scaled_timeout(source),
+            registry=registry, job_id=job_id,
+        )
     except FfmpegError as e:
         return TranscodeResult(ok=False, stderr=e.stderr)
 
