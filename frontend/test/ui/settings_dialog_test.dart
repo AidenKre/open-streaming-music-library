@@ -204,6 +204,23 @@ void main() {
     expect(prefs.getString('settings.downloadQuality'), '320');
   });
 
+  testWidgets('notify-stale-downloads switch defaults on and toggles prefs',
+      (tester) async {
+    final prefs = await SharedPreferences.getInstance();
+    await tester.pumpWidget(_wrap(prefs));
+    await tester.pumpAndSettle();
+
+    final switchFinder = find.byType(SwitchListTile);
+    expect(switchFinder, findsOneWidget);
+    expect(tester.widget<SwitchListTile>(switchFinder).value, isTrue);
+
+    await tester.tap(switchFinder);
+    await tester.pumpAndSettle();
+
+    expect(prefs.getBool('settings.notifyStaleDownloads'), false);
+    expect(tester.widget<SwitchListTile>(switchFinder).value, isFalse);
+  });
+
   testWidgets('Disconnect button is hidden when no callback is provided', (
     tester,
   ) async {

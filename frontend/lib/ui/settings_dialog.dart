@@ -86,6 +86,19 @@ class SettingsDialog extends ConsumerWidget {
               'existing downloads stay as-is.',
               style: TextStyle(fontSize: 12),
             ),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Notify about outdated downloads'),
+              subtitle: const Text(
+                'Warn when a server-side change makes a local download '
+                'stale (e.g. a master-type conversion).',
+              ),
+              value: settings.notifyStaleDownloads,
+              onChanged: (value) => ref
+                  .read(settingsProvider.notifier)
+                  .setNotifyStaleDownloads(value),
+            ),
           ],
         ),
       ),

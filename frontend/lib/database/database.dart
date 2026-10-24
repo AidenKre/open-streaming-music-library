@@ -1011,6 +1011,20 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     return row?.writeMode;
   }
 
+  /// Dismisses the stale-download warning for [uuidId] as of its CURRENT
+  /// revision -- stamping `staleDismissedAtRevision` (not a bool) so the
+  /// warning re-arms if the server master changes again later. A no-op for
+  /// an unknown uuid.
+  Future<void> dismissStaleDownload(String uuidId) async {
+    final row = await (select(tracks)
+          ..where((t) => t.uuidId.equals(uuidId)))
+        .getSingleOrNull();
+    if (row == null) return;
+    await (update(tracks)..where((t) => t.uuidId.equals(uuidId))).write(
+      TracksCompanion(staleDismissedAtRevision: Value(row.revision)),
+    );
+  }
+
   /// Live counts of outstanding edits for the pending-edits surface.
   /// `take_server` rows are excluded at the source: they are resolution
   /// markers awaiting their refetch, not user-visible outbox rows.

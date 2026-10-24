@@ -1862,6 +1862,28 @@ void main() {
     });
   });
 
+  group('dismissStaleDownload', () {
+    test('stamps staleDismissedAtRevision from the track\'s current revision',
+        () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision) "
+        "VALUES ('u1', 0, 0, 9, '/x.flac', 5)",
+      );
+
+      await db.dismissStaleDownload('u1');
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('u1'))).getSingle();
+      expect(row.staleDismissedAtRevision, 9);
+    });
+
+    test('is a no-op for an unknown uuid', () async {
+      await db.dismissStaleDownload('does-not-exist'); // must not throw
+    });
+  });
+
   group('reactive browse', () {
     Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
 
