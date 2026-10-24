@@ -1226,7 +1226,7 @@ class TestAppInfo:
         track = body["entities"]["track"]
         keys = [f["key"] for f in track["fields"]]
         assert keys == EDITABLE_METADATA_COLUMNS  # advertised == accepted
-        assert track["actions"] == []  # no actions in Phase 1
+        assert track["actions"] == ["convert"]  # Phase 2 master-type conversion
         assert all(f["editable"] for f in track["fields"])
 
 

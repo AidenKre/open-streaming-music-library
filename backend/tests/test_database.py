@@ -3762,3 +3762,42 @@ class TestConversionJobs:
             assert version == Database.LATEST_SCHEMA_VERSION == 7
             # Table must actually exist and be queryable, not just declared.
             conn.execute("SELECT * FROM conversion_jobs LIMIT 0")
+
+    def test_list_conversion_jobs__filters_by_uuid_and_status(self, tmp_path):
+        database = self._db(tmp_path)
+        track_a = self._add(database, tmp_path / "a.flac")
+        track_b = self._add(database, tmp_path / "b.flac")
+        job_a1 = database.insert_conversion_job(track_a.uuid_id, "aac", "m4a", 192)
+        job_a2 = database.insert_conversion_job(track_a.uuid_id, "mp3", "mp3", 320)
+        job_b1 = database.insert_conversion_job(track_b.uuid_id, "flac", "flac", None)
+        database.mark_conversion_job_running(job_a2)
+
+        by_uuid, _ = database.list_conversion_jobs(uuid_id=track_a.uuid_id)
+        assert {j["id"] for j in by_uuid} == {job_a1, job_a2}
+
+        by_status, _ = database.list_conversion_jobs(status="running")
+        assert {j["id"] for j in by_status} == {job_a2}
+
+        all_jobs, cursor = database.list_conversion_jobs()
+        assert {j["id"] for j in all_jobs} == {job_a1, job_a2, job_b1}
+        assert cursor is None
+
+    def test_list_conversion_jobs__pagination__cursor_advances_until_exhausted(self, tmp_path):
+        database = self._db(tmp_path)
+        track = self._add(database, tmp_path / "a.flac")
+        job_ids = [
+            database.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+            for _ in range(5)
+        ]
+
+        page1, cursor1 = database.list_conversion_jobs(after_id=0, limit=2)
+        assert [j["id"] for j in page1] == job_ids[0:2]
+        assert cursor1 == job_ids[1]
+
+        page2, cursor2 = database.list_conversion_jobs(after_id=cursor1, limit=2)
+        assert [j["id"] for j in page2] == job_ids[2:4]
+        assert cursor2 == job_ids[3]
+
+        page3, cursor3 = database.list_conversion_jobs(after_id=cursor2, limit=2)
+        assert [j["id"] for j in page3] == job_ids[4:5]
+        assert cursor3 is None

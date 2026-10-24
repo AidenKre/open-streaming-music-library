@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Flag, auto
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from app.models.album import Album
 from app.models.artist import Artist
@@ -1184,6 +1184,43 @@ class Database:
                 "updated_at FROM conversion_jobs WHERE status = 'running'"
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def list_conversion_jobs(
+        self,
+        *,
+        uuid_id: Optional[str] = None,
+        status: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        after_id: int = 0,
+        limit: int = 50,
+    ) -> tuple[List[dict], Optional[int]]:
+        """Jobs with id > after_id (ascending), optionally filtered. Returns
+        (jobs, next_cursor) -- next_cursor is the highest id consumed when the
+        page filled exactly `limit` (more rows may exist), else None. Mirrors
+        get_changes' "page-fullness implies more" cursor convention."""
+        clauses = ["id > ?"]
+        params: List[Any] = [after_id]
+        if uuid_id is not None:
+            clauses.append("uuid_id = ?")
+            params.append(uuid_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if batch_id is not None:
+            clauses.append("batch_id = ?")
+            params.append(batch_id)
+        where = " AND ".join(clauses)
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, uuid_id, target_codec, target_container, "
+                "target_bitrate, status, error_text, batch_id, created_at, "
+                f"updated_at FROM conversion_jobs WHERE {where} "
+                "ORDER BY id ASC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        jobs = [dict(row) for row in rows]
+        next_cursor = jobs[-1]["id"] if len(jobs) == limit else None
+        return jobs, next_cursor
 
     def mark_conversion_job_running(self, job_id: int) -> bool:
         """Transition queued->running. Returns False if the job already lost

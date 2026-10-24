@@ -30,13 +30,18 @@ from app.models import (
     AppInfoResponse,
     ChangeEntry,
     ClientTrack,
+    ConversionCapabilities,
+    ConversionTargetInfo,
+    DeleteJobResponse,
     EntityInfo,
     FieldDescriptor,
     GetAlbumsResponse,
     GetArtistsResponse,
     GetChangesResponse,
+    GetJobsResponse,
     GetSearchResponse,
     GetTracksResponse,
+    JobResponse,
     PatchTrackResponse,
     WarmRequest,
     WarmResponse,
@@ -45,14 +50,20 @@ from app.models import (
     SetQualityResponse,
     Track,
 )
-from app.core.media_types import CODEC_MIME, MIME_EXTENSION
+from app.core.media_types import CODEC_MIME, MIME_EXTENSION, is_lossless
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.services.metadata import TagWriteError
 from app.services.track_edit import (
     TrackPatchRequest,
     WriteMode,
 )
-from app.services.conversion import ConversionOrchestrator, reconcile_conversion_jobs
+from app.services.conversion import (
+    ConversionOrchestrator,
+    InsufficientDiskSpace,
+    MasterNotFound,
+    NoOpConversion,
+    reconcile_conversion_jobs,
+)
 from app.services.track_editor import (
     MasterWriteError,
     TrackEditor,
@@ -71,6 +82,7 @@ from app.services import (
     Organizer,
     OrganizerContext,
     ORIGINAL_QUALITY,
+    QUALITY_BITRATES_KBPS,
     normalize_quality,
     probe_available_encoders,
 )
@@ -79,6 +91,8 @@ from app.services.encoder_coordinator import (
     PrefetchOutcome,
     SourceUnavailable,
 )
+from app.services.job_request import PostJobRequest
+from app.services.transcoder import SUPPORTED_TARGET_CODECS
 
 
 @asynccontextmanager
@@ -1033,15 +1047,33 @@ def set_quality_setting(request: SetQualityRequest):
 
 @app.get("/app/info", response_model=AppInfoResponse)
 def get_app_info():
-    """App-level bootstrap: per-entity editable fields + actions. Backed by the
-    same edit allowlist that gates PATCH, so advertised == accepted. Cached
-    client-side; later phases extend this rather than add endpoints."""
+    """App-level bootstrap: per-entity editable fields + actions, plus a
+    ``conversion`` block (Phase 2). Backed by the same allowlists that gate
+    PATCH/POST /jobs, so advertised == accepted. Cached client-side; later
+    phases extend this rather than add endpoints.
+
+    The per-track *allowed* target list (which of these the no-op guard
+    would reject for a given track's source codec) is deliberately NOT
+    computed here -- it's derived live, client-side, from this global list
+    + the track's own (already-synced) source codec, so it stays out of this
+    cached blob."""
     track_fields = [
         FieldDescriptor(key=spec.key, label=spec.label, valueType=spec.value_type)
         for spec in EDIT_FIELD_SPECS
     ]
+    available_encoders = getattr(app.state, "available_encoders", frozenset())
+    targets = [
+        ConversionTargetInfo(codec=codec, is_lossless=is_lossless(codec))
+        for codec in sorted(SUPPORTED_TARGET_CODECS & available_encoders)
+    ]
     return AppInfoResponse(
-        entities={"track": EntityInfo(fields=track_fields, actions=[])}
+        entities={"track": EntityInfo(fields=track_fields, actions=["convert"])},
+        conversion=ConversionCapabilities(
+            targets=targets,
+            bitrate_presets=sorted(
+                (int(b) for b in QUALITY_BITRATES_KBPS.values()), reverse=True
+            ),
+        ),
     )
 
 
@@ -1105,6 +1137,103 @@ def patch_track(uuid_id: str, request: TrackPatchRequest):
     return PatchTrackResponse(
         uuid_id=uuid_id, revision=new_revision, master_written=master_written
     )
+
+
+def _job_to_response(job: dict) -> JobResponse:
+    return JobResponse(
+        job_id=job["id"],
+        uuid_id=job["uuid_id"],
+        target_codec=job["target_codec"],
+        target_container=job["target_container"],
+        target_bitrate=job["target_bitrate"],
+        status=job["status"],
+        error_text=job["error_text"],
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+    )
+
+
+@app.post("/jobs", response_model=JobResponse)
+def post_job(request: PostJobRequest):
+    """Create an async job. Only ``type="conversion"`` exists today (the
+    generic ``/jobs`` resource is forward-looking per the doc so future
+    bulk/upload job types add zero endpoints). Non-idempotent (mints a job)
+    -> single-attempt; an orphaned job from a timed-out-but-succeeded POST is
+    recovered via ``GET /jobs``."""
+    orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
+    database: Database = cast(Database, app.state.database)
+
+    try:
+        job_id = orchestrator.enqueue(
+            uuid_id=request.uuid_id,
+            target_codec=request.params.target_codec,
+            target_bitrate_kbps=request.params.target_bitrate_kbps,
+            base_revision=request.base_revision,
+        )
+    except TrackNotFound:
+        raise HTTPException(status_code=404, detail="Track not found")
+    except MasterNotFound:
+        raise HTTPException(status_code=404, detail="Master file not found")
+    except RevisionConflict as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "current_revision": e.current_revision,
+            },
+        )
+    except NoOpConversion:
+        raise HTTPException(
+            status_code=422,
+            detail="Target codec is the same lossless codec as the source",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except InsufficientDiskSpace as e:
+        raise HTTPException(status_code=507, detail=str(e))
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            raise HTTPException(status_code=503, detail="Database busy, retry")
+        raise
+
+    job = database.get_conversion_job(job_id)
+    return _job_to_response(job)
+
+
+@app.get("/jobs", response_model=GetJobsResponse)
+def get_jobs(
+    uuid_id: Optional[str] = None,
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    cursor: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Filtered, cursored job collection -- replaces both a global and a
+    per-uuid conversion list (the per-uuid variant is just ``?uuid_id=``).
+    ``cursor``/``nextCursor`` are job ids (ascending), mirroring
+    ``GET /changes``' int-cursor convention. ``type`` only accepts
+    ``"conversion"`` today (the only job type that exists)."""
+    if type is not None and type != "conversion":
+        raise HTTPException(status_code=422, detail=f"unsupported job type: {type}")
+
+    database: Database = cast(Database, app.state.database)
+    jobs, next_cursor = database.list_conversion_jobs(
+        uuid_id=uuid_id, status=status, batch_id=batch_id, after_id=cursor, limit=limit,
+    )
+    return GetJobsResponse(
+        data=[_job_to_response(job) for job in jobs], nextCursor=next_cursor
+    )
+
+
+@app.delete("/jobs/{job_id}", response_model=DeleteJobResponse)
+def delete_job(job_id: int):
+    """Cancel a queued or running job. Idempotent: a no-op (``cancelled:
+    false``) for an already-terminal or unknown job_id, never a 404 -- the
+    doc frames DELETE as remove-pending-work, not resource deletion."""
+    orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
+    cancelled = orchestrator.cancel(job_id)
+    return DeleteJobResponse(cancelled=cancelled)
 
 
 @app.get("/")
