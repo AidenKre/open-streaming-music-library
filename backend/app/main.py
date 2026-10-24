@@ -52,6 +52,7 @@ from app.services.track_edit import (
     TrackPatchRequest,
     WriteMode,
 )
+from app.services.conversion import ConversionOrchestrator, reconcile_conversion_jobs
 from app.services.track_editor import (
     MasterWriteError,
     TrackEditor,
@@ -158,6 +159,10 @@ def startup_event():
     )
     # Finish/revert any edit interrupted by a crash before serving requests.
     reconcile_journal(database, settings.music_library_dir)
+    # No worker thread survives a restart -- any conversion job still
+    # "running" is orphaned; independent of the journal pass above (a crash
+    # before the journal was even written leaves no journal row at all).
+    reconcile_conversion_jobs(database)
 
     # Set up cover art manager
     cover_art_dir = settings.app_data_dir / "cover_art"
@@ -232,6 +237,20 @@ def startup_event():
     # (libmp3lame/alac are build-dependent). Not consumed anywhere yet — the
     # conversion bootstrap block and job-enqueue guard read it once they land.
     app.state.available_encoders = probe_available_encoders()
+
+    # Master-type conversion orchestration (Phase 2). Shares the staging dir,
+    # per-uuid TrackLocks, and encoder pool with the edit path above -- no
+    # new subsystems. Nothing calls .enqueue()/.cancel() yet (no API route).
+    app.state.conversion_orchestrator = ConversionOrchestrator(
+        database=database,
+        music_library_dir=settings.music_library_dir,
+        staging_dir=staging_dir,
+        track_locks=app.state.track_locks,
+        encoder_coordinator=encoder_coordinator,
+        cache=encoded_cache,
+        default_cache=default_cache,
+        available_encoders=app.state.available_encoders,
+    )
 
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
