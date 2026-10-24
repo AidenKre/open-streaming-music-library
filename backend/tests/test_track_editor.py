@@ -549,3 +549,48 @@ class TestReconcileJournal:
             "reverted crash-recovered relocation"
         )
         assert db.list_journal_entries() == []
+
+    def test_convert_with_new_path_finishes_like_relocate(self, tmp_path):
+        # A conversion that changed the extension (e.g. .flac -> .m4a) and
+        # committed should behave exactly like a finished relocate.
+        db = _db(tmp_path)
+        old = tmp_path / "old.flac"; old.write_bytes(b"old")
+        new = tmp_path / "new.m4a"; new.write_bytes(b"new")
+        _add_track(db, new, "T", "Art")  # DB already points at new_path
+        uuid = db.get_tracks()[0].uuid_id
+        db.insert_journal_entry("convert", uuid, str(old), str(new), None)
+
+        reconcile_journal(db, tmp_path)
+
+        assert not old.exists()
+        assert new.exists()
+        assert db.list_journal_entries() == []
+
+    def test_convert_with_new_path_reverts_when_db_not_advanced(self, tmp_path):
+        db = _db(tmp_path)
+        old = tmp_path / "old.flac"; old.write_bytes(b"old")
+        new = tmp_path / "new.m4a"; new.write_bytes(b"new")
+        _add_track(db, old, "T", "Art")  # DB still points at old_path
+        uuid = db.get_tracks()[0].uuid_id
+        db.insert_journal_entry("convert", uuid, str(old), str(new), None)
+
+        reconcile_journal(db, tmp_path)
+
+        assert old.exists()
+        assert not new.exists()
+        assert db.list_journal_entries() == []
+
+    def test_convert_same_path_redoes_pending_replace_like_inplace(self, tmp_path):
+        # A same-codec re-encode (path unchanged) behaves like inplace.
+        db = _db(tmp_path)
+        target = tmp_path / "song.mp3"; target.write_bytes(b"stale")
+        temp = tmp_path / "temp.mp3"; temp.write_bytes(b"fresh")
+        _add_track(db, target, "T", "Art")
+        uuid = db.get_tracks()[0].uuid_id
+        db.insert_journal_entry("convert", uuid, str(target), None, str(temp))
+
+        reconcile_journal(db, tmp_path)
+
+        assert target.read_bytes() == b"fresh"
+        assert not temp.exists()
+        assert db.list_journal_entries() == []

@@ -195,6 +195,15 @@ def _reconcile_one(database: Database, entry: dict, music_library_dir: Path) -> 
         _reconcile_relocate(database, entry, music_library_dir)
     elif intent == "inplace":
         _reconcile_inplace(database, entry)
+    elif intent == "convert":
+        # A conversion's extension change (e.g. .flac -> .m4a) is physically
+        # the same situation _reconcile_relocate already handles; a
+        # same-codec re-encode (path unchanged) is exactly _reconcile_inplace.
+        # No separate reconcile body needed.
+        if entry["new_path"] and entry["new_path"] != entry["old_path"]:
+            _reconcile_relocate(database, entry, music_library_dir)
+        else:
+            _reconcile_inplace(database, entry)
     else:
         # Unknown intent (shouldn't happen) — drop it so it can't loop forever.
         database.delete_journal_entry(entry["id"])
