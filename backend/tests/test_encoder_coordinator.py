@@ -458,3 +458,37 @@ class TestPersistAndSetDefaultQuality:
         # be impossible.
         assert persisted_store["q"] == c.default_quality
         assert c.default_quality in qualities
+
+
+class TestSubmitConversion:
+    def test_submit_conversion__runs_fn_on_shared_pool(self, tmp_path):
+        c = _make_coordinator(tmp_path)
+        done = threading.Event()
+        received = {}
+
+        def fn(job_id: int) -> None:
+            received["job_id"] = job_id
+            done.set()
+
+        c.submit_conversion(fn, 42)
+
+        assert done.wait(timeout=5)
+        assert received["job_id"] == 42
+        c._executor.shutdown(wait=True)
+
+    def test_submit_conversion__uses_priority_conversion(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        from app.services.encoder_coordinator import _PriorityPool
+
+        c = _make_coordinator(tmp_path)
+        c._executor.submit = MagicMock()
+
+        def convert_fn(job_id: int) -> None:
+            pass
+
+        c.submit_conversion(convert_fn, 7, extra="x")
+
+        c._executor.submit.assert_called_once_with(
+            convert_fn, 7, priority=_PriorityPool.PRIORITY_CONVERSION, extra="x"
+        )

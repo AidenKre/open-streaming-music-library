@@ -97,17 +97,22 @@ class _Task:
 
 
 class _PriorityPool:
-    """Thread pool with two priority levels.
+    """Thread pool with three priority levels.
 
-    Priority 0 (PRIORITY_HIGH) — prefetch / queue-warm: encode tasks for tracks
-                                  the user is about to play (enqueue_prefetch,
-                                  enqueue_prefetch_batch).
-    Priority 1 (PRIORITY_LOW)  — background quality work: default-cache migration
-                                  and library-wide warming from set_default_quality.
+    Priority 0 (PRIORITY_HIGH)       — prefetch / queue-warm: encode tasks for
+                                        tracks the user is about to play
+                                        (enqueue_prefetch, enqueue_prefetch_batch).
+    Priority 1 (PRIORITY_LOW)        — background quality work: default-cache
+                                        migration and library-wide warming from
+                                        set_default_quality.
+    Priority 2 (PRIORITY_CONVERSION) — master-type conversion jobs (Phase 2).
+                                        Lowest priority: a long-running convert
+                                        must never starve streaming encodes.
     Within each level the newest submitted task runs first (LIFO).
     """
     PRIORITY_HIGH = 0
     PRIORITY_LOW = 1
+    PRIORITY_CONVERSION = 2
 
     def __init__(self, max_workers: int) -> None:
         self._q: _queue.PriorityQueue[_Task] = _queue.PriorityQueue()
@@ -176,6 +181,15 @@ class EncoderCoordinator:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False)
+
+    def submit_conversion(self, fn: Callable, *args: Any, **kwargs: Any) -> None:
+        """Schedule work at PRIORITY_CONVERSION on the shared pool. The one
+        entry point the Phase 2 conversion orchestrator uses instead of
+        reaching into the private ``_executor`` -- reuses this same pool
+        rather than adding a second one."""
+        self._executor.submit(
+            fn, *args, priority=_PriorityPool.PRIORITY_CONVERSION, **kwargs
+        )
 
     def startup(self) -> None:
         """Called once at app startup before any requests are served.
