@@ -9,6 +9,7 @@ import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/conversions_page.dart';
 import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/settings_dialog.dart';
@@ -197,6 +198,15 @@ List<Widget> buildTopBarActions(BuildContext context, WidgetRef ref) {
         Navigator.of(
           context,
         ).push(MaterialPageRoute(builder: (_) => const DownloadingPage()));
+      },
+    ),
+    IconButton(
+      icon: const Icon(Icons.transform),
+      tooltip: 'Conversions',
+      onPressed: () {
+        Navigator.of(
+          context,
+        ).push(MaterialPageRoute(builder: (_) => const ConversionsPage()));
       },
     ),
     IconButton(

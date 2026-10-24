@@ -243,4 +243,32 @@ void main() {
 
     expect(jobs.enqueueCalls, isEmpty);
   });
+
+  testWidgets(
+    'the top bar Conversions icon navigates to ConversionsPage',
+    (tester) async {
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            databaseProvider.overrideWithValue(db),
+            conversionJobsProvider.overrideWith(_RecordingConversionJobs.new),
+          ],
+          child: MaterialApp(
+            home: Builder(
+              builder: (context) => Consumer(
+                builder: (context, ref, _) => Scaffold(
+                  appBar: AppBar(actions: buildTopBarActions(context, ref)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.byTooltip('Conversions'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Conversions'), findsWidgets);
+    },
+  );
 }
