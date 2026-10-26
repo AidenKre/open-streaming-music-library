@@ -14,7 +14,9 @@ class TrackTile extends StatelessWidget {
   final void Function(String quality)? onDownloadAtQuality;
   final VoidCallback? onDeleteDownload;
   /// Starts a master-type conversion for this track. Null hides the menu
-  /// entry entirely (e.g. no capability, offline, or a pending edit).
+  /// entry entirely (offline, no `convert` capability, or no allowed target
+  /// for this track's codec -- see `canConvertTrack`). A pending edit does
+  /// NOT hide it; the flow itself blocks that with a snackbar.
   final VoidCallback? onConvert;
   /// Cancels this track's in-flight conversion job. Shown instead of
   /// [onConvert] while [conversionJob] is active.

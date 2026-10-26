@@ -87,4 +87,31 @@ void main() {
       );
     });
   });
+
+  group('ConversionJob equality', () {
+    Map<String, dynamic> json({String status = 'failed', String? error}) => {
+      'job_id': 1,
+      'uuid_id': 'abc',
+      'target_codec': 'aac',
+      'target_container': 'm4a',
+      'target_bitrate': 192,
+      'status': status,
+      'error_text': error,
+      'created_at': 1,
+      'updated_at': 1,
+    };
+
+    test('identical fields are equal with equal hashCodes', () {
+      final a = ConversionJob.fromJson(json(error: 'x'));
+      final b = ConversionJob.fromJson(json(error: 'x'));
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('a different status or failure message is not equal', () {
+      final failed = ConversionJob.fromJson(json(error: 'x'));
+      expect(failed, isNot(ConversionJob.fromJson(json(error: 'y'))));
+      expect(failed, isNot(ConversionJob.fromJson(json(status: 'running'))));
+    });
+  });
 }

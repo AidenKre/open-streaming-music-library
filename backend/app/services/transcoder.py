@@ -48,18 +48,16 @@ class TranscodeResult:
 
 @dataclass(frozen=True)
 class SourceAudioParams:
-    """Source audio params to mirror onto the ffmpeg command so a lossless
-    target doesn't silently pick up ffmpeg's own defaults instead of the
-    source's actual sample format/rate/channel layout.
+    """Source audio params mirrored onto the ffmpeg command so a lossless
+    target keeps the source's bit depth/rate/channel layout instead of
+    ffmpeg's defaults.
 
-    ``bits_per_raw_sample`` is informational only (there's no independent
-    ffmpeg output flag for it — ``sample_fmt`` is the flag that actually
-    carries bit depth); it's carried here for a caller that wants to reason
-    about or log it.
+    ``bits_per_sample`` is the source's effective integer bit depth (e.g. 24
+    for a 24-bit FLAC stored as s32), or None when it has none (float PCM,
+    unknown) -- then ffmpeg picks the encoder's default format.
     """
 
-    sample_fmt: Optional[str] = None
-    bits_per_raw_sample: Optional[int] = None
+    bits_per_sample: Optional[int] = None
     sample_rate_hz: Optional[int] = None
     channels: Optional[int] = None
 
@@ -70,6 +68,25 @@ _CODEC_FLAGS: dict[str, tuple[list[str], bool]] = {
     "alac": (["-c:a", "alac", "-f", "mp4", "-movflags", "+faststart"], False),
     "flac": (["-c:a", "flac", "-f", "flac"], False),
     "mp3": (["-c:a", "libmp3lame", "-f", "mp3"], True),
+}
+
+# Encoders accept only specific sample formats (flac: packed s16/s32, alac:
+# planar s16p/s32p), so bit depth maps to the encoder's own format rather
+# than copying the source's sample_fmt verbatim. s32 still records a 24-bit
+# source as 24-bit (ffmpeg carries bits_per_raw_sample through).
+_LOSSLESS_SAMPLE_FMTS: dict[str, tuple[str, str]] = {
+    "flac": ("s16", "s32"),
+    "alac": ("s16p", "s32p"),
+}
+
+# Carry cover art as-is: without an explicit copy ffmpeg re-encodes the
+# picture with the muxer's default video encoder (h264 for mp4, which then
+# fails to mux; PNG for flac/mp3).
+_ART_FLAGS: dict[str, list[str]] = {
+    "aac": ["-c:v", "copy", "-disposition:v:0", "attached_pic"],
+    "alac": ["-c:v", "copy", "-disposition:v:0", "attached_pic"],
+    "flac": ["-c:v", "copy"],
+    "mp3": ["-c:v", "copy", "-id3v2_version", "3"],
 }
 
 # Codecs transcode() can actually produce. Deliberately narrower than
@@ -87,10 +104,11 @@ _ENCODER_NAME_TO_CODEC: dict[str, str] = {
 }
 
 
-def _source_param_flags(params: SourceAudioParams) -> list[str]:
+def _source_param_flags(params: SourceAudioParams, target_codec: str) -> list[str]:
     flags: list[str] = []
-    if params.sample_fmt:
-        flags += ["-sample_fmt", params.sample_fmt]
+    fmts = _LOSSLESS_SAMPLE_FMTS.get(target_codec)
+    if fmts is not None and params.bits_per_sample:
+        flags += ["-sample_fmt", fmts[0] if params.bits_per_sample <= 16 else fmts[1]]
     if params.sample_rate_hz:
         flags += ["-ar", str(params.sample_rate_hz)]
     if params.channels:
@@ -130,11 +148,13 @@ def transcode(
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source)]
     if strip_video:
         cmd.append("-vn")
+    else:
+        cmd.extend(_ART_FLAGS[target_codec])
     cmd.extend(codec_flags)
     if needs_bitrate:
         cmd.extend(["-b:a", f"{bitrate_kbps}k"])
     if source_params is not None:
-        cmd.extend(_source_param_flags(source_params))
+        cmd.extend(_source_param_flags(source_params, target_codec))
     cmd.append(str(tmp_path))
 
     try:
@@ -144,6 +164,7 @@ def transcode(
             registry=registry, job_id=job_id,
         )
     except FfmpegError as e:
+        print(f"transcode of {source} to {target_codec} failed: {e.stderr[-500:]}")
         return TranscodeResult(ok=False, stderr=e.stderr)
 
     tmp_path.replace(dest)

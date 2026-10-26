@@ -186,7 +186,16 @@ class EncoderCoordinator:
         """Schedule work at PRIORITY_CONVERSION on the shared pool. The one
         entry point the Phase 2 conversion orchestrator uses instead of
         reaching into the private ``_executor`` -- reuses this same pool
-        rather than adding a second one."""
+        rather than adding a second one.
+
+        A running conversion holds its worker thread for its whole duration
+        (priority only orders the queue). With one active job per track and
+        single-track enqueue, concurrent conversions are bounded by how many
+        tracks the user converts at once; each occupies 1 of the
+        ``encoded_cache_prefetch_workers`` threads (default 4). Queued
+        conversions also wait behind any pending warm/prefetch work.
+        TODO(bulk-throughput): cap concurrent conversions (or give them a
+        dedicated slot) before bulk enqueue can flood the pool."""
         self._executor.submit(
             fn, *args, priority=_PriorityPool.PRIORITY_CONVERSION, **kwargs
         )
@@ -319,6 +328,10 @@ class EncoderCoordinator:
             if cached is not None:
                 return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
 
+            target_cache = self._write_cache(quality)
+            # Captured before the source is read: a conversion that replaces
+            # the master and evicts this uuid mid-encode invalidates it.
+            generation = target_cache.generation(uuid_id)
             source = source_path or self.source_lookup(uuid_id)
             if source is None or not source.exists():
                 raise SourceUnavailable(uuid_id)
@@ -346,8 +359,11 @@ class EncoderCoordinator:
                     scratch.unlink(missing_ok=True)
                 return None
 
-            target_cache = self._write_cache(quality)
-            cached_path = target_cache.insert(uuid_id, quality, scratch)
+            cached_path = target_cache.insert(
+                uuid_id, quality, scratch, expected_generation=generation
+            )
+            if cached_path is None:
+                return None  # encoded from a since-replaced master; the client retries
             return EncodeResult(path=cached_path, bitrate_kbps=bitrate, transcoded=True)
 
     def enqueue_prefetch(

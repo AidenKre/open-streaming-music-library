@@ -36,10 +36,6 @@ class DownloadJob {
   final String uuidId;
   final String? title;
   final String? artist;
-  // The source track's codec at enqueue time, denormalized like title/artist.
-  // Used at commit time to derive `downloadedCodec` (original quality keeps
-  // this codec as-is; every other quality preset transcodes to AAC).
-  final String? codec;
   final int? albumId;
   final int? artistId;
   final String quality;
@@ -57,7 +53,6 @@ class DownloadJob {
     required this.artist,
     required this.quality,
     required this.status,
-    this.codec,
     this.albumId,
     this.artistId,
     this.replacesFilePath,
@@ -72,7 +67,6 @@ class DownloadJob {
     uuidId: uuidId,
     title: title,
     artist: artist,
-    codec: codec,
     albumId: albumId,
     artistId: artistId,
     quality: quality,
@@ -93,6 +87,10 @@ class DownloadQueueState {
   Iterable<DownloadJob> get queued => jobs.where((j) => j.isQueued);
   Iterable<DownloadJob> get finished =>
       jobs.where((j) => j.isCompleted || j.isFailed);
+
+  /// True iff [uuidId] has a queued or active (not yet finished) job.
+  bool isPending(String uuidId) =>
+      jobs.any((j) => j.uuidId == uuidId && (j.isQueued || j.isActive));
 }
 
 /// Owns the in-memory list of [DownloadJob]s and notifies listeners on every

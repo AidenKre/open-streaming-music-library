@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, patch
@@ -135,27 +137,38 @@ class TestFfmpegProcessRegistry:
     def test_kill__process_registered__calls_os_killpg(self):
         registry = FfmpegProcessRegistry()
         fake_proc = MagicMock(pid=555)
+        fake_proc.poll.return_value = None  # still running
         registry.register("job-1", fake_proc)
 
-        with patch(
-            "app.services.ffmpeg_runner.os.getpgid", return_value=555
-        ) as getpgid, patch("app.services.ffmpeg_runner.os.killpg") as killpg:
+        with patch("app.services.ffmpeg_runner.os.killpg") as killpg:
             assert registry.kill("job-1") is True
 
-        getpgid.assert_called_once_with(555)
+        # pgid == pid (start_new_session=True): no getpgid round-trip.
         killpg.assert_called_once_with(555, signal.SIGKILL)
 
     def test_kill__nothing_registered__returns_false(self):
         registry = FfmpegProcessRegistry()
         assert registry.kill("missing") is False
 
-    def test_kill__process_already_exited__returns_false(self):
+    def test_kill__process_already_reaped__never_signalled(self):
         registry = FfmpegProcessRegistry()
         fake_proc = MagicMock(pid=555)
+        fake_proc.poll.return_value = 0  # exited and reaped; pid may be reused
+        registry.register("job-1", fake_proc)
+
+        with patch("app.services.ffmpeg_runner.os.killpg") as killpg:
+            assert registry.kill("job-1") is False
+
+        killpg.assert_not_called()
+
+    def test_kill__process_group_gone__returns_false(self):
+        registry = FfmpegProcessRegistry()
+        fake_proc = MagicMock(pid=555)
+        fake_proc.poll.return_value = None
         registry.register("job-1", fake_proc)
 
         with patch(
-            "app.services.ffmpeg_runner.os.getpgid", side_effect=ProcessLookupError
+            "app.services.ffmpeg_runner.os.killpg", side_effect=ProcessLookupError
         ):
             assert registry.kill("job-1") is False
 
@@ -166,6 +179,146 @@ class TestFfmpegProcessRegistry:
         registry.discard("job-1")
 
         assert registry.kill("job-1") is False
+
+    def test_kill_before_register__later_register_kills_on_arrival(self):
+        registry = FfmpegProcessRegistry()
+        assert registry.kill("job-1") is False  # nothing running yet
+
+        fake_proc = MagicMock(pid=777)
+        fake_proc.poll.return_value = None
+        with patch("app.services.ffmpeg_runner.os.killpg") as killpg:
+            registry.register("job-1", fake_proc)
+
+        killpg.assert_called_once_with(777, signal.SIGKILL)
+
+    def test_kill_flag__survives_discard__cleared_by_forget(self):
+        registry = FfmpegProcessRegistry()
+        registry.kill("job-1")
+        registry.discard("job-1")  # end of one ffmpeg step: flag must persist
+
+        with patch("app.services.ffmpeg_runner.os.killpg") as killpg:
+            proc = MagicMock(pid=1)
+            proc.poll.return_value = None
+            registry.register("job-1", proc)
+            assert killpg.call_count == 1
+
+            registry.forget("job-1")
+            proc2 = MagicMock(pid=2)
+            proc2.poll.return_value = None
+            registry.register("job-1", proc2)
+            assert killpg.call_count == 1  # flag gone: not killed
+
+    def test_kill_flag__is_per_job(self):
+        registry = FfmpegProcessRegistry()
+        registry.kill("job-1")
+
+        with patch("app.services.ffmpeg_runner.os.killpg") as killpg:
+            proc = MagicMock(pid=3)
+            proc.poll.return_value = None
+            registry.register("job-2", proc)
+
+        killpg.assert_not_called()
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+_SLEEP = ["sleep", "30"]
+
+
+class TestFfmpegProcessRegistryRealProcesses:
+    """Real child processes (``sleep``/``sh``) through run_ffmpeg: the
+    command is never inspected, only run, validated and registered."""
+
+    def test_kill__running_process__dies_and_run_ffmpeg_raises(self, tmp_path):
+        registry = FfmpegProcessRegistry()
+        output = tmp_path / "out.bin"
+        outcome = {}
+
+        def run():
+            try:
+                run_ffmpeg(_SLEEP, output, timeout=60, registry=registry, job_id="job-1")
+                outcome["result"] = "returned"
+            except BaseException as e:  # noqa: BLE001 - recorded for the assert
+                outcome["result"] = e
+
+        worker = threading.Thread(target=run)
+        started = time.monotonic()
+        worker.start()
+        assert _wait_for(lambda: "job-1" in registry._procs)
+        proc = registry._procs["job-1"]
+
+        assert registry.kill("job-1") is True
+        worker.join(timeout=10)
+
+        assert not worker.is_alive()
+        assert time.monotonic() - started < 10
+        assert isinstance(outcome["result"], FfmpegError)
+        assert proc.poll() == -signal.SIGKILL
+        assert "job-1" not in registry._procs
+        assert not output.exists()
+
+    def test_kill_before_register__run_ffmpeg_killed_immediately(self, tmp_path):
+        registry = FfmpegProcessRegistry()
+        registry.kill("job-1")
+        started = time.monotonic()
+
+        with pytest.raises(FfmpegError):
+            run_ffmpeg(_SLEEP, tmp_path / "out.bin", timeout=60, registry=registry, job_id="job-1")
+
+        assert time.monotonic() - started < 5
+        assert "job-1" not in registry._procs
+
+    def test_forget__clears_flag__next_run_succeeds(self, tmp_path):
+        registry = FfmpegProcessRegistry()
+        registry.kill("job-1")
+        registry.forget("job-1")
+        output = tmp_path / "out.bin"
+
+        run_ffmpeg(
+            ["sh", "-c", f"printf data > '{output}'"], output, timeout=10,
+            registry=registry, job_id="job-1",
+        )
+
+        assert output.read_bytes() == b"data"
+
+    @pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt])
+    def test_non_timeout_exception_in_communicate__child_killed_and_reaped(
+        self, tmp_path, exc_type
+    ):
+        registry = FfmpegProcessRegistry()
+        output = tmp_path / "out.bin"
+        output.write_bytes(b"partial")
+        spawned = []
+
+        class RaisingPopen(subprocess.Popen):
+            raised = False
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                spawned.append(self)
+
+            def communicate(self, *args, **kwargs):
+                if not RaisingPopen.raised:
+                    RaisingPopen.raised = True
+                    raise exc_type("interrupted mid-communicate")
+                return super().communicate(*args, **kwargs)
+
+        with patch("app.services.ffmpeg_runner.subprocess.Popen", RaisingPopen):
+            with pytest.raises(exc_type):
+                run_ffmpeg(_SLEEP, output, timeout=60, registry=registry, job_id="job-1")
+
+        (proc,) = spawned
+        assert proc.returncode is not None  # reaped, not leaked
+        assert proc.returncode == -signal.SIGKILL
+        assert "job-1" not in registry._procs
+        assert not output.exists()
 
 
 class TestScaledTimeout:

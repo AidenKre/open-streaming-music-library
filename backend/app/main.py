@@ -15,6 +15,7 @@ from app.database import (
     AlbumRowFilterParameter,
     ArtistOrderParameter,
     ArtistRowFilterParameter,
+    ConversionJobActive,
     Database,
     DatabaseContext,
     EmptyTrackEdit,
@@ -58,10 +59,14 @@ from app.services.track_edit import (
     WriteMode,
 )
 from app.services.conversion import (
+    ConversionJobStatus,
     ConversionOrchestrator,
     InsufficientDiskSpace,
     MasterNotFound,
     NoOpConversion,
+    PendingRecovery,
+    TargetPathTaken,
+    evict_converted_track_caches,
     reconcile_conversion_jobs,
 )
 from app.services.track_editor import (
@@ -171,12 +176,18 @@ def startup_event():
         music_library_dir=settings.music_library_dir,
         staging_dir=staging_dir,
     )
+    # A convert journal row outliving a crash means its commit may have
+    # landed without the encoded caches being evicted -- evicted below, once
+    # the caches exist.
+    interrupted_conversion_uuids = {
+        e["uuid_id"] for e in database.list_journal_entries() if e["intent"] == "convert"
+    }
     # Finish/revert any edit interrupted by a crash before serving requests.
     reconcile_journal(database, settings.music_library_dir)
     # No worker thread survives a restart -- any conversion job still
     # "running" is orphaned; independent of the journal pass above (a crash
     # before the journal was even written leaves no journal row at all).
-    reconcile_conversion_jobs(database)
+    reconcile_conversion_jobs(database, staging_dir)
 
     # Set up cover art manager
     cover_art_dir = settings.app_data_dir / "cover_art"
@@ -236,6 +247,8 @@ def startup_event():
 
     app.state.encoded_cache = encoded_cache
     app.state.default_cache = default_cache
+    for uuid_id in interrupted_conversion_uuids:
+        evict_converted_track_caches(uuid_id, encoded_cache, default_cache)
     encoder_coordinator = EncoderCoordinator(
         cache=encoded_cache,
         source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
@@ -248,13 +261,13 @@ def startup_event():
     encoder_coordinator.startup()
 
     # One-time probe of which ffmpeg encoders this build actually has
-    # (libmp3lame/alac are build-dependent). Not consumed anywhere yet — the
-    # conversion bootstrap block and job-enqueue guard read it once they land.
+    # (libmp3lame/alac are build-dependent). Both /app/info's advertised
+    # targets and POST /jobs' enqueue guard read it: advertised == accepted.
     app.state.available_encoders = probe_available_encoders()
 
     # Master-type conversion orchestration (Phase 2). Shares the staging dir,
     # per-uuid TrackLocks, and encoder pool with the edit path above -- no
-    # new subsystems. Nothing calls .enqueue()/.cancel() yet (no API route).
+    # new subsystems.
     app.state.conversion_orchestrator = ConversionOrchestrator(
         database=database,
         music_library_dir=settings.music_library_dir,
@@ -265,6 +278,7 @@ def startup_event():
         default_cache=default_cache,
         available_encoders=app.state.available_encoders,
     )
+    app.state.conversion_orchestrator.resume_queued()
 
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
@@ -300,6 +314,11 @@ def shutdown_event():
     watcher = getattr(app.state, "file_watcher", None)
     if watcher:
         watcher.stop_file_watcher()
+    # Conversion ffmpeg runs in its own session (killpg-able), so it would
+    # outlive this process; the job itself is failed by the next startup.
+    orchestrator = getattr(app.state, "conversion_orchestrator", None)
+    if orchestrator:
+        orchestrator.shutdown()
     coordinator = getattr(app.state, "encoder_coordinator", None)
     if coordinator:
         coordinator.shutdown()
@@ -655,9 +674,14 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
         source_suffix = file_path.suffix.lstrip(".").lower() if not encode_result.transcoded else ""
         extension = source_suffix or "audio"
 
+    # Codec + revision of what is actually served, so a client that saves the
+    # bytes can record exactly what it has (the revision is read before the
+    # encode, so a conversion landing mid-request errs toward "stale").
     extra_headers = {
         "X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps),
         "X-Audio-Extension": extension,
+        "X-Audio-Codec": "aac" if encode_result.transcoded else (track.metadata.codec or ""),
+        "X-Track-Revision": str(track.revision),
     }
 
     # Open the cache file eagerly (before returning the StreamingResponse) so
@@ -1067,7 +1091,11 @@ def get_app_info():
         for codec in sorted(SUPPORTED_TARGET_CODECS & available_encoders)
     ]
     return AppInfoResponse(
-        entities={"track": EntityInfo(fields=track_fields, actions=["convert"])},
+        entities={
+            "track": EntityInfo(
+                fields=track_fields, actions=["convert"] if targets else []
+            )
+        },
         conversion=ConversionCapabilities(
             targets=targets,
             bitrate_presets=sorted(
@@ -1182,6 +1210,14 @@ def post_job(request: PostJobRequest):
                 "current_revision": e.current_revision,
             },
         )
+    except ConversionJobActive as e:
+        raise HTTPException(
+            status_code=409, detail={"error": "job_active", "job_id": e.job_id}
+        )
+    except TargetPathTaken:
+        raise HTTPException(status_code=409, detail={"error": "target_exists"})
+    except PendingRecovery:
+        raise HTTPException(status_code=409, detail={"error": "pending_recovery"})
     except NoOpConversion:
         raise HTTPException(
             status_code=422,
@@ -1212,15 +1248,32 @@ def get_jobs(
     """Filtered, cursored job collection -- replaces both a global and a
     per-uuid conversion list (the per-uuid variant is just ``?uuid_id=``).
     ``cursor``/``nextCursor`` are job ids (ascending), mirroring
-    ``GET /changes``' int-cursor convention. ``type`` only accepts
+    ``GET /changes``' int-cursor convention. ``status`` takes one status or a
+    comma-separated list (``queued,running``). ``type`` only accepts
     ``"conversion"`` today (the only job type that exists)."""
+    # TODO(bulk-jobs): a grouped-by-batch_id list shape for bulk progress.
     if type is not None and type != "conversion":
         raise HTTPException(status_code=422, detail=f"unsupported job type: {type}")
+    statuses: Optional[List[str]] = None
+    if status is not None:
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        valid = {s.value for s in ConversionJobStatus}
+        unknown = [s for s in statuses if s not in valid]
+        if unknown or not statuses:
+            raise HTTPException(
+                status_code=422, detail=f"unsupported job status: {status}"
+            )
 
     database: Database = cast(Database, app.state.database)
-    jobs, next_cursor = database.list_conversion_jobs(
-        uuid_id=uuid_id, status=status, batch_id=batch_id, after_id=cursor, limit=limit,
-    )
+    try:
+        jobs, next_cursor = database.list_conversion_jobs(
+            uuid_id=uuid_id, statuses=statuses, batch_id=batch_id,
+            after_id=cursor, limit=limit,
+        )
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            raise HTTPException(status_code=503, detail="Database busy, retry")
+        raise
     return GetJobsResponse(
         data=[_job_to_response(job) for job in jobs], nextCursor=next_cursor
     )

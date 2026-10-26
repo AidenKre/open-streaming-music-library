@@ -177,9 +177,10 @@ CREATE TABLE IF NOT EXISTS conversion_jobs (
     "target_bitrate"   INTEGER,
     "status"           TEXT NOT NULL DEFAULT 'queued',
     "error_text"       TEXT,
-    "batch_id"         TEXT,
+    "batch_id"         TEXT, -- TODO(bulk-jobs): set by a future bulk enqueue
     "created_at"       INTEGER NOT NULL DEFAULT (unixepoch()),
-    "updated_at"       INTEGER NOT NULL DEFAULT (unixepoch())
+    "updated_at"       INTEGER NOT NULL DEFAULT (unixepoch()),
+    "base_revision"    INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversion_jobs_uuid ON conversion_jobs("uuid_id");

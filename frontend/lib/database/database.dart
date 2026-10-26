@@ -69,17 +69,24 @@ class Tracks extends Table {
   // "is the file at the requested quality?" idempotently even when the
   // backend served a passthrough that didn't match the requested bitrate.
   TextColumn get downloadedQuality => text().nullable()();
-  // The track's `revision` at the moment this download committed. Compared
-  // against the live `revision` to detect a stale download (the server
-  // master changed since -- e.g. a Phase 2 conversion -- but the local file
-  // is untouched). Null for files downloaded before this column existed.
+  // The server revision the downloaded bytes are current as of. Compared
+  // against the live `revision` to detect a stale download (the track changed
+  // server-side since -- audio, tags or artwork -- but the local file is
+  // untouched). Stamped from the stream response's `X-Track-Revision` header;
+  // older servers don't send it, so the fallback is the local revision read
+  // BEFORE the request (erring early: a harmless false-positive stale beats
+  // recording an old-master file as fresh forever), and 0 when even that is
+  // unknown so any later revision flags it. Null only for files downloaded
+  // before this column existed (never flagged -- nothing to compare to).
+  // Advanced in step with the user's OWN successful edits (see
+  // [AppDatabase.recordOwnEditRevision]): the app shows metadata from this DB,
+  // not the file's tags, so a self-edit doesn't make the copy outdated.
   IntColumn get downloadedAtRevision => integer().nullable()();
-  // The codec actually written to disk: the source codec when downloaded at
-  // `original` quality (no transcoding happens), else `aac` (every other
-  // quality preset transcodes to AAC today). Derived client-side at commit
-  // time from `quality` + the source `codec` -- not from a response header,
-  // since there isn't one; mirrors `downloadedBitrateKbps`'s "what actually
-  // landed on disk" intent, just computed instead of read off the wire.
+  // The codec actually written to disk. Read off the stream response's
+  // `X-Audio-Codec` header (the server passes the source through unchanged
+  // when its bitrate is already <= the requested preset, so a non-original
+  // download is NOT always AAC). See `TrackDownloader.resolveDownloadedCodec`
+  // for the fallback used against servers that don't send it.
   TextColumn get downloadedCodec => text().nullable()();
   // Re-arms (not a bool) when `revision` climbs again after a dismiss, so a
   // SECOND server-side change re-surfaces the stale warning even if the
@@ -673,6 +680,33 @@ const trackSelectColumns =
     't.downloaded_at_revision, t.downloaded_codec, t.stale_dismissed_at_revision';
 const _selectColumns = trackSelectColumns;
 
+/// SQL form of the stale-download rule, over a `tracks` row aliased `t`: the
+/// track has a downloaded file, its revision moved past the one the file is
+/// current as of, and the user hasn't dismissed this particular change.
+/// NULL `revision`/`downloaded_at_revision` compare as NULL (= not stale).
+/// Must agree with `TrackUI.isStaleDownload` -- the Dart mirror used on
+/// already-loaded rows; `test/models/ui/track_ui_test.dart` asserts the two
+/// agree over every null/ordering combination.
+const staleDownloadPredicate =
+    't.file_path IS NOT NULL '
+    'AND t.revision > t.downloaded_at_revision '
+    'AND (t.stale_dismissed_at_revision IS NULL '
+    'OR t.revision > t.stale_dismissed_at_revision)';
+
+/// Nulls every column that marks a track as downloaded. The single shared
+/// definition for every clear path (delete, reset fence, a commit undone by a
+/// reset) so adding a downloaded-state column can't leave a row half-cleared.
+/// Must stay in sync with the columns `TrackDownloader` writes on commit.
+const clearedDownloadColumns = TracksCompanion(
+  filePath: Value(null),
+  downloadedBitrateKbps: Value(null),
+  fileSizeBytes: Value(null),
+  downloadedQuality: Value(null),
+  downloadedAtRevision: Value(null),
+  downloadedCodec: Value(null),
+  staleDismissedAtRevision: Value(null),
+);
+
 // ── FTS5 virtual table creation statements ──────────────────────────────
 
 const _ftsStatements = [
@@ -1011,18 +1045,85 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     return row?.writeMode;
   }
 
-  /// Dismisses the stale-download warning for [uuidId] as of its CURRENT
-  /// revision -- stamping `staleDismissedAtRevision` (not a bool) so the
-  /// warning re-arms if the server master changes again later. A no-op for
-  /// an unknown uuid.
-  Future<void> dismissStaleDownload(String uuidId) async {
-    final row = await (select(tracks)
-          ..where((t) => t.uuidId.equals(uuidId)))
-        .getSingleOrNull();
-    if (row == null) return;
-    await (update(tracks)..where((t) => t.uuidId.equals(uuidId))).write(
-      TracksCompanion(staleDismissedAtRevision: Value(row.revision)),
+  /// Records the revision the user's OWN successful edit produced (raising
+  /// `revision` exactly like [updateTrackRevision]) and, when the downloaded
+  /// file was current as of [currentAsOf] -- the revision the server held
+  /// immediately before the edit -- advances `downloaded_at_revision` to
+  /// [newRevision] in the same statement. The app displays metadata from this
+  /// DB, not the file's tags, so a self-edit doesn't make the download
+  /// meaningfully outdated; server-originated changes (a conversion, another
+  /// device's edit, new artwork) never pass through here and still flag.
+  /// Likewise, a stale-download warning the user dismissed as of
+  /// [currentAsOf] is carried forward to [newRevision], so their own edit
+  /// doesn't resurrect a warning they already dismissed.
+  /// Pass a null [currentAsOf] to only raise the revision.
+  Future<void> recordOwnEditRevision(
+    String uuidId,
+    int newRevision, {
+    required int? currentAsOf,
+  }) async {
+    // SET expressions all read the pre-update row, so the CASEs see the old
+    // downloaded_at_revision / stale_dismissed_at_revision regardless of
+    // clause order.
+    await customUpdate(
+      'UPDATE tracks SET '
+      'downloaded_at_revision = CASE '
+      'WHEN ?1 IS NOT NULL AND file_path IS NOT NULL '
+      'AND downloaded_at_revision = ?1 AND ?2 > ?1 THEN ?2 '
+      'ELSE downloaded_at_revision END, '
+      'stale_dismissed_at_revision = CASE '
+      'WHEN ?1 IS NOT NULL AND stale_dismissed_at_revision = ?1 '
+      'AND ?2 > ?1 THEN ?2 '
+      'ELSE stale_dismissed_at_revision END, '
+      'revision = CASE WHEN revision IS NULL OR revision < ?2 THEN ?2 '
+      'ELSE revision END '
+      'WHERE uuid_id = ?3',
+      variables: [
+        currentAsOf == null
+            ? const Variable<int>(null)
+            : Variable.withInt(currentAsOf),
+        Variable.withInt(newRevision),
+        Variable.withString(uuidId),
+      ],
+      updates: {tracks},
+      updateKind: UpdateKind.update,
     );
+  }
+
+  /// Dismisses the stale-download warning for [uuidIds] as of each track's
+  /// CURRENT revision -- stamping `staleDismissedAtRevision` (not a bool) so
+  /// the warning re-arms if the track changes on the server again later.
+  /// Unknown uuids are ignored. One statement, so there's no read-then-write
+  /// window for a concurrent `/changes` upsert to slip a newer revision into
+  /// (which would silently dismiss a change the user never saw).
+  Future<void> dismissStaleDownloads(Iterable<String> uuidIds) async {
+    final ids = uuidIds.toSet().toList(growable: false);
+    if (ids.isEmpty) return;
+    final placeholders = List.filled(ids.length, '?').join(', ');
+    await customUpdate(
+      'UPDATE tracks SET stale_dismissed_at_revision = revision '
+      'WHERE uuid_id IN ($placeholders)',
+      variables: ids.map(Variable.withString).toList(),
+      updates: {tracks},
+      updateKind: UpdateKind.update,
+    );
+  }
+
+  Future<void> dismissStaleDownload(String uuidId) =>
+      dismissStaleDownloads([uuidId]);
+
+  /// Live list of downloaded tracks that are stale ([staleDownloadPredicate])
+  /// -- filtered in SQL so the always-on banner watch doesn't map every
+  /// downloaded track on each emission.
+  Stream<List<QueryRow>> watchStaleDownloads() {
+    return customSelect(
+      'SELECT $_selectColumns '
+      'FROM trackmetadata AS tm '
+      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
+      'WHERE $staleDownloadPredicate '
+      'ORDER BY tm.title COLLATE NOCASE, tm.uuid_id',
+      readsFrom: {trackmetadata, tracks},
+    ).watch();
   }
 
   /// Live counts of outstanding edits for the pending-edits surface.
@@ -1249,6 +1350,22 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     );
   }
 
+  /// Live form of [getTrackByUuid]: re-emits when the track's rows change
+  /// (e.g. a `/changes` pull lands a not-yet-synced track).
+  Stream<List<QueryRow>> watchTrackByUuid(String uuid) {
+    final (sql, vars) = _buildTrackQuery(
+      searchParams: [
+        SearchParameter(column: 'uuid_id', operator: '=', value: uuid),
+      ],
+      limit: 1,
+    );
+    return customSelect(
+      sql,
+      variables: vars,
+      readsFrom: {trackmetadata, tracks},
+    ).watch();
+  }
+
   Future<List<QueryRow>> getTracksByUuids(List<String> uuids) {
     if (uuids.isEmpty) return Future.value([]);
 
@@ -1284,6 +1401,10 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
         int? downloadedBitrateKbps,
         int? fileSizeBytes,
         String? downloadedQuality,
+        int? revision,
+        int? downloadedAtRevision,
+        String? downloadedCodec,
+        int? staleDismissedAtRevision,
       })
     >
   >
@@ -1292,7 +1413,8 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     final placeholders = List.filled(uuids.length, '?').join(', ');
     final rows = await customSelect(
       'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes, '
-      'downloaded_quality '
+      'downloaded_quality, revision, downloaded_at_revision, downloaded_codec, '
+      'stale_dismissed_at_revision '
       'FROM tracks WHERE uuid_id IN ($placeholders)',
       variables: uuids.map(Variable.withString).toList(),
       readsFrom: {tracks},
@@ -1304,6 +1426,12 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
           downloadedBitrateKbps: r.readNullable<int>('downloaded_bitrate_kbps'),
           fileSizeBytes: r.readNullable<int>('file_size_bytes'),
           downloadedQuality: r.readNullable<String>('downloaded_quality'),
+          revision: r.readNullable<int>('revision'),
+          downloadedAtRevision: r.readNullable<int>('downloaded_at_revision'),
+          downloadedCodec: r.readNullable<String>('downloaded_codec'),
+          staleDismissedAtRevision: r.readNullable<int>(
+            'stale_dismissed_at_revision',
+          ),
         ),
     };
   }

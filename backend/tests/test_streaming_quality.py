@@ -353,6 +353,65 @@ class TestStreamQuality:
         assert transcode_calls["n"] == 1
 
 
+class TestStreamCodecRevisionHeaders:
+    """X-Audio-Codec / X-Track-Revision describe exactly what was served, so a
+    client saving the bytes can record its codec and staleness."""
+
+    def _get_headers(self, client, uuid_id, quality=None):
+        url = f"/tracks/{uuid_id}/stream" + (f"?quality={quality}" if quality else "")
+        with client.stream("GET", url) as resp:
+            assert resp.status_code == 200, resp.text
+            _ = b"".join(resp.iter_bytes())
+            return resp.headers
+
+    @pytest.mark.parametrize("codec,name", [("flac", "t.flac"), ("mp3", "t.mp3")])
+    @pytest.mark.parametrize("quality", [None, "original"])
+    def test_passthrough__master_codec_and_revision(self, client, tmp_path, codec, name, quality):
+        track = _add_track_with_file(client, tmp_path, name=name, codec=codec)
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+
+        headers = self._get_headers(client, track.uuid_id, quality)
+
+        assert headers["x-audio-codec"] == codec
+        assert headers["x-track-revision"] == str(revision)
+
+    def test_transcoded__aac_and_revision(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path, name="t.flac", codec="flac")
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+
+        headers = self._get_headers(client, track.uuid_id, "192")
+
+        assert headers["x-audio-codec"] == "aac"
+        assert headers["x-track-revision"] == str(revision)
+
+    def test_revision_header__follows_track_revision_after_edit(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path, name="t.mp3", codec="mp3")
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        db = client.app.state.database
+        before = db.get_track_by_uuid(track.uuid_id).revision
+        new_revision = db.apply_track_metadata_edit(track.uuid_id, {"title": "New"}, before)
+        assert new_revision > before
+
+        headers = self._get_headers(client, track.uuid_id)
+
+        assert headers["x-track-revision"] == str(new_revision)
+
+    def test_range_request__also_carries_codec_and_revision(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path, name="t.mp3", codec="mp3")
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream", headers={"Range": "bytes=0-9"}
+        ) as resp:
+            assert resp.status_code == 206
+            _ = b"".join(resp.iter_bytes())
+            assert resp.headers["x-audio-codec"] == "mp3"
+            assert resp.headers["x-track-revision"] == str(revision)
+
+
 class TestStreamCacheRace:
     """Regressions for the cache-prune-during-stream race.
 

@@ -78,6 +78,19 @@ class RevisionConflict(Exception):
         )
 
 
+class ConversionJobActive(Exception):
+    """A conversion is already queued or running for this uuid."""
+
+    def __init__(self, uuid_id: str, job_id: int):
+        self.uuid_id = uuid_id
+        self.job_id = job_id
+        super().__init__(f"conversion job {job_id} already active for {uuid_id}")
+
+
+class ConversionJobNotRunning(Exception):
+    """The job left 'running' (e.g. cancelled) before its result committed."""
+
+
 # Leading 4-digit year prefix of a `date` string (e.g. "2019-05-01" -> "2019").
 _YEAR_PREFIX = re.compile(r"^\s*(\d{4})")
 
@@ -322,7 +335,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 7
+    LATEST_SCHEMA_VERSION = 8
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -538,6 +551,16 @@ class Database:
                     'ON conversion_jobs("status")'
                 )
                 conn.execute("PRAGMA user_version = 7")
+
+            if version < 8:
+                print("Migrating database to version 8: adding conversion_jobs.base_revision")
+                try:
+                    conn.execute(
+                        'ALTER TABLE conversion_jobs ADD COLUMN "base_revision" INTEGER'
+                    )
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                conn.execute("PRAGMA user_version = 8")
 
     @staticmethod
     def _next_revision(conn) -> int:
@@ -1121,6 +1144,14 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def has_journal_entry_for_uuid(self, uuid_id: str) -> bool:
+        """Whether a destructive FS step on this track is still awaiting
+        reconcile (e.g. a same-path replace that failed in-process)."""
+        with self._connection() as conn:
+            return conn.execute(
+                "SELECT 1 FROM edit_journal WHERE uuid_id = ? LIMIT 1", (uuid_id,)
+            ).fetchone() is not None
+
     def delete_journal_entry(self, entry_id: int) -> None:
         with self._connection(commit=True) as conn:
             conn.execute("DELETE FROM edit_journal WHERE id = ?", (entry_id,))
@@ -1146,42 +1177,58 @@ class Database:
 
     # ── Conversion jobs (Phase 2 master-type conversion) ─────────────────────
 
+    _CONVERSION_JOB_COLUMNS = (
+        "id, uuid_id, target_codec, target_container, target_bitrate, "
+        "base_revision, status, error_text, batch_id, created_at, updated_at"
+    )
+
     def insert_conversion_job(
         self,
         uuid_id: str,
         target_codec: str,
         target_container: str,
         target_bitrate: Optional[int],
+        base_revision: Optional[int] = None,
     ) -> int:
-        """Persist a new queued conversion job. Returns its id."""
-        with self._connection(commit=True) as conn:
+        """Persist a new queued conversion job. Returns its id. Raises
+        ``ConversionJobActive`` instead if the uuid already has a queued or
+        running job -- checked in the same write transaction, so two racing
+        POSTs can't both get in."""
+        # TODO(bulk-jobs): a bulk enqueue sets batch_id here.
+        with self._connection(commit=True, immediate=True) as conn:
+            active = conn.execute(
+                "SELECT id FROM conversion_jobs WHERE uuid_id = ? "
+                "AND status IN ('queued', 'running') ORDER BY id LIMIT 1",
+                (uuid_id,),
+            ).fetchone()
+            if active is not None:
+                raise ConversionJobActive(uuid_id, active["id"])
             cursor = conn.execute(
                 "INSERT INTO conversion_jobs "
                 "(uuid_id, target_codec, target_container, target_bitrate, "
-                "status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 'queued', unixepoch(), unixepoch())",
-                (uuid_id, target_codec, target_container, target_bitrate),
+                "base_revision, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', unixepoch(), unixepoch())",
+                (uuid_id, target_codec, target_container, target_bitrate, base_revision),
             )
             return cursor.lastrowid  # type: ignore[return-value]
 
     def get_conversion_job(self, job_id: int) -> Optional[dict]:
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT id, uuid_id, target_codec, target_container, "
-                "target_bitrate, status, error_text, batch_id, created_at, "
-                "updated_at FROM conversion_jobs WHERE id = ?",
+                f"SELECT {self._CONVERSION_JOB_COLUMNS} FROM conversion_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             return dict(row) if row is not None else None
 
-    def list_running_conversion_jobs(self) -> List[dict]:
-        """Every job still ``running`` — read once at startup. No worker
-        thread survives a process restart, so any such row is orphaned."""
+    def list_conversion_jobs_with_status(self, status: str) -> List[dict]:
+        """Every job in ``status``, oldest first -- read once at startup to
+        fail orphaned ``running`` rows and resubmit ``queued`` ones (no
+        worker thread or in-memory queue survives a restart)."""
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT id, uuid_id, target_codec, target_container, "
-                "target_bitrate, status, error_text, batch_id, created_at, "
-                "updated_at FROM conversion_jobs WHERE status = 'running'"
+                f"SELECT {self._CONVERSION_JOB_COLUMNS} FROM conversion_jobs "
+                "WHERE status = ? ORDER BY id",
+                (status,),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1189,7 +1236,7 @@ class Database:
         self,
         *,
         uuid_id: Optional[str] = None,
-        status: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
         batch_id: Optional[str] = None,
         after_id: int = 0,
         limit: int = 50,
@@ -1203,19 +1250,17 @@ class Database:
         if uuid_id is not None:
             clauses.append("uuid_id = ?")
             params.append(uuid_id)
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status)
+        if statuses:
+            clauses.append(f"status IN ({', '.join('?' for _ in statuses)})")
+            params.extend(statuses)
         if batch_id is not None:
             clauses.append("batch_id = ?")
             params.append(batch_id)
         where = " AND ".join(clauses)
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT id, uuid_id, target_codec, target_container, "
-                "target_bitrate, status, error_text, batch_id, created_at, "
-                f"updated_at FROM conversion_jobs WHERE {where} "
-                "ORDER BY id ASC LIMIT ?",
+                f"SELECT {self._CONVERSION_JOB_COLUMNS} FROM conversion_jobs "
+                f"WHERE {where} ORDER BY id ASC LIMIT ?",
                 (*params, limit),
             ).fetchall()
         jobs = [dict(row) for row in rows]
@@ -1234,14 +1279,14 @@ class Database:
             return cursor.rowcount > 0
 
     def mark_conversion_job_failed(self, job_id: int, error_text: str) -> bool:
-        """Transition running->failed. Conditioned on 'running' so a job
-        already marked cancelled by an external cancel request is never
-        clobbered back to failed."""
+        """Transition queued/running->failed (queued: the worker died before
+        it could even claim the job). Never touches a terminal job, so one
+        already cancelled by an external request is never clobbered."""
         with self._connection(commit=True) as conn:
             cursor = conn.execute(
                 "UPDATE conversion_jobs SET status = 'failed', "
                 "error_text = ?, updated_at = unixepoch() "
-                "WHERE id = ? AND status = 'running'",
+                "WHERE id = ? AND status IN ('queued', 'running')",
                 (error_text, job_id),
             )
             return cursor.rowcount > 0
@@ -1267,23 +1312,41 @@ class Database:
         sample_rate_hz: int,
         channels: int,
         file_path: Optional[str] = None,
-    ) -> int:
-        """One transaction: write the probed intrinsic fields (+ file_path if
-        the extension changed) and mark the job done. Conditioned on the job
-        still being 'running' so a job already cancelled out-of-band is never
-        clobbered back to done. A crash between these two writes is
-        impossible since they share a commit -- reconciliation never sees a
-        converted master paired with a still-'running' job."""
+        inplace_journal: Optional[tuple[str, str]] = None,
+    ) -> tuple[int, Optional[int]]:
+        """One transaction: mark the job done and write the probed intrinsic
+        fields (+ file_path if the path changed). Raises
+        ``ConversionJobNotRunning`` -- rolling back, so the track is untouched
+        -- when the job is no longer 'running' (cancelled out-of-band), so a
+        cancel the client saw succeed can never be followed by the conversion
+        landing anyway.
+
+        ``inplace_journal=(old_path, temp_path)`` also writes the same-path
+        "convert" journal row on this commit, so for that case a journal row
+        exists iff the DB advanced -- the invariant ``_reconcile_inplace``
+        relies on to redo the pending replace. Returns
+        ``(revision, journal_id)``."""
         with self._connection(commit=True) as conn:
-            revision = self._apply_conversion_result(
-                conn, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels, file_path
-            )
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE conversion_jobs SET status = 'done', "
                 "updated_at = unixepoch() WHERE id = ? AND status = 'running'",
                 (job_id,),
             )
-            return revision
+            if cursor.rowcount == 0:
+                raise ConversionJobNotRunning(job_id)
+            revision = self._apply_conversion_result(
+                conn, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels, file_path
+            )
+            journal_id = None
+            if inplace_journal is not None:
+                old_path, temp_path = inplace_journal
+                journal_id = conn.execute(
+                    "INSERT INTO edit_journal "
+                    "(intent, uuid_id, old_path, new_path, temp_path, created_at) "
+                    "VALUES ('convert', ?, ?, NULL, ?, unixepoch())",
+                    (uuid_id, old_path, temp_path),
+                ).lastrowid
+            return revision, journal_id
 
     def _apply_conversion_result(
         self,

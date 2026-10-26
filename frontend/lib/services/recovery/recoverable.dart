@@ -52,6 +52,10 @@ class RecoveryPriority {
   /// it.
   static const sync = 100;
 
+  /// Re-fetch server capabilities (`/app/info`) so capability-gated UI (e.g.
+  /// the per-track Convert action) appears after an offline cold start.
+  static const appInfo = 90;
+
   /// Re-dispatch downloads that were left queued while offline.
   static const resumeDownloads = 80;
 

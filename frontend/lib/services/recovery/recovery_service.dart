@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
@@ -115,6 +116,7 @@ final recoveryServiceProvider = Provider<RecoveryService>((ref) {
 final recoverablesProvider = Provider<List<RecoverableService>>((ref) {
   return <RecoverableService>[
     _SyncRecoverable(ref),
+    _AppInfoRecoverable(ref),
     _ResumeDownloadsRecoverable(ref),
     _ResumeConversionsRecoverable(ref),
     _ReconcileDownloadsRecoverable(ref),
@@ -149,6 +151,28 @@ class _SyncRecoverable implements RecoverableService {
       _ref.read(trackSyncProvider.notifier).sync();
 }
 
+/// Refreshes [appInfoProvider] when the network returns. Its value is only
+/// fetched from the server while online; after an offline cold start it holds
+/// the cached/default capabilities, which (by design) never advertise the
+/// `convert` action -- without this the Convert entry would stay hidden for
+/// the rest of the session.
+class _AppInfoRecoverable implements RecoverableService {
+  _AppInfoRecoverable(this._ref);
+  final Ref _ref;
+
+  @override
+  int get recoveryPriority => RecoveryPriority.appInfo;
+
+  @override
+  Set<RecoveryTrigger> get triggers => const {RecoveryTrigger.networkRecovered};
+
+  @override
+  Future<void> recover(RecoveryTrigger trigger) async {
+    _ref.invalidate(appInfoProvider);
+    await _ref.read(appInfoProvider.future);
+  }
+}
+
 /// Re-dispatches downloads that were left queued while offline. Runs after
 /// [_SyncRecoverable] so resumed workers see the just-synced rows.
 class _ResumeDownloadsRecoverable implements RecoverableService {
@@ -168,9 +192,11 @@ class _ResumeDownloadsRecoverable implements RecoverableService {
 }
 
 /// Resumes polling any conversion job still queued/running server-side --
-/// across a reconnect (the poll timer never started if the app was offline
-/// when the job was enqueued elsewhere) or an app restart (no poll timer
-/// survives a process restart, but the backend job can still be mid-flight).
+/// across a reconnect (polling is gated on online, so it stops while
+/// offline and must be restarted here), an app restart (no poll timer
+/// survives a process restart, but the backend job can still be mid-flight),
+/// or an app resume (a job may have finished while backgrounded). Each run
+/// also settles tracked jobs that finished during the gap.
 class _ResumeConversionsRecoverable implements RecoverableService {
   _ResumeConversionsRecoverable(this._ref);
   final Ref _ref;
@@ -179,8 +205,11 @@ class _ResumeConversionsRecoverable implements RecoverableService {
   int get recoveryPriority => RecoveryPriority.resumeConversions;
 
   @override
-  Set<RecoveryTrigger> get triggers =>
-      const {RecoveryTrigger.networkRecovered, RecoveryTrigger.coldStart};
+  Set<RecoveryTrigger> get triggers => const {
+    RecoveryTrigger.networkRecovered,
+    RecoveryTrigger.coldStart,
+    RecoveryTrigger.appResume,
+  };
 
   @override
   Future<void> recover(RecoveryTrigger trigger) =>

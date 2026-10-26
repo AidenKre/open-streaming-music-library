@@ -38,27 +38,54 @@ class FfmpegProcessRegistry:
 
     def __init__(self) -> None:
         self._procs: dict[Any, subprocess.Popen] = {}
+        # Jobs killed while no process was registered (between two ffmpeg
+        # steps, or before the first one started): any process registered
+        # for them later is killed on arrival. Cleared via forget().
+        self._killed: set[Any] = set()
         self._guard = threading.Lock()
 
     def register(self, job_id: Any, proc: subprocess.Popen) -> None:
         with self._guard:
             self._procs[job_id] = proc
+            if job_id in self._killed:
+                self._kill_locked(proc)
 
     def discard(self, job_id: Any) -> None:
         with self._guard:
             self._procs.pop(job_id, None)
 
-    def kill(self, job_id: Any) -> bool:
-        """Kill the process group for ``job_id``'s currently-running ffmpeg
-        subprocess, if any. Returns whether a process was found to kill —
-        best-effort: if nothing is registered (not started yet, or already
-        finished), this is a no-op, not an error."""
+    def forget(self, job_id: Any) -> None:
+        """Drop all state for a finished job (its kill flag included)."""
         with self._guard:
+            self._procs.pop(job_id, None)
+            self._killed.discard(job_id)
+
+    def kill(self, job_id: Any) -> bool:
+        """Kill ``job_id``'s running ffmpeg process group, and any it starts
+        later until ``forget(job_id)``. Returns whether a live process was
+        killed right now."""
+        with self._guard:
+            self._killed.add(job_id)
             proc = self._procs.get(job_id)
-        if proc is None:
+            if proc is None:
+                return False
+            return self._kill_locked(proc)
+
+    def kill_all(self) -> None:
+        with self._guard:
+            for job_id, proc in self._procs.items():
+                self._killed.add(job_id)
+                self._kill_locked(proc)
+
+    @staticmethod
+    def _kill_locked(proc: subprocess.Popen) -> bool:
+        # Checked under the guard so a process already reaped (whose pid may
+        # have been reused) is never signalled. pgid == pid because the
+        # child is started with start_new_session=True.
+        if proc.poll() is not None:
             return False
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             return False
         return True
@@ -120,6 +147,11 @@ def run_ffmpeg(
             proc.communicate()
             output_path.unlink(missing_ok=True)
             raise FfmpegError(f"ffmpeg failed: {e}") from e
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            output_path.unlink(missing_ok=True)
+            raise
     finally:
         if registry is not None and job_id is not None:
             registry.discard(job_id)

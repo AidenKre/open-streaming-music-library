@@ -26,6 +26,11 @@ class EncodedCache:
         self.ctx = ctx
         self.ctx.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
+        # Bumped by remove_all_for_uuid. An encode captures it before reading
+        # its source; insert() drops the result if the uuid was evicted in
+        # between (it was encoded from a master that has since been replaced),
+        # which matters most for the never-pruned default cache.
+        self._uuid_generations: dict[str, int] = {}
 
     def _key_filename(self, uuid_id: str, quality: str) -> str:
         # uuid_id and quality are constrained values; use directly to keep cache
@@ -50,10 +55,25 @@ class EncodedCache:
     def has(self, uuid_id: str, quality: str) -> bool:
         return self.path_for(uuid_id, quality).exists()
 
-    def insert(self, uuid_id: str, quality: str, source_path: Path) -> Path:
-        """Move ``source_path`` into the cache and prune if over budget."""
+    def generation(self, uuid_id: str) -> int:
+        with self._lock:
+            return self._uuid_generations.get(uuid_id, 0)
+
+    def insert(
+        self, uuid_id: str, quality: str, source_path: Path,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[Path]:
+        """Move ``source_path`` into the cache and prune if over budget.
+        Returns None (and deletes ``source_path``) when ``expected_generation``
+        is given and the uuid has been evicted since it was captured."""
         target = self.path_for(uuid_id, quality)
         with self._lock:
+            if (
+                expected_generation is not None
+                and self._uuid_generations.get(uuid_id, 0) != expected_generation
+            ):
+                source_path.unlink(missing_ok=True)
+                return None
             target.parent.mkdir(parents=True, exist_ok=True)
             os.replace(source_path, target)
             self._prune_locked(protect=target)
@@ -73,6 +93,7 @@ class EncodedCache:
         safe_uuid = uuid_id.replace("/", "_")
         prefix = f"{safe_uuid}__q"
         with self._lock:
+            self._uuid_generations[uuid_id] = self._uuid_generations.get(uuid_id, 0) + 1
             for entry in self.ctx.cache_dir.iterdir():
                 if (
                     entry.is_file()

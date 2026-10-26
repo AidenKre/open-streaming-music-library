@@ -187,12 +187,14 @@ void main() {
       expect(captured?.pathSegments, ['jobs', '42']);
     });
 
-    test('sets Accept and Content-Type headers', () async {
+    test('sets Accept but no Content-Type (DELETE sends no body)', () async {
       Map<String, String>? headers;
+      String? body;
       ApiClient.initForTest(
         'http://localhost:8000',
         MockClient((req) async {
           headers = req.headers;
+          body = req.body;
           return Response(jsonEncode({}), 200);
         }),
       );
@@ -200,6 +202,11 @@ void main() {
       await ApiClient.instance.deleteJson(['jobs', '1']);
 
       expect(headers?['Accept'], 'application/json');
+      expect(
+        headers?.keys.map((k) => k.toLowerCase()),
+        isNot(contains('content-type')),
+      );
+      expect(body, isEmpty);
     });
 
     test('decodes the JSON response body', () async {

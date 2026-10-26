@@ -460,6 +460,58 @@ class TestPersistAndSetDefaultQuality:
         assert c.default_quality in qualities
 
 
+class TestEvictionDuringEncode:
+    """A conversion that replaces a track's master evicts its encodes; an
+    encode already reading the OLD master must not land in the cache after
+    that eviction (the default cache is never pruned, so it would be served
+    forever)."""
+
+    @pytest.mark.parametrize("quality", ["192", "320"])  # default cache, LRU cache
+    def test_evicted_mid_encode__result_dropped_then_reencoded(self, tmp_path, quality):
+        holder = {}
+
+        def transcode_fn(src: Path, dst: Path, bitrate: int) -> bool:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded-from-" + src.read_bytes()[:5])
+            if not holder.get("evicted"):
+                holder["evicted"] = True
+                holder["c"].cache.remove_all_for_uuid("u1")
+                holder["c"]._default_cache_for_test.remove_all_for_uuid("u1")
+            return True
+
+        c = _make_coordinator(tmp_path, transcode_fn=transcode_fn)
+        _, default_cache, _ = c._snapshot_default_state()
+        c._default_cache_for_test = default_cache
+        holder["c"] = c
+
+        assert c.encode_for_stream("u1", quality, source_bitrate_kbps=1000) is None
+        assert not c.cache.has("u1", quality)
+        assert not default_cache.has("u1", quality)
+        assert list((c._scratch_dir).glob("*.m4a")) == []
+
+        result = c.encode_for_stream("u1", quality, source_bitrate_kbps=1000)
+        assert result is not None and result.transcoded
+        target = default_cache if quality == "192" else c.cache
+        assert target.has("u1", quality)
+        c._executor.shutdown(wait=True)
+
+    def test_insert__stale_generation__dropped_and_source_deleted(self, tmp_path):
+        cache = EncodedCache(ctx=EncodedCacheContext(cache_dir=tmp_path / "c", max_size_bytes=0))
+        gen = cache.generation("u1")
+        cache.remove_all_for_uuid("u1")
+        scratch = tmp_path / "scratch.m4a"
+        scratch.write_bytes(b"x")
+
+        assert cache.insert("u1", "192", scratch, expected_generation=gen) is None
+        assert not scratch.exists()
+        assert not cache.has("u1", "192")
+
+        other = tmp_path / "other.m4a"
+        other.write_bytes(b"y")
+        assert cache.insert("u2", "192", other, expected_generation=cache.generation("u2"))
+        assert cache.has("u2", "192")
+
+
 class TestSubmitConversion:
     def test_submit_conversion__runs_fn_on_shared_pool(self, tmp_path):
         c = _make_coordinator(tmp_path)

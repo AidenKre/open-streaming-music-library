@@ -805,6 +805,19 @@ void main() {
       );
       addTearDown(manager.dispose);
 
+      // A stale, previously-dismissed copy: downloaded at 4, the track is now
+      // at 6, dismissed at 5 (so the second change re-armed it).
+      await db.customStatement(
+        "UPDATE tracks SET revision = 6, downloaded_at_revision = 4, "
+        "stale_dismissed_at_revision = 5, downloaded_quality = '320', "
+        "downloaded_codec = 'mp3' WHERE uuid_id = 'abc'",
+      );
+      expect(
+        TrackUI.fromQueryRow((await db.getTrackByUuid('abc')).single)
+            .isStaleDownload,
+        isTrue,
+      );
+
       await manager.enqueueTracksAtQuality(
         [_track('abc', filePath: existingPath, downloadedBitrateKbps: 320)],
         quality: '320',
@@ -816,6 +829,80 @@ void main() {
       final job = manager.snapshot().first;
       expect(job.replacesFilePath, existingPath);
       expect(job.isCompleted, isTrue);
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.downloadedAtRevision, 6);
+      expect(row.staleDismissedAtRevision, isNull);
+      expect(row.filePath, isNot(existingPath));
+      expect(File(row.filePath!).existsSync(), isTrue);
+      expect(File(existingPath).existsSync(), isFalse,
+          reason: 'the stale copy is removed once the swap commits');
+      expect(
+        TrackUI.fromQueryRow((await db.getTrackByUuid('abc')).single)
+            .isStaleDownload,
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'a FAILED forced re-download keeps the stale copy, its file and its '
+    'columns',
+    () async {
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 320,
+        downloadedQuality: '320',
+      );
+      await db.customStatement(
+        "UPDATE tracks SET revision = 6, downloaded_at_revision = 4, "
+        "downloaded_codec = 'mp3', file_size_bytes = 2 WHERE uuid_id = 'abc'",
+      );
+      final before = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response('gone', 404)),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality(
+        [
+          _track(
+            'abc',
+            filePath: existingPath,
+            downloadedBitrateKbps: 320,
+            downloadedQuality: '320',
+          ),
+        ],
+        quality: '320',
+        force: true,
+      );
+      await _waitForFinish(manager);
+
+      expect(manager.snapshot().single.isFailed, isTrue);
+      final after = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(after, before, reason: 'the row must be untouched');
+      expect(File(existingPath).readAsBytesSync(), [9, 9]);
+      expect(
+        TrackUI.fromQueryRow((await db.getTrackByUuid('abc')).single)
+            .isStaleDownload,
+        isTrue,
+      );
+      // No stray replacement files left behind.
+      final leftovers = Directory(p.join(tempDir.path, 'tracks')).existsSync()
+          ? Directory(p.join(tempDir.path, 'tracks')).listSync()
+          : const <FileSystemEntity>[];
+      expect(leftovers, isEmpty);
     },
   );
 

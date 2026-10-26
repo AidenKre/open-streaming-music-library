@@ -370,5 +370,67 @@ void main() {
         isTrue,
       );
     });
+
+    test(
+      'agrees with the SQL staleDownloadPredicate over every null/ordering '
+      'combination',
+      () async {
+        final db = AppDatabase(NativeDatabase.memory());
+        addTearDown(db.close);
+        const values = <int?>[null, 4, 5, 6];
+        var i = 0;
+        final expected = <String, bool>{};
+        for (final hasFile in [true, false]) {
+          for (final rev in values) {
+            for (final dl in values) {
+              for (final dismissed in values) {
+                final uuid = 'u${i++}';
+                await db.customStatement(
+                  'INSERT INTO tracks (uuid_id, created_at, last_updated, '
+                  'revision, file_path, downloaded_at_revision, '
+                  'stale_dismissed_at_revision) VALUES (?, 0, 0, ?, ?, ?, ?)',
+                  [uuid, rev, hasFile ? '/f/$uuid' : null, dl, dismissed],
+                );
+                await db.customStatement(
+                  'INSERT INTO trackmetadata (uuid_id, duration, '
+                  'bitrate_kbps, sample_rate_hz, channels) '
+                  'VALUES (?, 1, 1, 1, 2)',
+                  [uuid],
+                );
+                expected[uuid] = TrackUI(
+                  uuidId: uuid,
+                  filePath: hasFile ? '/f/$uuid' : null,
+                  createdAt: 0,
+                  lastUpdated: 0,
+                  revision: rev,
+                  duration: 1,
+                  bitrateKbps: 1,
+                  sampleRateHz: 1,
+                  channels: 2,
+                  hasAlbumArt: false,
+                  downloadedAtRevision: dl,
+                  staleDismissedAtRevision: dismissed,
+                ).isStaleDownload;
+              }
+            }
+          }
+        }
+
+        final sqlStale = {
+          for (final r in await db.watchStaleDownloads().first)
+            r.read<String>('uuid_id'),
+        };
+        final dartStale = {
+          for (final e in expected.entries)
+            if (e.value) e.key,
+        };
+        expect(dartStale, isNotEmpty);
+        expect(sqlStale, dartStale);
+        // And every row the SQL returns maps to a TrackUI that agrees.
+        for (final r in await db.watchStaleDownloads().first) {
+          expect(TrackUI.fromQueryRow(r).isStaleDownload, isTrue);
+        }
+      },
+    );
   });
 }

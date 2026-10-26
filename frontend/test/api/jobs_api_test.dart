@@ -156,6 +156,45 @@ void main() {
       expect(captured?.queryParameters.containsKey('status'), isFalse);
       expect(captured?.queryParameters.containsKey('cursor'), isFalse);
     });
+
+    test('getJobsPage returns nextCursor and sends a comma status list',
+        () async {
+      Uri? captured;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          captured = req.url;
+          return Response(
+            jsonEncode({'data': [_jobJson(jobId: 3)], 'nextCursor': 3}),
+            200,
+          );
+        }),
+      );
+
+      final page = await JobsApi().getJobsPage(status: 'queued,running');
+
+      expect(captured?.queryParameters['status'], 'queued,running');
+      expect(page.jobs.single.jobId, 3);
+      expect(page.nextCursor, 3);
+    });
+
+    test('retry: false makes a single attempt on a retryable status',
+        () async {
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          return Response('unavailable', 503);
+        }),
+      );
+
+      await expectLater(
+        JobsApi().getJobs(retry: false),
+        throwsA(isA<ApiException>()),
+      );
+      expect(calls, 1);
+    });
   });
 
   group('JobsApi.cancelJob', () {

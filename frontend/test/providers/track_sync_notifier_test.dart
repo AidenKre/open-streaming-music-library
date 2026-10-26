@@ -1489,6 +1489,133 @@ void main() {
     );
   });
 
+  group('TrackSyncNotifier.syncFresh', () {
+    test('waits out an in-flight sync, then runs a fresh pull', () async {
+      final events = <String>[];
+      final firstHeld = Completer<void>();
+      final firstArrived = Completer<void>();
+      var call = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          final n = ++call;
+          events.add('start$n');
+          if (n == 1) {
+            firstArrived.complete();
+            await firstHeld.future;
+          }
+          events.add('end$n');
+          return _changesResponse([
+            _upsert(n, _trackJson('uuid-$n', revision: n)),
+          ]);
+        }),
+      );
+
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+
+      final plain = notifier.sync();
+      await firstArrived.future;
+      var freshDone = false;
+      final fresh = notifier.syncFresh().then((ok) {
+        freshDone = true;
+        return ok;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(freshDone, isFalse, reason: 'must wait for the in-flight pull');
+      expect(call, 1, reason: 'no overlapping pull was started');
+
+      firstHeld.complete();
+      await plain;
+      expect(await fresh, isTrue);
+      expect(events, ['start1', 'end1', 'start2', 'end2'],
+          reason: 'a second pull started only after the first finished');
+      expect((await db.select(db.tracks).get()).map((t) => t.uuidId).toSet(),
+          {'uuid-1', 'uuid-2'});
+    });
+
+    test('with nothing in flight runs exactly one pull and returns true',
+        () async {
+      var call = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          call++;
+          return _changesResponse([_upsert(1, _trackJson('uuid-1'))]);
+        }),
+      );
+      final c = createContainer();
+      await waitForBuild(c);
+
+      expect(await c.read(trackSyncProvider.notifier).syncFresh(), isTrue);
+      expect(call, 1);
+    });
+
+    test('offline returns false without a request', () async {
+      var call = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          call++;
+          return _changesResponse(const []);
+        }),
+      );
+      final c = createContainer(offline: true);
+      await waitForBuild(c);
+
+      expect(await c.read(trackSyncProvider.notifier).syncFresh(), isFalse);
+      expect(call, 0);
+    });
+
+    test('a failed pull returns false and publishes the error', () async {
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => Response('boom', 500)),
+      );
+      final c = createContainer();
+      await waitForBuild(c);
+
+      expect(await c.read(trackSyncProvider.notifier).syncFresh(), isFalse);
+      final state = c.read(trackSyncProvider).value!;
+      expect(state.error, isNotNull);
+      expect(state.isSyncing, isFalse);
+    });
+
+    test('concurrent syncFresh/sync calls never overlap a pull', () async {
+      var inFlight = 0;
+      var maxInFlight = 0;
+      var call = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          call++;
+          inFlight++;
+          maxInFlight = inFlight > maxInFlight ? inFlight : maxInFlight;
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          inFlight--;
+          return _changesResponse(const []);
+        }),
+      );
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+
+      final results = await Future.wait([
+        notifier.syncFresh(),
+        notifier.syncFresh(),
+        notifier.sync().then((_) => true),
+        notifier.syncFresh(),
+      ]);
+
+      expect(maxInFlight, 1);
+      expect(results, everyElement(isTrue),
+          reason: 'every syncFresh caller got its own completed fresh pull');
+      expect(call, greaterThanOrEqualTo(2));
+      expect(c.read(trackSyncProvider).value!.isSyncing, isFalse);
+    });
+  });
+
   group('Artist-rename orphan reproduction', () {
     test(
       'flushing an artist rename, then resuming the app, still leaves the '

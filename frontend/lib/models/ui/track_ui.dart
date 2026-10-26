@@ -35,21 +35,25 @@ class TrackUI {
   // Distinct from `downloadedBitrateKbps`, which is the actual on-disk
   // bitrate — for passthrough downloads the two can differ.
   final String? downloadedQuality;
-  // The track's `revision` when this download committed. Compared against
-  // `revision` to detect a server-side master change (e.g. a conversion)
-  // the local file hasn't picked up yet.
+  // The server revision this download is current as of (see the column's
+  // doc comment on `Tracks`). Compared against `revision` to detect a
+  // server-side change (audio, tags or artwork) the local file predates.
   final int? downloadedAtRevision;
   // The codec actually written to disk (see the column's doc comment on
-  // `Tracks` for how it's derived).
+  // `Tracks` for where it comes from).
   final String? downloadedCodec;
   // Re-arms when `revision` climbs past this value again after a dismiss.
   final int? staleDismissedAtRevision;
 
   bool get isDownloaded => filePath != null;
 
-  /// A downloaded file whose server master has since changed (its revision
-  /// moved past the one this file was downloaded at) and the user hasn't
-  /// dismissed this particular change.
+  /// A downloaded file whose track has since changed on the server (its
+  /// revision moved past the one this file is current as of) and the user
+  /// hasn't dismissed this particular change.
+  ///
+  /// Dart mirror of `staleDownloadPredicate` (database.dart), which is the
+  /// rule the banner's SQL query filters on; `track_ui_test.dart` asserts the
+  /// two agree over every null/ordering combination.
   bool get isStaleDownload {
     if (!isDownloaded || revision == null || downloadedAtRevision == null) {
       return false;
@@ -98,6 +102,7 @@ class TrackUI {
 
   TrackUI copyWith({
     Object? filePath = _sentinel,
+    Object? revision = _sentinel,
     Object? downloadedBitrateKbps = _sentinel,
     Object? fileSizeBytes = _sentinel,
     Object? downloadedQuality = _sentinel,
@@ -110,7 +115,7 @@ class TrackUI {
       filePath: filePath == _sentinel ? this.filePath : filePath as String?,
       createdAt: createdAt,
       lastUpdated: lastUpdated,
-      revision: revision,
+      revision: revision == _sentinel ? this.revision : revision as int?,
       title: title,
       artist: artist,
       album: album,

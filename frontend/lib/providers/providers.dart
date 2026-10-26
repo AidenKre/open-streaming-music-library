@@ -74,7 +74,40 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     return const TrackSyncState();
   }
 
+  /// The currently running guarded operation (a [sync] or [refreshTrack]),
+  /// so [syncFresh] can wait it out. Set/cleared in lockstep with
+  /// `isSyncing`.
+  Future<bool>? _inFlightRun;
+
   Future<void> sync() async {
+    await _syncOnce();
+  }
+
+  /// Like [sync], but guarantees a flush + `/changes` pull that *started
+  /// after this call* has completed: if a sync is already in flight (whose
+  /// pull may predate the caller's precondition) it is awaited first and
+  /// then a fresh one is run. Returns true only when that fresh pull
+  /// succeeded; false when offline or the pull failed (the error is still
+  /// published on [state]). Used where a stale local revision would be sent
+  /// to the server (e.g. the convert flow's `base_revision`) and after a
+  /// server-side change the client must pick up (a finished conversion).
+  Future<bool> syncFresh() async {
+    // Bounded: each in-flight run we wait out finishes in finite time, and
+    // a fresh entrant can't slip in between our null check and
+    // `_runGuarded`'s synchronous isSyncing claim (no awaits between them).
+    for (var i = 0; i < 5; i++) {
+      final inFlight = _inFlightRun;
+      if (inFlight != null) {
+        await inFlight;
+        continue;
+      }
+      if (ref.read(offlineModeProvider)) return false;
+      return _syncOnce();
+    }
+    return false;
+  }
+
+  Future<bool> _syncOnce() async {
     // Flush pending edits, then pull — in one mutex-guarded critical section
     // so a `/changes` pull can never clobber an unflushed optimistic edit
     // (the pull does a blind full-row upsert). Flushing first also satisfies
@@ -88,6 +121,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     if (ran) {
       await ref.read(editOutboxProvider).retryTakeServerResolutions();
     }
+    return ran;
   }
 
   /// Reconcile a single track to current server truth (refetch + apply, or
@@ -114,6 +148,22 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
   /// state that is current AT PUBLISH TIME. Returns true when [op] ran and
   /// its result was published.
   Future<bool> _runGuarded(
+    Future<SyncResult> Function(SyncService service) op,
+  ) {
+    // Offline mode skips entirely (see [_runGuardedBody]).
+    if (ref.read(offlineModeProvider)) return Future.value(false);
+    final current = state.value;
+    if (current != null && current.isSyncing) return Future.value(false);
+    // Synchronously claims the slot: `_runGuardedBody` publishes
+    // isSyncing:true before its first await.
+    final run = _runGuardedBody(op);
+    _inFlightRun = run;
+    return run.whenComplete(() {
+      if (identical(_inFlightRun, run)) _inFlightRun = null;
+    });
+  }
+
+  Future<bool> _runGuardedBody(
     Future<SyncResult> Function(SyncService service) op,
   ) async {
     // Offline mode skips entirely — the network call would just fail.

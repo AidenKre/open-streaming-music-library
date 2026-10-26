@@ -1882,6 +1882,116 @@ void main() {
     test('is a no-op for an unknown uuid', () async {
       await db.dismissStaleDownload('does-not-exist'); // must not throw
     });
+
+    test('dismissStaleDownloads stamps each listed track only', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision) VALUES "
+        "('u1', 0, 0, 9, '/1', 5), ('u2', 0, 0, 7, '/2', 5), "
+        "('u3', 0, 0, 8, '/3', 5)",
+      );
+
+      await db.dismissStaleDownloads(['u1', 'u2']);
+
+      final rows = {
+        for (final r in await db.select(db.tracks).get())
+          r.uuidId: r.staleDismissedAtRevision,
+      };
+      expect(rows, {'u1': 9, 'u2': 7, 'u3': null});
+    });
+  });
+
+  group('recordOwnEditRevision', () {
+    Future<Track> row() => (db.select(
+      db.tracks,
+    )..where((t) => t.uuidId.equals('u1'))).getSingle();
+
+    test('advances a current download along with the revision', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision) VALUES ('u1', 0, 0, 5, '/x', 5)",
+      );
+      await db.recordOwnEditRevision('u1', 6, currentAsOf: 5);
+      final r = await row();
+      expect(r.revision, 6);
+      expect(r.downloadedAtRevision, 6);
+    });
+
+    test('leaves an already-stale download stale', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision) VALUES ('u1', 0, 0, 5, '/x', 4)",
+      );
+      await db.recordOwnEditRevision('u1', 6, currentAsOf: 5);
+      final r = await row();
+      expect(r.revision, 6);
+      expect(r.downloadedAtRevision, 4);
+    });
+
+    test('null currentAsOf only raises the revision', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision) VALUES ('u1', 0, 0, 5, '/x', 5)",
+      );
+      await db.recordOwnEditRevision('u1', 6, currentAsOf: null);
+      final r = await row();
+      expect(r.revision, 6);
+      expect(r.downloadedAtRevision, 5);
+    });
+
+    test('never lowers the revision', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision) "
+        "VALUES ('u1', 0, 0, 9)",
+      );
+      await db.recordOwnEditRevision('u1', 6, currentAsOf: 5);
+      expect((await row()).revision, 9);
+    });
+
+    test('carries a dismissal at the base revision forward (stays not stale)',
+        () async {
+      Future<bool> isStale() async {
+        final r = await db.customSelect(
+          'SELECT COUNT(*) AS c FROM tracks AS t '
+          "WHERE t.uuid_id = 'u1' AND $staleDownloadPredicate",
+        ).getSingle();
+        return r.read<int>('c') > 0;
+      }
+
+      // Downloaded at 4, server change to 5 flagged stale, user dismissed at
+      // 5, then the user's own edit 5 -> 6.
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision) "
+        "VALUES ('u1', 0, 0, 5, '/x', 4)",
+      );
+      expect(await isStale(), isTrue);
+      await db.dismissStaleDownload('u1');
+      expect(await isStale(), isFalse);
+
+      await db.recordOwnEditRevision('u1', 6, currentAsOf: 5);
+      final r = await row();
+      expect(r.revision, 6);
+      expect(r.downloadedAtRevision, 4);
+      expect(r.staleDismissedAtRevision, 6);
+      expect(await isStale(), isFalse);
+    });
+
+    test('does not carry an older dismissal or a null currentAsOf', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision, stale_dismissed_at_revision) "
+        "VALUES ('u1', 0, 0, 5, '/x', 3, 4)",
+      );
+      await db.recordOwnEditRevision('u1', 6, currentAsOf: 5);
+      expect((await row()).staleDismissedAtRevision, 4);
+
+      await db.customStatement(
+        'UPDATE tracks SET stale_dismissed_at_revision = 6',
+      );
+      await db.recordOwnEditRevision('u1', 7, currentAsOf: null);
+      expect((await row()).staleDismissedAtRevision, 6);
+    });
   });
 
   group('reactive browse', () {

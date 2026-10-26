@@ -89,10 +89,10 @@ class SettingsDialog extends ConsumerWidget {
             const SizedBox(height: 8),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Notify about outdated downloads'),
+              title: const Text('Notify about changed downloads'),
               subtitle: const Text(
-                'Warn when a server-side change makes a local download '
-                'stale (e.g. a master-type conversion).',
+                'Show a banner when a track you downloaded changes on the '
+                'server (audio, tags, or artwork).',
               ),
               value: settings.notifyStaleDownloads,
               onChanged: (value) => ref

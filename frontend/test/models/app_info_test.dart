@@ -149,4 +149,17 @@ void main() {
       expect(editableFieldsFor(defaultAppInfo(), 'album'), isEmpty);
     });
   });
+
+  group('isLosslessCodec', () {
+    test('classifies source codecs', () {
+      for (final c in ['flac', 'alac', 'wav', 'pcm_s16le', 'PCM_S24LE']) {
+        expect(isLosslessCodec(c), isTrue, reason: c);
+      }
+      for (final c in ['aac', 'mp3', 'opus', 'vorbis']) {
+        expect(isLosslessCodec(c), isFalse, reason: c);
+      }
+      expect(isLosslessCodec('weird'), isNull);
+      expect(isLosslessCodec(null), isNull);
+    });
+  });
 }

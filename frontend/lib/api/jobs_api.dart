@@ -31,14 +31,17 @@ class JobsApi {
     return ConversionJob.fromJson(json);
   }
 
-  /// Fetches one page of jobs, optionally filtered. [cursor]/the response's
-  /// `nextCursor` are job ids (ascending) -- mirrors `/changes`' int-cursor
-  /// convention.
-  Future<List<ConversionJob>> getJobs({
+  /// Fetches one page of jobs, optionally filtered. [status] may be a single
+  /// status or a comma-separated list (`queued,running`). [cursor] is an
+  /// exclusive "job id greater than" cursor (ascending); the page's
+  /// [JobsPage.nextCursor] is non-null when the page was full. Pass
+  /// `retry: false` for polling, which is its own retry loop.
+  Future<JobsPage> getJobsPage({
     String? uuidId,
     String? status,
     int? cursor,
     int limit = 50,
+    bool retry = true,
   }) async {
     final query = <String, String>{
       'limit': limit.toString(),
@@ -46,11 +49,36 @@ class JobsApi {
       if (status != null) 'status': status,
       if (cursor != null) 'cursor': cursor.toString(),
     };
-    final json = await _apiClient.getJson(['jobs'], query: query);
+    final json = await _apiClient.getJson(
+      ['jobs'],
+      query: query,
+      retry: retry,
+    );
     final data = (json['data'] as List<dynamic>?) ?? const [];
-    return data
-        .map((j) => ConversionJob.fromJson(j as Map<String, dynamic>))
-        .toList();
+    return JobsPage(
+      jobs: data
+          .map((j) => ConversionJob.fromJson(j as Map<String, dynamic>))
+          .toList(),
+      nextCursor: json['nextCursor'] as int?,
+    );
+  }
+
+  /// [getJobsPage] without the cursor -- just the page's jobs.
+  Future<List<ConversionJob>> getJobs({
+    String? uuidId,
+    String? status,
+    int? cursor,
+    int limit = 50,
+    bool retry = true,
+  }) async {
+    final page = await getJobsPage(
+      uuidId: uuidId,
+      status: status,
+      cursor: cursor,
+      limit: limit,
+      retry: retry,
+    );
+    return page.jobs;
   }
 
   /// Cancels a queued or running job. Idempotent per the backend (a no-op
@@ -60,4 +88,14 @@ class JobsApi {
     final json = await _apiClient.deleteJson(['jobs', jobId.toString()]);
     return json['cancelled'] as bool;
   }
+}
+
+/// One page of `GET /jobs`.
+class JobsPage {
+  final List<ConversionJob> jobs;
+
+  /// Job id to pass as the next request's `cursor`; null on the last page.
+  final int? nextCursor;
+
+  const JobsPage({required this.jobs, this.nextCursor});
 }

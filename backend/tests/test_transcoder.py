@@ -98,19 +98,86 @@ class TestTranscode:
         cmd = run.call_args[0][0]
         assert "-vn" not in cmd
 
-    def test_transcode__source_params__mirrors_sample_fmt_rate_channels(self, tmp_path):
+    @staticmethod
+    def _cmd_for(tmp_path, codec, bitrate=None, **kwargs):
         source = tmp_path / "src.flac"
         source.write_bytes(b"x")
-        dest = tmp_path / "dst.flac"
-        params = SourceAudioParams(sample_fmt="s32", sample_rate_hz=48000, channels=2)
+        dest = tmp_path / f"dst.{ {'aac': 'm4a', 'alac': 'm4a'}.get(codec, codec) }"
         with patch(
             "app.services.ffmpeg_runner.subprocess.Popen", side_effect=_fake_ffmpeg_success
         ) as run:
-            transcode(source, dest, "flac", source_params=params)
-        cmd = run.call_args[0][0]
-        assert "-sample_fmt" in cmd and "s32" in cmd
-        assert "-ar" in cmd and "48000" in cmd
-        assert "-ac" in cmd and "2" in cmd
+            assert transcode(source, dest, codec, bitrate, **kwargs).ok
+        return run.call_args[0][0]
+
+    @staticmethod
+    def _flag_value(cmd, flag):
+        assert cmd.count(flag) == 1, cmd
+        return cmd[cmd.index(flag) + 1]
+
+    def test_transcode__source_params__mirrors_sample_fmt_rate_channels(self, tmp_path):
+        params = SourceAudioParams(bits_per_sample=24, sample_rate_hz=48000, channels=2)
+        cmd = self._cmd_for(tmp_path, "flac", source_params=params)
+        assert self._flag_value(cmd, "-sample_fmt") == "s32"
+        assert self._flag_value(cmd, "-ar") == "48000"
+        assert self._flag_value(cmd, "-ac") == "2"
+
+    @pytest.mark.parametrize("codec,bits,expected", [
+        ("flac", 16, "s16"),
+        ("flac", 8, "s16"),
+        ("flac", 24, "s32"),
+        ("flac", 32, "s32"),
+        ("alac", 16, "s16p"),
+        ("alac", 24, "s32p"),
+        ("alac", 32, "s32p"),
+    ])
+    def test_transcode__lossless_target__bits_map_to_encoder_sample_fmt(
+        self, tmp_path, codec, bits, expected
+    ):
+        params = SourceAudioParams(bits_per_sample=bits, sample_rate_hz=96000, channels=2)
+        cmd = self._cmd_for(tmp_path, codec, source_params=params)
+        assert self._flag_value(cmd, "-sample_fmt") == expected
+        # The sample format goes on the output side, after the codec flags.
+        assert cmd.index("-sample_fmt") > cmd.index("-c:a")
+        assert cmd[-1].endswith(".partial")
+
+    @pytest.mark.parametrize("codec,bitrate", [("aac", 256), ("mp3", 320)])
+    def test_transcode__lossy_target__never_gets_sample_fmt(self, tmp_path, codec, bitrate):
+        params = SourceAudioParams(bits_per_sample=24, sample_rate_hz=44100, channels=2)
+        cmd = self._cmd_for(tmp_path, codec, bitrate, source_params=params)
+        assert "-sample_fmt" not in cmd
+        assert self._flag_value(cmd, "-ar") == "44100"
+
+    @pytest.mark.parametrize("codec", ["flac", "alac"])
+    def test_transcode__unknown_bits__no_sample_fmt(self, tmp_path, codec):
+        params = SourceAudioParams(bits_per_sample=None, sample_rate_hz=44100, channels=1)
+        cmd = self._cmd_for(tmp_path, codec, source_params=params)
+        assert "-sample_fmt" not in cmd
+        assert self._flag_value(cmd, "-ac") == "1"
+
+    @pytest.mark.parametrize("codec,bitrate,art_flags", [
+        ("aac", 256, ["-c:v", "copy", "-disposition:v:0", "attached_pic"]),
+        ("alac", None, ["-c:v", "copy", "-disposition:v:0", "attached_pic"]),
+        ("flac", None, ["-c:v", "copy"]),
+        ("mp3", 320, ["-c:v", "copy", "-id3v2_version", "3"]),
+    ])
+    def test_transcode__conversion_keeps_art__per_codec_art_flags(
+        self, tmp_path, codec, bitrate, art_flags
+    ):
+        cmd = self._cmd_for(tmp_path, codec, bitrate, strip_video=False)
+        assert "-vn" not in cmd
+        start = cmd.index("-c:v")
+        assert cmd[start:start + len(art_flags)] == art_flags
+        assert cmd.count("-c:v") == 1
+
+    @pytest.mark.parametrize("codec,bitrate", [
+        ("aac", 256), ("alac", None), ("flac", None), ("mp3", 320),
+    ])
+    def test_transcode__streaming_strips_video__no_art_flags(self, tmp_path, codec, bitrate):
+        cmd = self._cmd_for(tmp_path, codec, bitrate, strip_video=True)
+        assert cmd.count("-vn") == 1
+        assert "-c:v" not in cmd
+        assert "-disposition:v:0" not in cmd
+        assert "-id3v2_version" not in cmd
 
     def test_transcode__no_source_params__omits_mirrored_flags(self, tmp_path):
         source = tmp_path / "src.flac"
@@ -137,8 +204,16 @@ class TestTranscodeToAacM4a:
             ok = transcode_to_aac_m4a(source, dest, 192)
         assert ok is True
         cmd = run.call_args[0][0]
-        assert "-vn" in cmd
-        assert "-b:a" in cmd and "192k" in cmd
+        # The streaming path: no art flags, no source-param mirroring.
+        assert cmd == [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source),
+            "-vn",
+            "-c:a", "aac", "-f", "mp4", "-movflags", "+faststart",
+            "-b:a", "192k",
+            str(tmp_path / "dst.m4a.partial"),
+        ]
+        assert dest.exists()
 
     def test_transcode_to_aac_m4a__ffmpeg_failure__returns_false(self, tmp_path):
         source = tmp_path / "src.flac"

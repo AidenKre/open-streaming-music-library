@@ -61,6 +61,25 @@ class EntityInfo {
   };
 }
 
+/// Whether a *source* codec (as stored in `trackmetadata.codec`, i.e.
+/// ffprobe's `codec_name`) is lossless. Null for a codec this client doesn't
+/// recognise -- callers fall back to a generic warning rather than guessing.
+///
+/// Targets carry their own server-advertised [ConversionTargetInfo.isLossless];
+/// this is the one client-side home for classifying an arbitrary source
+/// codec, so a new codec is one edit here.
+bool? isLosslessCodec(String? codec) {
+  if (codec == null) return null;
+  final c = codec.toLowerCase();
+  if (c.startsWith('pcm_')) return true;
+  if (_losslessCodecs.contains(c)) return true;
+  if (_lossyCodecs.contains(c)) return false;
+  return null;
+}
+
+const _losslessCodecs = {'flac', 'alac', 'wav', 'pcm', 'wavpack', 'ape'};
+const _lossyCodecs = {'aac', 'mp3', 'opus', 'vorbis'};
+
 class ConversionTargetInfo {
   final String codec;
   final bool isLossless;
