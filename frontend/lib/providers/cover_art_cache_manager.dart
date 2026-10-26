@@ -71,11 +71,21 @@ class CoverArtCacheManager implements LocalResettable {
   }
 
   /// Prefetches cover art so it is ready when the UI or audio service needs it.
+  ///
+  /// Called from grid item builders, so it runs on every rebuild: it must be
+  /// cheap for art that's already here and must never throw. Locally
+  /// downloaded art is skipped; `getSingleFile` serves a still-valid cached
+  /// copy without touching the network (`downloadFile` always re-downloads).
+  /// Fire-and-forget and best-effort, so a failed fetch (offline, server
+  /// error) is dropped -- `ignore()` keeps it from surfacing as an unhandled
+  /// async error.
   void prefetch(List<int> coverArtIds) {
     final cache = _cache;
     if (cache == null) return;
-    for (final id in coverArtIds) {
-      cache.downloadFile(_url(id));
+    final local = _localStore;
+    for (final id in coverArtIds.toSet()) {
+      if (local != null && local.has(id)) continue;
+      cache.getSingleFile(_url(id)).ignore();
     }
   }
 

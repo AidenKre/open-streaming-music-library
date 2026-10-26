@@ -1,3 +1,5 @@
+import 'dart:io' show SocketException;
+
 import 'package:file/file.dart';
 import 'package:file/memory.dart';
 import 'package:flutter/painting.dart';
@@ -115,27 +117,41 @@ void main() {
   });
 
   group('prefetch', () {
-    test('calls downloadFile for each cover art ID', () {
+    test('fetches each distinct cover art ID through the cache', () {
       when(
-        () => mockCache.downloadFile(any()),
-      ).thenAnswer((_) async => FakeFileInfo('/tmp/cover.jpg'));
+        () => mockCache.getSingleFile(any()),
+      ).thenAnswer((_) async => FakeFileInfo('/tmp/cover.jpg').file);
 
-      manager.prefetch([1, 2, 3]);
+      manager.prefetch([1, 2, 3, 2]);
 
       verify(
-        () => mockCache.downloadFile('http://localhost:8000/cover_art/1'),
+        () => mockCache.getSingleFile('http://localhost:8000/cover_art/1'),
       ).called(1);
       verify(
-        () => mockCache.downloadFile('http://localhost:8000/cover_art/2'),
+        () => mockCache.getSingleFile('http://localhost:8000/cover_art/2'),
       ).called(1);
       verify(
-        () => mockCache.downloadFile('http://localhost:8000/cover_art/3'),
+        () => mockCache.getSingleFile('http://localhost:8000/cover_art/3'),
       ).called(1);
+      // downloadFile bypasses the cache and always hits the network.
+      verifyNever(() => mockCache.downloadFile(any()));
+    });
+
+    test('a failed fetch (e.g. offline) is swallowed, not unhandled', () async {
+      when(
+        () => mockCache.getSingleFile(any()),
+      ).thenAnswer((_) => Future.error(const SocketException('offline')));
+
+      manager.prefetch([1]);
+      // Let the failed future complete; an unhandled error would fail the
+      // test.
+      await Future<void>.delayed(Duration.zero);
+      verify(() => mockCache.getSingleFile(any())).called(1);
     });
 
     test('does nothing for empty list', () {
       manager.prefetch([]);
-      verifyNever(() => mockCache.downloadFile(any()));
+      verifyNever(() => mockCache.getSingleFile(any()));
     });
   });
 
