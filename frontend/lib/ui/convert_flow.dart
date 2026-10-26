@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
@@ -105,6 +106,10 @@ Future<bool> _runConversionFlow(
     snack("You're offline. Converting needs the server.");
     return false;
   }
+  if (_isLoadedInPlayer(ref, uuidId)) {
+    snack(convertWhilePlayingMessage);
+    return false;
+  }
 
   final synced = await syncNotifier.syncFresh();
   if (!context.mounted) return false;
@@ -164,6 +169,11 @@ Future<bool> _runConversionFlow(
     targetBitrateKbps: choice.bitrateKbps,
   );
   if (!confirmed || !context.mounted) return false;
+  // Re-checked: playback may have started while the sheets were open.
+  if (_isLoadedInPlayer(ref, uuidId)) {
+    snack(convertWhilePlayingMessage);
+    return false;
+  }
 
   try {
     await jobsNotifier.enqueue(
@@ -183,6 +193,25 @@ Future<bool> _runConversionFlow(
     return false;
   }
 }
+
+@visibleForTesting
+const convertWhilePlayingMessage =
+    'This track is loaded in the player. Stop or skip it before converting.';
+
+/// TEMPORARY GUARD -- NOT A PERMANENT FIX. Converting the track this device
+/// is playing swaps its master file mid-stream: the player keeps issuing
+/// byte-range requests for offsets in the OLD file, which the server then
+/// answers from the NEW one (416s, or bytes from the middle of a different
+/// encoding -> noise/skips). Refusing to convert the current track (playing
+/// or paused -- a paused track resumes with more range requests) covers the
+/// common case only. It does NOT cover: another device streaming the track,
+/// a job queued before playback started, the player's preloaded next track,
+/// or Phase 1 master-file tag edits (same swap problem). The real fix is
+/// versioned stream URLs (`?v=<revision>`, server rejects stale versions)
+/// plus the player reloading the current source when its revision changes;
+/// see the Phase 2 follow-ups. Remove this guard once that lands.
+bool _isLoadedInPlayer(WidgetRef ref, String uuidId) =>
+    ref.read(currentTrackProvider)?.uuidId == uuidId;
 
 /// [presetCodec]/[presetBitrateKbps] as a choice, if still valid for this
 /// track and server; null means "ask the user".

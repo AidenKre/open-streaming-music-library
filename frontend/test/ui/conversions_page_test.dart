@@ -13,6 +13,7 @@ import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
@@ -174,6 +175,7 @@ void main() {
     return ProviderScope(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        currentTrackProvider.overrideWithValue(null),
         conversionJobsProvider.overrideWith(
           () => notifier ?? _FixedConversionJobs(jobs),
         ),

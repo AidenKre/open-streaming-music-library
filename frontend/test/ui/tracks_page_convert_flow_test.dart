@@ -15,8 +15,10 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
@@ -173,6 +175,18 @@ Future<void> _markPending(AppDatabase db, String uuid) async {
   );
 }
 
+TrackUI _loadedTrack(String uuid) => TrackUI(
+  uuidId: uuid,
+  createdAt: 0,
+  lastUpdated: 0,
+  codec: 'flac',
+  duration: 60,
+  bitrateKbps: 900,
+  sampleRateHz: 44100,
+  channels: 2,
+  hasAlbumArt: false,
+);
+
 ApiException _apiError(int status, Object detail) =>
     ApiException(status, jsonEncode({'detail': detail}));
 
@@ -195,10 +209,12 @@ void main() {
     bool offline = false,
     String? presetCodec,
     int? presetBitrateKbps,
+    TrackUI? playing,
   }) {
     return ProviderScope(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        currentTrackProvider.overrideWithValue(playing),
         trackSyncProvider.overrideWith(() => sync ?? _StubTrackSync()),
         appInfoProvider.overrideWith((ref) async => capabilities),
         conversionJobsProvider.overrideWith(() => jobsNotifier),
@@ -313,6 +329,45 @@ void main() {
       expect(find.textContaining("You're offline"), findsOneWidget);
       expect(sync.syncFreshCalls, 0);
       expect(jobs.enqueueCalls, isEmpty);
+    });
+
+    // Temporary guard (see _isLoadedInPlayer): the track loaded in the
+    // player can't be converted.
+    testWidgets('the track loaded in the player is refused before any sync',
+        (tester) async {
+      await _insertTrack(db, uuid: 'abc');
+      final jobs = _RecordingConversionJobs();
+      final sync = _StubTrackSync();
+
+      await tester.pumpWidget(harness(
+        uuidId: 'abc',
+        jobsNotifier: jobs,
+        sync: sync,
+        playing: _loadedTrack('abc'),
+      ));
+      await tester.tap(find.text('Start'));
+      await tester.pumpAndSettle();
+
+      expect(find.text(convertWhilePlayingMessage), findsOneWidget);
+      expect(sync.syncFreshCalls, 0);
+      expect(jobs.enqueueCalls, isEmpty);
+    });
+
+    testWidgets('a different track loaded in the player does not block',
+        (tester) async {
+      await _insertTrack(db, uuid: 'abc');
+      final jobs = _RecordingConversionJobs();
+
+      await tester.pumpWidget(harness(
+        uuidId: 'abc',
+        jobsNotifier: jobs,
+        playing: _loadedTrack('other'),
+      ));
+      await tester.tap(find.text('Start'));
+      await tester.pumpAndSettle();
+
+      expect(find.text(convertWhilePlayingMessage), findsNothing);
+      expect(find.text('Convert to'), findsOneWidget);
     });
 
     testWidgets('a server without the convert action aborts', (tester) async {
@@ -643,6 +698,7 @@ void main() {
       await tester.pumpWidget(ProviderScope(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          currentTrackProvider.overrideWithValue(null),
           downloadManagerProvider.overrideWithValue(manager),
           trackSyncProvider.overrideWith(() => _StubTrackSync()),
           appInfoProvider.overrideWith((ref) async => capabilities),
@@ -739,6 +795,7 @@ void main() {
       await tester.pumpWidget(ProviderScope(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          currentTrackProvider.overrideWithValue(null),
           downloadManagerProvider.overrideWithValue(manager),
           trackSyncProvider.overrideWith(() => _StubTrackSync(gate: gate)),
           appInfoProvider.overrideWith((ref) async => _capabilities),
@@ -831,6 +888,7 @@ void main() {
       await tester.pumpWidget(ProviderScope(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          currentTrackProvider.overrideWithValue(null),
           downloadManagerProvider.overrideWithValue(manager),
           trackSyncProvider.overrideWith(() => _StubTrackSync()),
           appInfoProvider.overrideWith((ref) async => _capabilities),
@@ -924,6 +982,7 @@ void main() {
         ProviderScope(
           overrides: [
             databaseProvider.overrideWithValue(db),
+            currentTrackProvider.overrideWithValue(null),
             conversionJobsProvider.overrideWith(_RecordingConversionJobs.new),
           ],
           child: MaterialApp(
