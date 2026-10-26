@@ -115,11 +115,13 @@ def _probe_source_params(source: Path, source_codec: Optional[str]) -> Optional[
     return None
 
 
-def _probe_intrinsic_fields(path: Path, target_codec: str) -> tuple[str, float, int, int]:
+def _probe_intrinsic_fields(
+    path: Path, target_codec: str
+) -> tuple[str, Optional[float], int, int]:
     """Re-probe a converted file to get the codec/bitrate/sample_rate/channels
-    that actually landed, so stored values match ingestion exactly. FLAC (and
-    other lossless codecs) typically omit stream-level bit_rate -- fall back
-    to format.bit_rate, which ffprobe derives from container size/duration."""
+    that actually landed, using the same builder as ingestion so stored
+    values match it exactly (including its format.bit_rate fallback for
+    FLAC, which has no stream-level bit_rate)."""
     raw = ffprobe_for_metadata(path)
     if raw is None:
         raise ConversionFailed(f"post-conversion probe of {path} failed")
@@ -129,15 +131,7 @@ def _probe_intrinsic_fields(path: Path, target_codec: str) -> tuple[str, float, 
             f"post-conversion probe codec mismatch: expected {target_codec}, "
             f"got {metadata.codec if metadata else None}"
         )
-    bitrate_kbps = metadata.bitrate_kbps
-    if is_lossless(target_codec) and bitrate_kbps == 0.0:
-        fmt_bitrate = raw.get("format", {}).get("bit_rate")
-        try:
-            if fmt_bitrate is not None:
-                bitrate_kbps = float(fmt_bitrate) / 1000.0
-        except (TypeError, ValueError):
-            pass
-    return metadata.codec, bitrate_kbps, metadata.sample_rate_hz, metadata.channels
+    return metadata.codec, metadata.bitrate_kbps, metadata.sample_rate_hz, metadata.channels
 
 
 def _estimate_output_bytes(track: Track, source_size: int, target_codec: str,

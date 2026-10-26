@@ -146,7 +146,8 @@ class Trackmetadata extends Table {
   IntColumn get discNumber => integer().nullable()();
   TextColumn get codec => text().nullable()();
   RealColumn get duration => real()();
-  RealColumn get bitrateKbps => real()();
+  // Null = unknown (the server couldn't determine it); 0 is a real value.
+  RealColumn get bitrateKbps => real().nullable()();
   IntColumn get sampleRateHz => integer()();
   IntColumn get channels => integer()();
   BoolColumn get hasAlbumArt => boolean().withDefault(const Constant(false))();

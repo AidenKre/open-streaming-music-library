@@ -36,7 +36,7 @@ Future<void> _insertTrack(
           uuidId: uuid,
           codec: Value(codec),
           duration: 120,
-          bitrateKbps: 320,
+          bitrateKbps: const Value(320),
           sampleRateHz: 44100,
           channels: 2,
         ),

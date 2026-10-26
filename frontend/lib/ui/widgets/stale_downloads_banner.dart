@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/models/app_info.dart' show isLosslessCodec;
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart' show formatBytes;
@@ -79,33 +80,43 @@ String staleDownloadsBannerLabel(int count) =>
 
 /// The per-track "what changed" line: the downloaded copy's codec, bitrate
 /// and file size (each when known) against the current master's codec and
-/// bitrate. When the downloaded audio already
-/// matches the current master (same codec, bitrate within 1 kbps), the change
+/// bitrate. An unknown (null) bitrate is omitted; a real 0 is shown.
+///
+/// When the downloaded audio already matches the current master, the change
 /// must have been to tags or artwork, so say that instead of an identical
-/// "flac, 900 kbps -> flac, 900 kbps". The tolerance is needed because the
-/// server's `X-Audio-Bitrate-Kbps` header (stored as the downloaded bitrate)
-/// is the TRUNCATED master bitrate, so 899.7 kbps downloads as 899.
+/// "flac, 900 kbps -> flac, 900 kbps". "Matches" means the same codec and
+/// either a lossless codec (a lossless master can't be re-encoded to its own
+/// codec -- the server rejects that as a no-op -- so its audio is unchanged
+/// whatever the bitrates say) or bitrates within 1 kbps. The tolerance is
+/// needed because the server's `X-Audio-Bitrate-Kbps` header (stored as the
+/// downloaded bitrate) is the TRUNCATED master bitrate, so 899.7 kbps
+/// downloads as 899.
 @visibleForTesting
 String staleDownloadDiffLabel(TrackUI track) {
   final oldCodec = track.downloadedCodec;
   final newCodec = track.codec;
-  final oldBitrate = track.downloadedBitrateKbps;
-  final newBitrate = track.bitrateKbps.round();
+  final oldBitrate = track.downloadedBitrateKbps?.toDouble();
+  final newBitrate = track.bitrateKbps;
   if (oldCodec != null &&
       newCodec != null &&
-      oldBitrate != null &&
       oldCodec.toLowerCase() == newCodec.toLowerCase() &&
-      (oldBitrate - track.bitrateKbps).abs() <= 1) {
+      ((isLosslessCodec(newCodec) ?? false) ||
+          (oldBitrate != null &&
+              newBitrate != null &&
+              (oldBitrate - newBitrate).abs() <= 1))) {
     return 'Audio unchanged — tags or artwork updated';
   }
   final size = track.fileSizeBytes;
   final oldPart = [
     oldCodec ?? '?',
-    if (oldBitrate != null) '$oldBitrate kbps',
+    if (oldBitrate != null) '${oldBitrate.round()} kbps',
     if (size != null) formatBytes(size),
   ].join(', ');
-  return 'Your download: $oldPart  →  '
-      'Server: ${newCodec ?? '?'}, $newBitrate kbps';
+  final newPart = [
+    newCodec ?? '?',
+    if (newBitrate != null) '${newBitrate.round()} kbps',
+  ].join(', ');
+  return 'Your download: $oldPart  →  Server: $newPart';
 }
 
 class _StaleDownloadsList extends ConsumerWidget {

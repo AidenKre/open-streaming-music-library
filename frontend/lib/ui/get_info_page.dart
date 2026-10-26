@@ -261,7 +261,14 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
     final rows = <(String, String?)>[
       ('Codec', _track.codec),
       ('Duration', _track.formattedDuration),
-      ('Bitrate', '${_track.bitrateKbps.round()} kbps'),
+      // Null = the server doesn't know it; a real 0 still shows "0 kbps".
+      (
+        'Bitrate',
+        switch (_track.bitrateKbps) {
+          null => 'Unknown',
+          final kbps => '${kbps.round()} kbps',
+        },
+      ),
       ('Sample rate', '${_track.sampleRateHz} Hz'),
       ('Channels', '${_track.channels}'),
       ('Path', _track.filePath),

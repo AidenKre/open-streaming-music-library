@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -25,7 +26,7 @@ Future<void> _insertTrack(AppDatabase db, String uuid) async {
         TrackmetadataCompanion.insert(
           uuidId: uuid,
           duration: 120,
-          bitrateKbps: 320,
+          bitrateKbps: const Value(320),
           sampleRateHz: 44100,
           channels: 2,
         ),

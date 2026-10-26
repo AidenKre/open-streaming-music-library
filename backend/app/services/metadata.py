@@ -216,7 +216,15 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
 
     metadata.codec = codec
     metadata.duration = float(audio_stream.get("duration", 0.0))
-    metadata.bitrate_kbps = float(audio_stream.get("bit_rate", 0.0)) / 1000.0
+    # FLAC (and some other containers) carry no stream-level bit_rate; fall
+    # back to format.bit_rate, which ffprobe derives from file size/duration
+    # (so it includes embedded art -- a small overstatement beats not
+    # knowing). Neither reported -> None ("unknown"), never a made-up 0.
+    stream_bitrate = _bitrate_kbps(audio_stream.get("bit_rate"))
+    metadata.bitrate_kbps = (
+        stream_bitrate if stream_bitrate is not None
+        else _bitrate_kbps(json_data.get("format", {}).get("bit_rate"))
+    )
     metadata.sample_rate_hz = int(audio_stream.get("sample_rate", 0))
     metadata.channels = int(audio_stream.get("channels", 0))
 
@@ -273,6 +281,16 @@ def extract_cover_art_bytes(file_path: Path) -> bytes | None:
         return None
 
     return result.stdout
+
+
+def _bitrate_kbps(bit_rate: object) -> float | None:
+    """ffprobe's bit_rate (bits/s, usually a string; may be missing or "N/A")
+    in kbps, or None when it isn't reported or can't be parsed."""
+    try:
+        value = float(bit_rate)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return value / 1000.0 if value >= 0 else None
 
 
 def _parse_year(date_val: object) -> int | None:

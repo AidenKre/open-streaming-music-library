@@ -10,7 +10,8 @@ class TrackMetadataDto {
   final int? discNumber;
   final String? codec;
   final double duration;
-  final double bitrateKbps;
+  /// Null when the server doesn't know it; 0 is a real reading.
+  final double? bitrateKbps;
   final int sampleRateHz;
   final int channels;
   final bool hasAlbumArt;
@@ -52,7 +53,7 @@ class TrackMetadataDto {
       discNumber: (json['disc_number'] as num?)?.toInt(),
       codec: json['codec'] as String?,
       duration: (json['duration'] as num).toDouble(),
-      bitrateKbps: (json['bitrate_kbps'] as num).toDouble(),
+      bitrateKbps: (json['bitrate_kbps'] as num?)?.toDouble(),
       sampleRateHz: (json['sample_rate_hz'] as num).toInt(),
       channels: (json['channels'] as num).toInt(),
       hasAlbumArt: json['has_album_art'] as bool? ?? false,

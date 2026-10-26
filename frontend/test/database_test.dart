@@ -111,6 +111,19 @@ void main() {
       expect(companion.hasAlbumArt, const Value(true));
     });
 
+    test('an unknown (null) bitrate stays null; a real 0 stays 0', () {
+      for (final (raw, expected) in [(null, null), (0.0, 0.0)]) {
+        final dto = ClientTrackDto.fromJson(_trackJson(
+          uuid: 'b-$raw',
+          metadata: {..._minimalMetadataJson(), 'bitrate_kbps': raw},
+        ));
+        expect(
+          trackmetadataCompanionFromDto(dto).bitrateKbps,
+          Value<double?>(expected),
+        );
+      }
+    });
+
     test('handles nullable fields when absent', () {
       final dto = ClientTrackDto.fromJson(
         _trackJson(uuid: 'xyz-789', metadata: _minimalMetadataJson()),

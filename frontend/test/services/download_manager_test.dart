@@ -71,7 +71,7 @@ Future<void> _insertTrack(
         TrackmetadataCompanion.insert(
           uuidId: uuid,
           duration: 120,
-          bitrateKbps: 320,
+          bitrateKbps: const Value(320),
           sampleRateHz: 44100,
           channels: 2,
           hasAlbumArt: Value(hasAlbumArt),

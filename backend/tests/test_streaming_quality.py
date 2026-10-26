@@ -68,7 +68,7 @@ def _add_track_with_file(
     client,
     tmp_path: Path,
     name: str = "track.mp3",
-    bitrate_kbps: float = 0.0,
+    bitrate_kbps: float | None = None,
     codec: str = "mp3",
 ):
     track_path = tmp_path / name
@@ -330,7 +330,7 @@ class TestStreamQuality:
         won't trigger), and (c) the response headers are still present.
         """
         track = _add_track_with_file(
-            client, tmp_path, name="unknown_bitrate.mp3", bitrate_kbps=0.0
+            client, tmp_path, name="unknown_bitrate.mp3", bitrate_kbps=None
         )
         transcode_calls = {"n": 0}
 
@@ -351,6 +351,26 @@ class TestStreamQuality:
         # ffprobe returns None on a fake file → coordinator falls through to
         # transcoding (since it can't confirm source_bitrate <= requested).
         assert transcode_calls["n"] == 1
+
+    def test_original_quality_unknown_bitrate__header_omitted(self, client, tmp_path):
+        """A master whose bitrate is unknown (NULL) must not be reported as
+        "0" -- the client would record a fabricated 0 kbps download."""
+        track = _add_track_with_file(
+            client, tmp_path, name="unknown.flac", bitrate_kbps=None
+        )
+        with client.stream("GET", f"/tracks/{track.uuid_id}/stream") as resp:
+            assert resp.status_code == 200
+            assert "x-audio-bitrate-kbps" not in resp.headers
+            _ = b"".join(resp.iter_bytes())
+
+    def test_original_quality_zero_bitrate__header_reports_zero(self, client, tmp_path):
+        track = _add_track_with_file(
+            client, tmp_path, name="zero.flac", bitrate_kbps=0.0
+        )
+        with client.stream("GET", f"/tracks/{track.uuid_id}/stream") as resp:
+            assert resp.status_code == 200
+            assert resp.headers["x-audio-bitrate-kbps"] == "0"
+            _ = b"".join(resp.iter_bytes())
 
 
 class TestStreamCodecRevisionHeaders:

@@ -3877,7 +3877,7 @@ class TestConversionJobs:
         database = self._db(tmp_path)
         with database._connection() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version == Database.LATEST_SCHEMA_VERSION == 8
+            assert version == Database.LATEST_SCHEMA_VERSION == 9
             # Table must actually exist and be queryable, not just declared.
             conn.execute("SELECT * FROM conversion_jobs LIMIT 0")
             columns = [r[1] for r in conn.execute("PRAGMA table_info(conversion_jobs)")]
@@ -4002,7 +4002,7 @@ class TestConversionJobsMigration:
         assert database.initialize()
 
         columns, _, version = _conversion_jobs_shape(database_path)
-        assert version == 8
+        assert version == Database.LATEST_SCHEMA_VERSION
         assert [c[1] for c in columns][-1] == "base_revision"
         job = database.get_conversion_job(1)
         assert job["uuid_id"] == "u-1" and job["status"] == "done"
@@ -4022,7 +4022,7 @@ class TestConversionJobsMigration:
         assert set_up_database(database_path).initialize()
 
         columns, _, version = _conversion_jobs_shape(database_path)
-        assert version == 8
+        assert version == Database.LATEST_SCHEMA_VERSION
         assert [c[1] for c in columns].count("base_revision") == 1
 
     def test_migrate__v6_and_fresh__identical_conversion_jobs_shape(self, tmp_path: Path):
@@ -4055,3 +4055,35 @@ class TestConversionJobsMigration:
         assert set_up_database(migrated_path).initialize()
 
         assert _conversion_jobs_shape(migrated_path) == _conversion_jobs_shape(fresh_path)
+
+
+class TestUnknownBitrateMigration:
+    def test_migrate__v8_database__zero_bitrates_become_null(self, tmp_path: Path):
+        database_path = tmp_path / "database.db"
+        database = set_up_database(database_path)
+        assert database.initialize()
+        for name, bitrate in (("zero", 0.0), ("known", 320.0), ("unknown", None)):
+            metadata = TrackMetaData(
+                title=name, codec="flac", duration=60.0, bitrate_kbps=bitrate,
+                sample_rate_hz=44100, channels=2,
+            )
+            assert database.add_track(Track(file_path=tmp_path / f"{name}.flac", metadata=metadata))
+        conn = sqlite3.connect(database_path)
+        revisions_before = dict(conn.execute("SELECT uuid_id, revision FROM tracks").fetchall())
+        conn.execute("PRAGMA user_version = 8")
+        conn.commit()
+        conn.close()
+
+        assert set_up_database(database_path).initialize()
+
+        conn = sqlite3.connect(database_path)
+        try:
+            rows = dict(conn.execute("SELECT title, bitrate_kbps FROM trackmetadata").fetchall())
+            revisions_after = dict(conn.execute("SELECT uuid_id, revision FROM tracks").fetchall())
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+        # A legacy 0 was ingest's stand-in for "ffprobe reported nothing".
+        assert rows == {"zero": None, "known": 320.0, "unknown": None}
+        assert revisions_after == revisions_before  # no spurious "changed" flags
+        assert version == 9

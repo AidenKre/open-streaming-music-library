@@ -41,7 +41,7 @@ Future<void> _insertTrack(AppDatabase db, String uuid) async {
         TrackmetadataCompanion.insert(
           uuidId: uuid,
           duration: 120,
-          bitrateKbps: 320,
+          bitrateKbps: const Value(320),
           sampleRateHz: 44100,
           channels: 2,
           hasAlbumArt: const Value(false),

@@ -22,7 +22,8 @@ class TrackUI {
   final int? discNumber;
   final String? codec;
   final double duration;
-  final double bitrateKbps;
+  /// Null when the server doesn't know it; 0 is a real reading.
+  final double? bitrateKbps;
   final int sampleRateHz;
   final int channels;
   final bool hasAlbumArt;
@@ -188,7 +189,7 @@ class TrackUI {
       discNumber: row.readNullable<int>('disc_number'),
       codec: row.readNullable<String>('codec'),
       duration: row.read<double>('duration'),
-      bitrateKbps: row.read<double>('bitrate_kbps'),
+      bitrateKbps: row.readNullable<double>('bitrate_kbps'),
       sampleRateHz: row.read<int>('sample_rate_hz'),
       channels: row.read<int>('channels'),
       hasAlbumArt: row.read<bool>('has_album_art'),

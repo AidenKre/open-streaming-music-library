@@ -81,7 +81,9 @@ class EncodeResult:
     type, not ``audio/mp4``, when ``transcoded`` is False.
     """
     path: Path
-    bitrate_kbps: int
+    # None when the source's bitrate is unknown (passthrough of a file
+    # ffprobe reported no bitrate for).
+    bitrate_kbps: Optional[int]
     transcoded: bool
 
 
@@ -303,7 +305,7 @@ class EncoderCoordinator:
                 raise SourceUnavailable(uuid_id)
             return EncodeResult(
                 path=source,
-                bitrate_kbps=source_bitrate_kbps or 0,
+                bitrate_kbps=source_bitrate_kbps,
                 transcoded=False,
             )
 

@@ -335,7 +335,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 8
+    LATEST_SCHEMA_VERSION = 9
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -561,6 +561,22 @@ class Database:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
                 conn.execute("PRAGMA user_version = 8")
+
+            if version < 9:
+                print("Migrating database to version 9: unknown bitrates become NULL")
+                # Ingest used to store 0 whenever ffprobe reported no bitrate
+                # (every FLAC), so a stored 0 means "unknown", not a real 0
+                # kbps. NULL is the unknown marker from now on. Revisions are
+                # deliberately not bumped: that would flag every downloaded
+                # FLAC as changed on the server.
+                has_trackmetadata = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trackmetadata'"
+                ).fetchone() is not None
+                if has_trackmetadata:
+                    conn.execute(
+                        "UPDATE trackmetadata SET bitrate_kbps = NULL WHERE bitrate_kbps = 0"
+                    )
+                conn.execute("PRAGMA user_version = 9")
 
     @staticmethod
     def _next_revision(conn) -> int:
@@ -1308,7 +1324,7 @@ class Database:
         job_id: int,
         uuid_id: str,
         codec: str,
-        bitrate_kbps: float,
+        bitrate_kbps: Optional[float],
         sample_rate_hz: int,
         channels: int,
         file_path: Optional[str] = None,
@@ -1353,7 +1369,7 @@ class Database:
         conn,
         uuid_id: str,
         codec: str,
-        bitrate_kbps: float,
+        bitrate_kbps: Optional[float],
         sample_rate_hz: int,
         channels: int,
         file_path: Optional[str] = None,

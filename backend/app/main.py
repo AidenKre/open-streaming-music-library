@@ -631,7 +631,11 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
             status_code=404, detail=f"Could not find track with uuid: {uuid_id}"
         )
     track: Track = track_list[0]
-    source_bitrate = int(track.metadata.bitrate_kbps or 0) or None
+    # None = unknown; a real 0 is kept so the header can report it.
+    source_bitrate = (
+        int(track.metadata.bitrate_kbps)
+        if track.metadata.bitrate_kbps is not None else None
+    )
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
     try:
@@ -677,8 +681,13 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     # Codec + revision of what is actually served, so a client that saves the
     # bytes can record exactly what it has (the revision is read before the
     # encode, so a conversion landing mid-request errs toward "stale").
+    # X-Audio-Bitrate-Kbps is omitted when the bitrate is unknown, so the
+    # client records "unknown" rather than a fabricated 0.
     extra_headers = {
-        "X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps),
+        **(
+            {"X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps)}
+            if encode_result.bitrate_kbps is not None else {}
+        ),
         "X-Audio-Extension": extension,
         "X-Audio-Codec": "aac" if encode_result.transcoded else (track.metadata.codec or ""),
         "X-Track-Revision": str(track.revision),

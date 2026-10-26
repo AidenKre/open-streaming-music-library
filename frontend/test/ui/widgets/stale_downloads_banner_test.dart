@@ -316,13 +316,15 @@ void main() {
       String? downloadedCodec,
       int? downloadedBitrateKbps,
       int? fileSizeBytes,
+      String codec = 'aac',
+      double? bitrateKbps = 192,
     }) => TrackUI(
       uuidId: 'x',
       createdAt: 0,
       lastUpdated: 0,
-      codec: 'aac',
+      codec: codec,
       duration: 1,
-      bitrateKbps: 192,
+      bitrateKbps: bitrateKbps,
       sampleRateHz: 44100,
       channels: 2,
       hasAlbumArt: false,
@@ -350,6 +352,69 @@ void main() {
       expect(
         staleDownloadDiffLabel(track()),
         'Your download: ?  →  Server: aac, 192 kbps',
+      );
+    });
+
+    test('an unknown (null) bitrate is omitted; a real 0 is shown', () {
+      expect(
+        staleDownloadDiffLabel(track(
+          downloadedCodec: 'mp3',
+          downloadedBitrateKbps: 320,
+          codec: 'flac',
+          bitrateKbps: null,
+        )),
+        'Your download: mp3, 320 kbps  →  Server: flac',
+      );
+      expect(
+        staleDownloadDiffLabel(track(
+          downloadedCodec: 'flac',
+          downloadedBitrateKbps: 0,
+          fileSizeBytes: 1536 * 1024,
+        )),
+        'Your download: flac, 0 kbps, 1.5 MB  →  Server: aac, 192 kbps',
+      );
+    });
+
+    test('same lossless codec is "audio unchanged" even with unknown bitrates',
+        () {
+      expect(
+        staleDownloadDiffLabel(track(
+          downloadedCodec: 'flac',
+          codec: 'flac',
+          bitrateKbps: null,
+        )),
+        'Audio unchanged — tags or artwork updated',
+      );
+      expect(
+        staleDownloadDiffLabel(track(
+          downloadedCodec: 'flac',
+          codec: 'flac',
+          bitrateKbps: 912.4,
+        )),
+        'Audio unchanged — tags or artwork updated',
+      );
+    });
+
+    test('same lossy codec needs matching bitrates to be "audio unchanged"', () {
+      expect(
+        staleDownloadDiffLabel(track(
+          downloadedCodec: 'aac',
+          downloadedBitrateKbps: 191,
+          bitrateKbps: 191.8,
+        )),
+        'Audio unchanged — tags or artwork updated',
+      );
+      expect(
+        staleDownloadDiffLabel(track(
+          downloadedCodec: 'aac',
+          downloadedBitrateKbps: 256,
+        )),
+        'Your download: aac, 256 kbps  →  Server: aac, 192 kbps',
+      );
+      // Unknown lossy bitrate: can't claim the audio is unchanged.
+      expect(
+        staleDownloadDiffLabel(track(downloadedCodec: 'aac')),
+        'Your download: aac  →  Server: aac, 192 kbps',
       );
     });
   });
