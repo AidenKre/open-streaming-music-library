@@ -542,6 +542,24 @@ class TestReconcileConversionJobs:
         assert editor_temp.exists()
         assert unrelated.exists()
 
+    def test_reconcile__kills_orphaned_ffmpeg_before_sweeping(self, tmp_path, monkeypatch):
+        db, _, _ = _make_orchestrator(tmp_path)
+        staging = tmp_path / ".staging"
+        staging.mkdir()
+        temp = staging / "u1.7.convert.m4a.partial"
+        temp.write_bytes(b"x")
+        seen = []
+
+        def fake_kill(work_dir):
+            seen.append((work_dir, temp.exists()))
+            return []
+
+        monkeypatch.setattr(conversion_module, "kill_orphaned_ffmpeg", fake_kill)
+        reconcile_conversion_jobs(db, staging)
+
+        assert seen == [(staging, True)]  # killed while the temp still existed
+        assert not temp.exists()
+
 
 class TestResumeQueued:
     def test_resume_queued__submits_each_queued_job_only(self, tmp_path):

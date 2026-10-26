@@ -13,6 +13,7 @@ import pytest
 from app.services.ffmpeg_runner import (
     FfmpegError,
     FfmpegProcessRegistry,
+    kill_orphaned_ffmpeg,
     run_ffmpeg,
     scaled_timeout,
 )
@@ -329,3 +330,69 @@ class TestScaledTimeout:
         big = MagicMock()
         big.stat.return_value.st_size = 700 * 1024 * 1024
         assert scaled_timeout(big) == 600
+
+
+# ── kill_orphaned_ffmpeg (real processes) ───────────────────────────────────
+
+
+def _spawn_fake(binary: Path, target: Path) -> subprocess.Popen:
+    """A long-lived process whose argv[0] is ``binary`` and whose command line
+    names ``target`` -- like an orphaned conversion ffmpeg. ``binary`` is a
+    symlink to /bin/sh; the trailing ``; :`` stops sh from exec-ing sleep
+    (which would replace the matching command line)."""
+    return subprocess.Popen(
+        [str(binary), "-c", "sleep 30; :", str(target)],
+        start_new_session=True,
+    )
+
+
+def _wait_dead(proc: subprocess.Popen, timeout: float = 5.0) -> bool:
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+class TestKillOrphanedFfmpeg:
+    @pytest.fixture
+    def fake_ffmpeg(self, tmp_path):
+        binary = tmp_path / "bin" / "ffmpeg"
+        binary.parent.mkdir()
+        binary.symlink_to("/bin/sh")
+        return binary
+
+    def test_kills_ffmpeg_writing_into_work_dir(self, tmp_path, fake_ffmpeg):
+        staging = tmp_path / "music dir" / ".staging"  # space: real libraries have them
+        staging.mkdir(parents=True)
+        proc = _spawn_fake(fake_ffmpeg, staging / "u.1.convert.m4a.partial")
+        try:
+            time.sleep(0.2)
+            killed = kill_orphaned_ffmpeg(staging)
+            assert proc.pid in killed
+            assert _wait_dead(proc)
+            assert proc.returncode == -signal.SIGKILL
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_leaves_unrelated_processes_alone(self, tmp_path, fake_ffmpeg):
+        staging = tmp_path / ".staging"
+        staging.mkdir()
+        elsewhere = tmp_path / "workspace" / "x.m4a"  # an ffmpeg, but not ours
+        not_ffmpeg = tmp_path / "bin" / "sh-alias"  # names staging, but not ffmpeg
+        not_ffmpeg.symlink_to("/bin/sh")
+        procs = [
+            _spawn_fake(fake_ffmpeg, elsewhere),
+            _spawn_fake(not_ffmpeg, staging / "u.1.convert.m4a"),
+            # A sibling directory that merely shares the prefix.
+            _spawn_fake(fake_ffmpeg, tmp_path / ".staging-old" / "u.1.convert.m4a"),
+        ]
+        try:
+            time.sleep(0.2)
+            assert kill_orphaned_ffmpeg(staging) == []
+            assert all(p.poll() is None for p in procs)
+        finally:
+            for p in procs:
+                p.kill()
+                p.wait()

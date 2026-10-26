@@ -91,6 +91,71 @@ class FfmpegProcessRegistry:
         return True
 
 
+def kill_orphaned_ffmpeg(work_dir: Path) -> list[int]:
+    """Startup: SIGKILL any ffmpeg still writing into ``work_dir``; returns
+    the pids killed.
+
+    ``run_ffmpeg`` starts each ffmpeg in its own session so a cancel can kill
+    its process group -- which also means a hard-killed server (SIGKILL, OOM
+    kill) leaves them running, burning CPU on temps the startup sweep is
+    about to delete. A process matches only if its binary is ffmpeg AND its
+    command line names a path inside ``work_dir``, so nothing else is
+    touched. Must run before this server starts any ffmpeg of its own there.
+    Best-effort: returns [] where processes can't be listed.
+    """
+    prefixes = {str(work_dir) + os.sep, str(work_dir.resolve()) + os.sep}
+    killed = []
+    for pid, argv0, cmdline in _list_processes():
+        if pid == os.getpid() or not os.path.basename(argv0).startswith("ffmpeg"):
+            continue
+        if not any(prefix in cmdline for prefix in prefixes):
+            continue
+        try:
+            # Our ffmpegs lead their own process group (start_new_session).
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+        killed.append(pid)
+    return killed
+
+
+def _list_processes() -> list[tuple[int, str, str]]:
+    """``(pid, argv[0], full command line)`` for every visible process."""
+    proc_root = Path("/proc")
+    if proc_root.is_dir():  # Linux: no external tools needed (slim images lack ps)
+        procs = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except OSError:
+                continue
+            args = [a.decode("utf-8", errors="replace") for a in raw.split(b"\0") if a]
+            if args:
+                procs.append((int(entry.name), args[0], " ".join(args)))
+        return procs
+    try:
+        result = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,args="],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    procs = []
+    for line in result.stdout.splitlines():
+        pid_str, _, cmdline = line.strip().partition(" ")
+        cmdline = cmdline.strip()
+        if pid_str.isdigit() and cmdline:
+            # ps joins argv with spaces, so argv[0] is only recoverable up to
+            # its first space -- fine for an ffmpeg binary path.
+            procs.append((int(pid_str), cmdline.split(" ", 1)[0], cmdline))
+    return procs
+
+
 def scaled_timeout(source: Path, floor_s: int = 30, cap_s: int = 600) -> int:
     """~1s per MB of ``source`` on top of a floor, capped: large lossless files
     don't trip a fixed timeout, and a hang can't wedge a request forever."""

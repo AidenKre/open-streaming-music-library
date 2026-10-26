@@ -24,7 +24,7 @@ from app.database.database import (
 from app.models.track import Track
 from app.services.encoded_cache import EncodedCache
 from app.services.encoder_coordinator import EncoderCoordinator
-from app.services.ffmpeg_runner import FfmpegProcessRegistry
+from app.services.ffmpeg_runner import FfmpegProcessRegistry, kill_orphaned_ffmpeg
 from app.services.metadata import (
     TagWriteError,
     build_ffmpeg_tags,
@@ -455,7 +455,8 @@ def reconcile_conversion_jobs(database: Database, staging_dir: Path) -> None:
     """Startup pass, run AFTER reconcile_journal: no worker thread survives
     a process restart, so any conversion_jobs row still 'running' is
     orphaned -- flip it to failed (the master is untouched: conversion only
-    writes temps until its commit, which also marks the job done). Then
+    writes temps until its commit, which also marks the job done). Then kill
+    any ffmpeg a hard-killed predecessor left writing into staging, and
     sweep conversion temps no journal row owns any more (a crash before the
     commit leaves them behind)."""
     for job in database.list_conversion_jobs_with_status("running"):
@@ -463,6 +464,10 @@ def reconcile_conversion_jobs(database: Database, staging_dir: Path) -> None:
     owned = {e["temp_path"] for e in database.list_journal_entries() if e["temp_path"]}
     if not staging_dir.is_dir():
         return
+    # A hard-killed server leaves its conversion ffmpeg running (each has its
+    # own session), still writing a temp the sweep below deletes. No ffmpeg
+    # of this process exists yet, so anything writing here is an orphan.
+    kill_orphaned_ffmpeg(staging_dir)
     for path in staging_dir.iterdir():
         if (".convert." in path.name or ".tagged." in path.name) and str(path) not in owned:
             path.unlink(missing_ok=True)
