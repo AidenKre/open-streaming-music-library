@@ -274,6 +274,7 @@ class TrackDownloader {
       // transport error re-queues for retry, anything else (e.g. a disk
       // write failure) is a genuine, permanent failure.
       if (e is SocketException ||
+          e is OSError ||
           e is http.ClientException ||
           e is TimeoutException) {
         _onNetworkFailure?.call();

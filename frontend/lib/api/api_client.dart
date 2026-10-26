@@ -541,7 +541,7 @@ class ApiClient {
 
   /// Runs [attempt] exactly once, wrapped in the per-attempt timeout. Logs
   /// the attempt and rethrows the raw classification signals
-  /// ([_HttpFailureSignal], [SocketException], [TimeoutException],
+  /// ([_HttpFailureSignal], [SocketException], [OSError], [TimeoutException],
   /// [http.ClientException], [ArgumentError]) for [_runWithPolicy] to
   /// decide what to do with.
   ///
@@ -574,13 +574,13 @@ class ApiClient {
   ///
   /// Retries on:
   ///   - HTTP codes in `policy.retryableStatusCodes` (via [_HttpFailureSignal])
-  ///   - SocketException, TimeoutException, http.ClientException
+  ///   - SocketException, OSError, TimeoutException, http.ClientException
   ///   - ArgumentError (treated as a transport failure — typically a
   ///     malformed URL caused by an empty/invalid baseUrl)
   ///
   /// On exhaustion throws [ApiException] (HTTP) or [NetworkException]
-  /// (transport). No raw SocketException/TimeoutException/ClientException/
-  /// ArgumentError escapes ApiClient via the request methods.
+  /// (transport). No raw SocketException/OSError/TimeoutException/
+  /// ClientException/ArgumentError escapes ApiClient via the request methods.
   Future<T> _runWithPolicy<T>(
     Future<T> Function() attempt, {
     required String label,
@@ -618,6 +618,16 @@ class ApiClient {
         if (attemptNumber >= maxAttempts) break;
         final delay = _delayForRetry(attemptNumber, const {}, policy);
         developer.log('$label socket error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
+        await _delay(delay);
+        continue;
+      } on OSError catch (e) {
+        // dart:io can throw a bare OSError (not wrapped in SocketException)
+        // when a connection is reset during connect -- e.g. a proxy or
+        // restarting server accepting and immediately dropping it.
+        lastNetworkCause = e;
+        if (attemptNumber >= maxAttempts) break;
+        final delay = _delayForRetry(attemptNumber, const {}, policy);
+        developer.log('$label OS error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
         await _delay(delay);
         continue;
       } on TimeoutException catch (e) {

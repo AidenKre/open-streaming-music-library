@@ -1445,6 +1445,32 @@ void main() {
     },
   );
 
+  test(
+    'a mid-stream bare OSError is classified as a network failure too',
+    () async {
+      await _insertTrack(db, 'abc');
+      var offline = false;
+      final manager = buildManager(
+        client: MockClient.streaming(
+          (req, _) async => http.StreamedResponse(
+            failingStream(const OSError('Connection reset by peer', 54)),
+            200,
+            contentLength: 999,
+          ),
+        ),
+        isOfflineFn: () => offline,
+        onNetworkFailure: () => offline = true,
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await waitUntilNotActive(manager);
+
+      expect(offline, isTrue);
+      expect(manager.snapshot().first.isQueued, isTrue);
+    },
+  );
+
   test('dispose cancels an active worker before it can commit', () async {
     await _insertTrack(db, 'abc');
     final stream = StreamController<List<int>>.broadcast();
