@@ -603,11 +603,11 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T4.1 Artists in-page search | DONE | e07bd05 | RED: 10/10 failed (no search field). GREEN: artists + badge suites 28/28; `test/ui` all pass. Two test-side fixes on the way (see D11): a test pumped two ProviderScopes sharing one DownloadManager, and `deleteDownload` needs `tester.runAsync` (real file I/O hangs fake-async) |
 | T4.2 Tracks in-page search | DONE | f688a38 | RED: 10/11 failed (no search field); detail-route guard passed. GREEN: tracks filters + convert-flow suites green; `test/ui` 282/282. Browse and search rows share one `_buildTrackTile` (download progress, conversion badge, Convert… action). `seedLibrary` made idempotent (insertOrIgnore artists/albums) for tests that seed twice |
 | T5.1 Full verification | DONE | (no code; plan-only, committed with T5.2) | `flutter test` 982/982 passing (baseline 883), `flutter analyze` no issues, 15 new Dart files `dart format`-clean (0 changed), backend has no diff vs `main` and `pytest` 774 passed |
-| T5.2 AppShell integration | DONE | `git log --grep T5.2:` | `app_shell_filters_test.dart` 4/4 against the real AppShell. It passed first time, as expected for an integration test over finished features. **Mutation check:** making album detail render a FilterBar fails the detail-route test. Reverted |
-| T5.3 Live app smoke | TODO | | |
-| T5.4 Trace + close-out | TODO | | |
+| T5.2 AppShell integration | DONE | 59f6a57 | `app_shell_filters_test.dart` 4/4 against the real AppShell. It passed first time, as expected for an integration test over finished features. **Mutation check:** making album detail render a FilterBar fails the detail-route test. Reverted |
+| T5.3 Live app smoke | DONE (partial; see §11.3) | n/a | `flutter build macos --debug` succeeded. The interactive on-device pass was **not** run (reason and manual checklist in §11.3) |
+| T5.4 Trace + close-out | DONE | `git log --grep T5.4:` | §11 requirements trace written; working tree clean on `phase-3` |
 
-**Next action:** T5.3.
+**Next action:** none. All tasks are done. The remaining follow-ups are user-owned (§11.3 manual device pass, §11.4).
 
 ## 10. Decision log
 
@@ -627,4 +627,56 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 
 ## 11. Final verification results
 
-_To be filled in by T5.x._
+Recorded 2026-10-26 on `phase-3`.
+
+### 11.1 Commands run (actual results)
+
+| Check | Result |
+| --- | --- |
+| `flutter test` (frontend, full) | **986 passed, 0 failed.** Baseline 883. The T5.1 run showed 982, and T5.2 added 4 |
+| `flutter analyze` | No issues found |
+| `dart format --set-exit-if-changed` on the 15 new Dart files (+1 in T5.2) | 0 changed |
+| Backend `pytest` (`backend/.venv`) | 774 passed. No backend files differ from `main` |
+| `flutter build macos --debug` | ✓ Built `build/macos/Build/Products/Debug/frontend.app` |
+| Mutation check on T5.2 | Album detail rendering a FilterBar fails the detail-route test (reverted) |
+
+### 11.2 Requirements trace
+
+| Req | Satisfied by | Verified by |
+| --- | --- | --- |
+| R1 `BrowseFilters` | `lib/models/browse_filters.dart` | `test/models/browse_filters_test.dart` |
+| R2 `FilterBar` | `lib/ui/widgets/filter_bar.dart` | `test/ui/widgets/filter_bar_test.dart` |
+| R3 Offline lock + restore | `FilterBar` (`onSelected: null`), `BrowseFilters.effectiveDownloaded` | filter_bar offline tests; artists/tracks "coming back online restores/keeps" tests |
+| R4 FilterBar replaces badge | `artist_page.dart` (badge only when non-root); Tracks root never had one | artists "offline … no badge"; the badge tests for non-root/Albums/Search still pass |
+| R5 Per-page, session-only | `_filters` in each page `State` | `app_shell_filters_test.dart` "per tab and survives tab switches" |
+| R6 Root tabs only | `widget.isRoot` gates FilterBar + `initInPageSearch` | tracks detail-route group; artists non-root tests; AppShell artist → albums → detail test |
+| R7 Tracks tab filters uniformly | `TracksPage._downloadedOnly` (root) → `watchTracks` / `playFromQueue` | tracks "offline: filters (not dims)", "the play queue follows the effective filter" |
+| R8 Unified search method | `BrowseRepository.search(types:)` + `SearchType` | repository `search types` group + cap-100 rank-order test |
+| R9 One shared search primitive | `LibrarySearchController`, used by `SearchPage` + `InPageSearchMixin` | `library_search_controller_test.dart` (20); SearchPage suites |
+| R10 Browse vs capped search, empty/capped states | `InPageSearchMixin` (`kInPageSearchCap = 100`), `search_status.dart`, `ListStatusMessage` | artists/tracks in-page search groups (no-match copy, cap-100 hint, no hint below cap) |
+| R11 Race-free mode switch | `CursorPaginationMixin.suspendPagination`, `InPageSearchMixin._onSearchChanged` (suspend on enter, `refresh()` on leave), results list without the browse scroll controller | mixin `suspendPagination` group; "a query swaps … and suspends browse" (DB write under search mode doesn't reach the window); "clearing returns to browse through refresh()" |
+| R12 Composes with filter, offline, download status | `onBrowseParamsChanged`, `onDownloadStatusChanged`, `LibrarySearchController.onDownloadStatusChanged` (D6) | chip-toggle / offline-flip / delete-drops-out / patch-in-place tests on both pages and SearchPage |
+| R13 Debounce cancelled on dispose | `LibrarySearchController.dispose` | controller dispose group; "unmounting with a pending debounce leaks nothing" on both pages |
+| R14 No backend changes | n/a | `git diff main -- backend` is empty |
+| R15 No regressions | | full suite, analyze, existing SearchPage/badge/convert-flow tests unmodified. The deliberate behaviour changes are D4 (immediate clear) and R7 (Tracks tab filters offline) |
+
+### 11.3 What was NOT verified, and why
+
+- **Interactive on-device pass (macOS/iOS).** The app compiles (`flutter build macos --debug`), but it was not launched and driven. Launching it uses the real `com.example.frontend` sandbox container, i.e. the user's saved server URL and local DB. The Phase 2 E2E approach (a separate bundle id plus a scratch backend) needs temporary build-config changes, which were out of scope. **Suggested manual checklist:**
+  1. Artists tab: tap Downloaded → only artists with downloads. Tap again → all.
+  2. Tracks tab: same; tapping a track with the chip on queues only downloaded tracks.
+  3. Toggle the chip on Artists, switch to Tracks: its chip is independent. Switch back: still on.
+  4. Kill the server: both tabs' chips lock on (greyed and selected, tooltip on long-press), lists filter, and there is no "Showing downloaded only" strip. Restart the server: each chip returns to its previous value.
+  5. Type in "Search artists" / "Search tracks": results after ~300 ms. Clear (×) returns to the full list instantly, at the top.
+  6. While searching, toggle the chip and go offline/online: results update. Delete a download from a result (with the chip on): it disappears.
+  7. A broad query (e.g. one letter) on a large library shows "Showing the first 100 matches…".
+  8. Artist → album → track list: no chips or search field; offline, non-downloaded rows are dimmed (unchanged).
+  9. Global Search tab still works as before, and clear is instant.
+
+### 11.4 Known limitations / follow-ups (not Phase 3 requirements)
+
+- Search results are a snapshot. A metadata edit or `/changes` sync while searching isn't reflected until the next query, chip toggle or offline flip (K3; same as the global Search page). Download state *is* kept honest.
+- Returning from search to browse restarts the list at the top (by design: `refresh()` from page 1).
+- Per-page scope means opening an artist from a Downloaded-filtered Artists tab shows **all** of that artist's albums (the detail route doesn't inherit the chip). This is by design per R5/R6; revisit in Phase 4 if it reads oddly.
+- No root Albums tab exists, so albums have no chip or in-page search (D1). The global Search page still searches albums.
+- The design doc (`temp/roadmap/phase-3-filter-chips.md`) is gitignored. Its drift from the as-built code is recorded here in §2.3 and §10.
