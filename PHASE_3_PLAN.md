@@ -581,11 +581,13 @@ Phase 3 is complete when **all** of the following hold:
 
 Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
 
+Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `Phase 3 T<id>: …`).
+
 | Task | Status | Commit | Evidence |
 | --- | --- | --- | --- |
 | T0.1 Branch + plan | DONE | (this commit) | Baseline 883 tests passing, analyze clean |
-| T1.1 BrowseFilters | DONE | see git log | RED: 5/6 failed on stub (wrong values); GREEN: `browse_filters_test.dart` 6/6 |
-| T1.2 FilterBar | TODO | | |
+| T1.1 BrowseFilters | DONE | 8e8b79c | RED: 5/6 failed on stub (wrong values); GREEN: `browse_filters_test.dart` 6/6 |
+| T1.2 FilterBar | DONE | `git log --grep T1.2:` | RED: 5/5 failed on stub (no shape/selection/scroll/tooltip); GREEN: `filter_bar_test.dart` 5/5 |
 | T1.3 Pagination suspend | TODO | | |
 | T2.1 Artists root chip | TODO | | |
 | T2.2 Tracks root chip | TODO | | |
@@ -602,7 +604,7 @@ Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T1.2.
+**Next action:** T1.3.
 
 ## 10. Decision log
 
