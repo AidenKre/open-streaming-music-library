@@ -2,7 +2,9 @@ import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
@@ -172,15 +174,15 @@ void main() {
   group('filtered empty state', () {
     const message = 'No downloaded tracks yet.';
 
-  Future<void> clearAllDownloads() async {
-    await db.update(db.tracks).write(clearedDownloadColumns);
-  }
-
-  Future<void> clearLibrary() async {
-    for (final t in ['trackmetadata', 'tracks', 'albums', 'artists']) {
-      await db.customStatement('DELETE FROM $t');
+    Future<void> clearAllDownloads() async {
+      await db.update(db.tracks).write(clearedDownloadColumns);
     }
-  }
+
+    Future<void> clearLibrary() async {
+      for (final t in ['trackmetadata', 'tracks', 'albums', 'artists']) {
+        await db.customStatement('DELETE FROM $t');
+      }
+    }
 
     testWidgets('root: shown once a filtered window settles empty', (
       tester,
@@ -210,6 +212,173 @@ void main() {
       await pump(tester, detail, offline: true);
       expect(find.text(message), findsNothing);
       expect(find.text('Remote Song'), findsOneWidget);
+      await teardownTree(tester);
+    });
+  });
+
+  group('in-page search', () {
+    Future<void> search(WidgetTester tester, String query) async {
+      await tester.enterText(find.byType(TextField), query);
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pumpAndSettle();
+    }
+
+    CursorPaginationMixin<TrackUI> pageState(WidgetTester tester) =>
+        tester.state(find.byType(TracksPage)) as CursorPaginationMixin<TrackUI>;
+
+    testWidgets('root shows a search field', (tester) async {
+      await pump(tester, root);
+      expect(find.widgetWithText(TextField, 'Search tracks'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('album detail shows no search field', (tester) async {
+      await pump(tester, detail);
+      expect(find.byType(TextField), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a query swaps the list for results and suspends browse', (
+      tester,
+    ) async {
+      await pump(tester, root);
+      await search(tester, 'Kept');
+
+      expect(find.text('Kept Song'), findsOneWidget);
+      expect(find.text('Remote Song'), findsNothing);
+      expect(pageState(tester).isPaginationSuspended, isTrue);
+
+      final dormant = List.of(pageState(tester).paginatedItems);
+      await seedLibrary(db, const [
+        SeedTrack(uuid: 'n1', title: 'Kept New', artistId: 1, artist: 'Artist'),
+      ]);
+      await tester.pumpAndSettle();
+      expect(pageState(tester).paginatedItems, dormant);
+      await teardownTree(tester);
+    });
+
+    testWidgets('clearing returns to browse through refresh()', (tester) async {
+      await pump(tester, root);
+      await search(tester, 'Kept');
+
+      await tester.tap(find.byIcon(Icons.clear));
+      await tester.pumpAndSettle();
+      expect(pageState(tester).isPaginationSuspended, isFalse);
+      expect(find.text('Kept Song'), findsOneWidget);
+      expect(find.text('Remote Song'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('no match explains itself, naming the Downloaded filter', (
+      tester,
+    ) async {
+      await pump(tester, root);
+      await search(tester, 'Nope');
+      expect(find.text('No tracks match "Nope".'), findsOneWidget);
+
+      await search(tester, 'Remote');
+      await tapChip(tester);
+      expect(find.text('No downloaded tracks match "Remote".'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('chip toggles and offline flips re-run the search', (
+      tester,
+    ) async {
+      await pump(tester, root);
+      await search(tester, 'Song');
+      expect(find.text('Remote Song'), findsOneWidget);
+
+      await tapChip(tester);
+      expect(find.text('Remote Song'), findsNothing);
+      await tapChip(tester);
+      expect(find.text('Remote Song'), findsOneWidget);
+
+      await setOffline(tester, true);
+      expect(find.text('Remote Song'), findsNothing);
+      expect(find.text('Kept Song'), findsOneWidget);
+      expect(pageState(tester).isPaginationSuspended, isTrue);
+      await teardownTree(tester);
+    });
+
+    testWidgets('online + unfiltered: a new download patches its row', (
+      tester,
+    ) async {
+      await pump(tester, root);
+      await search(tester, 'Song');
+      expect(tileFor(tester, 'Remote Song').track.isDownloaded, isFalse);
+
+      await markDownloaded(db, 's1');
+      h.manager.downloadStatusVersion.value++;
+      await tester.pumpAndSettle();
+      expect(tileFor(tester, 'Remote Song').track.isDownloaded, isTrue);
+      await teardownTree(tester);
+    });
+
+    testWidgets('filtered: a deleted download drops out of the results', (
+      tester,
+    ) async {
+      await pump(tester, root);
+      await tapChip(tester);
+      await search(tester, 'Song');
+      expect(find.text('Kept Song'), findsOneWidget);
+
+      // Real file I/O: must run outside the widget test's fake-async zone.
+      await tester.runAsync(() => h.manager.deleteDownload('d1'));
+      await tester.pumpAndSettle();
+      expect(find.text('Kept Song'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('tapping a result plays the result list in order', (
+      tester,
+    ) async {
+      await pump(tester, root);
+      await search(tester, 'Song');
+      final shown = tester
+          .widgetList<TrackTile>(find.byType(TrackTile))
+          .map((t) => t.track.uuidId)
+          .toList();
+
+      await tester.tap(find.text('Remote Song'));
+      await tester.pumpAndSettle();
+      expect(h.audio.calls.last, {
+        'method': 'playFromTrackList',
+        'uuids': shown,
+        'uuid': 's1',
+        'sourceType': 'search',
+      });
+      await teardownTree(tester);
+    });
+
+    testWidgets('a full page of matches is capped at 100 with a hint', (
+      tester,
+    ) async {
+      await seedLibrary(db, [
+        for (var i = 0; i < 105; i++)
+          SeedTrack(
+            uuid: 'm$i',
+            title: 'Many $i',
+            artistId: 2,
+            artist: 'Other',
+            trackNumber: i,
+          ),
+      ]);
+      await pump(tester, root);
+      await search(tester, 'Many');
+
+      final list = tester.widget<ListView>(find.byType(ListView));
+      final delegate = list.childrenDelegate as SliverChildBuilderDelegate;
+      expect(delegate.childCount, 100);
+      expect(find.textContaining('Showing the first 100 matches'), findsOne);
+      await teardownTree(tester);
+    });
+
+    testWidgets('unmounting with a pending debounce leaks nothing', (
+      tester,
+    ) async {
+      await pump(tester, root);
+      await tester.enterText(find.byType(TextField), 'Kep');
       await teardownTree(tester);
     });
   });

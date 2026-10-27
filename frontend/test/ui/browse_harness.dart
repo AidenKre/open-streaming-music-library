@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Value;
+import 'package:drift/drift.dart' show InsertMode, Value;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -47,6 +47,7 @@ class SeedTrack {
   final int trackNumber;
 }
 
+/// Safe to call again on a seeded DB: existing artists/albums are kept.
 Future<void> seedLibrary(AppDatabase db, List<SeedTrack> tracks) async {
   final artists = <int, String>{};
   final albums = <int, (String, int)>{};
@@ -59,6 +60,7 @@ Future<void> seedLibrary(AppDatabase db, List<SeedTrack> tracks) async {
       batch.insert(
         db.artists,
         ArtistsCompanion(id: Value(e.key), name: Value(e.value)),
+        mode: InsertMode.insertOrIgnore,
       );
     }
     for (final e in albums.entries) {
@@ -70,6 +72,7 @@ Future<void> seedLibrary(AppDatabase db, List<SeedTrack> tracks) async {
           artistId: Value(e.value.$2),
           isSingleGrouping: const Value(false),
         ),
+        mode: InsertMode.insertOrIgnore,
       );
     }
   });

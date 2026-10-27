@@ -144,15 +144,15 @@ void main() {
   group('filtered empty state', () {
     const message = 'No downloaded artists yet.';
 
-  Future<void> clearAllDownloads() async {
-    await db.update(db.tracks).write(clearedDownloadColumns);
-  }
-
-  Future<void> clearLibrary() async {
-    for (final t in ['trackmetadata', 'tracks', 'albums', 'artists']) {
-      await db.customStatement('DELETE FROM $t');
+    Future<void> clearAllDownloads() async {
+      await db.update(db.tracks).write(clearedDownloadColumns);
     }
-  }
+
+    Future<void> clearLibrary() async {
+      for (final t in ['trackmetadata', 'tracks', 'albums', 'artists']) {
+        await db.customStatement('DELETE FROM $t');
+      }
+    }
 
     testWidgets('shown once a filtered window settles empty', (tester) async {
       await clearAllDownloads();
@@ -223,18 +223,18 @@ void main() {
 
       // A DB write underneath search mode must not reach the dormant window.
       final dormant = List.of(pageState(tester).paginatedItems);
-      await db.into(db.artists).insert(
-        const ArtistsCompanion(id: Value(99), name: Value('New Artist')),
-      );
+      await db
+          .into(db.artists)
+          .insert(
+            const ArtistsCompanion(id: Value(99), name: Value('New Artist')),
+          );
       await tester.pumpAndSettle();
       expect(pageState(tester).paginatedItems, dormant);
       expect(find.text('New Artist'), findsNothing);
       await teardownTree(tester);
     });
 
-    testWidgets('clearing returns to browse through refresh()', (
-      tester,
-    ) async {
+    testWidgets('clearing returns to browse through refresh()', (tester) async {
       await pumpRoot(tester);
       await search(tester, 'Downloaded');
 
@@ -316,7 +316,10 @@ void main() {
       await tester.runAsync(() => h.manager.deleteDownload('d1'));
       await tester.pumpAndSettle();
       expect(find.text('Downloaded Artist'), findsNothing);
-      expect(find.text('No downloaded artists match "Artist".'), findsOneWidget);
+      expect(
+        find.text('No downloaded artists match "Artist".'),
+        findsOneWidget,
+      );
       await teardownTree(tester);
     });
 

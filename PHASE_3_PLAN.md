@@ -600,14 +600,14 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T3.3 LibrarySearchController | DONE | 2cbeb7c | RED: 14/20 failed on no-op stub; 6 'does nothing' guards passed by construction. GREEN: 20/20, stable across 3 consecutive runs (real-time tests with an injected 20ms debounce). Adds failure handling (a throwing search ends in-flight with empty results), which was not in the original acceptance list |
 | T3.4 Search field + status | DONE | 8582d2d | RED: 8/8 failed on stubs. GREEN: field 4/4 + status 4/4 |
 | T3.5 SearchPage refactor | DONE | bd6df97 | RED: the immediate-clear test failed (5 tiles still shown one frame after clear); cap-5, offline re-run and online patch-in-place tests guard the refactor. GREEN: SearchPage + badge suites 13/13 with existing tests unmodified; full suite green |
-| T4.1 Artists in-page search | DONE | `git log --grep T4.1:` | RED: 10/10 failed (no search field). GREEN: artists + badge suites 28/28; `test/ui` all pass. Two test-side fixes on the way (see D11): a test pumped two ProviderScopes sharing one DownloadManager, and `deleteDownload` needs `tester.runAsync` (real file I/O hangs fake-async) |
-| T4.2 Tracks in-page search | TODO | | |
+| T4.1 Artists in-page search | DONE | e07bd05 | RED: 10/10 failed (no search field). GREEN: artists + badge suites 28/28; `test/ui` all pass. Two test-side fixes on the way (see D11): a test pumped two ProviderScopes sharing one DownloadManager, and `deleteDownload` needs `tester.runAsync` (real file I/O hangs fake-async) |
+| T4.2 Tracks in-page search | DONE | `git log --grep T4.2:` | RED: 10/11 failed (no search field); detail-route guard passed. GREEN: tracks filters + convert-flow suites green; `test/ui` 282/282. Browse and search rows share one `_buildTrackTile` (download progress, conversion badge, Convert… action). `seedLibrary` made idempotent (insertOrIgnore artists/albums) for tests that seed twice |
 | T5.1 Full verification | TODO | | |
 | T5.2 AppShell integration | TODO | | |
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T4.2.
+**Next action:** T5.1.
 
 ## 10. Decision log
 
