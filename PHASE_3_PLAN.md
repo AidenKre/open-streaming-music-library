@@ -584,7 +584,7 @@ Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
 | Task | Status | Commit | Evidence |
 | --- | --- | --- | --- |
 | T0.1 Branch + plan | DONE | (this commit) | Baseline 883 tests passing, analyze clean |
-| T1.1 BrowseFilters | TODO | | |
+| T1.1 BrowseFilters | DONE | see git log | RED: 5/6 failed on stub (wrong values); GREEN: `browse_filters_test.dart` 6/6 |
 | T1.2 FilterBar | TODO | | |
 | T1.3 Pagination suspend | TODO | | |
 | T2.1 Artists root chip | TODO | | |
@@ -602,7 +602,7 @@ Status: `TODO` · `IN PROGRESS` · `BLOCKED` · `DONE`
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T1.1.
+**Next action:** T1.2.
 
 ## 10. Decision log
 
