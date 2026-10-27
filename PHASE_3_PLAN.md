@@ -601,13 +601,13 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T3.4 Search field + status | DONE | 8582d2d | RED: 8/8 failed on stubs. GREEN: field 4/4 + status 4/4 |
 | T3.5 SearchPage refactor | DONE | bd6df97 | RED: the immediate-clear test failed (5 tiles still shown one frame after clear); cap-5, offline re-run and online patch-in-place tests guard the refactor. GREEN: SearchPage + badge suites 13/13 with existing tests unmodified; full suite green |
 | T4.1 Artists in-page search | DONE | e07bd05 | RED: 10/10 failed (no search field). GREEN: artists + badge suites 28/28; `test/ui` all pass. Two test-side fixes on the way (see D11): a test pumped two ProviderScopes sharing one DownloadManager, and `deleteDownload` needs `tester.runAsync` (real file I/O hangs fake-async) |
-| T4.2 Tracks in-page search | DONE | `git log --grep T4.2:` | RED: 10/11 failed (no search field); detail-route guard passed. GREEN: tracks filters + convert-flow suites green; `test/ui` 282/282. Browse and search rows share one `_buildTrackTile` (download progress, conversion badge, Convert… action). `seedLibrary` made idempotent (insertOrIgnore artists/albums) for tests that seed twice |
-| T5.1 Full verification | TODO | | |
-| T5.2 AppShell integration | TODO | | |
+| T4.2 Tracks in-page search | DONE | f688a38 | RED: 10/11 failed (no search field); detail-route guard passed. GREEN: tracks filters + convert-flow suites green; `test/ui` 282/282. Browse and search rows share one `_buildTrackTile` (download progress, conversion badge, Convert… action). `seedLibrary` made idempotent (insertOrIgnore artists/albums) for tests that seed twice |
+| T5.1 Full verification | DONE | (no code; plan-only, committed with T5.2) | `flutter test` 982/982 passing (baseline 883), `flutter analyze` no issues, 15 new Dart files `dart format`-clean (0 changed), backend has no diff vs `main` and `pytest` 774 passed |
+| T5.2 AppShell integration | DONE | `git log --grep T5.2:` | `app_shell_filters_test.dart` 4/4 against the real AppShell. It passed first time, as expected for an integration test over finished features. **Mutation check:** making album detail render a FilterBar fails the detail-route test. Reverted |
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T5.1.
+**Next action:** T5.3.
 
 ## 10. Decision log
 
