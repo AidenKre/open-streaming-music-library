@@ -1,20 +1,20 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
-import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/ui/utils/library_search_controller.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
+import 'package:frontend/ui/widgets/library_search_field.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class SearchPage extends ConsumerStatefulWidget {
@@ -25,101 +25,31 @@ class SearchPage extends ConsumerStatefulWidget {
 }
 
 class _SearchPageState extends ConsumerState<SearchPage> {
-  final _controller = TextEditingController();
-  Timer? _debounceTimer;
-  String _query = '';
-  bool _isSearching = false;
-  List<ArtistUI> _artists = [];
-  List<AlbumUI> _albums = [];
-  List<TrackUI> _tracks = [];
+  // Shared with the in-page search on the browse tabs: debounce, generation
+  // stale-guard (a request that started before an offline flip or a newer
+  // query never overwrites newer results), and dispose-cancel all live there.
+  late final LibrarySearchController _search;
 
-  // Monotonically increases each time we start a new search. A completing
-  // request that captured an older generation drops its results rather than
-  // overwriting the UI — protects against:
-  //   * stale-query writes (older request finishes after a newer one),
-  //   * offline-mode flips (a request started before toggling offline must
-  //     not overwrite the offline-filtered results that started after).
-  int _searchGeneration = 0;
+  @override
+  void initState() {
+    super.initState();
+    _search = LibrarySearchController(
+      repository: ref.read(browseRepositoryProvider),
+      types: SearchType.values.toSet(),
+      limitPerType: 5,
+      // Offline: the repository filters to locally-downloaded content inside
+      // the FTS query (before LIMIT), so a downloaded match ranked below the
+      // top 5 is still returned.
+      downloadedOnly: () => ref.read(offlineModeProvider),
+    )..addListener(_onSearchChanged);
+  }
+
+  void _onSearchChanged() => setState(() {});
 
   @override
   void dispose() {
-    _debounceTimer?.cancel();
-    _controller.dispose();
+    _search.dispose();
     super.dispose();
-  }
-
-  void _patchDownloadStates() async {
-    if (!mounted) return;
-    final uuids = _tracks.map((t) => t.uuidId).toList();
-    if (uuids.isEmpty) return;
-    final db = ref.read(databaseProvider);
-    final states = await db.getTrackDownloadStates(uuids);
-    if (!mounted) return;
-    setState(() {
-      _tracks = _tracks.map((t) {
-        final s = states[t.uuidId];
-        if (s == null) return t;
-        return t.copyWith(
-          filePath: s.filePath,
-          downloadedBitrateKbps: s.downloadedBitrateKbps,
-          fileSizeBytes: s.fileSizeBytes,
-          downloadedQuality: s.downloadedQuality,
-          // Staleness compares these against `revision`, so patch all four
-          // together or a re-download/dismiss would read inconsistently.
-          revision: s.revision,
-          downloadedAtRevision: s.downloadedAtRevision,
-          downloadedCodec: s.downloadedCodec,
-          staleDismissedAtRevision: s.staleDismissedAtRevision,
-        );
-      }).toList();
-    });
-  }
-
-  void _onQueryChanged(String value) {
-    _debounceTimer?.cancel();
-    _debounceTimer = Timer(const Duration(milliseconds: 300), () {
-      if (!mounted) return;
-      setState(() => _query = value.trim());
-      _search();
-    });
-  }
-
-  Future<void> _search() async {
-    // Bump first so any in-flight older request is invalidated on completion.
-    final generation = ++_searchGeneration;
-
-    if (_query.isEmpty) {
-      setState(() {
-        _isSearching = false;
-        _artists = [];
-        _albums = [];
-        _tracks = [];
-      });
-      return;
-    }
-
-    setState(() => _isSearching = true);
-
-    // Offline: the repository filters to locally-downloaded content inside the
-    // FTS query (before LIMIT), so a downloaded match ranked below the top 5
-    // is still returned.
-    final results = await ref.read(browseRepositoryProvider).search(
-          _query,
-          limitPerType: 5,
-          downloadedOnly: ref.read(offlineModeProvider),
-        );
-
-    if (!mounted) return;
-    // Drop stale completions — a newer search started before this one
-    // returned, or the offline mode flipped (which also bumps the generation
-    // via the listener that calls _search).
-    if (generation != _searchGeneration) return;
-    setState(() {
-      _isSearching = false;
-      _artists = results.artists;
-      _albums = results.albums;
-      _tracks = results.tracks;
-    });
   }
 
   void _onArtistTap(ArtistUI artist) {
@@ -161,24 +91,22 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   @override
   Widget build(BuildContext context) {
     ref.listen(downloadStatusVersionProvider, (_, _) {
-      // Online: just patch the existing rows with refreshed download fields.
+      // Online: patch the existing rows with refreshed download fields.
       // Offline: the visible result set is filtered by downloaded state, so
       // a delete that removes the last downloaded match must re-run the FTS
       // query — patching alone would leave the dead row on screen.
-      if (ref.read(offlineModeProvider)) {
-        _search();
-      } else {
-        _patchDownloadStates();
-      }
+      _search.onDownloadStatusChanged();
     });
     ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (prev != next) _search();
+      if (prev != next) _search.rerun();
     });
     final manager = ref.watch(downloadManagerListenableProvider);
     final isOffline = ref.watch(offlineModeProvider);
 
-    final hasResults =
-        _artists.isNotEmpty || _albums.isNotEmpty || _tracks.isNotEmpty;
+    final query = _search.query;
+    final artists = _search.results.artists;
+    final albums = _search.results.albums;
+    final tracks = _search.results.tracks;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Search')),
@@ -187,51 +115,36 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           if (isOffline) const DownloadedOnlyBadge(),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-            child: TextField(
-              controller: _controller,
+            child: LibrarySearchField(
+              hintText: 'Search your library',
               autofocus: true,
-              decoration: InputDecoration(
-                hintText: 'Search your library',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _controller.text.isNotEmpty
-                    ? IconButton(
-                        icon: const Icon(Icons.clear),
-                        onPressed: () {
-                          _controller.clear();
-                          _onQueryChanged('');
-                        },
-                      )
-                    : null,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-              onChanged: _onQueryChanged,
+              onChanged: _search.onQueryChanged,
+              onCleared: _search.clear,
             ),
           ),
-          if (_query.isNotEmpty && !hasResults && !_isSearching)
+          if (_search.isActive && !_search.hasResults && !_search.isSearching)
             Padding(
               padding: const EdgeInsets.all(32),
               child: Center(
                 child: Text(
                   isOffline
-                      ? 'No downloaded results match "$_query". '
+                      ? 'No downloaded results match "$query". '
                           'Reconnect to the server to search the full library.'
                       : 'No results found',
                   textAlign: TextAlign.center,
                 ),
               ),
             ),
-          if (_artists.isNotEmpty) ...[
+          if (artists.isNotEmpty) ...[
             _buildSectionHeader('Artists'),
             SizedBox(
               height: 190,
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
-                itemCount: _artists.length,
+                itemCount: artists.length,
                 itemBuilder: (context, index) {
-                  final artist = _artists[index];
+                  final artist = artists[index];
                   return SizedBox(
                     width: 140,
                     child: ArtistCard(
@@ -268,16 +181,16 @@ class _SearchPageState extends ConsumerState<SearchPage> {
               ),
             ),
           ],
-          if (_albums.isNotEmpty) ...[
+          if (albums.isNotEmpty) ...[
             _buildSectionHeader('Albums'),
             SizedBox(
               height: 220,
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
-                itemCount: _albums.length,
+                itemCount: albums.length,
                 itemBuilder: (context, index) {
-                  final album = _albums[index];
+                  final album = albums[index];
                   return SizedBox(
                     width: 160,
                     child: AlbumCard(
@@ -323,9 +236,9 @@ class _SearchPageState extends ConsumerState<SearchPage> {
               ),
             ),
           ],
-          if (_tracks.isNotEmpty) ...[
+          if (tracks.isNotEmpty) ...[
             _buildSectionHeader('Songs'),
-            for (final track in _tracks)
+            for (final track in tracks)
               Builder(
                 key: ValueKey(track.uuidId),
                 builder: (_) {
@@ -351,7 +264,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                     onTap: () => ref
                         .read(audioProvider.notifier)
                         .playFromTrackList(
-                          _tracks.map((t) => t.uuidId).toList(),
+                          tracks.map((t) => t.uuidId).toList(),
                           track,
                           sourceType: 'search',
                         ),

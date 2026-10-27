@@ -7,12 +7,16 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/database/database.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
+import 'package:frontend/ui/widgets/track_tile.dart';
+
+import 'browse_harness.dart';
 
 void main() {
   late AppDatabase db;
@@ -68,6 +72,87 @@ void main() {
       expect(find.text('Add to Queue'), findsOneWidget);
     },
   );
+
+  group('shared search primitive (regressions)', () {
+    late AppDatabase libDb;
+    late BrowseHarness h;
+
+    setUp(() async {
+      initCoverArtCache(CoverArtCacheManager.noop());
+      libDb = AppDatabase(NativeDatabase.memory());
+      // Seven tracks match "Blue" by title only; artist/album names don't,
+      // so the Songs section is the only one on screen.
+      await seedLibrary(libDb, [
+        for (var i = 1; i <= 7; i++)
+          SeedTrack(
+            uuid: 'b$i',
+            title: 'Blue $i',
+            artistId: i,
+            artist: 'Artist $i',
+            downloaded: i == 1,
+          ),
+      ]);
+      h = await BrowseHarness.create(libDb);
+    });
+
+    tearDown(() async {
+      await libDb.close();
+      await h.dispose();
+    });
+
+    Future<void> search(WidgetTester tester, String query) async {
+      await tester.enterText(find.byType(TextField), query);
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('caps each section at 5 results', (tester) async {
+      await tester.pumpWidget(h.wrap(const SearchPage()));
+      await search(tester, 'Blue');
+      expect(find.byType(TrackTile), findsNWidgets(5));
+    });
+
+    testWidgets('the clear button returns to the blank state immediately', (
+      tester,
+    ) async {
+      await tester.pumpWidget(h.wrap(const SearchPage()));
+      await search(tester, 'Blue');
+      expect(find.byType(TrackTile), findsWidgets);
+
+      await tester.tap(find.byIcon(Icons.clear));
+      await tester.pump(); // one frame — no debounce wait
+      expect(find.byType(TrackTile), findsNothing);
+    });
+
+    testWidgets('going offline mid-query re-runs it downloaded-only', (
+      tester,
+    ) async {
+      await tester.pumpWidget(h.wrap(const SearchPage()));
+      await search(tester, 'Blue');
+      expect(find.byType(TrackTile), findsNWidgets(5));
+
+      h.offline.set(true);
+      await tester.pumpAndSettle();
+      expect(find.byType(TrackTile), findsOneWidget);
+      expect(find.text('Blue 1'), findsOneWidget);
+    });
+
+    testWidgets('online, a new download patches its row in place', (
+      tester,
+    ) async {
+      await tester.pumpWidget(h.wrap(const SearchPage()));
+      await search(tester, 'Blue');
+      TrackTile tile() => tester.widget(
+        find.ancestor(of: find.text('Blue 2'), matching: find.byType(TrackTile)),
+      );
+      expect(tile().track.isDownloaded, isFalse);
+
+      await markDownloaded(libDb, 'b2');
+      h.manager.downloadStatusVersion.value++;
+      await tester.pumpAndSettle();
+      expect(tile().track.isDownloaded, isTrue);
+    });
+  });
 }
 
 Future<void> _seedSearchData(AppDatabase db) async {
