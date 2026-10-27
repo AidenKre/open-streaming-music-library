@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -14,6 +15,7 @@ import 'package:frontend/ui/convert_flow.dart';
 import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/settings_dialog.dart';
+import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
@@ -42,6 +44,17 @@ class TracksPageState extends ConsumerState<TracksPage>
 
   @override
   int get pageSize => 50;
+
+  /// Chip selection for the root tab; session-only. Detail sub-routes (an
+  /// album's tracks) show no [FilterBar] and never filter by it.
+  BrowseFilters _filters = const BrowseFilters();
+
+  /// The downloaded-only filter this list (and the queue built from a tap)
+  /// uses. Root: the chip, forced on offline. Detail: never — offline it
+  /// keeps every row and dims the ones that can't play.
+  bool get _downloadedOnly => widget.isRoot
+      ? _filters.effectiveDownloaded(isOffline: ref.read(offlineModeProvider))
+      : false;
 
   List<OrderParameter> get _orderParams => [
     OrderParameter(column: 'artist'),
@@ -79,11 +92,23 @@ class TracksPageState extends ConsumerState<TracksPage>
       artistId: widget.artistId,
       albumId: widget.albumId,
       limit: limit,
+      downloadedOnly: _downloadedOnly,
     );
+  }
+
+  void _onFiltersChanged(BrowseFilters filters) {
+    if (filters == _filters) return;
+    setState(() => _filters = filters);
+    refresh();
   }
 
   @override
   Widget build(BuildContext context) {
+    // Offline flips the root tab's effective filter, so re-fetch from page 1.
+    // Detail lists don't filter (they dim instead), so they needn't refresh.
+    ref.listen<bool>(offlineModeProvider, (prev, next) {
+      if (widget.isRoot && prev != next) refresh();
+    });
     final manager = ref.watch(downloadManagerListenableProvider);
     final isOffline = ref.watch(offlineModeProvider);
     final conversionJobs = ref.watch(conversionJobsProvider);
@@ -91,6 +116,12 @@ class TracksPageState extends ConsumerState<TracksPage>
 
     final body = Column(
       children: [
+        if (widget.isRoot)
+          FilterBar(
+            filters: _filters,
+            onChanged: _onFiltersChanged,
+            isOffline: isOffline,
+          ),
         Expanded(
           child: ListView.builder(
             controller: scrollController,
@@ -123,9 +154,10 @@ class TracksPageState extends ConsumerState<TracksPage>
                   Completed() || Failed() => null,
                 };
               }
-              // Offline: keep all rows visible for visual consistency with
-              // the same album/artist viewed online, but dim and disable any
-              // track that isn't locally downloaded.
+              // Offline, a detail list keeps all rows visible for visual
+              // consistency with the same album/artist viewed online, but
+              // dims and disables any track that isn't locally downloaded.
+              // (The root tab filters instead, so it never dims.)
               final isInteractive = !isOffline || track.isDownloaded;
               final conversionJob = conversionJobs
                   .where((j) => j.uuidId == track.uuidId && j.isActive)
@@ -147,6 +179,8 @@ class TracksPageState extends ConsumerState<TracksPage>
                       artistId: widget.artistId,
                       albumId: widget.albumId,
                       orderParams: _orderParams,
+                      // Queue exactly what the filtered list shows.
+                      downloadedOnly: _downloadedOnly,
                     ),
                 onPlayNext: () =>
                     ref.read(audioProvider.notifier).playNext([track]),

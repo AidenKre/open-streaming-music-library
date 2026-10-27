@@ -589,8 +589,8 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T1.1 BrowseFilters | DONE | 8e8b79c | RED: 5/6 failed on stub (wrong values); GREEN: `browse_filters_test.dart` 6/6 |
 | T1.2 FilterBar | DONE | 0934862 | RED: 5/5 failed on stub (no shape/selection/scroll/tooltip); GREEN: `filter_bar_test.dart` 5/5 |
 | T1.3 Pagination suspend | DONE | f079c99 | RED: 3/4 new failed on no-op stub (emissions delivered, trailing delivered, loadMore re-subscribed); 4th (resume) is a guard on existing refresh(). GREEN: mixin test 10/10; `test/ui` all pass |
-| T2.1 Artists root chip | DONE | `git log --grep T2.1:` | RED: 5/6 failed (no FilterBar rendered); non-root case passed as existing behaviour. GREEN: `artists_page_filters_test.dart` 6/6 + badge tests 8/8. Adds the shared `test/ui/browse_harness.dart` (real drift DB, real DownloadManager, recording AudioCoordinator) |
-| T2.2 Tracks root chip | TODO | | |
+| T2.1 Artists root chip | DONE | 995bfac | RED: 5/6 failed (no FilterBar rendered); non-root case passed as existing behaviour. GREEN: `artists_page_filters_test.dart` 6/6 + badge tests 8/8. Adds the shared `test/ui/browse_harness.dart` (real drift DB, real DownloadManager, recording AudioCoordinator) |
+| T2.2 Tracks root chip | DONE | `git log --grep T2.2:` | RED: 4/6 failed (no chip; offline root still listed streaming-only rows); 2 detail-route cases passed as existing behaviour. GREEN: `tracks_page_filters_test.dart` 6/6, convert-flow suite green, `test/ui` all pass |
 | T2.3 Filtered empty state | TODO | | |
 | T3.1 search(types) | TODO | | |
 | T3.2 withFreshDownloadState | TODO | | |
@@ -604,7 +604,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T2.2.
+**Next action:** T2.3.
 
 ## 10. Decision log
 
