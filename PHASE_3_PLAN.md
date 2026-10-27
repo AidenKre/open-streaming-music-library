@@ -596,8 +596,8 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T2.3 Filtered empty state | DONE | c96b156 | RED: 3 'shown' cases failed (no message); 3 'not shown' guards passed. GREEN: both page suites 18/18; `test/ui` all pass. Adds `lib/ui/widgets/list_status_message.dart` (reused by T3.4/T4.x) |
 | T3.1 search(types) | DONE | 0ab5928 | RED: 4/7 failed with types ignored (other types leaked through); default, downloadedOnly and cap-100 rank-order cases are guards. GREEN: repo suite 15/15; search page, badge and database suites green |
 | T3.2 withFreshDownloadState | DONE | c774b32 | RED: 2/5 failed on identity stub (fields not re-read, cleared download not reflected); order/vanished/empty are guards. GREEN: repo suite 20/20. SearchPage still has its own copy until T3.5 removes it |
-| T3.3 LibrarySearchController | DONE | `git log --grep T3.3:` | RED: 14/20 failed on no-op stub; 6 'does nothing' guards passed by construction. GREEN: 20/20, stable across 3 consecutive runs (real-time tests with an injected 20ms debounce). Adds failure handling (a throwing search ends in-flight with empty results), which was not in the original acceptance list |
-| T3.4 Search field + status | TODO | | |
+| T3.3 LibrarySearchController | DONE | 2cbeb7c | RED: 14/20 failed on no-op stub; 6 'does nothing' guards passed by construction. GREEN: 20/20, stable across 3 consecutive runs (real-time tests with an injected 20ms debounce). Adds failure handling (a throwing search ends in-flight with empty results), which was not in the original acceptance list |
+| T3.4 Search field + status | DONE | `git log --grep T3.4:` | RED: 8/8 failed on stubs. GREEN: field 4/4 + status 4/4 |
 | T3.5 SearchPage refactor | TODO | | |
 | T4.1 Artists in-page search | TODO | | |
 | T4.2 Tracks in-page search | TODO | | |
@@ -606,7 +606,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T3.4.
+**Next action:** T3.5.
 
 ## 10. Decision log
 
