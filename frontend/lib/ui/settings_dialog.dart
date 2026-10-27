@@ -86,6 +86,19 @@ class SettingsDialog extends ConsumerWidget {
               'existing downloads stay as-is.',
               style: TextStyle(fontSize: 12),
             ),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Notify about changed downloads'),
+              subtitle: const Text(
+                'Show a banner when a track you downloaded changes on the '
+                'server (audio, tags, or artwork).',
+              ),
+              value: settings.notifyStaleDownloads,
+              onChanged: (value) => ref
+                  .read(settingsProvider.notifier)
+                  .setNotifyStaleDownloads(value),
+            ),
           ],
         ),
       ),

@@ -68,7 +68,7 @@ def _add_track_with_file(
     client,
     tmp_path: Path,
     name: str = "track.mp3",
-    bitrate_kbps: float = 0.0,
+    bitrate_kbps: float | None = None,
     codec: str = "mp3",
 ):
     track_path = tmp_path / name
@@ -173,7 +173,7 @@ class TestStreamQuality:
     def test_stream__passthrough_unknown_codec__uses_source_suffix(
         self, client, tmp_path
     ):
-        """Codec strings outside [_MIME_EXTENSION] (opus, vorbis, ...) used
+        """Codec strings outside [MIME_EXTENSION] (opus, vorbis, ...) used
         to surface as ``X-Audio-Extension: audio`` because the lookup fell
         through to a literal string fallback. The fix is to use the source
         file's own suffix when the codec isn't mapped — that's what the
@@ -330,7 +330,7 @@ class TestStreamQuality:
         won't trigger), and (c) the response headers are still present.
         """
         track = _add_track_with_file(
-            client, tmp_path, name="unknown_bitrate.mp3", bitrate_kbps=0.0
+            client, tmp_path, name="unknown_bitrate.mp3", bitrate_kbps=None
         )
         transcode_calls = {"n": 0}
 
@@ -351,6 +351,85 @@ class TestStreamQuality:
         # ffprobe returns None on a fake file → coordinator falls through to
         # transcoding (since it can't confirm source_bitrate <= requested).
         assert transcode_calls["n"] == 1
+
+    def test_original_quality_unknown_bitrate__header_omitted(self, client, tmp_path):
+        """A master whose bitrate is unknown (NULL) must not be reported as
+        "0" -- the client would record a fabricated 0 kbps download."""
+        track = _add_track_with_file(
+            client, tmp_path, name="unknown.flac", bitrate_kbps=None
+        )
+        with client.stream("GET", f"/tracks/{track.uuid_id}/stream") as resp:
+            assert resp.status_code == 200
+            assert "x-audio-bitrate-kbps" not in resp.headers
+            _ = b"".join(resp.iter_bytes())
+
+    def test_original_quality_zero_bitrate__header_reports_zero(self, client, tmp_path):
+        track = _add_track_with_file(
+            client, tmp_path, name="zero.flac", bitrate_kbps=0.0
+        )
+        with client.stream("GET", f"/tracks/{track.uuid_id}/stream") as resp:
+            assert resp.status_code == 200
+            assert resp.headers["x-audio-bitrate-kbps"] == "0"
+            _ = b"".join(resp.iter_bytes())
+
+
+class TestStreamCodecRevisionHeaders:
+    """X-Audio-Codec / X-Track-Revision describe exactly what was served, so a
+    client saving the bytes can record its codec and staleness."""
+
+    def _get_headers(self, client, uuid_id, quality=None):
+        url = f"/tracks/{uuid_id}/stream" + (f"?quality={quality}" if quality else "")
+        with client.stream("GET", url) as resp:
+            assert resp.status_code == 200, resp.text
+            _ = b"".join(resp.iter_bytes())
+            return resp.headers
+
+    @pytest.mark.parametrize("codec,name", [("flac", "t.flac"), ("mp3", "t.mp3")])
+    @pytest.mark.parametrize("quality", [None, "original"])
+    def test_passthrough__master_codec_and_revision(self, client, tmp_path, codec, name, quality):
+        track = _add_track_with_file(client, tmp_path, name=name, codec=codec)
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+
+        headers = self._get_headers(client, track.uuid_id, quality)
+
+        assert headers["x-audio-codec"] == codec
+        assert headers["x-track-revision"] == str(revision)
+
+    def test_transcoded__aac_and_revision(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path, name="t.flac", codec="flac")
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+
+        headers = self._get_headers(client, track.uuid_id, "192")
+
+        assert headers["x-audio-codec"] == "aac"
+        assert headers["x-track-revision"] == str(revision)
+
+    def test_revision_header__follows_track_revision_after_edit(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path, name="t.mp3", codec="mp3")
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        db = client.app.state.database
+        before = db.get_track_by_uuid(track.uuid_id).revision
+        new_revision = db.apply_track_metadata_edit(track.uuid_id, {"title": "New"}, before)
+        assert new_revision > before
+
+        headers = self._get_headers(client, track.uuid_id)
+
+        assert headers["x-track-revision"] == str(new_revision)
+
+    def test_range_request__also_carries_codec_and_revision(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path, name="t.mp3", codec="mp3")
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
+        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+
+        with client.stream(
+            "GET", f"/tracks/{track.uuid_id}/stream", headers={"Range": "bytes=0-9"}
+        ) as resp:
+            assert resp.status_code == 206
+            _ = b"".join(resp.iter_bytes())
+            assert resp.headers["x-audio-codec"] == "mp3"
+            assert resp.headers["x-track-revision"] == str(revision)
 
 
 class TestStreamCacheRace:
@@ -590,6 +669,20 @@ class TestEncodedCache:
         path2 = cache.insert("uuid-big2", "192", src2)
         assert path2.exists()
         assert not cache.has("uuid-big", "192")
+
+    def test_remove_all_for_uuid__removes_only_matching_uuid_across_qualities(self, tmp_path):
+        cache = self._make_cache(tmp_path, 10 * 1024 * 1024)
+        for quality in ("192", "320"):
+            src = self._stage_source(tmp_path, f"target-{quality}.m4a", b"x" * 10)
+            cache.insert("uuid-target", quality, src)
+        other_src = self._stage_source(tmp_path, "other.m4a", b"y" * 10)
+        cache.insert("uuid-other", "192", other_src)
+
+        cache.remove_all_for_uuid("uuid-target")
+
+        assert not cache.has("uuid-target", "192")
+        assert not cache.has("uuid-target", "320")
+        assert cache.has("uuid-other", "192")
 
 
 class TestWarmEndpoint:

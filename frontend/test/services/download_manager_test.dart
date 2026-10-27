@@ -71,7 +71,7 @@ Future<void> _insertTrack(
         TrackmetadataCompanion.insert(
           uuidId: uuid,
           duration: 120,
-          bitrateKbps: 320,
+          bitrateKbps: const Value(320),
           sampleRateHz: 44100,
           channels: 2,
           hasAlbumArt: Value(hasAlbumArt),
@@ -784,6 +784,129 @@ void main() {
   );
 
   test(
+    'enqueueTracksAtQuality force:true re-downloads even when quality matches '
+    '(stale-refresh use case)',
+    () async {
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 320,
+      );
+
+      var requestCount = 0;
+      final manager = buildManager(
+        client: MockClient((_) async {
+          requestCount++;
+          return http.Response.bytes([1], 200);
+        }),
+      );
+      addTearDown(manager.dispose);
+
+      // A stale, previously-dismissed copy: downloaded at 4, the track is now
+      // at 6, dismissed at 5 (so the second change re-armed it).
+      await db.customStatement(
+        "UPDATE tracks SET revision = 6, downloaded_at_revision = 4, "
+        "stale_dismissed_at_revision = 5, downloaded_quality = '320', "
+        "downloaded_codec = 'mp3' WHERE uuid_id = 'abc'",
+      );
+      expect(
+        TrackUI.fromQueryRow((await db.getTrackByUuid('abc')).single)
+            .isStaleDownload,
+        isTrue,
+      );
+
+      await manager.enqueueTracksAtQuality(
+        [_track('abc', filePath: existingPath, downloadedBitrateKbps: 320)],
+        quality: '320',
+        force: true,
+      );
+      await _waitForFinish(manager);
+
+      expect(requestCount, 1, reason: 'force:true must trigger a real request');
+      final job = manager.snapshot().first;
+      expect(job.replacesFilePath, existingPath);
+      expect(job.isCompleted, isTrue);
+
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(row.downloadedAtRevision, 6);
+      expect(row.staleDismissedAtRevision, isNull);
+      expect(row.filePath, isNot(existingPath));
+      expect(File(row.filePath!).existsSync(), isTrue);
+      expect(File(existingPath).existsSync(), isFalse,
+          reason: 'the stale copy is removed once the swap commits');
+      expect(
+        TrackUI.fromQueryRow((await db.getTrackByUuid('abc')).single)
+            .isStaleDownload,
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'a FAILED forced re-download keeps the stale copy, its file and its '
+    'columns',
+    () async {
+      final existingPath = p.join(tempDir.path, 'existing.audio');
+      await File(existingPath).writeAsBytes([9, 9]);
+      await _insertTrack(
+        db,
+        'abc',
+        filePath: existingPath,
+        downloadedBitrateKbps: 320,
+        downloadedQuality: '320',
+      );
+      await db.customStatement(
+        "UPDATE tracks SET revision = 6, downloaded_at_revision = 4, "
+        "downloaded_codec = 'mp3', file_size_bytes = 2 WHERE uuid_id = 'abc'",
+      );
+      final before = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response('gone', 404)),
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracksAtQuality(
+        [
+          _track(
+            'abc',
+            filePath: existingPath,
+            downloadedBitrateKbps: 320,
+            downloadedQuality: '320',
+          ),
+        ],
+        quality: '320',
+        force: true,
+      );
+      await _waitForFinish(manager);
+
+      expect(manager.snapshot().single.isFailed, isTrue);
+      final after = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect(after, before, reason: 'the row must be untouched');
+      expect(File(existingPath).readAsBytesSync(), [9, 9]);
+      expect(
+        TrackUI.fromQueryRow((await db.getTrackByUuid('abc')).single)
+            .isStaleDownload,
+        isTrue,
+      );
+      // No stray replacement files left behind.
+      final leftovers = Directory(p.join(tempDir.path, 'tracks')).existsSync()
+          ? Directory(p.join(tempDir.path, 'tracks')).listSync()
+          : const <FileSystemEntity>[];
+      expect(leftovers, isEmpty);
+    },
+  );
+
+  test(
     'enqueueTracksAtQuality deletes stale file and re-downloads when bitrate '
     'differs',
     () async {
@@ -1319,6 +1442,32 @@ void main() {
       expect(offline, isTrue);
       final job = manager.snapshot().first;
       expect(job.isQueued, isTrue);
+    },
+  );
+
+  test(
+    'a mid-stream bare OSError is classified as a network failure too',
+    () async {
+      await _insertTrack(db, 'abc');
+      var offline = false;
+      final manager = buildManager(
+        client: MockClient.streaming(
+          (req, _) async => http.StreamedResponse(
+            failingStream(const OSError('Connection reset by peer', 54)),
+            200,
+            contentLength: 999,
+          ),
+        ),
+        isOfflineFn: () => offline,
+        onNetworkFailure: () => offline = true,
+      );
+      addTearDown(manager.dispose);
+
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      await waitUntilNotActive(manager);
+
+      expect(offline, isTrue);
+      expect(manager.snapshot().first.isQueued, isTrue);
     },
   );
 

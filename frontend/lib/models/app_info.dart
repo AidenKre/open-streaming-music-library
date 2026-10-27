@@ -61,15 +61,94 @@ class EntityInfo {
   };
 }
 
+/// Whether a *source* codec (as stored in `trackmetadata.codec`, i.e.
+/// ffprobe's `codec_name`) is lossless. Null for a codec this client doesn't
+/// recognise -- callers fall back to a generic warning rather than guessing.
+///
+/// Targets carry their own server-advertised [ConversionTargetInfo.isLossless];
+/// this is the one client-side home for classifying an arbitrary source
+/// codec, so a new codec is one edit here.
+bool? isLosslessCodec(String? codec) {
+  if (codec == null) return null;
+  final c = codec.toLowerCase();
+  if (c.startsWith('pcm_')) return true;
+  if (_losslessCodecs.contains(c)) return true;
+  if (_lossyCodecs.contains(c)) return false;
+  return null;
+}
+
+const _losslessCodecs = {'flac', 'alac', 'wav', 'pcm', 'wavpack', 'ape'};
+const _lossyCodecs = {'aac', 'mp3', 'opus', 'vorbis'};
+
+class ConversionTargetInfo {
+  final String codec;
+  final bool isLossless;
+
+  const ConversionTargetInfo({required this.codec, required this.isLossless});
+
+  factory ConversionTargetInfo.fromJson(Map<String, dynamic> json) {
+    return ConversionTargetInfo(
+      codec: json['codec'] as String,
+      isLossless: json['is_lossless'] as bool,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {'codec': codec, 'is_lossless': isLossless};
+}
+
+class ConversionCapabilities {
+  final List<ConversionTargetInfo> targets;
+  final List<int> bitratePresets;
+
+  const ConversionCapabilities({
+    this.targets = const [],
+    this.bitratePresets = const [],
+  });
+
+  /// Every target this build supports, minus the hard no-op (a lossless
+  /// target that's the same codec as [sourceCodec]). Lossy same-codec stays
+  /// in the list -- it's warn-only, not blocked server-side either. This is
+  /// the client-side "per-track allowed target list" the backend doc
+  /// deliberately keeps out of the cached bootstrap blob: computed live from
+  /// this global list + the track's own (already-synced) source codec.
+  List<ConversionTargetInfo> allowedFor(String? sourceCodec) {
+    if (sourceCodec == null) return targets;
+    return targets
+        .where((t) => !(t.isLossless && t.codec == sourceCodec))
+        .toList();
+  }
+
+  factory ConversionCapabilities.fromJson(Map<String, dynamic> json) {
+    final rawTargets = (json['targets'] as List<dynamic>? ?? const []);
+    final rawPresets = (json['bitrate_presets'] as List<dynamic>? ?? const []);
+    return ConversionCapabilities(
+      targets: rawTargets
+          .map((t) => ConversionTargetInfo.fromJson(Map<String, dynamic>.from(t as Map)))
+          .toList(),
+      bitratePresets: rawPresets.map((p) => p as int).toList(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'targets': targets.map((t) => t.toJson()).toList(),
+    'bitrate_presets': bitratePresets,
+  };
+}
+
 class AppInfo {
   final Map<String, EntityInfo> entities;
+  final ConversionCapabilities conversion;
 
-  const AppInfo({this.entities = const {}});
+  const AppInfo({
+    this.entities = const {},
+    this.conversion = const ConversionCapabilities(),
+  });
 
   EntityInfo? entity(String name) => entities[name];
 
   factory AppInfo.fromJson(Map<String, dynamic> json) {
     final rawEntities = (json['entities'] as Map<dynamic, dynamic>? ?? const {});
+    final rawConversion = json['conversion'] as Map<dynamic, dynamic>?;
     return AppInfo(
       entities: rawEntities.map(
         (key, value) => MapEntry(
@@ -77,10 +156,14 @@ class AppInfo {
           EntityInfo.fromJson(Map<String, dynamic>.from(value as Map)),
         ),
       ),
+      conversion: rawConversion != null
+          ? ConversionCapabilities.fromJson(Map<String, dynamic>.from(rawConversion))
+          : const ConversionCapabilities(),
     );
   }
 
   Map<String, dynamic> toJson() => {
     'entities': entities.map((k, v) => MapEntry(k, v.toJson())),
+    'conversion': conversion.toJson(),
   };
 }

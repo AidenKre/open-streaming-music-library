@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 
@@ -213,30 +214,84 @@ void main() {
   });
 
   group('recoverablesProvider default registration', () {
-    test('advertises sync, resume-downloads, and reconcile adapters', () {
-      // No member overrides — exercises the real default list. The adapters
-      // are private, so assert by count + trigger coverage rather than type.
-      final container = ProviderContainer();
-      addTearDown(container.dispose);
+    test(
+      'advertises sync, app-info, resume-downloads, resume-conversions, and '
+      'reconcile adapters',
+      () {
+        // No member overrides — exercises the real default list. The adapters
+        // are private, so assert by count + trigger coverage rather than type.
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
 
-      final registered = container.read(recoverablesProvider);
-      expect(registered, hasLength(3));
+        final registered = container.read(recoverablesProvider);
+        expect(registered, hasLength(5));
 
-      final networkMembers = registered
-          .where((r) => r.triggers.contains(RecoveryTrigger.networkRecovered))
-          .toList();
-      expect(networkMembers, hasLength(2),
-          reason: 'sync + resume-downloads fire on network recovery');
+        final networkMembers = registered
+            .where((r) => r.triggers.contains(RecoveryTrigger.networkRecovered))
+            .toList();
+        expect(networkMembers, hasLength(4),
+            reason: 'sync + app-info + resume-downloads + resume-conversions '
+                'fire on network recovery');
 
-      final coldMembers = registered
-          .where((r) => r.triggers.contains(RecoveryTrigger.coldStart))
-          .toList();
-      expect(coldMembers, hasLength(1), reason: 'reconcile fires on cold start');
-      expect(
-        coldMembers.single.triggers,
-        contains(RecoveryTrigger.appResume),
-        reason: 'reconcile also fires on resume',
+        final coldMembers = registered
+            .where((r) => r.triggers.contains(RecoveryTrigger.coldStart))
+            .toList();
+        expect(coldMembers, hasLength(2),
+            reason: 'reconcile + resume-conversions fire on cold start');
+
+        final conversionMembers = registered
+            .where((r) =>
+                r.recoveryPriority == RecoveryPriority.resumeConversions)
+            .toList();
+        expect(conversionMembers, hasLength(1));
+        expect(
+          conversionMembers.single.triggers,
+          containsAll(<RecoveryTrigger>{
+            RecoveryTrigger.networkRecovered,
+            RecoveryTrigger.coldStart,
+            RecoveryTrigger.appResume,
+          }),
+          reason: 'conversion polling restarts on reconnect and catches up '
+              'on cold start and resume',
+        );
+
+        final reconcileMembers = coldMembers
+            .where((r) => r.recoveryPriority == RecoveryPriority.reconcileDownloads)
+            .toList();
+        expect(reconcileMembers, hasLength(1));
+        expect(
+          reconcileMembers.single.triggers,
+          contains(RecoveryTrigger.appResume),
+          reason: 'reconcile also fires on resume',
+        );
+      },
+    );
+
+    test('network recovery re-fetches app capabilities', () async {
+      // After an offline cold start appInfoProvider holds the cached/default
+      // capabilities (no `convert` action); it must reload once the server is
+      // reachable or the Convert entry stays hidden all session.
+      var loads = 0;
+      final container = ProviderContainer(
+        overrides: [
+          appInfoProvider.overrideWith((ref) async {
+            loads++;
+            return defaultAppInfo();
+          }),
+        ],
       );
+      addTearDown(container.dispose);
+      await container.read(appInfoProvider.future);
+      expect(loads, 1);
+
+      final member = container
+          .read(recoverablesProvider)
+          .where((r) => r.recoveryPriority == RecoveryPriority.appInfo)
+          .single;
+      expect(member.triggers, {RecoveryTrigger.networkRecovered});
+
+      await member.recover(RecoveryTrigger.networkRecovered);
+      expect(loads, 2, reason: 'invalidated and re-loaded');
     });
 
     test('sync also fires on app resume', () {

@@ -64,6 +64,12 @@ class _SearchPageState extends ConsumerState<SearchPage> {
           downloadedBitrateKbps: s.downloadedBitrateKbps,
           fileSizeBytes: s.fileSizeBytes,
           downloadedQuality: s.downloadedQuality,
+          // Staleness compares these against `revision`, so patch all four
+          // together or a re-download/dismiss would read inconsistently.
+          revision: s.revision,
+          downloadedAtRevision: s.downloadedAtRevision,
+          downloadedCodec: s.downloadedCodec,
+          staleDismissedAtRevision: s.staleDismissedAtRevision,
         );
       }).toList();
     });

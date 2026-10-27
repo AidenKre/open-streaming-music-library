@@ -19,7 +19,8 @@ class TrackMetaData(BaseModel):
 
     codec: str | None = None
     duration: float = 0.0
-    bitrate_kbps: float = 0.0
+    # None = unknown (ffprobe reported no bitrate); 0.0 is a real reading.
+    bitrate_kbps: float | None = None
     sample_rate_hz: int = 0
     channels: int = 0
 
@@ -30,7 +31,7 @@ class TrackMetaData(BaseModel):
         return (
             self.codec is None
             and self.duration == 0.0
-            and self.bitrate_kbps == 0.0
+            and not self.bitrate_kbps
             and self.sample_rate_hz == 0
             and self.channels == 0
         )

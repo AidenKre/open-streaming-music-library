@@ -62,7 +62,33 @@ class BrowseRepository {
         .map((rows) => rows.map(TrackUI.fromQueryRow).toList(growable: false));
   }
 
+  /// Live list of downloaded tracks that changed on the server since they
+  /// were downloaded and haven't been dismissed. The stale rule is applied in
+  /// SQL ([staleDownloadPredicate]), not by mapping every downloaded row.
+  Stream<List<TrackUI>> watchStaleDownloads() {
+    return _db.watchStaleDownloads().map(
+      (rows) => rows.map(TrackUI.fromQueryRow).toList(growable: false),
+    );
+  }
+
   // ── Track loading for queue operations ──────────────────────────────────
+
+  /// The current state of a single track, or null if it no longer exists.
+  /// Used to re-check a track's revision/codec right before an action that
+  /// needs fresh state (e.g. after a `/changes` sync, before enqueuing a
+  /// conversion) rather than trusting a possibly-stale in-memory `TrackUI`.
+  Future<TrackUI?> getTrack(String uuidId) async {
+    final rows = await _db.getTrackByUuid(uuidId);
+    if (rows.isEmpty) return null;
+    return TrackUI.fromQueryRow(rows.first);
+  }
+
+  /// Live form of [getTrack] (null while the track isn't in the local DB).
+  Stream<TrackUI?> watchTrack(String uuidId) {
+    return _db.watchTrackByUuid(uuidId).map(
+      (rows) => rows.isEmpty ? null : TrackUI.fromQueryRow(rows.first),
+    );
+  }
 
   Future<List<TrackUI>> getTracksForAlbum(int artistId, int albumId) async {
     final uuids = await _db.getTrackUuids(

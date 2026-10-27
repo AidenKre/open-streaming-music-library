@@ -13,6 +13,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/metadata_edit.dart';
+import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
@@ -490,6 +491,164 @@ void main() {
             .getSingle())
         .read<int>('r');
     expect(revAfterSecond, 7);
+  });
+
+  group('own edits vs downloaded-file staleness', () {
+    Future<void> markDownloaded(AppDatabase db, int downloadedAtRevision) =>
+        db.customStatement(
+          "UPDATE tracks SET file_path = '/local/u1.flac', "
+          "downloaded_at_revision = ? WHERE uuid_id = 'u1'",
+          [downloadedAtRevision],
+        );
+
+    Future<TrackUI> track(AppDatabase db) async =>
+        TrackUI.fromQueryRow((await db.getTrackByUuid('u1')).single);
+
+    test('a successful flush on a current download does not make it stale',
+        () async {
+      final db = AppDatabase(NativeDatabase.memory());
+      addTearDown(db.close);
+      await _seedTrack(db, revision: 5);
+      await markDownloaded(db, 5);
+      final outbox = _container(db, onPatch: (_) async => _ok())
+          .read(editOutboxProvider);
+
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'Mine'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+      await outbox.flush();
+
+      final t = await track(db);
+      expect(t.revision, 6);
+      expect(t.downloadedAtRevision, 6);
+      expect(t.isStaleDownload, isFalse);
+    });
+
+    test('a successful flush on an already-stale download keeps it stale',
+        () async {
+      final db = AppDatabase(NativeDatabase.memory());
+      addTearDown(db.close);
+      await _seedTrack(db, revision: 5);
+      // Downloaded at 4; a server-side change (e.g. conversion) took it to 5.
+      await markDownloaded(db, 4);
+      final outbox = _container(db, onPatch: (_) async => _ok())
+          .read(editOutboxProvider);
+
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'Mine'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+      await outbox.flush();
+
+      final t = await track(db);
+      expect(t.revision, 6);
+      expect(t.downloadedAtRevision, 4);
+      expect(t.isStaleDownload, isTrue);
+    });
+
+    test(
+      'a self-resolved 409 carries a current download forward only when the '
+      'server audio/artwork is unchanged',
+      () async {
+        for (final serverCodec in [null, 'aac']) {
+          final db = AppDatabase(NativeDatabase.memory());
+          addTearDown(db.close);
+          await _seedTrack(db, revision: 5);
+          await markDownloaded(db, 5);
+          final outbox = _container(
+            db,
+            onPatch: (_) async => _conflict(8),
+            onGetTrack: (_) async {
+              final resp = _trackResponse(
+                title: 'Mine',
+                artist: 'OldA',
+                album: 'OldAlb',
+                revision: 8,
+              );
+              final json = jsonDecode(resp.body) as Map<String, dynamic>;
+              (json['metadata'] as Map<String, dynamic>)['codec'] =
+                  serverCodec;
+              return http.Response(jsonEncode(json), 200,
+                  headers: {'content-type': 'application/json'});
+            },
+          ).read(editOutboxProvider);
+
+          await outbox.enqueue(
+            uuidId: 'u1',
+            edit: const MetadataEdit.empty().set('title', 'Mine'),
+            writeMode: EditWriteMode.dbOnly,
+            baseRevision: 5,
+          );
+          await outbox.flush();
+
+          final t = await track(db);
+          expect(t.revision, 8);
+          if (serverCodec == null) {
+            expect(t.isStaleDownload, isFalse,
+                reason: 'only our own tag edit changed server-side');
+          } else {
+            expect(t.isStaleDownload, isTrue,
+                reason: 'the server audio changed too (e.g. a conversion)');
+          }
+        }
+      },
+    );
+
+    test(
+      'a self-resolved 409 keeps the download stale when a pull already '
+      'applied a server change (e.g. a conversion) to the local row',
+      () async {
+        final db = AppDatabase(NativeDatabase.memory());
+        addTearDown(db.close);
+        await _seedTrack(db, revision: 5);
+        await markDownloaded(db, 5);
+        final outbox = _container(
+          db,
+          onPatch: (_) async => _conflict(8),
+          onGetTrack: (_) async {
+            final resp = _trackResponse(
+              title: 'Mine',
+              artist: 'OldA',
+              album: 'OldAlb',
+              revision: 8,
+            );
+            final json = jsonDecode(resp.body) as Map<String, dynamic>;
+            (json['metadata'] as Map<String, dynamic>)['codec'] = 'aac';
+            return http.Response(jsonEncode(json), 200,
+                headers: {'content-type': 'application/json'});
+          },
+        ).read(editOutboxProvider);
+
+        await outbox.enqueue(
+          uuidId: 'u1',
+          edit: const MetadataEdit.empty().set('title', 'Mine'),
+          writeMode: EditWriteMode.dbOnly,
+          baseRevision: 5,
+        );
+        // While the edit sat pending, a /changes pull applied the server's
+        // conversion (rev 7): the local audio fields now equal server truth,
+        // so they no longer describe what the downloaded file holds.
+        await db.customStatement(
+          "UPDATE trackmetadata SET codec = 'aac' WHERE uuid_id = 'u1'",
+        );
+        await db.customStatement(
+          "UPDATE tracks SET revision = 7 WHERE uuid_id = 'u1'",
+        );
+        await outbox.flush();
+
+        final t = await track(db);
+        expect(await db.select(db.pendingEdits).get(), isEmpty,
+            reason: 'the 409 was still resolved as our own applied edit');
+        expect(t.revision, 8);
+        expect(t.downloadedAtRevision, 5);
+        expect(t.isStaleDownload, isTrue);
+      },
+    );
   });
 
   test('flush 422 reverts the optimistic write and surfaces a rejection',

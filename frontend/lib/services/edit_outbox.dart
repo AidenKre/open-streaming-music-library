@@ -160,7 +160,16 @@ class EditOutbox {
       // row. This path holds the shared mutex, so the write can't race a pull.
       final newRevision = resp['revision'];
       if (newRevision is int) {
-        await db.updateTrackRevision(row.uuidId, newRevision);
+        // A 200 means the server held exactly `base_revision` right before
+        // this edit (anything else 409s), so a download current as of that
+        // revision differs from server truth only by this user's own edit --
+        // carry it forward rather than flag the user's own save as a stale
+        // download. Server-originated changes never pass through here.
+        await db.recordOwnEditRevision(
+          row.uuidId,
+          newRevision,
+          currentAsOf: row.baseRevision,
+        );
       }
       await _delete(row.uuidId);
     } on ApiException catch (e) {
@@ -243,11 +252,50 @@ class EditOutbox {
           : serverValue == editedValue;
       if (!equal) return false;
     }
-    await db.updateTrackRevision(row.uuidId, dto.revision);
+    // Unlike a 200, a 409 can't prove the server's revision moved ONLY by
+    // our edit (a conversion or new artwork could have landed too), so only
+    // carry a current download forward when the server's audio + artwork
+    // still match what's stored locally; otherwise leave it to flag as stale
+    // (the safe direction). The local row is only a valid "before" snapshot
+    // while no `/changes` pull has applied anything since the edit's base: a
+    // pull could already have overwritten it with server truth (e.g. a
+    // conversion), which would then trivially "match" the server.
+    final localRevision = await _localRevision(row.uuidId);
+    final carryForward = localRevision == row.baseRevision &&
+        await _audioAndArtUnchanged(row.uuidId, dto);
+    await db.recordOwnEditRevision(
+      row.uuidId,
+      dto.revision,
+      currentAsOf: carryForward ? row.baseRevision : null,
+    );
     await _delete(row.uuidId);
     developer.log('409 was our own applied edit — resolved: ${row.uuidId}',
         name: 'EditOutbox');
     return true;
+  }
+
+  Future<int?> _localRevision(String uuidId) async {
+    final track = await (db.select(db.tracks)
+          ..where((t) => t.uuidId.equals(uuidId)))
+        .getSingleOrNull();
+    return track?.revision;
+  }
+
+  /// True when [dto]'s intrinsic audio fields and artwork match the local
+  /// `trackmetadata` row -- i.e. nothing a downloaded file embeds besides tags
+  /// changed server-side.
+  Future<bool> _audioAndArtUnchanged(String uuidId, ClientTrackDto dto) async {
+    final local = await (db.select(db.trackmetadata)
+          ..where((t) => t.uuidId.equals(uuidId)))
+        .getSingleOrNull();
+    if (local == null) return false;
+    final m = dto.metadata;
+    return local.codec == m.codec &&
+        local.bitrateKbps == m.bitrateKbps &&
+        local.sampleRateHz == m.sampleRateHz &&
+        local.channels == m.channels &&
+        local.hasAlbumArt == m.hasAlbumArt &&
+        local.coverArtId == m.coverArtId;
   }
 
   /// Revert a track's optimistic write back to the pre-edit snapshot captured

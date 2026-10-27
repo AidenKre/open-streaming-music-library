@@ -158,6 +158,30 @@ void main() {
     );
   });
 
+  test('notifyStaleDownloads defaults to true', () async {
+    final prefs = await SharedPreferences.getInstance();
+    final container = _containerWith(prefs);
+    addTearDown(container.dispose);
+
+    final settings = await container.read(settingsProvider.future);
+    expect(settings.notifyStaleDownloads, isTrue);
+  });
+
+  test('setNotifyStaleDownloads persists and updates state', () async {
+    final prefs = await SharedPreferences.getInstance();
+    final container = _containerWith(prefs);
+    addTearDown(container.dispose);
+
+    await container.read(settingsProvider.future);
+    await container.read(settingsProvider.notifier).setNotifyStaleDownloads(false);
+
+    expect(prefs.getBool('settings.notifyStaleDownloads'), false);
+    expect(
+      container.read(settingsProvider).value!.notifyStaleDownloads,
+      isFalse,
+    );
+  });
+
   test('setStreamQualityFull rejects invalid values', () async {
     final prefs = await SharedPreferences.getInstance();
     final container = _containerWith(prefs);

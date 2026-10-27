@@ -35,9 +35,15 @@ class AppSettings {
 
   final String downloadQuality;
 
+  /// Global "don't notify" pref for the stale-download warning (Phase 2).
+  /// Pure-prefs mutator, same shape as `downloadQuality` -- no backend
+  /// reconcile.
+  final bool notifyStaleDownloads;
+
   const AppSettings({
     required this.persistedStreamQuality,
     required this.downloadQuality,
+    this.notifyStaleDownloads = true,
     this.temporaryStreamQuality,
     this.streamQualityChangeKind,
   });
@@ -48,6 +54,7 @@ class AppSettings {
   AppSettings copyWith({
     String? persistedStreamQuality,
     String? downloadQuality,
+    bool? notifyStaleDownloads,
     String? temporaryStreamQuality,
     QualityChangeKind? streamQualityChangeKind,
     bool clearTemporary = false,
@@ -57,6 +64,7 @@ class AppSettings {
       persistedStreamQuality:
           persistedStreamQuality ?? this.persistedStreamQuality,
       downloadQuality: downloadQuality ?? this.downloadQuality,
+      notifyStaleDownloads: notifyStaleDownloads ?? this.notifyStaleDownloads,
       temporaryStreamQuality:
           clearTemporary ? null : (temporaryStreamQuality ?? this.temporaryStreamQuality),
       streamQualityChangeKind: clearStreamQualityChangeKind
@@ -71,6 +79,7 @@ class AppSettings {
       other.persistedStreamQuality == persistedStreamQuality &&
       other.temporaryStreamQuality == temporaryStreamQuality &&
       other.downloadQuality == downloadQuality &&
+      other.notifyStaleDownloads == notifyStaleDownloads &&
       other.streamQualityChangeKind == streamQualityChangeKind;
 
   @override
@@ -78,6 +87,7 @@ class AppSettings {
         persistedStreamQuality,
         temporaryStreamQuality,
         downloadQuality,
+        notifyStaleDownloads,
         streamQualityChangeKind,
       );
 }
@@ -85,6 +95,7 @@ class AppSettings {
 class SettingsNotifier extends AsyncNotifier<AppSettings> {
   static const _streamQualityKey = 'settings.streamQuality';
   static const _downloadQualityKey = 'settings.downloadQuality';
+  static const _notifyStaleDownloadsKey = 'settings.notifyStaleDownloads';
   static const _defaultQuality = originalQuality;
 
   /// Hard cap on a single backend-sync attempt. The reconciliation runs
@@ -150,6 +161,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       persistedStreamQuality:
           isValidQuality(stream) ? stream! : _defaultQuality,
       downloadQuality: isValidQuality(download) ? download! : _defaultQuality,
+      notifyStaleDownloads:
+          prefs.getBool(_notifyStaleDownloadsKey) ?? true,
     );
   }
 
@@ -264,6 +277,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     final prefs = await ref.read(sharedPreferencesProvider.future);
     await prefs.setString(_downloadQualityKey, quality);
     state = AsyncData(_current.copyWith(downloadQuality: quality));
+  }
+
+  /// Pure-prefs mutator (no backend reconcile), mirroring [setDownloadQuality].
+  Future<void> setNotifyStaleDownloads(bool notify) async {
+    final prefs = await ref.read(sharedPreferencesProvider.future);
+    await prefs.setBool(_notifyStaleDownloadsKey, notify);
+    state = AsyncData(_current.copyWith(notifyStaleDownloads: notify));
   }
 }
 

@@ -3,6 +3,8 @@ from .database import (
     AlbumRowFilterParameter,
     ArtistOrderParameter,
     ArtistRowFilterParameter,
+    ConversionJobActive,
+    ConversionJobNotRunning,
     Database,
     DatabaseContext,
     EDITABLE_METADATA_COLUMNS,

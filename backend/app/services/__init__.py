@@ -8,4 +8,5 @@ from .transcoder import (
     ORIGINAL_QUALITY,
     QUALITY_BITRATES_KBPS,
     normalize_quality,
+    probe_available_encoders,
 )

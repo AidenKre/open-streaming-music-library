@@ -22,7 +22,8 @@ class TrackUI {
   final int? discNumber;
   final String? codec;
   final double duration;
-  final double bitrateKbps;
+  /// Null when the server doesn't know it; 0 is a real reading.
+  final double? bitrateKbps;
   final int sampleRateHz;
   final int channels;
   final bool hasAlbumArt;
@@ -35,8 +36,33 @@ class TrackUI {
   // Distinct from `downloadedBitrateKbps`, which is the actual on-disk
   // bitrate — for passthrough downloads the two can differ.
   final String? downloadedQuality;
+  // The server revision this download is current as of (see the column's
+  // doc comment on `Tracks`). Compared against `revision` to detect a
+  // server-side change (audio, tags or artwork) the local file predates.
+  final int? downloadedAtRevision;
+  // The codec actually written to disk (see the column's doc comment on
+  // `Tracks` for where it comes from).
+  final String? downloadedCodec;
+  // Re-arms when `revision` climbs past this value again after a dismiss.
+  final int? staleDismissedAtRevision;
 
   bool get isDownloaded => filePath != null;
+
+  /// A downloaded file whose track has since changed on the server (its
+  /// revision moved past the one this file is current as of) and the user
+  /// hasn't dismissed this particular change.
+  ///
+  /// Dart mirror of `staleDownloadPredicate` (database.dart), which is the
+  /// rule the banner's SQL query filters on; `track_ui_test.dart` asserts the
+  /// two agree over every null/ordering combination.
+  bool get isStaleDownload {
+    if (!isDownloaded || revision == null || downloadedAtRevision == null) {
+      return false;
+    }
+    if (revision! <= downloadedAtRevision!) return false;
+    if (staleDismissedAtRevision == null) return true;
+    return revision! > staleDismissedAtRevision!;
+  }
 
   String get subtitle =>
       [artist ?? 'Unknown Artist', album].whereType<String>().join(' \u2014 ');
@@ -68,22 +94,29 @@ class TrackUI {
     this.downloadedBitrateKbps,
     this.fileSizeBytes,
     this.downloadedQuality,
+    this.downloadedAtRevision,
+    this.downloadedCodec,
+    this.staleDismissedAtRevision,
   });
 
   static const Object _sentinel = Object();
 
   TrackUI copyWith({
     Object? filePath = _sentinel,
+    Object? revision = _sentinel,
     Object? downloadedBitrateKbps = _sentinel,
     Object? fileSizeBytes = _sentinel,
     Object? downloadedQuality = _sentinel,
+    Object? downloadedAtRevision = _sentinel,
+    Object? downloadedCodec = _sentinel,
+    Object? staleDismissedAtRevision = _sentinel,
   }) {
     return TrackUI(
       uuidId: uuidId,
       filePath: filePath == _sentinel ? this.filePath : filePath as String?,
       createdAt: createdAt,
       lastUpdated: lastUpdated,
-      revision: revision,
+      revision: revision == _sentinel ? this.revision : revision as int?,
       title: title,
       artist: artist,
       album: album,
@@ -111,6 +144,15 @@ class TrackUI {
       downloadedQuality: downloadedQuality == _sentinel
           ? this.downloadedQuality
           : downloadedQuality as String?,
+      downloadedAtRevision: downloadedAtRevision == _sentinel
+          ? this.downloadedAtRevision
+          : downloadedAtRevision as int?,
+      downloadedCodec: downloadedCodec == _sentinel
+          ? this.downloadedCodec
+          : downloadedCodec as String?,
+      staleDismissedAtRevision: staleDismissedAtRevision == _sentinel
+          ? this.staleDismissedAtRevision
+          : staleDismissedAtRevision as int?,
     );
   }
 
@@ -147,7 +189,7 @@ class TrackUI {
       discNumber: row.readNullable<int>('disc_number'),
       codec: row.readNullable<String>('codec'),
       duration: row.read<double>('duration'),
-      bitrateKbps: row.read<double>('bitrate_kbps'),
+      bitrateKbps: row.readNullable<double>('bitrate_kbps'),
       sampleRateHz: row.read<int>('sample_rate_hz'),
       channels: row.read<int>('channels'),
       hasAlbumArt: row.read<bool>('has_album_art'),
@@ -155,6 +197,10 @@ class TrackUI {
       downloadedBitrateKbps: row.readNullable<int>('downloaded_bitrate_kbps'),
       fileSizeBytes: row.readNullable<int>('file_size_bytes'),
       downloadedQuality: row.readNullable<String>('downloaded_quality'),
+      downloadedAtRevision: row.readNullable<int>('downloaded_at_revision'),
+      downloadedCodec: row.readNullable<String>('downloaded_codec'),
+      staleDismissedAtRevision:
+          row.readNullable<int>('stale_dismissed_at_revision'),
     );
   }
 
@@ -186,6 +232,9 @@ class TrackUI {
       downloadedBitrateKbps: track.downloadedBitrateKbps,
       fileSizeBytes: track.fileSizeBytes,
       downloadedQuality: track.downloadedQuality,
+      downloadedAtRevision: track.downloadedAtRevision,
+      downloadedCodec: track.downloadedCodec,
+      staleDismissedAtRevision: track.staleDismissedAtRevision,
     );
   }
 }

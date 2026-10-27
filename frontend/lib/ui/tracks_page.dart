@@ -5,8 +5,12 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/app_info_service.dart';
+import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/conversions_page.dart';
+import 'package:frontend/ui/convert_flow.dart';
 import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/settings_dialog.dart';
@@ -82,6 +86,8 @@ class TracksPageState extends ConsumerState<TracksPage>
   Widget build(BuildContext context) {
     final manager = ref.watch(downloadManagerListenableProvider);
     final isOffline = ref.watch(offlineModeProvider);
+    final conversionJobs = ref.watch(conversionJobsProvider);
+    final appInfo = ref.watch(appInfoProvider).value;
 
     final body = Column(
       children: [
@@ -89,7 +95,11 @@ class TracksPageState extends ConsumerState<TracksPage>
           child: ListView.builder(
             controller: scrollController,
             itemCount: paginatedItems.length + (hasMore ? 1 : 0),
-            itemBuilder: (context, index) {
+            // The builder's context is deliberately unnamed: long-lived flows
+            // below (convert: a network sync plus two sheets) use the page's
+            // own `context`, so their lifetime is tied to the page rather
+            // than to list internals.
+            itemBuilder: (_, index) {
               if (index >= paginatedItems.length) {
                 return const Padding(
                   padding: EdgeInsets.all(16),
@@ -117,6 +127,9 @@ class TracksPageState extends ConsumerState<TracksPage>
               // the same album/artist viewed online, but dim and disable any
               // track that isn't locally downloaded.
               final isInteractive = !isOffline || track.isDownloaded;
+              final conversionJob = conversionJobs
+                  .where((j) => j.uuidId == track.uuidId && j.isActive)
+                  .firstOrNull;
               return TrackTile(
                 track: track,
                 trailing: trailing,
@@ -143,6 +156,18 @@ class TracksPageState extends ConsumerState<TracksPage>
                 onDownloadAtQuality: (q) =>
                     downloadScope(ref, TrackScope(track), quality: q),
                 onDeleteDownload: () => deleteScope(ref, TrackScope(track)),
+                conversionJob: conversionJob,
+                onConvert:
+                    canConvertTrack(
+                      isOffline: isOffline,
+                      appInfo: appInfo,
+                      codec: track.codec,
+                    )
+                    ? () => startConversion(context, ref, track.uuidId)
+                    : null,
+                onCancelConvert: conversionJob != null
+                    ? () => cancelConversion(context, ref, conversionJob.jobId)
+                    : null,
               );
             },
           ),
@@ -175,6 +200,15 @@ List<Widget> buildTopBarActions(BuildContext context, WidgetRef ref) {
         Navigator.of(
           context,
         ).push(MaterialPageRoute(builder: (_) => const DownloadingPage()));
+      },
+    ),
+    IconButton(
+      icon: const Icon(Icons.transform),
+      tooltip: 'Conversions',
+      onPressed: () {
+        Navigator.of(
+          context,
+        ).push(MaterialPageRoute(builder: (_) => const ConversionsPage()));
       },
     ),
     IconButton(

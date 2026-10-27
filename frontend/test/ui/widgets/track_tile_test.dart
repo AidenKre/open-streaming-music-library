@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
@@ -42,6 +43,9 @@ void main() {
     VoidCallback? onDownload,
     void Function(String)? onDownloadAtQuality,
     VoidCallback? onDeleteDownload,
+    VoidCallback? onConvert,
+    VoidCallback? onCancelConvert,
+    ConversionJob? conversionJob,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -53,6 +57,9 @@ void main() {
           onDownload: onDownload,
           onDownloadAtQuality: onDownloadAtQuality,
           onDeleteDownload: onDeleteDownload,
+          onConvert: onConvert,
+          onCancelConvert: onCancelConvert,
+          conversionJob: conversionJob,
         ),
       ),
     );
@@ -209,6 +216,91 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(chosenQuality, 'original');
+    });
+  });
+
+  group('TrackTile convert menu + badge', () {
+    testWidgets('Convert… appears and calls onConvert when no job is active',
+        (tester) async {
+      var convertCalled = false;
+      await tester.pumpWidget(buildTile(
+        _track(),
+        onPlayNext: () {},
+        onConvert: () => convertCalled = true,
+      ));
+
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Convert…'), findsOneWidget);
+      await tester.tap(find.text('Convert…'));
+      await tester.pumpAndSettle();
+
+      expect(convertCalled, isTrue);
+    });
+
+    testWidgets('omits Convert… when onConvert is null', (tester) async {
+      await tester.pumpWidget(buildTile(_track(), onPlayNext: () {}));
+
+      await tester.tap(find.byIcon(Icons.more_vert));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Convert…'), findsNothing);
+    });
+
+    testWidgets(
+      'shows "Cancel conversion" instead of "Convert…" while a job is active',
+      (tester) async {
+        var cancelCalled = false;
+        final job = ConversionJob.fromJson({
+          'job_id': 1, 'uuid_id': 'test-uuid', 'target_codec': 'aac',
+          'target_container': 'm4a', 'target_bitrate': 192,
+          'status': 'running', 'error_text': null,
+          'created_at': 1, 'updated_at': 1,
+        });
+        await tester.pumpWidget(buildTile(
+          _track(),
+          onPlayNext: () {},
+          onConvert: () {},
+          onCancelConvert: () => cancelCalled = true,
+          conversionJob: job,
+        ));
+
+        await tester.tap(find.byIcon(Icons.more_vert));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Convert…'), findsNothing);
+        expect(find.text('Cancel conversion'), findsOneWidget);
+
+        await tester.tap(find.text('Cancel conversion'));
+        await tester.pumpAndSettle();
+        expect(cancelCalled, isTrue);
+      },
+    );
+
+    testWidgets('shows an inline badge icon while a conversion is active',
+        (tester) async {
+      final job = ConversionJob.fromJson({
+        'job_id': 1, 'uuid_id': 'test-uuid', 'target_codec': 'aac',
+        'target_container': 'm4a', 'target_bitrate': 192,
+        'status': 'running', 'error_text': null,
+        'created_at': 1, 'updated_at': 1,
+      });
+      await tester.pumpWidget(buildTile(_track(), conversionJob: job));
+
+      expect(find.byIcon(Icons.sync), findsOneWidget);
+    });
+
+    testWidgets('omits the badge once the job is terminal', (tester) async {
+      final job = ConversionJob.fromJson({
+        'job_id': 1, 'uuid_id': 'test-uuid', 'target_codec': 'aac',
+        'target_container': 'm4a', 'target_bitrate': 192,
+        'status': 'done', 'error_text': null,
+        'created_at': 1, 'updated_at': 1,
+      });
+      await tester.pumpWidget(buildTile(_track(), conversionJob: job));
+
+      expect(find.byIcon(Icons.sync), findsNothing);
     });
   });
 }

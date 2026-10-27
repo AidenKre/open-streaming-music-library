@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Value;
-
 import 'package:frontend/database/database.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
 
@@ -76,12 +74,7 @@ class DownloadReconciliationService {
     await _db.transaction(() async {
       for (final uuid in missing) {
         await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuid)))
-            .write(const TracksCompanion(
-          filePath: Value(null),
-          downloadedBitrateKbps: Value(null),
-          fileSizeBytes: Value(null),
-          downloadedQuality: Value(null),
-        ));
+            .write(clearedDownloadColumns);
       }
     });
 

@@ -97,12 +97,63 @@ class EntityInfo(BaseModel):
     actions: List[str] = []
 
 
+class ConversionTargetInfo(BaseModel):
+    """One codec this server can actually encode to (ffmpeg-probed at
+    startup). ``is_lossless`` lets the client derive a *per-track* allowed
+    target list itself (filtering out the lossless-same-codec no-op) without
+    a second, per-track endpoint -- the doc's "stays OUT of the cached
+    bootstrap blob" requirement is met by computing that filtered list live,
+    client-side, from this global list + the track's own source codec."""
+
+    codec: str
+    is_lossless: bool
+
+
+class ConversionCapabilities(BaseModel):
+    targets: List[ConversionTargetInfo]
+    # Reuses the existing streaming-quality presets (320/256/192/128) --
+    # see transcoder.QUALITY_BITRATES_KBPS. Lossless targets ignore this.
+    bitrate_presets: List[int]
+
+
 class AppInfoResponse(BaseModel):
     """App-level bootstrap blob. The home for app-global facts so later phases
     extend it (Phase 2 adds a ``conversion`` block) rather than add endpoints.
     Per-entity *live* data stays out of it; this is cached client-side."""
 
     entities: dict[str, EntityInfo]
+    conversion: ConversionCapabilities
+
+
+class JobResponse(BaseModel):
+    """Current state of one async job. Only ``type="conversion"`` exists
+    today; the shape is forward-looking per the doc's generic-/jobs design."""
+
+    job_id: int
+    type: Literal["conversion"] = "conversion"
+    uuid_id: str
+    target_codec: str
+    target_container: str
+    target_bitrate: Optional[int] = None
+    status: Literal["queued", "running", "done", "failed", "cancelled"]
+    error_text: Optional[str] = None
+    created_at: int
+    updated_at: int
+
+
+class GetJobsResponse(BaseModel):
+    data: List[JobResponse]
+    # The last job id consumed when the page filled exactly `limit` (more may
+    # exist); None once the client has caught up. Mirrors GetChangesResponse's
+    # int-cursor convention (jobs are naturally id-ordered, unlike tracks'
+    # multi-column sortable browse, which needs the heavier JSON cursor).
+    nextCursor: Optional[int] = None
+
+
+class DeleteJobResponse(BaseModel):
+    # False for both "already terminal" and "unknown job_id" -- DELETE is
+    # idempotent per the doc, so neither case is treated as an error.
+    cancelled: bool
 
 
 class PatchTrackResponse(BaseModel):

@@ -84,6 +84,17 @@ void main() {
       expect(dto.hasAlbumArt, false);
     });
 
+    test('bitrateKbps: null means unknown, 0 is kept as a real value', () {
+      final unknown = TrackMetadataDto.fromJson(
+        {..._minimalMetadataJson(), 'bitrate_kbps': null},
+      );
+      final zero = TrackMetadataDto.fromJson(
+        {..._minimalMetadataJson(), 'bitrate_kbps': 0},
+      );
+      expect(unknown.bitrateKbps, isNull);
+      expect(zero.bitrateKbps, 0.0);
+    });
+
     test('hasAlbumArt defaults to false when absent', () {
       final json = Map<String, dynamic>.from(_minimalMetadataJson())
         ..remove('has_album_art');

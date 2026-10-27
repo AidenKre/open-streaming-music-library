@@ -89,6 +89,44 @@ void main() {
       expect(result['ok'], true);
     });
 
+    test('retries on a bare OSError (connection reset during connect) and succeeds',
+        () async {
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          if (calls < 2) throw const OSError('Connection reset by peer', 54);
+          return Response(jsonEncode({'ok': true}), 200);
+        }),
+      );
+
+      final result = await ApiClient.instance.getJson(['tracks']);
+
+      expect(calls, 2);
+      expect(result['ok'], true);
+    });
+
+    test('persistent bare OSError -> NetworkException and the offline hook fires',
+        () async {
+      var hookCalls = 0;
+      ApiClient.addNetworkFailureListener(() => hookCalls++);
+      addTearDown(ApiClient.clearNetworkFailureListenersForTest);
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async =>
+            throw const OSError('Connection reset by peer', 54)),
+      );
+
+      await expectLater(
+        ApiClient.instance.getJson(['tracks']),
+        throwsA(isA<NetworkException>()
+            .having((e) => e.attemptsMade, 'attemptsMade', 3)
+            .having((e) => e.cause, 'cause', isA<OSError>())),
+      );
+      expect(hookCalls, 1);
+    });
+
     test('exhausts retries on persistent SocketException; throws NetworkException with attemptsMade=3', () async {
       var calls = 0;
       ApiClient.initForTest(

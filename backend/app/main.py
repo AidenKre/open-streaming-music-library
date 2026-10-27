@@ -15,6 +15,7 @@ from app.database import (
     AlbumRowFilterParameter,
     ArtistOrderParameter,
     ArtistRowFilterParameter,
+    ConversionJobActive,
     Database,
     DatabaseContext,
     EmptyTrackEdit,
@@ -30,13 +31,18 @@ from app.models import (
     AppInfoResponse,
     ChangeEntry,
     ClientTrack,
+    ConversionCapabilities,
+    ConversionTargetInfo,
+    DeleteJobResponse,
     EntityInfo,
     FieldDescriptor,
     GetAlbumsResponse,
     GetArtistsResponse,
     GetChangesResponse,
+    GetJobsResponse,
     GetSearchResponse,
     GetTracksResponse,
+    JobResponse,
     PatchTrackResponse,
     WarmRequest,
     WarmResponse,
@@ -45,11 +51,23 @@ from app.models import (
     SetQualityResponse,
     Track,
 )
+from app.core.media_types import CODEC_MIME, MIME_EXTENSION, is_lossless
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.services.metadata import TagWriteError
 from app.services.track_edit import (
     TrackPatchRequest,
     WriteMode,
+)
+from app.services.conversion import (
+    ConversionJobStatus,
+    ConversionOrchestrator,
+    InsufficientDiskSpace,
+    MasterNotFound,
+    NoOpConversion,
+    PendingRecovery,
+    TargetPathTaken,
+    evict_converted_track_caches,
+    reconcile_conversion_jobs,
 )
 from app.services.track_editor import (
     MasterWriteError,
@@ -69,13 +87,17 @@ from app.services import (
     Organizer,
     OrganizerContext,
     ORIGINAL_QUALITY,
+    QUALITY_BITRATES_KBPS,
     normalize_quality,
+    probe_available_encoders,
 )
 from app.services.encoder_coordinator import (
     EncodeResult,
     PrefetchOutcome,
     SourceUnavailable,
 )
+from app.services.job_request import PostJobRequest
+from app.services.transcoder import SUPPORTED_TARGET_CODECS
 
 
 @asynccontextmanager
@@ -154,8 +176,18 @@ def startup_event():
         music_library_dir=settings.music_library_dir,
         staging_dir=staging_dir,
     )
+    # A convert journal row outliving a crash means its commit may have
+    # landed without the encoded caches being evicted -- evicted below, once
+    # the caches exist.
+    interrupted_conversion_uuids = {
+        e["uuid_id"] for e in database.list_journal_entries() if e["intent"] == "convert"
+    }
     # Finish/revert any edit interrupted by a crash before serving requests.
     reconcile_journal(database, settings.music_library_dir)
+    # No worker thread survives a restart -- any conversion job still
+    # "running" is orphaned; independent of the journal pass above (a crash
+    # before the journal was even written leaves no journal row at all).
+    reconcile_conversion_jobs(database, staging_dir)
 
     # Set up cover art manager
     cover_art_dir = settings.app_data_dir / "cover_art"
@@ -215,6 +247,8 @@ def startup_event():
 
     app.state.encoded_cache = encoded_cache
     app.state.default_cache = default_cache
+    for uuid_id in interrupted_conversion_uuids:
+        evict_converted_track_caches(uuid_id, encoded_cache, default_cache)
     encoder_coordinator = EncoderCoordinator(
         cache=encoded_cache,
         source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
@@ -225,6 +259,26 @@ def startup_event():
     )
     app.state.encoder_coordinator = encoder_coordinator
     encoder_coordinator.startup()
+
+    # One-time probe of which ffmpeg encoders this build actually has
+    # (libmp3lame/alac are build-dependent). Both /app/info's advertised
+    # targets and POST /jobs' enqueue guard read it: advertised == accepted.
+    app.state.available_encoders = probe_available_encoders()
+
+    # Master-type conversion orchestration (Phase 2). Shares the staging dir,
+    # per-uuid TrackLocks, and encoder pool with the edit path above -- no
+    # new subsystems.
+    app.state.conversion_orchestrator = ConversionOrchestrator(
+        database=database,
+        music_library_dir=settings.music_library_dir,
+        staging_dir=staging_dir,
+        track_locks=app.state.track_locks,
+        encoder_coordinator=encoder_coordinator,
+        cache=encoded_cache,
+        default_cache=default_cache,
+        available_encoders=app.state.available_encoders,
+    )
+    app.state.conversion_orchestrator.resume_queued()
 
     if settings.enable_file_watcher:
         organizer_context = OrganizerContext(
@@ -260,6 +314,11 @@ def shutdown_event():
     watcher = getattr(app.state, "file_watcher", None)
     if watcher:
         watcher.stop_file_watcher()
+    # Conversion ffmpeg runs in its own session (killpg-able), so it would
+    # outlive this process; the job itself is failed by the next startup.
+    orchestrator = getattr(app.state, "conversion_orchestrator", None)
+    if orchestrator:
+        orchestrator.shutdown()
     coordinator = getattr(app.state, "encoder_coordinator", None)
     if coordinator:
         coordinator.shutdown()
@@ -475,28 +534,6 @@ def get_cover_art(cover_art_id: int):
     )
 
 
-_MIME_EXTENSION: dict[str, str] = {
-    "audio/mp4": "m4a",
-    "audio/mpeg": "mp3",
-    "audio/flac": "flac",
-    "audio/x-flac": "flac",
-    "audio/ogg": "ogg",
-    "audio/aac": "aac",
-    "audio/wav": "wav",
-    "audio/x-wav": "wav",
-}
-
-_CODEC_MIME: dict[str, str] = {
-    "aac": "audio/mp4",
-    "alac": "audio/mp4",
-    "mp3": "audio/mpeg",
-    "flac": "audio/flac",
-    "wav": "audio/wav",
-    "pcm_s16le": "audio/wav",
-    "pcm_s24le": "audio/wav",
-    "pcm_f32le": "audio/wav",
-}
-
 
 def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int]:
     """Parse a single HTTP byte range and return ``(start, end)`` inclusive.
@@ -594,7 +631,11 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
             status_code=404, detail=f"Could not find track with uuid: {uuid_id}"
         )
     track: Track = track_list[0]
-    source_bitrate = int(track.metadata.bitrate_kbps or 0) or None
+    # None = unknown; a real 0 is kept so the header can report it.
+    source_bitrate = (
+        int(track.metadata.bitrate_kbps)
+        if track.metadata.bitrate_kbps is not None else None
+    )
 
     coordinator: EncoderCoordinator = app.state.encoder_coordinator
     try:
@@ -624,22 +665,32 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     if encode_result.transcoded:
         media_type = "audio/mp4"
     else:
-        media_type = _CODEC_MIME.get(
+        media_type = CODEC_MIME.get(
             track.metadata.codec or "", f"audio/{track.metadata.codec or 'octet-stream'}"
         )
 
     # For passthrough/original responses, the source's own file extension is
     # a better fallback than the literal string "audio" when the codec is not
-    # in [_MIME_EXTENSION] (e.g. opus, vorbis) — that name is what the client
+    # in [MIME_EXTENSION] (e.g. opus, vorbis) — that name is what the client
     # would have got had it downloaded the source directly.
-    extension = _MIME_EXTENSION.get(media_type)
+    extension = MIME_EXTENSION.get(media_type)
     if extension is None:
         source_suffix = file_path.suffix.lstrip(".").lower() if not encode_result.transcoded else ""
         extension = source_suffix or "audio"
 
+    # Codec + revision of what is actually served, so a client that saves the
+    # bytes can record exactly what it has (the revision is read before the
+    # encode, so a conversion landing mid-request errs toward "stale").
+    # X-Audio-Bitrate-Kbps is omitted when the bitrate is unknown, so the
+    # client records "unknown" rather than a fabricated 0.
     extra_headers = {
-        "X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps),
+        **(
+            {"X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps)}
+            if encode_result.bitrate_kbps is not None else {}
+        ),
         "X-Audio-Extension": extension,
+        "X-Audio-Codec": "aac" if encode_result.transcoded else (track.metadata.codec or ""),
+        "X-Track-Revision": str(track.revision),
     }
 
     # Open the cache file eagerly (before returning the StreamingResponse) so
@@ -1029,15 +1080,37 @@ def set_quality_setting(request: SetQualityRequest):
 
 @app.get("/app/info", response_model=AppInfoResponse)
 def get_app_info():
-    """App-level bootstrap: per-entity editable fields + actions. Backed by the
-    same edit allowlist that gates PATCH, so advertised == accepted. Cached
-    client-side; later phases extend this rather than add endpoints."""
+    """App-level bootstrap: per-entity editable fields + actions, plus a
+    ``conversion`` block (Phase 2). Backed by the same allowlists that gate
+    PATCH/POST /jobs, so advertised == accepted. Cached client-side; later
+    phases extend this rather than add endpoints.
+
+    The per-track *allowed* target list (which of these the no-op guard
+    would reject for a given track's source codec) is deliberately NOT
+    computed here -- it's derived live, client-side, from this global list
+    + the track's own (already-synced) source codec, so it stays out of this
+    cached blob."""
     track_fields = [
         FieldDescriptor(key=spec.key, label=spec.label, valueType=spec.value_type)
         for spec in EDIT_FIELD_SPECS
     ]
+    available_encoders = getattr(app.state, "available_encoders", frozenset())
+    targets = [
+        ConversionTargetInfo(codec=codec, is_lossless=is_lossless(codec))
+        for codec in sorted(SUPPORTED_TARGET_CODECS & available_encoders)
+    ]
     return AppInfoResponse(
-        entities={"track": EntityInfo(fields=track_fields, actions=[])}
+        entities={
+            "track": EntityInfo(
+                fields=track_fields, actions=["convert"] if targets else []
+            )
+        },
+        conversion=ConversionCapabilities(
+            targets=targets,
+            bitrate_presets=sorted(
+                (int(b) for b in QUALITY_BITRATES_KBPS.values()), reverse=True
+            ),
+        ),
     )
 
 
@@ -1101,6 +1174,128 @@ def patch_track(uuid_id: str, request: TrackPatchRequest):
     return PatchTrackResponse(
         uuid_id=uuid_id, revision=new_revision, master_written=master_written
     )
+
+
+def _job_to_response(job: dict) -> JobResponse:
+    return JobResponse(
+        job_id=job["id"],
+        uuid_id=job["uuid_id"],
+        target_codec=job["target_codec"],
+        target_container=job["target_container"],
+        target_bitrate=job["target_bitrate"],
+        status=job["status"],
+        error_text=job["error_text"],
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+    )
+
+
+@app.post("/jobs", response_model=JobResponse)
+def post_job(request: PostJobRequest):
+    """Create an async job. Only ``type="conversion"`` exists today (the
+    generic ``/jobs`` resource is forward-looking per the doc so future
+    bulk/upload job types add zero endpoints). Non-idempotent (mints a job)
+    -> single-attempt; an orphaned job from a timed-out-but-succeeded POST is
+    recovered via ``GET /jobs``."""
+    orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
+    database: Database = cast(Database, app.state.database)
+
+    try:
+        job_id = orchestrator.enqueue(
+            uuid_id=request.uuid_id,
+            target_codec=request.params.target_codec,
+            target_bitrate_kbps=request.params.target_bitrate_kbps,
+            base_revision=request.base_revision,
+        )
+    except TrackNotFound:
+        raise HTTPException(status_code=404, detail="Track not found")
+    except MasterNotFound:
+        raise HTTPException(status_code=404, detail="Master file not found")
+    except RevisionConflict as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "current_revision": e.current_revision,
+            },
+        )
+    except ConversionJobActive as e:
+        raise HTTPException(
+            status_code=409, detail={"error": "job_active", "job_id": e.job_id}
+        )
+    except TargetPathTaken:
+        raise HTTPException(status_code=409, detail={"error": "target_exists"})
+    except PendingRecovery:
+        raise HTTPException(status_code=409, detail={"error": "pending_recovery"})
+    except NoOpConversion:
+        raise HTTPException(
+            status_code=422,
+            detail="Target codec is the same lossless codec as the source",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except InsufficientDiskSpace as e:
+        raise HTTPException(status_code=507, detail=str(e))
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            raise HTTPException(status_code=503, detail="Database busy, retry")
+        raise
+
+    job = database.get_conversion_job(job_id)
+    return _job_to_response(job)
+
+
+@app.get("/jobs", response_model=GetJobsResponse)
+def get_jobs(
+    uuid_id: Optional[str] = None,
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    cursor: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Filtered, cursored job collection -- replaces both a global and a
+    per-uuid conversion list (the per-uuid variant is just ``?uuid_id=``).
+    ``cursor``/``nextCursor`` are job ids (ascending), mirroring
+    ``GET /changes``' int-cursor convention. ``status`` takes one status or a
+    comma-separated list (``queued,running``). ``type`` only accepts
+    ``"conversion"`` today (the only job type that exists)."""
+    # TODO(bulk-jobs): a grouped-by-batch_id list shape for bulk progress.
+    if type is not None and type != "conversion":
+        raise HTTPException(status_code=422, detail=f"unsupported job type: {type}")
+    statuses: Optional[List[str]] = None
+    if status is not None:
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        valid = {s.value for s in ConversionJobStatus}
+        unknown = [s for s in statuses if s not in valid]
+        if unknown or not statuses:
+            raise HTTPException(
+                status_code=422, detail=f"unsupported job status: {status}"
+            )
+
+    database: Database = cast(Database, app.state.database)
+    try:
+        jobs, next_cursor = database.list_conversion_jobs(
+            uuid_id=uuid_id, statuses=statuses, batch_id=batch_id,
+            after_id=cursor, limit=limit,
+        )
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            raise HTTPException(status_code=503, detail="Database busy, retry")
+        raise
+    return GetJobsResponse(
+        data=[_job_to_response(job) for job in jobs], nextCursor=next_cursor
+    )
+
+
+@app.delete("/jobs/{job_id}", response_model=DeleteJobResponse)
+def delete_job(job_id: int):
+    """Cancel a queued or running job. Idempotent: a no-op (``cancelled:
+    false``) for an already-terminal or unknown job_id, never a 404 -- the
+    doc frames DELETE as remove-pending-work, not resource deletion."""
+    orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
+    cancelled = orchestrator.cancel(job_id)
+    return DeleteJobResponse(cancelled=cancelled)
 
 
 @app.get("/")

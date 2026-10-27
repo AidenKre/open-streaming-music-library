@@ -219,6 +219,97 @@ class TestBuildTrackMetadata:
         }
         assert metadata.build_track_metadata(json_data) is None
 
+    def test_build_track_metadata__no_stream_bit_rate__falls_back_to_format(self):
+        # FLAC: ffprobe reports no stream-level bit_rate, only format.bit_rate.
+        json_data = {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "codec_name": "flac",
+                    "duration": "60.0",
+                    "sample_rate": "44100",
+                    "channels": 2,
+                }
+            ],
+            "format": {"bit_rate": "912345"},
+        }
+        track_metadata = metadata.build_track_metadata(json_data)
+        assert track_metadata is not None
+        assert track_metadata.bitrate_kbps == pytest.approx(912.345)
+
+    def test_build_track_metadata__stream_bit_rate_preferred_over_format(self):
+        json_data = {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "codec_name": "mp3",
+                    "duration": "60.0",
+                    "bit_rate": "320000",
+                    "sample_rate": "44100",
+                    "channels": 2,
+                }
+            ],
+            # Includes embedded art, so it's higher than the audio bitrate.
+            "format": {"bit_rate": "350000"},
+        }
+        track_metadata = metadata.build_track_metadata(json_data)
+        assert track_metadata is not None
+        assert track_metadata.bitrate_kbps == pytest.approx(320.0)
+
+    def test_build_track_metadata__unparseable_bit_rates__unknown(self):
+        json_data = {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "codec_name": "flac",
+                    "duration": "60.0",
+                    "bit_rate": "N/A",
+                    "sample_rate": "44100",
+                    "channels": 2,
+                }
+            ],
+            "format": {"bit_rate": "N/A"},
+        }
+        track_metadata = metadata.build_track_metadata(json_data)
+        assert track_metadata is not None
+        assert track_metadata.bitrate_kbps is None
+
+    def test_build_track_metadata__no_bit_rate_anywhere__unknown(self):
+        json_data = {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "codec_name": "flac",
+                    "duration": "60.0",
+                    "sample_rate": "44100",
+                    "channels": 2,
+                }
+            ],
+        }
+        track_metadata = metadata.build_track_metadata(json_data)
+        assert track_metadata is not None
+        assert track_metadata.bitrate_kbps is None
+
+    def test_build_track_metadata__reported_zero_bit_rate__kept_as_zero(self):
+        # A real "0" from ffprobe is information, not "unknown": keep it, and
+        # don't fall back to the container figure.
+        json_data = {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "codec_name": "pcm_s16le",
+                    "duration": "60.0",
+                    "bit_rate": "0",
+                    "sample_rate": "44100",
+                    "channels": 2,
+                }
+            ],
+            "format": {"bit_rate": "1411200"},
+        }
+        track_metadata = metadata.build_track_metadata(json_data)
+        assert track_metadata is not None
+        assert track_metadata.bitrate_kbps == 0.0
+
     def test_build_track_metadata__has_album_art__track_metadata_has_album_art(self):
         json_data = {
             "streams": [

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:drift/drift.dart' show Value, Variable;
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
@@ -10,6 +11,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/audio/track_cache_manager.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/quality_presets.dart';
 
 /// Why a single download attempt ended. Drives whether the caller marks the
 /// job completed, re-queues it for retry, or fails it.
@@ -70,13 +72,6 @@ class TrackDownloader {
 
   Directory? _downloadDir;
 
-  static const _clearedDownloadColumns = TracksCompanion(
-    filePath: Value(null),
-    downloadedBitrateKbps: Value(null),
-    fileSizeBytes: Value(null),
-    downloadedQuality: Value(null),
-  );
-
   /// Test seam fired immediately before the partial→destination rename. Lets
   /// a test deterministically interleave a reset with the commit step so the
   /// rename-race fix can be regressed. Surface via
@@ -111,6 +106,21 @@ class TrackDownloader {
     final dir = await _ensureDownloadDir();
     if (!generationCheck()) {
       return DownloadOutcome.cancelled;
+    }
+
+    // Snapshot the track's local revision + source codec BEFORE the request
+    // is sent. These are the fallbacks for servers that don't send
+    // `X-Track-Revision`/`X-Audio-Codec`: the revision must predate the bytes
+    // (a `/changes` upsert landing mid-download must not get credited to an
+    // old-master file), and the codec must be the one current at attempt time
+    // rather than at enqueue time (a conversion can land in between).
+    // Guarded like the request below: an escaped exception would leave the
+    // worker pool's job stuck `active` forever.
+    final ({int? revision, String? codec}) preRequest;
+    try {
+      preRequest = await _readTrackState(job.uuidId);
+    } catch (e) {
+      return DownloadOutcome.otherFailure(e.toString());
     }
 
     http.StreamedResponse response;
@@ -230,6 +240,16 @@ class TrackDownloader {
         generationCheck: generationCheck,
         downloadedBitrate: downloadedBitrate,
         downloadedQuality: job.quality,
+        downloadedCodec: resolveDownloadedCodec(
+          headerCodec: response.headers['x-audio-codec'],
+          quality: job.quality,
+          sourceCodec: preRequest.codec,
+          contentType: response.headers['content-type'],
+        ),
+        downloadedAtRevision: resolveDownloadedAtRevision(
+          headerRevision: response.headers['x-track-revision'],
+          preRequestRevision: preRequest.revision,
+        ),
         received: received,
         replacesFilePath: job.replacesFilePath,
       );
@@ -254,6 +274,7 @@ class TrackDownloader {
       // transport error re-queues for retry, anything else (e.g. a disk
       // write failure) is a genuine, permanent failure.
       if (e is SocketException ||
+          e is OSError ||
           e is http.ClientException ||
           e is TimeoutException) {
         _onNetworkFailure?.call();
@@ -281,6 +302,8 @@ class TrackDownloader {
     required bool Function() generationCheck,
     required int? downloadedBitrate,
     required String downloadedQuality,
+    required String? downloadedCodec,
+    required int downloadedAtRevision,
     required int received,
     String? replacesFilePath,
   }) async {
@@ -317,6 +340,9 @@ class TrackDownloader {
             downloadedBitrateKbps: Value(downloadedBitrate),
             fileSizeBytes: Value(received),
             downloadedQuality: Value(downloadedQuality),
+            downloadedAtRevision: Value(downloadedAtRevision),
+            downloadedCodec: Value(downloadedCodec),
+            staleDismissedAtRevision: const Value(null),
           ),
         );
     if (updatedRows == 0) {
@@ -326,7 +352,7 @@ class TrackDownloader {
     if (!generationCheck()) {
       await (_db.update(
         _db.tracks,
-      )..where((t) => t.uuidId.equals(uuidId))).write(_clearedDownloadColumns);
+      )..where((t) => t.uuidId.equals(uuidId))).write(clearedDownloadColumns);
       await _deleteIfExists(destination);
       if (replacesFilePath != null && replacesFilePath != destination.path) {
         await _deleteIfExists(File(replacesFilePath));
@@ -342,6 +368,68 @@ class TrackDownloader {
       await _deleteIfExists(File(replacesFilePath));
     }
     return true;
+  }
+
+  /// The track's local revision and source codec right now (both null for an
+  /// unknown uuid).
+  Future<({int? revision, String? codec})> _readTrackState(
+    String uuidId,
+  ) async {
+    final row = await _db
+        .customSelect(
+          'SELECT t.revision AS revision, tm.codec AS codec FROM tracks AS t '
+          'LEFT JOIN trackmetadata AS tm ON tm.uuid_id = t.uuid_id '
+          'WHERE t.uuid_id = ? LIMIT 1',
+          variables: [Variable.withString(uuidId)],
+        )
+        .getSingleOrNull();
+    return (
+      revision: row?.readNullable<int>('revision'),
+      codec: row?.readNullable<String>('codec'),
+    );
+  }
+
+  /// The revision a just-downloaded file is current as of: the server's
+  /// `X-Track-Revision` (the revision at the moment it served the bytes) when
+  /// present, else the local revision read before the request was sent. Both
+  /// err early -- a harmless false-positive stale -- never late. 0 when even
+  /// that is unknown, so the first revision the track is seen at flags it
+  /// (a null watermark would mean "never stale" forever).
+  @visibleForTesting
+  static int resolveDownloadedAtRevision({
+    required String? headerRevision,
+    required int? preRequestRevision,
+  }) {
+    final fromHeader = headerRevision == null
+        ? null
+        : int.tryParse(headerRevision.trim());
+    return fromHeader ?? preRequestRevision ?? 0;
+  }
+
+  /// The codec actually written to disk. Prefers the server's `X-Audio-Codec`
+  /// (the codec of the bytes it served). Fallback for servers that don't
+  /// send it:
+  /// * `original` quality is always a passthrough -> the source codec.
+  /// * any other preset transcodes to AAC (served as `audio/mp4`) unless the
+  ///   source's bitrate is already <= the preset, in which case the source is
+  ///   passed through under its own MIME type. So `audio/mp4` means AAC
+  ///   unless the source is itself AAC (a passthrough is indistinguishable
+  ///   and is AAC either way). An ALAC source is lossless -- its bitrate is
+  ///   never under a preset -- so at a preset it is always transcoded to AAC.
+  ///   Anything else is the source codec.
+  @visibleForTesting
+  static String? resolveDownloadedCodec({
+    required String? headerCodec,
+    required String quality,
+    required String? sourceCodec,
+    required String? contentType,
+  }) {
+    final header = headerCodec?.trim().toLowerCase();
+    if (header != null && header.isNotEmpty) return header;
+    if (quality == originalQuality) return sourceCodec;
+    final mime = contentType?.split(';').first.trim().toLowerCase();
+    if (mime == 'audio/mp4') return 'aac';
+    return sourceCodec;
   }
 
   Future<void> _downloadCoverArtForTrack(String uuidId) async {

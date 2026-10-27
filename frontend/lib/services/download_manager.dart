@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Value, Variable;
+import 'package:drift/drift.dart' show Variable;
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -65,16 +65,6 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   late final WorkerPool _pool;
   late final DownloadStatusReader _status;
   bool _disposed = false;
-
-  /// Nulls every column that marks a track as downloaded. Kept in one place so
-  /// adding a downloaded-state column can't leave a row half-cleared. Must stay
-  /// in sync with the columns [TrackDownloader] writes on a successful commit.
-  static const _clearedDownloadColumns = TracksCompanion(
-    filePath: Value(null),
-    downloadedBitrateKbps: Value(null),
-    fileSizeBytes: Value(null),
-    downloadedQuality: Value(null),
-  );
 
   /// Test seam fired immediately before the partial→destination rename. Lets a
   /// test deterministically interleave [resetAndDeleteFiles] with the commit
@@ -250,6 +240,12 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   Future<void> enqueueTracksAtQuality(
     List<TrackUI> tracks, {
     required String quality,
+    // Bypasses the "already at this quality" skip below. Used to force a
+    // redownload at the SAME quality when the file itself is known to be
+    // stale for a reason the quality check can't see (the track changed on
+    // the server since the download) -- not a new re-download pathway, just
+    // this one existing check made optional.
+    bool force = false,
   }) async {
     if (!isValidQuality(quality)) {
       throw ArgumentError('invalid download quality: $quality');
@@ -259,7 +255,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     final replacements = <String, String>{};
     for (final t in tracks) {
       final hasFile = t.filePath != null && await File(t.filePath!).exists();
-      if (hasFile && _qualityMatches(t, quality)) {
+      if (hasFile && !force && _qualityMatches(t, quality)) {
         continue; // already at the requested quality
       }
       if (hasFile) {
@@ -355,7 +351,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     }
     await (_db.update(
       _db.tracks,
-    )..where((t) => t.uuidId.equals(uuidId))).write(_clearedDownloadColumns);
+    )..where((t) => t.uuidId.equals(uuidId))).write(clearedDownloadColumns);
     _status.bumpVersion();
   }
 
@@ -400,7 +396,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       // 3. Null out the downloaded-state columns for this bounded chunk.
       await (_db.update(
         _db.tracks,
-      )..where((t) => t.uuidId.isIn(chunk))).write(_clearedDownloadColumns);
+      )..where((t) => t.uuidId.isIn(chunk))).write(clearedDownloadColumns);
     }
 
     _status.bumpVersion();

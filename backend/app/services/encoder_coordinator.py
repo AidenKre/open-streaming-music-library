@@ -81,7 +81,9 @@ class EncodeResult:
     type, not ``audio/mp4``, when ``transcoded`` is False.
     """
     path: Path
-    bitrate_kbps: int
+    # None when the source's bitrate is unknown (passthrough of a file
+    # ffprobe reported no bitrate for).
+    bitrate_kbps: Optional[int]
     transcoded: bool
 
 
@@ -97,17 +99,22 @@ class _Task:
 
 
 class _PriorityPool:
-    """Thread pool with two priority levels.
+    """Thread pool with three priority levels.
 
-    Priority 0 (PRIORITY_HIGH) — prefetch / queue-warm: encode tasks for tracks
-                                  the user is about to play (enqueue_prefetch,
-                                  enqueue_prefetch_batch).
-    Priority 1 (PRIORITY_LOW)  — background quality work: default-cache migration
-                                  and library-wide warming from set_default_quality.
+    Priority 0 (PRIORITY_HIGH)       — prefetch / queue-warm: encode tasks for
+                                        tracks the user is about to play
+                                        (enqueue_prefetch, enqueue_prefetch_batch).
+    Priority 1 (PRIORITY_LOW)        — background quality work: default-cache
+                                        migration and library-wide warming from
+                                        set_default_quality.
+    Priority 2 (PRIORITY_CONVERSION) — master-type conversion jobs (Phase 2).
+                                        Lowest priority: a long-running convert
+                                        must never starve streaming encodes.
     Within each level the newest submitted task runs first (LIFO).
     """
     PRIORITY_HIGH = 0
     PRIORITY_LOW = 1
+    PRIORITY_CONVERSION = 2
 
     def __init__(self, max_workers: int) -> None:
         self._q: _queue.PriorityQueue[_Task] = _queue.PriorityQueue()
@@ -176,6 +183,24 @@ class EncoderCoordinator:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False)
+
+    def submit_conversion(self, fn: Callable, *args: Any, **kwargs: Any) -> None:
+        """Schedule work at PRIORITY_CONVERSION on the shared pool. The one
+        entry point the Phase 2 conversion orchestrator uses instead of
+        reaching into the private ``_executor`` -- reuses this same pool
+        rather than adding a second one.
+
+        A running conversion holds its worker thread for its whole duration
+        (priority only orders the queue). With one active job per track and
+        single-track enqueue, concurrent conversions are bounded by how many
+        tracks the user converts at once; each occupies 1 of the
+        ``encoded_cache_prefetch_workers`` threads (default 4). Queued
+        conversions also wait behind any pending warm/prefetch work.
+        TODO(bulk-throughput): cap concurrent conversions (or give them a
+        dedicated slot) before bulk enqueue can flood the pool."""
+        self._executor.submit(
+            fn, *args, priority=_PriorityPool.PRIORITY_CONVERSION, **kwargs
+        )
 
     def startup(self) -> None:
         """Called once at app startup before any requests are served.
@@ -280,7 +305,7 @@ class EncoderCoordinator:
                 raise SourceUnavailable(uuid_id)
             return EncodeResult(
                 path=source,
-                bitrate_kbps=source_bitrate_kbps or 0,
+                bitrate_kbps=source_bitrate_kbps,
                 transcoded=False,
             )
 
@@ -305,6 +330,10 @@ class EncoderCoordinator:
             if cached is not None:
                 return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
 
+            target_cache = self._write_cache(quality)
+            # Captured before the source is read: a conversion that replaces
+            # the master and evicts this uuid mid-encode invalidates it.
+            generation = target_cache.generation(uuid_id)
             source = source_path or self.source_lookup(uuid_id)
             if source is None or not source.exists():
                 raise SourceUnavailable(uuid_id)
@@ -332,8 +361,11 @@ class EncoderCoordinator:
                     scratch.unlink(missing_ok=True)
                 return None
 
-            target_cache = self._write_cache(quality)
-            cached_path = target_cache.insert(uuid_id, quality, scratch)
+            cached_path = target_cache.insert(
+                uuid_id, quality, scratch, expected_generation=generation
+            )
+            if cached_path is None:
+                return None  # encoded from a since-replaced master; the client retries
             return EncodeResult(path=cached_path, bitrate_kbps=bitrate, transcoded=True)
 
     def enqueue_prefetch(

@@ -168,6 +168,88 @@ void main() {
     });
   });
 
+  group('ApiClient.deleteJson', () {
+    test('sends a DELETE request to the correct URL', () async {
+      String? method;
+      Uri? captured;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          method = req.method;
+          captured = req.url;
+          return Response(jsonEncode({'cancelled': true}), 200);
+        }),
+      );
+
+      await ApiClient.instance.deleteJson(['jobs', '42']);
+
+      expect(method, 'DELETE');
+      expect(captured?.pathSegments, ['jobs', '42']);
+    });
+
+    test('sets Accept but no Content-Type (DELETE sends no body)', () async {
+      Map<String, String>? headers;
+      String? body;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          headers = req.headers;
+          body = req.body;
+          return Response(jsonEncode({}), 200);
+        }),
+      );
+
+      await ApiClient.instance.deleteJson(['jobs', '1']);
+
+      expect(headers?['Accept'], 'application/json');
+      expect(
+        headers?.keys.map((k) => k.toLowerCase()),
+        isNot(contains('content-type')),
+      );
+      expect(body, isEmpty);
+    });
+
+    test('decodes the JSON response body', () async {
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => Response(jsonEncode({'cancelled': false}), 200)),
+      );
+
+      final result = await ApiClient.instance.deleteJson(['jobs', '1']);
+
+      expect(result, {'cancelled': false});
+    });
+
+    test('throws ApiException on 404', () async {
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async => Response('Not Found', 404)),
+      );
+
+      expect(
+        () => ApiClient.instance.deleteJson(['jobs', '999']),
+        throwsA(isA<ApiException>().having((e) => e.statusCode, 'statusCode', 404)),
+      );
+    });
+
+    test('defaults to retrying on transient failures (idempotent cancel)', () async {
+      var calls = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          if (calls < 2) return Response('Service Unavailable', 503);
+          return Response(jsonEncode({'cancelled': true}), 200);
+        }),
+      );
+
+      final result = await ApiClient.instance.deleteJson(['jobs', '1']);
+
+      expect(calls, greaterThan(1));
+      expect(result, {'cancelled': true});
+    });
+  });
+
   group('ApiException', () {
     test('toString formats statusCode and message', () {
       final e = ApiException(422, 'Unprocessable Entity');

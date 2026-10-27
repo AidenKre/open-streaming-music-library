@@ -87,6 +87,10 @@ class DownloadQueueState {
   Iterable<DownloadJob> get queued => jobs.where((j) => j.isQueued);
   Iterable<DownloadJob> get finished =>
       jobs.where((j) => j.isCompleted || j.isFailed);
+
+  /// True iff [uuidId] has a queued or active (not yet finished) job.
+  bool isPending(String uuidId) =>
+      jobs.any((j) => j.uuidId == uuidId && (j.isQueued || j.isActive));
 }
 
 /// Owns the in-memory list of [DownloadJob]s and notifies listeners on every

@@ -52,6 +52,23 @@ void main() {
     expect(tracks.every((t) => t.album == 'Target Album'), isTrue);
   });
 
+  test('getTrack returns the matching track by uuid', () async {
+    await fixture.insertAlbum(
+      artist: 'Artist', album: 'Target Album', uuids: ['t1', 't2'],
+    );
+
+    final track = await repo.getTrack('t2');
+
+    expect(track != null, true);
+    expect(track!.uuidId, 't2');
+    expect(track.album, 'Target Album');
+  });
+
+  test('getTrack returns null for an unknown uuid', () async {
+    final track = await repo.getTrack('no-such-uuid');
+    expect(track, null);
+  });
+
   test('getTracksForArtist returns tracks for specific artist', () async {
     await fixture.insertAlbum(
       artist: 'Target',

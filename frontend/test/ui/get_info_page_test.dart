@@ -33,10 +33,26 @@ const _track = TrackUI(
   hasAlbumArt: false,
 );
 
+TrackUI _withBitrate(double? kbps) => TrackUI(
+  uuidId: 'u1',
+  createdAt: 0,
+  lastUpdated: 0,
+  title: 'Old Title',
+  artist: 'Old Artist',
+  album: 'Old Album',
+  codec: 'flac',
+  duration: 200,
+  bitrateKbps: kbps,
+  sampleRateHz: 44100,
+  channels: 2,
+  hasAlbumArt: false,
+);
+
 Future<AppDatabase> _pump(
   WidgetTester tester, {
   AppInfo? caps,
   Future<void> Function(AppDatabase db)? seed,
+  TrackUI track = _track,
 }) async {
   // Tall surface so the whole form + info rows build (the ListView is lazy, so
   // off-screen widgets wouldn't be in the tree on the default 800x600).
@@ -56,7 +72,7 @@ Future<AppDatabase> _pump(
         // Offline so Save just enqueues (no flush / network) in these tests.
         offlineModeProvider.overrideWith(() => _StubOffline(true)),
       ],
-      child: const MaterialApp(home: GetInfoPage(track: _track)),
+      child: MaterialApp(home: GetInfoPage(track: track)),
     ),
   );
   await tester.pumpAndSettle();
@@ -95,6 +111,26 @@ void main() {
     expect(find.widgetWithText(TextButton, 'Edit'), findsOneWidget);
     expect(find.widgetWithText(TextButton, 'Save'), findsNothing);
     expect(find.widgetWithText(TextButton, 'Cancel'), findsNothing);
+  });
+
+  testWidgets('bitrate row shows a known bitrate', (
+    tester,
+  ) async {
+    await _pump(tester);
+    expect(find.text('1000 kbps'), findsOneWidget);
+  });
+
+  testWidgets('bitrate row shows a real 0 as "0 kbps"', (tester) async {
+    await _pump(tester, track: _withBitrate(0));
+    expect(find.text('0 kbps'), findsOneWidget);
+  });
+
+  testWidgets('bitrate row shows "Unknown" when the server does not know it', (
+    tester,
+  ) async {
+    await _pump(tester, track: _withBitrate(null));
+    expect(find.text('Unknown'), findsOneWidget);
+    expect(find.textContaining('kbps'), findsNothing);
   });
 
   testWidgets('Edit enables fields and Save with no changes shows a notice', (
