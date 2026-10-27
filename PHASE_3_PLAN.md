@@ -494,7 +494,7 @@ the task complete. All paths are relative to `frontend/` unless noted.
 - **Acceptance:**
   - `flutter test` passes in full (count ≥ baseline 883 plus the new tests).
   - `flutter analyze` reports no issues.
-  - `dart format` is clean on every file this phase touched. The repo isn't uniformly formatted, so only touched files are held to it (see D8).
+  - Every **new** file is `dart format`-clean (see D8).
   - Backend `pytest` still passes. No backend files changed, so this is a sanity check only.
 
 #### T5.2 — Shell-level integration test
@@ -572,7 +572,7 @@ Phase 3 is complete when **all** of the following hold:
 
 1. Every task in §9 is `DONE`, with its acceptance criteria verified by the named tests.
 2. Every requirement R1–R15 is traced to code and tests in §11.
-3. `flutter test` (full) passes, `flutter analyze` is clean, and touched files are `dart format`-clean.
+3. `flutter test` (full) passes, `flutter analyze` is clean, and new files are `dart format`-clean (D8).
 4. The backend test suite still passes (sanity; no backend changes).
 5. T5.3 is recorded truthfully: what ran, and what couldn't.
 6. All work is committed on `phase-3` with a clean working tree. Nothing is pushed and no PR is opened (not requested).
@@ -587,8 +587,8 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | --- | --- | --- | --- |
 | T0.1 Branch + plan | DONE | (this commit) | Baseline 883 tests passing, analyze clean |
 | T1.1 BrowseFilters | DONE | 8e8b79c | RED: 5/6 failed on stub (wrong values); GREEN: `browse_filters_test.dart` 6/6 |
-| T1.2 FilterBar | DONE | `git log --grep T1.2:` | RED: 5/5 failed on stub (no shape/selection/scroll/tooltip); GREEN: `filter_bar_test.dart` 5/5 |
-| T1.3 Pagination suspend | TODO | | |
+| T1.2 FilterBar | DONE | 0934862 | RED: 5/5 failed on stub (no shape/selection/scroll/tooltip); GREEN: `filter_bar_test.dart` 5/5 |
+| T1.3 Pagination suspend | DONE | `git log --grep T1.3:` | RED: 3/4 new failed on no-op stub (emissions delivered, trailing delivered, loadMore re-subscribed); 4th (resume) is a guard on existing refresh(). GREEN: mixin test 10/10; `test/ui` all pass |
 | T2.1 Artists root chip | TODO | | |
 | T2.2 Tracks root chip | TODO | | |
 | T2.3 Filtered empty state | TODO | | |
@@ -604,7 +604,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T1.3.
+**Next action:** T2.1.
 
 ## 10. Decision log
 
@@ -617,7 +617,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | D5 | In-page search cap = 100 (`kInPageSearchCap`). | Inside the doc's 50–100 range and far below the 999 variable/sort-fallback limit (G5). |
 | D6 | Re-search vs patch keys on "is the visible set download-filtered", not on "is offline". | The in-page chip can filter while online. Patching would leave a deleted download visible (G6). |
 | D7 | Root Tracks tab passes the effective filter into `playFromQueue`. | The play queue must match the visible filtered list. The detail route keeps `false` (unchanged). |
-| D8 | `dart format` is enforced on touched files only. | The existing tree isn't uniformly formatted. Reformatting unrelated files would bloat diffs. |
+| D8 | `dart format` is enforced on **new** files. In pre-existing files, new code follows the surrounding style and unrelated lines are never reformatted. | The existing tree isn't uniformly formatted, and running the formatter over a pre-existing file rewraps untouched code (discovered in T1.3), which bloats diffs. |
 | D9 | A non-root `ArtistsPage` keeps the badge behaviour. | Only tests use it today. Keeps the R6 rule uniform (FilterBar iff `isRoot`) and the existing badge tests valid. |
 
 ## 11. Final verification results

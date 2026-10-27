@@ -40,6 +40,26 @@ mixin CursorPaginationMixin<T> {
     _quietTimer = null;
   }
 
+  bool _suspended = false;
+
+  /// True between [suspendPagination] and the next [refresh].
+  bool get isPaginationSuspended => _suspended;
+
+  /// Put the window to sleep while another view (e.g. in-page search results)
+  /// replaces the list: cancels the live subscription and any held trailing
+  /// emission, and makes [loadMore] a no-op so a scroll can't re-subscribe it.
+  /// [paginatedItems] are kept but dormant. Only [refresh] resumes — it
+  /// restarts from page 1 so `hasMore`/the window can't be stale.
+  void suspendPagination() {
+    _suspended = true;
+    _pageSub?.cancel();
+    _pageSub = null;
+    _quietTimer?.cancel();
+    _quietTimer = null;
+    _pendingItems = null;
+    isLoading = false;
+  }
+
   void _onScroll() {
     if (scrollController.position.pixels >=
         scrollController.position.maxScrollExtent - 200) {
@@ -50,7 +70,7 @@ mixin CursorPaginationMixin<T> {
   /// Grow the reactive window by one page. The stream re-emits the larger window
   /// (or the same rows if there are no more), clearing [isLoading].
   void loadMore() {
-    if (isLoading || !hasMore) return;
+    if (_suspended || isLoading || !hasMore) return;
     isLoading = true;
     _loadedCount += pageSize;
     _subscribe();
@@ -60,7 +80,9 @@ mixin CursorPaginationMixin<T> {
   /// (e.g. the offline → downloaded-only filter), which the stream can't observe
   /// on its own. Clears the current window immediately so the old parameter's
   /// rows don't linger on screen until the new stream's first emission lands.
+  /// Also the way out of [suspendPagination].
   void refresh() {
+    _suspended = false;
     // A burst-coalescing quiet timer from before this refresh must not
     // suppress the new subscription's leading-edge delivery.
     _quietTimer?.cancel();

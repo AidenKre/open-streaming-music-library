@@ -182,4 +182,85 @@ void main() {
             'the new reactive window emitted');
     expect(host.hasMore, isTrue);
   });
+
+  group('suspendPagination', () {
+    late StreamController<List<int>> controller;
+    late _Host host;
+    late int watchCalls;
+
+    setUp(() {
+      controller = StreamController<List<int>>.broadcast();
+      watchCalls = 0;
+      host = _Host(({required limit}) {
+        watchCalls++;
+        return controller.stream.map((all) => all.take(limit).toList());
+      });
+    });
+
+    tearDown(() async {
+      host.disposePagination();
+      host.scrollController.dispose();
+      await controller.close();
+    });
+
+    test('stops delivering window emissions', () async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await _pump();
+      expect(host.isPaginationSuspended, isFalse);
+
+      host.suspendPagination();
+      expect(host.isPaginationSuspended, isTrue);
+      // A DB write underneath search mode must not touch the dormant list.
+      controller.add([7, 8]);
+      await _pump();
+      expect(host.paginatedItems, [1, 2]);
+    });
+
+    test('drops a trailing emission held by the quiet timer', () async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await Future<void>.delayed(Duration.zero); // leading edge delivered
+      controller.add([3, 4]); // held for the trailing edge
+      await Future<void>.delayed(Duration.zero);
+
+      host.suspendPagination();
+      await _pump();
+      expect(host.paginatedItems, [1, 2]);
+    });
+
+    test('makes loadMore a no-op (no scroll-driven re-subscribe)', () async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await _pump();
+      final callsBefore = watchCalls;
+
+      host.suspendPagination();
+      host.loadMore();
+      expect(watchCalls, callsBefore);
+      expect(host.isLoading, isFalse);
+    });
+
+    test('refresh resumes from the first page', () async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await _pump();
+      host.loadMore();
+      controller.add([1, 2, 3, 4]);
+      await _pump();
+
+      host.suspendPagination();
+      host.refresh();
+      expect(host.isPaginationSuspended, isFalse);
+      controller.add([5, 6, 7]);
+      await _pump();
+      expect(host.paginatedItems, [5, 6], reason: 'window reset to pageSize');
+
+      // And growth works again after resuming.
+      host.loadMore();
+      controller.add([5, 6, 7]);
+      await _pump();
+      expect(host.paginatedItems, [5, 6, 7]);
+    });
+  });
 }
