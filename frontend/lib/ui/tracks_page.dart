@@ -16,6 +16,7 @@ import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/settings_dialog.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
@@ -96,6 +97,11 @@ class TracksPageState extends ConsumerState<TracksPage>
     );
   }
 
+  /// A filtered window that settled with nothing in it (root only — detail
+  /// lists never filter).
+  bool get _showFilteredEmpty =>
+      _downloadedOnly && !hasMore && paginatedItems.isEmpty;
+
   void _onFiltersChanged(BrowseFilters filters) {
     if (filters == _filters) return;
     setState(() => _filters = filters);
@@ -123,88 +129,90 @@ class TracksPageState extends ConsumerState<TracksPage>
             isOffline: isOffline,
           ),
         Expanded(
-          child: ListView.builder(
-            controller: scrollController,
-            itemCount: paginatedItems.length + (hasMore ? 1 : 0),
-            // The builder's context is deliberately unnamed: long-lived flows
-            // below (convert: a network sync plus two sheets) use the page's
-            // own `context`, so their lifetime is tied to the page rather
-            // than to list internals.
-            itemBuilder: (_, index) {
-              if (index >= paginatedItems.length) {
-                return const Padding(
-                  padding: EdgeInsets.all(16),
-                  child: Center(child: CircularProgressIndicator()),
-                );
-              }
-              final track = paginatedItems[index];
-              final job = manager.state.jobs
-                  .where((j) => j.uuidId == track.uuidId)
-                  .firstOrNull;
-              Widget? trailing;
-              if (job != null) {
-                trailing = switch (job.status) {
-                  Active(:final progress) => SizedBox(
-                    width: 80,
-                    child: LinearProgressIndicator(
-                      value: progress > 0 ? progress : null,
-                    ),
-                  ),
-                  Queued() => const Icon(Icons.schedule, size: 16),
-                  Completed() || Failed() => null,
-                };
-              }
-              // Offline, a detail list keeps all rows visible for visual
-              // consistency with the same album/artist viewed online, but
-              // dims and disables any track that isn't locally downloaded.
-              // (The root tab filters instead, so it never dims.)
-              final isInteractive = !isOffline || track.isDownloaded;
-              final conversionJob = conversionJobs
-                  .where((j) => j.uuidId == track.uuidId && j.isActive)
-                  .firstOrNull;
-              return TrackTile(
-                track: track,
-                trailing: trailing,
-                isDimmed: isOffline && !track.isDownloaded,
-                isInteractive: isInteractive,
-                onTap: () => ref
-                    .read(audioProvider.notifier)
-                    .playFromQueue(
-                      track: track,
-                      sourceType: widget.albumId != null
-                          ? 'album'
-                          : widget.artistId != null
-                          ? 'artist'
-                          : 'library',
-                      artistId: widget.artistId,
-                      albumId: widget.albumId,
-                      orderParams: _orderParams,
-                      // Queue exactly what the filtered list shows.
-                      downloadedOnly: _downloadedOnly,
-                    ),
-                onPlayNext: () =>
-                    ref.read(audioProvider.notifier).playNext([track]),
-                onAddToQueue: () =>
-                    ref.read(audioProvider.notifier).addToQueue([track]),
-                onDownload: () => downloadScope(ref, TrackScope(track)),
-                onDownloadAtQuality: (q) =>
-                    downloadScope(ref, TrackScope(track), quality: q),
-                onDeleteDownload: () => deleteScope(ref, TrackScope(track)),
-                conversionJob: conversionJob,
-                onConvert:
-                    canConvertTrack(
-                      isOffline: isOffline,
-                      appInfo: appInfo,
-                      codec: track.codec,
-                    )
-                    ? () => startConversion(context, ref, track.uuidId)
-                    : null,
-                onCancelConvert: conversionJob != null
-                    ? () => cancelConversion(context, ref, conversionJob.jobId)
-                    : null,
-              );
-            },
-          ),
+          child: _showFilteredEmpty
+              ? const ListStatusMessage('No downloaded tracks yet.')
+              : ListView.builder(
+                controller: scrollController,
+                itemCount: paginatedItems.length + (hasMore ? 1 : 0),
+                // The builder's context is deliberately unnamed: long-lived flows
+                // below (convert: a network sync plus two sheets) use the page's
+                // own `context`, so their lifetime is tied to the page rather
+                // than to list internals.
+                itemBuilder: (_, index) {
+                  if (index >= paginatedItems.length) {
+                    return const Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  }
+                  final track = paginatedItems[index];
+                  final job = manager.state.jobs
+                      .where((j) => j.uuidId == track.uuidId)
+                      .firstOrNull;
+                  Widget? trailing;
+                  if (job != null) {
+                    trailing = switch (job.status) {
+                      Active(:final progress) => SizedBox(
+                        width: 80,
+                        child: LinearProgressIndicator(
+                          value: progress > 0 ? progress : null,
+                        ),
+                      ),
+                      Queued() => const Icon(Icons.schedule, size: 16),
+                      Completed() || Failed() => null,
+                    };
+                  }
+                  // Offline, a detail list keeps all rows visible for visual
+                  // consistency with the same album/artist viewed online, but
+                  // dims and disables any track that isn't locally downloaded.
+                  // (The root tab filters instead, so it never dims.)
+                  final isInteractive = !isOffline || track.isDownloaded;
+                  final conversionJob = conversionJobs
+                      .where((j) => j.uuidId == track.uuidId && j.isActive)
+                      .firstOrNull;
+                  return TrackTile(
+                    track: track,
+                    trailing: trailing,
+                    isDimmed: isOffline && !track.isDownloaded,
+                    isInteractive: isInteractive,
+                    onTap: () => ref
+                        .read(audioProvider.notifier)
+                        .playFromQueue(
+                          track: track,
+                          sourceType: widget.albumId != null
+                              ? 'album'
+                              : widget.artistId != null
+                              ? 'artist'
+                              : 'library',
+                          artistId: widget.artistId,
+                          albumId: widget.albumId,
+                          orderParams: _orderParams,
+                          // Queue exactly what the filtered list shows.
+                          downloadedOnly: _downloadedOnly,
+                        ),
+                    onPlayNext: () =>
+                        ref.read(audioProvider.notifier).playNext([track]),
+                    onAddToQueue: () =>
+                        ref.read(audioProvider.notifier).addToQueue([track]),
+                    onDownload: () => downloadScope(ref, TrackScope(track)),
+                    onDownloadAtQuality: (q) =>
+                        downloadScope(ref, TrackScope(track), quality: q),
+                    onDeleteDownload: () => deleteScope(ref, TrackScope(track)),
+                    conversionJob: conversionJob,
+                    onConvert:
+                        canConvertTrack(
+                          isOffline: isOffline,
+                          appInfo: appInfo,
+                          codec: track.codec,
+                        )
+                        ? () => startConversion(context, ref, track.uuidId)
+                        : null,
+                    onCancelConvert: conversionJob != null
+                        ? () => cancelConversion(context, ref, conversionJob.jobId)
+                        : null,
+                  );
+                },
+              ),
         ),
       ],
     );

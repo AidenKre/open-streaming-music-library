@@ -137,4 +137,50 @@ void main() {
       await teardownTree(tester);
     });
   });
+
+  group('filtered empty state', () {
+    const message = 'No downloaded artists yet.';
+
+  Future<void> clearAllDownloads() async {
+    await db.update(db.tracks).write(clearedDownloadColumns);
+  }
+
+  Future<void> clearLibrary() async {
+    for (final t in ['trackmetadata', 'tracks', 'albums', 'artists']) {
+      await db.customStatement('DELETE FROM $t');
+    }
+  }
+
+    testWidgets('shown once a filtered window settles empty', (tester) async {
+      await clearAllDownloads();
+      await tester.pumpWidget(
+        h.wrap(const ArtistsPage(isRoot: true), offline: true),
+      );
+      expect(find.text(message), findsNothing, reason: 'still loading');
+
+      await tester.pumpAndSettle();
+      expect(find.text(message), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('shown when the chip filters everything out online', (
+      tester,
+    ) async {
+      await clearAllDownloads();
+      await pumpRoot(tester);
+      expect(find.text(message), findsNothing);
+
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(find.text(message), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('not shown for an unfiltered empty library', (tester) async {
+      await clearLibrary();
+      await pumpRoot(tester);
+      expect(find.text(message), findsNothing);
+      await teardownTree(tester);
+    });
+  });
 }

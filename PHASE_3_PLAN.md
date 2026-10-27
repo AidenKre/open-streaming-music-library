@@ -115,7 +115,8 @@ frontend/lib/
   models/browse_filters.dart            NEW  BrowseFilters value object (R1)
   ui/widgets/filter_bar.dart            NEW  FilterBar capsule-chip row (R2, R3)
   ui/widgets/library_search_field.dart  NEW  shared search TextField + clear (R9)
-  ui/widgets/search_status.dart         NEW  empty-state / capped-hint widgets + copy (R10)
+  ui/widgets/list_status_message.dart   NEW  centered empty-state text (T2.3; reused by search)
+  ui/widgets/search_status.dart         NEW  empty-state copy + capped-hint widget (R10)
   ui/utils/library_search_controller.dart NEW shared search primitive (R9, R12, R13)
   ui/mixins/cursor_pagination_mixin.dart CHG  + suspendPagination / isPaginationSuspended (R11)
   repositories/browse_repository.dart   CHG  search(types:), withFreshDownloadState() (R8, R12)
@@ -590,8 +591,8 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T1.2 FilterBar | DONE | 0934862 | RED: 5/5 failed on stub (no shape/selection/scroll/tooltip); GREEN: `filter_bar_test.dart` 5/5 |
 | T1.3 Pagination suspend | DONE | f079c99 | RED: 3/4 new failed on no-op stub (emissions delivered, trailing delivered, loadMore re-subscribed); 4th (resume) is a guard on existing refresh(). GREEN: mixin test 10/10; `test/ui` all pass |
 | T2.1 Artists root chip | DONE | 995bfac | RED: 5/6 failed (no FilterBar rendered); non-root case passed as existing behaviour. GREEN: `artists_page_filters_test.dart` 6/6 + badge tests 8/8. Adds the shared `test/ui/browse_harness.dart` (real drift DB, real DownloadManager, recording AudioCoordinator) |
-| T2.2 Tracks root chip | DONE | `git log --grep T2.2:` | RED: 4/6 failed (no chip; offline root still listed streaming-only rows); 2 detail-route cases passed as existing behaviour. GREEN: `tracks_page_filters_test.dart` 6/6, convert-flow suite green, `test/ui` all pass |
-| T2.3 Filtered empty state | TODO | | |
+| T2.2 Tracks root chip | DONE | 7610352 | RED: 4/6 failed (no chip; offline root still listed streaming-only rows); 2 detail-route cases passed as existing behaviour. GREEN: `tracks_page_filters_test.dart` 6/6, convert-flow suite green, `test/ui` all pass |
+| T2.3 Filtered empty state | DONE | `git log --grep T2.3:` | RED: 3 'shown' cases failed (no message); 3 'not shown' guards passed. GREEN: both page suites 18/18; `test/ui` all pass. Adds `lib/ui/widgets/list_status_message.dart` (reused by T3.4/T4.x) |
 | T3.1 search(types) | TODO | | |
 | T3.2 withFreshDownloadState | TODO | | |
 | T3.3 LibrarySearchController | TODO | | |
@@ -604,7 +605,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T2.3.
+**Next action:** T3.1.
 
 ## 10. Decision log
 

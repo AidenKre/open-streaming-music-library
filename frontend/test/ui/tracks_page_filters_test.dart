@@ -168,4 +168,49 @@ void main() {
       await teardownTree(tester);
     });
   });
+
+  group('filtered empty state', () {
+    const message = 'No downloaded tracks yet.';
+
+  Future<void> clearAllDownloads() async {
+    await db.update(db.tracks).write(clearedDownloadColumns);
+  }
+
+  Future<void> clearLibrary() async {
+    for (final t in ['trackmetadata', 'tracks', 'albums', 'artists']) {
+      await db.customStatement('DELETE FROM $t');
+    }
+  }
+
+    testWidgets('root: shown once a filtered window settles empty', (
+      tester,
+    ) async {
+      await clearAllDownloads();
+      await tester.pumpWidget(h.wrap(root, offline: true));
+      expect(find.text(message), findsNothing, reason: 'still loading');
+
+      await tester.pumpAndSettle();
+      expect(find.text(message), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('root: not shown for an unfiltered empty library', (
+      tester,
+    ) async {
+      await clearLibrary();
+      await pump(tester, root);
+      expect(find.text(message), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('detail: never shown (it dims rather than filters)', (
+      tester,
+    ) async {
+      await clearAllDownloads();
+      await pump(tester, detail, offline: true);
+      expect(find.text(message), findsNothing);
+      expect(find.text('Remote Song'), findsOneWidget);
+      await teardownTree(tester);
+    });
+  });
 }

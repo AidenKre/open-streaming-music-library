@@ -14,6 +14,7 @@ import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
   /// True when rendered as a root tab inside [AppShell]; the page then owns
@@ -71,6 +72,11 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     );
   }
 
+  /// A filtered window that settled with nothing in it. The locked/selected
+  /// chip already says why; this says it in words.
+  bool get _showFilteredEmpty =>
+      widget.isRoot && _downloadedOnly && !hasMore && paginatedItems.isEmpty;
+
   void _onFiltersChanged(BrowseFilters filters) {
     if (filters == _filters) return;
     setState(() => _filters = filters);
@@ -108,61 +114,63 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
         else if (isOffline)
           const DownloadedOnlyBadge(),
         Expanded(
-          child: GridView.builder(
-            controller: scrollController,
-            padding: const EdgeInsets.all(8),
-            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-              maxCrossAxisExtent: 200,
-              childAspectRatio: 0.78,
-              mainAxisSpacing: 8,
-              crossAxisSpacing: 8,
-            ),
-            itemCount: paginatedItems.length + (hasMore ? 1 : 0),
-            itemBuilder: (context, index) {
-              if (index >= paginatedItems.length) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              final artist = paginatedItems[index];
-              if (index % 6 == 0) {
-                final end = (index + 12).clamp(0, paginatedItems.length);
-                final ids = paginatedItems
-                    .sublist(index, end)
-                    .map((a) => a.coverArtId)
-                    .whereType<int>()
-                    .toList();
-                prefetchCoverArt(ids);
-              }
-              return ArtistCard(
-                artist: artist,
-                onTap: () => _onArtistTap(artist),
-                onPlayNext: () async {
-                  final tracks = await ref
-                      .read(browseRepositoryProvider)
-                      .getTracksForArtist(artist.id);
-                  if (tracks.isNotEmpty) {
-                    ref.read(audioProvider.notifier).playNext(tracks);
+          child: _showFilteredEmpty
+              ? const ListStatusMessage('No downloaded artists yet.')
+              : GridView.builder(
+                controller: scrollController,
+                padding: const EdgeInsets.all(8),
+                gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                  maxCrossAxisExtent: 200,
+                  childAspectRatio: 0.78,
+                  mainAxisSpacing: 8,
+                  crossAxisSpacing: 8,
+                ),
+                itemCount: paginatedItems.length + (hasMore ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (index >= paginatedItems.length) {
+                    return const Center(child: CircularProgressIndicator());
                   }
-                },
-                onAddToQueue: () async {
-                  final tracks = await ref
-                      .read(browseRepositoryProvider)
-                      .getTracksForArtist(artist.id);
-                  if (tracks.isNotEmpty) {
-                    ref.read(audioProvider.notifier).addToQueue(tracks);
+                  final artist = paginatedItems[index];
+                  if (index % 6 == 0) {
+                    final end = (index + 12).clamp(0, paginatedItems.length);
+                    final ids = paginatedItems
+                        .sublist(index, end)
+                        .map((a) => a.coverArtId)
+                        .whereType<int>()
+                        .toList();
+                    prefetchCoverArt(ids);
                   }
+                  return ArtistCard(
+                    artist: artist,
+                    onTap: () => _onArtistTap(artist),
+                    onPlayNext: () async {
+                      final tracks = await ref
+                          .read(browseRepositoryProvider)
+                          .getTracksForArtist(artist.id);
+                      if (tracks.isNotEmpty) {
+                        ref.read(audioProvider.notifier).playNext(tracks);
+                      }
+                    },
+                    onAddToQueue: () async {
+                      final tracks = await ref
+                          .read(browseRepositoryProvider)
+                          .getTracksForArtist(artist.id);
+                      if (tracks.isNotEmpty) {
+                        ref.read(audioProvider.notifier).addToQueue(tracks);
+                      }
+                    },
+                    onDownload: isOffline
+                        ? null
+                        : () => downloadScope(ref, ArtistScope(artistId: artist.id)),
+                    onDownloadAtQuality: isOffline
+                        ? null
+                        : (q) => downloadScope(
+                            ref, ArtistScope(artistId: artist.id), quality: q),
+                    onDeleteDownload: () =>
+                        deleteScope(ref, ArtistScope(artistId: artist.id)),
+                  );
                 },
-                onDownload: isOffline
-                    ? null
-                    : () => downloadScope(ref, ArtistScope(artistId: artist.id)),
-                onDownloadAtQuality: isOffline
-                    ? null
-                    : (q) => downloadScope(
-                        ref, ArtistScope(artistId: artist.id), quality: q),
-                onDeleteDownload: () =>
-                    deleteScope(ref, ArtistScope(artistId: artist.id)),
-              );
-            },
-          ),
+              ),
         ),
       ],
     );
