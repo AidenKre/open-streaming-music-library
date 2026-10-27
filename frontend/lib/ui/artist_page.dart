@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -12,6 +13,7 @@ import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
+import 'package:frontend/ui/widgets/filter_bar.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
   /// True when rendered as a root tab inside [AppShell]; the page then owns
@@ -31,6 +33,15 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
 
   @override
   int get pageSize => 30;
+
+  /// Chip selection for this tab; session-only (survives tab switches via
+  /// the shell's IndexedStack, never persisted). Only a root instance shows
+  /// the [FilterBar], so elsewhere this stays at its default and the
+  /// effective filter is just the offline flag.
+  BrowseFilters _filters = const BrowseFilters();
+
+  bool get _downloadedOnly =>
+      _filters.effectiveDownloaded(isOffline: ref.read(offlineModeProvider));
 
   List<ArtistOrderParameter> get _orderParams => [
     ArtistOrderParameter(column: 'name'),
@@ -56,8 +67,15 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     return repo.watchArtists(
       orderBy: _orderParams,
       limit: limit,
-      downloadedOnly: ref.read(offlineModeProvider),
+      downloadedOnly: _downloadedOnly,
     );
+  }
+
+  void _onFiltersChanged(BrowseFilters filters) {
+    if (filters == _filters) return;
+    setState(() => _filters = filters);
+    // A query parameter changed; the live window can't observe that itself.
+    refresh();
   }
 
   void _onArtistTap(ArtistUI artist) {
@@ -81,7 +99,14 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
-        if (isOffline) const DownloadedOnlyBadge(),
+        if (widget.isRoot)
+          FilterBar(
+            filters: _filters,
+            onChanged: _onFiltersChanged,
+            isOffline: isOffline,
+          )
+        else if (isOffline)
+          const DownloadedOnlyBadge(),
         Expanded(
           child: GridView.builder(
             controller: scrollController,
