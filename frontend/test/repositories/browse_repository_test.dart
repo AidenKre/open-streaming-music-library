@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 
 void main() {
@@ -229,6 +230,87 @@ void main() {
       results.tracks.map((t) => t.uuidId).toList(),
       expected.map((r) => r.read<String>('uuid_id')).toList(),
     );
+  });
+
+  group('withFreshDownloadState', () {
+    Future<List<TrackUI>> loadTracks() =>
+        repo.watchTracks(orderBy: [OrderParameter(column: 'uuid_id')]).first;
+
+    setUp(() async {
+      await fixture.insertAlbum(
+        artist: 'A',
+        album: 'B',
+        uuids: ['p1', 'p2', 'p3'],
+      );
+    });
+
+    test('re-reads every download/staleness field together', () async {
+      final before = await loadTracks();
+      expect(before.every((t) => !t.isDownloaded), isTrue);
+
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p2'))).write(
+        const TracksCompanion(
+          filePath: Value('/dl/p2.m4a'),
+          downloadedBitrateKbps: Value(256),
+          fileSizeBytes: Value(4096),
+          downloadedQuality: Value('high'),
+          revision: Value(9),
+          downloadedAtRevision: Value(8),
+          downloadedCodec: Value('aac'),
+          staleDismissedAtRevision: Value(7),
+        ),
+      );
+
+      final after = await repo.withFreshDownloadState(before);
+      final p2 = after[1];
+      expect(p2.uuidId, 'p2');
+      expect(p2.filePath, '/dl/p2.m4a');
+      expect(p2.downloadedBitrateKbps, 256);
+      expect(p2.fileSizeBytes, 4096);
+      expect(p2.downloadedQuality, 'high');
+      expect(p2.revision, 9);
+      expect(p2.downloadedAtRevision, 8);
+      expect(p2.downloadedCodec, 'aac');
+      expect(p2.staleDismissedAtRevision, 7);
+      expect(p2.title, before[1].title, reason: 'metadata untouched');
+    });
+
+    test('preserves order and length', () async {
+      final before = await loadTracks();
+      final shuffled = [before[2], before[0], before[1]];
+      final after = await repo.withFreshDownloadState(shuffled);
+      expect(after.map((t) => t.uuidId), ['p3', 'p1', 'p2']);
+    });
+
+    test('reflects a cleared download', () async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p1')))
+          .write(const TracksCompanion(filePath: Value('/dl/p1.flac')));
+      final before = await loadTracks();
+      expect(before.first.isDownloaded, isTrue);
+
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p1')))
+          .write(clearedDownloadColumns);
+      final after = await repo.withFreshDownloadState(before);
+      expect(after.first.filePath, equals(null));
+      expect(after.first.isDownloaded, isFalse);
+    });
+
+    test('leaves a row whose track vanished unchanged', () async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p3')))
+          .write(const TracksCompanion(filePath: Value('/dl/p3.flac')));
+      final before = await loadTracks();
+      await (db.delete(db.trackmetadata)..where((t) => t.uuidId.equals('p3')))
+          .go();
+      await (db.delete(db.tracks)..where((t) => t.uuidId.equals('p3'))).go();
+
+      final after = await repo.withFreshDownloadState(before);
+      expect(after, hasLength(3));
+      expect(after[2].filePath, '/dl/p3.flac');
+    });
+
+    test('an empty list stays empty', () async {
+      expect(await repo.withFreshDownloadState(const []), isEmpty);
+    });
   });
 }
 

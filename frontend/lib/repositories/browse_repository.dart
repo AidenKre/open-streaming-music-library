@@ -122,6 +122,32 @@ class BrowseRepository {
     return rows.map(TrackUI.fromQueryRow).toList(growable: false);
   }
 
+  /// [tracks] with their local download state re-read from the DB, for lists
+  /// that are snapshots rather than live queries (search results). Order and
+  /// length are preserved; a row whose track has vanished is left as is.
+  Future<List<TrackUI>> withFreshDownloadState(List<TrackUI> tracks) async {
+    if (tracks.isEmpty) return tracks;
+    final states = await _db.getTrackDownloadStates(
+      tracks.map((t) => t.uuidId).toList(),
+    );
+    return tracks.map((t) {
+      final s = states[t.uuidId];
+      if (s == null) return t;
+      return t.copyWith(
+        filePath: s.filePath,
+        downloadedBitrateKbps: s.downloadedBitrateKbps,
+        fileSizeBytes: s.fileSizeBytes,
+        downloadedQuality: s.downloadedQuality,
+        // Staleness compares these against `revision`, so patch all four
+        // together or a re-download/dismiss would read inconsistently.
+        revision: s.revision,
+        downloadedAtRevision: s.downloadedAtRevision,
+        downloadedCodec: s.downloadedCodec,
+        staleDismissedAtRevision: s.staleDismissedAtRevision,
+      );
+    }).toList(growable: false);
+  }
+
   // ── Search ──────────────────────────────────────────────────────────────
 
   /// The one FTS search used by every search surface: the global Search page
