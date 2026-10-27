@@ -142,6 +142,94 @@ void main() {
 
     expect(results.tracks, hasLength(5));
   });
+
+  group('search types', () {
+    setUp(() async {
+      // "Blue" matches the artist, the album and the track.
+      await fixture.insertAlbum(
+        artist: 'Blue Artist',
+        album: 'Blue Album',
+        uuids: ['b1'],
+        trackTitlePrefix: 'Blue Song',
+      );
+      await _populateFts(db);
+    });
+
+    test('defaults to every type', () async {
+      final results = await repo.search('Blue');
+      expect(results.artists, hasLength(1));
+      expect(results.albums, hasLength(1));
+      expect(results.tracks, hasLength(1));
+    });
+
+    test('{tracks} returns only tracks', () async {
+      final results = await repo.search('Blue', types: {SearchType.tracks});
+      expect(results.tracks.map((t) => t.uuidId), ['b1']);
+      expect(results.artists, isEmpty);
+      expect(results.albums, isEmpty);
+    });
+
+    test('{artists} returns only artists', () async {
+      final results = await repo.search('Blue', types: {SearchType.artists});
+      expect(results.artists.map((a) => a.name), ['Blue Artist']);
+      expect(results.albums, isEmpty);
+      expect(results.tracks, isEmpty);
+    });
+
+    test('{albums} returns only albums', () async {
+      final results = await repo.search('Blue', types: {SearchType.albums});
+      expect(results.albums.map((a) => a.name), ['Blue Album']);
+      expect(results.artists, isEmpty);
+      expect(results.tracks, isEmpty);
+    });
+
+    test('an empty type set returns nothing', () async {
+      final results = await repo.search('Blue', types: const {});
+      expect(results.artists, isEmpty);
+      expect(results.albums, isEmpty);
+      expect(results.tracks, isEmpty);
+    });
+
+    test('downloadedOnly still applies to a single type', () async {
+      final results = await repo.search(
+        'Blue',
+        types: {SearchType.artists},
+        downloadedOnly: true,
+      );
+      expect(results.artists, isEmpty, reason: 'nothing is downloaded');
+    });
+  });
+
+  test('a single-type search at the in-page cap returns exactly the top N '
+      'in FTS rank order', () async {
+    for (var i = 1; i <= 120; i++) {
+      await fixture.insertAlbum(
+        artist: 'Artist $i',
+        album: 'Album $i',
+        uuids: ['t$i'],
+        trackTitlePrefix: i.isEven ? 'Blue Blue Song' : 'Blue Song',
+      );
+    }
+    await _populateFts(db);
+
+    final results = await repo.search(
+      'Blue',
+      types: {SearchType.tracks},
+      limitPerType: 100,
+    );
+
+    final expected = await db.customSelect(
+      'SELECT tm.uuid_id FROM fts_tracks '
+      'JOIN trackmetadata tm ON tm.rowid = fts_tracks.rowid '
+      'WHERE fts_tracks MATCH ? ORDER BY rank LIMIT 100',
+      variables: [Variable.withString(prepareFtsQuery('Blue'))],
+    ).get();
+    expect(results.tracks, hasLength(100));
+    expect(
+      results.tracks.map((t) => t.uuidId).toList(),
+      expected.map((r) => r.read<String>('uuid_id')).toList(),
+    );
+  });
 }
 
 /// Mirrors the FTS population the sync pipeline performs in production.

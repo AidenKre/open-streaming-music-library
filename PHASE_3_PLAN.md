@@ -592,8 +592,8 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T1.3 Pagination suspend | DONE | f079c99 | RED: 3/4 new failed on no-op stub (emissions delivered, trailing delivered, loadMore re-subscribed); 4th (resume) is a guard on existing refresh(). GREEN: mixin test 10/10; `test/ui` all pass |
 | T2.1 Artists root chip | DONE | 995bfac | RED: 5/6 failed (no FilterBar rendered); non-root case passed as existing behaviour. GREEN: `artists_page_filters_test.dart` 6/6 + badge tests 8/8. Adds the shared `test/ui/browse_harness.dart` (real drift DB, real DownloadManager, recording AudioCoordinator) |
 | T2.2 Tracks root chip | DONE | 7610352 | RED: 4/6 failed (no chip; offline root still listed streaming-only rows); 2 detail-route cases passed as existing behaviour. GREEN: `tracks_page_filters_test.dart` 6/6, convert-flow suite green, `test/ui` all pass |
-| T2.3 Filtered empty state | DONE | `git log --grep T2.3:` | RED: 3 'shown' cases failed (no message); 3 'not shown' guards passed. GREEN: both page suites 18/18; `test/ui` all pass. Adds `lib/ui/widgets/list_status_message.dart` (reused by T3.4/T4.x) |
-| T3.1 search(types) | TODO | | |
+| T2.3 Filtered empty state | DONE | c96b156 | RED: 3 'shown' cases failed (no message); 3 'not shown' guards passed. GREEN: both page suites 18/18; `test/ui` all pass. Adds `lib/ui/widgets/list_status_message.dart` (reused by T3.4/T4.x) |
+| T3.1 search(types) | DONE | `git log --grep T3.1:` | RED: 4/7 failed with types ignored (other types leaked through); default, downloadedOnly and cap-100 rank-order cases are guards. GREEN: repo suite 15/15; search page, badge and database suites green |
 | T3.2 withFreshDownloadState | TODO | | |
 | T3.3 LibrarySearchController | TODO | | |
 | T3.4 Search field + status | TODO | | |
@@ -605,7 +605,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T3.1.
+**Next action:** T3.2.
 
 ## 10. Decision log
 
