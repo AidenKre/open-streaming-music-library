@@ -1,9 +1,12 @@
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/artist_page.dart';
+import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 
@@ -181,6 +184,177 @@ void main() {
       await pumpRoot(tester);
       expect(find.text(message), findsNothing);
       await teardownTree(tester);
+    });
+  });
+
+  group('in-page search', () {
+    Future<void> search(WidgetTester tester, String query) async {
+      await tester.enterText(find.byType(TextField), query);
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pumpAndSettle();
+    }
+
+    CursorPaginationMixin<ArtistUI> pageState(WidgetTester tester) =>
+        tester.state(find.byType(ArtistsPage))
+            as CursorPaginationMixin<ArtistUI>;
+
+    testWidgets('root shows a search field', (tester) async {
+      await pumpRoot(tester);
+      expect(find.widgetWithText(TextField, 'Search artists'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('non-root shows no search field', (tester) async {
+      await tester.pumpWidget(h.wrap(const ArtistsPage()));
+      await tester.pumpAndSettle();
+      expect(find.byType(TextField), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a query swaps the grid for results and suspends browse', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await search(tester, 'Downloaded');
+
+      expect(find.text('Downloaded Artist'), findsOneWidget);
+      expect(find.text('Streaming Artist'), findsNothing);
+      expect(pageState(tester).isPaginationSuspended, isTrue);
+
+      // A DB write underneath search mode must not reach the dormant window.
+      final dormant = List.of(pageState(tester).paginatedItems);
+      await db.into(db.artists).insert(
+        const ArtistsCompanion(id: Value(99), name: Value('New Artist')),
+      );
+      await tester.pumpAndSettle();
+      expect(pageState(tester).paginatedItems, dormant);
+      expect(find.text('New Artist'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('clearing returns to browse through refresh()', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await search(tester, 'Downloaded');
+
+      await tester.tap(find.byIcon(Icons.clear));
+      await tester.pumpAndSettle();
+      expect(pageState(tester).isPaginationSuspended, isFalse);
+      expect(find.text('Downloaded Artist'), findsOneWidget);
+      expect(find.text('Streaming Artist'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('no match explains itself, naming the Downloaded filter', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await search(tester, 'Nope');
+      expect(find.text('No artists match "Nope".'), findsOneWidget);
+
+      await search(tester, 'Streaming');
+      expect(find.text('Streaming Artist'), findsOneWidget);
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('No downloaded artists match "Streaming".'),
+        findsOneWidget,
+      );
+      await teardownTree(tester);
+    });
+
+    testWidgets('toggling the chip re-runs the search; browse stays asleep', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await search(tester, 'Artist');
+      expect(find.text('Streaming Artist'), findsOneWidget);
+
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(find.text('Downloaded Artist'), findsOneWidget);
+      expect(find.text('Streaming Artist'), findsNothing);
+      expect(pageState(tester).isPaginationSuspended, isTrue);
+
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(find.text('Streaming Artist'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('going offline mid-search re-runs it downloaded-only', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await search(tester, 'Streaming');
+      expect(find.text('Streaming Artist'), findsOneWidget);
+
+      await setOffline(tester, true);
+      expect(find.text('Streaming Artist'), findsNothing);
+      expect(
+        find.text(
+          'No downloaded artists match "Streaming". '
+          'Reconnect to the server to search the full library.',
+        ),
+        findsOneWidget,
+      );
+      expect(pageState(tester).isPaginationSuspended, isTrue);
+      await teardownTree(tester);
+    });
+
+    testWidgets('deleting the last download drops a filtered result', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      await search(tester, 'Artist');
+      expect(find.text('Downloaded Artist'), findsOneWidget);
+
+      // Real file I/O: must run outside the widget test's fake-async zone.
+      await tester.runAsync(() => h.manager.deleteDownload('d1'));
+      await tester.pumpAndSettle();
+      expect(find.text('Downloaded Artist'), findsNothing);
+      expect(find.text('No downloaded artists match "Artist".'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a full page of matches is capped at 100 with a hint', (
+      tester,
+    ) async {
+      await seedLibrary(db, [
+        for (var i = 0; i < 105; i++)
+          SeedTrack(
+            uuid: 'm$i',
+            title: 'Song $i',
+            artistId: 100 + i,
+            artist: 'Many $i',
+          ),
+      ]);
+      await pumpRoot(tester);
+      await search(tester, 'Many');
+
+      final grid = tester.widget<GridView>(find.byType(GridView));
+      final delegate = grid.childrenDelegate as SliverChildBuilderDelegate;
+      expect(delegate.childCount, 100);
+      expect(find.textContaining('Showing the first 100 matches'), findsOne);
+      await teardownTree(tester);
+    });
+
+    testWidgets('no hint below the cap', (tester) async {
+      await pumpRoot(tester);
+      await search(tester, 'Artist');
+      expect(find.textContaining('Showing the first'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('unmounting with a pending debounce leaks nothing', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await tester.enterText(find.byType(TextField), 'Down');
+      await teardownTree(tester); // debounce still pending
     });
   });
 }

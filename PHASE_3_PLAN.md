@@ -119,6 +119,7 @@ frontend/lib/
   ui/widgets/search_status.dart         NEW  empty-state copy + capped-hint widget (R10)
   ui/utils/library_search_controller.dart NEW shared search primitive (R9, R12, R13)
   ui/mixins/cursor_pagination_mixin.dart CHG  + suspendPagination / isPaginationSuspended (R11)
+  ui/mixins/in_page_search_mixin.dart   NEW  browse↔search mode switch shared by both root pages; kInPageSearchCap (R11, R12; D10)
   repositories/browse_repository.dart   CHG  search(types:), withFreshDownloadState() (R8, R12)
   ui/artist_page.dart                   CHG  root: FilterBar + in-page search
   ui/tracks_page.dart                   CHG  root: FilterBar + in-page search, uniform filtering
@@ -598,15 +599,15 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T3.2 withFreshDownloadState | DONE | c774b32 | RED: 2/5 failed on identity stub (fields not re-read, cleared download not reflected); order/vanished/empty are guards. GREEN: repo suite 20/20. SearchPage still has its own copy until T3.5 removes it |
 | T3.3 LibrarySearchController | DONE | 2cbeb7c | RED: 14/20 failed on no-op stub; 6 'does nothing' guards passed by construction. GREEN: 20/20, stable across 3 consecutive runs (real-time tests with an injected 20ms debounce). Adds failure handling (a throwing search ends in-flight with empty results), which was not in the original acceptance list |
 | T3.4 Search field + status | DONE | 8582d2d | RED: 8/8 failed on stubs. GREEN: field 4/4 + status 4/4 |
-| T3.5 SearchPage refactor | DONE | `git log --grep T3.5:` | RED: the immediate-clear test failed (5 tiles still shown one frame after clear); cap-5, offline re-run and online patch-in-place tests guard the refactor. GREEN: SearchPage + badge suites 13/13 with existing tests unmodified; full suite green |
-| T4.1 Artists in-page search | TODO | | |
+| T3.5 SearchPage refactor | DONE | bd6df97 | RED: the immediate-clear test failed (5 tiles still shown one frame after clear); cap-5, offline re-run and online patch-in-place tests guard the refactor. GREEN: SearchPage + badge suites 13/13 with existing tests unmodified; full suite green |
+| T4.1 Artists in-page search | DONE | `git log --grep T4.1:` | RED: 10/10 failed (no search field). GREEN: artists + badge suites 28/28; `test/ui` all pass. Two test-side fixes on the way (see D11): a test pumped two ProviderScopes sharing one DownloadManager, and `deleteDownload` needs `tester.runAsync` (real file I/O hangs fake-async) |
 | T4.2 Tracks in-page search | TODO | | |
 | T5.1 Full verification | TODO | | |
 | T5.2 AppShell integration | TODO | | |
 | T5.3 Live app smoke | TODO | | |
 | T5.4 Trace + close-out | TODO | | |
 
-**Next action:** T4.1.
+**Next action:** T4.2.
 
 ## 10. Decision log
 
@@ -620,6 +621,8 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | D6 | Re-search vs patch keys on "is the visible set download-filtered", not on "is offline". | The in-page chip can filter while online. Patching would leave a deleted download visible (G6). |
 | D7 | Root Tracks tab passes the effective filter into `playFromQueue`. | The play queue must match the visible filtered list. The detail route keeps `false` (unchanged). |
 | D8 | `dart format` is enforced on **new** files. In pre-existing files, new code follows the surrounding style and unrelated lines are never reformatted. | The existing tree isn't uniformly formatted, and running the formatter over a pre-existing file rewraps untouched code (discovered in T1.3), which bloats diffs. |
+| D10 | The §3.6 page logic lives in one `InPageSearchMixin` (on `ConsumerState` + `CursorPaginationMixin`), not duplicated in each page. `onBrowseParamsChanged()` and `onDownloadStatusChanged()` route to the visible mode. | Artists and Tracks need identical, race-sensitive wiring. One copy means one place to get it right. Added during T4.1. |
+| D11 | Page tests that delete a download call `DownloadManager.deleteDownload` inside `tester.runAsync`, and each test pumps a single `ProviderScope` per `BrowseHarness`. | `deleteDownload` does real file I/O, which never completes under `testWidgets`' fake async. Riverpod disposes the shared manager with the first scope's `downloadManagerListenableProvider`. Found in T4.1. |
 | D9 | A non-root `ArtistsPage` keeps the badge behaviour. | Only tests use it today. Keeps the R6 rule uniform (FilterBar iff `isRoot`) and the existing badge tests valid. |
 
 ## 11. Final verification results
