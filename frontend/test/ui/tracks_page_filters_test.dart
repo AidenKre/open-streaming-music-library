@@ -94,19 +94,33 @@ void main() {
       await teardownTree(tester);
     });
 
-    testWidgets('offline: filters (not dims) with the chip locked on', (
+    testWidgets('offline: the chip switches on and filters (not dims)', (
       tester,
     ) async {
       await pump(tester, root, offline: true);
 
       expect(chip(tester).selected, isTrue);
-      expect(chip(tester).onSelected, isNull);
       expect(find.text('Kept Song'), findsOneWidget);
       expect(
         find.text('Remote Song'),
         findsNothing,
         reason: 'the Tracks tab now filters offline instead of dimming',
       );
+      await teardownTree(tester);
+    });
+
+    testWidgets('offline: chip off shows the full library, unplayable dimmed', (
+      tester,
+    ) async {
+      await pump(tester, root, offline: true);
+      expect(chip(tester).onSelected, isNotNull, reason: 'not locked');
+
+      await tapChip(tester);
+      expect(chip(tester).selected, isFalse);
+      expect(find.text('Remote Song'), findsOneWidget);
+      expect(tileFor(tester, 'Remote Song').isDimmed, isTrue);
+      expect(tileFor(tester, 'Remote Song').isInteractive, isFalse);
+      expect(tileFor(tester, 'Kept Song').isDimmed, isFalse);
       await teardownTree(tester);
     });
 
@@ -125,12 +139,13 @@ void main() {
       await teardownTree(tester);
     });
 
-    testWidgets('offline round trip restores the explicit choice', (
+    testWidgets('offline round trip restores the pre-offline choice', (
       tester,
     ) async {
       await pump(tester, root);
 
       await setOffline(tester, true);
+      expect(chip(tester).selected, isTrue);
       expect(find.text('Remote Song'), findsNothing);
       await setOffline(tester, false);
       expect(chip(tester).selected, isFalse);
@@ -141,6 +156,18 @@ void main() {
       await setOffline(tester, false);
       expect(chip(tester).selected, isTrue);
       expect(find.text('Remote Song'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('switching the chip off offline survives reconnecting', (
+      tester,
+    ) async {
+      await pump(tester, root, offline: true);
+      await tapChip(tester);
+
+      await setOffline(tester, false);
+      expect(chip(tester).selected, isFalse);
+      expect(find.text('Remote Song'), findsOneWidget);
       await teardownTree(tester);
     });
   });
@@ -298,6 +325,12 @@ void main() {
       expect(find.text('Remote Song'), findsNothing);
       expect(find.text('Kept Song'), findsOneWidget);
       expect(pageState(tester).isPaginationSuspended, isTrue);
+
+      // Offline search can still cover the full library; rows that can't
+      // play are dimmed, as in browse mode.
+      await tapChip(tester);
+      expect(find.text('Remote Song'), findsOneWidget);
+      expect(tileFor(tester, 'Remote Song').isDimmed, isTrue);
       await teardownTree(tester);
     });
 

@@ -92,26 +92,49 @@ void main() {
       await teardownTree(tester);
     });
 
-    testWidgets('offline: chip locked on, filtered, and no badge', (
+    testWidgets('offline: chip switched on, filtered, and no badge', (
       tester,
     ) async {
       await pumpRoot(tester, offline: true);
 
       expect(chip(tester).selected, isTrue);
-      expect(chip(tester).onSelected, isNull);
       expect(find.text('Downloaded Artist'), findsOneWidget);
       expect(find.text('Streaming Artist'), findsNothing);
       expect(find.byType(DownloadedOnlyBadge), findsNothing);
       await teardownTree(tester);
     });
 
-    testWidgets('coming back online restores an explicit OFF', (tester) async {
+    testWidgets('offline: the chip can be switched off to browse everything', (
+      tester,
+    ) async {
+      await pumpRoot(tester, offline: true);
+      expect(chip(tester).onSelected, isNotNull, reason: 'not locked');
+
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(chip(tester).selected, isFalse);
+      expect(find.text('Downloaded Artist'), findsOneWidget);
+      expect(find.text('Streaming Artist'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('going offline mid-session switches the chip on', (
+      tester,
+    ) async {
       await pumpRoot(tester);
 
       await setOffline(tester, true);
       expect(chip(tester).selected, isTrue);
       expect(find.text('Streaming Artist'), findsNothing);
+      await teardownTree(tester);
+    });
 
+    testWidgets('coming back online undoes the offline switch-on', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+
+      await setOffline(tester, true);
       await setOffline(tester, false);
       expect(chip(tester).selected, isFalse);
       expect(find.text('Streaming Artist'), findsOneWidget);
@@ -126,7 +149,26 @@ void main() {
       await setOffline(tester, true);
       await setOffline(tester, false);
       expect(chip(tester).selected, isTrue);
-      expect(chip(tester).onSelected, isNotNull);
+      expect(find.text('Streaming Artist'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a choice made while offline survives reconnecting', (
+      tester,
+    ) async {
+      await pumpRoot(tester, offline: true);
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(chip(tester).selected, isFalse);
+
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      await setOffline(tester, false);
+      expect(
+        chip(tester).selected,
+        isTrue,
+        reason: 'the user switched it back on themselves',
+      );
       expect(find.text('Streaming Artist'), findsNothing);
       await teardownTree(tester);
     });
@@ -292,14 +334,20 @@ void main() {
 
       await setOffline(tester, true);
       expect(find.text('Streaming Artist'), findsNothing);
+      // The chip can lift the filter here, so no "reconnect" advice.
       expect(
-        find.text(
-          'No downloaded artists match "Streaming". '
-          'Reconnect to the server to search the full library.',
-        ),
+        find.text('No downloaded artists match "Streaming".'),
         findsOneWidget,
       );
       expect(pageState(tester).isPaginationSuspended, isTrue);
+
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Streaming Artist'),
+        findsOneWidget,
+        reason: 'offline search can still cover the full library',
+      );
       await teardownTree(tester);
     });
 

@@ -4,34 +4,18 @@ import 'package:frontend/ui/widgets/search_status.dart';
 
 void main() {
   group('noSearchResultsMessage', () {
-    String msg({required bool downloadedOnly, required bool isOffline}) =>
-        noSearchResultsMessage(
-          noun: 'artists',
-          query: 'Blue',
-          downloadedOnly: downloadedOnly,
-          isOffline: isOffline,
-        );
+    String msg({required bool downloadedOnly}) => noSearchResultsMessage(
+      noun: 'artists',
+      query: 'Blue',
+      downloadedOnly: downloadedOnly,
+    );
 
-    test('online, unfiltered', () {
-      expect(
-        msg(downloadedOnly: false, isOffline: false),
-        'No artists match "Blue".',
-      );
+    test('unfiltered', () {
+      expect(msg(downloadedOnly: false), 'No artists match "Blue".');
     });
 
-    test('online, Downloaded chip on', () {
-      expect(
-        msg(downloadedOnly: true, isOffline: false),
-        'No downloaded artists match "Blue".',
-      );
-    });
-
-    test('offline adds the reconnect hint', () {
-      expect(
-        msg(downloadedOnly: true, isOffline: true),
-        'No downloaded artists match "Blue". '
-        'Reconnect to the server to search the full library.',
-      );
+    test('Downloaded chip on (online or offline)', () {
+      expect(msg(downloadedOnly: true), 'No downloaded artists match "Blue".');
     });
   });
 

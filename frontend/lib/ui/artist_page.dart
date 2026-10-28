@@ -42,13 +42,14 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   int get pageSize => 30;
 
   /// Chip selection for this tab; session-only (survives tab switches via
-  /// the shell's IndexedStack, never persisted). Only a root instance shows
-  /// the [FilterBar], so elsewhere this stays at its default and the
-  /// effective filter is just the offline flag.
-  BrowseFilters _filters = const BrowseFilters();
+  /// the shell's IndexedStack, never persisted). Offline switches Downloaded
+  /// on but the user may switch it off again (see [BrowseFilters]).
+  late BrowseFilters _filters;
 
+  /// Root: the chip. A non-root instance has no chip, so offline it filters
+  /// to what's playable, as before Phase 3.
   bool get _downloadedOnly =>
-      _filters.effectiveDownloaded(isOffline: ref.read(offlineModeProvider));
+      widget.isRoot ? _filters.downloaded : ref.read(offlineModeProvider);
 
   List<ArtistOrderParameter> get _orderParams => [
     ArtistOrderParameter(column: 'name'),
@@ -58,6 +59,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   void initState() {
     super.initState();
     Future.microtask(() => ref.read(trackSyncProvider.notifier).sync());
+    _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
     initPagination();
     if (widget.isRoot) {
       initInPageSearch(
@@ -85,8 +87,8 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     );
   }
 
-  /// A filtered window that settled with nothing in it. The locked/selected
-  /// chip already says why; this says it in words.
+  /// A filtered window that settled with nothing in it. The selected chip
+  /// already says why; this says it in words.
   bool get _showFilteredEmpty =>
       widget.isRoot && _downloadedOnly && !hasMore && paginatedItems.isEmpty;
 
@@ -109,11 +111,19 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
 
   @override
   Widget build(BuildContext context) {
-    // Toggling offline mode flips the downloadedOnly filter, so we must
-    // re-fetch from page 1 (or re-run the search); the items on screen came
-    // from a different filter.
+    // Offline switches the root chip on (and reconnecting may switch it back
+    // off); a non-root instance filters by the flag itself. Either way the
+    // items on screen came from a different filter, so re-fetch from page 1
+    // (or re-run the search).
     ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (prev != next) onBrowseParamsChanged();
+      if (prev == next) return;
+      if (widget.isRoot) {
+        _onFiltersChanged(
+          next ? _filters.wentOffline() : _filters.cameOnline(),
+        );
+      } else {
+        onBrowseParamsChanged();
+      }
     });
     ref.listen(downloadStatusVersionProvider, (_, _) {
       onDownloadStatusChanged();
@@ -130,11 +140,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
               onCleared: search.clear,
             ),
           ),
-          FilterBar(
-            filters: _filters,
-            onChanged: _onFiltersChanged,
-            isOffline: isOffline,
-          ),
+          FilterBar(filters: _filters, onChanged: _onFiltersChanged),
         ] else if (isOffline)
           const DownloadedOnlyBadge(),
         Expanded(
@@ -175,7 +181,6 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
           noun: 'artists',
           query: search.query,
           downloadedOnly: _downloadedOnly,
-          isOffline: isOffline,
         ),
       );
     }

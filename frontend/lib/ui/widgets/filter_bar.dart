@@ -7,46 +7,33 @@ import 'package:frontend/models/browse_filters.dart';
 /// re-queries in [onChanged]. Adding a filter means adding a chip here next to
 /// its [BrowseFilters] field.
 ///
-/// Offline, the Downloaded chip is locked on (selected + disabled) because
-/// nothing else is playable. This replaces the old `DownloadedOnlyBadge` on
-/// pages that show the bar. The user's own value is untouched underneath, so
-/// it reappears when the app comes back online.
+/// The chips are always tappable. Offline mode only changes the page's
+/// [BrowseFilters] (Downloaded switches on), so the user can still switch it
+/// off to browse everything.
 class FilterBar extends StatelessWidget {
   static const downloadedChipKey = ValueKey('filter-chip-downloaded');
 
   final BrowseFilters filters;
   final ValueChanged<BrowseFilters> onChanged;
-  final bool isOffline;
 
-  const FilterBar({
-    super.key,
-    required this.filters,
-    required this.onChanged,
-    required this.isOffline,
-  });
+  const FilterBar({super.key, required this.filters, required this.onChanged});
 
   @override
   Widget build(BuildContext context) {
-    Widget downloaded = FilterChip(
-      key: downloadedChipKey,
-      label: const Text('Downloaded'),
-      shape: const StadiumBorder(),
-      selected: filters.effectiveDownloaded(isOffline: isOffline),
-      onSelected: isOffline
-          ? null
-          : (value) => onChanged(filters.copyWith(downloaded: value)),
-    );
-    if (isOffline) {
-      downloaded = Tooltip(
-        message: 'Offline — only downloaded music is available',
-        child: downloaded,
-      );
-    }
-
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: Row(children: [downloaded]),
+      child: Row(
+        children: [
+          FilterChip(
+            key: downloadedChipKey,
+            label: const Text('Downloaded'),
+            shape: const StadiumBorder(),
+            selected: filters.downloaded,
+            onSelected: (value) => onChanged(filters.userSetDownloaded(value)),
+          ),
+        ],
+      ),
     );
   }
 }

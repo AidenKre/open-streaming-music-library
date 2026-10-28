@@ -54,16 +54,16 @@ class TracksPageState extends ConsumerState<TracksPage>
   @override
   int get pageSize => 50;
 
-  /// Chip selection for the root tab; session-only. Detail sub-routes (an
-  /// album's tracks) show no [FilterBar] and never filter by it.
-  BrowseFilters _filters = const BrowseFilters();
+  /// Chip selection for the root tab; session-only. Offline switches
+  /// Downloaded on but the user may switch it off again (see
+  /// [BrowseFilters]). Detail sub-routes (an album's tracks) show no
+  /// [FilterBar] and never filter by it.
+  late BrowseFilters _filters;
 
   /// The downloaded-only filter this list (and the queue built from a tap)
-  /// uses. Root: the chip, forced on offline. Detail: never — offline it
-  /// keeps every row and dims the ones that can't play.
-  bool get _downloadedOnly => widget.isRoot
-      ? _filters.effectiveDownloaded(isOffline: ref.read(offlineModeProvider))
-      : false;
+  /// uses. Root: the chip. Detail: never. Whenever a list shows tracks that
+  /// can't play offline, it dims and disables them.
+  bool get _downloadedOnly => widget.isRoot && _filters.downloaded;
 
   List<OrderParameter> get _orderParams => [
     OrderParameter(column: 'artist'),
@@ -77,6 +77,7 @@ class TracksPageState extends ConsumerState<TracksPage>
   void initState() {
     super.initState();
     sync();
+    _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
     initPagination();
     if (widget.isRoot) {
       initInPageSearch(
@@ -125,11 +126,12 @@ class TracksPageState extends ConsumerState<TracksPage>
 
   @override
   Widget build(BuildContext context) {
-    // Offline flips the root tab's effective filter, so re-fetch from page 1
-    // (or re-run the search). Detail lists don't filter (they dim instead),
-    // so they needn't refresh.
+    // Offline switches the root tab's chip on (and reconnecting may switch
+    // it back off), which re-fetches from page 1 (or re-runs the search).
+    // Detail lists don't filter (they dim instead), so they needn't refresh.
     ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (widget.isRoot && prev != next) onBrowseParamsChanged();
+      if (!widget.isRoot || prev == next) return;
+      _onFiltersChanged(next ? _filters.wentOffline() : _filters.cameOnline());
     });
     ref.listen(downloadStatusVersionProvider, (_, _) {
       onDownloadStatusChanged();
@@ -152,11 +154,7 @@ class TracksPageState extends ConsumerState<TracksPage>
               onCleared: search.clear,
             ),
           ),
-          FilterBar(
-            filters: _filters,
-            onChanged: _onFiltersChanged,
-            isOffline: rows.isOffline,
-          ),
+          FilterBar(filters: _filters, onChanged: _onFiltersChanged),
         ],
         Expanded(
           child: isSearchMode
@@ -230,7 +228,6 @@ class TracksPageState extends ConsumerState<TracksPage>
           noun: 'tracks',
           query: search.query,
           downloadedOnly: _downloadedOnly,
-          isOffline: rows.isOffline,
         ),
       );
     }
@@ -287,10 +284,9 @@ class TracksPageState extends ConsumerState<TracksPage>
       };
     }
     final isOffline = rows.isOffline;
-    // Offline, a detail list keeps all rows visible for visual consistency
-    // with the same album/artist viewed online, but dims and disables any
-    // track that isn't locally downloaded. (The root tab filters instead, so
-    // it never dims.)
+    // Offline, an unfiltered list (a detail route, or the root tab with the
+    // chip switched off) keeps every row visible but dims and disables any
+    // track that isn't locally downloaded.
     final isInteractive = !isOffline || track.isDownloaded;
     final conversionJob = rows.conversionJobs
         .where((j) => j.uuidId == track.uuidId && j.isActive)

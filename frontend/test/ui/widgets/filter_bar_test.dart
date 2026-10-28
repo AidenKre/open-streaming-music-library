@@ -8,14 +8,10 @@ void main() {
 
   setUp(() => changes = []);
 
-  Widget harness({required BrowseFilters filters, required bool isOffline}) {
+  Widget harness({required BrowseFilters filters}) {
     return MaterialApp(
       home: Scaffold(
-        body: FilterBar(
-          filters: filters,
-          isOffline: isOffline,
-          onChanged: changes.add,
-        ),
+        body: FilterBar(filters: filters, onChanged: changes.add),
       ),
     );
   }
@@ -24,9 +20,7 @@ void main() {
       tester.widget<FilterChip>(find.byKey(FilterBar.downloadedChipKey));
 
   testWidgets('renders a capsule "Downloaded" FilterChip', (tester) async {
-    await tester.pumpWidget(
-      harness(filters: const BrowseFilters(), isOffline: false),
-    );
+    await tester.pumpWidget(harness(filters: const BrowseFilters()));
 
     final chip = downloadedChip(tester);
     expect(find.text('Downloaded'), findsOneWidget);
@@ -35,9 +29,7 @@ void main() {
   });
 
   testWidgets('is a horizontally scrollable row', (tester) async {
-    await tester.pumpWidget(
-      harness(filters: const BrowseFilters(), isOffline: false),
-    );
+    await tester.pumpWidget(harness(filters: const BrowseFilters()));
 
     final scroll = tester.widget<SingleChildScrollView>(
       find.descendant(
@@ -51,51 +43,31 @@ void main() {
   testWidgets('online: tapping toggles the user value on and off', (
     tester,
   ) async {
-    await tester.pumpWidget(
-      harness(filters: const BrowseFilters(), isOffline: false),
-    );
+    await tester.pumpWidget(harness(filters: const BrowseFilters()));
     await tester.tap(find.byKey(FilterBar.downloadedChipKey));
     expect(changes, [const BrowseFilters(downloaded: true)]);
 
     await tester.pumpWidget(
-      harness(filters: const BrowseFilters(downloaded: true), isOffline: false),
+      harness(filters: const BrowseFilters(downloaded: true)),
     );
     expect(downloadedChip(tester).selected, isTrue);
     await tester.tap(find.byKey(FilterBar.downloadedChipKey));
     expect(changes.last, const BrowseFilters());
   });
 
-  testWidgets('offline: locked selected + disabled, user value untouched', (
+  testWidgets('an offline-applied ON shows selected and stays tappable', (
     tester,
   ) async {
-    // The user's own value is OFF; offline still shows the chip ON.
-    await tester.pumpWidget(
-      harness(filters: const BrowseFilters(), isOffline: true),
-    );
+    const applied = BrowseFilters(downloaded: true, downloadedByOffline: true);
+    await tester.pumpWidget(harness(filters: applied));
 
     final chip = downloadedChip(tester);
     expect(chip.selected, isTrue);
-    expect(chip.onSelected, isNull, reason: 'disabled while offline');
+    expect(chip.onSelected, isNotNull, reason: 'offline never locks the chip');
 
     await tester.tap(find.byKey(FilterBar.downloadedChipKey));
-    expect(changes, isEmpty);
-    expect(find.byType(Tooltip), findsOneWidget);
-  });
-
-  testWidgets('a rebuild with the network back unlocks the chip', (
-    tester,
-  ) async {
-    await tester.pumpWidget(
-      harness(filters: const BrowseFilters(), isOffline: true),
-    );
-    expect(downloadedChip(tester).selected, isTrue);
-
-    await tester.pumpWidget(
-      harness(filters: const BrowseFilters(), isOffline: false),
-    );
-    final chip = downloadedChip(tester);
-    expect(chip.selected, isFalse, reason: 'restores the user value');
-    expect(chip.onSelected, isNotNull);
-    expect(find.byType(Tooltip), findsNothing);
+    expect(changes, [
+      const BrowseFilters(),
+    ], reason: 'switching it off is the user\'s choice, not offline\'s');
   });
 }

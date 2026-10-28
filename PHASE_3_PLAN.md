@@ -26,13 +26,13 @@ reuse the same components.
 
 | ID | Requirement |
 | --- | --- |
-| R1 | An immutable, typed **`BrowseFilters`** value object (`downloaded` for now) with `copyWith`, value equality, and the rule **effective downloaded = user toggle ‖ offline**. Minimal but extensible — no generic filter framework. |
-| R2 | A stateless **`FilterBar`** widget: a horizontally scrollable row of **capsule** (`StadiumBorder`) `FilterChip`s. Props: `BrowseFilters filters`, `ValueChanged<BrowseFilters> onChanged`, `bool isOffline`. The page owns the state. |
-| R3 | **Offline lock**: while offline the Downloaded chip renders **selected and disabled** (`onSelected: null`). The user's own value is preserved underneath, so going back online restores the last explicit setting. |
+| R1 | An immutable, typed **`BrowseFilters`** value object (`downloaded` for now) with `copyWith`, value equality, ~~and the rule **effective downloaded = user toggle ‖ offline**~~. Minimal but extensible — no generic filter framework. **Amended (D12):** offline *switches `downloaded` on* (`wentOffline()`) instead of overriding it, and reconnecting undoes only an ON that offline applied (`cameOnline()`). |
+| R2 | A stateless **`FilterBar`** widget: a horizontally scrollable row of **capsule** (`StadiumBorder`) `FilterChip`s. Props: `BrowseFilters filters`, `ValueChanged<BrowseFilters> onChanged`~~, `bool isOffline`~~. The page owns the state. **Amended (D12):** no `isOffline` prop; the bar renders `filters` as-is. |
+| R3 | ~~**Offline lock**: while offline the Downloaded chip renders **selected and disabled** (`onSelected: null`). The user's own value is preserved underneath, so going back online restores the last explicit setting.~~ **Amended (D12) — offline auto-applies, never locks:** going offline switches the Downloaded chip **on**, but it stays tappable, so the user can switch it off and browse the full library from local metadata (non-downloaded tracks show dimmed and can't be played). Coming back online switches it off again only if offline turned it on and the user left it alone; a choice made before or during the offline period is kept. A page created while offline starts with the chip on. |
 | R4 | The FilterBar **replaces `DownloadedOnlyBadge`** on pages that show it. A page never shows both. |
 | R5 | Filter state is **per-page, session-only**: it lives in the page `State`, is not global, and is not persisted. The tab `IndexedStack` keeps `State` alive across tab switches. |
 | R6 | The FilterBar (and in-page search) attach **only to root tab instances** (`isRoot: true`), never to the `TracksPage`/`AlbumsPage` pushed as album/artist **detail** sub-routes. |
-| R7 | The chip **filters uniformly** on every root browse tab. The **Tracks tab changes from offline row-dimming to filtering** (deliberate and confirmed in the design doc). |
+| R7 | The chip **filters uniformly** on every root browse tab. The **Tracks tab changes from offline row-dimming to filtering** (deliberate and confirmed in the design doc). **Amended (D12):** that is now the offline *default*; with the chip switched off offline, the Tracks tab dims and disables non-downloaded rows, like the detail routes. |
 | R8 | A **single unified search method**: `BrowseRepository.search(query, {Set<SearchType> types, int limitPerType, bool downloadedOnly})`. It is a superset of today's signature. The global Search page uses all types and the in-page search uses one type. No separate `searchOne`. |
 | R9 | **One shared search primitive** used by the global Search page and the in-page search, and reusable by Phase 4. It owns the 300 ms debounce, the generation stale-guard, the capped FTS fetch, empty/capped state and dispose-cancel. |
 | R10 | In-page search behaviour: an **empty query means browse mode** (the existing reactive pagination, unchanged). A **non-empty query means capped FTS mode**, with `types: {thisPageType}`, a cap of **100** (well under 999), and the effective downloaded filter. Empty results show an empty state. A **"showing first N — refine to narrow"** hint appears when `results.length == cap`. |
@@ -141,19 +141,37 @@ class BrowseFilters {
 }
 ```
 
+~~The `effectiveDownloaded` rule above (offline forces downloaded-only).~~
+**Amended (D12):** `effectiveDownloaded` is gone; queries use `downloaded`
+directly and offline changes the value itself:
+
+```dart
+const BrowseFilters({this.downloaded = false, this.downloadedByOffline = false});
+factory BrowseFilters.initial({required bool isOffline}); // offline → on, marked as offline's
+final bool downloadedByOffline;        // ON came from going offline, not the user
+BrowseFilters userSetDownloaded(bool); // chip tap: the value becomes the user's
+BrowseFilters wentOffline();           // off → on (marked); a user ON is kept
+BrowseFilters cameOnline();            // undo only offline's own, untouched ON
+```
+
 Adding a filter later means adding a field, a `copyWith` arg, a chip in
 `FilterBar`, and the query clause. No framework.
 
 ### 3.3 `FilterBar` (`lib/ui/widgets/filter_bar.dart`)
 
-`StatelessWidget(filters, onChanged, isOffline)` builds a
+`StatelessWidget(filters, onChanged~~, isOffline~~)` builds a
 `SingleChildScrollView(scrollDirection: Axis.horizontal)` of chips. The Downloaded
 chip is `FilterChip(label: 'Downloaded', shape: StadiumBorder(), selected:
-filters.effectiveDownloaded(isOffline), onSelected: isOffline ? null : (v) =>
-onChanged(filters.copyWith(downloaded: v)))`. When offline it is wrapped in a
+~~filters.effectiveDownloaded(isOffline), onSelected: isOffline ? null : (v) =>
+onChanged(filters.copyWith(downloaded: v))~~)`. ~~When offline it is wrapped in a
 `Tooltip` ("Offline — only downloaded music is available"). That tooltip
-carries the information the removed badge used to give. Each chip has a stable
+carries the information the removed badge used to give.~~ Each chip has a stable
 `Key` (`FilterBar.downloadedChipKey`) for tests and Phase 4.
+
+**Amended (D12):** `selected: filters.downloaded, onSelected: (v) =>
+onChanged(filters.userSetDownloaded(v))` — always tappable, no tooltip (its
+"only downloaded music is available" was no longer true). The selected chip
+still tells the user why the list is narrowed offline.
 
 ### 3.4 Unified search
 
@@ -245,7 +263,9 @@ scroll listener.
   - Search: a list of `TrackTile`s from one shared `_buildTrackTile`. Tapping a
     row calls `playFromTrackList(resultUuids, track, sourceType: 'search')`,
     the same as the global search.
-  - Rows no longer need dimming (offline means everything is downloaded).
+  - ~~Rows no longer need dimming (offline means everything is downloaded).~~
+    **Amended (D12):** offline with the chip off, rows that aren't downloaded
+    are dimmed and disabled (the shared `_buildTrackTile` already does this).
 - **TracksPage (detail, `isRoot: false`)**: **unchanged**. No header, no
   `downloadedOnly`, offline dimming kept, `playFromQueue(downloadedOnly:
   false)`.
@@ -261,11 +281,13 @@ scroll listener.
 ### 3.8 Search status copy (`lib/ui/widgets/search_status.dart`)
 
 `String noSearchResultsMessage({required String noun, required String query,
-required bool downloadedOnly, required bool isOffline})`:
+required bool downloadedOnly~~, required bool isOffline~~})`:
 
 - online, unfiltered: `No <noun> match "<q>".`
 - download-filtered: `No downloaded <noun> match "<q>".`
-- offline adds: ` Reconnect to the server to search the full library.`
+- ~~offline adds: ` Reconnect to the server to search the full library.`~~
+  **Amended (D12):** no reconnect hint. Both callers have a Downloaded chip,
+  and switching it off searches the full library offline.
 
 The global Search page keeps its exact existing strings (pinned by existing
 tests): `No results found`, and `No downloaded results match "<q>". Reconnect to
@@ -302,8 +324,9 @@ the task complete. All paths are relative to `frontend/` unless noted.
   - Defaults to `downloaded: false`.
   - `copyWith` changes only the given field.
   - Value equality and `hashCode` hold.
-  - `effectiveDownloaded` truth table: (false, online) → false; (true, online) → true; (false, offline) → true; (true, offline) → true.
-  - The user value survives an offline period: `copyWith` is never applied by the offline lock.
+  - ~~`effectiveDownloaded` truth table: (false, online) → false; (true, online) → true; (false, offline) → true; (true, offline) → true.~~
+  - ~~The user value survives an offline period: `copyWith` is never applied by the offline lock.~~
+  - **Amended (D12):** `initial(isOffline:)`; `wentOffline()` switches off → on (marked) and keeps a user ON; `cameOnline()` undoes only an untouched offline ON; `userSetDownloaded` clears the mark so a choice made offline survives reconnect.
 - **Tests:** a unit test for each bullet.
 - **Verify:** `flutter test test/models/browse_filters_test.dart`.
 
@@ -314,10 +337,11 @@ the task complete. All paths are relative to `frontend/` unless noted.
 - **Acceptance:**
   - Renders a `FilterChip` labelled "Downloaded" with a `StadiumBorder` shape.
   - Online and unselected: tapping calls `onChanged` with `downloaded: true`. When selected, tapping calls it with `false`.
-  - Offline: the chip is selected **and** disabled (`onSelected == null`). Tapping does not call `onChanged`. A tooltip explains why.
-  - Offline with the user value false: still shown selected (lock), and `onChanged` is never called (the user value is untouched).
+  - ~~Offline: the chip is selected **and** disabled (`onSelected == null`). Tapping does not call `onChanged`. A tooltip explains why.~~
+  - ~~Offline with the user value false: still shown selected (lock), and `onChanged` is never called (the user value is untouched).~~
+  - **Amended (D12):** an offline-applied ON renders selected and stays tappable; tapping it reports a user-owned OFF.
   - Horizontally scrollable (a `SingleChildScrollView` on `Axis.horizontal`).
-- **Edge cases:** rebuilding with a new `isOffline` flips the lock without any state of its own (the widget is stateless).
+- ~~**Edge cases:** rebuilding with a new `isOffline` flips the lock without any state of its own (the widget is stateless).~~ (No lock since D12.)
 - **Verify:** `flutter test test/ui/widgets/filter_bar_test.dart`.
 
 #### T1.3 — Pagination suspend/resume
@@ -338,17 +362,19 @@ the task complete. All paths are relative to `frontend/` unless noted.
 #### T2.1 — ArtistsPage root: FilterBar + effective downloaded filter
 - **What:** the root `ArtistsPage` holds `BrowseFilters _filters`. A `FilterBar`
   replaces the badge. `watchPage` uses
-  `_filters.effectiveDownloaded(isOffline: ref.read(offlineModeProvider))`. A
-  chip change triggers `setState` and `refresh()`. The offline flip still
-  triggers `refresh()`. Non-root keeps the badge.
+  ~~`_filters.effectiveDownloaded(isOffline: ref.read(offlineModeProvider))`~~
+  `_filters.downloaded` (D12). A
+  chip change triggers `setState` and `refresh()`. The offline flip ~~still
+  triggers `refresh()`~~ applies `wentOffline()`/`cameOnline()` to the filters,
+  which refreshes when they change (D12). Non-root keeps the badge.
 - **Files:** `lib/ui/artist_page.dart`; `test/ui/artists_page_filters_test.dart` (new).
 - **Deps:** T1.1, T1.2.
 - **Acceptance (widget tests, real in-memory drift DB, seeded with one downloaded artist and one streaming-only artist):**
   1. Online root shows the FilterBar with the chip unselected. Both artists are visible. No badge.
   2. Tapping the chip leaves only the downloaded artist visible.
   3. Tapping it again shows both again.
-  4. Offline root: the chip is selected and disabled, only the downloaded artist is shown, and there is no `DownloadedOnlyBadge`.
-  5. **Restore:** online with the chip off → offline (locked on, filtered) → online gives the chip unselected and both artists. With the chip on before going offline, it is still on after coming back.
+  4. Offline root: the chip is selected ~~and disabled~~, only the downloaded artist is shown, and there is no `DownloadedOnlyBadge`. **Amended (D12):** the chip can be switched off offline, which shows every artist.
+  5. **Restore:** online with the chip off → offline (~~locked~~ switched on, filtered) → online gives the chip unselected and both artists. With the chip on before going offline, it is still on after coming back.
   6. A non-root `ArtistsPage` shows no FilterBar (existing badge tests are kept).
 - **Verify:** `flutter test test/ui/artists_page_filters_test.dart test/ui/offline_downloaded_only_badge_test.dart`.
 
@@ -361,7 +387,7 @@ the task complete. All paths are relative to `frontend/` unless noted.
 - **Deps:** T1.1, T1.2.
 - **Acceptance:**
   1. Root, online: chip off shows both tracks and no dimming. Chip on shows only the downloaded track.
-  2. Root, offline: the chip is locked on and only the downloaded track is listed (**filtering, not dimming**).
+  2. Root, offline: the chip is ~~locked~~ switched on and only the downloaded track is listed (**filtering, not dimming**). **Amended (D12):** switching it off lists both, with the non-downloaded one dimmed and disabled.
   3. Root: tapping a row with the chip on calls `playFromQueue(downloadedOnly: true)`. With the chip off, `false`. Recorded via an `AudioCoordinator` test subclass.
   4. Detail (`isRoot: false`, `artistId`/`albumId`), offline: no FilterBar, both tracks listed, and the non-downloaded one is dimmed (`TrackTile.isDimmed == true`). This is the existing behaviour, kept.
   5. Detail: a row tap passes `downloadedOnly: false` (unchanged).
@@ -470,7 +496,7 @@ the task complete. All paths are relative to `frontend/` unless noted.
   2. Clearing returns to browse through `refresh()`: all artists are back and pagination is resumed.
   3. No match shows `No artists match "q".`. With the chip on, `No downloaded artists match "q".`.
   4. Chip toggled while searching: the search re-runs with the new filter (a streaming-only match disappears and reappears). Browse stays suspended.
-  5. Offline flip while searching: the search re-runs filtered, and the offline copy appears on an empty result.
+  5. Offline flip while searching: the search re-runs filtered, ~~and the offline copy appears on an empty result~~ with the plain "No downloaded …" copy; switching the chip off re-runs it over the full library (D12).
   6. Download status change while filtering: an artist whose last download was deleted disappears from the results (requires the re-run).
   7. Capped: with more than 100 matching artists seeded, the hint shows and exactly 100 cards render (the grid is lazily built, so the result count is asserted on state).
   8. Disposing the page with a pending debounce throws no exception and leaves no pending timers.
@@ -562,7 +588,7 @@ Commands are run from `frontend/`: `flutter test <paths>`, `flutter analyze`,
 | K2 | A late async search completion overwrites newer results or touches a disposed page. | The generation guard and the disposed flag (T3.3 #3 and #8). |
 | K3 | Search results are a snapshot, so metadata edits or a sync while searching aren't reflected. | Same as today's global Search. Download-state changes are handled (R12). Documented as a known limitation. |
 | K4 | A stale dead row after a delete mid-search. | Re-run whenever the result set is download-filtered (D6). |
-| K5 | Tracks-tab behaviour change (dim → filter) surprises users. | Confirmed in the design doc. The detail routes keep dimming. The locked chip and tooltip explain the offline state. |
+| K5 | Tracks-tab behaviour change (dim → filter) surprises users. | Confirmed in the design doc. The detail routes keep dimming. ~~The locked chip and tooltip explain the offline state.~~ The auto-selected chip explains the offline state, and switching it off brings back the dimmed full list (D12). |
 | K6 | Queue/visible-list mismatch: the chip is on, but tapping a track queues streaming-only tracks. | Pass `downloadedOnly: effective` to `playFromQueue` (D7), tested in T2.2 #3. |
 | K7 | Cap ≥ 999 breaks the hydrate `IN (…)` / sort fallback. | Cap = 100, a constant, plus a repository test at the cap. |
 | K8 | Refactoring SearchPage regresses it. | Existing tests stay unmodified, plus new regression tests (T3.5). |
@@ -606,6 +632,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | T5.2 AppShell integration | DONE | 59f6a57 | `app_shell_filters_test.dart` 4/4 against the real AppShell. It passed first time, as expected for an integration test over finished features. **Mutation check:** making album detail render a FilterBar fails the detail-route test. Reverted |
 | T5.3 Live app smoke | DONE (partial; see §11.3) | n/a | `flutter build macos --debug` succeeded. The interactive on-device pass was **not** run (reason and manual checklist in §11.3) |
 | T5.4 Trace + close-out | DONE | `git log --grep T5.4:` | §11 requirements trace written; working tree clean on `phase-3` |
+| A1 Offline auto-applies, never locks (D12) | DONE | `git log --grep A1:` | User-requested change, 2026-10-28. RED: 5 page tests failed (chip locked offline, couldn't be switched off) and the model/bar/status tests failed to compile against the new API. GREEN: affected suites 66/66; full suite 993/993; analyze clean |
 
 **Next action:** none. All tasks are done. The remaining follow-ups are user-owned (§11.3 manual device pass, §11.4).
 
@@ -624,6 +651,7 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | D10 | The §3.6 page logic lives in one `InPageSearchMixin` (on `ConsumerState` + `CursorPaginationMixin`), not duplicated in each page. `onBrowseParamsChanged()` and `onDownloadStatusChanged()` route to the visible mode. | Artists and Tracks need identical, race-sensitive wiring. One copy means one place to get it right. Added during T4.1. |
 | D11 | Page tests that delete a download call `DownloadManager.deleteDownload` inside `tester.runAsync`, and each test pumps a single `ProviderScope` per `BrowseHarness`. | `deleteDownload` does real file I/O, which never completes under `testWidgets`' fake async. Riverpod disposes the shared manager with the first scope's `downloadManagerListenableProvider`. Found in T4.1. |
 | D9 | A non-root `ArtistsPage` keeps the badge behaviour. | Only tests use it today. Keeps the R6 rule uniform (FilterBar iff `isRoot`) and the existing badge tests valid. |
+| D12 | **Supersedes the offline lock (R3).** Offline switches the Downloaded chip on but never locks it; reconnecting undoes only an ON that offline applied and the user left alone. The global Search page (no chip) still filters to downloaded offline, unchanged. | User request, 2026-10-28. The lock hid the rest of the library whenever the server was unreachable, even though its metadata is stored locally — that throws away an advantage of the offline-first design. Defaulting to downloaded keeps the common case ("what can I play?") one glance away, and the user can still browse or search everything. Playback stays safe: rows that can't play offline are dimmed and disabled, and `AudioCoordinator.playFromQueue` already forces a downloaded-only queue offline. |
 
 ## 11. Final verification results
 
@@ -639,6 +667,7 @@ Recorded 2026-10-26 on `phase-3`.
 | Backend `pytest` (`backend/.venv`) | 774 passed. No backend files differ from `main` |
 | `flutter build macos --debug` | ✓ Built `build/macos/Build/Products/Debug/frontend.app` |
 | Mutation check on T5.2 | Album detail rendering a FilterBar fails the detail-route test (reverted) |
+| Re-run after A1 / D12 (2026-10-28) | `flutter test` **993 passed, 0 failed** (+7 for the auto-apply behaviour; the lock-specific assertions were rewritten, not deleted); `flutter analyze` no issues; the 8 touched Phase 3 files `dart format`-clean. No backend change, so `pytest` was not re-run |
 
 ### 11.2 Requirements trace
 
@@ -646,11 +675,11 @@ Recorded 2026-10-26 on `phase-3`.
 | --- | --- | --- |
 | R1 `BrowseFilters` | `lib/models/browse_filters.dart` | `test/models/browse_filters_test.dart` |
 | R2 `FilterBar` | `lib/ui/widgets/filter_bar.dart` | `test/ui/widgets/filter_bar_test.dart` |
-| R3 Offline lock + restore | `FilterBar` (`onSelected: null`), `BrowseFilters.effectiveDownloaded` | filter_bar offline tests; artists/tracks "coming back online restores/keeps" tests |
+| R3 ~~Offline lock~~ Offline auto-apply + restore (D12) | ~~`FilterBar` (`onSelected: null`), `BrowseFilters.effectiveDownloaded`~~ `BrowseFilters.initial/wentOffline/cameOnline/userSetDownloaded`; the pages' `offlineModeProvider` listeners | `browse_filters_test.dart` offline-transition group; filter_bar "offline-applied ON … stays tappable"; artists/tracks "switched off to browse everything", "undoes the offline switch-on", "keeps an explicit ON", "choice made while offline survives reconnecting" |
 | R4 FilterBar replaces badge | `artist_page.dart` (badge only when non-root); Tracks root never had one | artists "offline … no badge"; the badge tests for non-root/Albums/Search still pass |
 | R5 Per-page, session-only | `_filters` in each page `State` | `app_shell_filters_test.dart` "per tab and survives tab switches" |
 | R6 Root tabs only | `widget.isRoot` gates FilterBar + `initInPageSearch` | tracks detail-route group; artists non-root tests; AppShell artist → albums → detail test |
-| R7 Tracks tab filters uniformly | `TracksPage._downloadedOnly` (root) → `watchTracks` / `playFromQueue` | tracks "offline: filters (not dims)", "the play queue follows the effective filter" |
+| R7 Tracks tab filters uniformly | `TracksPage._downloadedOnly` (root) → `watchTracks` / `playFromQueue` | tracks "offline: the chip switches on and filters (not dims)", "offline: chip off shows the full library, unplayable dimmed" (D12), "the play queue follows the effective filter" |
 | R8 Unified search method | `BrowseRepository.search(types:)` + `SearchType` | repository `search types` group + cap-100 rank-order test |
 | R9 One shared search primitive | `LibrarySearchController`, used by `SearchPage` + `InPageSearchMixin` | `library_search_controller_test.dart` (20); SearchPage suites |
 | R10 Browse vs capped search, empty/capped states | `InPageSearchMixin` (`kInPageSearchCap = 100`), `search_status.dart`, `ListStatusMessage` | artists/tracks in-page search groups (no-match copy, cap-100 hint, no hint below cap) |
@@ -666,7 +695,7 @@ Recorded 2026-10-26 on `phase-3`.
   1. Artists tab: tap Downloaded → only artists with downloads. Tap again → all.
   2. Tracks tab: same; tapping a track with the chip on queues only downloaded tracks.
   3. Toggle the chip on Artists, switch to Tracks: its chip is independent. Switch back: still on.
-  4. Kill the server: both tabs' chips lock on (greyed and selected, tooltip on long-press), lists filter, and there is no "Showing downloaded only" strip. Restart the server: each chip returns to its previous value.
+  4. ~~Kill the server: both tabs' chips lock on (greyed and selected, tooltip on long-press), lists filter, and there is no "Showing downloaded only" strip. Restart the server: each chip returns to its previous value.~~ **Amended (D12):** kill the server: both tabs' chips switch on, lists filter, and there is no "Showing downloaded only" strip. Tap a chip off: the full list returns, with non-downloaded tracks dimmed and untappable. Restart the server: a chip you didn't touch switches back off; one you changed keeps your choice.
   5. Type in "Search artists" / "Search tracks": results after ~300 ms. Clear (×) returns to the full list instantly, at the top.
   6. While searching, toggle the chip and go offline/online: results update. Delete a download from a result (with the chip on): it disappears.
   7. A broad query (e.g. one letter) on a large library shows "Showing the first 100 matches…".

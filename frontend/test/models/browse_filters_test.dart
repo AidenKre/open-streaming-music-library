@@ -28,40 +28,63 @@ void main() {
     );
   });
 
-  group('effectiveDownloaded', () {
-    test('online follows the user toggle', () {
+  test('the offline-applied flag is part of equality', () {
+    expect(
+      const BrowseFilters(downloaded: true, downloadedByOffline: true),
+      isNot(equals(const BrowseFilters(downloaded: true))),
+    );
+    expect(
+      const BrowseFilters(downloaded: true).copyWith(downloadedByOffline: true),
+      const BrowseFilters(downloaded: true, downloadedByOffline: true),
+    );
+  });
+
+  test('initial: offline at creation starts with Downloaded applied', () {
+    expect(BrowseFilters.initial(isOffline: false), const BrowseFilters());
+    expect(
+      BrowseFilters.initial(isOffline: true),
+      const BrowseFilters(downloaded: true, downloadedByOffline: true),
+    );
+  });
+
+  group('offline transitions', () {
+    test('going offline switches Downloaded on and marks it as offline\'s', () {
       expect(
-        const BrowseFilters().effectiveDownloaded(isOffline: false),
-        isFalse,
-      );
-      expect(
-        const BrowseFilters(
-          downloaded: true,
-        ).effectiveDownloaded(isOffline: false),
-        isTrue,
+        const BrowseFilters().wentOffline(),
+        const BrowseFilters(downloaded: true, downloadedByOffline: true),
       );
     });
 
-    test('offline forces downloaded-only regardless of the toggle', () {
+    test('going offline keeps an explicit ON as the user\'s', () {
+      const filters = BrowseFilters(downloaded: true);
+      expect(filters.wentOffline(), filters);
+    });
+
+    test('coming back online undoes an untouched offline ON', () {
       expect(
-        const BrowseFilters().effectiveDownloaded(isOffline: true),
-        isTrue,
-      );
-      expect(
-        const BrowseFilters(
-          downloaded: true,
-        ).effectiveDownloaded(isOffline: true),
-        isTrue,
+        const BrowseFilters().wentOffline().cameOnline(),
+        const BrowseFilters(),
       );
     });
 
-    test('the offline lock never rewrites the user value', () {
-      // The page keeps one BrowseFilters across an offline period; the lock is
-      // derived, so coming back online restores the explicit choice.
-      const filters = BrowseFilters();
-      expect(filters.effectiveDownloaded(isOffline: true), isTrue);
-      expect(filters.downloaded, isFalse);
-      expect(filters.effectiveDownloaded(isOffline: false), isFalse);
+    test('coming back online keeps an explicit ON', () {
+      const filters = BrowseFilters(downloaded: true);
+      expect(filters.wentOffline().cameOnline(), filters);
     });
+
+    test(
+      'a user toggle while offline is the user\'s and survives reconnect',
+      () {
+        final off = const BrowseFilters().wentOffline().userSetDownloaded(
+          false,
+        );
+        expect(off, const BrowseFilters());
+        expect(off.cameOnline(), const BrowseFilters());
+
+        final on = off.userSetDownloaded(true);
+        expect(on, const BrowseFilters(downloaded: true));
+        expect(on.cameOnline(), const BrowseFilters(downloaded: true));
+      },
+    );
   });
 }
