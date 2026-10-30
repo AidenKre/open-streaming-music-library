@@ -3,6 +3,21 @@ import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 
+/// Entity kinds a [BrowseRepository.search] can be asked for.
+enum SearchType { artists, albums, tracks }
+
+typedef LibrarySearchResults = ({
+  List<ArtistUI> artists,
+  List<AlbumUI> albums,
+  List<TrackUI> tracks,
+});
+
+const LibrarySearchResults emptySearchResults = (
+  artists: <ArtistUI>[],
+  albums: <AlbumUI>[],
+  tracks: <TrackUI>[],
+);
+
 class BrowseRepository {
   final AppDatabase _db;
 
@@ -107,16 +122,61 @@ class BrowseRepository {
     return rows.map(TrackUI.fromQueryRow).toList(growable: false);
   }
 
+  /// [tracks] with their local download state re-read from the DB, for lists
+  /// that are snapshots rather than live queries (search results). Order and
+  /// length are preserved; a row whose track has vanished is left as is.
+  Future<List<TrackUI>> withFreshDownloadState(List<TrackUI> tracks) async {
+    if (tracks.isEmpty) return tracks;
+    final states = await _db.getTrackDownloadStates(
+      tracks.map((t) => t.uuidId).toList(),
+    );
+    return tracks.map((t) {
+      final s = states[t.uuidId];
+      if (s == null) return t;
+      return t.copyWith(
+        filePath: s.filePath,
+        downloadedBitrateKbps: s.downloadedBitrateKbps,
+        fileSizeBytes: s.fileSizeBytes,
+        downloadedQuality: s.downloadedQuality,
+        // Staleness compares these against `revision`, so patch all four
+        // together or a re-download/dismiss would read inconsistently.
+        revision: s.revision,
+        downloadedAtRevision: s.downloadedAtRevision,
+        downloadedCodec: s.downloadedCodec,
+        staleDismissedAtRevision: s.staleDismissedAtRevision,
+      );
+    }).toList(growable: false);
+  }
+
   // ── Search ──────────────────────────────────────────────────────────────
 
-  Future<({List<ArtistUI> artists, List<AlbumUI> albums, List<TrackUI> tracks})>
-  search(
+  /// The one FTS search used by every search surface: the global Search page
+  /// asks for all [types], an in-page browse search for just its own, and
+  /// Phase 4's Home reuses the same call. [downloadedOnly] is applied inside
+  /// the FTS query (before the per-type LIMIT), so a low-ranked downloaded
+  /// match is never cut off. Keep [limitPerType] well under 999: hydration
+  /// binds one SQL variable per hit.
+  Future<LibrarySearchResults> search(
     String query, {
+    Set<SearchType> types = const {
+      SearchType.artists,
+      SearchType.albums,
+      SearchType.tracks,
+    },
     int limitPerType = 5,
     bool downloadedOnly = false,
   }) async {
+    // SQLite reads a negative LIMIT as "no limit".
+    assert(
+      limitPerType > 0 && limitPerType < 999,
+      'limitPerType must be in 1..998, got $limitPerType',
+    );
+    if (types.isEmpty) return emptySearchResults;
     final results = await _db.getSearchResults(
       query,
+      searchArtists: types.contains(SearchType.artists),
+      searchAlbums: types.contains(SearchType.albums),
+      searchTracks: types.contains(SearchType.tracks),
       limitPerType: limitPerType,
       downloadedOnly: downloadedOnly,
     );

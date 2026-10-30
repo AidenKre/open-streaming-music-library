@@ -7,7 +7,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
-import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
+import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class DownloadedTracksPage extends ConsumerStatefulWidget {

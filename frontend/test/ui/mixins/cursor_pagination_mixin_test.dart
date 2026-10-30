@@ -182,4 +182,233 @@ void main() {
             'the new reactive window emitted');
     expect(host.hasMore, isTrue);
   });
+
+  // Fake clock (testWidgets): the 150ms quiet timer is advanced exactly,
+  // never waited out in real time.
+  group('suspendPagination', () {
+    late StreamController<List<int>> controller;
+    late _Host host;
+    late int watchCalls;
+
+    setUp(() {
+      controller = StreamController<List<int>>.broadcast();
+      watchCalls = 0;
+      host = _Host(({required limit}) {
+        watchCalls++;
+        return controller.stream.map((all) => all.take(limit).toList());
+      });
+    });
+
+    tearDown(() async {
+      host.disposePagination();
+      host.scrollController.dispose();
+      await controller.close();
+    });
+
+    /// Past the 150ms quiet window, so any trailing delivery has flushed.
+    Future<void> pastQuiet(WidgetTester tester) =>
+        tester.pump(const Duration(milliseconds: 151));
+
+    testWidgets('stops delivering window emissions', (tester) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      expect(host.isPaginationSuspended, isFalse);
+
+      host.suspendPagination();
+      expect(host.isPaginationSuspended, isTrue);
+      // A DB write underneath search mode must not touch the dormant list.
+      controller.add([7, 8]);
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [1, 2]);
+    });
+
+    testWidgets('drops a trailing emission held by the quiet timer', (
+      tester,
+    ) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await tester.pump(); // leading edge delivered, quiet timer armed
+      controller.add([3, 4]); // held for the trailing edge
+      await tester.pump();
+      expect(host.paginatedItems, [1, 2]);
+
+      host.suspendPagination();
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [1, 2]);
+    });
+
+    testWidgets('makes loadMore (the scroll listener\'s only action) a '
+        'no-op', (tester) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      final callsBefore = watchCalls;
+
+      host.suspendPagination();
+      host.loadMore();
+      host.loadMore();
+      expect(watchCalls, callsBefore);
+      expect(host.isLoading, isFalse);
+    });
+
+    testWidgets('clears a load-more that was in flight', (tester) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      host.loadMore();
+      expect(host.isLoading, isTrue);
+
+      host.suspendPagination();
+      expect(host.isLoading, isFalse);
+      controller.add([1, 2, 3, 4]); // the grown window lands too late
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [1, 2]);
+    });
+
+    testWidgets('suspending twice is harmless; one resume wakes it', (
+      tester,
+    ) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      host.suspendPagination();
+      host.suspendPagination();
+      expect(host.isPaginationSuspended, isTrue);
+
+      host.resumePagination();
+      expect(host.isPaginationSuspended, isFalse);
+      controller.add([3, 4]);
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [3, 4]);
+    });
+
+    testWidgets('resume restarts from the first page', (tester) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      host.loadMore();
+      controller.add([1, 2, 3, 4]);
+      await pastQuiet(tester);
+
+      host.suspendPagination();
+      host.resumePagination();
+      expect(host.isPaginationSuspended, isFalse);
+      expect(host.paginatedItems, isEmpty, reason: 'old rows cleared');
+      controller.add([5, 6, 7]);
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [5, 6], reason: 'window reset to pageSize');
+
+      // And growth works again after resuming.
+      host.loadMore();
+      controller.add([5, 6, 7]);
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [5, 6, 7]);
+      expect(host.hasMore, isFalse, reason: 'short window = last page');
+    });
+
+    testWidgets('a window of exactly one page needs one more grow to learn '
+        'it is the last', (tester) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      expect(host.hasMore, isTrue);
+      host.loadMore();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [1, 2]);
+      expect(host.hasMore, isFalse);
+      final calls = watchCalls;
+      host.loadMore();
+      expect(watchCalls, calls, reason: 'no subscribe past the last page');
+    });
+
+    testWidgets('refresh while suspended is a no-op: whatever replaced the '
+        'list stays in charge', (tester) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      host.suspendPagination();
+      final calls = watchCalls;
+
+      // e.g. an offline listener that doesn't know about search mode.
+      host.refresh();
+      expect(host.isPaginationSuspended, isTrue);
+      expect(watchCalls, calls, reason: 'no re-subscribe while suspended');
+      controller.add([7, 8]);
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [1, 2], reason: 'dormant rows untouched');
+
+      // Resuming picks up whatever the parameters became meanwhile.
+      host.resumePagination();
+      expect(watchCalls, calls + 1);
+      controller.add([7, 8]);
+      await pastQuiet(tester);
+      expect(host.paginatedItems, [7, 8]);
+    });
+
+    testWidgets('resume without a suspend is a no-op', (tester) async {
+      host.initPagination();
+      controller.add([1, 2]);
+      await pastQuiet(tester);
+      final calls = watchCalls;
+
+      host.resumePagination();
+      expect(watchCalls, calls);
+      expect(host.paginatedItems, [1, 2]);
+    });
+  });
+
+  // A filter that narrows the list leaves a deep offset past the new first
+  // page; clamping it fires no scroll notification, so without the reset the
+  // user is stranded at a load-more spinner that never loads.
+  group('restart scrolls back to the top', () {
+    late StreamController<List<int>> controller;
+    late _Host host;
+
+    setUp(() {
+      controller = StreamController<List<int>>.broadcast();
+      host = _Host(
+        ({required limit}) =>
+            controller.stream.map((all) => all.take(limit).toList()),
+      );
+    });
+
+    tearDown(() async {
+      host.disposePagination();
+      host.scrollController.dispose();
+      await controller.close();
+    });
+
+    Future<void> mountScrolledDeep(WidgetTester tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ListView.builder(
+            controller: host.scrollController,
+            itemCount: 200,
+            itemBuilder: (_, i) => SizedBox(height: 50, child: Text('$i')),
+          ),
+        ),
+      );
+      host.scrollController.jumpTo(5000);
+      await tester.pump();
+      expect(host.scrollController.offset, 5000);
+    }
+
+    testWidgets('on refresh', (tester) async {
+      host.initPagination();
+      await mountScrolledDeep(tester);
+      host.refresh();
+      expect(host.scrollController.offset, 0);
+      expect(host.paginatedItems, isEmpty);
+    });
+
+    testWidgets('on resume', (tester) async {
+      host.initPagination();
+      await mountScrolledDeep(tester);
+      host.suspendPagination();
+      host.resumePagination();
+      expect(host.scrollController.offset, 0);
+    });
+  });
 }
