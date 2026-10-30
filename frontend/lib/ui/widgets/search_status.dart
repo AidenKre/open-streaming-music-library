@@ -14,6 +14,9 @@ String noSearchResultsMessage({
   return 'No $kind match "$query".';
 }
 
+/// Copy for a search that threw, so a failure never reads as "no matches".
+const searchFailedMessage = "Couldn't search your library. Try again.";
+
 /// Shown under capped search results: search mode has no infinite scroll, so
 /// a full page of results means there may be more.
 class SearchCappedHint extends StatelessWidget {

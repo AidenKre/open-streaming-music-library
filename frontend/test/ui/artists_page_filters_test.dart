@@ -141,6 +141,48 @@ void main() {
       await teardownTree(tester);
     });
 
+    testWidgets('created offline and untouched: reconnecting switches the '
+        'chip off and shows everything', (tester) async {
+      await pumpRoot(tester, offline: true);
+      expect(chip(tester).selected, isTrue);
+
+      await setOffline(tester, false);
+      expect(chip(tester).selected, isFalse);
+      expect(find.text('Streaming Artist'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a chip toggle while scrolled deep restarts at the top', (
+      tester,
+    ) async {
+      await seedLibrary(db, [
+        for (var i = 0; i < 200; i++)
+          SeedTrack(
+            uuid: 'bulk$i',
+            title: 'Bulk $i',
+            artistId: 100 + i,
+            artist: 'Bulk ${i.toString().padLeft(3, '0')}',
+            downloaded: i.isEven,
+          ),
+      ]);
+      await pumpRoot(tester);
+      final grid = find.byType(GridView);
+      for (var i = 0; i < 15; i++) {
+        await tester.drag(grid, const Offset(0, -3000));
+        await tester.pumpAndSettle();
+      }
+      final state =
+          tester.state(find.byType(ArtistsPage))
+              as CursorPaginationMixin<ArtistUI>;
+      expect(state.paginatedItems.length, greaterThan(60));
+
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(state.scrollController.offset, 0);
+      expect(state.paginatedItems.length, 30);
+      await teardownTree(tester);
+    });
+
     testWidgets('coming back online keeps an explicit ON', (tester) async {
       await pumpRoot(tester);
       await tester.tap(find.byKey(FilterBar.downloadedChipKey));
@@ -276,15 +318,40 @@ void main() {
       await teardownTree(tester);
     });
 
-    testWidgets('clearing returns to browse through refresh()', (tester) async {
+    testWidgets('clearing resumes browse from a fresh window', (tester) async {
       await pumpRoot(tester);
       await search(tester, 'Downloaded');
+      // Written while browse sleeps: only a re-subscribed window shows it.
+      await db
+          .into(db.artists)
+          .insert(
+            const ArtistsCompanion(id: Value(99), name: Value('New Artist')),
+          );
+      await tester.pumpAndSettle();
 
       await tester.tap(find.byIcon(Icons.clear));
       await tester.pumpAndSettle();
       expect(pageState(tester).isPaginationSuspended, isFalse);
       expect(find.text('Downloaded Artist'), findsOneWidget);
       expect(find.text('Streaming Artist'), findsOneWidget);
+      expect(find.text('New Artist'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a chip toggled during search still applies after clearing', (
+      tester,
+    ) async {
+      await pumpRoot(tester);
+      await search(tester, 'Artist');
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(find.text('Streaming Artist'), findsNothing);
+
+      await tester.tap(find.byIcon(Icons.clear));
+      await tester.pumpAndSettle();
+      expect(chip(tester).selected, isTrue);
+      expect(find.text('Downloaded Artist'), findsOneWidget);
+      expect(find.text('Streaming Artist'), findsNothing);
       await teardownTree(tester);
     });
 

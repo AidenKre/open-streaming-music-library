@@ -54,8 +54,149 @@ void main() {
     expect(find.byIcon(Icons.clear), findsNothing);
   });
 
-  testWidgets('passes autofocus through', (tester) async {
+  testWidgets('autofocus focuses the field; without it, it stays '
+      'unfocused', (tester) async {
+    bool hasFocus() => tester
+        .widget<EditableText>(find.byType(EditableText))
+        .focusNode
+        .hasFocus;
     await tester.pumpWidget(harness(autofocus: true));
-    expect(tester.widget<TextField>(find.byType(TextField)).autofocus, isTrue);
+    await tester.pump();
+    expect(hasFocus(), isTrue);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpWidget(harness());
+    await tester.pump();
+    expect(hasFocus(), isFalse);
+  });
+
+  testWidgets('the keyboard search action reports the text', (tester) async {
+    final submitted = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: LibrarySearchField(
+            hintText: 'Search',
+            onChanged: (_) {},
+            onSubmitted: submitted.add,
+            onCleared: () {},
+          ),
+        ),
+      ),
+    );
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).textInputAction,
+      TextInputAction.search,
+    );
+    await tester.enterText(find.byType(TextField), 'Blue');
+    await tester.testTextInput.receiveAction(TextInputAction.search);
+    expect(submitted, ['Blue']);
+  });
+
+  group('page-owned controller and focus', () {
+    late TextEditingController controller;
+    late List<int> cleared;
+
+    setUp(() {
+      controller = TextEditingController();
+      cleared = [];
+    });
+    tearDown(() => controller.dispose());
+
+    Widget field({TextEditingController? c, FocusNode? focusNode}) =>
+        MaterialApp(
+          home: Scaffold(
+            body: LibrarySearchField(
+              hintText: 'Search',
+              controller: c,
+              focusNode: focusNode,
+              onChanged: (_) {},
+              onCleared: () => cleared.add(1),
+            ),
+          ),
+        );
+
+    testWidgets('the clear button follows text the page sets or clears', (
+      tester,
+    ) async {
+      await tester.pumpWidget(field(c: controller));
+      expect(find.byTooltip('Clear search'), findsNothing);
+
+      controller.text = 'abc';
+      await tester.pump();
+      expect(find.byTooltip('Clear search'), findsOneWidget);
+
+      controller.clear();
+      await tester.pump();
+      expect(find.byTooltip('Clear search'), findsNothing);
+    });
+
+    testWidgets('the clear button empties the page\'s controller', (
+      tester,
+    ) async {
+      await tester.pumpWidget(field(c: controller));
+      await tester.enterText(find.byType(TextField), 'abc');
+      await tester.pump();
+      await tester.tap(find.byTooltip('Clear search'));
+      await tester.pump();
+      expect(controller.text, isEmpty);
+      expect(cleared, [1]);
+    });
+
+    testWidgets('dropping the page\'s controller keeps the text it showed', (
+      tester,
+    ) async {
+      await tester.pumpWidget(field(c: controller));
+      await tester.enterText(find.byType(TextField), 'abc');
+      await tester.pumpWidget(field());
+      expect(find.text('abc'), findsOneWidget);
+      expect(find.byTooltip('Clear search'), findsOneWidget);
+
+      // And handing over to a page controller shows its text instead.
+      controller.text = 'xyz';
+      await tester.pumpWidget(field(c: controller));
+      expect(find.text('xyz'), findsOneWidget);
+    });
+
+    testWidgets('uses the page\'s focus node', (tester) async {
+      final node = FocusNode();
+      addTearDown(node.dispose);
+      await tester.pumpWidget(field(focusNode: node));
+      node.requestFocus();
+      await tester.pump();
+      expect(
+        tester.widget<EditableText>(find.byType(EditableText)).focusNode,
+        same(node),
+      );
+      expect(node.hasFocus, isTrue);
+    });
+  });
+
+  testWidgets('an external controller keeps the text across a remount and is '
+      'not disposed by the field', (tester) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+    Widget field({Key? key}) => MaterialApp(
+      home: Scaffold(
+        body: LibrarySearchField(
+          key: key,
+          hintText: 'Search',
+          controller: controller,
+          onChanged: (_) {},
+          onCleared: () {},
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(field(key: const ValueKey(1)));
+    await tester.enterText(find.byType(TextField), 'abc');
+    await tester.pump();
+    // A different key disposes the old field state and builds a new one.
+    await tester.pumpWidget(field(key: const ValueKey(2)));
+    expect(find.text('abc'), findsOneWidget);
+    expect(find.byTooltip('Clear search'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    controller.text = 'still usable'; // throws if the field disposed it
   });
 }

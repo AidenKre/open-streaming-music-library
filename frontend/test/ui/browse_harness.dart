@@ -14,6 +14,7 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
@@ -209,7 +210,13 @@ class BrowseHarness {
     if (await tempDir.exists()) await tempDir.delete(recursive: true);
   }
 
-  Widget wrap(Widget child, {bool offline = false}) {
+  /// [repository] replaces the real one (e.g. to make search fail).
+  Widget wrap(
+    Widget child, {
+    bool offline = false,
+    AppInfo appInfo = const AppInfo(),
+    BrowseRepository? repository,
+  }) {
     this.offline = TestOffline(offline);
     return ProviderScope(
       overrides: [
@@ -218,9 +225,11 @@ class BrowseHarness {
         downloadManagerProvider.overrideWithValue(manager),
         offlineModeProvider.overrideWith(() => this.offline),
         trackSyncProvider.overrideWith(StubTrackSync.new),
-        appInfoProvider.overrideWith((ref) async => const AppInfo()),
+        appInfoProvider.overrideWith((ref) async => appInfo),
         conversionJobsProvider.overrideWith(EmptyConversionJobs.new),
         audioProvider.overrideWith(() => audio),
+        if (repository != null)
+          browseRepositoryProvider.overrideWithValue(repository),
       ],
       child: MaterialApp(home: child),
     );

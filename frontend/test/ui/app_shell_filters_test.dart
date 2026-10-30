@@ -132,4 +132,118 @@ void main() {
     expect(find.text('Remote Song'), findsOneWidget);
     await teardownTree(tester);
   });
+
+  // Riverpod pauses a consumer's listeners while TickerMode is off (an
+  // offstage IndexedStack tab, a route covered by another) and replays only
+  // the last missed (prev, next) on resume. The transitions must still come
+  // out right.
+  group('offline transitions on a hidden root', () {
+    Future<void> setOffline(WidgetTester tester, bool value) async {
+      h.offline.set(value);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a hidden tab catches up on outage and recovery', (
+      tester,
+    ) async {
+      await pumpShell(tester); // Artists visible, Tracks hidden
+      await setOffline(tester, true);
+      await openTab(tester, 'Tracks');
+      expect(visibleChip(tester).selected, isTrue, reason: 'auto-applied');
+      expect(find.text('Remote Song'), findsNothing);
+
+      await openTab(tester, 'Artists');
+      await setOffline(tester, false);
+      await openTab(tester, 'Tracks');
+      expect(visibleChip(tester).selected, isFalse, reason: 'auto undone');
+      expect(find.text('Remote Song'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('an outage and recovery both while hidden net to no change, '
+        'and neither tab takes the other\'s choice', (tester) async {
+      await pumpShell(tester);
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey)); // Artists ON
+      await tester.pumpAndSettle();
+
+      await setOffline(tester, true);
+      // Explicit OFF on Artists while offline.
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      expect(visibleChip(tester).selected, isFalse);
+      await setOffline(tester, false);
+      expect(visibleChip(tester).selected, isFalse, reason: 'user OFF kept');
+      await setOffline(tester, true);
+      expect(visibleChip(tester).selected, isTrue, reason: 'new outage');
+      await setOffline(tester, false);
+      expect(visibleChip(tester).selected, isFalse);
+
+      // Tracks saw all four transitions only as a replay of the last one.
+      await openTab(tester, 'Tracks');
+      expect(visibleChip(tester).selected, isFalse);
+      expect(find.text('Remote Song'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a hidden tab keeps an explicit ON through outage and '
+        'recovery', (tester) async {
+      await pumpShell(tester);
+      await openTab(tester, 'Tracks');
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey));
+      await tester.pumpAndSettle();
+      await openTab(tester, 'Artists');
+
+      await setOffline(tester, true);
+      await setOffline(tester, false);
+      await openTab(tester, 'Tracks');
+      expect(visibleChip(tester).selected, isTrue);
+      expect(find.text('Remote Song'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a root covered by a detail route applies the outage once '
+        'uncovered', (tester) async {
+      await pumpShell(tester);
+      await tester.tap(find.text('Streaming Artist'));
+      await tester.pumpAndSettle();
+      expect(find.byType(FilterBar), findsNothing);
+
+      await setOffline(tester, true);
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+      expect(visibleChip(tester).selected, isTrue);
+      expect(find.text('Streaming Artist'), findsNothing);
+
+      await tester.tap(find.text('Downloaded Artist'));
+      await tester.pumpAndSettle();
+      await setOffline(tester, false);
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+      expect(visibleChip(tester).selected, isFalse);
+      expect(find.text('Streaming Artist'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a hidden tab\'s in-page search re-runs on resume', (
+      tester,
+    ) async {
+      await pumpShell(tester);
+      await openTab(tester, 'Tracks');
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Search tracks'),
+        'Song',
+      );
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pumpAndSettle();
+      expect(find.text('Remote Song'), findsOneWidget);
+
+      await openTab(tester, 'Artists');
+      await setOffline(tester, true);
+      await openTab(tester, 'Tracks');
+      expect(visibleChip(tester).selected, isTrue);
+      expect(find.text('Remote Song'), findsNothing);
+      expect(find.text('Kept Song'), findsOneWidget);
+      await teardownTree(tester);
+    });
+  });
 }

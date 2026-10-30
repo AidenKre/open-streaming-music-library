@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -10,15 +9,12 @@ import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
-import 'package:frontend/ui/mixins/in_page_search_mixin.dart';
-import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
+import 'package:frontend/ui/mixins/root_browse_mixin.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
-import 'package:frontend/ui/widgets/filter_bar.dart';
-import 'package:frontend/ui/widgets/library_search_field.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
-import 'package:frontend/ui/widgets/search_status.dart';
+import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
   /// True when rendered as a root tab inside [AppShell]; the page then owns
@@ -34,22 +30,18 @@ class ArtistsPage extends ConsumerStatefulWidget {
 class _ArtistPageState extends ConsumerState<ArtistsPage>
     with
         CursorPaginationMixin<ArtistUI>,
-        InPageSearchMixin<ArtistsPage, ArtistUI> {
+        RootBrowseMixin<ArtistsPage, ArtistUI> {
   @override
   final scrollController = ScrollController();
 
   @override
   int get pageSize => 30;
 
-  /// Chip selection for this tab; session-only (survives tab switches via
-  /// the shell's IndexedStack, never persisted). Offline switches Downloaded
-  /// on but the user may switch it off again (see [BrowseFilters]).
-  late BrowseFilters _filters;
-
   /// Root: the chip. A non-root instance has no chip, so offline it filters
   /// to what's playable, as before Phase 3.
-  bool get _downloadedOnly =>
-      widget.isRoot ? _filters.downloaded : ref.read(offlineModeProvider);
+  bool get _downloadedOnly => hasBrowseControls
+      ? filters.downloaded
+      : ref.read(offlineModeProvider);
 
   List<ArtistOrderParameter> get _orderParams => [
     ArtistOrderParameter(column: 'name'),
@@ -59,19 +51,13 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   void initState() {
     super.initState();
     Future.microtask(() => ref.read(trackSyncProvider.notifier).sync());
-    _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
+    if (widget.isRoot) initRootBrowse(type: SearchType.artists);
     initPagination();
-    if (widget.isRoot) {
-      initInPageSearch(
-        type: SearchType.artists,
-        downloadedOnly: () => _downloadedOnly,
-      );
-    }
   }
 
   @override
   void dispose() {
-    disposeInPageSearch();
+    disposeRootBrowse();
     disposePagination();
     scrollController.dispose();
     super.dispose();
@@ -87,17 +73,6 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
     );
   }
 
-  /// A filtered window that settled with nothing in it. The selected chip
-  /// already says why; this says it in words.
-  bool get _showFilteredEmpty =>
-      widget.isRoot && _downloadedOnly && !hasMore && paginatedItems.isEmpty;
-
-  void _onFiltersChanged(BrowseFilters filters) {
-    if (filters == _filters) return;
-    setState(() => _filters = filters);
-    onBrowseParamsChanged();
-  }
-
   void _onArtistTap(ArtistUI artist) {
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -111,42 +86,20 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
 
   @override
   Widget build(BuildContext context) {
-    // Offline switches the root chip on (and reconnecting may switch it back
-    // off); a non-root instance filters by the flag itself. Either way the
-    // items on screen came from a different filter, so re-fetch from page 1
-    // (or re-run the search).
-    ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (prev == next) return;
-      if (widget.isRoot) {
-        _onFiltersChanged(
-          next ? _filters.wentOffline() : _filters.cameOnline(),
-        );
-      } else {
-        onBrowseParamsChanged();
-      }
-    });
-    ref.listen(downloadStatusVersionProvider, (_, _) {
-      onDownloadStatusChanged();
-    });
+    // A non-root instance filters by the offline flag itself, so a flip
+    // means the items on screen came from a different filter.
+    listenForBrowseChanges(refreshOnOfflineChange: true);
     final isOffline = ref.watch(offlineModeProvider);
     final body = Column(
       children: [
-        if (widget.isRoot) ...[
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: LibrarySearchField(
-              hintText: 'Search artists',
-              onChanged: search.onQueryChanged,
-              onCleared: search.clear,
-            ),
-          ),
-          FilterBar(filters: _filters, onChanged: _onFiltersChanged),
-        ] else if (isOffline)
+        if (hasBrowseControls)
+          buildBrowseHeader(hintText: 'Search artists')
+        else if (isOffline)
           const DownloadedOnlyBadge(),
         Expanded(
           child: isSearchMode
               ? _buildSearchResults(isOffline)
-              : _showFilteredEmpty
+              : showDownloadedEmpty
               ? const ListStatusMessage('No downloaded artists yet.')
               : _buildGrid(
                   paginatedItems,
@@ -171,28 +124,13 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   }
 
   Widget _buildSearchResults(bool isOffline) {
-    final artists = search.results.artists;
-    if (artists.isEmpty) {
-      if (search.isSearching) {
-        return const Center(child: CircularProgressIndicator());
-      }
-      return ListStatusMessage(
-        noSearchResultsMessage(
-          noun: 'artists',
-          query: search.query,
-          downloadedOnly: _downloadedOnly,
-        ),
-      );
-    }
-    return Column(
-      children: [
-        if (search.isCapped) const SearchCappedHint(cap: kInPageSearchCap),
-        Expanded(
-          // Its own (absent) scroll controller: scrolling results must never
-          // reach the browse window's load-more listener.
-          child: _buildGrid(artists, showLoader: false, isOffline: isOffline),
-        ),
-      ],
+    return buildSearchBody(
+      results: search.results.artists,
+      noun: 'artists',
+      // Its own (absent) scroll controller: scrolling results must never
+      // reach the browse window's load-more listener.
+      builder: (artists) =>
+          _buildGrid(artists, showLoader: false, isOffline: isOffline),
     );
   }
 

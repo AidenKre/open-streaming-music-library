@@ -694,6 +694,35 @@ const staleDownloadPredicate =
     'AND (t.stale_dismissed_at_revision IS NULL '
     'OR t.revision > t.stale_dismissed_at_revision)';
 
+/// SQL `EXISTS` test: some track whose `trackmetadata.[column]` equals
+/// [owner] has a downloaded file. The one definition of "has downloads",
+/// shared by browse and search so the Downloaded filter means the same thing
+/// on every surface.
+String _hasDownloadedTrack(String column, String owner) =>
+    'EXISTS (SELECT 1 FROM trackmetadata tm '
+    'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
+    'WHERE tm.$column = $owner AND t.file_path IS NOT NULL)';
+
+/// Scalar subquery picking the cover art for the tracks whose
+/// `trackmetadata.[column]` equals [owner]: the lowest-numbered track with
+/// art. With [downloadedOnly] only downloaded tracks qualify; otherwise the
+/// chosen `cover_art_id` may belong to a streaming-only track and resolving
+/// it needs a network round trip. Shared by browse and search so an artist or
+/// album shows the same cover in both.
+String _coverArtSubquery(
+  String column,
+  String owner, {
+  required bool downloadedOnly,
+}) =>
+    'SELECT tm.cover_art_id FROM trackmetadata tm '
+    '${downloadedOnly ? 'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id ' : ''}'
+    'WHERE tm.$column = $owner '
+    'AND tm.has_album_art = 1 '
+    'AND tm.cover_art_id IS NOT NULL '
+    '${downloadedOnly ? 'AND t.file_path IS NOT NULL ' : ''}'
+    'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
+    'LIMIT 1';
+
 /// Nulls every column that marks a track as downloaded. The single shared
 /// definition for every clear path (delete, reset fence, a commit undone by a
 /// reset) so adding a downloaded-state column can't leave a row half-cleared.
@@ -1501,24 +1530,11 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }) {
     final vars = <Variable>[];
 
-    // When offline, the cover-art subquery must restrict candidate tracks to
-    // downloaded ones; otherwise the chosen `cover_art_id` may belong to a
-    // streaming-only track and resolving it requires a network round trip.
-    final coverArtSubquery = downloadedOnly
-        ? 'SELECT tm.cover_art_id FROM trackmetadata tm '
-            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-            'WHERE tm.artist_id = artists.id '
-            'AND tm.has_album_art = 1 '
-            'AND tm.cover_art_id IS NOT NULL '
-            'AND t.file_path IS NOT NULL '
-            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-            'LIMIT 1'
-        : 'SELECT tm.cover_art_id FROM trackmetadata tm '
-            'WHERE tm.artist_id = artists.id '
-            'AND tm.has_album_art = 1 '
-            'AND tm.cover_art_id IS NOT NULL '
-            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-            'LIMIT 1';
+    final coverArtSubquery = _coverArtSubquery(
+      'artist_id',
+      'artists.id',
+      downloadedOnly: downloadedOnly,
+    );
 
     var query =
         'SELECT id, name, '
@@ -1530,11 +1546,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     if (downloadedOnly) {
       // Artist appears iff at least one of their tracks is downloaded. EXISTS
       // short-circuits on first hit, so this is cheaper than a COUNT.
-      whereClauses.add(
-        'EXISTS (SELECT 1 FROM trackmetadata tm '
-        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-        'WHERE tm.artist_id = artists.id AND t.file_path IS NOT NULL)',
-      );
+      whereClauses.add(_hasDownloadedTrack('artist_id', 'artists.id'));
     }
 
     // Cursor filter
@@ -1655,24 +1667,11 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }) {
     final vars = <Variable>[];
 
-    // See [getArtists] — when offline, restrict the cover-art subquery to
-    // tracks that are downloaded so the chosen `cover_art_id` resolves
-    // locally instead of triggering a streaming fallback.
-    final coverArtSubquery = downloadedOnly
-        ? 'SELECT tm.cover_art_id FROM trackmetadata tm '
-            'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-            'WHERE tm.album_id = a.id '
-            'AND tm.has_album_art = 1 '
-            'AND tm.cover_art_id IS NOT NULL '
-            'AND t.file_path IS NOT NULL '
-            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-            'LIMIT 1'
-        : 'SELECT tm.cover_art_id FROM trackmetadata tm '
-            'WHERE tm.album_id = a.id '
-            'AND tm.has_album_art = 1 '
-            'AND tm.cover_art_id IS NOT NULL '
-            'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-            'LIMIT 1';
+    final coverArtSubquery = _coverArtSubquery(
+      'album_id',
+      'a.id',
+      downloadedOnly: downloadedOnly,
+    );
 
     var sql =
         'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
@@ -1689,11 +1688,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
 
     if (downloadedOnly) {
-      whereClauses.add(
-        'EXISTS (SELECT 1 FROM trackmetadata tm '
-        'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-        'WHERE tm.album_id = a.id AND t.file_path IS NOT NULL)',
-      );
+      whereClauses.add(_hasDownloadedTrack('album_id', 'a.id'));
     }
 
     // Cursor filter
@@ -1806,25 +1801,31 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     // LIMIT — otherwise a downloaded match ranked below limitPerType would be
     // dropped before we ever see it.
     final trackDownloadedFilter = downloadedOnly
-        ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
-              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-              'WHERE tm.rowid = fts_tracks.rowid AND t.file_path IS NOT NULL)'
+        ? ' AND ${_hasDownloadedTrack('rowid', 'fts_tracks.rowid')}'
         : '';
     final artistDownloadedFilter = downloadedOnly
-        ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
-              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-              'WHERE tm.artist_id = fts_artists.rowid AND t.file_path IS NOT NULL)'
+        ? ' AND ${_hasDownloadedTrack('artist_id', 'fts_artists.rowid')}'
         : '';
     final albumDownloadedFilter = downloadedOnly
-        ? ' AND EXISTS (SELECT 1 FROM trackmetadata tm '
-              'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-              'WHERE tm.album_id = fts_albums.rowid AND t.file_path IS NOT NULL)'
+        ? ' AND ${_hasDownloadedTrack('album_id', 'fts_albums.rowid')}'
         : '';
+    // Same cover rule as browse, so a result shows the same art as its
+    // browse card (and, filtered, art that resolves offline).
+    final artistCoverArt = _coverArtSubquery(
+      'artist_id',
+      'artists.id',
+      downloadedOnly: downloadedOnly,
+    );
+    final albumCoverArt = _coverArtSubquery(
+      'album_id',
+      'a.id',
+      downloadedOnly: downloadedOnly,
+    );
 
     if (searchTracks) {
       final ftsRows = await customSelect(
         'SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH ?'
-        '$trackDownloadedFilter ORDER BY rank LIMIT ?',
+        '$trackDownloadedFilter ORDER BY rank, rowid LIMIT ?',
         variables: [
           Variable.withString(ftsQuery),
           Variable.withInt(limitPerType),
@@ -1859,7 +1860,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     if (searchArtists) {
       final ftsRows = await customSelect(
         'SELECT rowid FROM fts_artists WHERE fts_artists MATCH ?'
-        '$artistDownloadedFilter ORDER BY rank LIMIT ?',
+        '$artistDownloadedFilter ORDER BY rank, rowid LIMIT ?',
         variables: [
           Variable.withString(ftsQuery),
           Variable.withInt(limitPerType),
@@ -1872,15 +1873,10 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
         final vars = artistIds.map((id) => Variable.withInt(id)).toList();
         final fullRows = await customSelect(
           'SELECT id, name, '
-          '(SELECT tm.cover_art_id FROM trackmetadata tm '
-          'WHERE tm.artist_id = artists.id '
-          'AND tm.has_album_art = 1 '
-          'AND tm.cover_art_id IS NOT NULL '
-          'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-          'LIMIT 1) AS cover_art_id '
+          '($artistCoverArt) AS cover_art_id '
           'FROM artists WHERE id IN ($placeholders)',
           variables: vars,
-          readsFrom: {artists, trackmetadata},
+          readsFrom: {artists, trackmetadata, tracks},
         ).get();
         final idOrder = {
           for (var i = 0; i < artistIds.length; i++) artistIds[i]: i,
@@ -1898,7 +1894,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     if (searchAlbums) {
       final ftsRows = await customSelect(
         'SELECT rowid FROM fts_albums WHERE fts_albums MATCH ?'
-        '$albumDownloadedFilter ORDER BY rank LIMIT ?',
+        '$albumDownloadedFilter ORDER BY rank, rowid LIMIT ?',
         variables: [
           Variable.withString(ftsQuery),
           Variable.withInt(limitPerType),
@@ -1912,17 +1908,12 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
         final fullRows = await customSelect(
           'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
           'a."year", a.is_single_grouping, '
-          '(SELECT tm.cover_art_id FROM trackmetadata tm '
-          'WHERE tm.album_id = a.id '
-          'AND tm.has_album_art = 1 '
-          'AND tm.cover_art_id IS NOT NULL '
-          'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-          'LIMIT 1) AS cover_art_id '
+          '($albumCoverArt) AS cover_art_id '
           'FROM albums a '
           'JOIN artists ar ON a.artist_id = ar.id '
           'WHERE a.id IN ($placeholders)',
           variables: vars,
-          readsFrom: {albums, artists, trackmetadata},
+          readsFrom: {albums, artists, trackmetadata, tracks},
         ).get();
         final idOrder = {
           for (var i = 0; i < albumIds.length; i++) albumIds[i]: i,

@@ -118,8 +118,10 @@ frontend/lib/
   ui/widgets/list_status_message.dart   NEW  centered empty-state text (T2.3; reused by search)
   ui/widgets/search_status.dart         NEW  empty-state copy + capped-hint widget (R10)
   ui/utils/library_search_controller.dart NEW shared search primitive (R9, R12, R13)
-  ui/mixins/cursor_pagination_mixin.dart CHG  + suspendPagination / isPaginationSuspended (R11)
-  ui/mixins/in_page_search_mixin.dart   NEW  browse↔search mode switch shared by both root pages; kInPageSearchCap (R11, R12; D10)
+  ui/mixins/cursor_pagination_mixin.dart CHG  + suspendPagination / resumePagination / isPaginationSuspended (R11; D14)
+  ui/mixins/root_browse_mixin.dart      NEW  a root tab's search field + chips and all their wiring; kInPageSearchCap (R11, R12; D10, D13)
+                                             (was in_page_search_mixin.dart until the follow-up review)
+  ui/widgets/top_bar_actions.dart       NEW  buildTopBarActions, moved out of tracks_page.dart (D17)
   repositories/browse_repository.dart   CHG  search(types:), withFreshDownloadState() (R8, R12)
   ui/artist_page.dart                   CHG  root: FilterBar + in-page search
   ui/tracks_page.dart                   CHG  root: FilterBar + in-page search, uniform filtering
@@ -232,14 +234,16 @@ New mixin API:
   memory but are not rendered.
 - `bool get isPaginationSuspended`.
 - `refresh()` clears `_suspended` and re-subscribes from page 1. This is the
-  **only** way back.
+  **only** way back. **Amended (D14):** `resumePagination()` is the only way
+  back; `refresh()` is a no-op while suspended. Every restart also scrolls
+  to the top.
 
 Page logic, the same for Artists and Tracks (root only), driven by a listener on
 the controller:
 
 ```
 controller becomes active   (''  → 'q') : suspendPagination(); setState
-controller becomes inactive ('q' → '' ) : refresh()            // never a bare rebuild
+controller becomes inactive ('q' → '' ) : resumePagination()   // never a bare rebuild (D14; was refresh())
 chip toggled / offline flip             : controller.isActive ? controller.rerun() : refresh()
 downloadStatusVersion bump              : controller.isActive ? controller.onDownloadStatusChanged() : (nothing — the window is reactive)
 ```
@@ -650,6 +654,12 @@ Commits are found with `git log --grep 'T<id>:'` (every task commit is titled `P
 | D8 | `dart format` is enforced on **new** files. In pre-existing files, new code follows the surrounding style and unrelated lines are never reformatted. | The existing tree isn't uniformly formatted, and running the formatter over a pre-existing file rewraps untouched code (discovered in T1.3), which bloats diffs. |
 | D10 | The §3.6 page logic lives in one `InPageSearchMixin` (on `ConsumerState` + `CursorPaginationMixin`), not duplicated in each page. `onBrowseParamsChanged()` and `onDownloadStatusChanged()` route to the visible mode. | Artists and Tracks need identical, race-sensitive wiring. One copy means one place to get it right. Added during T4.1. |
 | D11 | Page tests that delete a download call `DownloadManager.deleteDownload` inside `tester.runAsync`, and each test pumps a single `ProviderScope` per `BrowseHarness`. | `deleteDownload` does real file I/O, which never completes under `testWidgets`' fake async. Riverpod disposes the shared manager with the first scope's `downloadManagerListenableProvider`. Found in T4.1. |
+| D13 | **Amends D10.** The mixin becomes `RootBrowseMixin` (`root_browse_mixin.dart`) and also owns the filters, the offline/download listeners (`listenForBrowseChanges`), the header (`buildBrowseHeader`), the filtered-empty test (`showDownloadedEmpty`) and the search-results frame (`buildSearchBody`). A page supplies only `watchPage` and its row builder. | Follow-up review, 2026-10-29: Artists and Tracks hand-copied this wiring (the subtlest code in the phase), and Phase 4 adds an Albums root and Home. One copy keeps the replay/equality rules in one place. |
+| D14 | `refresh()` is a no-op while suspended; a new `resumePagination()` is the only way out of `suspendPagination()`. Every restart (`refresh` or resume) jumps the list to the top. | A `refresh()` from a caller unaware of search mode (e.g. `AlbumsPage`'s offline listener, once Phase 4 adds search there) would wake the window underneath the results. Without the jump, a chip toggle while scrolled deep clamped the offset to the bottom of the new first page; clamping fires no scroll notification, so the load-more spinner never loaded (follow-up review B1). |
+| D15 | Download events during an in-flight search set a flag; the search lands, then the event is handled once (re-search if filtered, else patch). A newer patch that fails no longer discards an older one that succeeded (`_appliedPatchSeq`). | Restarting the search per event starved it under a burst; `patch != _patchSeq` let a failed newer patch drop a successful older one. Both were in the review's own P3-1/P3-2 fixes. |
+| D16 | The controller exposes `failed`; every surface shows "Couldn't search your library. Try again." instead of the no-match copy (O1). The keyboard search action commits immediately (`submit`). | A failure must not read as "not in my library"; Enter shouldn't wait out the debounce. |
+| D17 | Global Search's field sits above its results (like the root tabs) instead of being the results list's first, lazily built child. The field accepts a page-owned `controller` and `focusNode` and follows the controller's text. `buildTopBarActions` moves to `ui/widgets/top_bar_actions.dart`. The chip bar is start-aligned with the field. | The lazy child was disposed when scrolled away (P3-4) and re-autofocused when rebuilt, reopening the keyboard. Phase 4 needs the page to own text and focus. |
+| D18 | Search hydration picks artist/album cover art with the same rule as browse (downloaded tracks only when filtering), via shared SQL builders `_hasDownloadedTrack` / `_coverArtSubquery` in `database.dart`. FTS results order by `rank, rowid`; `limitPerType` is asserted to be 1..998. | The search copy of the cover subquery had drifted: a filtered search could show a cover from a streaming-only track that doesn't resolve offline. Ties at the cap were arbitrary; SQLite reads a negative LIMIT as unlimited. |
 | D9 | A non-root `ArtistsPage` keeps the badge behaviour. | Only tests use it today. Keeps the R6 rule uniform (FilterBar iff `isRoot`) and the existing badge tests valid. |
 | D12 | **Supersedes the offline lock (R3).** Offline switches the Downloaded chip on but never locks it; reconnecting undoes only an ON that offline applied and the user left alone. The global Search page (no chip) still filters to downloaded offline, unchanged. | User request, 2026-10-28. The lock hid the rest of the library whenever the server was unreachable, even though its metadata is stored locally — that throws away an advantage of the offline-first design. Defaulting to downloaded keeps the common case ("what can I play?") one glance away, and the user can still browse or search everything. Playback stays safe: rows that can't play offline are dimmed and disabled, and `AudioCoordinator.playFromQueue` already forces a downloaded-only queue offline. |
 
@@ -668,6 +678,7 @@ Recorded 2026-10-26 on `phase-3`.
 | `flutter build macos --debug` | ✓ Built `build/macos/Build/Products/Debug/frontend.app` |
 | Mutation check on T5.2 | Album detail rendering a FilterBar fails the detail-route test (reverted) |
 | Re-run after A1 / D12 (2026-10-28) | `flutter test` **993 passed, 0 failed** (+7 for the auto-apply behaviour; the lock-specific assertions were rewritten, not deleted); `flutter analyze` no issues; the 8 touched Phase 3 files `dart format`-clean. No backend change, so `pytest` was not re-run |
+| Re-run after the PR review fixes (2026-10-30, pre-merge) | `flutter test` **1078 passed, 0 failed** (+85 from review rounds 1–2, D13–D18); `flutter analyze` no issues. Still no backend change |
 
 ### 11.2 Requirements trace
 
@@ -677,14 +688,14 @@ Recorded 2026-10-26 on `phase-3`.
 | R2 `FilterBar` | `lib/ui/widgets/filter_bar.dart` | `test/ui/widgets/filter_bar_test.dart` |
 | R3 ~~Offline lock~~ Offline auto-apply + restore (D12) | ~~`FilterBar` (`onSelected: null`), `BrowseFilters.effectiveDownloaded`~~ `BrowseFilters.initial/wentOffline/cameOnline/userSetDownloaded`; the pages' `offlineModeProvider` listeners | `browse_filters_test.dart` offline-transition group; filter_bar "offline-applied ON … stays tappable"; artists/tracks "switched off to browse everything", "undoes the offline switch-on", "keeps an explicit ON", "choice made while offline survives reconnecting" |
 | R4 FilterBar replaces badge | `artist_page.dart` (badge only when non-root); Tracks root never had one | artists "offline … no badge"; the badge tests for non-root/Albums/Search still pass |
-| R5 Per-page, session-only | `_filters` in each page `State` | `app_shell_filters_test.dart` "per tab and survives tab switches" |
-| R6 Root tabs only | `widget.isRoot` gates FilterBar + `initInPageSearch` | tracks detail-route group; artists non-root tests; AppShell artist → albums → detail test |
+| R5 Per-page, session-only | `RootBrowseMixin._filters`, one per page `State` | `app_shell_filters_test.dart` "per tab and survives tab switches" |
+| R6 Root tabs only | `widget.isRoot` gates FilterBar + `initRootBrowse` | tracks detail-route group; artists non-root tests; AppShell artist → albums → detail test |
 | R7 Tracks tab filters uniformly | `TracksPage._downloadedOnly` (root) → `watchTracks` / `playFromQueue` | tracks "offline: the chip switches on and filters (not dims)", "offline: chip off shows the full library, unplayable dimmed" (D12), "the play queue follows the effective filter" |
 | R8 Unified search method | `BrowseRepository.search(types:)` + `SearchType` | repository `search types` group + cap-100 rank-order test |
-| R9 One shared search primitive | `LibrarySearchController`, used by `SearchPage` + `InPageSearchMixin` | `library_search_controller_test.dart` (20); SearchPage suites |
-| R10 Browse vs capped search, empty/capped states | `InPageSearchMixin` (`kInPageSearchCap = 100`), `search_status.dart`, `ListStatusMessage` | artists/tracks in-page search groups (no-match copy, cap-100 hint, no hint below cap) |
-| R11 Race-free mode switch | `CursorPaginationMixin.suspendPagination`, `InPageSearchMixin._onSearchChanged` (suspend on enter, `refresh()` on leave), results list without the browse scroll controller | mixin `suspendPagination` group; "a query swaps … and suspends browse" (DB write under search mode doesn't reach the window); "clearing returns to browse through refresh()" |
-| R12 Composes with filter, offline, download status | `onBrowseParamsChanged`, `onDownloadStatusChanged`, `LibrarySearchController.onDownloadStatusChanged` (D6) | chip-toggle / offline-flip / delete-drops-out / patch-in-place tests on both pages and SearchPage |
+| R9 One shared search primitive | `LibrarySearchController`, used by `SearchPage` + `RootBrowseMixin` (was `InPageSearchMixin`, D13) | `library_search_controller_test.dart` (47); SearchPage suites |
+| R10 Browse vs capped search, empty/capped states | `RootBrowseMixin` (was `InPageSearchMixin`, D13) (`kInPageSearchCap = 100`), `search_status.dart`, `ListStatusMessage` | artists/tracks in-page search groups (no-match copy, cap-100 hint, no hint below cap) |
+| R11 Race-free mode switch | `CursorPaginationMixin.suspendPagination`, `RootBrowseMixin._onSearchChanged` (suspend on enter, `resumePagination()` on leave; D14), results list without the browse scroll controller | mixin `suspendPagination` group; "a query swaps … and suspends browse" (DB write under search mode doesn't reach the window); "clearing resumes browse from a fresh window" |
+| R12 Composes with filter, offline, download status | `RootBrowseMixin.onFiltersChanged` + `listenForBrowseChanges` (was `onBrowseParamsChanged`, D13), `LibrarySearchController.onDownloadStatusChanged` (D6, D15) | chip-toggle / offline-flip / delete-drops-out / patch-in-place tests on both pages and SearchPage |
 | R13 Debounce cancelled on dispose | `LibrarySearchController.dispose` | controller dispose group; "unmounting with a pending debounce leaks nothing" on both pages |
 | R14 No backend changes | n/a | `git diff main -- backend` is empty |
 | R15 No regressions | | full suite, analyze, existing SearchPage/badge/convert-flow tests unmodified. The deliberate behaviour changes are D4 (immediate clear) and R7 (Tracks tab filters offline) |
@@ -705,7 +716,7 @@ Recorded 2026-10-26 on `phase-3`.
 ### 11.4 Known limitations / follow-ups (not Phase 3 requirements)
 
 - Search results are a snapshot. A metadata edit or `/changes` sync while searching isn't reflected until the next query, chip toggle or offline flip (K3; same as the global Search page). Download state *is* kept honest.
-- Returning from search to browse restarts the list at the top (by design: `refresh()` from page 1).
+- Returning from search to browse restarts the list at the top (by design: `resumePagination()` from page 1).
 - Per-page scope means opening an artist from a Downloaded-filtered Artists tab shows **all** of that artist's albums (the detail route doesn't inherit the chip). This is by design per R5/R6; revisit in Phase 4 if it reads oddly.
 - No root Albums tab exists, so albums have no chip or in-page search (D1). The global Search page still searches albums.
 - The design doc (`temp/roadmap/phase-3-filter-chips.md`) is gitignored. Its drift from the as-built code is recorded here in §2.3 and §10.

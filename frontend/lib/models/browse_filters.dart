@@ -17,7 +17,10 @@ class BrowseFilters {
   const BrowseFilters({
     this.downloaded = false,
     this.downloadedByOffline = false,
-  });
+  }) : assert(
+         !downloadedByOffline || downloaded,
+         'only an ON can have been applied by offline',
+       );
 
   /// Starting selection for a page created while [isOffline].
   factory BrowseFilters.initial({required bool isOffline}) => isOffline

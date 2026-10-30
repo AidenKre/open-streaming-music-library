@@ -166,6 +166,11 @@ class BrowseRepository {
     int limitPerType = 5,
     bool downloadedOnly = false,
   }) async {
+    // SQLite reads a negative LIMIT as "no limit".
+    assert(
+      limitPerType > 0 && limitPerType < 999,
+      'limitPerType must be in 1..998, got $limitPerType',
+    );
     if (types.isEmpty) return emptySearchResults;
     final results = await _db.getSearchResults(
       query,

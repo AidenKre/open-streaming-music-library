@@ -192,12 +192,135 @@ void main() {
     });
 
     test('downloadedOnly still applies to a single type', () async {
-      final results = await repo.search(
+      for (final type in SearchType.values) {
+        final none = await repo.search(
+          'Blue',
+          types: {type},
+          downloadedOnly: true,
+        );
+        expect(none.artists, isEmpty, reason: '$type: nothing downloaded');
+        expect(none.albums, isEmpty, reason: '$type: nothing downloaded');
+        expect(none.tracks, isEmpty, reason: '$type: nothing downloaded');
+      }
+
+      await _markDownloaded(db, 'b1');
+      final artists = await repo.search(
         'Blue',
         types: {SearchType.artists},
         downloadedOnly: true,
       );
-      expect(results.artists, isEmpty, reason: 'nothing is downloaded');
+      expect(artists.artists.map((a) => a.name), ['Blue Artist']);
+      final albums = await repo.search(
+        'Blue',
+        types: {SearchType.albums},
+        downloadedOnly: true,
+      );
+      expect(albums.albums.map((a) => a.name), ['Blue Album']);
+      final tracks = await repo.search(
+        'Blue',
+        types: {SearchType.tracks},
+        downloadedOnly: true,
+      );
+      expect(tracks.tracks.map((t) => t.uuidId), ['b1']);
+    });
+
+    test('a limitPerType outside 1..998 is a programming error', () async {
+      // SQLite reads a negative LIMIT as "no limit".
+      for (final limit in [-1, 0, 999]) {
+        expect(
+          () => repo.search('Blue', limitPerType: limit),
+          throwsA(isA<AssertionError>()),
+          reason: '$limit',
+        );
+      }
+    });
+  });
+
+  group('browse and search agree', () {
+    // Track 1 has art but isn't downloaded; track 2 is downloaded with
+    // different art. Filtered, only track 2's art resolves offline.
+    setUp(() async {
+      await fixture.insertAlbum(
+        artist: 'Cover Artist',
+        album: 'Cover Album',
+        uuids: ['c1', 'c2'],
+      );
+      for (final (uuid, art) in [('c1', 10), ('c2', 20)]) {
+        await (db.update(
+          db.trackmetadata,
+        )..where((t) => t.uuidId.equals(uuid))).write(
+          TrackmetadataCompanion(
+            hasAlbumArt: const Value(true),
+            coverArtId: Value(art),
+          ),
+        );
+      }
+      await _markDownloaded(db, 'c2');
+      await _populateFts(db);
+    });
+
+    for (final downloadedOnly in [false, true]) {
+      test('cover art (downloadedOnly: $downloadedOnly)', () async {
+        final browseArtist = (await repo
+                .watchArtists(downloadedOnly: downloadedOnly)
+                .first)
+            .single;
+        final browseAlbum = (await repo
+                .watchAlbums(downloadedOnly: downloadedOnly)
+                .first)
+            .single;
+        final found = await repo.search(
+          'Cover',
+          types: {SearchType.artists, SearchType.albums},
+          downloadedOnly: downloadedOnly,
+        );
+        expect(browseArtist.coverArtId, downloadedOnly ? 20 : 10);
+        expect(found.artists.single.coverArtId, browseArtist.coverArtId);
+        expect(browseAlbum.coverArtId, downloadedOnly ? 20 : 10);
+        expect(found.albums.single.coverArtId, browseAlbum.coverArtId);
+      });
+    }
+
+    test('downloaded-only membership: a query matching everything returns '
+        'exactly the filtered browse set, per type', () async {
+      await fixture.insertAlbum(
+        artist: 'Cover Remote',
+        album: 'Cover Remote Album',
+        uuids: ['r1'],
+        trackTitlePrefix: 'Cover Song',
+      );
+      await fixture.insertAlbum(
+        artist: 'Cover Late',
+        album: 'Cover Late Album',
+        uuids: ['l1', 'l2', 'l3'],
+        trackTitlePrefix: 'Cover Song',
+      );
+      // Only a later track of "Cover Late" is downloaded.
+      await _markDownloaded(db, 'l3');
+      await _populateFts(db);
+
+      final found = await repo.search(
+        'Cover',
+        limitPerType: 100,
+        downloadedOnly: true,
+      );
+      final artists = await repo.watchArtists(downloadedOnly: true).first;
+      final albums = await repo.watchAlbums(downloadedOnly: true).first;
+      final tracks = await repo.watchTracks(downloadedOnly: true).first;
+      expect(
+        found.artists.map((a) => a.name).toSet(),
+        artists.map((a) => a.name).toSet(),
+      );
+      expect(
+        found.albums.map((a) => a.name).toSet(),
+        albums.map((a) => a.name).toSet(),
+      );
+      expect(
+        found.tracks.map((t) => t.uuidId).toSet(),
+        tracks.map((t) => t.uuidId).toSet(),
+      );
+      expect(artists.map((a) => a.name), contains('Cover Late'));
+      expect(artists.map((a) => a.name), isNot(contains('Cover Remote')));
     });
   });
 
@@ -232,6 +355,215 @@ void main() {
     );
   });
 
+  group('in-page cap boundaries (single type, cap 100)', () {
+    setUp(() async {
+      // Disjoint tokens with exactly 99, 100 and 101 matching artists, each
+      // a real artist with one track whose title carries the same token.
+      for (final (token, n) in [
+        ('alpha', 99),
+        ('bravo', 100),
+        ('charlie', 101),
+      ]) {
+        for (var i = 1; i <= n; i++) {
+          await fixture.insertAlbum(
+            artist: '$token Artist $i',
+            album: '$token Album $i',
+            uuids: ['$token$i'],
+            trackTitlePrefix: '$token Song',
+          );
+        }
+      }
+      await _populateFts(db);
+    });
+
+    for (final (token, n) in [
+      ('alpha', 99),
+      ('bravo', 100),
+      ('charlie', 100),
+    ]) {
+      test('"$token" → $n artists and $n tracks', () async {
+        final artists = await repo.search(
+          token,
+          types: {SearchType.artists},
+          limitPerType: 100,
+        );
+        final tracks = await repo.search(
+          token,
+          types: {SearchType.tracks},
+          limitPerType: 100,
+        );
+        expect(artists.artists, hasLength(n));
+        expect(tracks.tracks, hasLength(n));
+        expect(artists.artists.map((a) => a.id).toSet(), hasLength(n));
+        expect(tracks.tracks.map((t) => t.uuidId).toSet(), hasLength(n));
+        expect(artists.artists.every((a) => a.name.startsWith(token)), isTrue);
+      });
+    }
+
+    test('a refined query reaches a match the cap excluded', () async {
+      final capped = await repo.search(
+        'charlie',
+        types: {SearchType.artists},
+        limitPerType: 100,
+      );
+      final all = List.generate(101, (i) => 'charlie Artist ${i + 1}');
+      final excluded = all.toSet().difference(
+        capped.artists.map((a) => a.name).toSet(),
+      );
+      expect(excluded, hasLength(1));
+      final number = excluded.single.split(' ').last;
+      final refined = await repo.search(
+        'charlie artist $number',
+        types: {SearchType.artists},
+        limitPerType: 100,
+      );
+      expect(refined.artists.map((a) => a.name), contains(excluded.single));
+    });
+  });
+
+  test('artists: downloadedOnly applies before the cap, so a downloaded '
+      'artist ranked outside the unfiltered top 100 is found', () async {
+    for (var i = 1; i <= 120; i++) {
+      await fixture.insertAlbum(
+        artist: 'Blue $i',
+        album: 'Album $i',
+        uuids: ['u$i'],
+      );
+    }
+    // Longer name → lower bm25 score → ranked below every "Blue N".
+    await fixture.insertAlbum(
+      artist: 'Blue with a much longer name than the others',
+      album: 'Low Album',
+      uuids: ['low'],
+    );
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals('low'))).write(
+      const TracksCompanion(filePath: Value('/dl/low.flac')),
+    );
+    await _populateFts(db);
+
+    final unfiltered = await repo.search(
+      'Blue',
+      types: {SearchType.artists},
+      limitPerType: 100,
+    );
+    expect(unfiltered.artists, hasLength(100));
+    expect(
+      unfiltered.artists.map((a) => a.name),
+      isNot(contains(startsWith('Blue with'))),
+      reason: 'precondition: the downloaded artist is outside the top 100',
+    );
+
+    final filtered = await repo.search(
+      'Blue',
+      types: {SearchType.artists},
+      limitPerType: 100,
+      downloadedOnly: true,
+    );
+    expect(filtered.artists.map((a) => a.name), [
+      'Blue with a much longer name than the others',
+    ]);
+  });
+
+  test('rank order puts the stronger matches first (independent of the '
+      'query text)', () async {
+    for (var i = 1; i <= 120; i++) {
+      await fixture.insertAlbum(
+        artist: 'Artist $i',
+        album: 'Album $i',
+        uuids: ['t$i'],
+        trackTitlePrefix: i.isEven ? 'Blue Blue Song' : 'Blue Song',
+      );
+    }
+    await _populateFts(db);
+    final results = await repo.search(
+      'Blue',
+      types: {SearchType.tracks},
+      limitPerType: 100,
+    );
+    final evens = {for (var i = 2; i <= 120; i += 2) 't$i'};
+    expect(
+      results.tracks.take(60).map((t) => t.uuidId).toSet(),
+      evens,
+      reason: 'two "Blue" tokens outrank one',
+    );
+  });
+
+  test('malformed or punctuation-heavy input never throws and stays '
+      'within the requested type', () async {
+    await fixture.insertAlbum(
+      artist: "Guns N' Roses",
+      album: 'Appetite',
+      uuids: ['g1'],
+      trackTitlePrefix: 'Sweet Child O\' Mine',
+    );
+    await fixture.insertAlbum(
+      artist: 'Beyoncé',
+      album: 'Lemonade',
+      uuids: ['b1'],
+      trackTitlePrefix: 'Hold Up',
+    );
+    await _populateFts(db);
+    const inputs = [
+      '"',
+      "'",
+      '""',
+      '-',
+      '*',
+      '^',
+      '(',
+      ')',
+      ':',
+      'AND',
+      'OR',
+      'NOT',
+      'NEAR(',
+      'a"b',
+      'x OR',
+      '-roses',
+      'roses*',
+      '    ',
+      '\t',
+      'ü',
+      '😀',
+    ];
+    for (final q in inputs) {
+      for (final type in SearchType.values) {
+        final r = await repo.search(q, types: {type}, limitPerType: 100);
+        if (type != SearchType.artists) expect(r.artists, isEmpty, reason: q);
+        if (type != SearchType.albums) expect(r.albums, isEmpty, reason: q);
+        if (type != SearchType.tracks) expect(r.tracks, isEmpty, reason: q);
+      }
+    }
+    // Operator characters are quoted away, not dropped with their term.
+    for (final q in ['-roses', 'roses*', '"roses"', 'roses:']) {
+      final r = await repo.search(q, types: {SearchType.artists});
+      expect(r.artists.map((a) => a.name), ["Guns N' Roses"], reason: q);
+    }
+    // Every term must match (AND), each as a prefix.
+    final both = await repo.search('gun ros', types: {SearchType.artists});
+    expect(both.artists.map((a) => a.name), ["Guns N' Roses"]);
+    final oneMissing = await repo.search(
+      'guns zzz',
+      types: {SearchType.artists},
+    );
+    expect(oneMissing.artists, isEmpty);
+    // Tokenizer behaviour the live run relies on (unicode61, prefix terms).
+    final apostrophe = await repo.search(
+      "guns n'",
+      types: {SearchType.artists},
+    );
+    expect(apostrophe.artists.map((a) => a.name), ["Guns N' Roses"]);
+    final unaccented = await repo.search(
+      'beyonce',
+      types: {SearchType.artists},
+    );
+    expect(unaccented.artists.map((a) => a.name), ['Beyoncé']);
+    final mixedCase = await repo.search(
+      'sWEET chi',
+      types: {SearchType.tracks},
+    );
+    expect(mixedCase.tracks.map((t) => t.uuidId), ['g1']);
+  });
   group('withFreshDownloadState', () {
     Future<List<TrackUI>> loadTracks() =>
         repo.watchTracks(orderBy: [OrderParameter(column: 'uuid_id')]).first;
@@ -275,11 +607,14 @@ void main() {
       expect(p2.title, before[1].title, reason: 'metadata untouched');
     });
 
-    test('preserves order and length', () async {
+    test('preserves order and length, matching each row by uuid', () async {
       final before = await loadTracks();
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p1')))
+          .write(const TracksCompanion(filePath: Value('/dl/p1.flac')));
       final shuffled = [before[2], before[0], before[1]];
       final after = await repo.withFreshDownloadState(shuffled);
       expect(after.map((t) => t.uuidId), ['p3', 'p1', 'p2']);
+      expect(after.map((t) => t.isDownloaded), [false, true, false]);
     });
 
     test('reflects a cleared download', () async {
@@ -295,6 +630,32 @@ void main() {
       expect(after.first.isDownloaded, isFalse);
     });
 
+    test('a cleared download nulls every download column on the row', () async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p1'))).write(
+        const TracksCompanion(
+          filePath: Value('/dl/p1.m4a'),
+          downloadedBitrateKbps: Value(256),
+          fileSizeBytes: Value(4096),
+          downloadedQuality: Value('high'),
+          downloadedAtRevision: Value(8),
+          downloadedCodec: Value('aac'),
+          staleDismissedAtRevision: Value(7),
+        ),
+      );
+      final before = await loadTracks();
+      await (db.update(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('p1'))).write(clearedDownloadColumns);
+      final p1 = (await repo.withFreshDownloadState(before)).first;
+      expect(p1.filePath, equals(null));
+      expect(p1.downloadedBitrateKbps, equals(null));
+      expect(p1.fileSizeBytes, equals(null));
+      expect(p1.downloadedQuality, equals(null));
+      expect(p1.downloadedAtRevision, equals(null));
+      expect(p1.downloadedCodec, equals(null));
+      expect(p1.staleDismissedAtRevision, equals(null));
+      expect(p1.revision, before.first.revision, reason: 'not a download col');
+    });
     test('leaves a row whose track vanished unchanged', () async {
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('p3')))
           .write(const TracksCompanion(filePath: Value('/dl/p3.flac')));
@@ -316,6 +677,11 @@ void main() {
 
 /// Mirrors the FTS population the sync pipeline performs in production.
 Future<void> _populateFts(AppDatabase db) => db.rebuildFtsIndexes();
+
+Future<void> _markDownloaded(AppDatabase db, String uuid) =>
+    (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid))).write(
+      TracksCompanion(filePath: Value('/dl/$uuid.flac')),
+    );
 
 class _LibraryFixture {
   final AppDatabase db;

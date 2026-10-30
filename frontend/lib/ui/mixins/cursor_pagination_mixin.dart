@@ -42,14 +42,14 @@ mixin CursorPaginationMixin<T> {
 
   bool _suspended = false;
 
-  /// True between [suspendPagination] and the next [refresh].
+  /// True between [suspendPagination] and [resumePagination].
   bool get isPaginationSuspended => _suspended;
 
   /// Put the window to sleep while another view (e.g. in-page search results)
   /// replaces the list: cancels the live subscription and any held trailing
-  /// emission, and makes [loadMore] a no-op so a scroll can't re-subscribe it.
-  /// [paginatedItems] are kept but dormant. Only [refresh] resumes — it
-  /// restarts from page 1 so `hasMore`/the window can't be stale.
+  /// emission, and makes [loadMore] and [refresh] no-ops so neither a scroll
+  /// nor a parameter change can re-subscribe it. [paginatedItems] are kept
+  /// but dormant. Only [resumePagination] wakes it.
   void suspendPagination() {
     _suspended = true;
     _pageSub?.cancel();
@@ -76,13 +76,37 @@ mixin CursorPaginationMixin<T> {
     _subscribe();
   }
 
-  /// Re-subscribe from the first page. Needed when a query *parameter* changes
-  /// (e.g. the offline → downloaded-only filter), which the stream can't observe
-  /// on its own. Clears the current window immediately so the old parameter's
-  /// rows don't linger on screen until the new stream's first emission lands.
-  /// Also the way out of [suspendPagination].
-  void refresh() {
+  /// Wake a suspended window. It restarts from page 1 at the top, so
+  /// `hasMore`/the window can't be stale, and it picks up whatever the query
+  /// parameters became while it slept.
+  void resumePagination() {
+    if (!_suspended) return;
     _suspended = false;
+    _restart();
+  }
+
+  /// Re-subscribe from the first page, at the top. Needed when a query
+  /// *parameter* changes (e.g. the Downloaded filter), which the stream can't
+  /// observe on its own. Clears the current window immediately so the old
+  /// parameter's rows don't linger on screen until the new stream's first
+  /// emission lands.
+  ///
+  /// A no-op while suspended: whatever replaced the list stays in charge,
+  /// and [resumePagination] restarts with the parameters current by then.
+  void refresh() {
+    if (_suspended) return;
+    _restart();
+  }
+
+  void _restart() {
+    // Back to the top. Otherwise a narrower first page clamps a deep offset
+    // to its bottom, which fires no scroll notification, stranding the user
+    // at a load-more spinner that never loads.
+    if (scrollController.hasClients &&
+        scrollController.position.hasPixels &&
+        scrollController.offset != 0) {
+      scrollController.jumpTo(0);
+    }
     // A burst-coalescing quiet timer from before this refresh must not
     // suppress the new subscription's leading-edge delivery.
     _quietTimer?.cancel();

@@ -39,6 +39,26 @@ void main() {
     );
   });
 
+  test('"applied by offline" without Downloaded on is rejected', () {
+    // e.g. copyWith(downloaded: false) on an offline-applied ON, which
+    // should have been userSetDownloaded(false).
+    expect(
+      () => const BrowseFilters(
+        downloaded: true,
+        downloadedByOffline: true,
+      ).copyWith(downloaded: false),
+      throwsA(isA<AssertionError>()),
+    );
+  });
+
+  test('transitions are idempotent', () {
+    final offline = const BrowseFilters().wentOffline();
+    expect(offline.wentOffline(), offline);
+    expect(const BrowseFilters().cameOnline(), const BrowseFilters());
+    const userOn = BrowseFilters(downloaded: true);
+    expect(userOn.cameOnline(), userOn);
+  });
+
   test('initial: offline at creation starts with Downloaded applied', () {
     expect(BrowseFilters.initial(isOffline: false), const BrowseFilters());
     expect(

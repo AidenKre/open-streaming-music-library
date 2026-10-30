@@ -11,7 +11,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/disconnect_controller.dart';
 import 'package:frontend/ui/settings_dialog.dart';
-import 'package:frontend/ui/tracks_page.dart' show buildTopBarActions;
+import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
 /// Override that pins [offlineModeProvider] to a fixed value without running
 /// the real health-poll timer.

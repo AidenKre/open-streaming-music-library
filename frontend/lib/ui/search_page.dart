@@ -15,6 +15,7 @@ import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 import 'package:frontend/ui/widgets/library_search_field.dart';
+import 'package:frontend/ui/widgets/search_status.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class SearchPage extends ConsumerStatefulWidget {
@@ -29,6 +30,10 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   // stale-guard (a request that started before an offline flip or a newer
   // query never overwrites newer results), and dispose-cancel all live there.
   late final LibrarySearchController _search;
+
+  // The page owns the query text, so what the field shows and what was
+  // searched can't drift apart.
+  final _queryText = TextEditingController();
 
   @override
   void initState() {
@@ -49,6 +54,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   @override
   void dispose() {
     _search.dispose();
+    _queryText.dispose();
     super.dispose();
   }
 
@@ -110,7 +116,11 @@ class _SearchPageState extends ConsumerState<SearchPage> {
 
     return Scaffold(
       appBar: AppBar(title: const Text('Search')),
-      body: ListView(
+      // The field sits above the results, like the browse tabs' search: it
+      // never scrolls away, so it is built once (autofocus fires once, and
+      // never steals focus back mid-scroll).
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (isOffline) const DownloadedOnlyBadge(),
           Padding(
@@ -118,169 +128,179 @@ class _SearchPageState extends ConsumerState<SearchPage> {
             child: LibrarySearchField(
               hintText: 'Search your library',
               autofocus: true,
+              controller: _queryText,
               onChanged: _search.onQueryChanged,
+              onSubmitted: _search.submit,
               onCleared: _search.clear,
             ),
           ),
-          if (_search.isActive && !_search.hasResults && !_search.isSearching)
-            Padding(
-              padding: const EdgeInsets.all(32),
-              child: Center(
-                child: Text(
-                  isOffline
-                      ? 'No downloaded results match "$query". '
-                          'Reconnect to the server to search the full library.'
-                      : 'No results found',
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            ),
-          if (artists.isNotEmpty) ...[
-            _buildSectionHeader('Artists'),
-            SizedBox(
-              height: 190,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                itemCount: artists.length,
-                itemBuilder: (context, index) {
-                  final artist = artists[index];
-                  return SizedBox(
-                    width: 140,
-                    child: ArtistCard(
-                      artist: artist,
-                      onTap: () => _onArtistTap(artist),
-                      onPlayNext: () async {
-                        final tracks = await ref.read(browseRepositoryProvider)
-                            .getTracksForArtist(artist.id);
-                        if (tracks.isNotEmpty) {
-                          ref.read(audioProvider.notifier).playNext(tracks);
-                        }
-                      },
-                      onAddToQueue: () async {
-                        final tracks = await ref.read(browseRepositoryProvider)
-                            .getTracksForArtist(artist.id);
-                        if (tracks.isNotEmpty) {
-                          ref.read(audioProvider.notifier).addToQueue(tracks);
-                        }
-                      },
-                      onDownload: isOffline
-                          ? null
-                          : () => downloadScope(
-                              ref, ArtistScope(artistId: artist.id)),
-                      onDownloadAtQuality: isOffline
-                          ? null
-                          : (q) => downloadScope(
-                              ref, ArtistScope(artistId: artist.id),
-                              quality: q),
-                      onDeleteDownload: () => deleteScope(
-                          ref, ArtistScope(artistId: artist.id)),
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
-          if (albums.isNotEmpty) ...[
-            _buildSectionHeader('Albums'),
-            SizedBox(
-              height: 220,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                itemCount: albums.length,
-                itemBuilder: (context, index) {
-                  final album = albums[index];
-                  return SizedBox(
-                    width: 160,
-                    child: AlbumCard(
-                      album: album,
-                      onTap: () => _onAlbumTap(album),
-                      onPlayNext: () async {
-                        final tracks = await ref.read(browseRepositoryProvider)
-                            .getTracksForAlbum(album.artistId, album.id);
-                        if (tracks.isNotEmpty) {
-                          ref.read(audioProvider.notifier).playNext(tracks);
-                        }
-                      },
-                      onAddToQueue: () async {
-                        final tracks = await ref.read(browseRepositoryProvider)
-                            .getTracksForAlbum(album.artistId, album.id);
-                        if (tracks.isNotEmpty) {
-                          ref.read(audioProvider.notifier).addToQueue(tracks);
-                        }
-                      },
-                      onDownload: isOffline
-                          ? null
-                          : () => downloadScope(
-                              ref,
-                              AlbumScope(
-                                  artistId: album.artistId, albumId: album.id),
-                            ),
-                      onDownloadAtQuality: isOffline
-                          ? null
-                          : (q) => downloadScope(
-                              ref,
-                              AlbumScope(
-                                  artistId: album.artistId, albumId: album.id),
-                              quality: q,
-                            ),
-                      onDeleteDownload: () => deleteScope(
-                        ref,
-                        AlbumScope(
-                            artistId: album.artistId, albumId: album.id),
+          Expanded(
+            child: ListView(
+              children: [
+                if (_search.isActive && !_search.hasResults && !_search.isSearching)
+                  Padding(
+                    padding: const EdgeInsets.all(32),
+                    child: Center(
+                      child: Text(
+                        _search.failed
+                            ? searchFailedMessage
+                            : isOffline
+                            ? 'No downloaded results match "$query". '
+                                'Reconnect to the server to search the full library.'
+                            : 'No results found',
+                        textAlign: TextAlign.center,
                       ),
                     ),
-                  );
-                },
-              ),
-            ),
-          ],
-          if (tracks.isNotEmpty) ...[
-            _buildSectionHeader('Songs'),
-            for (final track in tracks)
-              Builder(
-                key: ValueKey(track.uuidId),
-                builder: (_) {
-                  final job = manager.state.jobs
-                      .where((j) => j.uuidId == track.uuidId)
-                      .firstOrNull;
-                  Widget? trailing;
-                  if (job != null) {
-                    trailing = switch (job.status) {
-                      Active(:final progress) => SizedBox(
-                          width: 80,
-                          child: LinearProgressIndicator(
-                            value: progress > 0 ? progress : null,
+                  ),
+                if (artists.isNotEmpty) ...[
+                  _buildSectionHeader('Artists'),
+                  SizedBox(
+                    height: 190,
+                    child: ListView.builder(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      itemCount: artists.length,
+                      itemBuilder: (context, index) {
+                        final artist = artists[index];
+                        return SizedBox(
+                          width: 140,
+                          child: ArtistCard(
+                            artist: artist,
+                            onTap: () => _onArtistTap(artist),
+                            onPlayNext: () async {
+                              final tracks = await ref.read(browseRepositoryProvider)
+                                  .getTracksForArtist(artist.id);
+                              if (tracks.isNotEmpty) {
+                                ref.read(audioProvider.notifier).playNext(tracks);
+                              }
+                            },
+                            onAddToQueue: () async {
+                              final tracks = await ref.read(browseRepositoryProvider)
+                                  .getTracksForArtist(artist.id);
+                              if (tracks.isNotEmpty) {
+                                ref.read(audioProvider.notifier).addToQueue(tracks);
+                              }
+                            },
+                            onDownload: isOffline
+                                ? null
+                                : () => downloadScope(
+                                    ref, ArtistScope(artistId: artist.id)),
+                            onDownloadAtQuality: isOffline
+                                ? null
+                                : (q) => downloadScope(
+                                    ref, ArtistScope(artistId: artist.id),
+                                    quality: q),
+                            onDeleteDownload: () => deleteScope(
+                                ref, ArtistScope(artistId: artist.id)),
                           ),
-                        ),
-                      Queued() => const Icon(Icons.schedule, size: 16),
-                      Completed() || Failed() => null,
-                    };
-                  }
-                  return TrackTile(
-                    track: track,
-                    trailing: trailing,
-                    onTap: () => ref
-                        .read(audioProvider.notifier)
-                        .playFromTrackList(
-                          tracks.map((t) => t.uuidId).toList(),
-                          track,
-                          sourceType: 'search',
-                        ),
-                    onPlayNext: () =>
-                        ref.read(audioProvider.notifier).playNext([track]),
-                    onAddToQueue: () =>
-                        ref.read(audioProvider.notifier).addToQueue([track]),
-                    onDownload: () => downloadScope(ref, TrackScope(track)),
-                    onDownloadAtQuality: (q) =>
-                        downloadScope(ref, TrackScope(track), quality: q),
-                    onDeleteDownload: () =>
-                        deleteScope(ref, TrackScope(track)),
-                  );
-                },
-              ),
-          ],
+                        );
+                      },
+                    ),
+                  ),
+                ],
+                if (albums.isNotEmpty) ...[
+                  _buildSectionHeader('Albums'),
+                  SizedBox(
+                    height: 220,
+                    child: ListView.builder(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      itemCount: albums.length,
+                      itemBuilder: (context, index) {
+                        final album = albums[index];
+                        return SizedBox(
+                          width: 160,
+                          child: AlbumCard(
+                            album: album,
+                            onTap: () => _onAlbumTap(album),
+                            onPlayNext: () async {
+                              final tracks = await ref.read(browseRepositoryProvider)
+                                  .getTracksForAlbum(album.artistId, album.id);
+                              if (tracks.isNotEmpty) {
+                                ref.read(audioProvider.notifier).playNext(tracks);
+                              }
+                            },
+                            onAddToQueue: () async {
+                              final tracks = await ref.read(browseRepositoryProvider)
+                                  .getTracksForAlbum(album.artistId, album.id);
+                              if (tracks.isNotEmpty) {
+                                ref.read(audioProvider.notifier).addToQueue(tracks);
+                              }
+                            },
+                            onDownload: isOffline
+                                ? null
+                                : () => downloadScope(
+                                    ref,
+                                    AlbumScope(
+                                        artistId: album.artistId, albumId: album.id),
+                                  ),
+                            onDownloadAtQuality: isOffline
+                                ? null
+                                : (q) => downloadScope(
+                                    ref,
+                                    AlbumScope(
+                                        artistId: album.artistId, albumId: album.id),
+                                    quality: q,
+                                  ),
+                            onDeleteDownload: () => deleteScope(
+                              ref,
+                              AlbumScope(
+                                  artistId: album.artistId, albumId: album.id),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+                if (tracks.isNotEmpty) ...[
+                  _buildSectionHeader('Songs'),
+                  for (final track in tracks)
+                    Builder(
+                      key: ValueKey(track.uuidId),
+                      builder: (_) {
+                        final job = manager.state.jobs
+                            .where((j) => j.uuidId == track.uuidId)
+                            .firstOrNull;
+                        Widget? trailing;
+                        if (job != null) {
+                          trailing = switch (job.status) {
+                            Active(:final progress) => SizedBox(
+                                width: 80,
+                                child: LinearProgressIndicator(
+                                  value: progress > 0 ? progress : null,
+                                ),
+                              ),
+                            Queued() => const Icon(Icons.schedule, size: 16),
+                            Completed() || Failed() => null,
+                          };
+                        }
+                        return TrackTile(
+                          track: track,
+                          trailing: trailing,
+                          onTap: () => ref
+                              .read(audioProvider.notifier)
+                              .playFromTrackList(
+                                tracks.map((t) => t.uuidId).toList(),
+                                track,
+                                sourceType: 'search',
+                              ),
+                          onPlayNext: () =>
+                              ref.read(audioProvider.notifier).playNext([track]),
+                          onAddToQueue: () =>
+                              ref.read(audioProvider.notifier).addToQueue([track]),
+                          onDownload: () => downloadScope(ref, TrackScope(track)),
+                          onDownloadAtQuality: (q) =>
+                              downloadScope(ref, TrackScope(track), quality: q),
+                          onDeleteDownload: () =>
+                              deleteScope(ref, TrackScope(track)),
+                        );
+                      },
+                    ),
+                ],
+              ],
+            ),
+          ),
         ],
       ),
     );

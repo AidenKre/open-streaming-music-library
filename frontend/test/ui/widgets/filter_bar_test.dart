@@ -70,4 +70,27 @@ void main() {
       const BrowseFilters(),
     ], reason: 'switching it off is the user\'s choice, not offline\'s');
   });
+
+  testWidgets('screen readers hear a selectable "Downloaded" chip and its '
+      'state', (tester) async {
+    final handle = tester.ensureSemantics();
+    await tester.pumpWidget(
+      harness(filters: const BrowseFilters(downloaded: true)),
+    );
+    expect(
+      tester.getSemantics(find.byKey(FilterBar.downloadedChipKey)),
+      matchesSemantics(
+        label: 'Downloaded',
+        isButton: true,
+        hasSelectedState: true,
+        isSelected: true,
+        hasEnabledState: true,
+        isEnabled: true,
+        isFocusable: true,
+        hasTapAction: true,
+        hasFocusAction: true,
+      ),
+    );
+    handle.dispose();
+  });
 }

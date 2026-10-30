@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
-import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
@@ -13,16 +12,11 @@ import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
-import 'package:frontend/ui/conversions_page.dart';
 import 'package:frontend/ui/convert_flow.dart';
-import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
-import 'package:frontend/ui/mixins/in_page_search_mixin.dart';
-import 'package:frontend/ui/settings_dialog.dart';
-import 'package:frontend/ui/widgets/filter_bar.dart';
-import 'package:frontend/ui/widgets/library_search_field.dart';
+import 'package:frontend/ui/mixins/root_browse_mixin.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
-import 'package:frontend/ui/widgets/search_status.dart';
+import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
@@ -47,23 +41,18 @@ class TracksPage extends ConsumerStatefulWidget {
 class TracksPageState extends ConsumerState<TracksPage>
     with
         CursorPaginationMixin<TrackUI>,
-        InPageSearchMixin<TracksPage, TrackUI> {
+        RootBrowseMixin<TracksPage, TrackUI> {
   @override
   final scrollController = ScrollController();
 
   @override
   int get pageSize => 50;
 
-  /// Chip selection for the root tab; session-only. Offline switches
-  /// Downloaded on but the user may switch it off again (see
-  /// [BrowseFilters]). Detail sub-routes (an album's tracks) show no
-  /// [FilterBar] and never filter by it.
-  late BrowseFilters _filters;
-
   /// The downloaded-only filter this list (and the queue built from a tap)
-  /// uses. Root: the chip. Detail: never. Whenever a list shows tracks that
-  /// can't play offline, it dims and disables them.
-  bool get _downloadedOnly => widget.isRoot && _filters.downloaded;
+  /// uses. Root: the chip. Detail sub-routes (an album's tracks) have no
+  /// chip and never filter. Whenever a list shows tracks that can't play
+  /// offline, it dims and disables them.
+  bool get _downloadedOnly => filters.downloaded;
 
   List<OrderParameter> get _orderParams => [
     OrderParameter(column: 'artist'),
@@ -77,14 +66,8 @@ class TracksPageState extends ConsumerState<TracksPage>
   void initState() {
     super.initState();
     sync();
-    _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
+    if (widget.isRoot) initRootBrowse(type: SearchType.tracks);
     initPagination();
-    if (widget.isRoot) {
-      initInPageSearch(
-        type: SearchType.tracks,
-        downloadedOnly: () => _downloadedOnly,
-      );
-    }
   }
 
   void sync() {
@@ -95,7 +78,7 @@ class TracksPageState extends ConsumerState<TracksPage>
 
   @override
   void dispose() {
-    disposeInPageSearch();
+    disposeRootBrowse();
     disposePagination();
     scrollController.dispose();
     super.dispose();
@@ -113,29 +96,11 @@ class TracksPageState extends ConsumerState<TracksPage>
     );
   }
 
-  /// A filtered window that settled with nothing in it (root only — detail
-  /// lists never filter).
-  bool get _showFilteredEmpty =>
-      _downloadedOnly && !hasMore && paginatedItems.isEmpty;
-
-  void _onFiltersChanged(BrowseFilters filters) {
-    if (filters == _filters) return;
-    setState(() => _filters = filters);
-    onBrowseParamsChanged();
-  }
-
   @override
   Widget build(BuildContext context) {
-    // Offline switches the root tab's chip on (and reconnecting may switch
-    // it back off), which re-fetches from page 1 (or re-runs the search).
-    // Detail lists don't filter (they dim instead), so they needn't refresh.
-    ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (!widget.isRoot || prev == next) return;
-      _onFiltersChanged(next ? _filters.wentOffline() : _filters.cameOnline());
-    });
-    ref.listen(downloadStatusVersionProvider, (_, _) {
-      onDownloadStatusChanged();
-    });
+    // Detail lists don't filter (they dim instead), so an offline flip
+    // needn't re-fetch them.
+    listenForBrowseChanges();
     final _RowContext rows = (
       manager: ref.watch(downloadManagerListenableProvider),
       isOffline: ref.watch(offlineModeProvider),
@@ -145,21 +110,11 @@ class TracksPageState extends ConsumerState<TracksPage>
 
     final body = Column(
       children: [
-        if (widget.isRoot) ...[
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            child: LibrarySearchField(
-              hintText: 'Search tracks',
-              onChanged: search.onQueryChanged,
-              onCleared: search.clear,
-            ),
-          ),
-          FilterBar(filters: _filters, onChanged: _onFiltersChanged),
-        ],
+        if (hasBrowseControls) buildBrowseHeader(hintText: 'Search tracks'),
         Expanded(
           child: isSearchMode
               ? _buildSearchResults(rows)
-              : _showFilteredEmpty
+              : showDownloadedEmpty
               ? const ListStatusMessage('No downloaded tracks yet.')
               : _buildBrowseList(rows),
         ),
@@ -218,45 +173,29 @@ class TracksPageState extends ConsumerState<TracksPage>
   }
 
   Widget _buildSearchResults(_RowContext rows) {
-    final tracks = search.results.tracks;
-    if (tracks.isEmpty) {
-      if (search.isSearching) {
-        return const Center(child: CircularProgressIndicator());
-      }
-      return ListStatusMessage(
-        noSearchResultsMessage(
-          noun: 'tracks',
-          query: search.query,
-          downloadedOnly: _downloadedOnly,
-        ),
-      );
-    }
-    return Column(
-      children: [
-        if (search.isCapped) const SearchCappedHint(cap: kInPageSearchCap),
-        Expanded(
-          // No controller: scrolling results must never reach the browse
-          // window's load-more listener.
-          child: ListView.builder(
-            itemCount: tracks.length,
-            itemBuilder: (_, index) {
-              final track = tracks[index];
-              return _buildTrackTile(
-                track,
-                rows,
-                // Play the visible result list, like the global search.
-                onTap: () => ref
-                    .read(audioProvider.notifier)
-                    .playFromTrackList(
-                      tracks.map((t) => t.uuidId).toList(),
-                      track,
-                      sourceType: 'search',
-                    ),
-              );
-            },
-          ),
-        ),
-      ],
+    return buildSearchBody(
+      results: search.results.tracks,
+      noun: 'tracks',
+      // No controller: scrolling results must never reach the browse
+      // window's load-more listener.
+      builder: (tracks) => ListView.builder(
+        itemCount: tracks.length,
+        itemBuilder: (_, index) {
+          final track = tracks[index];
+          return _buildTrackTile(
+            track,
+            rows,
+            // Play the visible result list, like the global search.
+            onTap: () => ref
+                .read(audioProvider.notifier)
+                .playFromTrackList(
+                  tracks.map((t) => t.uuidId).toList(),
+                  track,
+                  sourceType: 'search',
+                ),
+          );
+        },
+      ),
     );
   }
 
@@ -327,40 +266,3 @@ typedef _RowContext = ({
   List<ConversionJob> conversionJobs,
   AppInfo? appInfo,
 });
-
-/// Standard top-bar action set used by every page that shows a top bar.
-/// Replaces the old standalone disconnect button with a downloads-page
-/// shortcut and a settings menu.
-List<Widget> buildTopBarActions(BuildContext context, WidgetRef ref) {
-  return [
-    IconButton(
-      icon: const Icon(Icons.download),
-      tooltip: 'Downloads',
-      onPressed: () {
-        Navigator.of(
-          context,
-        ).push(MaterialPageRoute(builder: (_) => const DownloadingPage()));
-      },
-    ),
-    IconButton(
-      icon: const Icon(Icons.transform),
-      tooltip: 'Conversions',
-      onPressed: () {
-        Navigator.of(
-          context,
-        ).push(MaterialPageRoute(builder: (_) => const ConversionsPage()));
-      },
-    ),
-    IconButton(
-      icon: const Icon(Icons.settings),
-      tooltip: 'Settings',
-      onPressed: () {
-        showDialog<void>(
-          context: context,
-          useRootNavigator: false,
-          builder: (_) => const SettingsDialog(),
-        );
-      },
-    ),
-  ];
-}
