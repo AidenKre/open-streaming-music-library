@@ -3,7 +3,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
-import 'package:frontend/ui/browse_controller.dart';
+import 'package:frontend/repositories/browse_repository.dart';
+import 'package:frontend/ui/mixins/root_browse_mixin.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
@@ -12,14 +14,21 @@ import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
   final int? artistId;
-  const AlbumsPage({super.key, this.artistId});
+
+  /// Browse-all capability: every artist's albums with the Downloaded chip
+  /// and album-only in-page search (`AlbumsBrowsePage`). Requires no
+  /// [artistId]. Otherwise an artist's grid, which has no chip and narrows
+  /// itself to downloads while offline (its existing detail behaviour).
+  final bool browseAll;
+  const AlbumsPage({super.key, this.artistId, this.browseAll = false})
+    : assert(!browseAll || artistId == null);
 
   @override
   ConsumerState<AlbumsPage> createState() => _AlbumsPageState();
 }
 
 class _AlbumsPageState extends ConsumerState<AlbumsPage>
-    with CursorPaginationMixin<AlbumUI> {
+    with CursorPaginationMixin<AlbumUI>, RootBrowseMixin<AlbumsPage, AlbumUI> {
   @override
   final scrollController = ScrollController();
 
@@ -29,16 +38,13 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
   @override
   void initState() {
     super.initState();
-    sync();
+    if (widget.browseAll) initRootBrowse(type: SearchType.albums);
     initPagination();
-  }
-
-  void sync() {
-    Future.microtask(() => ref.read(browseControlsProvider).refreshLibrary());
   }
 
   @override
   void dispose() {
+    disposeRootBrowse();
     disposePagination();
     scrollController.dispose();
     super.dispose();
@@ -50,55 +56,80 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     return repo.watchAlbums(
       artistId: widget.artistId,
       limit: limit,
-      offline: ref.read(offlineModeProvider),
+      // Browse-all: the chip. An artist's grid has no chip; it passes the
+      // observed offline flag and the model narrows it.
+      downloadedOnly: filters.downloaded,
+      offline: !hasBrowseControls && ref.read(offlineModeProvider),
     );
   }
 
-
   @override
   Widget build(BuildContext context) {
-    ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (prev != next) refresh();
-    });
+    listenForBrowseChanges(refreshOnOfflineChange: true);
     final isOffline = ref.watch(offlineModeProvider);
-    final body = Column(
+    return Column(
       children: [
-        if (isOffline) const DownloadedOnlyBadge(),
+        if (hasBrowseControls)
+          buildBrowseHeader(hintText: 'Search albums')
+        else if (isOffline)
+          const DownloadedOnlyBadge(),
         Expanded(
-          child: GridView.builder(
-            controller: scrollController,
-            padding: const EdgeInsets.all(8),
-            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-              maxCrossAxisExtent: 200,
-              childAspectRatio: 0.75,
-              mainAxisSpacing: 8,
-              crossAxisSpacing: 8,
-            ),
-            itemCount: paginatedItems.length + (hasMore ? 1 : 0),
-            itemBuilder: (context, index) {
-              if (index >= paginatedItems.length) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              final album = paginatedItems[index];
-              if (index % 6 == 0) {
-                final end = (index + 12).clamp(0, paginatedItems.length);
-                final ids = paginatedItems
-                    .sublist(index, end)
-                    .map((a) => a.coverArtId)
-                    .whereType<int>()
-                    .toList();
-                prefetchCoverArt(ids);
-              }
-              return AlbumCard(
-                album: album,
-                onTap: () => openAlbumDetail(context, album),
-              );
-            },
-          ),
+          child: isSearchMode
+              ? buildSearchBody(
+                  results: search.results.albums,
+                  noun: 'albums',
+                  // No controller: scrolling results must never reach the
+                  // browse window's load-more listener.
+                  builder: (albums) => _buildGrid(albums, showLoader: false),
+                )
+              : showDownloadedEmpty
+              ? const ListStatusMessage('No downloaded albums yet.')
+              : _buildGrid(
+                  paginatedItems,
+                  showLoader: hasMore,
+                  controller: scrollController,
+                ),
         ),
       ],
     );
+  }
 
-    return body;
+  /// The album grid: browse mode ([paginatedItems], trailing loader while
+  /// [hasMore]) or a capped search snapshot.
+  Widget _buildGrid(
+    List<AlbumUI> albums, {
+    required bool showLoader,
+    ScrollController? controller,
+  }) {
+    return GridView.builder(
+      controller: controller,
+      padding: const EdgeInsets.all(8),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 200,
+        childAspectRatio: 0.75,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+      ),
+      itemCount: albums.length + (showLoader ? 1 : 0),
+      itemBuilder: (context, index) {
+        if (index >= albums.length) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final album = albums[index];
+        if (index % 6 == 0) {
+          final end = (index + 12).clamp(0, albums.length);
+          final ids = albums
+              .sublist(index, end)
+              .map((a) => a.coverArtId)
+              .whereType<int>()
+              .toList();
+          prefetchCoverArt(ids);
+        }
+        return AlbumCard(
+          album: album,
+          onTap: () => openAlbumDetail(context, album),
+        );
+      },
+    );
   }
 }

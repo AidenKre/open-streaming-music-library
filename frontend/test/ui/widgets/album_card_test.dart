@@ -315,4 +315,13 @@ void main() {
     await tester.pumpAndSettle();
     expect(actions.calls, ['playNext album(3,7)', 'addToQueue album(3,7)']);
   });
+
+  testWidgets('semantics name the album and its artist', (tester) async {
+    final handle = tester.ensureSemantics();
+    await tester.pumpWidget(buildCard(_album));
+    await tester.pumpAndSettle();
+    expect(find.bySemanticsLabel(RegExp(r'^Album, Test Album, by Test Artist')),
+        findsOneWidget);
+    handle.dispose();
+  });
 }

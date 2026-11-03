@@ -20,11 +20,15 @@ class _FakeService extends SessionService {
   Completer<void>? resetGate;
   int resets = 0;
   int starts = 0;
+  int syncs = 0;
+  @override
+  Future<void> syncLibrary() async => syncs++;
   @override
   Future<SessionStart> resumeSavedSession() async {
     starts++;
     return start;
   }
+
   @override
   Future<String?> connect(String url) async => connectError;
   @override
@@ -43,7 +47,9 @@ void main() {
     setUp(() {
       c = ProviderContainer(
         overrides: [
-          sessionServiceProvider.overrideWith((ref) => service = _FakeService(ref)),
+          sessionServiceProvider.overrideWith(
+            (ref) => service = _FakeService(ref),
+          ),
         ],
       );
       c.read(sessionServiceProvider);
@@ -58,15 +64,27 @@ void main() {
       expect(session().phase, SessionPhase.live);
     });
 
-    test('readiness is not the controller\'s rule (the model marks it)',
-        () async {
-      // The fake service never marks readiness; going live through the
-      // controller must not mark it either.
-      service.start = const SessionStart(SessionStartKind.offline);
-      await session().start();
-      expect(session().phase, SessionPhase.live);
-      expect(c.read(sessionReadinessProvider).isReady, isFalse);
-    });
+    test(
+      'readiness is not the controller\'s rule (the model marks it)',
+      () async {
+        // The fake service never marks readiness; going live through the
+        // controller must not mark it either.
+        service.start = const SessionStart(SessionStartKind.offline);
+        await session().start();
+        expect(session().phase, SessionPhase.live);
+        expect(c.read(sessionReadinessProvider).isReady, isFalse);
+      },
+    );
+
+    // Re-audit 4A #6: the real controller's Retry reaches the model.
+    test(
+      'retryLibrarySync asks the model for a library sync each time',
+      () async {
+        await session().retryLibrarySync();
+        await session().retryLibrarySync();
+        expect(service.syncs, 2);
+      },
+    );
 
     test('start runs the saved-session check once', () async {
       await session().start();
@@ -75,8 +93,10 @@ void main() {
     });
 
     test('a rejected saved server signs out with its error', () async {
-      service.start =
-          const SessionStart(SessionStartKind.signedOut, error: 'rejected');
+      service.start = const SessionStart(
+        SessionStartKind.signedOut,
+        error: 'rejected',
+      );
       await session().start();
       expect(session().phase, SessionPhase.signedOut);
       expect(session().connectError, 'rejected');
@@ -95,25 +115,27 @@ void main() {
       expect(session().connectError, isNull);
     });
 
-    test('disconnect: resetting, then complete with an honest failure',
-        () async {
-      service.start = const SessionStart(SessionStartKind.online);
-      await session().start();
-      service.resetGate = Completer<void>();
-      service.resetFailure = LocalResetException([]);
-      final done = session().disconnect();
-      expect(session().phase, SessionPhase.resetting);
-      // A second request while resetting does not start a second reset.
-      unawaited(session().disconnect());
-      service.resetGate!.complete();
-      await done;
-      expect(service.resets, 1);
-      expect(session().phase, SessionPhase.resetComplete);
-      expect(session().resetFailure, same(service.resetFailure));
-      session().acknowledgeReset();
-      expect(session().phase, SessionPhase.signedOut);
-      expect(session().resetFailure, isNull);
-    });
+    test(
+      'disconnect: resetting, then complete with an honest failure',
+      () async {
+        service.start = const SessionStart(SessionStartKind.online);
+        await session().start();
+        service.resetGate = Completer<void>();
+        service.resetFailure = LocalResetException([]);
+        final done = session().disconnect();
+        expect(session().phase, SessionPhase.resetting);
+        // A second request while resetting does not start a second reset.
+        unawaited(session().disconnect());
+        service.resetGate!.complete();
+        await done;
+        expect(service.resets, 1);
+        expect(session().phase, SessionPhase.resetComplete);
+        expect(session().resetFailure, same(service.resetFailure));
+        session().acknowledgeReset();
+        expect(session().phase, SessionPhase.signedOut);
+        expect(session().resetFailure, isNull);
+      },
+    );
   });
 
   group('StartupGate renders the session controller', () {
@@ -123,12 +145,14 @@ void main() {
       VoidCallback? onLocalResetComplete,
     }) async {
       final fake = FakeSessionControls(phase: phase);
-      await tester.pumpWidget(ProviderScope(
-        overrides: [sessionControlsProvider.overrideWithValue(fake)],
-        child: MaterialApp(
-          home: StartupGate(onLocalResetComplete: onLocalResetComplete),
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [sessionControlsProvider.overrideWithValue(fake)],
+          child: MaterialApp(
+            home: StartupGate(onLocalResetComplete: onLocalResetComplete),
+          ),
         ),
-      ));
+      );
       await tester.pump();
       return fake;
     }
@@ -150,11 +174,15 @@ void main() {
       expect(fake.calls, ['start', 'connect http://x']);
     });
 
-    testWidgets('a partial reset is shown, then the scope is rebuilt',
-        (tester) async {
+    testWidgets('a partial reset is shown, then the scope is rebuilt', (
+      tester,
+    ) async {
       var rebuilt = 0;
-      final fake = await pump(tester, SessionPhase.resetting,
-          onLocalResetComplete: () => rebuilt++);
+      final fake = await pump(
+        tester,
+        SessionPhase.resetting,
+        onLocalResetComplete: () => rebuilt++,
+      );
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
       fake.set(SessionPhase.resetComplete, failure: LocalResetException([]));
       // The splash spinner animates forever: bounded pumps, not settle.
@@ -168,8 +196,9 @@ void main() {
       expect(rebuilt, 1);
     });
 
-    testWidgets('without a rebuild hook, a finished reset returns to login',
-        (tester) async {
+    testWidgets('without a rebuild hook, a finished reset returns to login', (
+      tester,
+    ) async {
       final fake = await pump(tester, SessionPhase.resetting);
       fake.set(SessionPhase.resetComplete);
       await tester.pump();

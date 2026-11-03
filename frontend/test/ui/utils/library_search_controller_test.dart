@@ -4,6 +4,7 @@ import 'package:drift/native.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/repositories/browse_repository.dart';
@@ -250,6 +251,9 @@ void main() {
       expect(uuids(c), ['a']);
     });
 
+    // 4A.3 (phase-4 §SC-19): a failure now RETAINS the previous results
+    // (with the error indicator) instead of emptying them. With no previous
+    // results the list is still empty, so this test keeps its expectations.
     testWidgets('a failed search ends the in-flight state with empty results', (
       tester,
     ) async {
@@ -283,6 +287,85 @@ void main() {
       await tester.pump();
       c.clear();
       expect(c.failed, isFalse);
+    });
+  });
+
+  group('Retry and error retention (4A.3)', () {
+    testWidgets('a failure keeps the previous results with the error', (
+      tester,
+    ) async {
+      final repo = _ScriptedRepo(db);
+      final c = make(repo);
+      await commit(tester, c, 'Blue');
+      repo.searches.last.complete([_track('a')]);
+      await tester.pump();
+      await commit(tester, c, 'Blues');
+      repo.searches.last.fail(StateError('db closed'));
+      await tester.pump();
+      expect(c.isSearching, isFalse);
+      expect(c.failed, isTrue);
+      expect(uuids(c), ['a'], reason: 'previous results retained');
+      expect(c.query, 'Blues');
+    });
+
+    testWidgets('starting a new search clears the error right away', (
+      tester,
+    ) async {
+      final repo = _ScriptedRepo(db);
+      final c = make(repo);
+      await commit(tester, c, 'Blue');
+      repo.searches.last.fail(StateError('db closed'));
+      await tester.pump();
+      await commit(tester, c, 'Red');
+      expect(c.isSearching, isTrue);
+      expect(c.failed, isFalse);
+    });
+
+    testWidgets('retry re-runs the committed query with the current filter '
+        'and success clears the error', (tester) async {
+      final repo = _ScriptedRepo(db);
+      final c = make(repo);
+      await commit(tester, c, 'Blue');
+      repo.searches.last.fail(StateError('db closed'));
+      await tester.pump();
+      downloadedOnly = true;
+      final done = c.retry();
+      expect(repo.searches, hasLength(2));
+      expect(repo.searches.last.query, 'Blue');
+      expect(repo.searches.last.downloadedOnly, isTrue);
+      expect(c.failed, isFalse, reason: 'retrying clears the error');
+      repo.searches.last.complete([_track('b')]);
+      await done;
+      expect(c.failed, isFalse);
+      expect(uuids(c), ['b']);
+    });
+
+    testWidgets('an old failure landing after retry is ignored', (
+      tester,
+    ) async {
+      final repo = _ScriptedRepo(db);
+      final c = make(repo);
+      await commit(tester, c, 'Blue');
+      final first = repo.searches.last;
+      unawaited(c.retry());
+      expect(repo.searches, hasLength(2));
+      repo.searches.last.complete([_track('b')]);
+      await tester.pump();
+      first.fail(StateError('late'));
+      await tester.pump();
+      expect(c.failed, isFalse);
+      expect(uuids(c), ['b']);
+    });
+
+    testWidgets('retry is a no-op when inactive or disposed', (tester) async {
+      final repo = _ScriptedRepo(db);
+      final c = make(repo);
+      await c.retry();
+      expect(repo.searches, isEmpty);
+      await commit(tester, c, 'Blue');
+      c.dispose();
+      await c.retry();
+      expect(repo.searches, hasLength(1));
     });
   });
 
@@ -530,6 +613,56 @@ void main() {
       expect(uuids(c), ['red']);
     });
 
+    // Audit 4A(a) m3: rows kept after a failure must not keep the download
+    // state a dropped patch would have fixed.
+    for (final patchFirst in [true, false]) {
+      testWidgets('a patch dropped by a newer query that then fails is redone '
+          'for the kept rows (patch lands ${patchFirst ? 'before' : 'after'} '
+          'the failure)', (tester) async {
+        final repo = _ScriptedRepo(db);
+        final c = make(repo);
+        await commit(tester, c, 'Blue');
+        repo.searches[0].complete([_track('blue')]);
+        await tester.pump();
+        unawaited(c.onDownloadStatusChanged());
+        await commit(tester, c, 'Red');
+        if (patchFirst) {
+          repo.patches[0].complete([_track('blue', filePath: '/b')]);
+          await tester.pump();
+          repo.searches[1].fail(StateError('db closed'));
+        } else {
+          repo.searches[1].fail(StateError('db closed'));
+          await tester.pump();
+          repo.patches[0].complete([_track('blue', filePath: '/b')]);
+        }
+        await tester.pump();
+        expect(c.failed, isTrue);
+        expect(repo.patches, hasLength(2), reason: 'the kept rows re-patched');
+        repo.patches[1].complete([_track('blue', filePath: '/b')]);
+        await tester.pump();
+        expect(c.results.tracks.single.filePath, '/b');
+      });
+    }
+
+    // Re-audit 4A #5: clear() discards a pending redo (no stale extra
+    // re-patch on a later failed search).
+    testWidgets('clear() forgets a patch dropped for a search', (tester) async {
+      final repo = _ScriptedRepo(db);
+      final c = make(repo);
+      await commit(tester, c, 'Blue');
+      repo.searches[0].complete([_track('blue')]);
+      await tester.pump();
+      unawaited(c.onDownloadStatusChanged());
+      await commit(tester, c, 'Red');
+      repo.patches[0].complete([_track('blue', filePath: '/b')]); // dropped
+      await tester.pump();
+      c.clear();
+      await commit(tester, c, 'Green');
+      repo.searches.last.fail(StateError('db closed'));
+      await tester.pump();
+      expect(repo.patches, hasLength(1), reason: 'no stale re-patch');
+    });
+
     testWidgets('a patch landing after clear() is dropped', (tester) async {
       final repo = _ScriptedRepo(db);
       final c = make(repo);
@@ -718,26 +851,56 @@ void main() {
       expect(c.isCapped, isFalse);
     });
 
+    testWidgets('cappedFor is per type: only the full, requested types', (
+      tester,
+    ) async {
+      const a1 = ArtistUI(id: 1, name: 'A');
+      const a2 = ArtistUI(id: 2, name: 'B');
+      final repo = _ScriptedRepo(db);
+      final c = make(
+        repo,
+        types: {SearchType.artists, SearchType.tracks},
+        limitPerType: 2,
+      );
+      await commit(tester, c, 'Blue');
+      repo.searches.single.completeWith((
+        artists: const [a1, a2],
+        albums: const [],
+        tracks: [_track('a')],
+      ));
+      await tester.pump();
+      expect(c.cappedFor(SearchType.artists), isTrue);
+      expect(c.cappedFor(SearchType.tracks), isFalse, reason: '1 < 2');
+      expect(c.cappedFor(SearchType.albums), isFalse, reason: 'not requested');
+    });
+
     testWidgets('multi-type: any one requested type at the cap', (
       tester,
     ) async {
       const artist = ArtistUI(id: 1, name: 'A');
       const two = [artist, ArtistUI(id: 2, name: 'B')];
-      for (final (artists, tracks, capped) in [
-        (two, [_track('a')], true),
-        (const [artist], [_track('a'), _track('b')], true),
-        (const [artist], [_track('a')], false),
+      const a1 = AlbumUI(id: 1, artistId: 1);
+      const a2 = AlbumUI(id: 2, artistId: 1);
+      for (final (artists, albums, tracks, capped) in [
+        (two, const <AlbumUI>[], [_track('a')], true),
+        (const [artist], const <AlbumUI>[], [_track('a'), _track('b')], true),
+        (const [artist], const <AlbumUI>[], [_track('a')], false),
+        // Audit 4A(c) #3: albums alone at the cap.
+        (const <ArtistUI>[], const [a1, a2], [_track('a')], true),
       ]) {
         final repo = _ScriptedRepo(db);
         final c = make(repo, types: SearchType.values.toSet(), limitPerType: 2);
         await commit(tester, c, 'Blue');
         repo.searches.single.completeWith((
           artists: artists,
-          albums: const [],
+          albums: albums,
           tracks: tracks,
         ));
         await tester.pump();
-        expect(c.isCapped, capped, reason: '$artists / $tracks');
+        expect(c.isCapped, capped, reason: '$artists / $albums / $tracks');
+        expect(c.cappedFor(SearchType.albums), albums.length >= 2);
+        expect(c.cappedFor(SearchType.artists), artists.length >= 2);
+        expect(c.cappedFor(SearchType.tracks), tracks.length >= 2);
       }
     });
   });

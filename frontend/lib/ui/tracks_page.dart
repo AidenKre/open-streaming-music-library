@@ -17,32 +17,30 @@ import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/mixins/root_browse_mixin.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
-import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
   final int? artistId;
   final int? albumId;
 
-  /// True when rendered as a root tab inside [AppShell]; the page then owns
-  /// its own [Scaffold] + [AppBar]. False when pushed as a sub-route.
-  final bool isRoot;
+  /// Browse-all capability (the whole library with the Downloaded chip and
+  /// in-page search), not "navigator root". Requires no album. The page owns
+  /// no chrome: `TracksBrowsePage` / the album detail route supply it.
+  final bool browseAll;
 
   const TracksPage({
     super.key,
     this.artistId,
     this.albumId,
-    this.isRoot = false,
+    this.browseAll = false,
   });
 
   @override
-  ConsumerState<TracksPage> createState() => TracksPageState();
+  ConsumerState<TracksPage> createState() => _TracksPageState();
 }
 
-class TracksPageState extends ConsumerState<TracksPage>
-    with
-        CursorPaginationMixin<TrackUI>,
-        RootBrowseMixin<TracksPage, TrackUI> {
+class _TracksPageState extends ConsumerState<TracksPage>
+    with CursorPaginationMixin<TrackUI>, RootBrowseMixin<TracksPage, TrackUI> {
   @override
   final scrollController = ScrollController();
 
@@ -63,12 +61,17 @@ class TracksPageState extends ConsumerState<TracksPage>
   @override
   void initState() {
     super.initState();
-    sync();
-    if (widget.isRoot) initRootBrowse(type: SearchType.tracks);
+    assert(!widget.browseAll || widget.albumId == null);
+    // Creating a Tracks browse route refreshes the library (phase-4 §4);
+    // the initial sync belongs to the session host, so details don't.
+    if (widget.browseAll) {
+      _refreshLibrary();
+      initRootBrowse(type: SearchType.tracks);
+    }
     initPagination();
   }
 
-  void sync() {
+  void _refreshLibrary() {
     Future.microtask(() => ref.read(browseControlsProvider).refreshLibrary());
   }
 
@@ -115,15 +118,6 @@ class TracksPageState extends ConsumerState<TracksPage>
       ],
     );
 
-    if (widget.isRoot) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('OSML'),
-          actions: buildTopBarActions(context, ref),
-        ),
-        body: body,
-      );
-    }
     return body;
   }
 
@@ -197,9 +191,7 @@ class TracksPageState extends ConsumerState<TracksPage>
       trailing = switch (job.status) {
         Active(:final progress) => SizedBox(
           width: 80,
-          child: LinearProgressIndicator(
-            value: progress > 0 ? progress : null,
-          ),
+          child: LinearProgressIndicator(value: progress > 0 ? progress : null),
         ),
         Queued() => const Icon(Icons.schedule, size: 16),
         Completed() || Failed() => null,
@@ -232,7 +224,6 @@ class TracksPageState extends ConsumerState<TracksPage>
       ),
     );
   }
-
 }
 
 /// Per-build inputs every track row needs, watched once in `build`.

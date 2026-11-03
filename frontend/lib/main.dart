@@ -16,16 +16,10 @@ import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/services/session_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:frontend/ui/artist_page.dart';
-import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:frontend/ui/startup_gate.dart';
-import 'package:frontend/ui/search_page.dart';
-import 'package:frontend/ui/tracks_page.dart';
-import 'package:frontend/ui/widgets/mini_player.dart';
-import 'package:frontend/ui/widgets/offline_banner.dart';
-import 'package:frontend/ui/widgets/pending_edits_banner.dart';
-import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
+
+export 'package:frontend/ui/shell/app_shell.dart' show AppShell;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -171,97 +165,6 @@ class _FrontendState extends ConsumerState<Frontend>
       title: 'OSML',
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
       home: StartupGate(onLocalResetComplete: widget.onLocalResetComplete),
-    );
-  }
-}
-
-class AppShell extends ConsumerStatefulWidget {
-  const AppShell({super.key});
-
-  @override
-  ConsumerState<AppShell> createState() => _AppShellState();
-}
-
-class _AppShellState extends ConsumerState<AppShell> {
-  int _tabIndex = 0;
-  final _tracksKey = GlobalKey<TracksPageState>();
-
-  final _navigatorKeys = [
-    GlobalKey<NavigatorState>(debugLabel: 'artists'),
-    GlobalKey<NavigatorState>(debugLabel: 'tracks'),
-    GlobalKey<NavigatorState>(debugLabel: 'downloads'),
-    GlobalKey<NavigatorState>(debugLabel: 'search'),
-  ];
-
-  Widget _buildTabNavigator(int index, Widget Function() rootBuilder) {
-    return Navigator(
-      key: _navigatorKeys[index],
-      onGenerateRoute: (_) => MaterialPageRoute(builder: (_) => rootBuilder()),
-    );
-  }
-
-  void _onTabTap(int index) {
-    if (index == _tabIndex) {
-      _navigatorKeys[index].currentState?.popUntil((r) => r.isFirst);
-    } else {
-      setState(() => _tabIndex = index);
-      if (index == 1) _tracksKey.currentState?.sync();
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final isOffline = ref.watch(offlineModeProvider);
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (didPop) return;
-        final nav = _navigatorKeys[_tabIndex].currentState;
-        if (nav != null && nav.canPop()) {
-          nav.pop();
-        }
-      },
-      child: Scaffold(
-        body: Column(
-          children: [
-            Expanded(
-              child: IndexedStack(
-                index: _tabIndex,
-                children: [
-                  _buildTabNavigator(0, () => const ArtistsPage(isRoot: true)),
-                  _buildTabNavigator(
-                    1,
-                    () => TracksPage(key: _tracksKey, isRoot: true),
-                  ),
-                  _buildTabNavigator(2, () => const DownloadedTracksPage()),
-                  _buildTabNavigator(3, () => const SearchPage()),
-                ],
-              ),
-            ),
-            const PendingEditsBanner(),
-            const StaleDownloadsBanner(),
-            if (isOffline) const OfflineBanner(),
-            const MiniPlayer(),
-          ],
-        ),
-        bottomNavigationBar: BottomNavigationBar(
-          currentIndex: _tabIndex,
-          onTap: _onTabTap,
-          type: BottomNavigationBarType.fixed,
-          items: const [
-            BottomNavigationBarItem(icon: Icon(Icons.home), label: "Artists"),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.music_note),
-              label: "Tracks",
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.download_done),
-              label: "Downloads",
-            ),
-            BottomNavigationBarItem(icon: Icon(Icons.search), label: "Search"),
-          ],
-        ),
-      ),
     );
   }
 }

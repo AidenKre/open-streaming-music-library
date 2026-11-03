@@ -41,104 +41,128 @@ class MiniPlayer extends ConsumerWidget {
           builder: (_) => const FullPlayer(),
         );
       },
-      child: Container(
-        color: colors.surfaceContainerHigh,
-        height: 64,
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        child: Row(
-          children: [
-            CoverArtImage(
-              hasAlbumArt: track.hasAlbumArt,
-              coverArtId: track.coverArtId,
-              width: 48,
-              height: 48,
-              borderRadius: BorderRadius.circular(4),
-              fallback: Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: colors.primaryContainer,
+      // At least 64 pt, growing with the text scale rather than overflowing;
+      // on narrow widths the secondary shuffle/repeat buttons give way (both
+      // stay in the full player).
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 480;
+          return Container(
+            color: colors.surfaceContainerHigh,
+            constraints: const BoxConstraints(minHeight: 64),
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              children: [
+                CoverArtImage(
+                  hasAlbumArt: track.hasAlbumArt,
+                  coverArtId: track.coverArtId,
+                  width: 48,
+                  height: 48,
                   borderRadius: BorderRadius.circular(4),
+                  fallback: Container(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: colors.primaryContainer,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Icon(
+                      Icons.music_note,
+                      color: colors.onPrimaryContainer,
+                    ),
+                  ),
                 ),
-                child: Icon(Icons.music_note, color: colors.onPrimaryContainer),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    track.title ?? 'Unknown Title',
-                    style: textTheme.titleSmall,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  Text(
-                    [track.artist ?? 'Unknown Artist', track.album]
-                        .where((s) => s != null)
-                        .join(' — '),
-                    style: textTheme.bodySmall
-                        ?.copyWith(color: colors.onSurfaceVariant),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 2),
-                  Row(
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(
-                        child: LinearProgressIndicator(
-                          value: progress.clamp(0.0, 1.0),
-                          minHeight: 2,
-                        ),
-                      ),
-                      const SizedBox(width: 4),
                       Text(
-                        formatDuration(position),
-                        style: textTheme.bodySmall
-                            ?.copyWith(color: colors.onSurfaceVariant),
+                        track.title ?? 'Unknown Title',
+                        style: textTheme.titleSmall,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      Text(
+                        [
+                          track.artist ?? 'Unknown Artist',
+                          track.album,
+                        ].where((s) => s != null).join(' — '),
+                        style: textTheme.bodySmall?.copyWith(
+                          color: colors.onSurfaceVariant,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 2),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: LinearProgressIndicator(
+                              value: progress.clamp(0.0, 1.0),
+                              minHeight: 2,
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            formatDuration(position),
+                            style: textTheme.bodySmall?.copyWith(
+                              color: colors.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
-                ],
-              ),
+                ),
+                if (!compact)
+                  IconButton(
+                    icon: Icon(
+                      Icons.shuffle,
+                      color: shuffleOn ? colors.primary : null,
+                      size: 20,
+                    ),
+                    onPressed: () =>
+                        ref.read(playerControlsProvider).toggleShuffle(),
+                  ),
+                IconButton(
+                  icon: const Icon(Icons.skip_previous),
+                  onPressed: () =>
+                      ref.read(playerControlsProvider).skipPrevious(),
+                ),
+                IconButton(
+                  icon: Icon(
+                    status == PlayerStatus.playing
+                        ? Icons.pause
+                        : Icons.play_arrow,
+                  ),
+                  // The model decides play vs pause when the command runs.
+                  onPressed: () =>
+                      ref.read(playerControlsProvider).togglePlayPause(),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.skip_next),
+                  onPressed: () => ref.read(playerControlsProvider).skipNext(),
+                ),
+                if (!compact)
+                  IconButton(
+                    icon: Icon(
+                      repeatMode == QueueRepeatMode.one
+                          ? Icons.repeat_one
+                          : Icons.repeat,
+                      color: repeatMode != QueueRepeatMode.off
+                          ? colors.primary
+                          : null,
+                      size: 20,
+                    ),
+                    onPressed: () =>
+                        ref.read(playerControlsProvider).cycleRepeat(),
+                  ),
+              ],
             ),
-            IconButton(
-              icon: Icon(
-                Icons.shuffle,
-                color: shuffleOn ? colors.primary : null,
-                size: 20,
-              ),
-              onPressed: () => ref.read(playerControlsProvider).toggleShuffle(),
-            ),
-            IconButton(
-              icon: const Icon(Icons.skip_previous),
-              onPressed: () => ref.read(playerControlsProvider).skipPrevious(),
-            ),
-            IconButton(
-              icon: Icon(
-                status == PlayerStatus.playing
-                    ? Icons.pause
-                    : Icons.play_arrow,
-              ),
-              // The model decides play vs pause when the command runs.
-              onPressed: () => ref.read(playerControlsProvider).togglePlayPause(),
-            ),
-            IconButton(
-              icon: const Icon(Icons.skip_next),
-              onPressed: () => ref.read(playerControlsProvider).skipNext(),
-            ),
-            IconButton(
-              icon: Icon(
-                repeatMode == QueueRepeatMode.one ? Icons.repeat_one : Icons.repeat,
-                color: repeatMode != QueueRepeatMode.off ? colors.primary : null,
-                size: 20,
-              ),
-              onPressed: () => ref.read(playerControlsProvider).cycleRepeat(),
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }

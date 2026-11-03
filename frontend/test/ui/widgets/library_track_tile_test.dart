@@ -70,6 +70,26 @@ void main() {
     await teardownTree(tester);
   });
 
+  testWidgets('offline, a streaming-only track still offers Get info',
+      (tester) async {
+    await tester.pumpWidget(host(
+      LibraryTrackTile(track: tracks['remote']!, onTap: () {}),
+      offline: true,
+    ));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.more_vert));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<ListTile>(find.widgetWithText(ListTile, 'Add to Queue')).enabled,
+      isFalse,
+      reason: 'play/queue stay blocked',
+    );
+    await tester.tap(find.text('Get Info'));
+    await tester.pumpAndSettle();
+    expect(find.byType(GetInfoPage), findsOneWidget);
+    await teardownTree(tester);
+  });
+
   testWidgets('offline, a downloaded track plays', (tester) async {
     var tapped = false;
     await tester.pumpWidget(host(

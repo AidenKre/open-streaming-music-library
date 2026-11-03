@@ -59,6 +59,7 @@ Future<void> _pumpMiniPlayer(
   TrackUI track, {
   PlayerStatus status = PlayerStatus.paused,
   FakePlayerControls? controls,
+  bool inColumn = false,
 }) async {
   final db = AppDatabase(NativeDatabase.memory());
   addTearDown(db.close);
@@ -77,7 +78,17 @@ Future<void> _pumpMiniPlayer(
   await tester.pumpWidget(
     UncontrolledProviderScope(
       container: container,
-      child: const MaterialApp(home: Scaffold(body: MiniPlayer())),
+      child: MaterialApp(
+        home: Scaffold(
+          // inColumn: as in the shell's bottom stack (loose height).
+          body: inColumn
+              ? const Column(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [MiniPlayer()],
+                )
+              : const MiniPlayer(),
+        ),
+      ),
     ),
   );
 }
@@ -89,43 +100,43 @@ void main() {
   });
 
   group('MiniPlayer cover art', () {
-    testWidgets(
-      'shows fallback music note when track has no cover art',
-      (tester) async {
-        await _pumpMiniPlayer(
-          tester,
-          _track(hasAlbumArt: false, coverArtId: null),
-        );
+    testWidgets('shows fallback music note when track has no cover art', (
+      tester,
+    ) async {
+      await _pumpMiniPlayer(
+        tester,
+        _track(hasAlbumArt: false, coverArtId: null),
+      );
 
-        expect(find.byIcon(Icons.music_note), findsOneWidget);
-        expect(find.byType(Image), findsNothing);
-      },
-    );
+      expect(find.byIcon(Icons.music_note), findsOneWidget);
+      expect(find.byType(Image), findsNothing);
+    });
 
-    testWidgets(
-      'shows CoverArtImage when track has cover art',
-      (tester) async {
-        await _pumpMiniPlayer(
-          tester,
-          _track(hasAlbumArt: true, coverArtId: 7),
-        );
+    testWidgets('shows CoverArtImage when track has cover art', (tester) async {
+      await _pumpMiniPlayer(tester, _track(hasAlbumArt: true, coverArtId: 7));
 
-        expect(find.byType(CoverArtImage), findsOneWidget);
-        expect(find.byType(Image), findsOneWidget);
-      },
-    );
+      expect(find.byType(CoverArtImage), findsOneWidget);
+      expect(find.byType(Image), findsOneWidget);
+    });
   });
 
   group('MiniPlayer inputs go to PlayerControls (SC-27)', () {
     for (final status in [PlayerStatus.paused, PlayerStatus.playing]) {
-      testWidgets('play/pause button asks the model to toggle ($status)',
-          (tester) async {
+      testWidgets('play/pause button asks the model to toggle ($status)', (
+        tester,
+      ) async {
         final controls = FakePlayerControls();
-        await _pumpMiniPlayer(tester, _track(), status: status,
-            controls: controls);
-        await tester.tap(find.byIcon(
-          status == PlayerStatus.playing ? Icons.pause : Icons.play_arrow,
-        ));
+        await _pumpMiniPlayer(
+          tester,
+          _track(),
+          status: status,
+          controls: controls,
+        );
+        await tester.tap(
+          find.byIcon(
+            status == PlayerStatus.playing ? Icons.pause : Icons.play_arrow,
+          ),
+        );
         // The view never decides play vs pause.
         expect(controls.calls, ['toggle']);
       });
@@ -140,5 +151,30 @@ void main() {
       await tester.tap(find.byIcon(Icons.repeat));
       expect(controls.calls, ['shuffle', 'previous', 'next', 'repeat']);
     });
+  });
+
+  // 4A live C03 (narrow window, text scale 2): the mini player grows with
+  // the text instead of overflowing a fixed 64-pt height.
+  group('MiniPlayer text scale', () {
+    for (final scale in [1.0, 2.0]) {
+      testWidgets('360 pt wide at text scale $scale: no overflow', (
+        tester,
+      ) async {
+        tester.view.physicalSize = const Size(360, 800);
+        tester.view.devicePixelRatio = 1;
+        tester.platformDispatcher.textScaleFactorTestValue = scale;
+        addTearDown(tester.view.reset);
+        addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+        await _pumpMiniPlayer(tester, _track(), inColumn: true);
+        await tester.pump();
+        expect(tester.takeException(), isNull);
+        final height = tester.getSize(find.byType(MiniPlayer)).height;
+        if (scale == 1.0) {
+          expect(height, 64, reason: 'unchanged at the standard scale');
+        } else {
+          expect(height, greaterThan(64));
+        }
+      });
+    }
   });
 }

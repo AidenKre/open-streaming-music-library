@@ -27,10 +27,26 @@ void main() {
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, const [
-      SeedTrack(uuid: 'k1', title: 'Kite One', artistId: 1, artist: 'Ann',
-          albumId: 2, album: 'Air', trackNumber: 1, downloaded: true),
-      SeedTrack(uuid: 'k2', title: 'Kite Two', artistId: 1, artist: 'Ann',
-          albumId: 2, album: 'Air', trackNumber: 2, downloaded: true),
+      SeedTrack(
+        uuid: 'k1',
+        title: 'Kite One',
+        artistId: 1,
+        artist: 'Ann',
+        albumId: 2,
+        album: 'Air',
+        trackNumber: 1,
+        downloaded: true,
+      ),
+      SeedTrack(
+        uuid: 'k2',
+        title: 'Kite Two',
+        artistId: 1,
+        artist: 'Ann',
+        albumId: 2,
+        album: 'Air',
+        trackNumber: 2,
+        downloaded: true,
+      ),
     ]);
     harness = await BrowseHarness.create(db);
     actions = FakeLibraryActions();
@@ -42,10 +58,12 @@ void main() {
   });
 
   Future<void> pump(WidgetTester tester, Widget page) async {
-    await tester.pumpWidget(harness.wrap(
-      page,
-      overrides: [libraryActionsProvider.overrideWithValue(actions)],
-    ));
+    await tester.pumpWidget(
+      harness.wrap(
+        page,
+        overrides: [libraryActionsProvider.overrideWithValue(actions)],
+      ),
+    );
     await tester.pumpAndSettle();
   }
 
@@ -61,14 +79,14 @@ void main() {
       const Scaffold(body: TracksPage(artistId: 1, albumId: 2)),
     );
     await tester.tap(find.text('Kite Two'));
-    expect(actions.calls,
-        ['playQuery k2 album(1,2) downloadedOnly=false']);
+    expect(actions.calls, ['playQuery k2 album(1,2) downloadedOnly=false']);
     await teardownTree(tester);
   });
 
-  testWidgets('root Tracks row tap plays the library query with the chip',
-      (tester) async {
-    await pump(tester, const TracksPage(isRoot: true));
+  testWidgets('root Tracks row tap plays the library query with the chip', (
+    tester,
+  ) async {
+    await pump(tester, const Scaffold(body: TracksPage(browseAll: true)));
     await tester.tap(find.text('Downloaded'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Kite One'));
@@ -76,9 +94,10 @@ void main() {
     await teardownTree(tester);
   });
 
-  testWidgets('root Tracks search row tap plays the result list',
-      (tester) async {
-    await pump(tester, const TracksPage(isRoot: true));
+  testWidgets('root Tracks search row tap plays the result list', (
+    tester,
+  ) async {
+    await pump(tester, const Scaffold(body: TracksPage(browseAll: true)));
     await search(tester, 'kite');
     await tester.tap(find.text('Kite Two'));
     expect(actions.calls, ['playFromList k1,k2 @1 search']);
@@ -93,8 +112,9 @@ void main() {
     await teardownTree(tester);
   });
 
-  testWidgets('Downloaded row tap plays the downloaded library query',
-      (tester) async {
+  testWidgets('Downloaded row tap plays the downloaded library query', (
+    tester,
+  ) async {
     await pump(tester, const DownloadedTracksPage());
     await tester.tap(find.text('Kite Two'));
     expect(actions.calls, ['playQuery k2 library downloadedOnly=true']);

@@ -1,5 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/session_service.dart';
 
 /// Input of the library browse pages that isn't a library action: asking
 /// for fresh catalog data when a browse route is created (SC-26: views never
@@ -20,6 +20,8 @@ class BrowseController implements BrowseControls {
 
   final Ref _ref;
 
+  /// Through the one model entry for a catalog sync (5A.0 gates it there).
   @override
-  Future<void> refreshLibrary() => _ref.read(trackSyncProvider.notifier).sync();
+  Future<void> refreshLibrary() =>
+      _ref.read(sessionServiceProvider).syncLibrary();
 }

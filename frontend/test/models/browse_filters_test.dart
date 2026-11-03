@@ -107,4 +107,29 @@ void main() {
       },
     );
   });
+
+  group('OfflineFilterPolicy (SC-09 shape)', () {
+    test('defaults to autoApply: Phase 3 behaviour unchanged', () {
+      expect(const BrowseFilters().policy, OfflineFilterPolicy.autoApply);
+      expect(BrowseFilters.initial(isOffline: true).policy,
+          OfflineFilterPolicy.autoApply);
+      expect(BrowseFilters.initial(isOffline: true).downloaded, isTrue);
+    });
+
+    test('manual never auto-selects and offline transitions are no-ops', () {
+      const manual = BrowseFilters(policy: OfflineFilterPolicy.manual);
+      expect(BrowseFilters.initial(isOffline: true, policy: OfflineFilterPolicy.manual),
+          manual);
+      expect(manual.wentOffline(), manual);
+      expect(manual.cameOnline(), manual);
+      final userOn = manual.userSetDownloaded(true);
+      expect(userOn.policy, OfflineFilterPolicy.manual);
+      expect(userOn.cameOnline(), userOn);
+    });
+
+    test('policy is part of equality', () {
+      expect(const BrowseFilters() == const BrowseFilters(policy: OfflineFilterPolicy.manual),
+          isFalse);
+    });
+  });
 }

@@ -251,45 +251,42 @@ void main() {
       },
     );
 
-    test(
-      'upsert stores the per-track revision from the payload, and a later '
-      'upsert overwrites it',
-      () async {
-        var call = 0;
-        ApiClient.initForTest(
-          'http://localhost:8000',
-          MockClient((req) async {
-            call++;
-            // The envelope revision (sync watermark) is deliberately set
-            // different from the track-payload revision so this proves the
-            // stored value comes from the payload, not the envelope.
-            if (call == 1) {
-              return _changesResponse([
-                _upsert(1, _trackJson('uuid-1', revision: 7)),
-              ]);
-            }
+    test('upsert stores the per-track revision from the payload, and a later '
+        'upsert overwrites it', () async {
+      var call = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          call++;
+          // The envelope revision (sync watermark) is deliberately set
+          // different from the track-payload revision so this proves the
+          // stored value comes from the payload, not the envelope.
+          if (call == 1) {
             return _changesResponse([
-              _upsert(2, _trackJson('uuid-1', revision: 9)),
+              _upsert(1, _trackJson('uuid-1', revision: 7)),
             ]);
-          }),
-        );
+          }
+          return _changesResponse([
+            _upsert(2, _trackJson('uuid-1', revision: 9)),
+          ]);
+        }),
+      );
 
-        final c = createContainer();
-        await waitForBuild(c);
+      final c = createContainer();
+      await waitForBuild(c);
 
-        await c.read(trackSyncProvider.notifier).sync();
-        final afterFirst = await (db.select(
-          db.tracks,
-        )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
-        expect(afterFirst.revision, 7);
+      await c.read(trackSyncProvider.notifier).sync();
+      final afterFirst = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
+      expect(afterFirst.revision, 7);
 
-        await c.read(trackSyncProvider.notifier).sync();
-        final afterSecond = await (db.select(
-          db.tracks,
-        )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
-        expect(afterSecond.revision, 9);
-      },
-    );
+      await c.read(trackSyncProvider.notifier).sync();
+      final afterSecond = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('uuid-1'))).getSingle();
+      expect(afterSecond.revision, 9);
+    });
 
     test(
       'subsequent sync sends the stored revision as after_revision',
@@ -490,22 +487,73 @@ void main() {
         // Serialized: the refresh is skipped while the sync is in flight
         // (its take_server marker is retried after the sync).
         expect(refreshedDuringSync, isFalse);
-        expect(
-          c.read(trackSyncProvider).value!.downloadMutationVersion,
-          1,
-        );
+        expect(c.read(trackSyncProvider).value!.downloadMutationVersion, 1);
 
         final refreshedAfterSync = await notifier.refreshTrack('uuid-b');
         expect(refreshedAfterSync, isTrue);
-        expect(
-          c.read(trackSyncProvider).value!.downloadMutationVersion,
-          2,
-        );
+        expect(c.read(trackSyncProvider).value!.downloadMutationVersion, 2);
         expect(await db.getTrackByUuid('uuid-b'), isEmpty);
 
         // No version was ever published twice.
         expect(publishedVersions.toSet().length, publishedVersions.length);
         expect(publishedVersions, [1, 2]);
+      },
+    );
+
+    // Re-audit 4A #4: the library status is the library sync's own.
+    test(
+      'libraryError: set by a failed library sync, untouched by a '
+      'single-track refresh, cleared by the next good library sync',
+      () async {
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse([_upsert(1, _trackJson('uuid-1'))]),
+          ),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
+        final notifier = c.read(trackSyncProvider.notifier);
+        await notifier.sync();
+        expect(c.read(trackSyncProvider).value!.libraryError, isNull);
+
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async => Response('server error', 500)),
+        );
+        final seenLibrarySyncing = <bool>[];
+        c.listen<AsyncValue<TrackSyncState>>(trackSyncProvider, (_, next) {
+          seenLibrarySyncing.add(next.value?.librarySyncing ?? false);
+        });
+        await notifier.sync();
+        expect(seenLibrarySyncing, contains(true));
+        expect(c.read(trackSyncProvider).value!.libraryError, isNotNull);
+
+        seenLibrarySyncing.clear();
+        await notifier.refreshTrack('uuid-1'); // fails (500)
+        expect(seenLibrarySyncing, isNot(contains(true)));
+        expect(
+          c.read(trackSyncProvider).value!.libraryError,
+          isNotNull,
+          reason: 'a refresh failure is not a library failure',
+        );
+
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => req.url.path.endsWith('/changes')
+                ? _changesResponse(const [])
+                : Response(jsonEncode(_trackJson('uuid-1')), 200),
+          ),
+        );
+        await notifier.refreshTrack('uuid-1'); // succeeds
+        expect(
+          c.read(trackSyncProvider).value!.libraryError,
+          isNotNull,
+          reason: 'a good refresh does not hide a failed library sync',
+        );
+        await notifier.sync();
+        expect(c.read(trackSyncProvider).value!.libraryError, isNull);
       },
     );
 
@@ -1529,28 +1577,36 @@ void main() {
       firstHeld.complete();
       await plain;
       expect(await fresh, isTrue);
-      expect(events, ['start1', 'end1', 'start2', 'end2'],
-          reason: 'a second pull started only after the first finished');
-      expect((await db.select(db.tracks).get()).map((t) => t.uuidId).toSet(),
-          {'uuid-1', 'uuid-2'});
+      expect(events, [
+        'start1',
+        'end1',
+        'start2',
+        'end2',
+      ], reason: 'a second pull started only after the first finished');
+      expect((await db.select(db.tracks).get()).map((t) => t.uuidId).toSet(), {
+        'uuid-1',
+        'uuid-2',
+      });
     });
 
-    test('with nothing in flight runs exactly one pull and returns true',
-        () async {
-      var call = 0;
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async {
-          call++;
-          return _changesResponse([_upsert(1, _trackJson('uuid-1'))]);
-        }),
-      );
-      final c = createContainer();
-      await waitForBuild(c);
+    test(
+      'with nothing in flight runs exactly one pull and returns true',
+      () async {
+        var call = 0;
+        ApiClient.initForTest(
+          'http://localhost:8000',
+          MockClient((req) async {
+            call++;
+            return _changesResponse([_upsert(1, _trackJson('uuid-1'))]);
+          }),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
 
-      expect(await c.read(trackSyncProvider.notifier).syncFresh(), isTrue);
-      expect(call, 1);
-    });
+        expect(await c.read(trackSyncProvider.notifier).syncFresh(), isTrue);
+        expect(call, 1);
+      },
+    );
 
     test('offline returns false without a request', () async {
       var call = 0;
@@ -1609,119 +1665,117 @@ void main() {
       ]);
 
       expect(maxInFlight, 1);
-      expect(results, everyElement(isTrue),
-          reason: 'every syncFresh caller got its own completed fresh pull');
+      expect(
+        results,
+        everyElement(isTrue),
+        reason: 'every syncFresh caller got its own completed fresh pull',
+      );
       expect(call, greaterThanOrEqualTo(2));
       expect(c.read(trackSyncProvider).value!.isSyncing, isFalse);
     });
   });
 
   group('Artist-rename orphan reproduction', () {
-    test(
-      'flushing an artist rename, then resuming the app, still leaves the '
-      'old artist on the browse grid',
-      () async {
-        // Establish Artist "Old" (id 31) locally exactly like a freshly
-        // synced library: one track, one artist, one album.
-        var patched = false;
-        ApiClient.initForTest(
-          'http://localhost:8000',
-          MockClient((req) async {
-            if (req.method == 'PATCH') {
-              patched = true;
-              // The server accepts the rename and reassigns the track
-              // server-side to a new Artist "New" (id 32), GC-ing Artist
-              // "Old" (31) — reflected below on the next `/changes` pull,
-              // which app-resume is what makes happen at all.
-              return Response(
-                jsonEncode({
-                  'uuid_id': 'uuid-moving',
-                  'revision': 2,
-                  'master_written': false,
-                }),
-                200,
-                headers: {'content-type': 'application/json'},
-              );
-            }
-            if (patched) {
-              return _changesResponse([
-                _upsert(
-                  2,
-                  _richTrackJson(
-                    'uuid-moving',
-                    title: 'Song',
-                    artist: 'New',
-                    album: 'Old Album',
-                    artistId: 32,
-                    albumId: 301,
-                  ),
-                ),
-              ]);
-            }
+    test('flushing an artist rename, then resuming the app, still leaves the '
+        'old artist on the browse grid', () async {
+      // Establish Artist "Old" (id 31) locally exactly like a freshly
+      // synced library: one track, one artist, one album.
+      var patched = false;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((req) async {
+          if (req.method == 'PATCH') {
+            patched = true;
+            // The server accepts the rename and reassigns the track
+            // server-side to a new Artist "New" (id 32), GC-ing Artist
+            // "Old" (31) — reflected below on the next `/changes` pull,
+            // which app-resume is what makes happen at all.
+            return Response(
+              jsonEncode({
+                'uuid_id': 'uuid-moving',
+                'revision': 2,
+                'master_written': false,
+              }),
+              200,
+              headers: {'content-type': 'application/json'},
+            );
+          }
+          if (patched) {
             return _changesResponse([
               _upsert(
-                1,
+                2,
                 _richTrackJson(
                   'uuid-moving',
                   title: 'Song',
-                  artist: 'Old',
+                  artist: 'New',
                   album: 'Old Album',
-                  artistId: 31,
+                  artistId: 32,
                   albumId: 301,
                 ),
               ),
             ]);
-          }),
-        );
-        final c = createContainer();
-        await waitForBuild(c);
-        await c.read(trackSyncProvider.notifier).sync();
+          }
+          return _changesResponse([
+            _upsert(
+              1,
+              _richTrackJson(
+                'uuid-moving',
+                title: 'Song',
+                artist: 'Old',
+                album: 'Old Album',
+                artistId: 31,
+                albumId: 301,
+              ),
+            ),
+          ]);
+        }),
+      );
+      final c = createContainer();
+      await waitForBuild(c);
+      await c.read(trackSyncProvider.notifier).sync();
 
-        // Sanity check: Artist "Old" is on the board after the initial sync.
-        expect(
-          await (db.select(db.artists)..where((a) => a.id.equals(31))).get(),
-          hasLength(1),
-        );
+      // Sanity check: Artist "Old" is on the board after the initial sync.
+      expect(
+        await (db.select(db.artists)..where((a) => a.id.equals(31))).get(),
+        hasLength(1),
+      );
 
-        // The user renames the track's artist via the real edit outbox — the
-        // same seam Get Info uses — and the save completes successfully.
-        final outbox = c.read(editOutboxProvider);
-        await outbox.enqueue(
-          uuidId: 'uuid-moving',
-          edit: const MetadataEdit.empty().set('artist', 'New'),
-          writeMode: EditWriteMode.dbOnly,
-          baseRevision: 1,
-        );
-        await outbox.flush();
-        expect(patched, isTrue);
-        expect(await db.select(db.pendingEdits).get(), isEmpty);
+      // The user renames the track's artist via the real edit outbox — the
+      // same seam Get Info uses — and the save completes successfully.
+      final outbox = c.read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'uuid-moving',
+        edit: const MetadataEdit.empty().set('artist', 'New'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 1,
+      );
+      await outbox.flush();
+      expect(patched, isTrue);
+      expect(await db.select(db.pendingEdits).get(), isEmpty);
 
-        // The app is backgrounded and resumed — no network flap, no manual
-        // navigation to a fresh Artists/Albums/Tracks page. Just the most
-        // ordinary "user put their phone away and picked it back up" edge.
-        await c
-            .read(recoveryServiceProvider)
-            .runFor(RecoveryTrigger.appResume);
+      // The app is backgrounded and resumed — no network flap, no manual
+      // navigation to a fresh Artists/Albums/Tracks page. Just the most
+      // ordinary "user put their phone away and picked it back up" edge.
+      await c.read(recoveryServiceProvider).runFor(RecoveryTrigger.appResume);
 
-        // Desired: Artist "Old" has zero tracks left after the rename, so it
-        // should no longer show on the browse grid. Actual: nothing ever
-        // repointed the local artist_id FK or pruned the parent row — that
-        // only happens inside SyncService, and app resume never triggers a
-        // sync (`_SyncRecoverable` only fires on `networkRecovered`) — so the
-        // orphaned card survives resume entirely.
-        final oldArtist = await (db.select(
-          db.artists,
-        )..where((a) => a.id.equals(31))).get();
-        expect(
-          oldArtist,
-          isEmpty,
-          reason:
-              'Artist "Old" has no remaining tracks after the rename '
-              'flushed, but resuming the app never reconciles it — the '
-              'orphaned card survives indefinitely until some other page '
-              'happens to trigger a sync.',
-        );
-      },
-    );
+      // Desired: Artist "Old" has zero tracks left after the rename, so it
+      // should no longer show on the browse grid. Actual: nothing ever
+      // repointed the local artist_id FK or pruned the parent row — that
+      // only happens inside SyncService, and app resume never triggers a
+      // sync (`_SyncRecoverable` only fires on `networkRecovered`) — so the
+      // orphaned card survives resume entirely.
+      final oldArtist = await (db.select(
+        db.artists,
+      )..where((a) => a.id.equals(31))).get();
+      expect(
+        oldArtist,
+        isEmpty,
+        reason:
+            'Artist "Old" has no remaining tracks after the rename '
+            'flushed, but resuming the app never reconciles it — the '
+            'orphaned card survives indefinitely until some other page '
+            'happens to trigger a sync.',
+      );
+    });
   });
 }

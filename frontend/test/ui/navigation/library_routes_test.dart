@@ -56,7 +56,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.widgetWithText(AppBar, 'Ann - Singles'), findsOneWidget);
     final page = tester.widget<TracksPage>(find.byType(TracksPage));
-    expect((page.artistId, page.albumId, page.isRoot), (4, 9, false));
+    expect((page.artistId, page.albumId, page.browseAll), (4, 9, false));
     await teardownTree(tester);
   });
 

@@ -81,7 +81,7 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  const root = TracksPage(isRoot: true);
+  const root = Scaffold(body: TracksPage(browseAll: true));
   const detail = Scaffold(body: TracksPage(artistId: 1, albumId: 10));
 
   CursorPaginationMixin<TrackUI> pageState(WidgetTester tester) =>
@@ -397,6 +397,42 @@ void main() {
       await teardownTree(tester);
     });
 
+    testWidgets('a failed search offers Retry, which re-runs the query', (
+      tester,
+    ) async {
+      final repo = _GatedSearchRepo(db, fail: true);
+      await tester.pumpWidget(h.wrap(root, repository: repo));
+      await tester.pumpAndSettle();
+      await search(tester, 'Kept');
+      expect(find.text(searchFailedMessage), findsOneWidget);
+
+      repo.fail = false;
+      repo.gate.complete();
+      await tester.tap(find.widgetWithText(TextButton, 'Retry'));
+      await tester.pumpAndSettle();
+      expect(find.text(searchFailedMessage), findsNothing);
+      expect(find.text('Kept Song'), findsOneWidget);
+      expect(find.text('Kept'), findsOneWidget, reason: 'query kept');
+      await teardownTree(tester);
+    });
+
+    testWidgets('a failure after results keeps the rows beside the error', (
+      tester,
+    ) async {
+      final repo = _GatedSearchRepo(db)..gate.complete();
+      await tester.pumpWidget(h.wrap(root, repository: repo));
+      await tester.pumpAndSettle();
+      await search(tester, 'Kept');
+      expect(find.text('Kept Song'), findsOneWidget);
+
+      repo.fail = true;
+      await search(tester, 'Kept S');
+      expect(find.text('Kept Song'), findsOneWidget);
+      expect(find.text(searchFailedMessage), findsOneWidget);
+      expect(find.widgetWithText(TextButton, 'Retry'), findsOneWidget);
+      await teardownTree(tester);
+    });
+
     testWidgets('no match explains itself, naming the Downloaded filter', (
       tester,
     ) async {
@@ -504,7 +540,11 @@ void main() {
       final list = tester.widget<ListView>(find.byType(ListView));
       final delegate = list.childrenDelegate as SliverChildBuilderDelegate;
       expect(delegate.childCount, 100);
-      expect(find.textContaining('Showing the first 100 matches'), findsOne);
+      // 4A.3: the per-type hint (was "… 100 matches …", changed on purpose).
+      expect(
+        find.text('Showing the first 100 tracks — refine your search.'),
+        findsOne,
+      );
       await teardownTree(tester);
     });
 
@@ -672,7 +712,8 @@ void main() {
 class _GatedSearchRepo extends BrowseRepository {
   _GatedSearchRepo(super.db, {this.fail = false});
 
-  final bool fail;
+  /// Flip mid-test to fail (or stop failing) the next search.
+  bool fail;
   final gate = Completer<void>();
 
   @override

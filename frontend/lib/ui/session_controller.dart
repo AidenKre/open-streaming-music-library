@@ -28,6 +28,12 @@ abstract interface class SessionControls implements Listenable {
 
   /// The view showed the finished reset; return to the login screen.
   void acknowledgeReset();
+
+  /// The session host mounted (the live session's UI exists).
+  Future<void> onSessionActivated();
+
+  /// The user's Retry after the library sync failed.
+  Future<void> retryLibrarySync();
 }
 
 final sessionControlsProvider = Provider<SessionControls>((ref) {
@@ -98,6 +104,12 @@ class SessionController extends ChangeNotifier implements SessionControls {
     _resetFailure = null;
     _set(SessionPhase.signedOut);
   }
+
+  @override
+  Future<void> onSessionActivated() => _service.onSessionActivated();
+
+  @override
+  Future<void> retryLibrarySync() => _service.syncLibrary();
 
   @override
   void dispose() {

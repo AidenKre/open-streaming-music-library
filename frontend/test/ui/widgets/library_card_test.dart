@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -19,18 +20,11 @@ class _StubOffline extends OfflineModeNotifier {
   bool build() => _value;
 }
 
-Widget _harness({
-  required Widget child,
-  bool offline = false,
-}) {
+Widget _harness({required Widget child, bool offline = false}) {
   return ProviderScope(
-    overrides: [
-      offlineModeProvider.overrideWith(() => _StubOffline(offline)),
-    ],
+    overrides: [offlineModeProvider.overrideWith(() => _StubOffline(offline))],
     child: MaterialApp(
-      home: Scaffold(
-        body: SizedBox(width: 200, height: 280, child: child),
-      ),
+      home: Scaffold(body: SizedBox(width: 200, height: 280, child: child)),
     ),
   );
 }
@@ -53,7 +47,8 @@ LibraryCard _build({
     title: title,
     subtitle: subtitle,
     onTap: onTap ?? () {},
-    menu: menu ??
+    menu:
+        menu ??
         buildLibraryActionMenu(
           const AlbumScope(artistId: 1, albumId: 2),
           PlaybackAvailability.of(
@@ -77,16 +72,15 @@ void main() {
   group('LibraryCard rendering', () {
     testWidgets('renders title, subtitle, and cover', (tester) async {
       const coverKey = Key('cover-content');
-      await tester.pumpWidget(_harness(
-        child: _build(
-          title: 'Hello',
-          subtitle: 'World',
-          cover: const ColoredBox(
-            key: coverKey,
-            color: Color(0xFF112233),
+      await tester.pumpWidget(
+        _harness(
+          child: _build(
+            title: 'Hello',
+            subtitle: 'World',
+            cover: const ColoredBox(key: coverKey, color: Color(0xFF112233)),
           ),
         ),
-      ));
+      );
 
       expect(find.text('Hello'), findsOneWidget);
       expect(find.text('World'), findsOneWidget);
@@ -94,18 +88,28 @@ void main() {
     });
 
     testWidgets('omits subtitle node when subtitle is null', (tester) async {
-      await tester.pumpWidget(_harness(
-        child: _build(title: 'Solo'),
-      ));
+      await tester.pumpWidget(_harness(child: _build(title: 'Solo')));
       // Only the title Text should appear in the padding column.
       expect(find.text('Solo'), findsOneWidget);
     });
 
+    // Audit 4A(c) #7 (phase-4 §5: keyboard activation).
+    for (final key in [LogicalKeyboardKey.enter, LogicalKeyboardKey.space]) {
+      testWidgets('keyboard: Tab focuses the card, ${key.keyLabel} activates '
+          'it', (tester) async {
+        var tapped = 0;
+        await tester.pumpWidget(_harness(child: _build(onTap: () => tapped++)));
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pump();
+        await tester.sendKeyEvent(key);
+        await tester.pump();
+        expect(tapped, 1);
+      });
+    }
+
     testWidgets('fires onTap when tapped', (tester) async {
       var tapped = 0;
-      await tester.pumpWidget(_harness(
-        child: _build(onTap: () => tapped++),
-      ));
+      await tester.pumpWidget(_harness(child: _build(onTap: () => tapped++)));
 
       await tester.tap(find.byType(LibraryCard));
       await tester.pumpAndSettle();
@@ -114,28 +118,29 @@ void main() {
   });
 
   group('LibraryCard download badges', () {
-    testWidgets(
-      'renders DownloadedBadge when counts indicate full download',
-      (tester) async {
-        await tester.pumpWidget(_harness(
-          child: _build(counts: (downloaded: 10, total: 10)),
-        ));
-        await tester.pumpAndSettle();
+    testWidgets('renders DownloadedBadge when counts indicate full download', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _harness(child: _build(counts: (downloaded: 10, total: 10))),
+      );
+      await tester.pumpAndSettle();
 
-        expect(find.byType(DownloadedBadge), findsOneWidget);
-        expect(find.byType(DownloadProgressBadge), findsNothing);
-      },
-    );
+      expect(find.byType(DownloadedBadge), findsOneWidget);
+      expect(find.byType(DownloadProgressBadge), findsNothing);
+    });
 
     testWidgets(
       'renders DownloadProgressBadge when isDownloading and not full',
       (tester) async {
-        await tester.pumpWidget(_harness(
-          child: _build(
-            isDownloading: true,
-            counts: (downloaded: 3, total: 10),
+        await tester.pumpWidget(
+          _harness(
+            child: _build(
+              isDownloading: true,
+              counts: (downloaded: 3, total: 10),
+            ),
           ),
-        ));
+        );
         await tester.pumpAndSettle();
 
         expect(find.byType(DownloadProgressBadge), findsOneWidget);
@@ -144,26 +149,26 @@ void main() {
       },
     );
 
-    testWidgets(
-      'no badge when not downloading and nothing downloaded',
-      (tester) async {
-        await tester.pumpWidget(_harness(
-          child: _build(counts: (downloaded: 0, total: 10)),
-        ));
-        await tester.pumpAndSettle();
+    testWidgets('no badge when not downloading and nothing downloaded', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _harness(child: _build(counts: (downloaded: 0, total: 10))),
+      );
+      await tester.pumpAndSettle();
 
-        expect(find.byType(DownloadedBadge), findsNothing);
-        expect(find.byType(DownloadProgressBadge), findsNothing);
-      },
-    );
+      expect(find.byType(DownloadedBadge), findsNothing);
+      expect(find.byType(DownloadProgressBadge), findsNothing);
+    });
   });
 
   group('LibraryCard long-press menu', () {
-    testWidgets('shows the builder menu for a partially downloaded album',
-        (tester) async {
-      await tester.pumpWidget(_harness(
-        child: _build(counts: (downloaded: 3, total: 10)),
-      ));
+    testWidgets('shows the builder menu for a partially downloaded album', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _harness(child: _build(counts: (downloaded: 3, total: 10))),
+      );
       await tester.pumpAndSettle();
 
       await tester.longPress(find.byType(LibraryCard));
@@ -176,17 +181,19 @@ void main() {
     });
 
     testWidgets('renders exactly the entries it is given', (tester) async {
-      await tester.pumpWidget(_harness(
-        child: _build(
-          menu: [
-            LibraryMenuAction(
-              icon: Icons.playlist_play,
-              label: 'Play Next',
-              onSelected: () {},
-            ),
-          ],
+      await tester.pumpWidget(
+        _harness(
+          child: _build(
+            menu: [
+              LibraryMenuAction(
+                icon: Icons.playlist_play,
+                label: 'Play Next',
+                onSelected: () {},
+              ),
+            ],
+          ),
         ),
-      ));
+      );
       await tester.pumpAndSettle();
 
       await tester.longPress(find.byType(LibraryCard));
@@ -199,9 +206,7 @@ void main() {
     });
 
     testWidgets('no long-press menu when the menu is empty', (tester) async {
-      await tester.pumpWidget(_harness(
-        child: _build(menu: const []),
-      ));
+      await tester.pumpWidget(_harness(child: _build(menu: const [])));
       await tester.pumpAndSettle();
 
       // Long-press should not crash and should not open a menu.
@@ -212,9 +217,9 @@ void main() {
     });
 
     testWidgets('hides Download tile when fully downloaded', (tester) async {
-      await tester.pumpWidget(_harness(
-        child: _build(counts: (downloaded: 10, total: 10)),
-      ));
+      await tester.pumpWidget(
+        _harness(child: _build(counts: (downloaded: 10, total: 10))),
+      );
       await tester.pumpAndSettle();
 
       await tester.longPress(find.byType(LibraryCard));
@@ -225,9 +230,9 @@ void main() {
     });
 
     testWidgets('hides Delete when nothing is downloaded', (tester) async {
-      await tester.pumpWidget(_harness(
-        child: _build(counts: (downloaded: 0, total: 10)),
-      ));
+      await tester.pumpWidget(
+        _harness(child: _build(counts: (downloaded: 0, total: 10))),
+      );
       await tester.pumpAndSettle();
 
       await tester.longPress(find.byType(LibraryCard));
@@ -237,28 +242,32 @@ void main() {
       expect(find.text('Delete downloads'), findsNothing);
     });
 
-    testWidgets(
-      'offline + partially downloaded: queue actions disabled',
-      (tester) async {
-        await tester.pumpWidget(_harness(
+    testWidgets('offline + partially downloaded: queue actions disabled', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _harness(
           offline: true,
           child: _build(offline: true, counts: (downloaded: 3, total: 10)),
-        ));
-        await tester.pumpAndSettle();
+        ),
+      );
+      await tester.pumpAndSettle();
 
-        await tester.longPress(find.byType(LibraryCard));
-        await tester.pumpAndSettle();
+      await tester.longPress(find.byType(LibraryCard));
+      await tester.pumpAndSettle();
 
-        final playNext = tester.widget<ListTile>(find.ancestor(
+      final playNext = tester.widget<ListTile>(
+        find.ancestor(
           of: find.text('Play Next'),
           matching: find.byType(ListTile),
-        ));
-        expect(playNext.enabled, isFalse);
-      },
-    );
+        ),
+      );
+      expect(playNext.enabled, isFalse);
+    });
 
-    testWidgets('an entry acts on the card scope via the controller',
-        (tester) async {
+    testWidgets('an entry acts on the card scope via the controller', (
+      tester,
+    ) async {
       final actions = FakeLibraryActions();
       await tester.pumpWidget(_harness(child: _build(actions: actions)));
       await tester.pumpAndSettle();
@@ -270,35 +279,46 @@ void main() {
     });
   });
 
-  testWidgets('the downloaded badge follows PlaybackAvailability, not raw counts',
-      (tester) async {
-    // Counts still loading, availability already known (one predicate).
-    await tester.pumpWidget(_harness(
-      child: LibraryCard(
-        cover: const SizedBox(),
-        title: 'T',
-        onTap: () {},
-        isDownloading: false,
-        downloadCounts: const AsyncLoading(),
-        availability:
-            PlaybackAvailability.of(offline: false, downloaded: 2, total: 2),
-      ),
-    ));
-    expect(find.byType(DownloadedBadge), findsOneWidget);
-  });
+  testWidgets(
+    'the downloaded badge follows PlaybackAvailability, not raw counts',
+    (tester) async {
+      // Counts still loading, availability already known (one predicate).
+      await tester.pumpWidget(
+        _harness(
+          child: LibraryCard(
+            cover: const SizedBox(),
+            title: 'T',
+            onTap: () {},
+            isDownloading: false,
+            downloadCounts: const AsyncLoading(),
+            availability: PlaybackAvailability.of(
+              offline: false,
+              downloaded: 2,
+              total: 2,
+            ),
+          ),
+        ),
+      );
+      expect(find.byType(DownloadedBadge), findsOneWidget);
+    },
+  );
 
-  testWidgets('no downloaded badge when availability is not full, whatever the counts say',
-      (tester) async {
-    await tester.pumpWidget(_harness(
-      child: LibraryCard(
-        cover: const SizedBox(),
-        title: 'T',
-        onTap: () {},
-        isDownloading: false,
-        downloadCounts: const AsyncData((downloaded: 2, total: 2)),
-        availability: const PlaybackAvailability.unknown(offline: false),
-      ),
-    ));
-    expect(find.byType(DownloadedBadge), findsNothing);
-  });
+  testWidgets(
+    'no downloaded badge when availability is not full, whatever the counts say',
+    (tester) async {
+      await tester.pumpWidget(
+        _harness(
+          child: LibraryCard(
+            cover: const SizedBox(),
+            title: 'T',
+            onTap: () {},
+            isDownloading: false,
+            downloadCounts: const AsyncData((downloaded: 2, total: 2)),
+            availability: const PlaybackAvailability.unknown(offline: false),
+          ),
+        ),
+      );
+      expect(find.byType(DownloadedBadge), findsNothing);
+    },
+  );
 }

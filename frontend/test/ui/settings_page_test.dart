@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/legacy.dart' show StateProvider;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -11,7 +12,9 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/settings_controller.dart';
-import 'package:frontend/ui/settings_dialog.dart';
+import 'package:frontend/ui/settings_page.dart';
+import 'package:frontend/ui/session/session_host.dart';
+import 'package:frontend/ui/settings/settings_registry.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
 import 'fake_session_controls.dart';
@@ -41,7 +44,7 @@ Widget _wrap(
     ],
     child: MaterialApp(
       theme: ThemeData(splashFactory: NoSplash.splashFactory),
-      home: const Scaffold(body: SettingsDialog()),
+      home: const SettingsPage(),
     ),
   );
 }
@@ -54,21 +57,22 @@ Widget _wrapNestedSettingsLauncher(
     overrides: [
       sharedPreferencesProvider.overrideWith((_) async => prefs),
       offlineModeProvider.overrideWith(() => _StubOffline(false)),
+      // One app scope, as in production (no nested override scope).
+      sessionControlsProvider.overrideWithValue(
+        FakeSessionControls(onDisconnect: onDisconnect),
+      ),
     ],
     child: MaterialApp(
       theme: ThemeData(splashFactory: NoSplash.splashFactory),
-      home: ProviderScope(
-        overrides: [
-          sessionControlsProvider.overrideWithValue(
-            FakeSessionControls(onDisconnect: onDisconnect),
-          ),
-        ],
-        child: Navigator(
-          onGenerateRoute: (_) => MaterialPageRoute<void>(
-            builder: (_) => Consumer(
-              builder: (context, ref, _) => Scaffold(
-                appBar: AppBar(actions: buildTopBarActions(context, ref)),
-                body: const SizedBox.shrink(),
+      home: Builder(
+        builder: (_) => SessionHost(
+          root: Navigator(
+            onGenerateRoute: (_) => MaterialPageRoute<void>(
+              builder: (_) => Consumer(
+                builder: (context, ref, _) => Scaffold(
+                  appBar: AppBar(actions: buildTopBarActions(context, ref)),
+                  body: const SizedBox.shrink(),
+                ),
               ),
             ),
           ),
@@ -76,6 +80,15 @@ Widget _wrapNestedSettingsLauncher(
       ),
     ),
   );
+}
+
+/// Settings is a lazy list: bring its end (Connection) into the tree.
+Future<void> _toBottom(WidgetTester tester) async {
+  final list = find.byType(Scrollable).first;
+  for (var i = 0; i < 5; i++) {
+    await tester.drag(list, const Offset(0, -400));
+    await tester.pumpAndSettle();
+  }
 }
 
 void main() {
@@ -231,8 +244,11 @@ void main() {
     await tester.pumpWidget(_wrap(prefs));
     await tester.pumpAndSettle();
 
+    await _toBottom(tester);
+    expect(find.text('Connection'), findsNothing);
     expect(find.text('Disconnect'), findsNothing);
-    expect(find.text('Close'), findsOneWidget);
+    // A page, not a dialog: no Close button; back is the AppBar's.
+    expect(find.text('Close'), findsNothing);
   });
 
   testWidgets('Disconnect tap opens the confirmation bottom sheet', (
@@ -242,6 +258,7 @@ void main() {
     await tester.pumpWidget(_wrap(prefs, onDisconnect: () async {}));
     await tester.pumpAndSettle();
 
+    await _toBottom(tester);
     await tester.tap(find.text('Disconnect'));
     await tester.pumpAndSettle();
 
@@ -262,6 +279,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Settings'), findsOneWidget);
+    await _toBottom(tester);
     expect(find.text('Disconnect'), findsOneWidget);
   });
 
@@ -280,6 +298,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await _toBottom(tester);
     expect(find.text('Disconnect'), findsOneWidget);
     await tester.tap(find.text('Disconnect'));
     await tester.pumpAndSettle();
@@ -289,7 +308,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(disconnectCalled, isFalse);
-    // The Settings AlertDialog is still visible.
+    // The Settings page is still visible.
     expect(find.text('Settings'), findsOneWidget);
   });
 
@@ -308,6 +327,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await _toBottom(tester);
     await tester.tap(find.text('Disconnect'));
     await tester.pumpAndSettle();
     // FilledButton with this label inside the bottom sheet.
@@ -315,8 +335,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(disconnectCalled, isTrue);
-    // The SettingsDialog itself has been popped.
-    expect(find.text('Settings'), findsNothing);
+    // The page doesn't pop itself: a successful reset ends the session and
+    // the session host (with every session route) goes away with it.
   });
 
   group('offline mode', () {
@@ -365,6 +385,57 @@ void main() {
     );
   });
 
+  group('SC-21 registry', () {
+    testWidgets('renders Phase 4\'s sections in order', (tester) async {
+      final prefs = await SharedPreferences.getInstance();
+      await tester.pumpWidget(_wrap(prefs, onDisconnect: () async {}));
+      await tester.pumpAndSettle();
+      final titles = [
+        for (final key in [
+          'settings.section.playback',
+          'settings.section.downloads',
+          'settings.section.notifications',
+          'settings.section.library_tools',
+          'settings.section.connection',
+        ])
+          tester.getTopLeft(find.byKey(ValueKey(key))).dy,
+      ];
+      expect([...titles]..sort(), titles, reason: 'registry order');
+      expect(find.text('Playback quality'), findsOneWidget);
+      await _toBottom(tester);
+      expect(find.text('Library tools'), findsOneWidget);
+      expect(find.text('Conversions'), findsOneWidget);
+    });
+
+    testWidgets('a section with no available rows is hidden', (tester) async {
+      final prefs = await SharedPreferences.getInstance();
+      final hidden = StateProvider<bool>((ref) => false);
+      await tester.pumpWidget(ProviderScope(
+        overrides: [
+          sharedPreferencesProvider.overrideWith((_) async => prefs),
+          offlineModeProvider.overrideWith(() => _StubOffline(false)),
+          settingsSectionsProvider.overrideWithValue(const [
+            SettingsSection(id: 'a', order: 0, title: 'Shown'),
+            SettingsSection(id: 'b', order: 1, title: 'Empty'),
+          ]),
+          settingsRowsProvider.overrideWithValue([
+            SettingsRowContribution(
+              sectionId: 'a', order: 0, build: (_) => const Text('row a')),
+            SettingsRowContribution(
+              sectionId: 'b', order: 0, isAvailable: hidden,
+              build: (_) => const Text('row b')),
+          ]),
+        ],
+        child: const MaterialApp(home: SettingsPage()),
+      ));
+      await tester.pumpAndSettle();
+      expect(find.text('Shown'), findsOneWidget);
+      expect(find.text('row a'), findsOneWidget);
+      expect(find.text('Empty'), findsNothing);
+      expect(find.text('row b'), findsNothing);
+    });
+  });
+
   group('inputs go to SettingsControls (SC-26)', () {
     late _FakeSettings fake;
     Future<void> pump(WidgetTester tester) async {
@@ -378,7 +449,7 @@ void main() {
         ],
         child: MaterialApp(
           theme: ThemeData(splashFactory: NoSplash.splashFactory),
-          home: const Scaffold(body: SettingsDialog()),
+          home: const SettingsPage(),
         ),
       ));
       await tester.pumpAndSettle();

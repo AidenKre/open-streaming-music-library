@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/services/session_service.dart';
@@ -182,10 +183,43 @@ void main() {
       expect(c.read(sessionReadinessProvider).isReady, isTrue);
     });
   });
+
+  test('session activation runs one catalog sync (not per call)', () async {
+    SharedPreferences.setMockInitialValues({});
+    final sync = _CountingSync();
+    c = ProviderContainer(overrides: [trackSyncProvider.overrideWith(() => sync)]);
+    addTearDown(c.dispose);
+    await c.read(trackSyncProvider.future);
+    await service().onSessionActivated();
+    await service().onSessionActivated();
+    expect(sync.syncs, 1);
+  });
+
+  // Audit 4A(a) M2: a failed initial sync can be retried by the user.
+  test('syncLibrary runs a catalog sync each time (Retry after activation)',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final sync = _CountingSync();
+    c = ProviderContainer(overrides: [trackSyncProvider.overrideWith(() => sync)]);
+    addTearDown(c.dispose);
+    await c.read(trackSyncProvider.future);
+    await service().onSessionActivated();
+    await service().syncLibrary();
+    await service().syncLibrary();
+    expect(sync.syncs, 3);
+  });
 }
 
 class _Throwing extends LocalResetService {
   _Throwing(super.ref);
   @override
   Future<void> reset() async => throw StateError('boom');
+}
+
+class _CountingSync extends TrackSyncNotifier {
+  int syncs = 0;
+  @override
+  Future<TrackSyncState> build() async => const TrackSyncState();
+  @override
+  Future<void> sync() async => syncs++;
 }

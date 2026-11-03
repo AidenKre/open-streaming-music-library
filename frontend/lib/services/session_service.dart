@@ -69,6 +69,24 @@ class SessionService {
   /// restore the saved queue (SC-27 session-ready signal).
   void _markReady() => _ref.read(sessionReadinessProvider).markReady();
 
+  bool _activated = false;
+
+  /// The live session's UI exists (the session host mounted): run the one
+  /// initial catalog sync, on first login and on saved-session startup
+  /// alike (Home and Search need the mirror without visiting a browse page;
+  /// recovery triggers keep covering resume/reconnect). Once per session:
+  /// a reset rebuilds the scope, and with it this service.
+  /// 5A.0 makes this await the SC-01 `bindingVerified` gate.
+  Future<void> onSessionActivated() async {
+    if (_activated) return;
+    _activated = true;
+    await _ref.read(trackSyncProvider.notifier).sync();
+  }
+
+  /// A user-requested catalog sync (Retry after a failed one). Unlike
+  /// [onSessionActivated], runs every time it is asked.
+  Future<void> syncLibrary() => _ref.read(trackSyncProvider.notifier).sync();
+
   /// Wipes local state. A partial reset is reported, never hidden; every
   /// step still runs (see [LocalResetService]).
   Future<LocalResetException?> resetLocalData() async {

@@ -15,6 +15,7 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/search_page.dart';
+import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 
 /// Pins [offlineModeProvider] to a fixed value without running the real
@@ -98,11 +99,19 @@ void main() {
     await teardownTree(tester);
   });
 
-  testWidgets('SearchPage shows DownloadedOnlyBadge when offline',
-      (tester) async {
+  // 4A.3: Search's Downloaded chip replaces the forced offline badge
+  // (SC-09 autoApply: offline turns the chip on). Changed on purpose.
+  testWidgets('SearchPage shows the Downloaded chip on, not the badge, '
+      'when offline', (tester) async {
     await tester.pumpWidget(wrap(const SearchPage(), offline: true));
     await tester.pumpAndSettle();
-    expect(find.byType(DownloadedOnlyBadge), findsOneWidget);
+    expect(find.byType(DownloadedOnlyBadge), findsNothing);
+    expect(
+      tester
+          .widget<FilterChip>(find.byKey(FilterBar.downloadedChipKey))
+          .selected,
+      isTrue,
+    );
   });
 
   testWidgets('SearchPage hides DownloadedOnlyBadge when online',
@@ -122,15 +131,13 @@ void main() {
     await tester.pump(const Duration(milliseconds: 350));
     await tester.pumpAndSettle();
 
+    // 4A.3 copy: no "reconnect" advice — the chip can be switched off to
+    // search all local metadata (was '… Reconnect to the server …').
     expect(
-      find.textContaining('No downloaded results match "NoSuchThing"'),
+      find.text('No downloaded results match "NoSuchThing".'),
       findsOneWidget,
     );
-    expect(
-      find.textContaining('Reconnect to the server'),
-      findsOneWidget,
-    );
-    expect(find.text('No results found'), findsNothing);
+    expect(find.textContaining('Reconnect to the server'), findsNothing);
   });
 
   testWidgets('SearchPage empty-state uses generic copy when online',
@@ -142,7 +149,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 350));
     await tester.pumpAndSettle();
 
-    expect(find.text('No results found'), findsOneWidget);
+    // 4A.3 copy (was 'No results found').
+    expect(find.text('No results match "NoSuchThing".'), findsOneWidget);
     expect(
       find.textContaining('No downloaded results match'),
       findsNothing,

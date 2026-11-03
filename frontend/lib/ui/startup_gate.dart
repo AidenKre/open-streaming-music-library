@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/main.dart';
+import 'package:frontend/ui/shell/app_shell.dart';
 import 'package:frontend/ui/login_page.dart';
+import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/session_controller.dart';
 
 /// Renders the session phase: splash while starting/resetting, the login
@@ -83,7 +84,9 @@ class _StartupGateState extends ConsumerState<StartupGate> {
           error: _session.connectError,
         );
       case SessionPhase.live:
-        return const AppShell();
+        // Session destinations (Settings, Downloading, Conversions) and the
+        // full player live on the session host above the shell (SC-08).
+        return const SessionHost(root: AppShell());
     }
   }
 }

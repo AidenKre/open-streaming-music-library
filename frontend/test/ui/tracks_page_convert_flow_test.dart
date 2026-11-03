@@ -7,6 +7,7 @@ import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
@@ -28,6 +29,7 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/ui/conversions_page.dart';
 import 'package:frontend/ui/convert_flow.dart';
 import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
@@ -977,8 +979,9 @@ void main() {
   });
 
   testWidgets(
-    'the top bar Conversions icon navigates to ConversionsPage',
+    'Conversions is reached from Settings -> Library tools, not the top bar',
     (tester) async {
+      SharedPreferences.setMockInitialValues({});
       await tester.pumpWidget(
         ProviderScope(
           overrides: [
@@ -987,22 +990,32 @@ void main() {
             conversionJobsProvider.overrideWith(_RecordingConversionJobs.new),
           ],
           child: MaterialApp(
-            home: Builder(
-              builder: (context) => Consumer(
-                builder: (context, ref, _) => Scaffold(
-                  appBar: AppBar(actions: buildTopBarActions(context, ref)),
+            home: SessionHost(
+              root: Builder(
+                builder: (context) => Consumer(
+                  builder: (context, ref, _) => Scaffold(
+                    appBar: AppBar(actions: buildTopBarActions(context, ref)),
+                  ),
                 ),
               ),
             ),
           ),
         ),
       );
-      expect(find.byType(ConversionsPage), findsNothing);
+      expect(find.byTooltip('Conversions'), findsNothing);
 
-      await tester.tap(find.byTooltip('Conversions'));
+      await tester.tap(find.byTooltip('Settings'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(find.text('Conversions'), 200,
+          scrollable: find.byType(Scrollable).last);
+      await tester.tap(find.text('Conversions'));
       await tester.pumpAndSettle();
 
       expect(find.byType(ConversionsPage), findsOneWidget);
+      // Back returns to Settings (same session host).
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.text('Library tools'), findsOneWidget);
     },
   );
 }

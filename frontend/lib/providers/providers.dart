@@ -33,6 +33,14 @@ final browseRepositoryProvider = Provider<BrowseRepository>((ref) {
 class TrackSyncState {
   final bool isSyncing;
   final String? error;
+
+  /// A LIBRARY (catalog) sync is running, as opposed to a single-track
+  /// refresh. The user-facing sync status follows only these.
+  final bool librarySyncing;
+
+  /// The last library sync's failure (null once one succeeds). Untouched by
+  /// single-track refreshes, which publish only [error].
+  final String? libraryError;
   final int queueMutationVersion;
   final int downloadMutationVersion;
   final Set<int> affectedQueueSessionIds;
@@ -41,6 +49,8 @@ class TrackSyncState {
   const TrackSyncState({
     this.isSyncing = false,
     this.error,
+    this.librarySyncing = false,
+    this.libraryError,
     this.queueMutationVersion = 0,
     this.downloadMutationVersion = 0,
     this.affectedQueueSessionIds = const {},
@@ -58,6 +68,8 @@ class TrackSyncState {
     return TrackSyncState(
       isSyncing: isSyncing ?? this.isSyncing,
       error: error,
+      librarySyncing: librarySyncing,
+      libraryError: libraryError,
       queueMutationVersion: queueMutationVersion ?? this.queueMutationVersion,
       downloadMutationVersion:
           downloadMutationVersion ?? this.downloadMutationVersion,
@@ -115,7 +127,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     final ran = await _runGuarded((service) async {
       await ref.read(editOutboxProvider).flushLocked();
       return service.syncChanges();
-    });
+    }, library: true);
     // Finish take-server resolutions deferred while offline or mid-sync —
     // outside the critical section; refreshTrack re-takes the guards itself.
     if (ran) {
@@ -148,24 +160,28 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
   /// state that is current AT PUBLISH TIME. Returns true when [op] ran and
   /// its result was published.
   Future<bool> _runGuarded(
-    Future<SyncResult> Function(SyncService service) op,
-  ) {
+    Future<SyncResult> Function(SyncService service) op, {
+    bool library = false,
+  }) {
     // Offline mode skips entirely (see [_runGuardedBody]).
     if (ref.read(offlineModeProvider)) return Future.value(false);
     final current = state.value;
     if (current != null && current.isSyncing) return Future.value(false);
     // Synchronously claims the slot: `_runGuardedBody` publishes
     // isSyncing:true before its first await.
-    final run = _runGuardedBody(op);
+    final run = _runGuardedBody(op, library: library);
     _inFlightRun = run;
     return run.whenComplete(() {
       if (identical(_inFlightRun, run)) _inFlightRun = null;
     });
   }
 
+  /// [library]: a catalog sync (publishes [TrackSyncState.librarySyncing]
+  /// and owns [TrackSyncState.libraryError]); other runs carry those over.
   Future<bool> _runGuardedBody(
-    Future<SyncResult> Function(SyncService service) op,
-  ) async {
+    Future<SyncResult> Function(SyncService service) op, {
+    required bool library,
+  }) async {
     // Offline mode skips entirely — the network call would just fail.
     // OfflineModeNotifier re-invokes sync on recovery, so the next online
     // tick will pick up everything that changed while we were dark.
@@ -179,6 +195,8 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     state = AsyncData(
       TrackSyncState(
         isSyncing: true,
+        librarySyncing: library,
+        libraryError: library ? null : current?.libraryError,
         queueMutationVersion: current?.queueMutationVersion ?? 0,
         downloadMutationVersion: current?.downloadMutationVersion ?? 0,
       ),
@@ -196,6 +214,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       final latest = state.value ?? current;
       state = AsyncData(
         TrackSyncState(
+          libraryError: library ? null : latest?.libraryError,
           queueMutationVersion: result.affectedQueueSessionIds.isEmpty
               ? (latest?.queueMutationVersion ?? 0)
               : (latest?.queueMutationVersion ?? 0) + 1,
@@ -212,6 +231,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       state = AsyncData(
         TrackSyncState(
           error: e.toString(),
+          libraryError: library ? e.toString() : latest?.libraryError,
           queueMutationVersion: latest?.queueMutationVersion ?? 0,
           downloadMutationVersion: latest?.downloadMutationVersion ?? 0,
         ),

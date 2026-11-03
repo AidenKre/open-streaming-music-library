@@ -138,7 +138,8 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
   }
 
   /// Search mode's body: a spinner until the first results land, the
-  /// no-match or failure copy, or [builder]'s list under the capped hint.
+  /// no-match copy or failure notice (with Retry), or [builder]'s list under
+  /// the failure notice (results kept from before) and the capped hint.
   /// [noun] names the rows in the copy ("tracks").
   Widget buildSearchBody<R>({
     required List<R> results,
@@ -149,19 +150,22 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
       if (search.isSearching) {
         return const Center(child: CircularProgressIndicator());
       }
+      if (search.failed) return SearchFailedNotice(onRetry: search.retry);
       return ListStatusMessage(
-        search.failed
-            ? searchFailedMessage
-            : noSearchResultsMessage(
-                noun: noun,
-                query: search.query,
-                downloadedOnly: _filters.downloaded,
-              ),
+        noSearchResultsMessage(
+          noun: noun,
+          query: search.query,
+          downloadedOnly: _filters.downloaded,
+        ),
       );
     }
     return Column(
       children: [
-        if (search.isCapped) const SearchCappedHint(cap: kInPageSearchCap),
+        // Results kept from before the failure (4A.3), under the error.
+        if (search.failed)
+          SearchFailedNotice(compact: true, onRetry: search.retry),
+        if (search.isCapped)
+          SearchCappedHint(cap: kInPageSearchCap, noun: noun),
         Expanded(child: builder(results)),
       ],
     );

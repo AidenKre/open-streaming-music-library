@@ -74,7 +74,7 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('OSML'),
+        title: const Text('Downloaded'),
         actions: buildTopBarActions(context, ref),
       ),
       body: Column(

@@ -4,11 +4,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
+import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
+import 'package:frontend/ui/widgets/library_card.dart';
+import 'package:frontend/ui/widgets/search_status.dart';
 
 import 'browse_harness.dart';
 
@@ -51,7 +54,10 @@ void main() {
 
   Future<void> pumpRoot(WidgetTester tester, {bool offline = false}) async {
     await tester.pumpWidget(
-      h.wrap(const ArtistsPage(isRoot: true), offline: offline),
+      h.wrap(
+        const Scaffold(body: ArtistsPage(browseAll: true)),
+        offline: offline,
+      ),
     );
     await tester.pumpAndSettle();
   }
@@ -241,7 +247,10 @@ void main() {
     testWidgets('shown once a filtered window settles empty', (tester) async {
       await clearAllDownloads();
       await tester.pumpWidget(
-        h.wrap(const ArtistsPage(isRoot: true), offline: true),
+        h.wrap(
+          const Scaffold(body: ArtistsPage(browseAll: true)),
+          offline: true,
+        ),
       );
       expect(find.text(message), findsNothing, reason: 'still loading');
 
@@ -456,7 +465,39 @@ void main() {
       final grid = tester.widget<GridView>(find.byType(GridView));
       final delegate = grid.childrenDelegate as SliverChildBuilderDelegate;
       expect(delegate.childCount, 100);
-      expect(find.textContaining('Showing the first 100 matches'), findsOne);
+      // 4A.3: the per-type hint (was "… 100 matches …", changed on purpose).
+      expect(
+        find.text('Showing the first 100 artists — refine your search.'),
+        findsOne,
+      );
+      await teardownTree(tester);
+    });
+
+    testWidgets('a failed search offers Retry; a later failure keeps the '
+        'cards beside the error', (tester) async {
+      final repo = _FlakySearchRepo(db)..fail = true;
+      await tester.pumpWidget(
+        h.wrap(
+          const Scaffold(body: ArtistsPage(browseAll: true)),
+          repository: repo,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await search(tester, 'Artist');
+      expect(find.text(searchFailedMessage), findsOneWidget);
+      expect(find.textContaining('No artists match'), findsNothing);
+
+      repo.fail = false;
+      await tester.tap(find.widgetWithText(TextButton, 'Retry'));
+      await tester.pumpAndSettle();
+      expect(find.text(searchFailedMessage), findsNothing);
+      final shown = find.byType(LibraryCard).evaluate().length;
+      expect(shown, greaterThan(0));
+
+      repo.fail = true;
+      await search(tester, 'Artis');
+      expect(find.text(searchFailedMessage), findsOneWidget);
+      expect(find.byType(LibraryCard), findsNWidgets(shown));
       await teardownTree(tester);
     });
 
@@ -475,4 +516,30 @@ void main() {
       await teardownTree(tester); // debounce still pending
     });
   });
+}
+
+class _FlakySearchRepo extends BrowseRepository {
+  _FlakySearchRepo(super.db);
+
+  bool fail = false;
+
+  @override
+  Future<LibrarySearchResults> search(
+    String query, {
+    Set<SearchType> types = const {
+      SearchType.artists,
+      SearchType.albums,
+      SearchType.tracks,
+    },
+    int limitPerType = 5,
+    bool downloadedOnly = false,
+  }) async {
+    if (fail) throw StateError('fts index corrupt');
+    return super.search(
+      query,
+      types: types,
+      limitPerType: limitPerType,
+      downloadedOnly: downloadedOnly,
+    );
+  }
 }

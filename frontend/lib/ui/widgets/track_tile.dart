@@ -18,9 +18,9 @@ class TrackTile extends StatelessWidget {
   final ConversionJob? conversionJob;
   final bool isHighlighted;
   final bool isDimmed;
-  /// When `false`, the row swallows taps and the more-vert button is rendered
-  /// in a disabled state. Used by offline mode on the tracks page so the row
-  /// stays visible (visual consistency with album views) but inert.
+  /// When `false`, the row's primary tap does nothing (offline and not
+  /// playable). The overflow menu stays available: its play/queue entries
+  /// are disabled by availability, inspection (Get info) is not.
   final bool isInteractive;
   final Widget? trailing;
 
@@ -161,11 +161,11 @@ class TrackTile extends StatelessWidget {
                         padding: EdgeInsets.zero,
                         icon: Icon(Icons.more_vert,
                             size: 20, color: colors.onSurfaceVariant),
-                        // Null onPressed renders the button in Flutter's
-                        // built-in disabled style (grayed but visible).
-                        onPressed: isInteractive
-                            ? () => showLibraryActionMenu(context, menu)
-                            : null,
+                        // The menu stays reachable even when the row isn't
+                        // playable: its play/queue entries are disabled by
+                        // availability, while Get info (inspection) stays
+                        // usable (spec §5).
+                        onPressed: () => showLibraryActionMenu(context, menu),
                       ),
                     ),
                   ],

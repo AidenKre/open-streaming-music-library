@@ -1,204 +1,235 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/repositories/browse_repository.dart';
-import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/feed/feed.dart';
+import 'package:frontend/ui/feed/feed_header.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/utils/library_search_controller.dart';
-import 'package:frontend/ui/widgets/album_card.dart';
-import 'package:frontend/ui/widgets/artist_card.dart';
-import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
-import 'package:frontend/ui/widgets/library_search_field.dart';
+import 'package:frontend/ui/widgets/filter_bar.dart';
+import 'package:frontend/ui/widgets/library_sync_status_view.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 import 'package:frontend/ui/widgets/search_status.dart';
-import 'package:frontend/ui/widgets/track_tile.dart';
 
+/// The global Search (SC-19): a sectioned feed of Artists, Albums and Songs
+/// rails under a live search header with the Downloaded chip.
+///
+/// Local FTS only, [cap] results per type, no pagination. The chip follows
+/// SC-09 `autoApply`: offline turns it on, reconnecting undoes only that.
+/// The header sits above the feed (never scrolls away), so its text and
+/// focus survive scrolling. The field never autofocuses: the shell calls
+/// [SearchPageState.focusSearchField] when Search is visible at its root.
 class SearchPage extends ConsumerStatefulWidget {
   const SearchPage({super.key});
 
+  /// Results fetched per type.
+  static const cap = 100;
+
   @override
-  ConsumerState<SearchPage> createState() => _SearchPageState();
+  ConsumerState<SearchPage> createState() => SearchPageState();
 }
 
-class _SearchPageState extends ConsumerState<SearchPage> {
-  // Shared with the in-page search on the browse tabs: debounce, generation
-  // stale-guard (a request that started before an offline flip or a newer
-  // query never overwrites newer results), and dispose-cancel all live there.
+class SearchPageState extends ConsumerState<SearchPage> {
+  // Debounce, immediate clear, generation guard, retry and download patching
+  // all live in the shared controller.
   late final LibrarySearchControls _search;
 
-  // The page owns the query text, so what the field shows and what was
-  // searched can't drift apart.
+  // The page owns the text and focus (one owner, reused by the field).
   final _queryText = TextEditingController();
+  final _focus = FocusNode(debugLabel: 'search.field');
+  final _feed = GlobalKey<SectionedFeedViewState>();
+
+  late BrowseFilters _filters;
 
   @override
   void initState() {
     super.initState();
+    _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
     _search = ref.read(librarySearchControllerFactoryProvider)(
       types: SearchType.values.toSet(),
-      limitPerType: 5,
-      // Offline: the repository filters to locally-downloaded content inside
-      // the FTS query (before LIMIT), so a downloaded match ranked below the
-      // top 5 is still returned.
-      downloadedOnly: () => ref.read(offlineModeProvider),
+      limitPerType: SearchPage.cap,
+      // Read at fetch time, so a chip change is picked up by rerun().
+      downloadedOnly: () => _filters.downloaded,
     )..addListener(_onSearchChanged);
   }
 
-  void _onSearchChanged() => setState(() {});
+  /// Bumped on every committed query and every filter change: the rails
+  /// start at their beginning for each new result set (a counter, so a
+  /// return to an earlier query or filter doesn't restore its old offset).
+  int _railReset = 0;
+  String _railQuery = '';
+
+  void _onSearchChanged() {
+    if (!mounted) return;
+    setState(() {
+      if (_search.query != _railQuery) {
+        _railQuery = _search.query;
+        _railReset++;
+      }
+    });
+  }
 
   @override
   void dispose() {
-    _search.dispose();
+    _search
+      ..removeListener(_onSearchChanged)
+      ..dispose();
     _queryText.dispose();
+    _focus.dispose();
     super.dispose();
   }
 
+  /// Put the keyboard in the search field (the shell calls this when Search
+  /// is shown at its root).
+  void focusSearchField() {
+    if (mounted) _focus.requestFocus();
+  }
 
+  /// Scroll the results back to the top (shell re-tap).
+  void scrollToTop() => _feed.currentState?.scrollToTop();
 
-  Widget _buildSectionHeader(String title) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-      child: Text(title, style: Theme.of(context).textTheme.titleMedium),
-    );
+  void _onFiltersChanged(BrowseFilters next) {
+    if (next == _filters) return;
+    setState(() {
+      _filters = next;
+      _railReset++;
+    });
+    _search.rerun();
+  }
+
+  void _onTextChanged(String raw) {
+    _search.onQueryChanged(raw);
+    // Status text depends on the raw text too (typed but not committed).
+    setState(() {});
+  }
+
+  void _onCleared() {
+    _search.clear();
+    setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
+    // A results snapshot needs help after a download/delete (the controller
+    // patches or re-searches; no-op while inactive).
     ref.listen(downloadStatusVersionProvider, (_, _) {
-      // Online: patch the existing rows with refreshed download fields.
-      // Offline: the visible result set is filtered by downloaded state, so
-      // a delete that removes the last downloaded match must re-run the FTS
-      // query — patching alone would leave the dead row on screen.
       _search.onDownloadStatusChanged();
     });
     ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (prev != next) _search.rerun();
+      if (prev == next) return;
+      _onFiltersChanged(next ? _filters.wentOffline() : _filters.cameOnline());
     });
-    final manager = ref.watch(downloadManagerListenableProvider);
-    final isOffline = ref.watch(offlineModeProvider);
 
-    final query = _search.query;
-    final artists = _search.results.artists;
-    final albums = _search.results.albums;
-    final tracks = _search.results.tracks;
-
+    // The shell owns the top bar (shown while Search is at its root).
     return Scaffold(
-      appBar: AppBar(title: const Text('Search')),
-      // The field sits above the results, like the browse tabs' search: it
-      // never scrolls away, so it is built once (autofocus fires once, and
-      // never steals focus back mid-scroll).
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (isOffline) const DownloadedOnlyBadge(),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-            child: LibrarySearchField(
-              hintText: 'Search your library',
-              autofocus: true,
-              controller: _queryText,
-              onChanged: _search.onQueryChanged,
-              onSubmitted: _search.submit,
-              onCleared: _search.clear,
+          FeedHeader.live(
+            controller: _queryText,
+            focusNode: _focus,
+            onChanged: _onTextChanged,
+            onSubmitted: _search.submit,
+            onClear: _onCleared,
+            filterBar: FilterBar(
+              filters: _filters,
+              onChanged: _onFiltersChanged,
             ),
           ),
+          // Bounded progress for a first query and for updating results;
+          // the space is reserved so the feed never jumps.
+          SizedBox(
+            height: 4,
+            child: _search.isSearching ? const LinearProgressIndicator() : null,
+          ),
           Expanded(
-            child: ListView(
-              children: [
-                if (_search.isActive && !_search.hasResults && !_search.isSearching)
-                  Padding(
-                    padding: const EdgeInsets.all(32),
-                    child: Center(
-                      child: Text(
-                        _search.failed
-                            ? searchFailedMessage
-                            : isOffline
-                            ? 'No downloaded results match "$query". '
-                                'Reconnect to the server to search the full library.'
-                            : 'No results found',
-                        textAlign: TextAlign.center,
-                      ),
-                    ),
-                  ),
-                if (artists.isNotEmpty) ...[
-                  _buildSectionHeader('Artists'),
-                  SizedBox(
-                    height: 190,
-                    child: ListView.builder(
-                      scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      itemCount: artists.length,
-                      itemBuilder: (context, index) {
-                        final artist = artists[index];
-                        return SizedBox(
-                          width: 140,
-                          child: ArtistCard(
-                            artist: artist,
-                            onTap: () => openArtistDetail(context, artist),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
-                if (albums.isNotEmpty) ...[
-                  _buildSectionHeader('Albums'),
-                  SizedBox(
-                    height: 220,
-                    child: ListView.builder(
-                      scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      itemCount: albums.length,
-                      itemBuilder: (context, index) {
-                        final album = albums[index];
-                        return SizedBox(
-                          width: 160,
-                          child: AlbumCard(
-                            album: album,
-                            onTap: () => openAlbumDetail(context, album),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
-                if (tracks.isNotEmpty) ...[
-                  _buildSectionHeader('Songs'),
-                  for (final (index, track) in tracks.indexed)
-                    Builder(
-                      key: ValueKey(track.uuidId),
-                      builder: (_) {
-                        final job = manager.state.jobs
-                            .where((j) => j.uuidId == track.uuidId)
-                            .firstOrNull;
-                        Widget? trailing;
-                        if (job != null) {
-                          trailing = switch (job.status) {
-                            Active(:final progress) => SizedBox(
-                                width: 80,
-                                child: LinearProgressIndicator(
-                                  value: progress > 0 ? progress : null,
-                                ),
-                              ),
-                            Queued() => const Icon(Icons.schedule, size: 16),
-                            Completed() || Failed() => null,
-                          };
-                        }
-                        return LibraryTrackTile(
-                          track: track,
-                          trailing: trailing,
-                          onTap: () => ref
-                              .read(libraryActionsProvider)
-                              .playFromList(tracks, index, source: 'search'),
-                        );
-                      },
-                    ),
-                ],
-              ],
-            ),
+            child: SectionedFeedView(key: _feed, sections: _sections(context)),
           ),
         ],
       ),
     );
+  }
+
+  List<FeedSection> _sections(BuildContext context) => [
+    // The library sync's feedback: results come from the local mirror.
+    const FeedStatusSection(
+      id: 'search.sync_status',
+      child: LibrarySyncStatusView(),
+    ),
+    ..._resultSections(context),
+  ];
+
+  List<FeedSection> _resultSections(BuildContext context) {
+    final search = _search;
+    FeedSection status(Widget child) =>
+        FeedStatusSection(id: 'search.status', child: child);
+
+    if (!search.isActive) {
+      // Typed but not committed yet: say nothing rather than "search".
+      if (_queryText.text.trim().isNotEmpty) return const [];
+      return [status(const ListStatusMessage('Search your library'))];
+    }
+    if (!search.hasResults) {
+      if (search.isSearching) return const [];
+      if (search.failed) {
+        return [status(SearchFailedNotice(onRetry: search.retry))];
+      }
+      return [
+        status(
+          ListStatusMessage(
+            noSearchResultsMessage(
+              noun: 'results',
+              query: search.query,
+              downloadedOnly: _filters.downloaded,
+            ),
+          ),
+        ),
+      ];
+    }
+
+    final results = search.results;
+    final tracks = results.tracks;
+    final rails = _railReset;
+    Widget? capHint(SearchType type, String noun) => search.cappedFor(type)
+        ? SearchCappedHint(cap: SearchPage.cap, noun: noun)
+        : null;
+
+    return [
+      // Results kept from before a failure sit under the error.
+      if (search.failed)
+        status(SearchFailedNotice(compact: true, onRetry: search.retry)),
+      EntityRailSection(
+        id: 'search.artists',
+        title: 'Artists',
+        entities: [for (final a in results.artists) ArtistEntity(a)],
+        onTap: (entity, _) =>
+            openArtistDetail(context, (entity as ArtistEntity).artist),
+        resetToken: rails,
+        footer: capHint(SearchType.artists, 'artists'),
+      ),
+      EntityRailSection(
+        id: 'search.albums',
+        title: 'Albums',
+        entities: [for (final a in results.albums) AlbumEntity(a)],
+        onTap: (entity, _) =>
+            openAlbumDetail(context, (entity as AlbumEntity).album),
+        resetToken: rails,
+        footer: capHint(SearchType.albums, 'albums'),
+      ),
+      EntityRailSection(
+        id: 'search.songs',
+        title: 'Songs',
+        entities: [for (final t in tracks) TrackEntity(t)],
+        // The capped ranked list, from the tapped song.
+        onTap: (_, index) => ref
+            .read(libraryActionsProvider)
+            .playFromList(tracks, index, source: 'search'),
+        resetToken: rails,
+        footer: capHint(SearchType.tracks, 'songs'),
+      ),
+    ];
   }
 }

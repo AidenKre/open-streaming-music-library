@@ -52,6 +52,10 @@ class AlbumCard extends ConsumerWidget {
       ),
       title: isSingle ? 'Singles' : (album.name ?? 'Unknown Album'),
       subtitle: subtitle,
+      semanticLabel: isSingle
+          ? 'Singles, by ${album.artist ?? 'Unknown Artist'}'
+          : 'Album, ${album.name ?? 'Unknown Album'}, by '
+                '${album.artist ?? 'Unknown Artist'}',
       onTap: onTap,
       availability: availability,
       menu: buildLibraryActionMenu(

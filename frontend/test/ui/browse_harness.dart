@@ -158,6 +158,17 @@ class RecordingAudio extends AudioCoordinator {
   @override
   AudioState build() => const AudioState();
 
+  /// Show [track] as the (paused) current track, so the mini player and the
+  /// full player can open in widget tests.
+  void showTrack(TrackUI track) => state = AudioState(
+    playback: PlaybackSlice(
+      currentTrack: track,
+      status: PlayerStatus.paused,
+      duration: const Duration(minutes: 3),
+    ),
+    queue: const QueueSlice(),
+  );
+
   @override
   Future<void> playFromQueue({
     required TrackUI track,

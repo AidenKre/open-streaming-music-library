@@ -34,4 +34,10 @@ class FakeSessionControls extends ChangeNotifier implements SessionControls {
 
   @override
   void acknowledgeReset() => calls.add('acknowledgeReset');
+
+  @override
+  Future<void> onSessionActivated() async => calls.add('activated');
+
+  @override
+  Future<void> retryLibrarySync() async => calls.add('retrySync');
 }

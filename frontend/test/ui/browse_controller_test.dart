@@ -8,7 +8,8 @@ import 'package:frontend/main.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/albums_page.dart';
-import 'package:frontend/ui/artist_page.dart';
+import 'package:frontend/ui/browse/browse_pages.dart';
+import 'package:frontend/services/session_service.dart';
 import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/tracks_page.dart';
 
@@ -43,8 +44,14 @@ void main() {
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, const [
-      SeedTrack(uuid: 'u1', title: 'Song', artistId: 1, artist: 'Ann',
-          albumId: 2, album: 'Air'),
+      SeedTrack(
+        uuid: 'u1',
+        title: 'Song',
+        artistId: 1,
+        artist: 'Ann',
+        albumId: 2,
+        album: 'Air',
+      ),
     ]);
     harness = await BrowseHarness.create(db);
     browse = _FakeBrowse();
@@ -56,37 +63,74 @@ void main() {
   });
 
   Future<void> pump(WidgetTester tester, Widget page) async {
-    await tester.pumpWidget(harness.wrap(
-      page,
-      overrides: [browseControlsProvider.overrideWithValue(browse)],
-    ));
+    await tester.pumpWidget(
+      harness.wrap(
+        page,
+        overrides: [browseControlsProvider.overrideWithValue(browse)],
+      ),
+    );
     await tester.pumpAndSettle();
   }
 
-  for (final (name, page) in [
-    ('Artists root', const ArtistsPage(isRoot: true) as Widget),
-    ('artist detail (albums)', const Scaffold(body: AlbumsPage(artistId: 1))),
-    ('Tracks root', const TracksPage(isRoot: true)),
-    ('album detail', const Scaffold(body: TracksPage(artistId: 1, albumId: 2))),
+  // 4A.4 (phase-4 §4): the session host runs the initial sync; only the
+  // creation of a Tracks browse route still refreshes (was: every browse
+  // page and detail refreshed once on creation).
+  for (final (name, page, expected) in [
+    ('Tracks browse', const TracksBrowsePage() as Widget, 1),
+    ('Artists browse', const ArtistsBrowsePage(), 0),
+    ('Albums browse', const AlbumsBrowsePage(), 0),
+    (
+      'artist detail (albums)',
+      const Scaffold(body: AlbumsPage(artistId: 1)),
+      0,
+    ),
+    (
+      'album detail',
+      const Scaffold(body: TracksPage(artistId: 1, albumId: 2)),
+      0,
+    ),
   ]) {
-    testWidgets('$name refreshes the library once when created',
-        (tester) async {
+    testWidgets('$name refreshes the library $expected time(s) when created', (
+      tester,
+    ) async {
       await pump(tester, page);
-      expect(browse.refreshes, 1);
+      expect(browse.refreshes, expected);
       // Rebuilds do not add network work.
       await tester.pump(const Duration(seconds: 1));
-      expect(browse.refreshes, 1);
+      expect(browse.refreshes, expected);
       await teardownTree(tester);
     });
   }
 
-  testWidgets('re-selecting the Tracks tab refreshes again', (tester) async {
+  // 4A.4: the Tracks-tab re-select hook is gone (phase-4 §4); opening the
+  // Tracks browse route from Home refreshes instead, and re-tapping the tab
+  // does not (was: re-selecting the Tracks tab refreshed again).
+  testWidgets('opening Tracks browse from Home refreshes; re-tapping Home '
+      'does not', (tester) async {
     await pump(tester, const AppShell());
-    final atStart = browse.refreshes;
-    await tester.tap(find.text('Tracks').last);
+    expect(browse.refreshes, 0);
+    await tester.tap(find.text('Tracks'));
     await tester.pumpAndSettle();
-    expect(browse.refreshes, atStart + 1);
+    expect(browse.refreshes, 1);
+    await tester.tap(find.text('Home'));
+    await tester.pumpAndSettle();
+    expect(browse.refreshes, 1);
     await teardownTree(tester);
+  });
+
+  // Audit 4A(b) #4: one model entry for a catalog sync (5A.0 gates it).
+  test('refreshLibrary goes through SessionService.syncLibrary', () async {
+    late _CountingService service;
+    final container = ProviderContainer(
+      overrides: [
+        sessionServiceProvider.overrideWith(
+          (ref) => service = _CountingService(ref),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+    await container.read(browseControlsProvider).refreshLibrary();
+    expect(service.syncs, 1);
   });
 
   test('BrowseController.refreshLibrary runs a catalog sync', () async {
@@ -99,4 +143,11 @@ void main() {
     await container.read(browseControlsProvider).refreshLibrary();
     expect(sync.syncs, 1);
   });
+}
+
+class _CountingService extends SessionService {
+  _CountingService(super.ref);
+  int syncs = 0;
+  @override
+  Future<void> syncLibrary() async => syncs++;
 }

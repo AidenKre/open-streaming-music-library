@@ -4,7 +4,6 @@ import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
-import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/mixins/root_browse_mixin.dart';
@@ -12,14 +11,12 @@ import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
-import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
 class ArtistsPage extends ConsumerStatefulWidget {
-  /// True when rendered as a root tab inside [AppShell]; the page then owns
-  /// its own [Scaffold] + [AppBar]. False when pushed as a sub-route (the
-  /// parent route's Scaffold provides the chrome).
-  final bool isRoot;
-  const ArtistsPage({super.key, this.isRoot = false});
+  /// Browse-all capability (the Downloaded chip and in-page search), not
+  /// "navigator root". The page owns no chrome (`ArtistsBrowsePage` does).
+  final bool browseAll;
+  const ArtistsPage({super.key, this.browseAll = false});
 
   @override
   ConsumerState<ArtistsPage> createState() => _ArtistPageState();
@@ -38,8 +35,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   @override
   void initState() {
     super.initState();
-    Future.microtask(() => ref.read(browseControlsProvider).refreshLibrary());
-    if (widget.isRoot) initRootBrowse(type: SearchType.artists);
+    if (widget.browseAll) initRootBrowse(type: SearchType.artists);
     initPagination();
   }
 
@@ -62,7 +58,6 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
       offline: !hasBrowseControls && ref.read(offlineModeProvider),
     );
   }
-
 
   @override
   Widget build(BuildContext context) {
@@ -91,15 +86,6 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
       ],
     );
 
-    if (widget.isRoot) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('OSML'),
-          actions: buildTopBarActions(context, ref),
-        ),
-        body: body,
-      );
-    }
     return body;
   }
 

@@ -42,6 +42,9 @@ abstract interface class LibrarySearchControls implements Listenable {
   /// Some requested type came back full.
   bool get isCapped;
 
+  /// [type] was requested and came back full (one hint per capped type).
+  bool cappedFor(SearchType type);
+
   /// Raw text-field input (debounced).
   void onQueryChanged(String raw);
 
@@ -53,6 +56,10 @@ abstract interface class LibrarySearchControls implements Listenable {
 
   /// Re-fetch the current query now (filter/offline change).
   Future<void> rerun();
+
+  /// The user's Retry after a failure: re-runs the committed query with the
+  /// current filter.
+  Future<void> retry();
 
   /// Keep a results snapshot honest after a download/delete.
   Future<void> onDownloadStatusChanged();
@@ -114,6 +121,10 @@ class LibrarySearchController extends ChangeNotifier
   int _patchSeq = 0;
   int _appliedPatchSeq = 0;
   bool _downloadsChangedMidSearch = false;
+
+  /// A download patch was dropped because a search was replacing the rows;
+  /// redone if that search fails and keeps the old rows.
+  bool _patchDroppedForSearch = false;
   Timer? _debounceTimer;
   bool _disposed = false;
 
@@ -133,8 +144,8 @@ class LibrarySearchController extends ChangeNotifier
   @override
   LibrarySearchResults get results => _results;
 
-  /// The last fetch threw, so the (empty) [results] mean "couldn't search",
-  /// not "nothing matched".
+  /// The last fetch threw. [results] still hold whatever was shown before
+  /// (possibly empty); either way they don't mean "nothing matched".
   @override
   bool get failed => _failed;
 
@@ -147,13 +158,19 @@ class LibrarySearchController extends ChangeNotifier
   /// Some requested type came back full, so there may be more matches than
   /// shown.
   @override
-  bool get isCapped =>
-      (types.contains(SearchType.artists) &&
-          _results.artists.length >= limitPerType) ||
-      (types.contains(SearchType.albums) &&
-          _results.albums.length >= limitPerType) ||
-      (types.contains(SearchType.tracks) &&
-          _results.tracks.length >= limitPerType);
+  bool get isCapped => types.any(cappedFor);
+
+  /// [type] was requested and came back full: there may be more of it.
+  @override
+  bool cappedFor(SearchType type) {
+    if (!types.contains(type)) return false;
+    final count = switch (type) {
+      SearchType.artists => _results.artists.length,
+      SearchType.albums => _results.albums.length,
+      SearchType.tracks => _results.tracks.length,
+    };
+    return count >= limitPerType;
+  }
 
   /// Raw text-field input. Commits (and searches) once typing pauses for
   /// [debounce].
@@ -189,6 +206,11 @@ class LibrarySearchController extends ChangeNotifier
     await _search();
   }
 
+  /// The user's Retry after a failure: the same committed query, read with
+  /// the current filter. No-op while inactive or disposed.
+  @override
+  Future<void> retry() => rerun();
+
   /// Keep a snapshot of results honest after a download/delete. If the
   /// results are download-filtered, membership may have changed (a deleted
   /// download must drop out), so re-search. Otherwise just patch the rows'
@@ -223,9 +245,18 @@ class LibrarySearchController extends ChangeNotifier
     // Dropped if a search replaced the rows, or a later patch (which read
     // the DB after this one) already landed. A later patch that is still
     // pending may yet fail, so this one applies meanwhile.
-    if (_disposed || generation != _generation || patch <= _appliedPatchSeq) {
+    if (_disposed) return;
+    if (generation != _generation) {
+      // A newer search replaced the rows this patch read. If that search
+      // fails, it keeps the OLD rows, so they still need this event.
+      if (_isSearching) {
+        _patchDroppedForSearch = true;
+      } else if (_failed) {
+        await onDownloadStatusChanged();
+      }
       return;
     }
+    if (patch <= _appliedPatchSeq) return;
     _appliedPatchSeq = patch;
     _results = (
       artists: _results.artists,
@@ -250,12 +281,16 @@ class LibrarySearchController extends ChangeNotifier
     if (_query.isEmpty) {
       _isSearching = false;
       _failed = false;
+      // The rows a dropped patch was for are gone too.
+      _patchDroppedForSearch = false;
       _results = emptySearchResults;
       notifyListeners();
       return;
     }
 
+    // Starting a search (incl. a retry) clears the last error right away.
     _isSearching = true;
+    _failed = false;
     notifyListeners();
 
     LibrarySearchResults results;
@@ -269,7 +304,9 @@ class LibrarySearchController extends ChangeNotifier
       );
     } catch (e) {
       debugPrint('LibrarySearchController: search failed: $e');
-      results = emptySearchResults;
+      // Keep the previous results on screen beside the error (4A.3): a
+      // failure is never shown as an empty "no matches" result.
+      results = _results;
       failed = true;
     }
 
@@ -278,6 +315,12 @@ class LibrarySearchController extends ChangeNotifier
     _failed = failed;
     _results = results;
     notifyListeners();
+    final redoPatch = _patchDroppedForSearch;
+    _patchDroppedForSearch = false;
+    if (failed && redoPatch) {
+      await onDownloadStatusChanged();
+      return;
+    }
     if (_downloadsChangedMidSearch) {
       _downloadsChangedMidSearch = false;
       await onDownloadStatusChanged();

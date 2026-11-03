@@ -3,6 +3,8 @@ import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/albums_page.dart';
+import 'package:frontend/ui/browse/browse_pages.dart';
+import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/get_info_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 
@@ -43,7 +45,22 @@ void openAlbumDetail(BuildContext context, AlbumUI album) {
 
 /// The Get info inspector for [track].
 void openTrackInfo(BuildContext context, TrackUI track) {
-  Navigator.of(context).push(
-    MaterialPageRoute<void>(builder: (_) => GetInfoPage(track: track)),
-  );
+  Navigator.of(
+    context,
+  ).push(MaterialPageRoute<void>(builder: (_) => GetInfoPage(track: track)));
+}
+
+/// The library browse-all destinations (Home's entry points).
+enum BrowseDestination { artists, albums, tracks, downloaded }
+
+/// Opens a browse-all page on the caller's (tab) navigator; each owns one
+/// back AppBar.
+void openBrowse(BuildContext context, BrowseDestination destination) {
+  final Widget page = switch (destination) {
+    BrowseDestination.artists => const ArtistsBrowsePage(),
+    BrowseDestination.albums => const AlbumsBrowsePage(),
+    BrowseDestination.tracks => const TracksBrowsePage(),
+    BrowseDestination.downloaded => const DownloadedTracksPage(),
+  };
+  Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => page));
 }
