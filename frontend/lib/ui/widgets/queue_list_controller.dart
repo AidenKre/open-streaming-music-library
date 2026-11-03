@@ -108,6 +108,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
   bool _hasMoreAfter = false;
   bool _shouldScrollToCurrent = false;
   Object? _error;
+  (int, int, int, int)? _failedInitialLoad;
   bool _disposed = false;
 
   @override
@@ -158,6 +159,13 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     required int totalCount,
   }) {
     final sessionChanged = _sessionId != sessionId;
+    final queueChanged = _queueVersion != queueVersion;
+    // A failed read is a settled state. Rebuilds must not turn it into an
+    // unbounded read/notify/rebuild loop; a changed queue or Retry can load.
+    if (_failedInitialLoad ==
+        (sessionId, queueVersion, currentPlayPosition, totalCount)) {
+      return QueueReloadKind.none;
+    }
     final currentOutsideLoadedRange =
         _tracks.isEmpty ||
         currentPlayPosition < _startPlayPosition ||
@@ -168,7 +176,6 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       _queueVersion = queueVersion;
       return QueueReloadKind.initial;
     }
-    final queueChanged = _queueVersion != queueVersion;
     if (!queueChanged || _isInitialLoad || _isViewportReload) {
       return QueueReloadKind.none;
     }
@@ -187,6 +194,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     if (_disposed) return;
     _isInitialLoad = true;
     _error = null;
+    _failedInitialLoad = null;
     _notify();
     if (totalCount == 0) {
       _tracks = const [];
@@ -221,6 +229,8 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     } catch (error) {
       if (_disposed) return;
       _error = error;
+      _failedInitialLoad =
+          (sessionId, expectedQueueVersion, currentPlayPosition, totalCount);
       _isInitialLoad = false;
       _notify();
     }

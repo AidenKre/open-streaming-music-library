@@ -594,7 +594,9 @@ class AudioCoordinator extends Notifier<AudioState> {
   }
 
   Future<void> _restoreStartupState() async {
+    if (!ref.mounted) return;
     await _restorePersistedVolume();
+    if (!ref.mounted) return;
     // Restore (and its queue warm and remote source loads) waits for the
     // session with its offline state known (SC-27 session-ready signal).
     await ref.read(sessionReadinessProvider).ready;
@@ -604,12 +606,14 @@ class AudioCoordinator extends Notifier<AudioState> {
 
   Future<void> _restorePersistedVolume() async {
     final prefs = await ref.read(sharedPreferencesProvider.future);
+    if (!ref.mounted) return;
     final savedVolume = prefs.getDouble(_volumePreferenceKey);
     if (savedVolume == null) {
       return;
     }
 
     await _player.setVolume(savedVolume);
+    if (!ref.mounted) return;
     state = state.copyWith(
       playback: state.playback.copyWith(volume: savedVolume),
     );
@@ -627,6 +631,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     }
 
     final snapshot = await _queueRepo.getActiveSessionSnapshot();
+    if (!ref.mounted) return;
     if (snapshot == null ||
         snapshot.currentItem == null ||
         snapshot.totalCount == 0) {
@@ -634,7 +639,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     }
 
     await _serialize(() async {
-      if (_hasHydratedSessionState) {
+      if (!ref.mounted || _hasHydratedSessionState) {
         return;
       }
 

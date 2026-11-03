@@ -1,7 +1,11 @@
+import 'dart:async';
+
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/ui/session_controller.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/main.dart';
@@ -101,6 +105,39 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
     expect(find.byType(LoginPage), findsOneWidget);
+    await teardownTree(tester);
+  });
+
+  // Audit 4B(b) F5: a sheet on the session navigator closes with the
+  // session (no stranded modal over the login page).
+  testWidgets('disconnect with a card menu sheet open ends the sheet too', (
+    tester,
+  ) async {
+    await seedLibrary(db, const [
+      SeedTrack(
+        uuid: 'u1',
+        title: 'Song',
+        artistId: 1,
+        artist: 'Ann',
+        albumId: 2,
+        album: 'Air',
+      ),
+    ]);
+    await pumpLiveApp(tester);
+    await tester.tap(find.text('Artists').hitTestable());
+    await tester.pumpAndSettle();
+    await tester.longPress(find.text('Ann').hitTestable());
+    await tester.pumpAndSettle();
+    expect(find.text('Play Next'), findsOneWidget);
+    final container = ProviderScope.containerOf(
+      tester.element(find.byType(StartupGate)),
+    );
+    unawaited(container.read(sessionControlsProvider).disconnect());
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byType(LoginPage), findsOneWidget);
+    expect(find.text('Play Next'), findsNothing);
+    expect(service.resets, 1);
     await teardownTree(tester);
   });
 

@@ -34,6 +34,43 @@ void main() {
     await db.close();
   });
 
+  testWidgets('a failed queue read settles and Retry loads the rows',
+      (tester) async {
+    await _seedQueueTracks(db, ['a']);
+    final sessionId = await repo.createSessionFromExplicitList(
+      sourceType: 'test', trackUuids: const ['a'],
+    );
+    final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+    final failingRepo = _FailOnceQueueRepository(db);
+    final container = ProviderContainer(overrides: [
+      databaseProvider.overrideWithValue(db),
+      queueRepositoryProvider.overrideWithValue(failingRepo),
+      playerControlsProvider.overrideWithValue(FakePlayerControls()),
+      audioProvider.overrideWith(() => _TestQueueAudioCoordinator(_audioStateFor(
+        sessionId: sessionId,
+        currentItemId: snapshot.currentItem!.itemId,
+        currentPlayPosition: 0,
+        totalCount: 1,
+        currentTrack: _track('a'),
+      ))),
+    ]);
+    addTearDown(container.dispose);
+    await tester.pumpWidget(UncontrolledProviderScope(
+      container: container,
+      child: const MaterialApp(home: Scaffold(body: FullPlayer())),
+    ));
+    await tester.tap(find.text('Queue'));
+    await tester.pumpAndSettle();
+    expect(find.text('Error loading queue'), findsOneWidget);
+    expect(failingRepo.pageReads, 1, reason: 'failure does not poll');
+    await tester.tap(find.text('Retry'));
+    await tester.pumpAndSettle();
+    expect(find.text('Error loading queue'), findsNothing);
+    expect(find.text('Track A'), findsOneWidget);
+    expect(failingRepo.pageReads, 2);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets(
     'queue shows separators only for current or future manual/main boundaries',
     (tester) async {
@@ -540,6 +577,21 @@ class _StubOffline extends OfflineModeNotifier {
   final bool _value;
   @override
   bool build() => _value;
+}
+
+class _FailOnceQueueRepository extends QueueRepository {
+  _FailOnceQueueRepository(super.db);
+  int pageReads = 0;
+
+  @override
+  Future<List<QueueTrackEntry>> getSessionTracksPage(int sessionId, {
+    required int startPlayPosition,
+    required int limit,
+  }) {
+    if (++pageReads == 1) return Future.error(StateError('temporary read failure'));
+    return super.getSessionTracksPage(sessionId,
+        startPlayPosition: startPlayPosition, limit: limit);
+  }
 }
 
 class _TestQueueAudioCoordinator extends AudioCoordinator {

@@ -30,6 +30,13 @@ class _CountingBrowse implements BrowseControls {
   Future<void> refreshLibrary() async => refreshes++;
 }
 
+/// 4B: the shell's bar is the floating top bar (AppShell.topBarKey), not an
+/// AppBar; browse and detail routes still own real AppBars.
+Finder shellBar(String title) => find.descendant(
+  of: find.byKey(AppShell.topBarKey),
+  matching: find.text(title),
+);
+
 /// A text field has focus (its node's context sits inside an EditableText).
 bool textFocused() =>
     FocusManager.instance.primaryFocus?.context
@@ -135,7 +142,9 @@ void main() {
         .toList();
     expect(destinations, ['Home', 'Search']);
     expect(find.byType(HomePage), findsOneWidget);
-    expect(find.byType(AppBar), findsOneWidget);
+    // 4B: one floating shell bar (was one AppBar); no AppBar at a root.
+    expect(find.byKey(AppShell.topBarKey), findsOneWidget);
+    expect(find.byType(AppBar), findsNothing);
     expect(find.byTooltip('Downloads'), findsOneWidget);
     expect(find.byTooltip('Settings'), findsOneWidget);
     expect(find.text('Artists'), findsOneWidget, reason: 'entry point');
@@ -150,13 +159,15 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(ArtistsBrowsePage), findsOneWidget);
     expect(find.byType(AppBar), findsOneWidget);
+    expect(find.byKey(AppShell.topBarKey), findsNothing, reason: '4B: hidden');
     expect(find.byType(BackButton), findsOneWidget);
     expect(find.byType(NavigationBar), findsOneWidget, reason: 'stays');
 
     await tester.tap(find.byType(BackButton));
     await tester.pumpAndSettle();
     expect(find.byType(ArtistsBrowsePage), findsNothing);
-    expect(find.byType(AppBar), findsOneWidget);
+    expect(find.byKey(AppShell.topBarKey), findsOneWidget);
+    expect(find.byType(AppBar), findsNothing);
     expect(find.byTooltip('Settings'), findsOneWidget);
     await teardownTree(tester);
   });
@@ -235,15 +246,17 @@ void main() {
     await tester.longPress(find.text('Streaming Artist').first);
     await tester.pumpAndSettle();
     expect(find.text('Play Next'), findsOneWidget, reason: 'sheet open');
-    expect(find.widgetWithText(AppBar, 'Search'), findsOneWidget);
+    expect(shellBar('Search'), findsOneWidget);
     expect(find.byTooltip('Settings'), findsOneWidget);
     await teardownTree(tester);
   });
 
-  // Re-audit 4A #1: a sheet left open on the Search root keeps the field
-  // unfocused when Search is shown again (nothing may be above the root).
-  testWidgets('returning to Search with a sheet open on its root does not '
-      'focus the field under it', (tester) async {
+  // Re-audit 4A #1, updated for 4B (audit 4B(a) M1): a card menu now opens
+  // above the whole shell, so its barrier covers the tab bar — a sheet can
+  // no longer be left open on a hidden tab — and closing it does not put
+  // the focus back in the field underneath.
+  testWidgets('a card menu sheet covers the tab bar; closing it does not '
+      'focus the Search field', (tester) async {
     await pumpShell(tester);
     await tapTab(tester, 'Search');
     await typeSearch(tester, 'Streaming');
@@ -252,9 +265,10 @@ void main() {
     await tester.longPress(find.text('Streaming Artist').first);
     await tester.pumpAndSettle();
     expect(find.text('Play Next'), findsOneWidget);
-    await tapTab(tester, 'Home');
-    await tapTab(tester, 'Search');
-    expect(find.text('Play Next'), findsOneWidget, reason: 'sheet still open');
+    expect(find.byType(NavigationBar).hitTestable(), findsNothing);
+    await tester.tapAt(const Offset(10, 10)); // the barrier
+    await tester.pumpAndSettle();
+    expect(find.text('Play Next'), findsNothing);
     expect(searchFocused(tester), isFalse);
     await teardownTree(tester);
   });
@@ -277,7 +291,7 @@ void main() {
       ),
     );
     await tester.pump(); // one frame
-    expect(find.widgetWithText(AppBar, 'Search'), findsOneWidget);
+    expect(shellBar('Search'), findsOneWidget);
     await tester.pumpAndSettle();
     await teardownTree(tester);
   });
@@ -300,7 +314,7 @@ void main() {
     );
     unawaited(nav.push(a));
     await tester.pumpAndSettle();
-    expect(find.widgetWithText(AppBar, 'OSML'), findsNothing);
+    expect(shellBar('OSML'), findsNothing);
     // Replace A with B: still a page above the root.
     unawaited(
       nav.pushReplacement(
@@ -311,12 +325,12 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.text('B'), findsOneWidget);
-    expect(find.widgetWithText(AppBar, 'OSML'), findsNothing);
+    expect(shellBar('OSML'), findsNothing);
     // Remove B without a pop: back at the root, the bar returns.
     final b = ModalRoute.of(tester.element(find.text('B')))!;
     nav.removeRoute(b);
     await tester.pumpAndSettle();
-    expect(find.widgetWithText(AppBar, 'OSML'), findsOneWidget);
+    expect(shellBar('OSML'), findsOneWidget);
     await teardownTree(tester);
   });
 
@@ -328,20 +342,20 @@ void main() {
     await pumpShell(tester);
     await tester.tap(find.text('Artists'));
     await tester.pumpAndSettle();
-    expect(find.widgetWithText(AppBar, 'OSML'), findsNothing);
+    expect(shellBar('OSML'), findsNothing);
 
     await tester.tap(
       find.descendant(of: navBar(), matching: find.text('Search')),
     );
     await tester.pump(); // one frame
-    expect(find.widgetWithText(AppBar, 'Search'), findsOneWidget);
+    expect(shellBar('Search'), findsOneWidget);
 
     await tester.tap(
       find.descendant(of: navBar(), matching: find.text('Home')),
     );
     await tester.pump(); // one frame
-    expect(find.widgetWithText(AppBar, 'Search'), findsNothing);
-    expect(find.widgetWithText(AppBar, 'OSML'), findsNothing);
+    expect(shellBar('Search'), findsNothing);
+    expect(shellBar('OSML'), findsNothing);
     expect(find.widgetWithText(AppBar, 'Artists'), findsOneWidget);
     await tester.pumpAndSettle();
     await teardownTree(tester);
@@ -465,7 +479,7 @@ void main() {
       }
       expect(find.widgetWithText(AppBar, 'Remote Album'), findsNothing);
       expect(find.widgetWithText(AppBar, 'Streaming Artist'), findsNothing);
-      expect(find.widgetWithText(AppBar, 'Search'), findsOneWidget);
+      expect(shellBar('Search'), findsOneWidget);
       expect(searchField(tester).controller!.text, 'Streaming');
       expect(
         tester
@@ -711,7 +725,7 @@ void main() {
       expect(find.text('Play Next'), findsOneWidget);
       await goBack(tester);
       expect(find.text('Play Next'), findsNothing);
-      expect(find.widgetWithText(AppBar, 'Search'), findsOneWidget);
+      expect(shellBar('Search'), findsOneWidget);
       expect(searchField(tester).controller!.text, 'Streaming');
       expect(find.text('Streaming Artist'), findsWidgets);
       await teardownTree(tester);

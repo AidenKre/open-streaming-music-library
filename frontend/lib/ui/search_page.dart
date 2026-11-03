@@ -8,6 +8,7 @@ import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/feed_header.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
+import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/utils/library_search_controller.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/library_sync_status_view.dart';
@@ -123,32 +124,61 @@ class SearchPageState extends ConsumerState<SearchPage> {
       _onFiltersChanged(next ? _filters.wentOffline() : _filters.cameOnline());
     });
 
-    // The shell owns the top bar (shown while Search is at its root).
+    // The shell owns the top bar (shown while Search is at its root) and
+    // the bottom chrome: the header sits below the bar, the feed pads its
+    // end by the bottom inset (and scrolls behind it).
+    final insets = ShellChromeInsets.of(context);
     return Scaffold(
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          FeedHeader.live(
-            controller: _queryText,
-            focusNode: _focus,
-            onChanged: _onTextChanged,
-            onSubmitted: _search.submit,
-            onClear: _onCleared,
-            filterBar: FilterBar(
-              filters: _filters,
-              onChanged: _onFiltersChanged,
+      body: Padding(
+        padding: EdgeInsets.only(top: insets.top),
+        // Side safe areas (landscape notches); top/bottom are the chrome's.
+        child: SafeArea(
+          top: false,
+          bottom: false,
+          child: LayoutBuilder(
+            builder: (context, constraints) => Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    // Leave room for results even when the keyboard
+                    // leaves only a few rows. The field and filters
+                    // scroll together only if the header cannot fit.
+                    maxHeight: constraints.maxHeight * 2 / 3,
+                  ),
+                  child: SingleChildScrollView(
+                    child: FeedHeader.live(
+                      controller: _queryText,
+                      focusNode: _focus,
+                      onChanged: _onTextChanged,
+                      onSubmitted: _search.submit,
+                      onClear: _onCleared,
+                      filterBar: FilterBar(
+                        filters: _filters,
+                        onChanged: _onFiltersChanged,
+                      ),
+                    ),
+                  ),
+                ),
+                // Bounded progress for a first query and for updating results;
+                // the space is reserved so the feed never jumps.
+                SizedBox(
+                  height: (constraints.maxHeight / 3).clamp(0, 4),
+                  child: _search.isSearching
+                      ? const LinearProgressIndicator()
+                      : null,
+                ),
+                Expanded(
+                  child: SectionedFeedView(
+                    key: _feed,
+                    sections: _sections(context),
+                    bottomPadding: insets.bottom,
+                  ),
+                ),
+              ],
             ),
           ),
-          // Bounded progress for a first query and for updating results;
-          // the space is reserved so the feed never jumps.
-          SizedBox(
-            height: 4,
-            child: _search.isSearching ? const LinearProgressIndicator() : null,
-          ),
-          Expanded(
-            child: SectionedFeedView(key: _feed, sections: _sections(context)),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -170,7 +200,11 @@ class SearchPageState extends ConsumerState<SearchPage> {
     if (!search.isActive) {
       // Typed but not committed yet: say nothing rather than "search".
       if (_queryText.text.trim().isNotEmpty) return const [];
-      return [status(const ListStatusMessage('Search your library'))];
+      return [
+        status(
+          const ListStatusMessage('Search your library', padForChrome: false),
+        ),
+      ];
     }
     if (!search.hasResults) {
       if (search.isSearching) return const [];
@@ -180,6 +214,7 @@ class SearchPageState extends ConsumerState<SearchPage> {
       return [
         status(
           ListStatusMessage(
+            padForChrome: false,
             noSearchResultsMessage(
               noun: 'results',
               query: search.query,

@@ -42,6 +42,28 @@ void main() {
 
   const album = AlbumScope(artistId: 3, albumId: 7);
 
+  testWidgets('short window: every menu action can be reached', (tester) async {
+    tester.view.physicalSize = const Size(800, 360);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: Builder(
+      builder: (context) => TextButton(
+        onPressed: () => showLibraryActionMenu(
+          context,
+          buildLibraryActionMenu(album, _a(false, 2, 4), actions: actions),
+        ),
+        child: const Text('Open menu'),
+      ),
+    ))));
+    await tester.tap(find.text('Open menu'));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    await tester.ensureVisible(find.text('Delete downloads'));
+    await tester.tap(find.text('Delete downloads'));
+    await tester.pumpAndSettle();
+    expect(actions.calls, ['deleteDownloads album(3,7)']);
+  });
+
   group('collection menu (was LibraryCard._showMenu)', () {
     test('online, nothing downloaded: queue actions and Download', () {
       expect(

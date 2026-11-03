@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -103,7 +104,8 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
   }) {
     return GridView.builder(
       controller: controller,
-      padding: const EdgeInsets.all(8),
+      // Ends above the shell's floating bottom chrome (4B).
+      padding: ShellChromeInsets.padEnd(context, const EdgeInsets.all(8)),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
         maxCrossAxisExtent: 200,
         childAspectRatio: 0.75,

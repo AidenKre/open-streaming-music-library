@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:drift/drift.dart' show Value;
@@ -115,12 +116,10 @@ void main() {
     );
     // ChangeNotifierProvider.overrideWith handles disposal at scope teardown.
 
-    // Drain the manager outside the fake-async zone so Future.delayed fires.
+    // Await the real file work outside the widget test's fake async zone.
     await tester.runAsync(() async {
       await manager.enqueueTracks([_track('abc')], quality: '320');
-      while (manager.snapshot().any((j) => j.isQueued || j.isActive)) {
-        await Future<void>.delayed(const Duration(milliseconds: 5));
-      }
+      await _waitForDownloads(manager);
     });
 
     await tester.pumpWidget(wrap(manager));
@@ -145,9 +144,7 @@ void main() {
 
     await tester.runAsync(() async {
       await manager.enqueueTracks([_track('abc')], quality: '320');
-      while (manager.snapshot().any((j) => j.isQueued || j.isActive)) {
-        await Future<void>.delayed(const Duration(milliseconds: 5));
-      }
+      await _waitForDownloads(manager);
     });
 
     await tester.pumpWidget(wrap(manager));
@@ -164,11 +161,7 @@ void main() {
     );
     await tester.runAsync(() async {
       await manager.enqueueTracks([_track('abc')], quality: '320');
-      for (var i = 0;
-          i < 400 && manager.snapshot().any((j) => j.isQueued || j.isActive);
-          i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 5));
-      }
+      await _waitForDownloads(manager);
     });
     final offlineManager = DownloadManager(
       db: db,
@@ -188,4 +181,22 @@ void main() {
     await tester.tap(find.byTooltip('Cancel'));
     expect(controls.calls, ['clearFinished', 'cancel q1']);
   });
+}
+
+/// Listen for settled job state; no sleep/poll loop and a bounded failure.
+Future<void> _waitForDownloads(DownloadManager manager) async {
+  final done = Completer<void>();
+  void changed() {
+    if (!manager.snapshot().any((j) => j.isQueued || j.isActive) &&
+        !done.isCompleted) {
+      done.complete();
+    }
+  }
+  manager.addListener(changed);
+  try {
+    changed(); // Completion may have preceded listener registration.
+    await done.future.timeout(const Duration(seconds: 5));
+  } finally {
+    manager.removeListener(changed);
+  }
 }

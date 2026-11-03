@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/ui/shell/shell_chrome.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
@@ -41,10 +43,7 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
   @override
   Stream<List<TrackUI>> watchPage({required int limit}) {
     final repo = ref.read(browseRepositoryProvider);
-    return repo.watchTracks(
-      limit: limit,
-      downloadedOnly: true,
-    );
+    return repo.watchTracks(limit: limit, downloadedOnly: true);
   }
 
   @override
@@ -55,7 +54,9 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
     final header = statsAsync.maybeWhen(
       data: (stats) {
         if (stats.count == 0) return const SizedBox.shrink();
-        final sizeStr = stats.totalBytes > 0 ? formatBytes(stats.totalBytes) : null;
+        final sizeStr = stats.totalBytes > 0
+            ? formatBytes(stats.totalBytes)
+            : null;
         final label = sizeStr != null
             ? '${stats.count} tracks \u2022 $sizeStr'
             : '${stats.count} tracks';
@@ -83,9 +84,12 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
           header,
           Expanded(
             child: paginatedItems.isEmpty && !hasMore
-                ? const Center(child: Text('No downloaded tracks yet.'))
+                // Centred above the shell's floating chrome (audit 4B(c)).
+                ? const ListStatusMessage('No downloaded tracks yet.')
                 : ListView.builder(
                     controller: scrollController,
+                    // Ends above the shell's floating bottom chrome (4B).
+                    padding: ShellChromeInsets.padEnd(context),
                     itemCount: paginatedItems.length + (hasMore ? 1 : 0),
                     itemBuilder: (context, index) {
                       if (index >= paginatedItems.length) {
@@ -102,11 +106,11 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
                       if (job != null) {
                         trailing = switch (job.status) {
                           Active(:final progress) => SizedBox(
-                              width: 80,
-                              child: LinearProgressIndicator(
-                                value: progress > 0 ? progress : null,
-                              ),
+                            width: 80,
+                            child: LinearProgressIndicator(
+                              value: progress > 0 ? progress : null,
                             ),
+                          ),
                           Queued() => const Icon(Icons.schedule, size: 16),
                           Completed() || Failed() => null,
                         };

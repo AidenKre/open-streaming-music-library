@@ -558,9 +558,25 @@ class _QueueViewState extends ConsumerState<_QueueView> {
 
     if (_list.error != null && rows.isEmpty) {
       return Center(
-        child: Text(
-          'Error loading queue',
-          style: textTheme.bodyMedium?.copyWith(color: colors.onSurfaceVariant),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Error loading queue',
+                style: textTheme.bodyMedium?.copyWith(color: colors.onSurfaceVariant),
+              ),
+              TextButton(
+                onPressed: () => _list.loadInitial(
+                  sessionId: sessionId,
+                  expectedQueueVersion: queueVersion,
+                  currentPlayPosition: currentPlayPosition,
+                  totalCount: totalCount,
+                ),
+                child: const Text('Retry'),
+              ),
+            ],
+          ),
         ),
       );
     }

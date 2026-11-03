@@ -197,6 +197,40 @@ void main() {
     list.remove(9);
     expect(player.calls, ['skipTo 7', 'remove 9']);
   });
+
+  test('a failed initial load does not automatically retry on every rebuild',
+      () async {
+    final failing = QueueListController(
+      repository: _FailingQueueRepository(db),
+      player: player,
+      isOffline: () => false,
+    );
+    addTearDown(failing.dispose);
+    expect(failing.plan(sessionId: 1, queueVersion: 1,
+        currentPlayPosition: 0, totalCount: 1), QueueReloadKind.initial);
+    await failing.loadInitial(sessionId: 1, expectedQueueVersion: 1,
+        currentPlayPosition: 0, totalCount: 1);
+    expect(failing.error, isA<StateError>());
+    expect(failing.isInitialLoad, isFalse);
+    // FullPlayer calls plan() on each notification. A failure must remain
+    // settled until an explicit retry or a changed queue, not start a
+    // fetch -> notify -> fetch loop at the display refresh rate.
+    expect(failing.plan(sessionId: 1, queueVersion: 1,
+        currentPlayPosition: 0, totalCount: 1), QueueReloadKind.none);
+    expect(failing.plan(sessionId: 1, queueVersion: 2,
+        currentPlayPosition: 0, totalCount: 2), QueueReloadKind.initial,
+        reason: 'a changed queue can recover without a manual retry');
+  });
+}
+
+class _FailingQueueRepository extends QueueRepository {
+  _FailingQueueRepository(super.db);
+
+  @override
+  Future<List<QueueTrackEntry>> getSessionTracksPage(int sessionId, {
+    required int startPlayPosition,
+    required int limit,
+  }) async => throw StateError('queue read failed');
 }
 
 class _ThrowingPlayer extends FakePlayerControls {

@@ -7,6 +7,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:just_audio/just_audio.dart' as ja;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
@@ -28,7 +30,7 @@ import 'package:frontend/ui/playback_wiring.dart';
 
 void main() {
   late AppDatabase db;
-  late QueueRepository repo;
+  late _ObservedStartupRepository repo;
   late _LibraryFixture fixture;
   ProviderContainer? container;
   late FakeConcatenatingPlayerController fakePlayer;
@@ -39,11 +41,22 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.init('http://localhost:8080');
+    // The real settings and warm services are built by AudioCoordinator.
+    // Keep their incidental requests in memory: localhost might be a real
+    // server, and connection failures/retry timing are not audio fixtures.
+    ApiClient.initForTest('http://audio.test', MockClient((request) async {
+      if (request.url.path == '/settings/quality') {
+        return http.Response('{"quality":"original"}', 200);
+      }
+      if (request.url.path == '/tracks/warm') {
+        return http.Response('{}', 200);
+      }
+      throw StateError('Unexpected audio-test request: ${request.url}');
+    }));
     initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     existingFiles.clear();
-    repo = QueueRepository(db, localFileExists: existingFiles.contains);
+    repo = _ObservedStartupRepository(db, localFileExists: existingFiles.contains);
     fixture = _LibraryFixture(db);
     fakePlayer = FakeConcatenatingPlayerController();
     bridge = RecordingAudioServiceBridge();
@@ -198,8 +211,7 @@ void main() {
     test('togglePlayPause with no session does nothing', () async {
       final c = createContainer();
       // Let the container's startup loads (settings, restore) finish first.
-      await c.read(sharedPreferencesProvider.future);
-      await Future<void>.delayed(const Duration(milliseconds: 10));
+      await repo.startupRead.future;
       await c.read(audioProvider.notifier).togglePlayPause();
       expect(fakePlayer.playCalls + fakePlayer.pauseCalls, 0);
     });
@@ -1005,10 +1017,7 @@ void main() {
       final c = createContainer();
       c.listen(playbackWiringProvider, (_, _) {});
       c.read(audioProvider.notifier); // build the coordinator
-      // Let the build's Future.microtask(_restoreStartupState) complete
-      // before tearing the scope down; otherwise the in-flight restore
-      // throws ref-after-dispose noise unrelated to the assertion below.
-      await Future<void>.delayed(const Duration(milliseconds: 10));
+      await repo.startupRead.future;
       expect(bridge.onPlay, isNotNull);
 
       container?.dispose();
@@ -1046,8 +1055,7 @@ void main() {
       final cA = createContainer();
       cA.listen(playbackWiringProvider, (_, _) {});
       cA.read(audioProvider.notifier);
-      // Wait for the first coordinator's startup-restore microtask.
-      await Future<void>.delayed(const Duration(milliseconds: 10));
+      await repo.startupRead.future;
       final firstOnPlay = bridge.onPlay;
       expect(firstOnPlay, isNotNull);
 
@@ -1064,9 +1072,8 @@ void main() {
       );
       addTearDown(cB.dispose);
       cB.listen(playbackWiringProvider, (_, _) {});
-      cB.read(audioProvider.notifier);
-      // Wait for the second coordinator's startup-restore microtask.
-      await Future<void>.delayed(const Duration(milliseconds: 10));
+      // Wiring is lazy; proving owner-token isolation does not require
+      // constructing a second engine or starting its restore work.
       expect(
         identical(bridge.onPlay, firstOnPlay),
         isFalse,
@@ -1591,6 +1598,19 @@ Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
       )
       .getSingle();
   return row.read<int>('c');
+}
+
+class _ObservedStartupRepository extends QueueRepository {
+  _ObservedStartupRepository(super.db, {super.localFileExists});
+
+  final startupRead = Completer<void>();
+
+  @override
+  Future<QueueSessionSnapshot?> getActiveSessionSnapshot() async {
+    final result = await super.getActiveSessionSnapshot();
+    if (!startupRead.isCompleted) startupRead.complete();
+    return result;
+  }
 }
 
 class FakeConcatenatingPlayerController

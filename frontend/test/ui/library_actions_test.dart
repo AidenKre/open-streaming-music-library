@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:drift/native.dart';
@@ -47,6 +48,7 @@ class _RecordingDownloads extends DownloadManager {
 class _SpyRepository extends BrowseRepository {
   _SpyRepository(super.db);
   final offlineArgs = <bool>[];
+  Completer<List<TrackUI>>? pendingMembers;
 
   @override
   Future<List<TrackUI>> getTracksForScope(
@@ -54,6 +56,7 @@ class _SpyRepository extends BrowseRepository {
     required bool offline,
   }) {
     offlineArgs.add(offline);
+    if (pendingMembers != null) return pendingMembers!.future;
     return super.getTracksForScope(scope, offline: offline);
   }
 }
@@ -112,6 +115,29 @@ void main() {
   Future<Map<String, TrackUI>> tracksByUuid() async => {
     for (final t in await repo.watchTracks().first) t.uuidId: t,
   };
+
+  for (final (label, command) in <(String, Future<void> Function(LibraryActionControls))>[
+    ('Play Next', (a) => a.playNext(const ArtistScope(artistId: 1))),
+    ('Add to Queue', (a) => a.addToQueue(const ArtistScope(artistId: 1))),
+    ('Download', (a) => a.download(const ArtistScope(artistId: 1))),
+    ('Download at quality', (a) => a.downloadAtQuality(const ArtistScope(artistId: 1), '128')),
+    ('Delete downloads', (a) => a.deleteDownloads(const ArtistScope(artistId: 1))),
+  ]) {
+    test('$label stops if its session ends during the membership read', () async {
+      final tracks = await tracksByUuid();
+      repo.pendingMembers = Completer<List<TrackUI>>();
+      final pending = command(actions());
+      expect(repo.offlineArgs, [false], reason: 'membership is in flight');
+      container.dispose();
+      // Keep the normal teardown valid without disposing the old scope twice.
+      container = ProviderContainer();
+      final completion = expectLater(pending, completes);
+      repo.pendingMembers!.complete(tracks.values.toList());
+      await completion;
+      expect(audio.calls, isEmpty);
+      expect(downloads.calls, isEmpty);
+    });
+  }
 
   test('Play next on an album queues its tracks in album order', () async {
     await actions().playNext(const AlbumScope(artistId: 1, albumId: 2));

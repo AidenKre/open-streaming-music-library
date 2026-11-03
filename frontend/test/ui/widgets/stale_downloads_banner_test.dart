@@ -89,7 +89,7 @@ void main() {
     if (await tempDir.exists()) await tempDir.delete(recursive: true);
   });
 
-  late DownloadManager manager;
+  late _FlakyDownloadManager manager;
 
   Widget wrap({
     bool notify = true,
@@ -136,17 +136,16 @@ void main() {
     await tester.pump(const Duration(seconds: 1)); // finish its animation
   }
 
-  /// Lets an action that awaits real file I/O (the re-download path checks
-  /// whether the stale file exists) finish, then settles the UI.
-  Future<void> settleRealIo(WidgetTester tester) async {
-    // Each real I/O hop needs a real event-loop turn, then a pump to flush
-    // the fake-zone microtasks it scheduled; the path has a few such hops.
-    for (var i = 0; i < 5; i++) {
-      await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 10)),
-      );
-      await tester.pump();
-    }
+  /// Run the gesture and its I/O in the real async zone, awaiting the
+  /// operation itself instead of guessing how many milliseconds it needs.
+  Future<void> tapRedownloadAndWait(WidgetTester tester, Finder button) async {
+    await tester.runAsync(() async {
+      await tester.tap(button);
+      expect(manager.redownloadDone, isNotNull,
+          reason: 'the gesture must invoke the download controller');
+      await manager.redownloadDone!.timeout(const Duration(seconds: 5));
+    });
+    await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
   }
 
@@ -471,8 +470,7 @@ void main() {
       await tester.pump();
       await openSheet(tester);
 
-      await tester.tap(find.byTooltip('Re-download'));
-      await settleRealIo(tester);
+      await tapRedownloadAndWait(tester, find.byTooltip('Re-download'));
 
       final job = manager.snapshot().single;
       expect(job.uuidId, 'abc');
@@ -506,8 +504,7 @@ void main() {
       await tester.pump();
       await openSheet(tester);
 
-      await tester.tap(find.byTooltip('Re-download'));
-      await settleRealIo(tester);
+      await tapRedownloadAndWait(tester, find.byTooltip('Re-download'));
 
       expect(manager.snapshot().single.quality, '320');
       expect(find.text('Re-download queued'), findsOneWidget);
@@ -571,8 +568,7 @@ void main() {
     await tester.pump();
     await openSheet(tester);
 
-    await tester.tap(find.text('Re-download all'));
-    await settleRealIo(tester);
+    await tapRedownloadAndWait(tester, find.text('Re-download all'));
 
     final jobs = {
       for (final j in manager.snapshot())
@@ -599,8 +595,7 @@ void main() {
     await tester.pump();
     await openSheet(tester);
 
-    await tester.tap(find.byTooltip('Re-download'));
-    await settleRealIo(tester);
+    await tapRedownloadAndWait(tester, find.byTooltip('Re-download'));
 
     expect(manager.snapshot(), isEmpty);
     expect(find.text('Couldn’t queue re-download. Try again.'), findsOneWidget);
@@ -637,8 +632,7 @@ void main() {
       await tester.pump();
       await openSheet(tester);
 
-      await tester.tap(find.text('Re-download all'));
-      await settleRealIo(tester);
+      await tapRedownloadAndWait(tester, find.text('Re-download all'));
 
       expect(manager.snapshot().map((j) => j.uuidId), ['b']);
       expect(
@@ -707,6 +701,14 @@ class _FlakyDownloadManager extends DownloadManager {
     required super.isOfflineFn,
   });
   final Set<String> _failing;
+  Future<int>? redownloadDone;
+
+  @override
+  Future<int> redownloadStale(List<TrackUI> tracks, {
+    required String fallbackQuality,
+  }) => redownloadDone = super.redownloadStale(
+    tracks, fallbackQuality: fallbackQuality,
+  );
 
   @override
   Future<void> enqueueTracksAtQuality(

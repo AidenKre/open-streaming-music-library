@@ -140,8 +140,8 @@ void main() {
 
   // Re-audit 4A #2: in a field, Escape first lets the field's own chain
   // act (Autocomplete options, a dialog) before leaving the field.
-  testWidgets('Escape in an Autocomplete with options open hides them and '
-      'keeps focus', (tester) async {
+  testWidgets('Escape hides Autocomplete options, then leaves the field',
+      (tester) async {
     final ctx = await pumpHost(tester);
     unawaited(
       Navigator.of(ctx).push(
@@ -173,7 +173,14 @@ void main() {
       findsOneWidget,
       reason: 'not popped',
     );
+    // Once the suggestions are gone, Escape must leave the field rather
+    // than being swallowed forever by the autocomplete ancestor.
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    final stillEditing = FocusManager.instance.primaryFocus?.context
+        ?.findAncestorWidgetOfExactType<EditableText>();
     await teardownTree(tester);
+    expect(stillEditing, isNull, reason: 'second Escape leaves the field');
   });
 
   testWidgets('Escape in a field inside a dialog closes the dialog at once', (

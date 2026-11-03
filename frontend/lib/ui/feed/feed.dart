@@ -235,11 +235,16 @@ class SectionedFeedView extends StatefulWidget {
     super.key,
     required this.sections,
     this.header,
+    this.topPadding = 0,
     this.bottomPadding = 0,
   });
 
   final List<FeedSection> sections;
   final Widget? header;
+
+  /// The shell's chrome insets: the first and last content stay reachable
+  /// while the rest scrolls behind the floating bars.
+  final double topPadding;
   final double bottomPadding;
 
   @override
@@ -270,6 +275,7 @@ class SectionedFeedViewState extends State<SectionedFeedView> {
     return CustomScrollView(
       controller: _controller,
       slivers: [
+        SliverPadding(padding: EdgeInsets.only(top: widget.topPadding)),
         if (widget.header != null)
           SliverToBoxAdapter(
             key: const ValueKey('feed.header'),

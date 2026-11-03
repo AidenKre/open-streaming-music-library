@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/feed_header.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
+import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/library_sync_status_view.dart';
 
 /// One Home entry point (SC-07). Phase 9 appends `listening_stats`.
@@ -149,19 +150,29 @@ class HomePageState extends ConsumerState<HomePage> {
   Widget build(BuildContext context) {
     final specs = ref.watch(homeSectionsProvider);
     final hasHeader = specs.any((s) => s.id == HomeSectionIds.search);
-    return SafeArea(
-      bottom: false,
-      child: SectionedFeedView(
-        key: _feed,
-        header: hasHeader
-            ? FeedHeader.navigate(
-                onActivate: () => widget.onSearchActivated?.call(),
-              )
-            : null,
-        sections: [
-          for (final spec in specs)
-            if (spec.build != null) spec.build!(context, ref),
-        ],
+    // The shell's floating chrome covers the top and bottom; the feed pads
+    // itself by its insets (and scrolls behind the glass).
+    final insets = ShellChromeInsets.of(context);
+    return Material(
+      type: MaterialType.transparency,
+      // Side safe areas (landscape notches); top/bottom are the chrome's.
+      child: SafeArea(
+        top: false,
+        bottom: false,
+        child: SectionedFeedView(
+          key: _feed,
+          topPadding: insets.top,
+          bottomPadding: insets.bottom,
+          header: hasHeader
+              ? FeedHeader.navigate(
+                  onActivate: () => widget.onSearchActivated?.call(),
+                )
+              : null,
+          sections: [
+            for (final spec in specs)
+              if (spec.build != null) spec.build!(context, ref),
+          ],
+        ),
       ),
     );
   }

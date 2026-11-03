@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/playback_availability.dart';
 import 'package:frontend/ui/library_actions.dart';
@@ -100,41 +101,47 @@ Future<void> showLibraryActionMenu(
   List<LibraryMenuEntry> entries,
 ) {
   return showModalBottomSheet<void>(
-    context: context,
+    context: SessionHost.sheetContext(context),
     builder: (ctx) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final entry in entries)
-            switch (entry) {
-              LibraryMenuAction(:final icon, :final label, :final onSelected) =>
-                ListTile(
-                  leading: Icon(icon),
-                  title: Text(label),
-                  enabled: onSelected != null,
-                  onTap: onSelected == null
-                      ? null
-                      : () {
-                          Navigator.pop(ctx);
-                          onSelected();
-                        },
-                ),
-              LibraryMenuDownload(
-                :final onDownload,
-                :final onDownloadAtQuality,
-              ) =>
-                SplitDownloadTile(
-                  onDownload: () {
-                    Navigator.pop(ctx);
-                    onDownload();
-                  },
-                  onDownloadAtQuality: (quality) {
-                    Navigator.pop(ctx);
-                    onDownloadAtQuality(quality);
-                  },
-                ),
-            },
-        ],
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final entry in entries)
+              switch (entry) {
+                LibraryMenuAction(
+                  :final icon,
+                  :final label,
+                  :final onSelected,
+                ) =>
+                  ListTile(
+                    leading: Icon(icon),
+                    title: Text(label),
+                    enabled: onSelected != null,
+                    onTap: onSelected == null
+                        ? null
+                        : () {
+                            Navigator.pop(ctx);
+                            onSelected();
+                          },
+                  ),
+                LibraryMenuDownload(
+                  :final onDownload,
+                  :final onDownloadAtQuality,
+                ) =>
+                  SplitDownloadTile(
+                    onDownload: () {
+                      Navigator.pop(ctx);
+                      onDownload();
+                    },
+                    onDownloadAtQuality: (quality) {
+                      Navigator.pop(ctx);
+                      onDownloadAtQuality(quality);
+                    },
+                  ),
+              },
+          ],
+        ),
       ),
     ),
   );

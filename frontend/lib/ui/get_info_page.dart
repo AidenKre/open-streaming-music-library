@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -154,7 +155,8 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
 
   Widget _body(List<FieldDescriptor> fields) {
     return ListView(
-      padding: const EdgeInsets.all(16),
+      // Ends above the shell's floating bottom chrome (4B).
+      padding: ShellChromeInsets.padEnd(context, const EdgeInsets.all(16)),
       children: [
         if (fields.isNotEmpty) ...[
           Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
@@ -168,7 +170,10 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
               suggestionsFor: _suggestions,
               // Keys _suggestions can actually resolve (drift-backed).
               autocompleteKeys: const {
-                'artist', 'album_artist', 'album', 'genre',
+                'artist',
+                'album_artist',
+                'album',
+                'genre',
               },
             ),
             const SizedBox(height: 8),

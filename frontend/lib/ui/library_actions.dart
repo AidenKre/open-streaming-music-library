@@ -64,14 +64,14 @@ class LibraryActions implements LibraryActionControls {
   @override
   Future<void> playNext(LibraryScope scope) async {
     final tracks = await _members(scope);
-    if (tracks.isEmpty) return;
+    if (!_ref.mounted || tracks.isEmpty) return;
     await _ref.read(audioProvider.notifier).playNext(tracks);
   }
 
   @override
   Future<void> addToQueue(LibraryScope scope) async {
     final tracks = await _members(scope);
-    if (tracks.isEmpty) return;
+    if (!_ref.mounted || tracks.isEmpty) return;
     await _ref.read(audioProvider.notifier).addToQueue(tracks);
   }
 
@@ -113,7 +113,7 @@ class LibraryActions implements LibraryActionControls {
   @override
   Future<void> download(LibraryScope scope) async {
     final tracks = await _members(scope);
-    if (tracks.isEmpty) return;
+    if (!_ref.mounted || tracks.isEmpty) return;
     await _ref
         .read(downloadManagerProvider)
         .enqueueTracks(tracks, quality: _ref.read(downloadQualityProvider));
@@ -122,7 +122,7 @@ class LibraryActions implements LibraryActionControls {
   @override
   Future<void> downloadAtQuality(LibraryScope scope, String quality) async {
     final tracks = await _members(scope);
-    if (tracks.isEmpty) return;
+    if (!_ref.mounted || tracks.isEmpty) return;
     await _ref
         .read(downloadManagerProvider)
         .enqueueTracksAtQuality(tracks, quality: quality);
@@ -131,7 +131,7 @@ class LibraryActions implements LibraryActionControls {
   @override
   Future<void> deleteDownloads(LibraryScope scope) async {
     final tracks = await _members(scope);
-    if (tracks.isEmpty) return;
+    if (!_ref.mounted || tracks.isEmpty) return;
     await _ref
         .read(downloadManagerProvider)
         .deleteDownloadsForUuids(tracks.map((t) => t.uuidId));

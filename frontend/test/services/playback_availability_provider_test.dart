@@ -87,9 +87,28 @@ void main() {
   /// Keeps the auto-dispose family element alive and lets it settle.
   Future<PlaybackAvailability> settle(LibraryScope scope) async {
     container.listen(playbackAvailabilityProvider(scope), (_, _) {});
-    for (var i = 0; i < 5; i++) {
-      await Future<void>.delayed(Duration.zero);
+    final counts = switch (scope) {
+      AlbumScope(:final albumId) => albumDownloadCountsProvider(albumId),
+      ArtistScope(:final artistId) => artistDownloadCountsProvider(artistId),
+      _ => null,
+    };
+    if (counts != null) {
+      final ready = Completer<void>();
+      final sub = container.listen(counts, (_, next) {
+        if (ready.isCompleted || next.isLoading) return;
+        if (next.hasError) {
+          ready.completeError(next.error!, next.stackTrace);
+        } else {
+          ready.complete();
+        }
+      }, fireImmediately: true);
+      try {
+        await ready.future.timeout(const Duration(seconds: 5));
+      } finally {
+        sub.close();
+      }
     }
+    await container.pump();
     return read(scope);
   }
 
@@ -97,7 +116,6 @@ void main() {
     db.gate = Completer<void>();
     const album = AlbumScope(artistId: 1, albumId: 1);
     container.listen(playbackAvailabilityProvider(album), (_, _) {});
-    await Future<void>.delayed(Duration.zero);
     expect(read(album), const PlaybackAvailability.unknown(offline: true));
     expect(read(album).canPlay, isFalse);
     db.gate!.complete();
@@ -173,7 +191,9 @@ void main() {
     db.gate = Completer<void>();
     await markDownloaded(db, 'd');
     versions.add(1);
-    final during = await settle(scope);
+    await container.read(downloadStatusVersionProvider.future);
+    await container.pump();
+    final during = read(scope);
     // Previous data while reloading: known and unchanged, never a fresh 0/0.
     expect(during, PlaybackAvailability.of(offline: true, downloaded: 0, total: 1));
     db.gate!.complete();

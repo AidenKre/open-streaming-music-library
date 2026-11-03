@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 
+import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/services/quality_presets.dart';
 
 /// Shows a bottom sheet listing all quality presets and returns the selected
 /// quality string. Callers await the Future; `null` means the user dismissed.
 Future<String?> showDownloadQualitySheet(BuildContext context) {
   return showModalBottomSheet<String>(
-    context: context,
+    context: SessionHost.sheetContext(context),
     builder: (ctx) => SafeArea(
       child: Column(
         mainAxisSize: MainAxisSize.min,

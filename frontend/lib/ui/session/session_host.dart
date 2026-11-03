@@ -56,6 +56,15 @@ class SessionHost extends ConsumerStatefulWidget {
     );
   }
 
+  /// Where a sheet started from tab content opens: the session navigator,
+  /// so it sits above the shell's floating chrome and closes with the
+  /// session (4B). Outside a session host, [context] itself.
+  static BuildContext sheetContext(BuildContext context) {
+    final scope = context
+        .getInheritedWidgetOfExactType<_SessionNavigatorScope>();
+    return scope?.navigatorKey.currentContext ?? context;
+  }
+
   @override
   ConsumerState<SessionHost> createState() => _SessionHostState();
 }
@@ -89,7 +98,7 @@ class _SessionHostState extends ConsumerState<SessionHost> {
       // The field's own chain (its toolbar, Autocomplete options, a dialog
       // or sheet around it) goes first: the app's shortcuts deliver it.
       final route = ModalRoute.of(field.context);
-      if (_insideAutocomplete(field.context) ||
+      if (_autocompleteOptionsOpen(field.context) ||
           (route != null && route is! PageRoute)) {
         return KeyEventResult.ignored;
       }
@@ -108,13 +117,22 @@ class _SessionHostState extends ConsumerState<SessionHost> {
     return KeyEventResult.handled;
   }
 
-  static bool _insideAutocomplete(BuildContext context) {
-    var found = false;
+  static bool _autocompleteOptionsOpen(BuildContext context) {
+    OverlayPortal? optionsPortal;
+    var showing = false;
     context.visitAncestorElements((e) {
-      found = e.widget is RawAutocomplete;
-      return !found;
+      // RawAutocomplete owns the portal immediately around its field.
+      // Its DismissIntent stays enabled even after the options close, so
+      // that action's enablement alone cannot tell us whether it can dismiss.
+      final widget = e.widget;
+      if (widget is OverlayPortal) optionsPortal = widget;
+      if (widget is RawAutocomplete) {
+        showing = optionsPortal?.controller.isShowing ?? false;
+        return false;
+      }
+      return true;
     });
-    return found;
+    return showing;
   }
 
   @override

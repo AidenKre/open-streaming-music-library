@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/models/app_info.dart';
 
 /// Irreversible-confirm bottom sheet for starting a conversion. This is NEW
@@ -26,7 +27,9 @@ Future<bool> showConvertConfirmSheet(
   required bool targetIsLossless,
   required int? targetBitrateKbps,
 }) async {
-  final bitratePart = targetBitrateKbps != null ? ' at ${targetBitrateKbps}kbps' : '';
+  final bitratePart = targetBitrateKbps != null
+      ? ' at ${targetBitrateKbps}kbps'
+      : '';
   final warning = conversionWarning(
     sourceCodec: sourceCodec,
     sourceBitrateKbps: sourceBitrateKbps,
@@ -35,7 +38,7 @@ Future<bool> showConvertConfirmSheet(
     targetBitrateKbps: targetBitrateKbps,
   );
   return await showModalBottomSheet<bool>(
-        context: context,
+        context: SessionHost.sheetContext(context),
         isScrollControlled: true,
         builder: (ctx) {
           // Lives in this outer closure (not inside StatefulBuilder's own
@@ -149,7 +152,8 @@ ConversionWarning conversionWarning({
   if (sourceLossless && !targetIsLossless) {
     return ConversionWarning(
       title: 'Permanent quality loss',
-      body: 'This converts your lossless $source original to lossy $target. '
+      body:
+          'This converts your lossless $source original to lossy $target. '
           'The audio detail discarded by lossy encoding can never be '
           'recovered. $_replacedNote',
       severe: true,
@@ -158,7 +162,8 @@ ConversionWarning conversionWarning({
   if (!sourceLossless && targetIsLossless) {
     return ConversionWarning(
       title: 'No quality is gained',
-      body: 'The source is already lossy $source, so converting to lossless '
+      body:
+          'The source is already lossy $source, so converting to lossless '
           '$target cannot restore any quality -- the file just gets much '
           'larger. $_replacedNote',
     );
@@ -166,7 +171,8 @@ ConversionWarning conversionWarning({
   if (sourceLossless && targetIsLossless) {
     return ConversionWarning(
       title: 'Lossless to lossless',
-      body: 'No audio quality is lost converting $source to $target. '
+      body:
+          'No audio quality is lost converting $source to $target. '
           '$_replacedNote',
     );
   }
@@ -180,7 +186,8 @@ ConversionWarning conversionWarning({
       targetBitrateKbps >= current) {
     return ConversionWarning(
       title: 'Pointless conversion',
-      body: 'Re-encoding $source at $targetBitrateKbps kbps (currently ~$current '
+      body:
+          'Re-encoding $source at $targetBitrateKbps kbps (currently ~$current '
           'kbps) gains no quality -- it can only lose a little more. '
           '$_replacedNote',
       severe: true,
@@ -188,8 +195,7 @@ ConversionWarning conversionWarning({
   }
   // "Lower bitrate" is only claimed when both bitrates are known (the
   // >= case returned above); an unknown source bitrate gets neutral wording.
-  final knownLower =
-      sameCodec && current != null && targetBitrateKbps != null;
+  final knownLower = sameCodec && current != null && targetBitrateKbps != null;
   return ConversionWarning(
     title: 'Additional quality loss',
     body: knownLower

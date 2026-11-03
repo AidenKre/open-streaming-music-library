@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -124,6 +125,8 @@ class _TracksPageState extends ConsumerState<TracksPage>
   Widget _buildBrowseList(_RowContext rows) {
     return ListView.builder(
       controller: scrollController,
+      // Ends above the shell's floating bottom chrome (4B).
+      padding: ShellChromeInsets.padEnd(context),
       itemCount: paginatedItems.length + (hasMore ? 1 : 0),
       // The builder's context is deliberately unnamed: long-lived flows
       // below (convert: a network sync plus two sheets) use the page's
@@ -160,6 +163,7 @@ class _TracksPageState extends ConsumerState<TracksPage>
       // No controller: scrolling results must never reach the browse
       // window's load-more listener.
       builder: (tracks) => ListView.builder(
+        padding: ShellChromeInsets.padEnd(context),
         itemCount: tracks.length,
         itemBuilder: (_, index) {
           final track = tracks[index];

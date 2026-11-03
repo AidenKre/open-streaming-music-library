@@ -46,8 +46,12 @@ List<Widget> buildTopBarActions(BuildContext context, WidgetRef ref) {
     for (final action in ref.watch(topBarActionsProvider))
       if (action.isAvailable == null || ref.watch(action.isAvailable!))
         IconButton(
-          icon: Icon(action.icon),
+          // An explicit accessible name (a tooltip alone is not a label).
+          icon: Icon(action.icon, semanticLabel: action.tooltip),
           tooltip: action.tooltip,
+          // A full-size target on every platform (desktop density would
+          // shrink it to 40).
+          constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
           onPressed: () => openSession(context, action.destination),
         ),
   ];

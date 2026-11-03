@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/models/app_info.dart';
 
 /// Result of [showConvertTargetSheet]: the chosen target codec, plus a
@@ -26,7 +27,7 @@ Future<ConvertTargetChoice?> showConvertTargetSheet(
   required List<int> bitratePresets,
 }) async {
   final codec = await showModalBottomSheet<String>(
-    context: context,
+    context: SessionHost.sheetContext(context),
     builder: (ctx) => SafeArea(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -57,17 +58,14 @@ Future<ConvertTargetChoice?> showConvertTargetSheet(
   }
 
   final bitrate = await showModalBottomSheet<int>(
-    context: context,
+    context: SessionHost.sheetContext(context),
     builder: (ctx) => SafeArea(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text(
-              'Bitrate',
-              style: Theme.of(ctx).textTheme.titleMedium,
-            ),
+            child: Text('Bitrate', style: Theme.of(ctx).textTheme.titleMedium),
           ),
           for (final preset in bitratePresets)
             ListTile(
