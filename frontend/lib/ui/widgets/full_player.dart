@@ -5,9 +5,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
-import 'package:frontend/providers/providers.dart';
-import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
+import 'package:frontend/ui/player_controller.dart';
+import 'package:frontend/ui/widgets/queue_list_controller.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
@@ -247,14 +247,14 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                     ),
                     iconSize: 24,
                     onPressed: () =>
-                        ref.read(audioProvider.notifier).toggleShuffle(),
+                        ref.read(playerControlsProvider).toggleShuffle(),
                   ),
                   const SizedBox(width: 8),
                   IconButton(
                     icon: const Icon(Icons.skip_previous),
                     iconSize: 36,
                     onPressed: () =>
-                        ref.read(audioProvider.notifier).skipPrevious(),
+                        ref.read(playerControlsProvider).skipPrevious(),
                   ),
                   const SizedBox(width: 16),
                   IconButton(
@@ -264,21 +264,16 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                           : Icons.play_circle_filled,
                     ),
                     iconSize: 48,
-                    onPressed: () {
-                      final notifier = ref.read(audioProvider.notifier);
-                      if (status == PlayerStatus.playing) {
-                        notifier.pause();
-                      } else {
-                        notifier.resume();
-                      }
-                    },
+                    // The model decides play vs pause when it runs.
+                    onPressed: () =>
+                        ref.read(playerControlsProvider).togglePlayPause(),
                   ),
                   const SizedBox(width: 16),
                   IconButton(
                     icon: const Icon(Icons.skip_next),
                     iconSize: 36,
                     onPressed: () =>
-                        ref.read(audioProvider.notifier).skipNext(),
+                        ref.read(playerControlsProvider).skipNext(),
                   ),
                   const SizedBox(width: 8),
                   IconButton(
@@ -292,7 +287,7 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                     ),
                     iconSize: 24,
                     onPressed: () =>
-                        ref.read(audioProvider.notifier).cycleQueueRepeatMode(),
+                        ref.read(playerControlsProvider).cycleRepeat(),
                   ),
                 ],
               ),
@@ -309,7 +304,7 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                     child: Slider(
                       value: volume,
                       onChanged: (v) {
-                        ref.read(audioProvider.notifier).setVolume(v);
+                        ref.read(playerControlsProvider).setVolume(v);
                       },
                     ),
                   ),
@@ -343,10 +338,8 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
   }
 
   void _handleSeekEnd(double value) {
-    final target = _clampPosition(
-      Duration(milliseconds: value.round()),
-      ref.read(audioDurationProvider),
-    );
+    // The model clamps the seek; the view only keeps the drag position.
+    final target = Duration(milliseconds: value.round());
 
     setState(() {
       _isScrubbing = false;
@@ -354,19 +347,14 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
       _pendingSeekPosition = target;
     });
 
-    unawaited(ref.read(audioProvider.notifier).seek(target));
+    unawaited(ref.read(playerControlsProvider).seek(target));
   }
 
+  /// Display bound only (the seek command is clamped by the model). An
+  /// unknown duration (zero today) bounds nothing: show the real position.
   Duration _clampPosition(Duration position, Duration duration) {
-    if (duration <= Duration.zero) {
-      return Duration.zero;
-    }
-    if (position.isNegative) {
-      return Duration.zero;
-    }
-    if (position > duration) {
-      return duration;
-    }
+    if (position.isNegative) return Duration.zero;
+    if (duration > Duration.zero && position > duration) return duration;
     return position;
   }
 
@@ -398,50 +386,62 @@ class _QueueView extends ConsumerStatefulWidget {
 }
 
 class _QueueViewState extends ConsumerState<_QueueView> {
-  static const _pageSize = 80;
-  static const _initialLeadingCount = 40;
-  static const _initialTrailingCount = 60;
   static const _itemExtent = 65.0;
 
   final _scrollController = ScrollController();
-  List<QueueTrackEntry> _tracks = const [];
-  int _startPlayPosition = 0;
-  int? _sessionId;
-  int _queueVersion = -1;
-  bool _isInitialLoad = false;
-  bool _isViewportReload = false;
-  bool _isLoadingBefore = false;
-  bool _isLoadingAfter = false;
-  bool _hasMoreBefore = false;
-  bool _hasMoreAfter = false;
-  bool _shouldScrollToCurrent = false;
-  Object? _error;
+  // Paging state and row inputs live in the controller (SC-27); this view
+  // keeps only scroll geometry.
+  // Created eagerly: dispose must never be its first use (an empty queue
+  // never touches it in build).
+  late final QueueListControls _list;
 
   @override
   void initState() {
     super.initState();
+    _list = ref.read(queueListControllerFactoryProvider)()
+      ..addListener(_onListChanged);
     _scrollController.addListener(_onScroll);
   }
 
   @override
   void dispose() {
+    _list.removeListener(_onListChanged);
+    _list.dispose();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     super.dispose();
   }
 
+  void _onListChanged() {
+    if (mounted) setState(() {});
+  }
+
+  int get _totalCount =>
+      ref.read(audioProvider.select((s) => s.queue.totalCount));
+
   void _onScroll() {
-    if (!_scrollController.hasClients || _isInitialLoad || _isViewportReload) {
+    if (!_scrollController.hasClients ||
+        _list.isInitialLoad ||
+        _list.isViewportReload) {
       return;
     }
-
     final position = _scrollController.position;
-    if (position.pixels <= 320) {
-      _loadBefore();
-    }
+    if (position.pixels <= 320) _loadBefore();
     if (position.maxScrollExtent - position.pixels <= 320) {
-      _loadAfter();
+      _list.loadAfter(totalCount: _totalCount);
     }
+  }
+
+  Future<void> _loadBefore() async {
+    final previousOffset = _scrollController.hasClients
+        ? _scrollController.offset
+        : 0.0;
+    final prepended = await _list.loadBefore(totalCount: _totalCount);
+    if (prepended == 0 || !mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      _scrollController.jumpTo(previousOffset + (prepended * _itemExtent));
+    });
   }
 
   void _scheduleReload({
@@ -450,317 +450,61 @@ class _QueueViewState extends ConsumerState<_QueueView> {
     required int currentPlayPosition,
     required int totalCount,
   }) {
-    final sessionChanged = _sessionId != sessionId;
-    final currentOutsideLoadedRange =
-        _tracks.isEmpty ||
-        currentPlayPosition < _startPlayPosition ||
-        currentPlayPosition >= _startPlayPosition + _tracks.length;
-
-    if (sessionChanged || currentOutsideLoadedRange) {
-      if (_isInitialLoad) return;
-      _sessionId = sessionId;
-      _queueVersion = queueVersion;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        _loadInitialPage(
-          sessionId: sessionId,
-          expectedQueueVersion: queueVersion,
-          currentPlayPosition: currentPlayPosition,
-          totalCount: totalCount,
-        );
-      });
-      return;
-    }
-
-    final queueChanged = _queueVersion != queueVersion;
-    if (!queueChanged || _isInitialLoad || _isViewportReload) return;
-
-    _sessionId = sessionId;
-    _queueVersion = queueVersion;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _reloadVisiblePage(
-        sessionId: sessionId,
-        expectedQueueVersion: queueVersion,
-        totalCount: totalCount,
-      );
-    });
-  }
-
-  Future<void> _loadInitialPage({
-    required int sessionId,
-    required int expectedQueueVersion,
-    required int currentPlayPosition,
-    required int totalCount,
-  }) async {
-    setState(() {
-      _isInitialLoad = true;
-      _error = null;
-    });
-
-    if (totalCount == 0) {
-      if (!mounted) return;
-      setState(() {
-        _tracks = const [];
-        _startPlayPosition = 0;
-        _hasMoreBefore = false;
-        _hasMoreAfter = false;
-        _shouldScrollToCurrent = false;
-        _isInitialLoad = false;
-      });
-      return;
-    }
-
-    final repo = ref.read(queueRepositoryProvider);
-    final start = (currentPlayPosition - _initialLeadingCount).clamp(
-      0,
-      totalCount - 1,
-    );
-    final limit = (_initialLeadingCount + _initialTrailingCount + 1).clamp(
-      1,
-      totalCount - start,
-    );
-
-    try {
-      final tracks = await repo.getSessionTracksPage(
-        sessionId,
-        startPlayPosition: start,
-        limit: limit,
-      );
-      if (!mounted ||
-          _sessionId != sessionId ||
-          _queueVersion != expectedQueueVersion) {
+    switch (_list.plan(
+      sessionId: sessionId,
+      queueVersion: queueVersion,
+      currentPlayPosition: currentPlayPosition,
+      totalCount: totalCount,
+    )) {
+      case QueueReloadKind.none:
         return;
-      }
-
-      setState(() {
-        _tracks = tracks;
-        _startPlayPosition = start;
-        _hasMoreBefore = start > 0;
-        _hasMoreAfter = start + tracks.length < totalCount;
-        _shouldScrollToCurrent = true;
-        _error = null;
-        _isInitialLoad = false;
-      });
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _error = error;
-        _isInitialLoad = false;
-      });
+      case QueueReloadKind.initial:
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          _list.loadInitial(
+            sessionId: sessionId,
+            expectedQueueVersion: queueVersion,
+            currentPlayPosition: currentPlayPosition,
+            totalCount: totalCount,
+          );
+        });
+      case QueueReloadKind.visible:
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          if (!mounted) return;
+          final rowCount = _list.rows.length;
+          final previousOffset = _scrollController.hasClients
+              ? _scrollController.offset
+              : 0.0;
+          final anchorLocalIndex = rowCount == 0
+              ? 0
+              : (previousOffset / _itemExtent).floor().clamp(0, rowCount - 1);
+          final anchorOffsetWithinItem =
+              previousOffset - (anchorLocalIndex * _itemExtent);
+          final newAnchorIndex = await _list.reloadVisible(
+            sessionId: sessionId,
+            expectedQueueVersion: queueVersion,
+            currentPlayPosition: ref.read(queueCurrentPlayPositionProvider),
+            totalCount: totalCount,
+            anchorLocalIndex: anchorLocalIndex,
+          );
+          if (!mounted) return;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!_scrollController.hasClients) return;
+            final rawOffset = newAnchorIndex == null
+                ? previousOffset
+                : (newAnchorIndex * _itemExtent) + anchorOffsetWithinItem;
+            final maxScrollExtent = _scrollController.position.maxScrollExtent;
+            _scrollController.jumpTo(rawOffset.clamp(0.0, maxScrollExtent));
+          });
+        });
     }
   }
 
-  Future<void> _reloadVisiblePage({
-    required int sessionId,
-    required int expectedQueueVersion,
-    required int totalCount,
-  }) async {
-    if (_tracks.isEmpty) {
-      final currentPlayPosition = ref.read(queueCurrentPlayPositionProvider);
-      await _loadInitialPage(
-        sessionId: sessionId,
-        expectedQueueVersion: expectedQueueVersion,
-        currentPlayPosition: currentPlayPosition,
-        totalCount: totalCount,
-      );
-      return;
-    }
-
-    setState(() {
-      _isViewportReload = true;
-      _error = null;
-    });
-
-    final repo = ref.read(queueRepositoryProvider);
-    final previousOffset = _scrollController.hasClients
-        ? _scrollController.offset
-        : 0.0;
-    final anchorLocalIndex = _tracks.isEmpty
-        ? 0
-        : ((previousOffset / _itemExtent).floor()).clamp(0, _tracks.length - 1);
-    final anchorItemId = _tracks[anchorLocalIndex].itemId;
-    final anchorOffsetWithinItem =
-        previousOffset - (anchorLocalIndex * _itemExtent);
-    final desiredLimit = totalCount < _tracks.length
-        ? totalCount
-        : _tracks.length;
-
-    try {
-      final anchorEntry = await repo.getPlaybackEntryForItem(
-        sessionId,
-        anchorItemId,
-      );
-      if (!mounted ||
-          _sessionId != sessionId ||
-          _queueVersion != expectedQueueVersion) {
-        return;
-      }
-
-      final maxStart = totalCount > desiredLimit
-          ? totalCount - desiredLimit
-          : 0;
-      final start = anchorEntry == null
-          ? _startPlayPosition.clamp(0, maxStart)
-          : (anchorEntry.playPosition - anchorLocalIndex).clamp(0, maxStart);
-
-      final tracks = desiredLimit <= 0
-          ? const <QueueTrackEntry>[]
-          : await repo.getSessionTracksPage(
-              sessionId,
-              startPlayPosition: start,
-              limit: desiredLimit,
-            );
-      if (!mounted ||
-          _sessionId != sessionId ||
-          _queueVersion != expectedQueueVersion) {
-        return;
-      }
-
-      setState(() {
-        _tracks = tracks;
-        _startPlayPosition = start;
-        _hasMoreBefore = start > 0;
-        _hasMoreAfter = start + tracks.length < totalCount;
-        _shouldScrollToCurrent = false;
-        _error = null;
-        _isViewportReload = false;
-      });
-
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!_scrollController.hasClients) return;
-
-        final newAnchorIndex = tracks.indexWhere(
-          (entry) => entry.itemId == anchorItemId,
-        );
-        final rawOffset = newAnchorIndex == -1
-            ? previousOffset
-            : (newAnchorIndex * _itemExtent) + anchorOffsetWithinItem;
-        final maxScrollExtent = _scrollController.position.maxScrollExtent;
-        _scrollController.jumpTo(rawOffset.clamp(0.0, maxScrollExtent));
-      });
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _error = error;
-        _isViewportReload = false;
-      });
-    }
-  }
-
-  Future<void> _loadBefore() async {
-    if (_isLoadingBefore || !_hasMoreBefore) return;
-    final sessionId = _sessionId;
-    if (sessionId == null) return;
-    final expectedQueueVersion = _queueVersion;
-
-    final currentTotalCount = ref.read(
-      audioProvider.select((s) => s.queue.totalCount),
-    );
-    final fetchStart = (_startPlayPosition - _pageSize).clamp(
-      0,
-      _startPlayPosition,
-    );
-    final limit = _startPlayPosition - fetchStart;
-    if (limit <= 0) {
-      setState(() => _hasMoreBefore = false);
-      return;
-    }
-
-    setState(() => _isLoadingBefore = true);
-    final repo = ref.read(queueRepositoryProvider);
-    final previousOffset = _scrollController.hasClients
-        ? _scrollController.offset
-        : 0.0;
-
-    try {
-      final tracks = await repo.getSessionTracksPage(
-        sessionId,
-        startPlayPosition: fetchStart,
-        limit: limit,
-      );
-      if (!mounted ||
-          _sessionId != sessionId ||
-          _queueVersion != expectedQueueVersion) {
-        return;
-      }
-
-      setState(() {
-        _tracks = [...tracks, ..._tracks];
-        _startPlayPosition = fetchStart;
-        _hasMoreBefore = fetchStart > 0;
-        _hasMoreAfter = _startPlayPosition + _tracks.length < currentTotalCount;
-        _isLoadingBefore = false;
-      });
-
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!_scrollController.hasClients) return;
-        _scrollController.jumpTo(
-          previousOffset + (tracks.length * _itemExtent),
-        );
-      });
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _error = error;
-        _isLoadingBefore = false;
-      });
-    }
-  }
-
-  Future<void> _loadAfter() async {
-    if (_isLoadingAfter || !_hasMoreAfter) return;
-    final sessionId = _sessionId;
-    if (sessionId == null) return;
-    final expectedQueueVersion = _queueVersion;
-
-    final totalCount = ref.read(
-      audioProvider.select((s) => s.queue.totalCount),
-    );
-    final fetchStart = _startPlayPosition + _tracks.length;
-    final remaining = totalCount - fetchStart;
-    if (remaining <= 0) {
-      setState(() => _hasMoreAfter = false);
-      return;
-    }
-    final limit = remaining < _pageSize ? remaining : _pageSize;
-
-    setState(() => _isLoadingAfter = true);
-    final repo = ref.read(queueRepositoryProvider);
-
-    try {
-      final tracks = await repo.getSessionTracksPage(
-        sessionId,
-        startPlayPosition: fetchStart,
-        limit: limit,
-      );
-      if (!mounted ||
-          _sessionId != sessionId ||
-          _queueVersion != expectedQueueVersion) {
-        return;
-      }
-
-      setState(() {
-        _tracks = [..._tracks, ...tracks];
-        _hasMoreBefore = _startPlayPosition > 0;
-        _hasMoreAfter = _startPlayPosition + _tracks.length < totalCount;
-        _isLoadingAfter = false;
-      });
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _error = error;
-        _isLoadingAfter = false;
-      });
-    }
-  }
-
-  void _scrollToCurrentTrack(int currentPlayPosition) {
-    if (!_shouldScrollToCurrent) return;
-    final localIndex = currentPlayPosition - _startPlayPosition;
-    if (localIndex < 0 || localIndex >= _tracks.length) return;
-
-    _shouldScrollToCurrent = false;
+  void _scrollToCurrentTrack(int currentPlayPosition, int rowCount) {
+    if (!_list.shouldScrollToCurrent) return;
+    final localIndex = currentPlayPosition - _list.startPlayPosition;
+    if (localIndex < 0 || localIndex >= rowCount) return;
+    _list.scrolledToCurrent();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
       const itemHeight = _itemExtent;
@@ -785,7 +529,8 @@ class _QueueViewState extends ConsumerState<_QueueView> {
     final totalCount = ref.watch(
       audioProvider.select((s) => s.queue.totalCount),
     );
-    final isOffline = ref.watch(offlineModeProvider);
+    // Observed only so rows re-derive their model availability on a flip.
+    ref.watch(offlineModeProvider);
     final colors = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
@@ -804,13 +549,14 @@ class _QueueViewState extends ConsumerState<_QueueView> {
       currentPlayPosition: currentPlayPosition,
       totalCount: totalCount,
     );
-    _scrollToCurrentTrack(currentPlayPosition);
+    final rows = _list.rows;
+    _scrollToCurrentTrack(currentPlayPosition, rows.length);
 
-    if (_isInitialLoad && _tracks.isEmpty) {
+    if (_list.isInitialLoad && rows.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (_error != null && _tracks.isEmpty) {
+    if (_list.error != null && rows.isEmpty) {
       return Center(
         child: Text(
           'Error loading queue',
@@ -822,16 +568,18 @@ class _QueueViewState extends ConsumerState<_QueueView> {
     return ListView.builder(
       controller: _scrollController,
       padding: const EdgeInsets.symmetric(horizontal: 8),
-      itemCount: _tracks.length,
+      itemCount: rows.length,
       itemBuilder: (context, index) {
-        final entry = _tracks[index];
+        final row = rows[index];
+        final entry = row.entry;
         final isCurrent = entry.itemId == currentItemId;
         final isPast = entry.playPosition < currentPlayPosition;
-        // Offline, the player skips streaming-only entries — grey them out so
+        // Offline, the player skips streaming-only entries; grey them out so
         // the queue matches what playback will actually do. The row stays
         // tappable (a tap still advances to the next local entry).
-        final isUnavailableOffline = isOffline && !entry.track.isDownloaded;
+        final isUnavailableOffline = !row.availability.canPlay;
         final showQueueTypeBoundary = _shouldShowQueueTypeBoundary(
+          rows,
           index,
           currentPlayPosition,
         );
@@ -853,14 +601,11 @@ class _QueueViewState extends ConsumerState<_QueueView> {
               track: entry.track,
               isHighlighted: isCurrent,
               isDimmed: isPast || isUnavailableOffline,
-              onTap: () =>
-                  ref.read(audioProvider.notifier).skipToTrack(entry.itemId),
+              onTap: () => _list.tapRow(entry.itemId),
               trailing: !isCurrent
                   ? IconButton(
                       icon: const Icon(Icons.close, size: 20),
-                      onPressed: () => ref
-                          .read(audioProvider.notifier)
-                          .removeFromQueue(entry.itemId),
+                      onPressed: () => _list.remove(entry.itemId),
                     )
                   : null,
             ),
@@ -870,11 +615,15 @@ class _QueueViewState extends ConsumerState<_QueueView> {
     );
   }
 
-  bool _shouldShowQueueTypeBoundary(int index, int currentPlayPosition) {
+  bool _shouldShowQueueTypeBoundary(
+    List<QueueRow> rows,
+    int index,
+    int currentPlayPosition,
+  ) {
     if (index <= 0) return false;
 
-    final entry = _tracks[index];
-    final previous = _tracks[index - 1];
+    final entry = rows[index].entry;
+    final previous = rows[index - 1].entry;
     if (entry.playPosition < currentPlayPosition ||
         previous.playPosition < currentPlayPosition) {
       return false;

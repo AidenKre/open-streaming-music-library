@@ -6,7 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/settings_service.dart';
-import 'package:frontend/ui/disconnect_controller.dart';
+import 'package:frontend/ui/session_controller.dart';
+import 'package:frontend/ui/settings_controller.dart';
 
 /// Modal that lets the user pick stream + download quality presets and exit
 /// the session. Replaces the standalone disconnect button.
@@ -21,9 +22,9 @@ class SettingsDialog extends ConsumerWidget {
     // the user staring at a spinner — so we disable the dropdowns entirely
     // and surface a tooltip explaining why.
     final isOffline = ref.watch(offlineModeProvider);
-    // Disconnect is unavailable outside the live-session scope (login screen,
-    // tests that don't set up the override). Hide the button in that case.
-    final disconnectController = ref.watch(disconnectControllerProvider);
+    // Disconnect only makes sense inside a live session.
+    final session = ref.watch(sessionControlsProvider);
+    final canDisconnect = session.phase == SessionPhase.live;
 
     return AlertDialog(
       title: const Text('Settings'),
@@ -74,7 +75,7 @@ class SettingsDialog extends ConsumerWidget {
                     : (value) {
                         if (value != null) {
                           ref
-                              .read(settingsProvider.notifier)
+                              .read(settingsControlsProvider)
                               .setDownloadQuality(value);
                         }
                       },
@@ -96,20 +97,20 @@ class SettingsDialog extends ConsumerWidget {
               ),
               value: settings.notifyStaleDownloads,
               onChanged: (value) => ref
-                  .read(settingsProvider.notifier)
+                  .read(settingsControlsProvider)
                   .setNotifyStaleDownloads(value),
             ),
           ],
         ),
       ),
       actions: [
-        if (disconnectController != null)
+        if (canDisconnect)
           TextButton(
             onPressed: () async {
               final confirmed = await _confirmDisconnect(context);
               if (!confirmed || !context.mounted) return;
               Navigator.of(context).pop();
-              unawaited(disconnectController.disconnect());
+              unawaited(session.disconnect());
             },
             child: const Text('Disconnect'),
           ),
@@ -238,8 +239,8 @@ class SettingsDialog extends ConsumerWidget {
                     onPressed: () {
                       Navigator.of(ctx).pop();
                       ref
-                          .read(settingsProvider.notifier)
-                          .setStreamQualityTemporary(newQuality);
+                          .read(settingsControlsProvider)
+                          .setStreamQualityForSession(newQuality);
                     },
                     child: const Text('This session only'),
                   ),
@@ -247,8 +248,8 @@ class SettingsDialog extends ConsumerWidget {
                     onPressed: () {
                       Navigator.of(ctx).pop();
                       ref
-                          .read(settingsProvider.notifier)
-                          .setStreamQualityFull(newQuality);
+                          .read(settingsControlsProvider)
+                          .setStreamQualityDefault(newQuality);
                     },
                     child: const Text('Set as default'),
                   ),

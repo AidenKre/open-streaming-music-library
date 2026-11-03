@@ -10,6 +10,9 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/ui/get_info_page.dart';
+import 'package:frontend/models/metadata_edit.dart';
+import 'package:frontend/services/edit_outbox.dart';
+import 'package:frontend/ui/edit_controller.dart';
 
 class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._v);
@@ -43,6 +46,22 @@ TrackUI _withBitrate(double? kbps) => TrackUI(
   codec: 'flac',
   duration: 200,
   bitrateKbps: kbps,
+  sampleRateHz: 44100,
+  channels: 2,
+  hasAlbumArt: false,
+);
+
+const _withRevision = TrackUI(
+  uuidId: 'u1',
+  createdAt: 0,
+  lastUpdated: 0,
+  revision: 7,
+  title: 'Old Title',
+  artist: 'Old Artist',
+  album: 'Old Album',
+  codec: 'flac',
+  duration: 200,
+  bitrateKbps: 900,
   sampleRateHz: 44100,
   channels: 2,
   hasAlbumArt: false,
@@ -190,6 +209,19 @@ void main() {
     expect(rows.single.uuidId, 'u1');
     expect(rows.single.writeMode, 'db_only');
     expect(rows.single.valuesJson, contains('New Title'));
+    // Offline in this harness: the user is told it syncs later.
+    expect(find.text('Saved — will sync when online'), findsOneWidget);
+  });
+
+  testWidgets('a save carries the track revision as its conflict base', (
+    tester,
+  ) async {
+    final db = await _pump(tester, track: _withRevision);
+    await _enterEditMode(tester);
+    await tester.enterText(find.byKey(const ValueKey('field_title')), 'X');
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
+    await tester.pumpAndSettle();
+    expect((await _pending(db)).single.baseRevision, 7);
   });
 
   testWidgets('DB+master Save is gated by the confirmation dialog', (
@@ -301,4 +333,71 @@ void main() {
     expect(row.status, 'conflicted');
     expect(row.baseRevision, 5);
   });
+
+  testWidgets('Save goes through EditControls (SC-26)', (tester) async {
+    final fake = _FakeEdits();
+    tester.view.physicalSize = const Size(1200, 4000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appInfoProvider.overrideWith((ref) async => defaultAppInfo()),
+          editControlsProvider.overrideWithValue(fake),
+        ],
+        child: const MaterialApp(home: GetInfoPage(track: _track)),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await _enterEditMode(tester);
+    await tester.enterText(find.byKey(const ValueKey('field_title')), 'New');
+    await tester.tap(find.widgetWithText(TextButton, 'Save'));
+    await tester.pumpAndSettle();
+    expect(fake.calls, [
+      'hasPendingMasterWrite u1',
+      'plan u1 db_only',
+      'submit u1 db_only',
+    ]);
+    expect(find.text('Saved'), findsOneWidget);
+  });
+}
+
+class _FakeEdits implements EditControls {
+  final calls = <String>[];
+  @override
+  Future<bool> hasPendingMasterWrite(String uuidId) async {
+    calls.add('hasPendingMasterWrite $uuidId');
+    return false;
+  }
+
+  @override
+  Future<List<String>> suggestions(String fieldKey, String query) async =>
+      const [];
+  @override
+  Future<EditSavePlan> planSave(
+    TrackUI track,
+    MetadataEdit edit,
+    EditWriteMode mode,
+  ) async {
+    calls.add('plan ${track.uuidId} ${mode.wire}');
+    return EditSavePlan.ready;
+  }
+
+  @override
+  Future<EditSubmitted> submit(
+    TrackUI track,
+    MetadataEdit edit,
+    EditWriteMode mode,
+  ) async {
+    calls.add('submit ${track.uuidId} ${mode.wire}');
+    return EditSubmitted.online;
+  }
+
+  @override
+  Future<void> resolveKeepMine(String uuidId) async => calls.add('keep $uuidId');
+  @override
+  Future<void> resolveTakeServer(String uuidId) async => calls.add('take $uuidId');
+  @override
+  Future<void> dismissRejected(String uuidId) async => calls.add('dismiss $uuidId');
 }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
 
@@ -25,6 +26,9 @@ EditWriteMode _escalate(EditWriteMode a, EditWriteMode b) =>
         ? EditWriteMode.dbAndMaster
         : EditWriteMode.dbOnly;
 
+/// What a Get info save needs before it may be submitted.
+enum EditSavePlan { noChanges, confirmMasterWrite, ready }
+
 /// The coalescing outbox for track metadata edits. One row per track; an edit
 /// writes optimistically to the local DB and queues here, then flushes via
 /// PATCH — online or on reconnect — through one path.
@@ -40,6 +44,65 @@ class EditOutbox {
   final TracksApi api;
   final AsyncMutex mutex;
   final Ref ref;
+
+  /// What a Get info save must do first. A DB-only save with no edited
+  /// field is a no-op. [enqueue] monotonically escalates the write mode
+  /// against an already queued master write and never downgrades it, so the
+  /// confirmation is gated on that EFFECTIVE mode, not just the requested one:
+  /// otherwise a permanent file write could be saved without confirmation.
+  Future<EditSavePlan> planSave(
+    String uuidId,
+    MetadataEdit edit,
+    EditWriteMode requested,
+  ) async {
+    if (edit.isEmpty && requested == EditWriteMode.dbOnly) {
+      return EditSavePlan.noChanges;
+    }
+    final effective = await hasPendingMasterWrite(uuidId)
+        ? EditWriteMode.dbAndMaster
+        : requested;
+    return effective == EditWriteMode.dbAndMaster
+        ? EditSavePlan.confirmMasterWrite
+        : EditSavePlan.ready;
+  }
+
+  /// A queued `db_and_master` edit for the track (Get info reopens with the
+  /// master-write toggle on, so re-saving keeps escalating).
+  Future<bool> hasPendingMasterWrite(String uuidId) async =>
+      await db.pendingWriteMode(uuidId) == EditWriteMode.dbAndMaster.wire;
+
+  /// Autocomplete values for an editable field (empty for free-text fields).
+  Future<List<String>> fieldSuggestions(String fieldKey, String prefix) {
+    switch (fieldKey) {
+      case 'artist':
+      case 'album_artist':
+        return db.artistSuggestions(prefix);
+      case 'album':
+        return db.albumSuggestions(prefix);
+      case 'genre':
+        return db.genreSuggestions(prefix);
+      default:
+        return Future.value(const []);
+    }
+  }
+
+  /// Optimistic local write + queue, then a best-effort flush ([flush] is a
+  /// no-op offline). `base_revision` is the track's revision at submit (NULL
+  /// forces the conflict path).
+  Future<void> submit({
+    required String uuidId,
+    required MetadataEdit edit,
+    required EditWriteMode writeMode,
+    required int? baseRevision,
+  }) async {
+    await enqueue(
+      uuidId: uuidId,
+      edit: edit,
+      writeMode: writeMode,
+      baseRevision: baseRevision,
+    );
+    unawaited(flush());
+  }
 
   /// Optimistically apply [edit] locally and queue it, coalescing into any
   /// existing row for [uuidId].

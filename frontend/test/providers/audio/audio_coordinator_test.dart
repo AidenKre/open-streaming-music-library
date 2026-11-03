@@ -13,6 +13,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/providers/audio/audio_coordinator.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
@@ -22,6 +23,8 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/session_readiness.dart';
+import 'package:frontend/ui/playback_wiring.dart';
 
 void main() {
   late AppDatabase db;
@@ -54,9 +57,19 @@ void main() {
     await db.close();
   });
 
-  ProviderContainer createContainer({bool offline = false}) {
+  ProviderContainer createContainer({
+    bool offline = false,
+    SessionReadiness? readiness,
+    OfflineModeNotifier Function()? offlineNotifier,
+  }) {
     container = ProviderContainer(
       overrides: [
+        // Most tests run inside an active session; B8 tests pass their own.
+        sessionReadinessProvider.overrideWithValue(
+          readiness ?? (SessionReadiness()..markReady()),
+        ),
+        if (offlineNotifier != null)
+          offlineModeProvider.overrideWith(offlineNotifier),
         databaseProvider.overrideWithValue(db),
         concatenatingPlayerProvider.overrideWithValue(fakePlayer),
         audioServiceProvider.overrideWithValue(bridge),
@@ -75,6 +88,14 @@ void main() {
     return container!;
   }
 
+  /// The active session's tracks in play order, read from the repository
+  /// (replaces the deleted test-only `queueTracksProvider`).
+  Future<List<QueueTrackEntry>> sessionTracksOf(ProviderContainer c) async {
+    final sessionId = c.read(audioProvider).queue.sessionId;
+    if (sessionId == null) return const [];
+    return repo.getSessionTracksInPlayOrder(sessionId);
+  }
+
   Future<void> markDownloaded(String uuid, String path) async {
     await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid))).write(
       TracksCompanion(filePath: Value(path)),
@@ -88,6 +109,127 @@ void main() {
     );
     existingFiles.remove(path);
   }
+
+  group('4A.0b: transport rules decided in the model', () {
+    Future<AudioCoordinator> playing(ProviderContainer c) async {
+      await fixture.insertAlbum(
+        artist: 'Artist',
+        album: 'Album',
+        uuids: ['a', 'b', 'c'],
+      );
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromQueue(
+        track: await fixture.track('a'),
+        sourceType: 'album',
+        artistId: 1,
+        albumId: 1,
+        orderParams: [OrderParameter(column: 'track_number')],
+      );
+      await Future<void>.delayed(Duration.zero);
+      return notifier;
+    }
+
+    test('the playback model does not bind the OS bridge (the wiring does)',
+        () async {
+      createContainer();
+      expect(bridge.onPlay, isNull);
+      expect(bridge.onPause, isNull);
+      expect(bridge.onClick, isNull);
+    });
+
+    test('togglePlayPause pauses while playing', () async {
+      final notifier = await playing(createContainer());
+      fakePlayer.emitPlayerState(ja.PlayerState(true, ja.ProcessingState.ready));
+      await Future<void>.delayed(Duration.zero);
+      final pausesBefore = fakePlayer.pauseCalls;
+      final playsBefore = fakePlayer.playCalls;
+      await notifier.togglePlayPause();
+      expect(fakePlayer.pauseCalls, pausesBefore + 1);
+      expect(fakePlayer.playCalls, playsBefore);
+    });
+
+    test('togglePlayPause resumes when paused', () async {
+      final notifier = await playing(createContainer());
+      await notifier.pause();
+      final playsBefore = fakePlayer.playCalls;
+      await notifier.togglePlayPause();
+      expect(fakePlayer.playCalls, playsBefore + 1);
+    });
+
+    test('back-to-back toggles are decided at execution, not at call time',
+        () async {
+      final notifier = await playing(createContainer());
+      fakePlayer.emitPlayerState(ja.PlayerState(true, ja.ProcessingState.ready));
+      await Future<void>.delayed(Duration.zero);
+      final pauses = fakePlayer.pauseCalls;
+      final plays = fakePlayer.playCalls;
+      // Both issued before either runs: the second must see the first.
+      await Future.wait([notifier.togglePlayPause(), notifier.togglePlayPause()]);
+      expect(fakePlayer.pauseCalls, pauses + 1);
+      expect(fakePlayer.playCalls, plays + 1);
+    });
+
+    test('while loading, toggle resumes, matching the play icon (no pause)',
+        () async {
+      // The play/pause icon and the OS state render from the published
+      // status; the toggle must act on the same thing the user sees.
+      final c = createContainer();
+      final notifier = await playing(c);
+      fakePlayer.emitPlayerState(ja.PlayerState(true, ja.ProcessingState.loading));
+      await Future<void>.delayed(Duration.zero);
+      expect(c.read(audioStatusProvider), PlayerStatus.loading);
+      final pauses = fakePlayer.pauseCalls;
+      final plays = fakePlayer.playCalls;
+      await notifier.togglePlayPause();
+      expect(fakePlayer.pauseCalls, pauses);
+      expect(fakePlayer.playCalls, plays + 1);
+    });
+
+    test('back-to-back toggles from paused alternate too', () async {
+      final notifier = await playing(createContainer());
+      await notifier.pause();
+      final pauses = fakePlayer.pauseCalls;
+      final plays = fakePlayer.playCalls;
+      await Future.wait([notifier.togglePlayPause(), notifier.togglePlayPause()]);
+      expect(fakePlayer.playCalls, plays + 1);
+      expect(fakePlayer.pauseCalls, pauses + 1);
+    });
+
+    test('togglePlayPause with no session does nothing', () async {
+      final c = createContainer();
+      // Let the container's startup loads (settings, restore) finish first.
+      await c.read(sharedPreferencesProvider.future);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      await c.read(audioProvider.notifier).togglePlayPause();
+      expect(fakePlayer.playCalls + fakePlayer.pauseCalls, 0);
+    });
+
+    test('seek clamps a negative target to zero', () async {
+      final notifier = await playing(createContainer());
+      fakePlayer.emitDuration(const Duration(seconds: 100));
+      await Future<void>.delayed(Duration.zero);
+      await notifier.seek(const Duration(seconds: -5));
+      expect(fakePlayer.position, Duration.zero);
+    });
+
+    test('seek clamps past the end to the known duration', () async {
+      final notifier = await playing(createContainer());
+      fakePlayer.emitDuration(const Duration(seconds: 100));
+      await Future<void>.delayed(Duration.zero);
+      await notifier.seek(const Duration(seconds: 250));
+      expect(fakePlayer.position, const Duration(seconds: 100));
+      expect(container!.read(audioPositionProvider),
+          const Duration(seconds: 100), reason: 'published position agrees');
+    });
+
+    test('an unknown (zero) duration is not an upper bound', () async {
+      final notifier = await playing(createContainer());
+      fakePlayer.emitDuration(null);
+      await Future<void>.delayed(Duration.zero);
+      await notifier.seek(const Duration(seconds: 42));
+      expect(fakePlayer.position, const Duration(seconds: 42));
+    });
+  });
 
   test('playFromQueue seeds only a bounded initial player queue', () async {
     await fixture.insertAlbum(
@@ -111,7 +253,7 @@ void main() {
     final snapshot = await repo.getSessionSnapshot(
       c.read(audioProvider).queue.sessionId!,
     );
-    final queueTracks = await c.read(queueTracksProvider.future);
+    final queueTracks = await sessionTracksOf(c);
 
     expect(fakePlayer.seedCalls, hasLength(1));
     expect(fakePlayer.seedCalls.single.entries.length, lessThan(120));
@@ -145,7 +287,7 @@ void main() {
       await notifier.toggleShuffle();
       await Future<void>.delayed(Duration.zero);
 
-      final queueTracks = await c.read(queueTracksProvider.future);
+      final queueTracks = await sessionTracksOf(c);
       expect(fakePlayer.seedCalls, hasLength(1));
       expect(fakePlayer.rebuildCalls, hasLength(1));
       expect(c.read(audioProvider).queue.currentItemId, currentItemId);
@@ -180,9 +322,7 @@ void main() {
       );
       await Future<void>.delayed(Duration.zero);
 
-      final canonicalOrder = (await c.read(
-        queueTracksProvider.future,
-      )).map((entry) => entry.uuidId).toList(growable: false);
+      final canonicalOrder = (await sessionTracksOf(c)).map((entry) => entry.uuidId).toList(growable: false);
       final currentItemId = c.read(audioProvider).queue.currentItemId;
 
       await notifier.toggleShuffle();
@@ -190,9 +330,7 @@ void main() {
       await notifier.toggleShuffle();
       await Future<void>.delayed(Duration.zero);
 
-      final restoredOrder = (await c.read(
-        queueTracksProvider.future,
-      )).map((entry) => entry.uuidId).toList(growable: false);
+      final restoredOrder = (await sessionTracksOf(c)).map((entry) => entry.uuidId).toList(growable: false);
 
       expect(fakePlayer.seedCalls, hasLength(1));
       expect(fakePlayer.rebuildCalls, hasLength(2));
@@ -224,7 +362,7 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final queueTracks = await c.read(queueTracksProvider.future);
+    final queueTracks = await sessionTracksOf(c);
     final target = queueTracks.last;
     expect(fakePlayer.hasItem(target.itemId), isFalse);
 
@@ -255,7 +393,7 @@ void main() {
     await notifier.playNext([x, y]);
     await Future<void>.delayed(Duration.zero);
 
-    final entries = await c.read(queueTracksProvider.future);
+    final entries = await sessionTracksOf(c);
     expect(entries.map((entry) => entry.uuidId), [
       'a',
       'b',
@@ -281,7 +419,7 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       final sessionId = c.read(audioProvider).queue.sessionId!;
-      final entries = await c.read(queueTracksProvider.future);
+      final entries = await sessionTracksOf(c);
 
       expect(entries.map((entry) => entry.uuidId), ['x', 'y']);
       expect(c.read(currentTrackProvider)?.uuidId, 'x');
@@ -309,7 +447,7 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       final sessionId = c.read(audioProvider).queue.sessionId!;
-      final entries = await c.read(queueTracksProvider.future);
+      final entries = await sessionTracksOf(c);
 
       expect(entries.map((entry) => entry.uuidId), ['x', 'y']);
       expect(c.read(currentTrackProvider)?.uuidId, 'x');
@@ -341,21 +479,21 @@ void main() {
     await notifier.playNext([queued]);
     await Future<void>.delayed(Duration.zero);
     expect(
-      (await c.read(queueTracksProvider.future)).map((entry) => entry.uuidId),
+      (await sessionTracksOf(c)).map((entry) => entry.uuidId),
       ['a', 'b', 'x', 'c', 'd'],
     );
 
     await notifier.toggleShuffle();
     await Future<void>.delayed(Duration.zero);
     expect(
-      (await c.read(queueTracksProvider.future)).skip(2).first.uuidId,
+      (await sessionTracksOf(c)).skip(2).first.uuidId,
       'x',
     );
 
     await notifier.toggleShuffle();
     await Future<void>.delayed(Duration.zero);
     expect(
-      (await c.read(queueTracksProvider.future)).map((entry) => entry.uuidId),
+      (await sessionTracksOf(c)).map((entry) => entry.uuidId),
       ['a', 'b', 'x', 'c', 'd'],
     );
   });
@@ -399,7 +537,7 @@ void main() {
       await c.read(audioProvider.notifier).playNext([queued]);
       await Future<void>.delayed(Duration.zero);
 
-      final entries = await c.read(queueTracksProvider.future);
+      final entries = await sessionTracksOf(c);
       expect(entries.map((entry) => entry.uuidId), [
         'a',
         'd',
@@ -456,7 +594,7 @@ void main() {
       await c.read(audioProvider.notifier).toggleShuffle();
       await Future<void>.delayed(Duration.zero);
 
-      final entries = await c.read(queueTracksProvider.future);
+      final entries = await sessionTracksOf(c);
       expect(entries.map((entry) => entry.uuidId), ['a', 'b', 'c', 'd', 'e']);
       expect(c.read(currentTrackProvider)?.uuidId, 'c');
       expect(c.read(audioProvider).queue.currentPlayPosition, 2);
@@ -483,7 +621,7 @@ void main() {
       await notifier.playNext([x, y]);
       await Future<void>.delayed(Duration.zero);
 
-      final afterInsert = await c.read(queueTracksProvider.future);
+      final afterInsert = await sessionTracksOf(c);
       await notifier.skipToTrack(afterInsert[2].itemId);
       await Future<void>.delayed(Duration.zero);
 
@@ -500,7 +638,7 @@ void main() {
       await notifier.toggleShuffle();
       await Future<void>.delayed(Duration.zero);
 
-      final restored = await c.read(queueTracksProvider.future);
+      final restored = await sessionTracksOf(c);
       expect(restored.map((entry) => entry.uuidId), [
         'a',
         'b',
@@ -529,14 +667,14 @@ void main() {
       );
       await Future<void>.delayed(Duration.zero);
 
-      var entries = await c.read(queueTracksProvider.future);
+      var entries = await sessionTracksOf(c);
       await notifier.skipToTrack(entries[3].itemId);
       await Future<void>.delayed(Duration.zero);
 
       await notifier.removeFromQueue(entries[1].itemId);
       await Future<void>.delayed(Duration.zero);
 
-      entries = await c.read(queueTracksProvider.future);
+      entries = await sessionTracksOf(c);
       expect(entries.map((entry) => entry.uuidId), ['a', 'c', 'd']);
       expect(c.read(audioProvider).queue.currentPlayPosition, 2);
       expect(c.read(currentTrackProvider)?.uuidId, 'd');
@@ -566,6 +704,59 @@ void main() {
     expect(fakePlayer.seedCalls.single.autoPlay, isFalse);
     expect(c.read(currentTrackProvider)?.uuidId, 'c');
     expect(c.read(audioPositionProvider), const Duration(seconds: 42));
+  });
+
+  test('queue restore waits for the session to be ready, with offline known',
+      () async {
+    // An offline cold start: the wiring/coordinator exist before the gate has
+    // health-checked. Restore must not seed a streaming entry meanwhile.
+    await fixture.insertSingles(['a', 'b']);
+    await markDownloaded('b', '/dl/b');
+    final sessionId = await repo.createSessionFromExplicitList(
+      sourceType: 'search',
+      trackUuids: const ['a', 'b'],
+      currentIndex: 0,
+    );
+    final snapshot = await repo.getSessionSnapshot(sessionId);
+    await repo.updatePlaybackCursor(
+      sessionId: sessionId,
+      currentItemId: snapshot!.currentItem!.itemId,
+      positionMs: 1000,
+    );
+    final readiness = SessionReadiness();
+    final offline = _MutableOffline();
+    final c = createContainer(readiness: readiness, offlineNotifier: () => offline);
+    c.read(audioProvider);
+    await pumpEventQueue(times: 50);
+    expect(fakePlayer.seedCalls, isEmpty, reason: 'no restore before ready');
+
+    // The session host learns the server is unreachable, then activates.
+    offline.set(true);
+    readiness.markReady();
+    for (var i = 0; i < 100 && fakePlayer.seedCalls.isEmpty; i++) {
+      await pumpEventQueue();
+    }
+    expect(fakePlayer.seedCalls, hasLength(1));
+    expect(c.read(currentTrackProvider)?.uuidId, 'b',
+        reason: 'offline known: restore lands on the downloaded entry');
+  });
+
+  test('a scope disposed while waiting for the session never restores',
+      () async {
+    await fixture.insertSingles(['a']);
+    await repo.createSessionFromExplicitList(
+      sourceType: 'search',
+      trackUuids: const ['a'],
+    );
+    final readiness = SessionReadiness();
+    final c = createContainer(readiness: readiness);
+    c.read(audioProvider);
+    await pumpEventQueue(times: 50);
+    c.dispose(); // e.g. a reset rebuilt the scope
+    container = null;
+    readiness.markReady();
+    await pumpEventQueue(times: 50);
+    expect(fakePlayer.seedCalls, isEmpty);
   });
 
   test('restores persisted volume on startup', () async {
@@ -799,18 +990,20 @@ void main() {
     await notifier.addToQueue([x, y]);
     await Future<void>.delayed(Duration.zero);
 
-    final entries = await c.read(queueTracksProvider.future);
+    final entries = await sessionTracksOf(c);
     expect(entries.map((entry) => entry.uuidId), ['a', 'x', 'y', 'b', 'c']);
     expect(c.read(currentTrackProvider)?.uuidId, 'a');
   });
 
   test(
-    'bridge media callbacks no-op after the coordinator is disposed',
+    'bridge media callbacks no-op after the playback scope is disposed',
     () async {
-      // Wire up a coordinator, then tear down its scope. An OS notification
-      // tap firing afterwards must NOT reach the disposed coordinator/player.
+      // Bind the OS bridge through the wiring (4A.0b: the wiring owns it, not
+      // the coordinator), then tear down the scope. An OS notification tap
+      // firing afterwards must NOT reach the disposed controller/player.
       await fixture.insertSingles(['a']);
       final c = createContainer();
+      c.listen(playbackWiringProvider, (_, _) {});
       c.read(audioProvider.notifier); // build the coordinator
       // Let the build's Future.microtask(_restoreStartupState) complete
       // before tearing the scope down; otherwise the in-flight restore
@@ -827,6 +1020,7 @@ void main() {
       expect(bridge.onSkipToPrevious, isNull);
       expect(bridge.onSeek, isNull);
       expect(bridge.onStop, isNull);
+      expect(bridge.onClick, isNull);
 
       // audio_service still routes media button events through the bridge.
       // After clearCallbacks they must be no-ops, not throws — this would
@@ -837,11 +1031,12 @@ void main() {
       await bridge.skipToPrevious();
       await bridge.seek(const Duration(seconds: 5));
       await bridge.stop();
+      await bridge.click(MediaButton.media);
     },
   );
 
   test(
-    'a newer coordinator rebinding the bridge survives the old one disposing',
+    'a newer scope rebinding the bridge survives the old one disposing',
     () async {
       // Two coordinators in sequence: scope A binds, scope B binds, then
       // scope A disposes. Owner-aware clearCallbacks must leave B's
@@ -849,6 +1044,7 @@ void main() {
       await fixture.insertSingles(['a']);
 
       final cA = createContainer();
+      cA.listen(playbackWiringProvider, (_, _) {});
       cA.read(audioProvider.notifier);
       // Wait for the first coordinator's startup-restore microtask.
       await Future<void>.delayed(const Duration(milliseconds: 10));
@@ -867,13 +1063,14 @@ void main() {
         ],
       );
       addTearDown(cB.dispose);
+      cB.listen(playbackWiringProvider, (_, _) {});
       cB.read(audioProvider.notifier);
       // Wait for the second coordinator's startup-restore microtask.
       await Future<void>.delayed(const Duration(milliseconds: 10));
       expect(
         identical(bridge.onPlay, firstOnPlay),
         isFalse,
-        reason: 'second coordinator should have rebound onPlay',
+        reason: 'the second scope\'s wiring should have rebound onPlay',
       );
 
       // Disposing scope A must NOT clear scope B's callbacks.
@@ -1194,7 +1391,7 @@ void main() {
         );
         await Future<void>.delayed(Duration.zero);
 
-        final entries = await c.read(queueTracksProvider.future);
+        final entries = await sessionTracksOf(c);
         final unavailable = entries.firstWhere((e) => e.uuidId == 'b');
 
         await notifier.skipToTrack(unavailable.itemId);
@@ -1697,6 +1894,10 @@ class FakeConcatenatingPlayerController
     _playerStateController.add(state);
   }
 
+  void emitDuration(Duration? duration) {
+    _durationController.add(duration);
+  }
+
   void emitUnavailableAdvance(UnavailableAdvance event) {
     _unavailableAdvanceController.add(event);
   }
@@ -1771,6 +1972,12 @@ class RecordingAudioServiceBridge extends AudioServiceBridge {
     await _mediaSub.cancel();
     await _playbackSub.cancel();
   }
+}
+
+class _MutableOffline extends OfflineModeNotifier {
+  @override
+  bool build() => false;
+  void set(bool value) => state = value;
 }
 
 class _OfflineOn extends OfflineModeNotifier {

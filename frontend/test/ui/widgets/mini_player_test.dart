@@ -11,7 +11,10 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
+import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
+
+import '../fake_player_controls.dart';
 
 TrackUI _track({bool hasAlbumArt = false, int? coverArtId}) {
   return TrackUI(
@@ -29,11 +32,14 @@ TrackUI _track({bool hasAlbumArt = false, int? coverArtId}) {
   );
 }
 
-AudioState _audioStateWith(TrackUI track) {
+AudioState _audioStateWith(
+  TrackUI track, {
+  PlayerStatus status = PlayerStatus.paused,
+}) {
   return AudioState(
     playback: PlaybackSlice(
       currentTrack: track,
-      status: PlayerStatus.paused,
+      status: status,
       duration: const Duration(minutes: 3),
     ),
     queue: const QueueSlice(),
@@ -48,14 +54,22 @@ class _TestAudioCoordinator extends AudioCoordinator {
   AudioState build() => _state;
 }
 
-Future<void> _pumpMiniPlayer(WidgetTester tester, TrackUI track) async {
+Future<void> _pumpMiniPlayer(
+  WidgetTester tester,
+  TrackUI track, {
+  PlayerStatus status = PlayerStatus.paused,
+  FakePlayerControls? controls,
+}) async {
   final db = AppDatabase(NativeDatabase.memory());
   addTearDown(db.close);
 
   final container = ProviderContainer(
     overrides: [
       databaseProvider.overrideWithValue(db),
-      audioProvider.overrideWith(() => _TestAudioCoordinator(_audioStateWith(track))),
+      audioProvider.overrideWith(
+        () => _TestAudioCoordinator(_audioStateWith(track, status: status)),
+      ),
+      if (controls != null) playerControlsProvider.overrideWithValue(controls),
     ],
   );
   addTearDown(container.dispose);
@@ -100,5 +114,31 @@ void main() {
         expect(find.byType(Image), findsOneWidget);
       },
     );
+  });
+
+  group('MiniPlayer inputs go to PlayerControls (SC-27)', () {
+    for (final status in [PlayerStatus.paused, PlayerStatus.playing]) {
+      testWidgets('play/pause button asks the model to toggle ($status)',
+          (tester) async {
+        final controls = FakePlayerControls();
+        await _pumpMiniPlayer(tester, _track(), status: status,
+            controls: controls);
+        await tester.tap(find.byIcon(
+          status == PlayerStatus.playing ? Icons.pause : Icons.play_arrow,
+        ));
+        // The view never decides play vs pause.
+        expect(controls.calls, ['toggle']);
+      });
+    }
+
+    testWidgets('shuffle, previous, next and repeat buttons', (tester) async {
+      final controls = FakePlayerControls();
+      await _pumpMiniPlayer(tester, _track(), controls: controls);
+      await tester.tap(find.byIcon(Icons.shuffle));
+      await tester.tap(find.byIcon(Icons.skip_previous));
+      await tester.tap(find.byIcon(Icons.skip_next));
+      await tester.tap(find.byIcon(Icons.repeat));
+      expect(controls.calls, ['shuffle', 'previous', 'next', 'repeat']);
+    });
   });
 }

@@ -9,6 +9,10 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/widgets/pending_edits_banner.dart';
+import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/models/metadata_edit.dart';
+import 'package:frontend/services/edit_outbox.dart';
+import 'package:frontend/ui/edit_controller.dart';
 
 void main() {
   testWidgets('rejected edit is visible with its reason and dismissible',
@@ -78,4 +82,56 @@ void main() {
     await tester.pumpWidget(const SizedBox());
     await tester.pump(const Duration(milliseconds: 1));
   });
+
+  testWidgets('Dismiss goes through EditControls (SC-26)', (tester) async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    await db.customStatement(
+      'INSERT INTO pending_edits (uuid_id, values_json, write_mode, status, '
+      'rejection_reason, updated_at) VALUES '
+      '(\'u1\', \'{"title":"My Song"}\', \'db_only\', \'rejected\', '
+      '\'Rejected by the server\', 0)',
+    );
+    final calls = <String>[];
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          editControlsProvider.overrideWithValue(_RecordingEdits(calls)),
+        ],
+        child: const MaterialApp(home: Scaffold(body: PendingEditsBanner())),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.text('Review'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Dismiss'));
+    await tester.pump();
+    expect(calls, ['dismiss u1']);
+    // Unmount inside the test so drift's stream-close timer is flushed.
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 1));
+  });
+}
+
+class _RecordingEdits implements EditControls {
+  _RecordingEdits(this.calls);
+  final List<String> calls;
+  @override
+  Future<bool> hasPendingMasterWrite(String uuidId) async => false;
+  @override
+  Future<List<String>> suggestions(String fieldKey, String query) async =>
+      const [];
+  @override
+  Future<EditSavePlan> planSave(TrackUI t, MetadataEdit e, EditWriteMode m) async =>
+      EditSavePlan.ready;
+  @override
+  Future<EditSubmitted> submit(TrackUI t, MetadataEdit e, EditWriteMode m) async =>
+      EditSubmitted.online;
+  @override
+  Future<void> resolveKeepMine(String uuidId) async => calls.add('keep $uuidId');
+  @override
+  Future<void> resolveTakeServer(String uuidId) async => calls.add('take $uuidId');
+  @override
+  Future<void> dismissRejected(String uuidId) async => calls.add('dismiss $uuidId');
 }

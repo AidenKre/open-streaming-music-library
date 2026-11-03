@@ -15,8 +15,11 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
+import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
+
+import 'fake_player_controls.dart';
 
 void main() {
   late AppDatabase db;
@@ -341,6 +344,92 @@ void main() {
         expect(find.byType(Image), findsOneWidget);
       },
     );
+  });
+
+  testWidgets('queue row tap and remove go to PlayerControls (SC-27)',
+      (tester) async {
+    await _seedQueueTracks(db, ['a', 'b', 'c']);
+    final sessionId = await repo.createSessionFromExplicitList(
+      sourceType: 'search',
+      trackUuids: const ['a', 'b', 'c'],
+      currentIndex: 0,
+    );
+    final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+    final entries = await repo.getPlaybackEntries(sessionId);
+    final controls = FakePlayerControls();
+    final container = ProviderContainer(
+      overrides: [
+        databaseProvider.overrideWithValue(db),
+        playerControlsProvider.overrideWithValue(controls),
+        audioProvider.overrideWith(
+          () => _TestQueueAudioCoordinator(
+            _audioStateFor(
+              sessionId: sessionId,
+              currentItemId: snapshot.currentItem!.itemId,
+              currentPlayPosition: 0,
+              totalCount: 3,
+              currentTrack: _track('a'),
+            ),
+          ),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(body: SizedBox(height: 700, child: FullPlayer())),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Queue'));
+    await tester.pump();
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Track C'));
+    final rowB = find.ancestor(of: find.text('Track B'), matching: find.byType(TrackTile));
+    await tester.tap(find.descendant(of: rowB, matching: find.byIcon(Icons.close)));
+    expect(controls.calls, [
+      'skipTo ${entries[2].itemId}',
+      'remove ${entries[1].itemId}',
+    ]);
+  });
+
+  testWidgets('an empty-queue Queue tab can be left without errors',
+      (tester) async {
+    final container = ProviderContainer(
+      overrides: [
+        databaseProvider.overrideWithValue(db),
+        audioProvider.overrideWith(
+          () => _TestQueueAudioCoordinator(
+            _audioStateFor(
+              sessionId: 1,
+              currentItemId: 1,
+              currentPlayPosition: 0,
+              totalCount: 0,
+              currentTrack: _track('a'),
+            ),
+          ),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(
+          home: Scaffold(body: SizedBox(height: 700, child: FullPlayer())),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Queue'));
+    await tester.pump();
+    expect(find.text('Queue is empty'), findsOneWidget);
+    // Leaving the tab disposes the queue view, which must not reach for a
+    // controller it never created.
+    await tester.tap(find.text('Now Playing'));
+    await tester.pump();
+    expect(tester.takeException(), equals(null));
   });
 }
 

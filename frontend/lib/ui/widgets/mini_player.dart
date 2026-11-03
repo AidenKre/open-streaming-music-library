@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
 
@@ -109,11 +110,11 @@ class MiniPlayer extends ConsumerWidget {
                 color: shuffleOn ? colors.primary : null,
                 size: 20,
               ),
-              onPressed: () => ref.read(audioProvider.notifier).toggleShuffle(),
+              onPressed: () => ref.read(playerControlsProvider).toggleShuffle(),
             ),
             IconButton(
               icon: const Icon(Icons.skip_previous),
-              onPressed: () => ref.read(audioProvider.notifier).skipPrevious(),
+              onPressed: () => ref.read(playerControlsProvider).skipPrevious(),
             ),
             IconButton(
               icon: Icon(
@@ -121,18 +122,12 @@ class MiniPlayer extends ConsumerWidget {
                     ? Icons.pause
                     : Icons.play_arrow,
               ),
-              onPressed: () {
-                final notifier = ref.read(audioProvider.notifier);
-                if (status == PlayerStatus.playing) {
-                  notifier.pause();
-                } else {
-                  notifier.resume();
-                }
-              },
+              // The model decides play vs pause when the command runs.
+              onPressed: () => ref.read(playerControlsProvider).togglePlayPause(),
             ),
             IconButton(
               icon: const Icon(Icons.skip_next),
-              onPressed: () => ref.read(audioProvider.notifier).skipNext(),
+              onPressed: () => ref.read(playerControlsProvider).skipNext(),
             ),
             IconButton(
               icon: Icon(
@@ -140,7 +135,7 @@ class MiniPlayer extends ConsumerWidget {
                 color: repeatMode != QueueRepeatMode.off ? colors.primary : null,
                 size: 20,
               ),
-              onPressed: () => ref.read(audioProvider.notifier).cycleQueueRepeatMode(),
+              onPressed: () => ref.read(playerControlsProvider).cycleRepeat(),
             ),
           ],
         ),

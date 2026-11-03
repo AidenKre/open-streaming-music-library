@@ -6,10 +6,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
-import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/edit_outbox.dart';
+import 'package:frontend/ui/edit_controller.dart';
 import 'package:frontend/ui/widgets/master_write_confirm_dialog.dart';
 import 'package:frontend/ui/widgets/metadata_form.dart';
 
@@ -42,9 +41,11 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
   /// master-write toggle already on — and re-saving can keep escalating to a
   /// master-file write.
   Future<void> _loadPendingWriteMode() async {
-    final mode = await ref.read(databaseProvider).pendingWriteMode(_track.uuidId);
+    final pending = await ref
+        .read(editControlsProvider)
+        .hasPendingMasterWrite(_track.uuidId);
     if (!mounted) return;
-    if (mode == 'db_and_master') setState(() => _writeToFile = true);
+    if (pending) setState(() => _writeToFile = true);
   }
 
   Object? _currentValue(String key) {
@@ -72,69 +73,33 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
     }
   }
 
-  Future<List<String>> _suggestions(String key, String query) {
-    final db = ref.read(databaseProvider);
-    switch (key) {
-      case 'artist':
-      case 'album_artist':
-        return db.artistSuggestions(query);
-      case 'album':
-        return db.albumSuggestions(query);
-      case 'genre':
-        return db.genreSuggestions(query);
-      default:
-        return Future.value(const []);
-    }
-  }
+  Future<List<String>> _suggestions(String key, String query) =>
+      ref.read(editControlsProvider).suggestions(key, query);
 
   Future<void> _save() async {
     if (!_editing) return;
-    final localMode = _writeToFile
+    final edits = ref.read(editControlsProvider);
+    final mode = _writeToFile
         ? EditWriteMode.dbAndMaster
         : EditWriteMode.dbOnly;
-    // Enabling master-write is itself a saveable change (re-tag the file from
-    // the current DB values), so "no changes" only applies to a DB-only save
-    // with no edited fields.
-    if (_edit.isEmpty && localMode == EditWriteMode.dbOnly) {
-      _toast('No changes to save');
-      return;
+    switch (await edits.planSave(_track, _edit, mode)) {
+      case EditSavePlan.noChanges:
+        _toast('No changes to save');
+        return;
+      case EditSavePlan.confirmMasterWrite:
+        if (!mounted) return;
+        final confirmed = await showMasterWriteConfirmDialog(context);
+        if (!confirmed) return;
+      case EditSavePlan.ready:
+        break;
     }
-    // enqueue() monotonically escalates the persisted write mode against any
-    // existing pending/conflicted row for this track and never downgrades —
-    // so if db_and_master is already queued, this save will still perform a
-    // master write even with the toggle off. Gate the confirmation dialog on
-    // that effective mode, not just the local toggle, or the user could save
-    // a permanent file write with no confirmation shown for this action.
-    final persisted =
-        await ref.read(databaseProvider).pendingWriteMode(_track.uuidId);
-    final effectiveMode = persisted == 'db_and_master'
-        ? EditWriteMode.dbAndMaster
-        : localMode;
-    if (effectiveMode == EditWriteMode.dbAndMaster) {
-      final confirmed = await showMasterWriteConfirmDialog(context);
-      if (!confirmed) return;
-    }
-    await _submit(_edit, localMode); // enqueue() still performs its own escalation
-  }
-
-  /// Optimistic local write + outbox enqueue, then a best-effort flush if
-  /// online. The form/page stay persistence-neutral — this is the only seam
-  /// that knows about the outbox.
-  Future<void> _submit(MetadataEdit edit, EditWriteMode mode) async {
-    final outbox = ref.read(editOutboxProvider);
-    // base_revision is captured here, at submit (NULL forces the conflict path).
-    await outbox.enqueue(
-      uuidId: _track.uuidId,
-      edit: edit,
-      writeMode: mode,
-      baseRevision: _track.revision,
-    );
-    final online = !ref.read(offlineModeProvider);
-    if (online) {
-      unawaited(outbox.flush());
-    }
+    final submitted = await edits.submit(_track, _edit, mode);
     if (!mounted) return;
-    _toast(online ? 'Saved' : 'Saved — will sync when online');
+    _toast(
+      submitted == EditSubmitted.online
+          ? 'Saved'
+          : 'Saved — will sync when online',
+    );
     if (Navigator.of(context).canPop()) Navigator.of(context).pop();
   }
 

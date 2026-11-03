@@ -18,7 +18,10 @@ import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/settings_service.dart';
+import 'package:frontend/ui/downloads_controller.dart';
 import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
+
+import '../fake_downloads_controls.dart';
 
 Future<void> _insertTrack(
   AppDatabase db, {
@@ -92,6 +95,7 @@ void main() {
     bool notify = true,
     String downloadQuality = '320',
     Set<String> failingQualities = const {},
+    FakeDownloadsControls? controls,
   }) {
     manager = _FlakyDownloadManager(
       failingQualities,
@@ -110,6 +114,8 @@ void main() {
         settingsProvider.overrideWith(
           () => _FixedSettings(notify, downloadQuality),
         ),
+        if (controls != null)
+          downloadsControlsProvider.overrideWithValue(controls),
       ],
       child: const MaterialApp(home: Scaffold(body: StaleDownloadsBanner())),
     );
@@ -667,6 +673,28 @@ void main() {
 
     await flushDispose(tester);
   });
+
+  testWidgets('sheet actions go through DownloadsControls (SC-26)',
+      (tester) async {
+    await _insertTrack(db, uuid: 'a', revision: 6, downloadedAtRevision: 5,
+        filePath: realFile('a'));
+    final controls = FakeDownloadsControls();
+    await tester.pumpWidget(wrap(controls: controls));
+    await tester.pump();
+    await openSheet(tester);
+    await tester.tap(find.byTooltip('Re-download'));
+    await tester.pump();
+    await tester.tap(find.byTooltip('Dismiss'));
+    await tester.pump();
+    await tester.tap(find.text('Re-download all'));
+    await tester.pump();
+    await tester.tap(find.text('Dismiss all'));
+    await tester.pump();
+    expect(controls.calls, [
+      'redownload a', 'dismiss a', 'redownload a', 'dismissAll a',
+    ]);
+    await flushDispose(tester);
+  });
 }
 
 /// Throws from [enqueueTracksAtQuality] for the listed qualities.
@@ -704,4 +732,5 @@ class _FixedSettings extends SettingsNotifier {
       notifyStaleDownloads: _notify,
     );
   }
+
 }

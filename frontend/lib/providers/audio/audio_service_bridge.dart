@@ -4,12 +4,16 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 
 /// Function signatures for media button callbacks.
-/// The coordinator binds these after construction.
+/// `playbackWiringProvider` binds these (to PlayerControls).
 typedef AsyncAction = Future<void> Function();
 typedef AsyncSeekAction = Future<void> Function(Duration position);
+typedef AsyncClickAction = Future<void> Function(MediaButton button);
 
-/// Bridge between audio_service and our audio coordinator.
-/// Handles notification updates and media button callbacks.
+/// Bridge between audio_service and the app.
+/// Publishes now-playing/state to the OS (from the playback model) and
+/// forwards OS input to callbacks bound by `playbackWiringProvider` (which
+/// routes them to `PlayerControls`). Callbacks that arrive before binding
+/// are intentional no-ops.
 class AudioServiceBridge extends BaseAudioHandler {
   AsyncAction? onPlay;
   AsyncAction? onPause;
@@ -17,11 +21,12 @@ class AudioServiceBridge extends BaseAudioHandler {
   AsyncAction? onSkipToPrevious;
   AsyncSeekAction? onSeek;
   AsyncAction? onStop;
+  AsyncClickAction? onClick;
 
-  /// Identifies which coordinator currently owns these callbacks. The
-  /// coordinator passes a token when binding so a later `clearCallbacks` call
-  /// from a disposed coordinator only nulls out callbacks it itself installed
-  /// — a newer coordinator that bound after a reset is left untouched.
+  /// Identifies which wiring currently owns these callbacks. The wiring
+  /// passes a token when binding so a later `clearCallbacks` call from a
+  /// disposed scope only nulls out callbacks it itself installed — a newer
+  /// scope that bound after a reset is left untouched.
   Object? _callbackOwner;
 
   /// Install media button callbacks and remember the owner. A coordinator
@@ -35,6 +40,7 @@ class AudioServiceBridge extends BaseAudioHandler {
     AsyncAction? onSkipToPrevious,
     AsyncSeekAction? onSeek,
     AsyncAction? onStop,
+    AsyncClickAction? onClick,
   }) {
     _callbackOwner = owner;
     this.onPlay = onPlay;
@@ -43,6 +49,7 @@ class AudioServiceBridge extends BaseAudioHandler {
     this.onSkipToPrevious = onSkipToPrevious;
     this.onSeek = onSeek;
     this.onStop = onStop;
+    this.onClick = onClick;
   }
 
   /// Clear media button callbacks if [owner] still owns them. Called from a
@@ -58,6 +65,7 @@ class AudioServiceBridge extends BaseAudioHandler {
     onSkipToPrevious = null;
     onSeek = null;
     onStop = null;
+    onClick = null;
   }
 
   /// Called by coordinator when the current track changes.
@@ -123,4 +131,11 @@ class AudioServiceBridge extends BaseAudioHandler {
 
   @override
   Future<void> stop() async => await onStop?.call();
+
+  /// Headset/media-key click. The default implementation toggles from the
+  /// published OS state; route it to the app instead (media toggles from app
+  /// state, next/previous skip).
+  @override
+  Future<void> click([MediaButton button = MediaButton.media]) async =>
+      await onClick?.call(button);
 }

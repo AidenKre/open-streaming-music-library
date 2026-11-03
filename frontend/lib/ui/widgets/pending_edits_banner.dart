@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/database/database.dart';
 import 'package:frontend/services/edit_outbox.dart';
+import 'package:frontend/ui/edit_controller.dart';
 import 'package:frontend/ui/widgets/edit_conflict_dialog.dart';
 
 /// Always-evaluated surface (visible online too — edits can be pending while
@@ -98,11 +99,11 @@ class _OutboxIssuesList extends ConsumerWidget {
                     trackLabel: _labelFor(row),
                   );
                   if (choice == null) return;
-                  final outbox = ref.read(editOutboxProvider);
+                  final edits = ref.read(editControlsProvider);
                   if (choice == ConflictResolution.keepMine) {
-                    await outbox.resolveKeepMine(row.uuidId);
+                    await edits.resolveKeepMine(row.uuidId);
                   } else {
-                    await outbox.resolveTakeServer(row.uuidId);
+                    await edits.resolveTakeServer(row.uuidId);
                   }
                 },
               ),
@@ -117,8 +118,9 @@ class _OutboxIssuesList extends ConsumerWidget {
                   row.rejectionReason ?? 'Rejected by the server',
                 ),
                 trailing: TextButton(
-                  onPressed: () =>
-                      ref.read(editOutboxProvider).dismissRejected(row.uuidId),
+                  onPressed: () => ref
+                      .read(editControlsProvider)
+                      .dismissRejected(row.uuidId),
                   child: const Text('Dismiss'),
                 ),
               ),

@@ -15,6 +15,9 @@ import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/ui/downloading_page.dart';
+import 'package:frontend/ui/downloads_controller.dart';
+
+import 'fake_downloads_controls.dart';
 
 TrackUI _track(String uuid) => TrackUI(
       uuidId: uuid,
@@ -82,10 +85,12 @@ void main() {
     );
   }
 
-  Widget wrap(DownloadManager manager) {
+  Widget wrap(DownloadManager manager, {FakeDownloadsControls? controls}) {
     return ProviderScope(
       overrides: [
         downloadManagerProvider.overrideWithValue(manager),
+        if (controls != null)
+          downloadsControlsProvider.overrideWithValue(controls),
       ],
       child: const MaterialApp(home: DownloadingPage()),
     );
@@ -148,5 +153,39 @@ void main() {
     await tester.pumpWidget(wrap(manager));
     expect(find.byIcon(Icons.error_outline), findsOneWidget);
     expect(find.textContaining('Failed:'), findsOneWidget);
+  });
+
+  testWidgets('Clear and Cancel go through DownloadsControls (SC-26)',
+      (tester) async {
+    await _insertTrack(db, 'abc');
+    await _insertTrack(db, 'q1');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1, 2, 3], 200)),
+    );
+    await tester.runAsync(() async {
+      await manager.enqueueTracks([_track('abc')], quality: '320');
+      for (var i = 0;
+          i < 400 && manager.snapshot().any((j) => j.isQueued || j.isActive);
+          i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+    });
+    final offlineManager = DownloadManager(
+      db: db,
+      coverArtStore: coverStore,
+      directoryProvider: () async => tempDir,
+      isOfflineFn: () => true,
+    );
+    addTearDown(offlineManager.dispose);
+    await tester.runAsync(
+      () => offlineManager.enqueueTracks([_track('q1')], quality: '320'),
+    );
+    final controls = FakeDownloadsControls();
+    await tester.pumpWidget(wrap(manager, controls: controls));
+    await tester.tap(find.text('Clear'));
+    await tester.pumpWidget(wrap(offlineManager, controls: controls));
+    await tester.pump();
+    await tester.tap(find.byTooltip('Cancel'));
+    expect(controls.calls, ['clearFinished', 'cancel q1']);
   });
 }

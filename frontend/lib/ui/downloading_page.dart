@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/downloads_controller.dart';
 
 /// Persistent view of the download queue. Active jobs sit at the top with
 /// progress indicators, queued jobs in the middle, and finished jobs at the
@@ -28,7 +29,7 @@ class DownloadingPage extends ConsumerWidget {
         actions: [
           if (finished.isNotEmpty)
             TextButton(
-              onPressed: manager.clearFinished,
+              onPressed: ref.read(downloadsControlsProvider).clearFinished,
               child: const Text('Clear'),
             ),
         ],
@@ -44,7 +45,9 @@ class DownloadingPage extends ConsumerWidget {
                 for (final job in queued)
                   _DownloadTile(
                     job: job,
-                    onCancel: () => manager.cancelQueued(job.uuidId),
+                    onCancel: () => ref
+                        .read(downloadsControlsProvider)
+                        .cancelQueued(job.uuidId),
                   ),
                 if (finished.isNotEmpty) const _SectionHeader('Finished'),
                 for (final job in finished)

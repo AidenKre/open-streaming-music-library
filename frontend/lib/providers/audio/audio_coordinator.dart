@@ -19,6 +19,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/queue_warm_service.dart';
+import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/services/settings_service.dart';
 
 class AudioCoordinator extends Notifier<AudioState> {
@@ -96,16 +97,6 @@ class AudioCoordinator extends Notifier<AudioState> {
       );
     });
 
-    _bridge.bindCallbacks(
-      owner: this,
-      onPlay: resume,
-      onPause: pause,
-      onSkipToNext: skipNext,
-      onSkipToPrevious: skipPrevious,
-      onSeek: seek,
-      onStop: stop,
-    );
-
     _subscriptions.add(_player.playerStateStream.listen(_onPlayerStateChanged));
     _subscriptions.add(_player.positionStream.listen(_onPositionChanged));
     _subscriptions.add(
@@ -129,11 +120,6 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
 
     ref.onDispose(() {
-      // Clear bridge callbacks first so an OS notification tap firing during
-      // teardown can't reach the about-to-be-disposed player. clearCallbacks
-      // is owner-aware — a newer coordinator that already rebound the bridge
-      // is left intact.
-      _bridge.clearCallbacks(this);
       _hydrationController.dispose();
       for (final sub in _subscriptions) {
         sub.cancel();
@@ -448,20 +434,56 @@ class AudioCoordinator extends Notifier<AudioState> {
     });
   }
 
-  Future<void> resume() {
+  /// Play/pause toggle, decided here when the command executes (inside the
+  /// serial lane), never by a view or the OS: two quick taps alternate, and
+  /// the OS media button and in-app buttons can't disagree (SC-27). It acts
+  /// on the published status -- what the play/pause icon and the OS state
+  /// show -- so a tap during a load resumes, as the icon promises. (5B.0c
+  /// splits desired transport into its own published axis.)
+  Future<void> togglePlayPause() {
     return _serialize(() async {
       if (state.queue.sessionId == null) return;
-      _playerIntendsPlaying = true;
-      await _player.play();
+      if (state.playback.status == PlayerStatus.playing) {
+        await _pauseInLane();
+      } else {
+        await _resumeInLane();
+      }
     });
   }
 
-  Future<void> pause() {
+  Future<void> resume() {
     return _serialize(() async {
-      _playerIntendsPlaying = false;
-      await _player.pause();
-      await _persistPlaybackCursor();
+      if (state.queue.sessionId == null) return;
+      await _resumeInLane();
     });
+  }
+
+  Future<void> pause() => _serialize(_pauseInLane);
+
+  // Lane bodies (invariant: lane code never awaits a public lane method).
+  Future<void> _resumeInLane() async {
+    _playerIntendsPlaying = true;
+    await _player.play();
+    // Mirror of _pauseInLane: publish the command's result so a toggle
+    // queued behind it alternates. A buffering engine corrects it to
+    // `loading` with its own state event.
+    if (state.playback.status == PlayerStatus.paused) {
+      _setPlaybackStatus(PlayerStatus.playing);
+      _updateBridgePlaybackState();
+    }
+  }
+
+  Future<void> _pauseInLane() async {
+    _playerIntendsPlaying = false;
+    await _player.pause();
+    // The paused state is the result of this command: publish it now so a
+    // toggle queued behind it decides from it (the engine's own state event
+    // confirms it later).
+    if (state.playback.status == PlayerStatus.playing) {
+      _setPlaybackStatus(PlayerStatus.paused);
+      _updateBridgePlaybackState();
+    }
+    await _persistPlaybackCursor();
   }
 
   Future<void> stop() {
@@ -546,8 +568,14 @@ class AudioCoordinator extends Notifier<AudioState> {
     });
   }
 
-  Future<void> seek(Duration position) {
+  /// Seek, clamped here (not in the view): negative targets go to 0, and a
+  /// known duration bounds the end. An unknown duration (today `zero`, made
+  /// nullable in 5B.0d) is no upper bound.
+  Future<void> seek(Duration requested) {
     return _serialize(() async {
+      final duration = state.playback.duration;
+      var position = requested.isNegative ? Duration.zero : requested;
+      if (duration > Duration.zero && position > duration) position = duration;
       await _player.seek(position);
       state = state.copyWith(
         playback: state.playback.copyWith(position: position),
@@ -567,6 +595,10 @@ class AudioCoordinator extends Notifier<AudioState> {
 
   Future<void> _restoreStartupState() async {
     await _restorePersistedVolume();
+    // Restore (and its queue warm and remote source loads) waits for the
+    // session with its offline state known (SC-27 session-ready signal).
+    await ref.read(sessionReadinessProvider).ready;
+    if (!ref.mounted) return;
     await _restoreSession();
   }
 

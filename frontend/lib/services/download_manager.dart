@@ -1,3 +1,4 @@
+import 'dart:developer' as developer;
 import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
@@ -301,6 +302,37 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     final requested = int.tryParse(quality);
     if (requested == null) return false;
     return bitrate == requested;
+  }
+
+  /// Queues a forced replacement download for each stale track at the
+  /// quality its copy was downloaded at (the two-phase `replacements` path,
+  /// so a failure keeps the stale-but-playable copy). A stored quality that
+  /// is no longer a valid preset falls back to [fallbackQuality]. Each
+  /// quality group is queued independently, so one failing group doesn't
+  /// stop the rest. Returns how many tracks could not be queued.
+  Future<int> redownloadStale(
+    List<TrackUI> tracks, {
+    required String fallbackQuality,
+  }) async {
+    final byQuality = <String, List<TrackUI>>{};
+    for (final t in tracks) {
+      final stored = t.downloadedQuality;
+      final quality = isValidQuality(stored) ? stored! : fallbackQuality;
+      (byQuality[quality] ??= []).add(t);
+    }
+    var failed = 0;
+    for (final entry in byQuality.entries) {
+      try {
+        await enqueueTracksAtQuality(entry.value, quality: entry.key, force: true);
+      } catch (e) {
+        failed += entry.value.length;
+        developer.log(
+          're-download enqueue failed (${entry.key}): $e',
+          name: 'DownloadManager',
+        );
+      }
+    }
+    return failed;
   }
 
   /// Drops the failed/completed history. Active and queued jobs are kept.

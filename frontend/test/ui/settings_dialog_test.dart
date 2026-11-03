@@ -9,9 +9,12 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/settings_service.dart';
-import 'package:frontend/ui/disconnect_controller.dart';
+import 'package:frontend/ui/session_controller.dart';
+import 'package:frontend/ui/settings_controller.dart';
 import 'package:frontend/ui/settings_dialog.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
+
+import 'fake_session_controls.dart';
 
 /// Override that pins [offlineModeProvider] to a fixed value without running
 /// the real health-poll timer.
@@ -32,8 +35,8 @@ Widget _wrap(
       sharedPreferencesProvider.overrideWith((_) async => prefs),
       offlineModeProvider.overrideWith(() => _StubOffline(offline)),
       if (onDisconnect != null)
-        disconnectControllerProvider.overrideWithValue(
-          DisconnectController(onDisconnect),
+        sessionControlsProvider.overrideWithValue(
+          FakeSessionControls(onDisconnect: onDisconnect),
         ),
     ],
     child: MaterialApp(
@@ -56,8 +59,8 @@ Widget _wrapNestedSettingsLauncher(
       theme: ThemeData(splashFactory: NoSplash.splashFactory),
       home: ProviderScope(
         overrides: [
-          disconnectControllerProvider.overrideWithValue(
-            DisconnectController(onDisconnect),
+          sessionControlsProvider.overrideWithValue(
+            FakeSessionControls(onDisconnect: onDisconnect),
           ),
         ],
         child: Navigator(
@@ -221,7 +224,7 @@ void main() {
     expect(tester.widget<SwitchListTile>(switchFinder).value, isFalse);
   });
 
-  testWidgets('Disconnect button is hidden when no callback is provided', (
+  testWidgets('Disconnect button is hidden outside a live session', (
     tester,
   ) async {
     final prefs = await SharedPreferences.getInstance();
@@ -361,4 +364,69 @@ void main() {
       },
     );
   });
+
+  group('inputs go to SettingsControls (SC-26)', () {
+    late _FakeSettings fake;
+    Future<void> pump(WidgetTester tester) async {
+      final prefs = await SharedPreferences.getInstance();
+      fake = _FakeSettings();
+      await tester.pumpWidget(ProviderScope(
+        overrides: [
+          sharedPreferencesProvider.overrideWith((_) async => prefs),
+          offlineModeProvider.overrideWith(() => _StubOffline(false)),
+          settingsControlsProvider.overrideWithValue(fake),
+        ],
+        child: MaterialApp(
+          theme: ThemeData(splashFactory: NoSplash.splashFactory),
+          home: const Scaffold(body: SettingsDialog()),
+        ),
+      ));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('stream quality: default vs this session', (tester) async {
+      await pump(tester);
+      await tester.tap(find.text('Original').first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('320 kbps').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Set as default'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Original').first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('192 kbps').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('This session only'));
+      await tester.pumpAndSettle();
+      expect(fake.calls, ['default 320', 'session 192']);
+    });
+
+    testWidgets('download quality and the stale switch', (tester) async {
+      await pump(tester);
+      final downloadDropdown = find.byType(DropdownButton<String>);
+      await tester.tap(downloadDropdown.last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('128 kbps').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(Switch));
+      await tester.pumpAndSettle();
+      expect(fake.calls, ['download 128', 'notify false']);
+    });
+  });
+}
+
+class _FakeSettings implements SettingsControls {
+  final calls = <String>[];
+  @override
+  Future<void> setStreamQualityDefault(String quality) async =>
+      calls.add('default $quality');
+  @override
+  void setStreamQualityForSession(String quality) =>
+      calls.add('session $quality');
+  @override
+  Future<void> setDownloadQuality(String quality) async =>
+      calls.add('download $quality');
+  @override
+  Future<void> setNotifyStaleDownloads(bool notify) async =>
+      calls.add('notify $notify');
 }

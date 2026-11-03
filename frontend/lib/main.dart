@@ -14,9 +14,11 @@ import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
+import 'package:frontend/services/session_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
+import 'package:frontend/ui/playback_wiring.dart';
 import 'package:frontend/ui/startup_gate.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
@@ -28,7 +30,7 @@ import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final prefs = await SharedPreferences.getInstance();
-  final savedUrl = prefs.getString('serverUrl');
+  final savedUrl = prefs.getString(SessionService.serverUrlKey);
   if (savedUrl != null) {
     ApiClient.init(savedUrl);
   }
@@ -104,6 +106,9 @@ class _FrontendState extends ConsumerState<Frontend>
   // `ref.read(...).enterOffline` twice yields equal tear-offs in practice,
   // but capturing once removes any doubt.
   late final void Function() _offlineListener;
+  // Keeps the OS media-session wiring alive for this provider scope (SC-27);
+  // a reset builds a new keyed scope, and so a fresh subscription.
+  late final ProviderSubscription<PlaybackWiring> _playbackWiring;
 
   @override
   void initState() {
@@ -113,6 +118,7 @@ class _FrontendState extends ConsumerState<Frontend>
     _offlineListener = ref.read(offlineModeProvider.notifier).enterOffline;
     ApiClient.addNetworkFailureListener(_offlineListener);
     WidgetsBinding.instance.addObserver(this);
+    _playbackWiring = ref.listenManual(playbackWiringProvider, (_, _) {});
     // Cold-start recovery. On this edge that means reconciling stale
     // `tracks.file_path` rows whose underlying files were removed outside the
     // app; UI consumers refresh through `downloadStatusVersionProvider` when
@@ -124,6 +130,7 @@ class _FrontendState extends ConsumerState<Frontend>
 
   @override
   void dispose() {
+    _playbackWiring.close();
     WidgetsBinding.instance.removeObserver(this);
     ApiClient.removeNetworkFailureListener(_offlineListener);
     super.dispose();

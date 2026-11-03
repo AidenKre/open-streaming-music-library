@@ -1,16 +1,13 @@
-import 'dart:developer' as developer;
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/models/app_info.dart' show isLosslessCodec;
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart' show formatBytes;
 import 'package:frontend/services/download_providers.dart';
-import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/services/stale_downloads_provider.dart';
+import 'package:frontend/ui/downloads_controller.dart';
 
 /// Always-evaluated surface for downloads whose track changed on the server
 /// (audio, tags or artwork) since the download completed -- structural mirror
@@ -165,8 +162,8 @@ class _StaleDownloadsList extends ConsumerWidget {
                       icon: const Icon(Icons.close),
                       label: const Text('Dismiss all'),
                       onPressed: () => ref
-                          .read(databaseProvider)
-                          .dismissStaleDownloads(stale.map((t) => t.uuidId)),
+                          .read(downloadsControlsProvider)
+                          .dismissAllStale(stale.map((t) => t.uuidId)),
                     ),
                   ],
                 ),
@@ -189,8 +186,8 @@ class _StaleDownloadsList extends ConsumerWidget {
                       redownloading: downloads.isPending(track.uuidId),
                       onRedownload: () => _redownload(context, ref, [track]),
                       onDismiss: () => ref
-                          .read(databaseProvider)
-                          .dismissStaleDownload(track.uuidId),
+                          .read(downloadsControlsProvider)
+                          .dismissStale(track.uuidId),
                     );
                   },
                 ),
@@ -201,47 +198,22 @@ class _StaleDownloadsList extends ConsumerWidget {
     );
   }
 
-  /// Queues a forced replacement download for each of [tracks] at the
-  /// quality its stale copy was downloaded at -- the existing two-phase
-  /// `replacements` path, so a failure keeps the stale-but-playable copy.
-  /// A stored quality that's no longer a valid preset falls back to the
-  /// current download-quality setting instead of throwing. Each quality group
-  /// is queued independently, so one failing group doesn't stop the rest.
+  /// Re-download through the controller; the quality rule is the model's.
   Future<void> _redownload(
     BuildContext context,
     WidgetRef ref,
     List<TrackUI> tracks,
   ) async {
     final messenger = ScaffoldMessenger.maybeOf(context);
-    final fallback =
-        ref.read(settingsProvider).value?.downloadQuality ?? originalQuality;
-    final byQuality = <String, List<TrackUI>>{};
-    for (final t in tracks) {
-      final stored = t.downloadedQuality;
-      final quality = isValidQuality(stored) ? stored! : fallback;
-      (byQuality[quality] ??= []).add(t);
-    }
-    final manager = ref.read(downloadManagerProvider);
-    var failed = 0;
-    for (final entry in byQuality.entries) {
-      try {
-        await manager.enqueueTracksAtQuality(
-          entry.value,
-          quality: entry.key,
-          force: true,
-        );
-      } catch (e) {
-        failed += entry.value.length;
-        developer.log('re-download enqueue failed (${entry.key}): $e',
-            name: 'StaleDownloads');
-      }
-    }
-    final message = failed == 0
+    final result = await ref
+        .read(downloadsControlsProvider)
+        .redownloadStale(tracks);
+    final message = result.failed == 0
         ? 'Re-download queued'
-        : failed == tracks.length
+        : result.failed == result.total
             ? 'Couldn’t queue re-download. Try again.'
-            : 'Couldn’t queue re-download for $failed of ${tracks.length} '
-                'tracks. Try again.';
+            : 'Couldn’t queue re-download for ${result.failed} of '
+                '${result.total} tracks. Try again.';
     messenger?.showSnackBar(SnackBar(content: Text(message)));
   }
 }
