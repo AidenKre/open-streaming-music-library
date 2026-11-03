@@ -1,7 +1,9 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 
 /// The one search primitive shared by every search surface (the global
@@ -16,7 +18,71 @@ import 'package:frontend/repositories/browse_repository.dart';
 /// generation (a newer query, [clear], [rerun]) or one landing after
 /// [dispose] is dropped, so results can never go backwards or touch a dead
 /// page.
-class LibrarySearchController extends ChangeNotifier {
+/// The search input of a page (SC-19/SC-26): what every search surface
+/// depends on. Page-scoped: obtained from
+/// [librarySearchControllerFactoryProvider] and disposed by its page.
+abstract interface class LibrarySearchControls implements Listenable {
+  Set<SearchType> get types;
+  int get limitPerType;
+
+  /// The committed (debounced, trimmed) query.
+  String get query;
+
+  /// Whether the owning page should be showing search results.
+  bool get isActive;
+
+  /// A fetch for the current query is in flight.
+  bool get isSearching;
+  LibrarySearchResults get results;
+
+  /// The last fetch threw.
+  bool get failed;
+  bool get hasResults;
+
+  /// Some requested type came back full.
+  bool get isCapped;
+
+  /// Raw text-field input (debounced).
+  void onQueryChanged(String raw);
+
+  /// The keyboard's search action: commit now.
+  void submit(String raw);
+
+  /// Leave search mode right away.
+  void clear();
+
+  /// Re-fetch the current query now (filter/offline change).
+  Future<void> rerun();
+
+  /// Keep a results snapshot honest after a download/delete.
+  Future<void> onDownloadStatusChanged();
+
+  void dispose();
+}
+
+typedef LibrarySearchFactory =
+    LibrarySearchControls Function({
+      required Set<SearchType> types,
+      required int limitPerType,
+      required bool Function() downloadedOnly,
+    });
+
+/// Creates a page's [LibrarySearchControls] over the model's search
+/// (SC-26: page-scoped controllers come from a provider, never from a view
+/// passing in a repository). Override in tests to substitute a fake.
+final librarySearchControllerFactoryProvider = Provider<LibrarySearchFactory>(
+  (ref) =>
+      ({required types, required limitPerType, required downloadedOnly}) =>
+          LibrarySearchController(
+            repository: ref.read(browseRepositoryProvider),
+            types: types,
+            limitPerType: limitPerType,
+            downloadedOnly: downloadedOnly,
+          ),
+);
+
+class LibrarySearchController extends ChangeNotifier
+    implements LibrarySearchControls {
   LibrarySearchController({
     required BrowseRepository repository,
     required this.types,
@@ -31,10 +97,12 @@ class LibrarySearchController extends ChangeNotifier {
   /// Read at fetch time, so a filter/offline change is picked up by [rerun].
   final bool Function() _downloadedOnly;
 
+  @override
   final Set<SearchType> types;
 
   /// Rows fetched per type. Search mode is capped by design (no infinite
   /// scroll); [isCapped] tells the UI when to suggest refining.
+  @override
   final int limitPerType;
   final Duration debounce;
 
@@ -50,21 +118,27 @@ class LibrarySearchController extends ChangeNotifier {
   bool _disposed = false;
 
   /// The committed (debounced, trimmed) query.
+  @override
   String get query => _query;
 
   /// Whether the owning page should be showing search results.
+  @override
   bool get isActive => _query.isNotEmpty;
 
   /// A fetch for the current query is in flight. The previous results stay
   /// visible meanwhile, so typing doesn't flash an empty list.
+  @override
   bool get isSearching => _isSearching;
 
+  @override
   LibrarySearchResults get results => _results;
 
   /// The last fetch threw, so the (empty) [results] mean "couldn't search",
   /// not "nothing matched".
+  @override
   bool get failed => _failed;
 
+  @override
   bool get hasResults =>
       _results.artists.isNotEmpty ||
       _results.albums.isNotEmpty ||
@@ -72,6 +146,7 @@ class LibrarySearchController extends ChangeNotifier {
 
   /// Some requested type came back full, so there may be more matches than
   /// shown.
+  @override
   bool get isCapped =>
       (types.contains(SearchType.artists) &&
           _results.artists.length >= limitPerType) ||
@@ -82,6 +157,7 @@ class LibrarySearchController extends ChangeNotifier {
 
   /// Raw text-field input. Commits (and searches) once typing pauses for
   /// [debounce].
+  @override
   void onQueryChanged(String raw) {
     if (_disposed) return;
     _debounceTimer?.cancel();
@@ -93,6 +169,7 @@ class LibrarySearchController extends ChangeNotifier {
 
   /// The keyboard's search action: the user is done typing, so commit [raw]
   /// now instead of waiting out the debounce.
+  @override
   void submit(String raw) {
     _debounceTimer?.cancel();
     _debounceTimer = null;
@@ -101,10 +178,12 @@ class LibrarySearchController extends ChangeNotifier {
 
   /// Leave search mode right away: there is no keystroke burst to coalesce,
   /// so don't make the user wait out the debounce.
+  @override
   void clear() => submit('');
 
   /// Re-fetch the current query now, e.g. after the Downloaded filter or
   /// offline mode changed. No-op while inactive.
+  @override
   Future<void> rerun() async {
     if (_disposed || !isActive) return;
     await _search();
@@ -119,6 +198,7 @@ class LibrarySearchController extends ChangeNotifier {
   /// patching the rows on screen would race it. Restarting it would starve
   /// under a burst of events (each restart drops the last), so let it land
   /// and then handle this event once.
+  @override
   Future<void> onDownloadStatusChanged() async {
     if (_disposed || !isActive) return;
     if (_isSearching) {

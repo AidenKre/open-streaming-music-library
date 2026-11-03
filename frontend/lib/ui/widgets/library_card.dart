@@ -1,131 +1,47 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
-import 'package:frontend/ui/widgets/download_quality_sheet.dart';
+import 'package:frontend/models/playback_availability.dart';
+import 'package:frontend/ui/widgets/library_action_menu.dart';
 
 /// Generic library item card used by [AlbumCard] and [ArtistCard].
 ///
 /// Renders a square cover with an optional download badge overlay, a title and
-/// optional subtitle, and a long-press popup menu with Play Next / Add to
-/// Queue / Download / Delete download options. Per-context labels and data
-/// lookups are supplied by the wrapper widgets.
-class LibraryCard extends ConsumerWidget {
+/// optional subtitle. Long-press opens [menu] (built by the one SC-06 menu
+/// builder, `buildLibraryActionMenu`), so the card holds no action logic of
+/// its own.
+class LibraryCard extends StatelessWidget {
   final Widget cover;
   final String title;
   final String? subtitle;
   final VoidCallback onTap;
-  final VoidCallback? onPlayNext;
-  final VoidCallback? onAddToQueue;
-  final VoidCallback? onDownload;
-  final void Function(String quality)? onDownloadAtQuality;
-  final VoidCallback? onDeleteDownload;
+
+  /// The card's action menu; empty means no long-press menu.
+  final List<LibraryMenuEntry> menu;
   final bool isDownloading;
-  final AsyncValue<({int downloaded, int total})> downloadCounts;
-  // Labels differ between album / artist contexts:
-  final String playNextLabel;
-  final String addToQueueLabel;
-  final String downloadLabel;
-  final String deleteDownloadLabel;
+  /// Only for the "x/y" progress text while downloading.
+  final AsyncValue<({int downloaded, int total})?> downloadCounts;
+
+  /// The card's scope availability (SC-06): decides the downloaded badge.
+  final PlaybackAvailability availability;
 
   const LibraryCard({
+    required this.availability,
     super.key,
     required this.cover,
     required this.title,
     this.subtitle,
     required this.onTap,
-    this.onPlayNext,
-    this.onAddToQueue,
-    this.onDownload,
-    this.onDownloadAtQuality,
-    this.onDeleteDownload,
+    this.menu = const [],
     required this.isDownloading,
     required this.downloadCounts,
-    this.playNextLabel = 'Play Next',
-    this.addToQueueLabel = 'Add to Queue',
-    this.downloadLabel = 'Download',
-    this.deleteDownloadLabel = 'Delete downloads',
   });
 
-  void _showMenu(
-    BuildContext context, {
-    required bool hasAnyDownloaded,
-    required bool isFullyDownloaded,
-    required bool queueEnabled,
-  }) {
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (onPlayNext != null)
-              ListTile(
-                leading: const Icon(Icons.playlist_play),
-                title: Text(playNextLabel),
-                enabled: queueEnabled,
-                onTap: queueEnabled
-                    ? () {
-                        Navigator.pop(ctx);
-                        onPlayNext!();
-                      }
-                    : null,
-              ),
-            if (onAddToQueue != null)
-              ListTile(
-                leading: const Icon(Icons.queue_music),
-                title: Text(addToQueueLabel),
-                enabled: queueEnabled,
-                onTap: queueEnabled
-                    ? () {
-                        Navigator.pop(ctx);
-                        onAddToQueue!();
-                      }
-                    : null,
-              ),
-            // Download (for the missing tracks) and Delete are independent:
-            // a partially-downloaded item shows both.
-            if (!isFullyDownloaded && onDownload != null)
-              SplitDownloadTile(
-                onDownload: () {
-                  Navigator.pop(ctx);
-                  onDownload!();
-                },
-                onDownloadAtQuality: onDownloadAtQuality != null
-                    ? (quality) {
-                        Navigator.pop(ctx);
-                        onDownloadAtQuality!(quality);
-                      }
-                    : null,
-              ),
-            if (hasAnyDownloaded && onDeleteDownload != null)
-              ListTile(
-                leading: const Icon(Icons.delete_outline),
-                title: Text(deleteDownloadLabel),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onDeleteDownload!();
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
     final counts = downloadCounts.value;
-    final isOffline = ref.watch(offlineModeProvider);
-
-    final hasAnyDownloaded = (counts?.downloaded ?? 0) > 0;
-    final isFullyDownloaded = counts != null &&
-        counts.total > 0 &&
-        counts.downloaded == counts.total;
-    // Offline, a queue action must not enqueue streaming-only tracks, so it's
-    // allowed only when the whole item is downloaded.
-    final queueEnabled = !isOffline || isFullyDownloaded;
+    final isFullyDownloaded = availability.isFullyDownloaded;
 
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -134,17 +50,9 @@ class LibraryCard extends ConsumerWidget {
       ),
       child: InkWell(
         onTap: onTap,
-        onLongPress: (onPlayNext != null ||
-                onAddToQueue != null ||
-                onDownload != null ||
-                onDeleteDownload != null)
-            ? () => _showMenu(
-                  context,
-                  hasAnyDownloaded: hasAnyDownloaded,
-                  isFullyDownloaded: isFullyDownloaded,
-                  queueEnabled: queueEnabled,
-                )
-            : null,
+        onLongPress: menu.isEmpty
+            ? null
+            : () => showLibraryActionMenu(context, menu),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [

@@ -327,8 +327,15 @@ class SearchParameter {
 class OrderParameter {
   final String column;
   final bool isAscending;
+  final int? nullsAs;
+  final bool caseInsensitive;
 
-  OrderParameter({required this.column, this.isAscending = true}) {
+  OrderParameter({
+    required this.column,
+    this.isAscending = true,
+    this.nullsAs,
+    this.caseInsensitive = false,
+  }) {
     if (!allowedMetadataColumns.contains(column) &&
         !allowedTrackColumns.contains(column)) {
       throw ArgumentError(
@@ -405,6 +412,23 @@ class ArtistRowFilterParameter {
 
 String aliasMap(String column) {
   return allowedMetadataColumns.contains(column) ? 'tm' : 't';
+}
+
+/// The one ORDER BY body for track queries (browse windows, uuid lists and
+/// the queue insert), so every list orders a given [OrderParameter] list the
+/// same way. [OrderParameter.nullsAs] sorts NULL as that value (COALESCE);
+/// [OrderParameter.caseInsensitive] compares with `COLLATE NOCASE`.
+String trackOrderClause(List<OrderParameter> orderBy) {
+  return orderBy
+      .map((o) {
+        final column = '${aliasMap(o.column)}."${o.column}"';
+        final key = o.nullsAs == null
+            ? column
+            : 'COALESCE($column, ${o.nullsAs})';
+        final collate = o.caseInsensitive ? ' COLLATE NOCASE' : '';
+        return '$key$collate ${o.isAscending ? 'ASC' : 'DESC'}';
+      })
+      .join(', ');
 }
 
 Variable _variableFrom(Object value) {
@@ -1225,6 +1249,14 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
 
     // Cursor filter
+    if (cursorFilters.isNotEmpty &&
+        orderBy.any((o) => o.nullsAs != null || o.caseInsensitive)) {
+      // The keyset comparison compares raw columns, which would disagree
+      // with a COALESCE / NOCASE sort key.
+      throw ArgumentError(
+        'cursor paging does not support nullsAs/caseInsensitive order keys',
+      );
+    }
     if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
       final (cursorClause, cursorVars) = filterForCursor(
         cursorFilters,
@@ -1246,12 +1278,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
 
     if (orderBy.isNotEmpty) {
-      final orderParts = orderBy.map((o) {
-        final alias = aliasMap(o.column);
-        final dir = o.isAscending ? 'ASC' : 'DESC';
-        return '$alias."${o.column}" $dir';
-      });
-      sql += ' ORDER BY ${orderParts.join(', ')}';
+      sql += ' ORDER BY ${trackOrderClause(orderBy)}';
     }
 
     if (limit != null) {
@@ -1341,12 +1368,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
 
     if (orderBy.isNotEmpty) {
-      final orderParts = orderBy.map((o) {
-        final alias = aliasMap(o.column);
-        final dir = o.isAscending ? 'ASC' : 'DESC';
-        return '$alias."${o.column}" $dir';
-      });
-      sql += ' ORDER BY ${orderParts.join(', ')}';
+      sql += ' ORDER BY ${trackOrderClause(orderBy)}';
     }
 
     return (sql, vars);

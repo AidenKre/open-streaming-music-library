@@ -1,14 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
-import 'package:frontend/services/download_providers.dart';
-import 'package:frontend/ui/albums_page.dart';
+import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
+import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/mixins/root_browse_mixin.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
@@ -37,20 +35,10 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   @override
   int get pageSize => 30;
 
-  /// Root: the chip. A non-root instance has no chip, so offline it filters
-  /// to what's playable, as before Phase 3.
-  bool get _downloadedOnly => hasBrowseControls
-      ? filters.downloaded
-      : ref.read(offlineModeProvider);
-
-  List<ArtistOrderParameter> get _orderParams => [
-    ArtistOrderParameter(column: 'name'),
-  ];
-
   @override
   void initState() {
     super.initState();
-    Future.microtask(() => ref.read(trackSyncProvider.notifier).sync());
+    Future.microtask(() => ref.read(browseControlsProvider).refreshLibrary());
     if (widget.isRoot) initRootBrowse(type: SearchType.artists);
     initPagination();
   }
@@ -67,22 +55,14 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
   Stream<List<ArtistUI>> watchPage({required int limit}) {
     final repo = ref.read(browseRepositoryProvider);
     return repo.watchArtists(
-      orderBy: _orderParams,
       limit: limit,
-      downloadedOnly: _downloadedOnly,
+      // Root: the chip. A non-root instance has no chip; it passes the
+      // observed offline flag and the model narrows the grid.
+      downloadedOnly: filters.downloaded,
+      offline: !hasBrowseControls && ref.read(offlineModeProvider),
     );
   }
 
-  void _onArtistTap(ArtistUI artist) {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Scaffold(
-          appBar: AppBar(title: Text(artist.name)),
-          body: AlbumsPage(artistId: artist.id),
-        ),
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -168,32 +148,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
         }
         return ArtistCard(
           artist: artist,
-          onTap: () => _onArtistTap(artist),
-          onPlayNext: () async {
-            final tracks = await ref
-                .read(browseRepositoryProvider)
-                .getTracksForArtist(artist.id);
-            if (tracks.isNotEmpty) {
-              ref.read(audioProvider.notifier).playNext(tracks);
-            }
-          },
-          onAddToQueue: () async {
-            final tracks = await ref
-                .read(browseRepositoryProvider)
-                .getTracksForArtist(artist.id);
-            if (tracks.isNotEmpty) {
-              ref.read(audioProvider.notifier).addToQueue(tracks);
-            }
-          },
-          onDownload: isOffline
-              ? null
-              : () => downloadScope(ref, ArtistScope(artistId: artist.id)),
-          onDownloadAtQuality: isOffline
-              ? null
-              : (q) => downloadScope(
-                  ref, ArtistScope(artistId: artist.id), quality: q),
-          onDeleteDownload: () =>
-              deleteScope(ref, ArtistScope(artistId: artist.id)),
+          onTap: () => openArtistDetail(context, artist),
         );
       },
     );

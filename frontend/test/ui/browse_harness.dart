@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:drift/drift.dart' show InsertMode, Value;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
@@ -36,6 +37,9 @@ class SeedTrack {
     this.album,
     this.downloaded = false,
     this.trackNumber = 1,
+    this.discNumber = 1,
+    this.albumYear,
+    this.albumIsSingles = false,
   });
 
   final String uuid;
@@ -45,16 +49,21 @@ class SeedTrack {
   final int? albumId;
   final String? album;
   final bool downloaded;
-  final int trackNumber;
+  final int? trackNumber;
+  final int? discNumber;
+
+  /// Album-level fields (taken from the first track seeding the album).
+  final int? albumYear;
+  final bool albumIsSingles;
 }
 
 /// Safe to call again on a seeded DB: existing artists/albums are kept.
 Future<void> seedLibrary(AppDatabase db, List<SeedTrack> tracks) async {
   final artists = <int, String>{};
-  final albums = <int, (String, int)>{};
+  final albums = <int, SeedTrack>{};
   for (final t in tracks) {
     artists[t.artistId] = t.artist;
-    if (t.albumId != null) albums[t.albumId!] = (t.album ?? '', t.artistId);
+    if (t.albumId != null) albums.putIfAbsent(t.albumId!, () => t);
   }
   await db.batch((batch) {
     for (final e in artists.entries) {
@@ -69,9 +78,10 @@ Future<void> seedLibrary(AppDatabase db, List<SeedTrack> tracks) async {
         db.albums,
         AlbumsCompanion(
           id: Value(e.key),
-          name: Value(e.value.$1),
-          artistId: Value(e.value.$2),
-          isSingleGrouping: const Value(false),
+          name: Value(e.value.album ?? ''),
+          artistId: Value(e.value.artistId),
+          year: Value(e.value.albumYear),
+          isSingleGrouping: Value(e.value.albumIsSingles),
         ),
         mode: InsertMode.insertOrIgnore,
       );
@@ -91,7 +101,7 @@ Future<void> seedLibrary(AppDatabase db, List<SeedTrack> tracks) async {
         'artist_id': t.artistId,
         'album_id': t.albumId,
         'track_number': t.trackNumber,
-        'disc_number': 1,
+        'disc_number': t.discNumber,
         'codec': 'flac',
         'duration': 60.0,
         'bitrate_kbps': 900.0,
@@ -161,6 +171,9 @@ class RecordingAudio extends AudioCoordinator {
       'method': 'playFromQueue',
       'uuid': track.uuidId,
       'sourceType': sourceType,
+      'artistId': artistId,
+      'albumId': albumId,
+      'orderParams': orderParams,
       'downloadedOnly': downloadedOnly,
     });
   }
@@ -176,6 +189,22 @@ class RecordingAudio extends AudioCoordinator {
       'uuids': uuids,
       'uuid': startTrack.uuidId,
       'sourceType': sourceType,
+    });
+  }
+
+  @override
+  Future<void> playNext(List<TrackUI> tracks) async {
+    calls.add({
+      'method': 'playNext',
+      'uuids': tracks.map((t) => t.uuidId).toList(),
+    });
+  }
+
+  @override
+  Future<void> addToQueue(List<TrackUI> tracks) async {
+    calls.add({
+      'method': 'addToQueue',
+      'uuids': tracks.map((t) => t.uuidId).toList(),
     });
   }
 }
@@ -216,6 +245,7 @@ class BrowseHarness {
     bool offline = false,
     AppInfo appInfo = const AppInfo(),
     BrowseRepository? repository,
+    List<Override> overrides = const [],
   }) {
     this.offline = TestOffline(offline);
     return ProviderScope(
@@ -230,6 +260,7 @@ class BrowseHarness {
         audioProvider.overrideWith(() => audio),
         if (repository != null)
           browseRepositoryProvider.overrideWithValue(repository),
+        ...overrides,
       ],
       child: MaterialApp(home: child),
     );

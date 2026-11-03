@@ -1,15 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/models/ui/album_ui.dart';
-import 'package:frontend/models/ui/artist_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
-import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
-import 'package:frontend/ui/albums_page.dart';
-import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/ui/library_actions.dart';
+import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/utils/library_search_controller.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
@@ -29,7 +25,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   // Shared with the in-page search on the browse tabs: debounce, generation
   // stale-guard (a request that started before an offline flip or a newer
   // query never overwrites newer results), and dispose-cancel all live there.
-  late final LibrarySearchController _search;
+  late final LibrarySearchControls _search;
 
   // The page owns the query text, so what the field shows and what was
   // searched can't drift apart.
@@ -38,8 +34,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   @override
   void initState() {
     super.initState();
-    _search = LibrarySearchController(
-      repository: ref.read(browseRepositoryProvider),
+    _search = ref.read(librarySearchControllerFactoryProvider)(
       types: SearchType.values.toSet(),
       limitPerType: 5,
       // Offline: the repository filters to locally-downloaded content inside
@@ -58,34 +53,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
     super.dispose();
   }
 
-  void _onArtistTap(ArtistUI artist) {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Scaffold(
-          appBar: AppBar(title: Text(artist.name)),
-          body: AlbumsPage(artistId: artist.id),
-        ),
-      ),
-    );
-  }
 
-  void _onAlbumTap(AlbumUI album) {
-    final String appBarTitle;
-    if (album.isSingleGrouping) {
-      appBarTitle = '${album.artist ?? "Unknown Artist"} - Singles';
-    } else {
-      appBarTitle = album.name ?? 'Unknown Album';
-    }
-
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Scaffold(
-          appBar: AppBar(title: Text(appBarTitle)),
-          body: TracksPage(artistId: album.artistId, albumId: album.id),
-        ),
-      ),
-    );
-  }
 
   Widget _buildSectionHeader(String title) {
     return Padding(
@@ -166,32 +134,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                           width: 140,
                           child: ArtistCard(
                             artist: artist,
-                            onTap: () => _onArtistTap(artist),
-                            onPlayNext: () async {
-                              final tracks = await ref.read(browseRepositoryProvider)
-                                  .getTracksForArtist(artist.id);
-                              if (tracks.isNotEmpty) {
-                                ref.read(audioProvider.notifier).playNext(tracks);
-                              }
-                            },
-                            onAddToQueue: () async {
-                              final tracks = await ref.read(browseRepositoryProvider)
-                                  .getTracksForArtist(artist.id);
-                              if (tracks.isNotEmpty) {
-                                ref.read(audioProvider.notifier).addToQueue(tracks);
-                              }
-                            },
-                            onDownload: isOffline
-                                ? null
-                                : () => downloadScope(
-                                    ref, ArtistScope(artistId: artist.id)),
-                            onDownloadAtQuality: isOffline
-                                ? null
-                                : (q) => downloadScope(
-                                    ref, ArtistScope(artistId: artist.id),
-                                    quality: q),
-                            onDeleteDownload: () => deleteScope(
-                                ref, ArtistScope(artistId: artist.id)),
+                            onTap: () => openArtistDetail(context, artist),
                           ),
                         );
                       },
@@ -212,41 +155,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                           width: 160,
                           child: AlbumCard(
                             album: album,
-                            onTap: () => _onAlbumTap(album),
-                            onPlayNext: () async {
-                              final tracks = await ref.read(browseRepositoryProvider)
-                                  .getTracksForAlbum(album.artistId, album.id);
-                              if (tracks.isNotEmpty) {
-                                ref.read(audioProvider.notifier).playNext(tracks);
-                              }
-                            },
-                            onAddToQueue: () async {
-                              final tracks = await ref.read(browseRepositoryProvider)
-                                  .getTracksForAlbum(album.artistId, album.id);
-                              if (tracks.isNotEmpty) {
-                                ref.read(audioProvider.notifier).addToQueue(tracks);
-                              }
-                            },
-                            onDownload: isOffline
-                                ? null
-                                : () => downloadScope(
-                                    ref,
-                                    AlbumScope(
-                                        artistId: album.artistId, albumId: album.id),
-                                  ),
-                            onDownloadAtQuality: isOffline
-                                ? null
-                                : (q) => downloadScope(
-                                    ref,
-                                    AlbumScope(
-                                        artistId: album.artistId, albumId: album.id),
-                                    quality: q,
-                                  ),
-                            onDeleteDownload: () => deleteScope(
-                              ref,
-                              AlbumScope(
-                                  artistId: album.artistId, albumId: album.id),
-                            ),
+                            onTap: () => openAlbumDetail(context, album),
                           ),
                         );
                       },
@@ -255,7 +164,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                 ],
                 if (tracks.isNotEmpty) ...[
                   _buildSectionHeader('Songs'),
-                  for (final track in tracks)
+                  for (final (index, track) in tracks.indexed)
                     Builder(
                       key: ValueKey(track.uuidId),
                       builder: (_) {
@@ -275,25 +184,12 @@ class _SearchPageState extends ConsumerState<SearchPage> {
                             Completed() || Failed() => null,
                           };
                         }
-                        return TrackTile(
+                        return LibraryTrackTile(
                           track: track,
                           trailing: trailing,
                           onTap: () => ref
-                              .read(audioProvider.notifier)
-                              .playFromTrackList(
-                                tracks.map((t) => t.uuidId).toList(),
-                                track,
-                                sourceType: 'search',
-                              ),
-                          onPlayNext: () =>
-                              ref.read(audioProvider.notifier).playNext([track]),
-                          onAddToQueue: () =>
-                              ref.read(audioProvider.notifier).addToQueue([track]),
-                          onDownload: () => downloadScope(ref, TrackScope(track)),
-                          onDownloadAtQuality: (q) =>
-                              downloadScope(ref, TrackScope(track), quality: q),
-                          onDeleteDownload: () =>
-                              deleteScope(ref, TrackScope(track)),
+                              .read(libraryActionsProvider)
+                              .playFromList(tracks, index, source: 'search'),
                         );
                       },
                     ),

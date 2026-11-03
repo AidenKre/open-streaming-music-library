@@ -1,18 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
+import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/convert_flow.dart';
+import 'package:frontend/ui/library_actions.dart';
+import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/mixins/root_browse_mixin.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
@@ -54,13 +55,10 @@ class TracksPageState extends ConsumerState<TracksPage>
   /// offline, it dims and disables them.
   bool get _downloadedOnly => filters.downloaded;
 
-  List<OrderParameter> get _orderParams => [
-    OrderParameter(column: 'artist'),
-    OrderParameter(column: 'album'),
-    OrderParameter(column: 'disc_number'),
-    OrderParameter(column: 'track_number'),
-    OrderParameter(column: 'uuid_id'),
-  ];
+  /// The album this list shows, or null for the whole library.
+  AlbumScope? get _album => widget.albumId == null
+      ? null
+      : AlbumScope(artistId: widget.artistId!, albumId: widget.albumId!);
 
   @override
   void initState() {
@@ -71,9 +69,7 @@ class TracksPageState extends ConsumerState<TracksPage>
   }
 
   void sync() {
-    Future.microtask(
-      () => ref.read(trackSyncProvider.notifier).sync(),
-    );
+    Future.microtask(() => ref.read(browseControlsProvider).refreshLibrary());
   }
 
   @override
@@ -88,9 +84,7 @@ class TracksPageState extends ConsumerState<TracksPage>
   Stream<List<TrackUI>> watchPage({required int limit}) {
     final repo = ref.read(browseRepositoryProvider);
     return repo.watchTracks(
-      orderBy: _orderParams,
-      artistId: widget.artistId,
-      albumId: widget.albumId,
+      album: _album,
       limit: limit,
       downloadedOnly: _downloadedOnly,
     );
@@ -153,17 +147,10 @@ class TracksPageState extends ConsumerState<TracksPage>
           track,
           rows,
           onTap: () => ref
-              .read(audioProvider.notifier)
-              .playFromQueue(
-                track: track,
-                sourceType: widget.albumId != null
-                    ? 'album'
-                    : widget.artistId != null
-                    ? 'artist'
-                    : 'library',
-                artistId: widget.artistId,
-                albumId: widget.albumId,
-                orderParams: _orderParams,
+              .read(libraryActionsProvider)
+              .playQuery(
+                track,
+                album: _album,
                 // Queue exactly what the filtered list shows.
                 downloadedOnly: _downloadedOnly,
               ),
@@ -187,12 +174,8 @@ class TracksPageState extends ConsumerState<TracksPage>
             rows,
             // Play the visible result list, like the global search.
             onTap: () => ref
-                .read(audioProvider.notifier)
-                .playFromTrackList(
-                  tracks.map((t) => t.uuidId).toList(),
-                  track,
-                  sourceType: 'search',
-                ),
+                .read(libraryActionsProvider)
+                .playFromList(tracks, index, source: 'search'),
           );
         },
       ),
@@ -222,38 +205,31 @@ class TracksPageState extends ConsumerState<TracksPage>
         Completed() || Failed() => null,
       };
     }
-    final isOffline = rows.isOffline;
-    // Offline, an unfiltered list (a detail route, or the root tab with the
-    // chip switched off) keeps every row visible but dims and disables any
-    // track that isn't locally downloaded.
-    final isInteractive = !isOffline || track.isDownloaded;
     final conversionJob = rows.conversionJobs
         .where((j) => j.uuidId == track.uuidId && j.isActive)
         .firstOrNull;
-    return TrackTile(
+    // Offline, an unfiltered list (a detail route, or the root tab with the
+    // chip switched off) keeps every row visible; LibraryTrackTile dims and
+    // disables any track that can't play (PlaybackAvailability).
+    return LibraryTrackTile(
       track: track,
       trailing: trailing,
-      isDimmed: isOffline && !track.isDownloaded,
-      isInteractive: isInteractive,
       onTap: onTap,
-      onPlayNext: () => ref.read(audioProvider.notifier).playNext([track]),
-      onAddToQueue: () => ref.read(audioProvider.notifier).addToQueue([track]),
-      onDownload: () => downloadScope(ref, TrackScope(track)),
-      onDownloadAtQuality: (q) =>
-          downloadScope(ref, TrackScope(track), quality: q),
-      onDeleteDownload: () => deleteScope(ref, TrackScope(track)),
       conversionJob: conversionJob,
-      onConvert:
-          canConvertTrack(
-            isOffline: isOffline,
-            appInfo: rows.appInfo,
-            codec: track.codec,
-          )
-          ? () => startConversion(context, ref, track.uuidId)
-          : null,
-      onCancelConvert: conversionJob != null
-          ? () => cancelConversion(context, ref, conversionJob.jobId)
-          : null,
+      extraActions: conversionMenuEntries(
+        conversionJob: conversionJob,
+        onConvert:
+            canConvertTrack(
+              isOffline: rows.isOffline,
+              appInfo: rows.appInfo,
+              codec: track.codec,
+            )
+            ? () => startConversion(context, ref, track.uuidId)
+            : null,
+        onCancelConvert: conversionJob != null
+            ? () => cancelConversion(context, ref, conversionJob.jobId)
+            : null,
+      ),
     );
   }
 

@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
-import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
@@ -36,14 +35,14 @@ const kInPageSearchCap = 100;
 /// on an offline flip if the page asks to.
 mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
     on ConsumerState<W>, CursorPaginationMixin<T> {
-  LibrarySearchController? _search;
+  LibrarySearchControls? _search;
   BrowseFilters _filters = const BrowseFilters();
 
   /// Whether this page shows the controls ([initRootBrowse] ran).
   bool get hasBrowseControls => _search != null;
 
   /// The page's search controller. Only valid after [initRootBrowse].
-  LibrarySearchController get search => _search!;
+  LibrarySearchControls get search => _search!;
 
   /// The chip selection. Always the default without controls.
   BrowseFilters get filters => _filters;
@@ -55,8 +54,7 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
   /// [filters]).
   void initRootBrowse({required SearchType type}) {
     _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
-    _search = LibrarySearchController(
-      repository: ref.read(browseRepositoryProvider),
+    _search = ref.read(librarySearchControllerFactoryProvider)(
       types: {type},
       limitPerType: kInPageSearchCap,
       downloadedOnly: () => _filters.downloaded,

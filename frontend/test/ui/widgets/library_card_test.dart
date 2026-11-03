@@ -3,7 +3,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
+import 'package:frontend/models/library_scope.dart';
+import 'package:frontend/models/playback_availability.dart';
+import 'package:frontend/ui/widgets/library_action_menu.dart';
 import 'package:frontend/ui/widgets/library_card.dart';
+
+import '../fake_library_actions.dart';
 
 /// Forces [offlineModeProvider] to a fixed value without starting the real
 /// health-poll timer.
@@ -30,39 +35,41 @@ Widget _harness({
   );
 }
 
+/// The card under test, with the menu the real builder makes for an album
+/// with [counts] (or an explicit [menu]).
 LibraryCard _build({
   String title = 'Test Title',
   String? subtitle,
   Widget cover = const ColoredBox(color: Color(0xFFEEEEEE)),
   VoidCallback? onTap,
-  VoidCallback? onPlayNext,
-  VoidCallback? onAddToQueue,
-  VoidCallback? onDownload,
-  void Function(String)? onDownloadAtQuality,
-  VoidCallback? onDeleteDownload,
   bool isDownloading = false,
+  bool offline = false,
   ({int downloaded, int total}) counts = (downloaded: 0, total: 10),
-  String playNextLabel = 'Play Next',
-  String addToQueueLabel = 'Add to Queue',
-  String downloadLabel = 'Download',
-  String deleteDownloadLabel = 'Delete downloads',
+  List<LibraryMenuEntry>? menu,
+  FakeLibraryActions? actions,
 }) {
   return LibraryCard(
     cover: cover,
     title: title,
     subtitle: subtitle,
     onTap: onTap ?? () {},
-    onPlayNext: onPlayNext,
-    onAddToQueue: onAddToQueue,
-    onDownload: onDownload,
-    onDownloadAtQuality: onDownloadAtQuality,
-    onDeleteDownload: onDeleteDownload,
+    menu: menu ??
+        buildLibraryActionMenu(
+          const AlbumScope(artistId: 1, albumId: 2),
+          PlaybackAvailability.of(
+            offline: offline,
+            downloaded: counts.downloaded,
+            total: counts.total,
+          ),
+          actions: actions ?? FakeLibraryActions(),
+        ),
     isDownloading: isDownloading,
     downloadCounts: AsyncValue.data(counts),
-    playNextLabel: playNextLabel,
-    addToQueueLabel: addToQueueLabel,
-    downloadLabel: downloadLabel,
-    deleteDownloadLabel: deleteDownloadLabel,
+    availability: PlaybackAvailability.of(
+      offline: offline,
+      downloaded: counts.downloaded,
+      total: counts.total,
+    ),
   );
 }
 
@@ -152,40 +159,32 @@ void main() {
   });
 
   group('LibraryCard long-press menu', () {
-    testWidgets('shows all menu items with configured labels', (tester) async {
+    testWidgets('shows the builder menu for a partially downloaded album',
+        (tester) async {
       await tester.pumpWidget(_harness(
-        child: _build(
-          onPlayNext: () {},
-          onAddToQueue: () {},
-          onDownload: () {},
-          onDeleteDownload: () {},
-          counts: (downloaded: 3, total: 10),
-          playNextLabel: 'Queue First',
-          addToQueueLabel: 'Enqueue',
-          downloadLabel: 'Save',
-          deleteDownloadLabel: 'Remove downloads',
-        ),
+        child: _build(counts: (downloaded: 3, total: 10)),
       ));
       await tester.pumpAndSettle();
 
       await tester.longPress(find.byType(LibraryCard));
       await tester.pumpAndSettle();
 
-      expect(find.text('Queue First'), findsOneWidget);
-      expect(find.text('Enqueue'), findsOneWidget);
+      expect(find.text('Play Next'), findsOneWidget);
+      expect(find.text('Add to Queue'), findsOneWidget);
       expect(find.byType(SplitDownloadTile), findsOneWidget);
-      expect(find.text('Remove downloads'), findsOneWidget);
+      expect(find.text('Delete downloads'), findsOneWidget);
     });
 
-    testWidgets('hides menu items when their callbacks are null',
-        (tester) async {
+    testWidgets('renders exactly the entries it is given', (tester) async {
       await tester.pumpWidget(_harness(
         child: _build(
-          onPlayNext: () {},
-          // onAddToQueue intentionally omitted
-          // onDownload intentionally omitted
-          // onDeleteDownload intentionally omitted
-          counts: (downloaded: 3, total: 10),
+          menu: [
+            LibraryMenuAction(
+              icon: Icons.playlist_play,
+              label: 'Play Next',
+              onSelected: () {},
+            ),
+          ],
         ),
       ));
       await tester.pumpAndSettle();
@@ -199,10 +198,9 @@ void main() {
       expect(find.text('Delete downloads'), findsNothing);
     });
 
-    testWidgets('no long-press handler when no callbacks provided',
-        (tester) async {
+    testWidgets('no long-press menu when the menu is empty', (tester) async {
       await tester.pumpWidget(_harness(
-        child: _build(),
+        child: _build(menu: const []),
       ));
       await tester.pumpAndSettle();
 
@@ -215,11 +213,7 @@ void main() {
 
     testWidgets('hides Download tile when fully downloaded', (tester) async {
       await tester.pumpWidget(_harness(
-        child: _build(
-          onDownload: () {},
-          onDeleteDownload: () {},
-          counts: (downloaded: 10, total: 10),
-        ),
+        child: _build(counts: (downloaded: 10, total: 10)),
       ));
       await tester.pumpAndSettle();
 
@@ -232,11 +226,7 @@ void main() {
 
     testWidgets('hides Delete when nothing is downloaded', (tester) async {
       await tester.pumpWidget(_harness(
-        child: _build(
-          onDownload: () {},
-          onDeleteDownload: () {},
-          counts: (downloaded: 0, total: 10),
-        ),
+        child: _build(counts: (downloaded: 0, total: 10)),
       ));
       await tester.pumpAndSettle();
 
@@ -252,12 +242,7 @@ void main() {
       (tester) async {
         await tester.pumpWidget(_harness(
           offline: true,
-          child: _build(
-            onPlayNext: () {},
-            onAddToQueue: () {},
-            onDeleteDownload: () {},
-            counts: (downloaded: 3, total: 10),
-          ),
+          child: _build(offline: true, counts: (downloaded: 3, total: 10)),
         ));
         await tester.pumpAndSettle();
 
@@ -271,5 +256,49 @@ void main() {
         expect(playNext.enabled, isFalse);
       },
     );
+
+    testWidgets('an entry acts on the card scope via the controller',
+        (tester) async {
+      final actions = FakeLibraryActions();
+      await tester.pumpWidget(_harness(child: _build(actions: actions)));
+      await tester.pumpAndSettle();
+      await tester.longPress(find.byType(LibraryCard));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Download'));
+      await tester.pumpAndSettle();
+      expect(actions.calls, ['download album(1,2)']);
+    });
+  });
+
+  testWidgets('the downloaded badge follows PlaybackAvailability, not raw counts',
+      (tester) async {
+    // Counts still loading, availability already known (one predicate).
+    await tester.pumpWidget(_harness(
+      child: LibraryCard(
+        cover: const SizedBox(),
+        title: 'T',
+        onTap: () {},
+        isDownloading: false,
+        downloadCounts: const AsyncLoading(),
+        availability:
+            PlaybackAvailability.of(offline: false, downloaded: 2, total: 2),
+      ),
+    ));
+    expect(find.byType(DownloadedBadge), findsOneWidget);
+  });
+
+  testWidgets('no downloaded badge when availability is not full, whatever the counts say',
+      (tester) async {
+    await tester.pumpWidget(_harness(
+      child: LibraryCard(
+        cover: const SizedBox(),
+        title: 'T',
+        onTap: () {},
+        isDownloading: false,
+        downloadCounts: const AsyncData((downloaded: 2, total: 2)),
+        availability: const PlaybackAvailability.unknown(offline: false),
+      ),
+    ));
+    expect(find.byType(DownloadedBadge), findsNothing);
   });
 }

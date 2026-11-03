@@ -2,11 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/conversion_job.dart';
+import 'package:frontend/models/library_scope.dart';
+import 'package:frontend/models/playback_availability.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
+import 'package:frontend/ui/widgets/library_action_menu.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
+
+import '../fake_library_actions.dart';
 
 TrackUI _track({
   bool hasAlbumArt = false,
@@ -35,14 +40,14 @@ void main() {
     initCoverArtCache(CoverArtCacheManager.noop());
   });
 
+  /// The tile with the menu the real builder makes for it (Get info and the
+  /// conversion rows included), acting through [actions].
   Widget buildTile(
     TrackUI track, {
     bool isHighlighted = false,
-    VoidCallback? onPlayNext,
-    VoidCallback? onAddToQueue,
-    VoidCallback? onDownload,
-    void Function(String)? onDownloadAtQuality,
-    VoidCallback? onDeleteDownload,
+    bool offline = false,
+    FakeLibraryActions? actions,
+    VoidCallback? onGetInfo,
     VoidCallback? onConvert,
     VoidCallback? onCancelConvert,
     ConversionJob? conversionJob,
@@ -52,14 +57,22 @@ void main() {
         body: TrackTile(
           track: track,
           isHighlighted: isHighlighted,
-          onPlayNext: onPlayNext,
-          onAddToQueue: onAddToQueue,
-          onDownload: onDownload,
-          onDownloadAtQuality: onDownloadAtQuality,
-          onDeleteDownload: onDeleteDownload,
-          onConvert: onConvert,
-          onCancelConvert: onCancelConvert,
           conversionJob: conversionJob,
+          menu: buildLibraryActionMenu(
+            TrackScope(track),
+            PlaybackAvailability.of(
+              offline: offline,
+              downloaded: track.isDownloaded ? 1 : 0,
+              total: 1,
+            ),
+            actions: actions ?? FakeLibraryActions(),
+            onGetInfo: onGetInfo ?? () {},
+            extraActions: conversionMenuEntries(
+              conversionJob: conversionJob,
+              onConvert: onConvert,
+              onCancelConvert: onCancelConvert,
+            ),
+          ),
         ),
       ),
     );
@@ -124,13 +137,8 @@ void main() {
   group('TrackTile context menu', () {
     testWidgets('Download menu item appears for un-downloaded tracks',
         (tester) async {
-      var downloadCalled = false;
-      await tester.pumpWidget(buildTile(
-        _track(),
-        onPlayNext: () {},
-        onDownload: () => downloadCalled = true,
-        onDeleteDownload: () {},
-      ));
+      final actions = FakeLibraryActions();
+      await tester.pumpWidget(buildTile(_track(), actions: actions));
 
       await tester.tap(find.byIcon(Icons.more_vert));
       await tester.pumpAndSettle();
@@ -140,18 +148,15 @@ void main() {
 
       await tester.tap(find.text('Download'));
       await tester.pumpAndSettle();
-      expect(downloadCalled, isTrue);
+      expect(actions.calls, ['download track(test-uuid)']);
     });
 
     testWidgets('Delete download appears instead when track is downloaded',
         (tester) async {
-      var deleteCalled = false;
-      await tester.pumpWidget(buildTile(
-        _track(filePath: '/tmp/abc.audio'),
-        onPlayNext: () {},
-        onDownload: () {},
-        onDeleteDownload: () => deleteCalled = true,
-      ));
+      final actions = FakeLibraryActions();
+      await tester.pumpWidget(
+        buildTile(_track(filePath: '/tmp/abc.audio'), actions: actions),
+      );
 
       await tester.tap(find.byIcon(Icons.more_vert));
       await tester.pumpAndSettle();
@@ -161,31 +166,24 @@ void main() {
 
       await tester.tap(find.text('Delete download'));
       await tester.pumpAndSettle();
-      expect(deleteCalled, isTrue);
+      expect(actions.calls, ['deleteDownloads track(test-uuid)']);
     });
 
-    testWidgets('no chevron when onDownloadAtQuality is null', (tester) async {
-      await tester.pumpWidget(buildTile(
-        _track(),
-        onPlayNext: () {},
-        onDownload: () {},
-        // onDownloadAtQuality intentionally omitted (null)
-      ));
+    testWidgets('offline downloaded track: Delete download, no Download row',
+        (tester) async {
+      await tester.pumpWidget(
+        buildTile(_track(filePath: '/tmp/abc.audio'), offline: true),
+      );
 
       await tester.tap(find.byIcon(Icons.more_vert));
       await tester.pumpAndSettle();
 
-      expect(find.byType(SplitDownloadTile), findsOneWidget);
-      expect(find.byIcon(Icons.chevron_right), findsNothing);
+      expect(find.byType(SplitDownloadTile), findsNothing);
+      expect(find.text('Delete download'), findsOneWidget);
     });
 
     testWidgets('split tile shows chevron icon in track menu', (tester) async {
-      await tester.pumpWidget(buildTile(
-        _track(),
-        onPlayNext: () {},
-        onDownload: () {},
-        onDownloadAtQuality: (_) {},
-      ));
+      await tester.pumpWidget(buildTile(_track()));
 
       await tester.tap(find.byIcon(Icons.more_vert));
       await tester.pumpAndSettle();
@@ -195,13 +193,8 @@ void main() {
     });
 
     testWidgets('chevron in track menu opens quality sheet', (tester) async {
-      String? chosenQuality;
-      await tester.pumpWidget(buildTile(
-        _track(),
-        onPlayNext: () {},
-        onDownload: () {},
-        onDownloadAtQuality: (q) => chosenQuality = q,
-      ));
+      final actions = FakeLibraryActions();
+      await tester.pumpWidget(buildTile(_track(), actions: actions));
 
       await tester.tap(find.byIcon(Icons.more_vert));
       await tester.pumpAndSettle();
@@ -215,8 +208,21 @@ void main() {
       await tester.tap(find.text('Original'));
       await tester.pumpAndSettle();
 
-      expect(chosenQuality, 'original');
+      expect(actions.calls, ['downloadAtQuality track(test-uuid) original']);
     });
+  });
+
+  testWidgets('Get Info is first and runs the surface\'s navigation',
+      (tester) async {
+    var opened = false;
+    await tester.pumpWidget(buildTile(_track(), onGetInfo: () => opened = true));
+    await tester.tap(find.byIcon(Icons.more_vert));
+    await tester.pumpAndSettle();
+    final first = tester.widget<ListTile>(find.byType(ListTile).first);
+    expect((first.title as Text).data, 'Get Info');
+    await tester.tap(find.text('Get Info'));
+    await tester.pumpAndSettle();
+    expect(opened, isTrue);
   });
 
   group('TrackTile convert menu + badge', () {
@@ -225,7 +231,6 @@ void main() {
       var convertCalled = false;
       await tester.pumpWidget(buildTile(
         _track(),
-        onPlayNext: () {},
         onConvert: () => convertCalled = true,
       ));
 
@@ -240,7 +245,7 @@ void main() {
     });
 
     testWidgets('omits Convert… when onConvert is null', (tester) async {
-      await tester.pumpWidget(buildTile(_track(), onPlayNext: () {}));
+      await tester.pumpWidget(buildTile(_track()));
 
       await tester.tap(find.byIcon(Icons.more_vert));
       await tester.pumpAndSettle();
@@ -260,8 +265,7 @@ void main() {
         });
         await tester.pumpWidget(buildTile(
           _track(),
-          onPlayNext: () {},
-          onConvert: () {},
+            onConvert: () {},
           onCancelConvert: () => cancelCalled = true,
           conversionJob: job,
         ));

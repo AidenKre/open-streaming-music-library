@@ -1267,13 +1267,7 @@ class QueueRepository {
       return 'tm."uuid_id" ASC';
     }
 
-    return orderBy
-        .map((order) {
-          final alias = aliasMap(order.column);
-          final direction = order.isAscending ? 'ASC' : 'DESC';
-          return '$alias."${order.column}" $direction';
-        })
-        .join(', ');
+    return trackOrderClause(orderBy);
   }
 
   static QueuePlaybackEntry _playbackEntryFromRow(QueryRow row) {

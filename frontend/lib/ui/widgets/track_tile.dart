@@ -1,26 +1,17 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/ui/get_info_page.dart';
+import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/library_actions.dart';
+import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
-import 'package:frontend/ui/widgets/download_quality_sheet.dart';
+import 'package:frontend/ui/widgets/library_action_menu.dart';
 
 class TrackTile extends StatelessWidget {
   final TrackUI track;
   final VoidCallback? onTap;
-  final VoidCallback? onPlayNext;
-  final VoidCallback? onAddToQueue;
-  final VoidCallback? onDownload;
-  final void Function(String quality)? onDownloadAtQuality;
-  final VoidCallback? onDeleteDownload;
-  /// Starts a master-type conversion for this track. Null hides the menu
-  /// entry entirely (offline, no `convert` capability, or no allowed target
-  /// for this track's codec -- see `canConvertTrack`). A pending edit does
-  /// NOT hide it; the flow itself blocks that with a snackbar.
-  final VoidCallback? onConvert;
-  /// Cancels this track's in-flight conversion job. Shown instead of
-  /// [onConvert] while [conversionJob] is active.
-  final VoidCallback? onCancelConvert;
   /// This track's current conversion job, if any (caller-supplied -- the
   /// tile stays a plain StatelessWidget, same as `isHighlighted`/`isDimmed`;
   /// the page watches `conversionJobsProvider` and passes the result down).
@@ -33,106 +24,21 @@ class TrackTile extends StatelessWidget {
   final bool isInteractive;
   final Widget? trailing;
 
+  /// The row's action menu (from `buildLibraryActionMenu`), behind the
+  /// overflow button. Empty: no overflow button (e.g. full-player queue rows).
+  final List<LibraryMenuEntry> menu;
+
   const TrackTile({
     super.key,
     required this.track,
     this.onTap,
-    this.onPlayNext,
-    this.onAddToQueue,
-    this.onDownload,
-    this.onDownloadAtQuality,
-    this.onDeleteDownload,
-    this.onConvert,
-    this.onCancelConvert,
+    this.menu = const [],
     this.conversionJob,
     this.isHighlighted = false,
     this.isDimmed = false,
     this.isInteractive = true,
     this.trailing,
   });
-
-  void _showTrackMenu(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.info_outline),
-              title: const Text('Get Info'),
-              onTap: () {
-                Navigator.pop(ctx);
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => GetInfoPage(track: track)),
-                );
-              },
-            ),
-            if (onPlayNext != null)
-              ListTile(
-                leading: const Icon(Icons.playlist_play),
-                title: const Text('Play Next'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onPlayNext!();
-                },
-              ),
-            if (onAddToQueue != null)
-              ListTile(
-                leading: const Icon(Icons.queue_music),
-                title: const Text('Add to Queue'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onAddToQueue!();
-                },
-              ),
-            if (track.isDownloaded && onDeleteDownload != null)
-              ListTile(
-                leading: const Icon(Icons.delete_outline),
-                title: const Text('Delete download'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onDeleteDownload!();
-                },
-              )
-            else if (!track.isDownloaded && onDownload != null)
-              SplitDownloadTile(
-                onDownload: () {
-                  Navigator.pop(ctx);
-                  onDownload!();
-                },
-                onDownloadAtQuality: onDownloadAtQuality != null
-                    ? (quality) {
-                        Navigator.pop(ctx);
-                        onDownloadAtQuality!(quality);
-                      }
-                    : null,
-              ),
-            if (conversionJob?.isActive ?? false)
-              ListTile(
-                leading: const Icon(Icons.close),
-                title: const Text('Cancel conversion'),
-                onTap: onCancelConvert == null
-                    ? null
-                    : () {
-                        Navigator.pop(ctx);
-                        onCancelConvert!();
-                      },
-              )
-            else if (onConvert != null)
-              ListTile(
-                leading: const Icon(Icons.transform),
-                title: const Text('Convert…'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  onConvert!();
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -237,8 +143,7 @@ class TrackTile extends StatelessWidget {
                       ),
                     ),
                   ],
-                  if (trailing == null &&
-                      (onPlayNext != null || onAddToQueue != null)) ...[
+                  if (trailing == null && menu.isNotEmpty) ...[
                     const SizedBox(width: 8),
                     Opacity(
                       opacity: opacity,
@@ -259,14 +164,12 @@ class TrackTile extends StatelessWidget {
                         // Null onPressed renders the button in Flutter's
                         // built-in disabled style (grayed but visible).
                         onPressed: isInteractive
-                            ? () => _showTrackMenu(context)
+                            ? () => showLibraryActionMenu(context, menu)
                             : null,
                       ),
                     ),
                   ],
-                  if (trailing == null &&
-                      onPlayNext == null &&
-                      onAddToQueue == null) ...[
+                  if (trailing == null && menu.isEmpty) ...[
                     const SizedBox(width: 8),
                     Opacity(
                       opacity: opacity,
@@ -285,6 +188,79 @@ class TrackTile extends StatelessWidget {
         ),
         const Divider(height: 1, thickness: 0.5, indent: 76),
       ],
+    );
+  }
+}
+
+
+/// The surface-specific conversion rows of a track menu: "Cancel conversion"
+/// while [conversionJob] is active (disabled without [onCancelConvert]),
+/// otherwise "Convert…" when [onConvert] is available (null hides it:
+/// offline, no `convert` capability, or no allowed target -- see
+/// `canConvertTrack`; a pending edit does NOT hide it, the flow blocks that).
+List<LibraryMenuEntry> conversionMenuEntries({
+  ConversionJob? conversionJob,
+  VoidCallback? onConvert,
+  VoidCallback? onCancelConvert,
+}) {
+  if (conversionJob?.isActive ?? false) {
+    return [
+      LibraryMenuAction(
+        icon: Icons.close,
+        label: 'Cancel conversion',
+        onSelected: onCancelConvert,
+      ),
+    ];
+  }
+  if (onConvert == null) return const [];
+  return [
+    LibraryMenuAction(
+      icon: Icons.transform,
+      label: 'Convert…',
+      onSelected: onConvert,
+    ),
+  ];
+}
+
+/// A library track row: [TrackTile] with the one SC-06 menu (Get info via
+/// `library_routes.dart`, actions via `LibraryActionControls`) and its
+/// dimming/interactivity from `PlaybackAvailability` -- the page supplies
+/// only the primary tap and any surface-specific [extraActions].
+class LibraryTrackTile extends ConsumerWidget {
+  const LibraryTrackTile({
+    super.key,
+    required this.track,
+    required this.onTap,
+    this.trailing,
+    this.conversionJob,
+    this.extraActions = const [],
+  });
+
+  final TrackUI track;
+  final VoidCallback onTap;
+  final Widget? trailing;
+  final ConversionJob? conversionJob;
+  final List<LibraryMenuEntry> extraActions;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final scope = TrackScope(track);
+    final availability = ref.watch(playbackAvailabilityProvider(scope));
+    return TrackTile(
+      track: track,
+      trailing: trailing,
+      conversionJob: conversionJob,
+      // Offline, a track that can't play stays visible but dimmed and inert.
+      isDimmed: !availability.canPlay,
+      isInteractive: availability.canPlay,
+      onTap: onTap,
+      menu: buildLibraryActionMenu(
+        scope,
+        availability,
+        actions: ref.watch(libraryActionsProvider),
+        onGetInfo: () => openTrackInfo(context, track),
+        extraActions: extraActions,
+      ),
     );
   }
 }

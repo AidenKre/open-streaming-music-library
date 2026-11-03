@@ -1,11 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
@@ -26,14 +25,6 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
   @override
   int get pageSize => 50;
 
-  List<OrderParameter> get _orderParams => [
-    OrderParameter(column: 'artist'),
-    OrderParameter(column: 'album'),
-    OrderParameter(column: 'disc_number'),
-    OrderParameter(column: 'track_number'),
-    OrderParameter(column: 'uuid_id'),
-  ];
-
   @override
   void initState() {
     super.initState();
@@ -51,7 +42,6 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
   Stream<List<TrackUI>> watchPage({required int limit}) {
     final repo = ref.read(browseRepositoryProvider);
     return repo.watchTracks(
-      orderBy: _orderParams,
       limit: limit,
       downloadedOnly: true,
     );
@@ -121,25 +111,12 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
                           Completed() || Failed() => null,
                         };
                       }
-                      return TrackTile(
+                      return LibraryTrackTile(
                         track: track,
                         trailing: trailing,
-                        onTap: () =>
-                            ref.read(audioProvider.notifier).playFromQueue(
-                          track: track,
-                          sourceType: 'library',
-                          orderParams: _orderParams,
-                          downloadedOnly: true,
-                        ),
-                        onPlayNext: () =>
-                            ref.read(audioProvider.notifier).playNext([track]),
-                        onAddToQueue: () =>
-                            ref.read(audioProvider.notifier).addToQueue([track]),
-                        onDownload: () => downloadScope(ref, TrackScope(track)),
-                        onDownloadAtQuality: (q) =>
-                            downloadScope(ref, TrackScope(track), quality: q),
-                        onDeleteDownload: () =>
-                            deleteScope(ref, TrackScope(track)),
+                        onTap: () => ref
+                            .read(libraryActionsProvider)
+                            .playQuery(track, downloadedOnly: true),
                       );
                     },
                   ),

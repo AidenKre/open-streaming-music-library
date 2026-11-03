@@ -6,7 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/models/library_scope.dart';
+import 'package:frontend/models/playback_availability.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download/download_reconciliation_service.dart';
@@ -146,18 +147,20 @@ final _artistDownloadCountsMapProvider =
       return ref.watch(databaseProvider).getAllArtistDownloadCounts();
     });
 
-({int downloaded, int total}) _sliceCounts(
+/// [id]'s counts, or null when the map has no entry (unknown, not 0/0).
+({int downloaded, int total})? _sliceCounts(
   Map<int, ({int total, int downloaded})> map,
   int id,
 ) {
   final entry = map[id];
-  return (downloaded: entry?.downloaded ?? 0, total: entry?.total ?? 0);
+  if (entry == null) return null;
+  return (downloaded: entry.downloaded, total: entry.total);
 }
 
 /// DB-backed (downloaded, total) counts for an album; refreshes on each
 /// completed/deleted download. Backed by the batched map provider.
 final albumDownloadCountsProvider =
-    Provider.family<AsyncValue<({int downloaded, int total})>, int>(
+    Provider.family<AsyncValue<({int downloaded, int total})?>, int>(
       (ref, albumId) => ref
           .watch(_albumDownloadCountsMapProvider)
           .whenData((map) => _sliceCounts(map, albumId)),
@@ -166,91 +169,52 @@ final albumDownloadCountsProvider =
 /// DB-backed (downloaded, total) counts for an artist; refreshes on each
 /// completed/deleted download. Backed by the batched map provider.
 final artistDownloadCountsProvider =
-    Provider.family<AsyncValue<({int downloaded, int total})>, int>(
+    Provider.family<AsyncValue<({int downloaded, int total})?>, int>(
       (ref, artistId) => ref
           .watch(_artistDownloadCountsMapProvider)
           .whenData((map) => _sliceCounts(map, artistId)),
     );
 
-// ── Sealed DownloadScope + unified entry points ─────────────────────────
-// Shared across albums_page, artist_page, search_page, tracks_page, and
-// downloaded_tracks_page. Adding a new download source (e.g. playlists)
-// is now a one-line `class PlaylistScope` constructor.
-
-sealed class DownloadScope {
-  const DownloadScope();
-}
-
-class AlbumScope extends DownloadScope {
-  final int artistId;
-  final int albumId;
-  const AlbumScope({required this.artistId, required this.albumId});
-}
-
-class ArtistScope extends DownloadScope {
-  final int artistId;
-  const ArtistScope({required this.artistId});
-}
-
-class TrackScope extends DownloadScope {
-  final TrackUI track;
-  const TrackScope(this.track);
-}
-
-class TracksScope extends DownloadScope {
-  final List<TrackUI> tracks;
-  const TracksScope(this.tracks);
-}
-
-Future<List<TrackUI>> _resolveTracks(WidgetRef ref, DownloadScope scope) {
-  switch (scope) {
-    case AlbumScope(:final artistId, :final albumId):
-      return ref
-          .read(browseRepositoryProvider)
-          .getTracksForAlbum(artistId, albumId);
-    case ArtistScope(:final artistId):
-      return ref.read(browseRepositoryProvider).getTracksForArtist(artistId);
-    case TrackScope(:final track):
-      return Future.value([track]);
-    case TracksScope(:final tracks):
-      return Future.value(tracks);
-  }
-}
-
-/// Enqueue downloads for the given scope.
+/// Whether [LibraryScope] can play/queue now and what its download actions
+/// offer (SC-06): the one enablement predicate every surface reads.
 ///
-/// When [quality] is null the user's current default download quality (from
-/// `downloadQualityProvider`) is applied. When [quality] is non-null the
-/// manager's `enqueueTracksAtQuality` path is used so the per-call override
-/// wins regardless of the default.
-Future<void> downloadScope(
-  WidgetRef ref,
-  DownloadScope scope, {
-  String? quality,
-}) async {
-  final tracks = await _resolveTracks(ref, scope);
-  if (tracks.isEmpty) return;
-  final manager = ref.read(downloadManagerProvider);
-  if (quality == null) {
-    await manager.enqueueTracks(
-      tracks,
-      quality: ref.read(downloadQualityProvider),
-    );
-  } else {
-    await manager.enqueueTracksAtQuality(tracks, quality: quality);
-  }
-}
-
-/// Delete downloads for the given scope. `TrackScope` deletes a single
-/// track via `deleteDownload(uuidId)`; everything else delegates to
-/// `deleteDownloadsForUuids` on the resolved track list.
-Future<void> deleteScope(WidgetRef ref, DownloadScope scope) async {
-  final manager = ref.read(downloadManagerProvider);
-  if (scope is TrackScope) {
-    await manager.deleteDownload(scope.track.uuidId);
-    return;
-  }
-  final tracks = await _resolveTracks(ref, scope);
-  if (tracks.isEmpty) return;
-  await manager.deleteDownloadsForUuids(tracks.map((t) => t.uuidId));
-}
+/// Album/artist scopes read the batched count maps above (one grouped query
+/// for every card, recomputed per download event), never a per-card
+/// resolution. Unknown is not zero: while the map loads, or when it has no
+/// entry for the scope (it is recomputed only on download events, so an
+/// album synced after it was built is absent), the result is `unknown`.
+/// Track scopes are computed from the rows' own download state.
+///
+/// Auto-dispose and keyed by value-equal scopes, so rebuilt cards reuse one
+/// element instead of leaking one per rebuild.
+final playbackAvailabilityProvider =
+    Provider.autoDispose.family<PlaybackAvailability, LibraryScope>((
+      ref,
+      scope,
+    ) {
+      final offline = ref.watch(offlineModeProvider);
+      ({int total, int downloaded})? counts;
+      switch (scope) {
+        case AlbumScope(:final albumId):
+          final map = ref.watch(_albumDownloadCountsMapProvider).value;
+          if (map == null) return PlaybackAvailability.unknown(offline: offline);
+          counts = map[albumId];
+        case ArtistScope(:final artistId):
+          final map = ref.watch(_artistDownloadCountsMapProvider).value;
+          if (map == null) return PlaybackAvailability.unknown(offline: offline);
+          counts = map[artistId];
+        case TrackScope(:final track):
+          counts = (total: 1, downloaded: track.isDownloaded ? 1 : 0);
+        case TracksScope(:final tracks):
+          counts = (
+            total: tracks.length,
+            downloaded: tracks.where((t) => t.isDownloaded).length,
+          );
+      }
+      if (counts == null) return PlaybackAvailability.unknown(offline: offline);
+      return PlaybackAvailability.of(
+        offline: offline,
+        downloaded: counts.downloaded,
+        total: counts.total,
+      );
+    });

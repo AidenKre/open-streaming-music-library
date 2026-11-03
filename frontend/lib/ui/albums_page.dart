@@ -1,13 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/album_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
-import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
-import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
@@ -28,13 +26,6 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
   @override
   int get pageSize => 30;
 
-  List<AlbumOrderParameter> get _orderParams => [
-    AlbumOrderParameter(column: 'artist'),
-    AlbumOrderParameter(column: 'year', isAscending: false, nullsLast: true),
-    AlbumOrderParameter(column: 'is_single_grouping'),
-    AlbumOrderParameter(column: 'name', nullsLast: true),
-  ];
-
   @override
   void initState() {
     super.initState();
@@ -43,9 +34,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
   }
 
   void sync() {
-    Future.microtask(
-      () => ref.read(trackSyncProvider.notifier).sync(),
-    );
+    Future.microtask(() => ref.read(browseControlsProvider).refreshLibrary());
   }
 
   @override
@@ -60,30 +49,11 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     final repo = ref.read(browseRepositoryProvider);
     return repo.watchAlbums(
       artistId: widget.artistId,
-      orderBy: _orderParams,
       limit: limit,
-      downloadedOnly: ref.read(offlineModeProvider),
+      offline: ref.read(offlineModeProvider),
     );
   }
 
-  void _onAlbumTap(AlbumUI album) {
-    final String appBarTitle;
-
-    if (album.isSingleGrouping) {
-      appBarTitle = '${album.artist ?? "Unknown Artist"} - Singles';
-    } else {
-      appBarTitle = album.name ?? 'Unknown Album';
-    }
-
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Scaffold(
-          appBar: AppBar(title: Text(appBarTitle)),
-          body: TracksPage(artistId: album.artistId, albumId: album.id),
-        ),
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -121,42 +91,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
               }
               return AlbumCard(
                 album: album,
-                onTap: () => _onAlbumTap(album),
-                onPlayNext: () async {
-                  final tracks = await ref
-                      .read(browseRepositoryProvider)
-                      .getTracksForAlbum(album.artistId, album.id);
-                  if (tracks.isNotEmpty) {
-                    ref.read(audioProvider.notifier).playNext(tracks);
-                  }
-                },
-                onAddToQueue: () async {
-                  final tracks = await ref
-                      .read(browseRepositoryProvider)
-                      .getTracksForAlbum(album.artistId, album.id);
-                  if (tracks.isNotEmpty) {
-                    ref.read(audioProvider.notifier).addToQueue(tracks);
-                  }
-                },
-                onDownload: isOffline
-                    ? null
-                    : () => downloadScope(
-                        ref,
-                        AlbumScope(
-                            artistId: album.artistId, albumId: album.id),
-                      ),
-                onDownloadAtQuality: isOffline
-                    ? null
-                    : (q) => downloadScope(
-                        ref,
-                        AlbumScope(
-                            artistId: album.artistId, albumId: album.id),
-                        quality: q,
-                      ),
-                onDeleteDownload: () => deleteScope(
-                  ref,
-                  AlbumScope(artistId: album.artistId, albumId: album.id),
-                ),
+                onTap: () => openAlbumDetail(context, album),
               );
             },
           ),

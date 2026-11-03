@@ -5,9 +5,13 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/models/playback_availability.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
+
+import '../fake_library_actions.dart';
 
 const _artist = ArtistUI(id: 1, name: 'Test Artist');
 const _artistWithArt = ArtistUI(id: 1, name: 'Test Artist', coverArtId: 3);
@@ -28,11 +32,7 @@ Widget buildCard(
   bool downloaded = false,
   bool offline = false,
   ({int downloaded, int total})? counts,
-  VoidCallback? onPlayNext,
-  VoidCallback? onAddToQueue,
-  VoidCallback? onDownload,
-  void Function(String)? onDownloadAtQuality,
-  VoidCallback? onDeleteDownload,
+  FakeLibraryActions? actions,
 }) {
   final effectiveCounts =
       counts ?? (downloaded: downloaded ? 10 : 0, total: 10);
@@ -44,6 +44,17 @@ Widget buildCard(
         (ref, artistId) => AsyncData(effectiveCounts),
       ),
       offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+      // The menu reads availability for its scope from the same counts.
+      playbackAvailabilityProvider.overrideWith(
+        (ref, scope) => PlaybackAvailability.of(
+          offline: offline,
+          downloaded: effectiveCounts.downloaded,
+          total: effectiveCounts.total,
+        ),
+      ),
+      libraryActionsProvider.overrideWithValue(
+        actions ?? FakeLibraryActions(),
+      ),
     ],
     child: MaterialApp(
       home: Scaffold(
@@ -53,11 +64,6 @@ Widget buildCard(
           child: ArtistCard(
             artist: artist,
             onTap: () {},
-            onPlayNext: onPlayNext,
-            onAddToQueue: onAddToQueue,
-            onDownload: onDownload,
-            onDownloadAtQuality: onDownloadAtQuality,
-            onDeleteDownload: onDeleteDownload,
           ),
         ),
       ),
@@ -130,12 +136,11 @@ void main() {
 
     testWidgets('long-press menu shows Download for un-downloaded artist',
         (tester) async {
-      var downloadCalled = false;
+      final actions = FakeLibraryActions();
       await tester.pumpWidget(buildCard(
+        actions: actions,
         _artist,
         downloaded: false,
-        onDownload: () => downloadCalled = true,
-        onDeleteDownload: () {},
       ));
       await tester.pumpAndSettle();
 
@@ -147,17 +152,16 @@ void main() {
 
       await tester.tap(find.text('Download'));
       await tester.pumpAndSettle();
-      expect(downloadCalled, isTrue);
+      expect(actions.calls, ['download artist(1)']);
     });
 
     testWidgets('long-press menu shows Delete downloads when fully downloaded',
         (tester) async {
-      var deleteCalled = false;
+      final actions = FakeLibraryActions();
       await tester.pumpWidget(buildCard(
+        actions: actions,
         _artist,
         downloaded: true,
-        onDownload: () {},
-        onDeleteDownload: () => deleteCalled = true,
       ));
       await tester.pumpAndSettle();
 
@@ -169,22 +173,23 @@ void main() {
 
       await tester.tap(find.text('Delete downloads'));
       await tester.pumpAndSettle();
-      expect(deleteCalled, isTrue);
+      expect(actions.calls, ['deleteDownloads artist(1)']);
     });
 
-    testWidgets('no chevron when onDownloadAtQuality is null', (tester) async {
+    testWidgets('offline: no Download row (downloading needs the server)',
+          (tester) async {
       await tester.pumpWidget(buildCard(
         _artist,
         downloaded: false,
-        onDownload: () {},
-        // onDownloadAtQuality intentionally omitted (null)
+        offline: true,
+        counts: (downloaded: 0, total: 10),
       ));
       await tester.pumpAndSettle();
 
       await tester.longPress(find.byType(ArtistCard));
       await tester.pumpAndSettle();
 
-      expect(find.byType(SplitDownloadTile), findsOneWidget);
+      expect(find.byType(SplitDownloadTile), findsNothing);
       expect(find.byIcon(Icons.chevron_right), findsNothing);
     });
 
@@ -192,8 +197,6 @@ void main() {
       await tester.pumpWidget(buildCard(
         _artist,
         downloaded: false,
-        onDownload: () {},
-        onDownloadAtQuality: (_) {},
       ));
       await tester.pumpAndSettle();
 
@@ -204,14 +207,13 @@ void main() {
       expect(find.byIcon(Icons.chevron_right), findsOneWidget);
     });
 
-    testWidgets('chevron opens quality sheet and calls onDownloadAtQuality',
+    testWidgets('chevron opens quality sheet and downloads at that quality',
         (tester) async {
-      String? chosenQuality;
+      final actions = FakeLibraryActions();
       await tester.pumpWidget(buildCard(
+        actions: actions,
         _artist,
         downloaded: false,
-        onDownload: () {},
-        onDownloadAtQuality: (q) => chosenQuality = q,
       ));
       await tester.pumpAndSettle();
 
@@ -227,7 +229,7 @@ void main() {
       await tester.tap(find.text('320 kbps'));
       await tester.pumpAndSettle();
 
-      expect(chosenQuality, '320');
+      expect(actions.calls, ['downloadAtQuality artist(1) 320']);
     });
   });
 
@@ -239,9 +241,6 @@ void main() {
           _artist,
           offline: true,
           counts: (downloaded: 3, total: 10),
-          onPlayNext: () {},
-          onAddToQueue: () {},
-          onDeleteDownload: () {},
         ));
         await tester.pumpAndSettle();
 
@@ -267,9 +266,6 @@ void main() {
         _artist,
         offline: true,
         counts: (downloaded: 10, total: 10),
-        onPlayNext: () {},
-        onAddToQueue: () {},
-        onDeleteDownload: () {},
       ));
       await tester.pumpAndSettle();
 
@@ -282,5 +278,20 @@ void main() {
       ));
       expect(playNext.enabled, isTrue);
     });
+  });
+
+  testWidgets('menu queue actions act on this card\'s scope', (tester) async {
+    final actions = FakeLibraryActions();
+    await tester.pumpWidget(buildCard(_artist, actions: actions));
+    await tester.pumpAndSettle();
+    await tester.longPress(find.byType(ArtistCard));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Play Next'));
+    await tester.pumpAndSettle();
+    await tester.longPress(find.byType(ArtistCard));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Add to Queue'));
+    await tester.pumpAndSettle();
+    expect(actions.calls, ['playNext artist(1)', 'addToQueue artist(1)']);
   });
 }

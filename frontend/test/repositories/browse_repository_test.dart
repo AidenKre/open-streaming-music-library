@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 
 void main() {
@@ -26,16 +27,14 @@ void main() {
     await fixture.insertAlbum(artist: 'Zed', album: 'Zebra', uuids: ['z1']);
     await fixture.insertAlbum(artist: 'Ace', album: 'Alpha', uuids: ['a1']);
 
-    final albums = await repo
-        .watchAlbums(orderBy: [AlbumOrderParameter(column: 'artist')])
-        .first;
+    final albums = await repo.watchAlbums().first;
 
     expect(albums, hasLength(2));
     expect(albums[0].name, 'Alpha');
     expect(albums[1].name, 'Zebra');
   });
 
-  test('getTracksForAlbum returns tracks for specific album', () async {
+  test('getTracksForScope(AlbumScope) returns tracks for specific album', () async {
     await fixture.insertAlbum(
       artist: 'Artist',
       album: 'Target Album',
@@ -47,7 +46,10 @@ void main() {
       uuids: ['o1'],
     );
 
-    final tracks = await repo.getTracksForAlbum(1, 1);
+    final tracks = await repo.getTracksForScope(
+      const AlbumScope(artistId: 1, albumId: 1),
+      offline: false,
+    );
 
     expect(tracks, hasLength(2));
     expect(tracks.every((t) => t.album == 'Target Album'), isTrue);
@@ -70,7 +72,7 @@ void main() {
     expect(track, null);
   });
 
-  test('getTracksForArtist returns tracks for specific artist', () async {
+  test('getTracksForScope(ArtistScope) returns tracks for specific artist', () async {
     await fixture.insertAlbum(
       artist: 'Target',
       album: 'Album 1',
@@ -82,7 +84,10 @@ void main() {
       uuids: ['o1'],
     );
 
-    final tracks = await repo.getTracksForArtist(1);
+    final tracks = await repo.getTracksForScope(
+      const ArtistScope(artistId: 1),
+      offline: false,
+    );
 
     expect(tracks, hasLength(2));
     expect(tracks.every((t) => t.artist == 'Target'), isTrue);
@@ -566,7 +571,7 @@ void main() {
   });
   group('withFreshDownloadState', () {
     Future<List<TrackUI>> loadTracks() =>
-        repo.watchTracks(orderBy: [OrderParameter(column: 'uuid_id')]).first;
+        repo.watchTracks().first;
 
     setUp(() async {
       await fixture.insertAlbum(
