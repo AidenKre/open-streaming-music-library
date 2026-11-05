@@ -1,8 +1,8 @@
 import 'package:flutter/foundation.dart';
 
-/// The filter-chip selection for one browse surface (a root browse tab today,
-/// the Home page in Phase 4). Session-only: the owning page keeps it in its
-/// `State`; it is never global or persisted.
+/// The filter-chip selection for one browse surface (a root browse tab or
+/// Search today, Home in Phase 6). Session-only: the surface's
+/// `BrowseFilterControls` holds it; it is never global or persisted.
 ///
 /// Minimal on purpose — a new filter is a new field + `copyWith` arg, a chip in
 /// `FilterBar`, and its query clause. The search query is deliberately NOT

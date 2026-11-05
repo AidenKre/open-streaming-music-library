@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/browse_filters.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/browse_filter_controller.dart';
 import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/feed_header.dart';
 import 'package:frontend/ui/library_actions.dart';
@@ -43,12 +43,15 @@ class SearchPageState extends ConsumerState<SearchPage> {
   final _focus = FocusNode(debugLabel: 'search.field');
   final _feed = GlobalKey<SectionedFeedViewState>();
 
-  late BrowseFilters _filters;
+  /// The chip selection and its offline policy (SC-09/SC-26).
+  late final BrowseFilterControls _filterControls;
+  BrowseFilters get _filters => _filterControls.filters;
 
   @override
   void initState() {
     super.initState();
-    _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
+    _filterControls = ref.read(browseFilterControllerFactoryProvider)()
+      ..addListener(_onFiltersChanged);
     _search = ref.read(librarySearchControllerFactoryProvider)(
       types: SearchType.values.toSet(),
       limitPerType: SearchPage.cap,
@@ -78,6 +81,9 @@ class SearchPageState extends ConsumerState<SearchPage> {
     _search
       ..removeListener(_onSearchChanged)
       ..dispose();
+    _filterControls
+      ..removeListener(_onFiltersChanged)
+      ..dispose();
     _queryText.dispose();
     _focus.dispose();
     super.dispose();
@@ -92,12 +98,11 @@ class SearchPageState extends ConsumerState<SearchPage> {
   /// Scroll the results back to the top (shell re-tap).
   void scrollToTop() => _feed.currentState?.scrollToTop();
 
-  void _onFiltersChanged(BrowseFilters next) {
-    if (next == _filters) return;
-    setState(() {
-      _filters = next;
-      _railReset++;
-    });
+  /// The chips changed (a tap or an offline flip; the controller only
+  /// notifies on a real change): new results, rails from the start.
+  void _onFiltersChanged() {
+    if (!mounted) return;
+    setState(() => _railReset++);
     _search.rerun();
   }
 
@@ -118,10 +123,6 @@ class SearchPageState extends ConsumerState<SearchPage> {
     // patches or re-searches; no-op while inactive).
     ref.listen(downloadStatusVersionProvider, (_, _) {
       _search.onDownloadStatusChanged();
-    });
-    ref.listen<bool>(offlineModeProvider, (prev, next) {
-      if (prev == next) return;
-      _onFiltersChanged(next ? _filters.wentOffline() : _filters.cameOnline());
     });
 
     // The shell owns the top bar (shown while Search is at its root) and
@@ -155,7 +156,7 @@ class SearchPageState extends ConsumerState<SearchPage> {
                       onClear: _onCleared,
                       filterBar: FilterBar(
                         filters: _filters,
-                        onChanged: _onFiltersChanged,
+                        onDownloadedChanged: _filterControls.setDownloaded,
                       ),
                     ),
                   ),
