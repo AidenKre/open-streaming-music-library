@@ -4,14 +4,14 @@ import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 
 void main() {
-  late List<BrowseFilters> changes;
+  late List<bool> changes;
 
   setUp(() => changes = []);
 
   Widget harness({required BrowseFilters filters}) {
     return MaterialApp(
       home: Scaffold(
-        body: FilterBar(filters: filters, onChanged: changes.add),
+        body: FilterBar(filters: filters, onDownloadedChanged: changes.add),
       ),
     );
   }
@@ -45,14 +45,14 @@ void main() {
   ) async {
     await tester.pumpWidget(harness(filters: const BrowseFilters()));
     await tester.tap(find.byKey(FilterBar.downloadedChipKey));
-    expect(changes, [const BrowseFilters(downloaded: true)]);
+    expect(changes, [true]);
 
     await tester.pumpWidget(
       harness(filters: const BrowseFilters(downloaded: true)),
     );
     expect(downloadedChip(tester).selected, isTrue);
     await tester.tap(find.byKey(FilterBar.downloadedChipKey));
-    expect(changes.last, const BrowseFilters());
+    expect(changes.last, isFalse);
   });
 
   testWidgets('an offline-applied ON shows selected and stays tappable', (
@@ -67,8 +67,8 @@ void main() {
 
     await tester.tap(find.byKey(FilterBar.downloadedChipKey));
     expect(changes, [
-      const BrowseFilters(),
-    ], reason: 'switching it off is the user\'s choice, not offline\'s');
+      false,
+    ], reason: 'the chip forwards the user\'s tap; the controller owns it');
   });
 
   testWidgets('screen readers hear a selectable "Downloaded" chip and its '

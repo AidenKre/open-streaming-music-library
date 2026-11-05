@@ -4,6 +4,7 @@ import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/ui/browse_filter_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/utils/library_search_controller.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
@@ -21,8 +22,10 @@ const kInPageSearchCap = 100;
 /// behaviour from one copy. A page supplies only its `watchPage` query (which
 /// reads [filters]) and its row builder.
 ///
-/// * Filters are per page and session-only. Offline switches Downloaded on
-///   and reconnecting undoes only that (see [BrowseFilters]).
+/// * Filters are per page and session-only, owned by the page's
+///   [BrowseFilterControls]: offline switches Downloaded on and reconnecting
+///   undoes only that (see [BrowseFilters]). The page only re-runs its query
+///   when the controller says the selection changed.
 /// * Entering search mode suspends the browse window, so a DB write can't
 ///   `setState` the dormant list underneath the results and neither a scroll
 ///   nor a [refresh] can re-subscribe it.
@@ -36,7 +39,7 @@ const kInPageSearchCap = 100;
 mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
     on ConsumerState<W>, CursorPaginationMixin<T> {
   LibrarySearchControls? _search;
-  BrowseFilters _filters = const BrowseFilters();
+  BrowseFilterControls? _filterControls;
 
   /// Whether this page shows the controls ([initRootBrowse] ran).
   bool get hasBrowseControls => _search != null;
@@ -45,7 +48,8 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
   LibrarySearchControls get search => _search!;
 
   /// The chip selection. Always the default without controls.
-  BrowseFilters get filters => _filters;
+  BrowseFilters get filters =>
+      _filterControls?.filters ?? const BrowseFilters();
 
   /// Showing search results instead of the browse window.
   bool get isSearchMode => _search?.isActive ?? false;
@@ -53,30 +57,32 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
   /// Call from `initState`, before `initPagination` (the first page reads
   /// [filters]).
   void initRootBrowse({required SearchType type}) {
-    _filters = BrowseFilters.initial(isOffline: ref.read(offlineModeProvider));
+    _filterControls = ref.read(browseFilterControllerFactoryProvider)()
+      ..addListener(_onFiltersChanged);
     _search = ref.read(librarySearchControllerFactoryProvider)(
       types: {type},
       limitPerType: kInPageSearchCap,
-      downloadedOnly: () => _filters.downloaded,
+      downloadedOnly: () => filters.downloaded,
     )..addListener(_onSearchChanged);
   }
 
   void disposeRootBrowse() {
+    _filterControls
+      ?..removeListener(_onFiltersChanged)
+      ..dispose();
+    _filterControls = null;
     _search?.dispose();
     _search = null;
   }
 
-  /// Call at the top of `build`. Routes offline flips and download events to
-  /// the mode on screen. [refreshOnOfflineChange] is for a page without
+  /// Call at the top of `build`. Routes download events to the mode on
+  /// screen (offline flips reach a page with controls through its
+  /// [BrowseFilterControls]). [refreshOnOfflineChange] is for a page without
   /// controls whose query reads the offline flag itself.
   void listenForBrowseChanges({bool refreshOnOfflineChange = false}) {
     ref.listen<bool>(offlineModeProvider, (prev, next) {
       if (prev == next) return;
-      if (hasBrowseControls) {
-        onFiltersChanged(next ? _filters.wentOffline() : _filters.cameOnline());
-      } else if (refreshOnOfflineChange) {
-        refresh();
-      }
+      if (!hasBrowseControls && refreshOnOfflineChange) refresh();
     });
     // The browse window is a live query and updates itself; search results
     // are a snapshot and need help.
@@ -88,9 +94,9 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
   /// The chips changed (a tap or an offline flip). Neither the live window
   /// nor a search snapshot can observe that on its own, so re-run whichever
   /// is showing.
-  void onFiltersChanged(BrowseFilters next) {
-    if (next == _filters) return;
-    setState(() => _filters = next);
+  void _onFiltersChanged() {
+    if (!mounted) return;
+    setState(() {});
     if (isSearchMode) {
       search.rerun();
     } else {
@@ -113,7 +119,7 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
   /// should say why instead of showing a blank list.
   bool get showDownloadedEmpty =>
       hasBrowseControls &&
-      _filters.downloaded &&
+      filters.downloaded &&
       !hasMore &&
       paginatedItems.isEmpty;
 
@@ -132,7 +138,10 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
             onCleared: search.clear,
           ),
         ),
-        FilterBar(filters: _filters, onChanged: onFiltersChanged),
+        FilterBar(
+          filters: filters,
+          onDownloadedChanged: _filterControls!.setDownloaded,
+        ),
       ],
     );
   }
@@ -155,7 +164,7 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
         noSearchResultsMessage(
           noun: noun,
           query: search.query,
-          downloadedOnly: _filters.downloaded,
+          downloadedOnly: filters.downloaded,
         ),
       );
     }
