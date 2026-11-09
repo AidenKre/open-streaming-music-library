@@ -60,6 +60,10 @@ class RecoveryPriority {
   /// the per-track Convert action) appears after an offline cold start.
   static const appInfo = 90;
 
+  /// Request a history pass (upload then pull) once capabilities are fresh
+  /// (after [appInfo]); the pass itself runs on its SingleFlightRunner.
+  static const history = 85;
+
   /// Re-dispatch downloads that were left queued while offline.
   static const resumeDownloads = 80;
 

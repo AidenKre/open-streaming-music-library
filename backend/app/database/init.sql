@@ -185,3 +185,24 @@ CREATE TABLE IF NOT EXISTS conversion_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_conversion_jobs_uuid ON conversion_jobs("uuid_id");
 CREATE INDEX IF NOT EXISTS idx_conversion_jobs_status ON conversion_jobs("status");
+
+CREATE TABLE IF NOT EXISTS history_events (
+    "event_uuid" TEXT NOT NULL PRIMARY KEY,
+    "revision" INTEGER NOT NULL UNIQUE CHECK (revision > 0),
+    "kind" TEXT NOT NULL CHECK (length(kind) BETWEEN 1 AND 64),
+    "entity_type" TEXT NOT NULL CHECK (length(entity_type) BETWEEN 1 AND 64),
+    "entity_ref" TEXT NOT NULL CHECK (length(entity_ref) BETWEEN 1 AND 256),
+    "occurred_at" INTEGER NOT NULL CHECK (occurred_at BETWEEN 0 AND 253402300799999),
+    "seconds_played" REAL CHECK (seconds_played IS NULL OR seconds_played >= 0),
+    "track_length" REAL CHECK (track_length IS NULL OR track_length > 0),
+    "received_at" INTEGER NOT NULL,
+    "owner_id" TEXT
+);
+
+CREATE TABLE IF NOT EXISTS history_hook_failures (
+    "id" INTEGER PRIMARY KEY,
+    "subscriber" TEXT NOT NULL,
+    "event_uuid" TEXT NOT NULL,
+    "error" TEXT NOT NULL,
+    "created_at" INTEGER NOT NULL
+);

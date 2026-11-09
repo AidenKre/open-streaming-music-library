@@ -297,6 +297,91 @@ class SyncCursors extends Table {
   Set<Column> get primaryKey => {stream};
 }
 
+@TableIndex(
+  name: 'idx_history_events_pending',
+  columns: {#pendingUpload, #localId},
+)
+@TableIndex.sql(
+  'CREATE INDEX idx_history_events_kind_occurred '
+  'ON history_events (kind, occurred_at DESC, event_uuid DESC)',
+)
+class HistoryEvents extends Table {
+  IntColumn get localId => integer().autoIncrement()();
+  TextColumn get eventUuid => text().unique()();
+  TextColumn get kind => text()();
+  TextColumn get entityType => text()();
+  TextColumn get entityRef => text()();
+  IntColumn get occurredAt => integer()();
+  RealColumn get secondsPlayed => real().nullable()();
+  RealColumn get trackLength => real().nullable()();
+  IntColumn get serverRevision => integer().nullable().unique()();
+  IntColumn get receivedAt => integer().nullable()();
+  BoolColumn get pendingUpload => boolean()();
+}
+
+class LocalCounters extends Table {
+  TextColumn get key => text()();
+  IntColumn get value => integer()();
+
+  @override
+  Set<Column> get primaryKey => {key};
+}
+
+class HistorySyncFailures extends Table {
+  TextColumn get eventUuid => text()();
+  TextColumn get reason => text()();
+  TextColumn get detail => text().nullable()();
+  IntColumn get failedAt => integer()();
+
+  @override
+  Set<Column> get primaryKey => {eventUuid};
+}
+
+class HistoryConflictArchive extends Table {
+  IntColumn get archiveId => integer().autoIncrement()();
+  TextColumn get eventUuid => text()();
+  TextColumn get payloadJson => text()();
+  IntColumn get archivedAt => integer()();
+}
+
+@TableIndex.sql(
+  "CREATE UNIQUE INDEX idx_active_listens_accumulating "
+  "ON active_listens (state) WHERE state = 'accumulating'",
+)
+class ActiveListens extends Table {
+  TextColumn get listenUuid => text()();
+  IntColumn get queueSessionId => integer()();
+  IntColumn get queueItemId => integer()();
+  TextColumn get trackUuid => text()();
+  IntColumn get startedAt => integer()();
+  RealColumn get durationSeconds => real().nullable()();
+  IntColumn get accumulatedMicros => integer()();
+  IntColumn get lastCheckpointAt => integer()();
+  TextColumn get state =>
+      // ignore: recursive_getters
+      text().check(state.isIn(['accumulating', 'finalizing']))();
+  TextColumn get finalPayloadJson => text().nullable()();
+
+  @override
+  Set<Column> get primaryKey => {listenUuid};
+}
+
+const _historyContentTriggerV3 = '''
+CREATE TRIGGER history_content
+AFTER UPDATE OF kind, entity_type, entity_ref, occurred_at, seconds_played, track_length
+ON history_events
+WHEN OLD.kind IS NOT NEW.kind
+  OR OLD.entity_type IS NOT NEW.entity_type
+  OR OLD.entity_ref IS NOT NEW.entity_ref
+  OR OLD.occurred_at IS NOT NEW.occurred_at
+  OR OLD.seconds_played IS NOT NEW.seconds_played
+  OR OLD.track_length IS NOT NEW.track_length
+BEGIN
+  INSERT INTO local_counters (key, value) VALUES ('history_content', 1)
+  ON CONFLICT(key) DO UPDATE SET value = value + 1;
+END
+''';
+
 // ── Column allowlists (mirrors backend database.py) ─────────────────────
 
 const allowedMetadataColumns = {
@@ -837,6 +922,11 @@ String _quoteSqlIdentifier(String identifier) {
     PendingEdits,
     ServerBinding,
     SyncCursors,
+    HistoryEvents,
+    LocalCounters,
+    HistorySyncFailures,
+    HistoryConflictArchive,
+    ActiveListens,
   ],
 )
 class AppDatabase extends _$AppDatabase implements LocalResettable {
@@ -872,12 +962,23 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
   ///     [rebuildFtsIndexes] afterwards.
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
+
+  @override
+  StreamQueryUpdateRules get streamUpdateRules => StreamQueryUpdateRules([
+    ...super.streamUpdateRules.rules,
+    // Include inserts too: an upsert can run the payload UPDATE trigger.
+    const WritePropagation(
+      on: TableUpdateQuery.onTableName('history_events'),
+      result: [TableUpdate('local_counters')],
+    ),
+  ]);
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
     onCreate: (m) async {
       await m.createAll();
+      await customStatement(_historyContentTriggerV3);
       for (final stmt in _ftsStatements) {
         await customStatement(stmt);
       }
@@ -921,6 +1022,17 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
         await customStatement(stmt);
       }
       await rebuildFtsIndexes();
+    },
+    from2To3: (m, schema) async {
+      await m.createTable(schema.historyEvents);
+      await m.createTable(schema.localCounters);
+      await m.createTable(schema.historySyncFailures);
+      await m.createTable(schema.historyConflictArchive);
+      await m.createTable(schema.activeListens);
+      await m.createIndex(schema.idxHistoryEventsPending);
+      await m.createIndex(schema.idxHistoryEventsKindOccurred);
+      await m.createIndex(schema.idxActiveListensAccumulating);
+      await customStatement(_historyContentTriggerV3);
     },
   );
 

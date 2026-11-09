@@ -409,6 +409,11 @@ void main() {
 
   group('SC-21 registry', () {
     testWidgets('renders Phase 4\'s sections in order', (tester) async {
+      // Tall enough that the lazy list builds every section (Phase 5 adds
+      // "Sync & storage" before Connection).
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
       final prefs = await SharedPreferences.getInstance();
       await tester.pumpWidget(_wrap(prefs, onDisconnect: () async {}));
       await tester.pumpAndSettle();

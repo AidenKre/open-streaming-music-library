@@ -1,7 +1,9 @@
 """Real previous-version backend databases for migration tests.
 
 ``fixtures/schema_v9.sql`` is the frozen ``init.sql`` of schema version 9
-(``main`` @ 3ee4c9e, the last pre-Phase-5 schema). Fixtures are built from it
+(``main`` @ 3ee4c9e, the last pre-Phase-5 schema); ``fixtures/schema_v11.sql``
+is the frozen ``init.sql`` of schema version 11 (PR 5A.0, ``phase-5a0`` @
+747fa35, before the history tables). Fixtures are built from it
 with plain SQL and then opened through the production ``Database.initialize()``
 so the real migration ladder runs.
 """
@@ -13,6 +15,7 @@ from app.database.database import Database, DatabaseContext
 
 FIXTURES = Path(__file__).parent / "fixtures"
 V9_SCHEMA = FIXTURES / "schema_v9.sql"
+V11_SCHEMA = FIXTURES / "schema_v11.sql"
 INIT_SQL = Path(__file__).parent.parent / "app" / "database" / "init.sql"
 
 
@@ -23,6 +26,21 @@ def make_v9_database(path: Path) -> None:
     try:
         conn.executescript(V9_SCHEMA.read_text())
         conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def make_v11_database(path: Path) -> None:
+    """An empty schema-v11 database (user_version 11, as PR 5A.0 ships it)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(V11_SCHEMA.read_text())
+        conn.execute("PRAGMA user_version = 11")
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('server_instance_id', 'inst-v11')"
+        )
         conn.commit()
     finally:
         conn.close()

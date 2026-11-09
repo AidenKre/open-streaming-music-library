@@ -1134,8 +1134,778 @@ i1.GeneratedColumn<int> _column_68(String aliasedName) =>
       type: i1.DriftSqlType.int,
       $customConstraints: 'NOT NULL',
     );
+
+final class Schema3 extends i0.VersionedSchema {
+  Schema3({required super.database}) : super(version: 3);
+  @override
+  late final List<i1.DatabaseSchemaEntity> entities = [
+    artists,
+    albums,
+    tracks,
+    trackmetadata,
+    queueSessions,
+    queueSessionItems,
+    queueSessionPlayOrder,
+    pendingEdits,
+    serverBinding,
+    syncCursors,
+    historyEvents,
+    localCounters,
+    historySyncFailures,
+    historyConflictArchive,
+    activeListens,
+    idxArtistsNameLower,
+    idxAlbumsNameLower,
+    idxAlbumsArtistId,
+    idxAlbumsRegular,
+    idxAlbumsSingles,
+    idxTitle,
+    idxArtist,
+    idxAlbum,
+    idxAlbumArtist,
+    idxTmArtistId,
+    idxTmAlbumId,
+    idxYear,
+    idxDate,
+    idxGenre,
+    idxGenreNocase,
+    idxTrackNumber,
+    idxDiscNumber,
+    idxCodec,
+    idxDuration,
+    idxBitrateKbps,
+    idxSampleRateHz,
+    idxChannels,
+    idxHasAlbumArt,
+    idxTmLibraryQueueOrder,
+    idxTmArtistQueueOrder,
+    idxTmAlbumQueueOrder,
+    idxQueueSessionItemsSessionPosition,
+    idxQueueSessionItemsSessionUuid,
+    idxQueueSessionPlayOrderSessionPosition,
+    idxQueueSessionPlayOrderSessionItem,
+    idxHistoryEventsPending,
+    idxHistoryEventsKindOccurred,
+    idxActiveListensAccumulating,
+  ];
+  late final Shape0 artists = Shape0(
+    source: i0.VersionedTable(
+      entityName: 'artists',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(id)'],
+      columns: [_column_0, _column_1, _column_2],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape1 albums = Shape1(
+    source: i0.VersionedTable(
+      entityName: 'albums',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(id)'],
+      columns: [
+        _column_0,
+        _column_3,
+        _column_4,
+        _column_5,
+        _column_6,
+        _column_7,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape2 tracks = Shape2(
+    source: i0.VersionedTable(
+      entityName: 'tracks',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(uuid_id)'],
+      columns: [
+        _column_8,
+        _column_9,
+        _column_10,
+        _column_11,
+        _column_12,
+        _column_13,
+        _column_14,
+        _column_15,
+        _column_16,
+        _column_17,
+        _column_18,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape3 trackmetadata = Shape3(
+    source: i0.VersionedTable(
+      entityName: 'trackmetadata',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(uuid_id)'],
+      columns: [
+        _column_19,
+        _column_20,
+        _column_21,
+        _column_22,
+        _column_23,
+        _column_24,
+        _column_25,
+        _column_6,
+        _column_26,
+        _column_27,
+        _column_28,
+        _column_29,
+        _column_30,
+        _column_31,
+        _column_32,
+        _column_33,
+        _column_34,
+        _column_35,
+        _column_36,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape4 queueSessions = Shape4(
+    source: i0.VersionedTable(
+      entityName: 'queue_sessions',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: [],
+      columns: [
+        _column_37,
+        _column_38,
+        _column_10,
+        _column_39,
+        _column_40,
+        _column_41,
+        _column_42,
+        _column_43,
+        _column_44,
+        _column_45,
+        _column_46,
+        _column_47,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape5 queueSessionItems = Shape5(
+    source: i0.VersionedTable(
+      entityName: 'queue_session_items',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['UNIQUE(session_id, queue_type, position)'],
+      columns: [_column_48, _column_49, _column_50, _column_51, _column_19],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape6 queueSessionPlayOrder = Shape6(
+    source: i0.VersionedTable(
+      entityName: 'queue_session_play_order',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: [
+        'PRIMARY KEY(session_id, play_position)',
+        'UNIQUE(session_id, item_id)',
+      ],
+      columns: [_column_49, _column_52, _column_53],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape7 pendingEdits = Shape7(
+    source: i0.VersionedTable(
+      entityName: 'pending_edits',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(uuid_id)'],
+      columns: [
+        _column_8,
+        _column_54,
+        _column_55,
+        _column_56,
+        _column_57,
+        _column_58,
+        _column_59,
+        _column_60,
+        _column_39,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape8 serverBinding = Shape8(
+    source: i0.VersionedTable(
+      entityName: 'server_binding',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(id)'],
+      columns: [
+        _column_61,
+        _column_62,
+        _column_63,
+        _column_64,
+        _column_65,
+        _column_66,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape9 syncCursors = Shape9(
+    source: i0.VersionedTable(
+      entityName: 'sync_cursors',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(stream)'],
+      columns: [_column_67, _column_68],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape10 historyEvents = Shape10(
+    source: i0.VersionedTable(
+      entityName: 'history_events',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: [],
+      columns: [
+        _column_69,
+        _column_70,
+        _column_71,
+        _column_72,
+        _column_73,
+        _column_74,
+        _column_75,
+        _column_76,
+        _column_77,
+        _column_78,
+        _column_79,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape11 localCounters = Shape11(
+    source: i0.VersionedTable(
+      entityName: 'local_counters',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY("key")'],
+      columns: [_column_80, _column_68],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape12 historySyncFailures = Shape12(
+    source: i0.VersionedTable(
+      entityName: 'history_sync_failures',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(event_uuid)'],
+      columns: [_column_81, _column_82, _column_83, _column_84],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape13 historyConflictArchive = Shape13(
+    source: i0.VersionedTable(
+      entityName: 'history_conflict_archive',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: [],
+      columns: [_column_85, _column_81, _column_86, _column_87],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  late final Shape14 activeListens = Shape14(
+    source: i0.VersionedTable(
+      entityName: 'active_listens',
+      withoutRowId: false,
+      isStrict: false,
+      tableConstraints: ['PRIMARY KEY(listen_uuid)'],
+      columns: [
+        _column_88,
+        _column_89,
+        _column_90,
+        _column_91,
+        _column_92,
+        _column_93,
+        _column_94,
+        _column_95,
+        _column_96,
+        _column_97,
+      ],
+      attachedDatabase: database,
+    ),
+    alias: null,
+  );
+  final i1.Index idxArtistsNameLower = i1.Index(
+    'idx_artists_name_lower',
+    'CREATE INDEX idx_artists_name_lower ON artists (name_lower)',
+  );
+  final i1.Index idxAlbumsNameLower = i1.Index(
+    'idx_albums_name_lower',
+    'CREATE INDEX idx_albums_name_lower ON albums (name_lower)',
+  );
+  final i1.Index idxAlbumsArtistId = i1.Index(
+    'idx_albums_artist_id',
+    'CREATE INDEX idx_albums_artist_id ON albums (artist_id)',
+  );
+  final i1.Index idxAlbumsRegular = i1.Index(
+    'idx_albums_regular',
+    'CREATE UNIQUE INDEX idx_albums_regular ON albums (name_lower, artist_id) WHERE is_single_grouping = 0',
+  );
+  final i1.Index idxAlbumsSingles = i1.Index(
+    'idx_albums_singles',
+    'CREATE UNIQUE INDEX idx_albums_singles ON albums (artist_id, COALESCE(year, -1)) WHERE is_single_grouping = 1',
+  );
+  final i1.Index idxTitle = i1.Index(
+    'idx_title',
+    'CREATE INDEX idx_title ON trackmetadata (title)',
+  );
+  final i1.Index idxArtist = i1.Index(
+    'idx_artist',
+    'CREATE INDEX idx_artist ON trackmetadata (artist)',
+  );
+  final i1.Index idxAlbum = i1.Index(
+    'idx_album',
+    'CREATE INDEX idx_album ON trackmetadata (album)',
+  );
+  final i1.Index idxAlbumArtist = i1.Index(
+    'idx_album_artist',
+    'CREATE INDEX idx_album_artist ON trackmetadata (album_artist)',
+  );
+  final i1.Index idxTmArtistId = i1.Index(
+    'idx_tm_artist_id',
+    'CREATE INDEX idx_tm_artist_id ON trackmetadata (artist_id)',
+  );
+  final i1.Index idxTmAlbumId = i1.Index(
+    'idx_tm_album_id',
+    'CREATE INDEX idx_tm_album_id ON trackmetadata (album_id)',
+  );
+  final i1.Index idxYear = i1.Index(
+    'idx_year',
+    'CREATE INDEX idx_year ON trackmetadata (year)',
+  );
+  final i1.Index idxDate = i1.Index(
+    'idx_date',
+    'CREATE INDEX idx_date ON trackmetadata (date)',
+  );
+  final i1.Index idxGenre = i1.Index(
+    'idx_genre',
+    'CREATE INDEX idx_genre ON trackmetadata (genre)',
+  );
+  final i1.Index idxGenreNocase = i1.Index(
+    'idx_genre_nocase',
+    'CREATE INDEX idx_genre_nocase ON trackmetadata (genre COLLATE NOCASE)',
+  );
+  final i1.Index idxTrackNumber = i1.Index(
+    'idx_track_number',
+    'CREATE INDEX idx_track_number ON trackmetadata (track_number)',
+  );
+  final i1.Index idxDiscNumber = i1.Index(
+    'idx_disc_number',
+    'CREATE INDEX idx_disc_number ON trackmetadata (disc_number)',
+  );
+  final i1.Index idxCodec = i1.Index(
+    'idx_codec',
+    'CREATE INDEX idx_codec ON trackmetadata (codec)',
+  );
+  final i1.Index idxDuration = i1.Index(
+    'idx_duration',
+    'CREATE INDEX idx_duration ON trackmetadata (duration)',
+  );
+  final i1.Index idxBitrateKbps = i1.Index(
+    'idx_bitrate_kbps',
+    'CREATE INDEX idx_bitrate_kbps ON trackmetadata (bitrate_kbps)',
+  );
+  final i1.Index idxSampleRateHz = i1.Index(
+    'idx_sample_rate_hz',
+    'CREATE INDEX idx_sample_rate_hz ON trackmetadata (sample_rate_hz)',
+  );
+  final i1.Index idxChannels = i1.Index(
+    'idx_channels',
+    'CREATE INDEX idx_channels ON trackmetadata (channels)',
+  );
+  final i1.Index idxHasAlbumArt = i1.Index(
+    'idx_has_album_art',
+    'CREATE INDEX idx_has_album_art ON trackmetadata (has_album_art)',
+  );
+  final i1.Index idxTmLibraryQueueOrder = i1.Index(
+    'idx_tm_library_queue_order',
+    'CREATE INDEX idx_tm_library_queue_order ON trackmetadata (artist, album, disc_number, track_number, uuid_id)',
+  );
+  final i1.Index idxTmArtistQueueOrder = i1.Index(
+    'idx_tm_artist_queue_order',
+    'CREATE INDEX idx_tm_artist_queue_order ON trackmetadata (artist_id, album, disc_number, track_number, uuid_id)',
+  );
+  final i1.Index idxTmAlbumQueueOrder = i1.Index(
+    'idx_tm_album_queue_order',
+    'CREATE INDEX idx_tm_album_queue_order ON trackmetadata (artist_id, album_id, disc_number, track_number, uuid_id)',
+  );
+  final i1.Index idxQueueSessionItemsSessionPosition = i1.Index(
+    'idx_queue_session_items_session_position',
+    'CREATE INDEX idx_queue_session_items_session_position ON queue_session_items (session_id, queue_type, position)',
+  );
+  final i1.Index idxQueueSessionItemsSessionUuid = i1.Index(
+    'idx_queue_session_items_session_uuid',
+    'CREATE INDEX idx_queue_session_items_session_uuid ON queue_session_items (session_id, uuid_id)',
+  );
+  final i1.Index idxQueueSessionPlayOrderSessionPosition = i1.Index(
+    'idx_queue_session_play_order_session_position',
+    'CREATE INDEX idx_queue_session_play_order_session_position ON queue_session_play_order (session_id, play_position)',
+  );
+  final i1.Index idxQueueSessionPlayOrderSessionItem = i1.Index(
+    'idx_queue_session_play_order_session_item',
+    'CREATE INDEX idx_queue_session_play_order_session_item ON queue_session_play_order (session_id, item_id)',
+  );
+  final i1.Index idxHistoryEventsPending = i1.Index(
+    'idx_history_events_pending',
+    'CREATE INDEX idx_history_events_pending ON history_events (pending_upload, local_id)',
+  );
+  final i1.Index idxHistoryEventsKindOccurred = i1.Index(
+    'idx_history_events_kind_occurred',
+    'CREATE INDEX idx_history_events_kind_occurred ON history_events (kind, occurred_at DESC, event_uuid DESC)',
+  );
+  final i1.Index idxActiveListensAccumulating = i1.Index(
+    'idx_active_listens_accumulating',
+    'CREATE UNIQUE INDEX idx_active_listens_accumulating ON active_listens (state) WHERE state = \'accumulating\'',
+  );
+}
+
+class Shape10 extends i0.VersionedTable {
+  Shape10({required super.source, required super.alias}) : super.aliased();
+  i1.GeneratedColumn<int> get localId =>
+      columnsByName['local_id']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<String> get eventUuid =>
+      columnsByName['event_uuid']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<String> get kind =>
+      columnsByName['kind']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<String> get entityType =>
+      columnsByName['entity_type']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<String> get entityRef =>
+      columnsByName['entity_ref']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<int> get occurredAt =>
+      columnsByName['occurred_at']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<double> get secondsPlayed =>
+      columnsByName['seconds_played']! as i1.GeneratedColumn<double>;
+  i1.GeneratedColumn<double> get trackLength =>
+      columnsByName['track_length']! as i1.GeneratedColumn<double>;
+  i1.GeneratedColumn<int> get serverRevision =>
+      columnsByName['server_revision']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<int> get receivedAt =>
+      columnsByName['received_at']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<int> get pendingUpload =>
+      columnsByName['pending_upload']! as i1.GeneratedColumn<int>;
+}
+
+i1.GeneratedColumn<int> _column_69(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'local_id',
+      aliasedName,
+      false,
+      hasAutoIncrement: true,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL PRIMARY KEY AUTOINCREMENT',
+    );
+i1.GeneratedColumn<String> _column_70(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'event_uuid',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL UNIQUE',
+    );
+i1.GeneratedColumn<String> _column_71(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'kind',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<String> _column_72(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'entity_type',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<String> _column_73(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'entity_ref',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<int> _column_74(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'occurred_at',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<double> _column_75(String aliasedName) =>
+    i1.GeneratedColumn<double>(
+      'seconds_played',
+      aliasedName,
+      true,
+      type: i1.DriftSqlType.double,
+      $customConstraints: 'NULL',
+    );
+i1.GeneratedColumn<double> _column_76(String aliasedName) =>
+    i1.GeneratedColumn<double>(
+      'track_length',
+      aliasedName,
+      true,
+      type: i1.DriftSqlType.double,
+      $customConstraints: 'NULL',
+    );
+i1.GeneratedColumn<int> _column_77(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'server_revision',
+      aliasedName,
+      true,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NULL UNIQUE',
+    );
+i1.GeneratedColumn<int> _column_78(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'received_at',
+      aliasedName,
+      true,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NULL',
+    );
+i1.GeneratedColumn<int> _column_79(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'pending_upload',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL CHECK (pending_upload IN (0, 1))',
+    );
+
+class Shape11 extends i0.VersionedTable {
+  Shape11({required super.source, required super.alias}) : super.aliased();
+  i1.GeneratedColumn<String> get key =>
+      columnsByName['key']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<int> get value =>
+      columnsByName['value']! as i1.GeneratedColumn<int>;
+}
+
+i1.GeneratedColumn<String> _column_80(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'key',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+
+class Shape12 extends i0.VersionedTable {
+  Shape12({required super.source, required super.alias}) : super.aliased();
+  i1.GeneratedColumn<String> get eventUuid =>
+      columnsByName['event_uuid']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<String> get reason =>
+      columnsByName['reason']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<String> get detail =>
+      columnsByName['detail']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<int> get failedAt =>
+      columnsByName['failed_at']! as i1.GeneratedColumn<int>;
+}
+
+i1.GeneratedColumn<String> _column_81(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'event_uuid',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<String> _column_82(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'reason',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<String> _column_83(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'detail',
+      aliasedName,
+      true,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NULL',
+    );
+i1.GeneratedColumn<int> _column_84(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'failed_at',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+
+class Shape13 extends i0.VersionedTable {
+  Shape13({required super.source, required super.alias}) : super.aliased();
+  i1.GeneratedColumn<int> get archiveId =>
+      columnsByName['archive_id']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<String> get eventUuid =>
+      columnsByName['event_uuid']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<String> get payloadJson =>
+      columnsByName['payload_json']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<int> get archivedAt =>
+      columnsByName['archived_at']! as i1.GeneratedColumn<int>;
+}
+
+i1.GeneratedColumn<int> _column_85(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'archive_id',
+      aliasedName,
+      false,
+      hasAutoIncrement: true,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL PRIMARY KEY AUTOINCREMENT',
+    );
+i1.GeneratedColumn<String> _column_86(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'payload_json',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<int> _column_87(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'archived_at',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+
+class Shape14 extends i0.VersionedTable {
+  Shape14({required super.source, required super.alias}) : super.aliased();
+  i1.GeneratedColumn<String> get listenUuid =>
+      columnsByName['listen_uuid']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<int> get queueSessionId =>
+      columnsByName['queue_session_id']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<int> get queueItemId =>
+      columnsByName['queue_item_id']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<String> get trackUuid =>
+      columnsByName['track_uuid']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<int> get startedAt =>
+      columnsByName['started_at']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<double> get durationSeconds =>
+      columnsByName['duration_seconds']! as i1.GeneratedColumn<double>;
+  i1.GeneratedColumn<int> get accumulatedMicros =>
+      columnsByName['accumulated_micros']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<int> get lastCheckpointAt =>
+      columnsByName['last_checkpoint_at']! as i1.GeneratedColumn<int>;
+  i1.GeneratedColumn<String> get state =>
+      columnsByName['state']! as i1.GeneratedColumn<String>;
+  i1.GeneratedColumn<String> get finalPayloadJson =>
+      columnsByName['final_payload_json']! as i1.GeneratedColumn<String>;
+}
+
+i1.GeneratedColumn<String> _column_88(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'listen_uuid',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<int> _column_89(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'queue_session_id',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<int> _column_90(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'queue_item_id',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<String> _column_91(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'track_uuid',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<int> _column_92(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'started_at',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<double> _column_93(String aliasedName) =>
+    i1.GeneratedColumn<double>(
+      'duration_seconds',
+      aliasedName,
+      true,
+      type: i1.DriftSqlType.double,
+      $customConstraints: 'NULL',
+    );
+i1.GeneratedColumn<int> _column_94(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'accumulated_micros',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<int> _column_95(String aliasedName) =>
+    i1.GeneratedColumn<int>(
+      'last_checkpoint_at',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.int,
+      $customConstraints: 'NOT NULL',
+    );
+i1.GeneratedColumn<String> _column_96(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'state',
+      aliasedName,
+      false,
+      type: i1.DriftSqlType.string,
+      $customConstraints:
+          'NOT NULL CHECK (state IN (\'accumulating\', \'finalizing\'))',
+    );
+i1.GeneratedColumn<String> _column_97(String aliasedName) =>
+    i1.GeneratedColumn<String>(
+      'final_payload_json',
+      aliasedName,
+      true,
+      type: i1.DriftSqlType.string,
+      $customConstraints: 'NULL',
+    );
 i0.MigrationStepWithVersion migrationSteps({
   required Future<void> Function(i1.Migrator m, Schema2 schema) from1To2,
+  required Future<void> Function(i1.Migrator m, Schema3 schema) from2To3,
 }) {
   return (currentVersion, database) async {
     switch (currentVersion) {
@@ -1144,6 +1914,11 @@ i0.MigrationStepWithVersion migrationSteps({
         final migrator = i1.Migrator(database, schema);
         await from1To2(migrator, schema);
         return 2;
+      case 2:
+        final schema = Schema3(database: database);
+        final migrator = i1.Migrator(database, schema);
+        await from2To3(migrator, schema);
+        return 3;
       default:
         throw ArgumentError.value('Unknown migration from $currentVersion');
     }
@@ -1152,6 +1927,7 @@ i0.MigrationStepWithVersion migrationSteps({
 
 i1.OnUpgrade stepByStep({
   required Future<void> Function(i1.Migrator m, Schema2 schema) from1To2,
+  required Future<void> Function(i1.Migrator m, Schema3 schema) from2To3,
 }) => i0.VersionedSchema.stepByStepHelper(
-  step: migrationSteps(from1To2: from1To2),
+  step: migrationSteps(from1To2: from1To2, from2To3: from2To3),
 );

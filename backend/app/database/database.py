@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Flag, auto
 from pathlib import Path
+from time import time_ns
 from typing import Any, List, Literal, Optional
 
 from app.database.table_rebuild import rebuild_tables
@@ -13,10 +14,34 @@ from app.models.album import Album
 from app.models.artist import Artist
 from app.models.cover_art import CoverArt
 from app.models.edit_fields import EDIT_FIELD_SPECS
+from app.models.history import HistoryEvent
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
 # TODO: catch specific sqlite3 exceptions rather than broad Exception
+
+# Keep these statements identical to the history DDL in init.sql.
+HISTORY_SCHEMA_DDL = (
+    '''CREATE TABLE IF NOT EXISTS history_events (
+    "event_uuid" TEXT NOT NULL PRIMARY KEY,
+    "revision" INTEGER NOT NULL UNIQUE CHECK (revision > 0),
+    "kind" TEXT NOT NULL CHECK (length(kind) BETWEEN 1 AND 64),
+    "entity_type" TEXT NOT NULL CHECK (length(entity_type) BETWEEN 1 AND 64),
+    "entity_ref" TEXT NOT NULL CHECK (length(entity_ref) BETWEEN 1 AND 256),
+    "occurred_at" INTEGER NOT NULL CHECK (occurred_at BETWEEN 0 AND 253402300799999),
+    "seconds_played" REAL CHECK (seconds_played IS NULL OR seconds_played >= 0),
+    "track_length" REAL CHECK (track_length IS NULL OR track_length > 0),
+    "received_at" INTEGER NOT NULL,
+    "owner_id" TEXT
+);''',
+    '''CREATE TABLE IF NOT EXISTS history_hook_failures (
+    "id" INTEGER PRIMARY KEY,
+    "subscriber" TEXT NOT NULL,
+    "event_uuid" TEXT NOT NULL,
+    "error" TEXT NOT NULL,
+    "created_at" INTEGER NOT NULL
+);''',
+)
 
 ALLOWED_METADATA_COLUMNS = [
     "title",
@@ -54,6 +79,12 @@ ALLOWED_ARTIST_COLUMNS = ["id", "name"]
 ARTIST_TEXT_COLUMNS = {"name"}
 
 ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
+
+
+class HistoryEventConflict(Exception):
+    def __init__(self, event_uuids: list[str]):
+        self.event_uuids = event_uuids
+        super().__init__("History event payload conflict")
 
 
 class TrackNotFound(Exception):
@@ -393,7 +424,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 11
+    LATEST_SCHEMA_VERSION = 12
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -664,6 +695,80 @@ class Database:
                 backup_path=database_path.with_name(database_path.name + ".pre-v11.bak"),
                 verify_tables=("artists", "albums"),
             )
+
+        if version < 12:
+            with self._connection(commit=True, immediate=True) as conn:
+                for statement in HISTORY_SCHEMA_DDL:
+                    conn.execute(statement)
+                conn.execute("PRAGMA user_version = 12")
+
+    def get_history_changes(
+        self, after: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int, int | None]:
+        with self._connection(commit=True) as conn:
+            # A connection context alone does not give SELECTs a shared snapshot.
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                "SELECT event_uuid, revision, kind, entity_type, entity_ref, "
+                "occurred_at, seconds_played, track_length, received_at "
+                "FROM history_events WHERE revision > ? ORDER BY revision ASC LIMIT ?",
+                (after, limit + 1),
+            ).fetchall()
+            latest_revision = conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM history_events"
+            ).fetchone()[0]
+        next_cursor = rows[limit - 1]["revision"] if len(rows) > limit else None
+        return [dict(row) for row in rows[:limit]], latest_revision, next_cursor
+
+    def insert_history_events(self, events: list[HistoryEvent]) -> list[str]:
+        # Import here because the services package itself depends on Database.
+        from app.services.history_hooks import on_history_events_inserted
+
+        with self._connection(commit=True, immediate=True) as conn:
+            payloads = {}
+            conflicts = set()
+            for event in events:
+                payload = event.model_dump()
+                if event.event_uuid in payloads and payloads[event.event_uuid] != payload:
+                    conflicts.add(event.event_uuid)
+                payloads[event.event_uuid] = payload
+            if conflicts:
+                raise HistoryEventConflict(sorted(conflicts))
+
+            columns = tuple(HistoryEvent.model_fields)
+            placeholders = ",".join("?" for _ in payloads)
+            existing = {
+                row["event_uuid"]: dict(row)
+                for row in conn.execute(
+                    f"SELECT {', '.join(columns)} FROM history_events "
+                    f"WHERE event_uuid IN ({placeholders})",
+                    tuple(payloads),
+                )
+            }
+            conflicts = {
+                uid for uid, payload in payloads.items()
+                if uid in existing and existing[uid] != payload
+            }
+            if conflicts:
+                raise HistoryEventConflict(sorted(conflicts))
+
+            new_events = []
+            for uid, payload in payloads.items():
+                if uid in existing:
+                    continue
+                row = {
+                    **payload,
+                    "revision": self._next_revision(conn),
+                    "received_at": time_ns() // 1_000_000,
+                }
+                conn.execute(
+                    f"INSERT INTO history_events ({', '.join(row)}) "
+                    f"VALUES ({', '.join('?' for _ in row)})",
+                    tuple(row.values()),
+                )
+                new_events.append(row)
+            on_history_events_inserted(conn, new_events)
+        return list(payloads)
 
     @staticmethod
     def _next_revision(conn) -> int:

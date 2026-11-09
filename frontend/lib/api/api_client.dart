@@ -43,6 +43,9 @@ class ApiException implements Exception {
     return detail is Map<String, dynamic> ? detail : null;
   }
 
+  /// FastAPI field-validation errors, parsed through the shared envelope.
+  List<dynamic>? get validationErrors => _detail is List ? _detail : null;
+
   /// Lets legacy callers keep showing only string-detail rejections.
   bool get hasStringDetail => _detail is String;
 

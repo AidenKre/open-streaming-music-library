@@ -20,8 +20,9 @@ const phase4SettingsSections = <SettingsSection>[
   SettingsSection(id: 'connection', order: 900, title: 'Connection'),
 ];
 
-/// Disconnect is offered only inside a live session.
-final _sessionIsLiveProvider = Provider<bool>(
+/// Disconnect (and the Sync & storage rows) are offered only inside a live
+/// session.
+final sessionIsLiveProvider = Provider<bool>(
   (ref) => ref.watch(sessionControlsProvider).phase == SessionPhase.live,
 );
 
@@ -49,7 +50,7 @@ final phase4SettingsRows = <SettingsRowContribution>[
   SettingsRowContribution(
     sectionId: 'connection',
     order: 0,
-    isAvailable: _sessionIsLiveProvider,
+    isAvailable: sessionIsLiveProvider,
     build: (_) => const _DisconnectRow(),
   ),
 ];

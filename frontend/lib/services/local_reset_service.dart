@@ -9,6 +9,7 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
+import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/local_resettable.dart';
 
 /// Coordinates a full local reset of frontend-owned state in three steps
@@ -163,13 +164,16 @@ class LocalResetAbortedException implements Exception {
 /// the fence and before the wipe. Playback goes first; later phases' runners
 /// register after it.
 final localQuiescablesProvider = Provider<List<Quiescable>>((ref) {
-  return <Quiescable>[_PlaybackQuiescable(ref)];
+  return <Quiescable>[_PlaybackQuiescable(ref), _HistoryQuiescable(ref)];
 });
 
 /// Contributors to the Disconnect confirmation's "will be lost" copy, in
 /// display order.
 final lossReportersProvider = Provider<List<LossReporter>>((ref) {
-  return <LossReporter>[ref.read(editOutboxProvider)];
+  return <LossReporter>[
+    ref.read(editOutboxProvider),
+    _HistoryLossReporter(ref),
+  ];
 });
 
 final localResetServiceProvider = Provider<LocalResetService>((ref) {
@@ -256,5 +260,35 @@ class _ApiClientUrlResettable implements LocalResettable {
   @override
   Future<void> resetLocalState() async {
     ApiClient.init('');
+  }
+}
+
+/// The history runner as a quiesce participant (after playback): stops its
+/// triggers, then waits out the pass in flight.
+class _HistoryQuiescable implements Quiescable {
+  _HistoryQuiescable(this._ref);
+  final Ref _ref;
+
+  @override
+  String get quiesceName => 'history';
+
+  @override
+  Future<void> quiesce() {
+    _ref.read(historySyncTriggersProvider).dispose();
+    return _ref.read(historyRunnerProvider).quiesce();
+  }
+}
+
+/// Unsent local history (pending upload, quarantined events included).
+class _HistoryLossReporter implements LossReporter {
+  _HistoryLossReporter(this._ref);
+  final Ref _ref;
+
+  @override
+  Future<String?> pendingLossSummary() async {
+    final counts = await _ref.read(historyRepositoryProvider).counts();
+    final n = counts.pending + counts.quarantined;
+    if (n == 0) return null;
+    return '$n unsent history event${n == 1 ? '' : 's'}';
   }
 }

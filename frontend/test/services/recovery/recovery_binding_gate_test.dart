@@ -174,6 +174,7 @@ void main() {
     expect(byPriority, {
       RecoveryPriority.sync: true,
       RecoveryPriority.appInfo: true,
+      RecoveryPriority.history: true,
       RecoveryPriority.resumeDownloads: true,
       RecoveryPriority.resumeConversions: true,
       RecoveryPriority.reconcileDownloads: false,

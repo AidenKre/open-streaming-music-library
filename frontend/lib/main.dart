@@ -11,6 +11,7 @@ import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
@@ -120,6 +121,8 @@ class _FrontendState extends ConsumerState<Frontend>
     unawaited(
       ref.read(recoveryServiceProvider).runFor(RecoveryTrigger.coldStart),
     );
+    // The scope starts in the foreground: the history poll may run.
+    ref.read(historySyncTriggersProvider).setForeground(true);
   }
 
   @override
@@ -132,6 +135,9 @@ class _FrontendState extends ConsumerState<Frontend>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    ref
+        .read(historySyncTriggersProvider)
+        .setForeground(state == AppLifecycleState.resumed);
     if (state == AppLifecycleState.resumed) {
       unawaited(
         ref.read(recoveryServiceProvider).runFor(RecoveryTrigger.appResume),

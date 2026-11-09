@@ -8,6 +8,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 
@@ -189,6 +190,7 @@ final recoverablesProvider = Provider<List<RecoverableService>>((ref) {
     _ResumeDownloadsRecoverable(ref),
     _ResumeConversionsRecoverable(ref),
     _ReconcileDownloadsRecoverable(ref),
+    _HistoryRecoverable(ref),
   ];
 });
 
@@ -318,4 +320,31 @@ class _ReconcileDownloadsRecoverable implements RecoverableService {
   @override
   Future<void> recover(RecoveryTrigger trigger) =>
       _ref.read(downloadReconciliationServiceProvider).reconcile();
+}
+
+/// Requests a history pass (upload, then pull) on every edge. Never runs the
+/// pass body itself; recovery edges (not cold start) bypass a pending
+/// backoff so a reconnect syncs now.
+class _HistoryRecoverable implements RecoverableService {
+  _HistoryRecoverable(this._ref);
+  final Ref _ref;
+
+  @override
+  bool get requiresBinding => true;
+
+  @override
+  int get recoveryPriority => RecoveryPriority.history;
+
+  @override
+  Set<RecoveryTrigger> get triggers => RecoveryTrigger.values.toSet();
+
+  @override
+  Future<void> recover(RecoveryTrigger trigger) async {
+    _ref
+        .read(historyRunnerProvider)
+        .request(
+          trigger.name,
+          bypassBackoff: trigger != RecoveryTrigger.coldStart,
+        );
+  }
 }

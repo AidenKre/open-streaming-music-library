@@ -120,6 +120,10 @@ class ServerInfo(BaseModel):
     instance_id: str
 
 
+class HistoryCapabilities(BaseModel):
+    version: Literal[1] = 1
+
+
 class AppInfoResponse(BaseModel):
     """App-level bootstrap blob. The home for app-global facts so later phases
     extend it (Phase 2 adds a ``conversion`` block) rather than add endpoints.
@@ -128,6 +132,7 @@ class AppInfoResponse(BaseModel):
     entities: dict[str, EntityInfo]
     conversion: ConversionCapabilities
     server: ServerInfo
+    history: HistoryCapabilities
 
 
 class JobResponse(BaseModel):

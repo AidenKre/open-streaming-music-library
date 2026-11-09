@@ -224,8 +224,8 @@ void main() {
 
   group('recoverablesProvider default registration', () {
     test(
-      'advertises sync, app-info, resume-downloads, resume-conversions, and '
-      'reconcile adapters',
+      'advertises sync, app-info, history, resume-downloads, '
+      'resume-conversions, and reconcile adapters',
       () {
         // No member overrides — exercises the real default list. The adapters
         // are private, so assert by count + trigger coverage rather than type.
@@ -233,20 +233,21 @@ void main() {
         addTearDown(container.dispose);
 
         final registered = container.read(recoverablesProvider);
-        expect(registered, hasLength(5));
+        expect(registered, hasLength(6));
 
         final networkMembers = registered
             .where((r) => r.triggers.contains(RecoveryTrigger.networkRecovered))
             .toList();
-        expect(networkMembers, hasLength(4),
-            reason: 'sync + app-info + resume-downloads + resume-conversions '
-                'fire on network recovery');
+        expect(networkMembers, hasLength(5),
+            reason: 'sync + app-info + history + resume-downloads + '
+                'resume-conversions fire on network recovery');
 
         final coldMembers = registered
             .where((r) => r.triggers.contains(RecoveryTrigger.coldStart))
             .toList();
-        expect(coldMembers, hasLength(2),
-            reason: 'reconcile + resume-conversions fire on cold start');
+        expect(coldMembers, hasLength(3),
+            reason: 'reconcile + resume-conversions + history fire on cold '
+                'start');
 
         final conversionMembers = registered
             .where((r) =>

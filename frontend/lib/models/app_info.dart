@@ -139,16 +139,27 @@ class AppInfo {
   final Map<String, EntityInfo> entities;
   final ConversionCapabilities conversion;
 
+  /// The server's `history` feature block version (SC-03), null when the
+  /// server doesn't advertise history sync (an older server, or a malformed
+  /// block): local recording continues, the endpoints are not called.
+  final int? historyVersion;
+
   const AppInfo({
     this.entities = const {},
     this.conversion = const ConversionCapabilities(),
+    this.historyVersion,
   });
 
   EntityInfo? entity(String name) => entities[name];
 
+  /// Whether the server supports history sync (version 1 or later).
+  bool get supportsHistory => (historyVersion ?? 0) >= 1;
+
   factory AppInfo.fromJson(Map<String, dynamic> json) {
     final rawEntities = (json['entities'] as Map<dynamic, dynamic>? ?? const {});
     final rawConversion = json['conversion'] as Map<dynamic, dynamic>?;
+    final rawHistory = json['history'];
+    final historyVersion = rawHistory is Map ? rawHistory['version'] : null;
     return AppInfo(
       entities: rawEntities.map(
         (key, value) => MapEntry(
@@ -159,11 +170,13 @@ class AppInfo {
       conversion: rawConversion != null
           ? ConversionCapabilities.fromJson(Map<String, dynamic>.from(rawConversion))
           : const ConversionCapabilities(),
+      historyVersion: historyVersion is int ? historyVersion : null,
     );
   }
 
   Map<String, dynamic> toJson() => {
     'entities': entities.map((k, v) => MapEntry(k, v.toJson())),
     'conversion': conversion.toJson(),
+    if (historyVersion != null) 'history': {'version': historyVersion},
   };
 }

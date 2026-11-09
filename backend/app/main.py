@@ -54,7 +54,8 @@ from app.models import (
 )
 from app.core.media_types import CODEC_MIME, MIME_EXTENSION, is_lossless
 from app.models.edit_fields import EDIT_FIELD_SPECS
-from app.models.api_return_models import ServerInfo
+from app.models.api_return_models import HistoryCapabilities, ServerInfo
+from app.routers.history import router as history_router
 from app.services.metadata import TagWriteError
 from app.services.track_edit import (
     TrackPatchRequest,
@@ -114,6 +115,7 @@ async def lifespan(_app: FastAPI):
 # The POSIX instance lock guards startup before migrations; run with --workers 1.
 # TODO: Dependency inject depends on get_database into api endpoints (and make the new function needed for this)
 app = FastAPI(lifespan=lifespan)
+app.include_router(history_router)
 
 
 def _resolve_track_source_path(database: Database, uuid_id: str) -> Optional[Path]:
@@ -1120,6 +1122,7 @@ def get_app_info():
     database: Database = cast(Database, app.state.database)
     return AppInfoResponse(
         server=ServerInfo(instance_id=database.get_server_instance_id()),
+        history=HistoryCapabilities(),
         entities={
             "track": EntityInfo(
                 fields=track_fields, actions=["convert"] if targets else []

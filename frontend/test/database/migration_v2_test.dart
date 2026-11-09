@@ -150,12 +150,14 @@ void main() {
     return db;
   }
 
-  test('upgrades the file to schema version 2', () async {
+  test('upgrades the file to the current schema version (via v2)', () async {
     final db = await openUpgraded();
     addTearDown(db.close);
-    expect(db.schemaVersion, 2);
+    // The v1 file is upgraded through every later step to the current
+    // version (this test pins the v1 -> v2 step's effects).
+    expect(db.schemaVersion, greaterThanOrEqualTo(2));
     final v = await db.customSelect('PRAGMA user_version').getSingle();
-    expect(v.data.values.single, 2);
+    expect(v.data.values.single, db.schemaVersion);
   });
 
   test('adds empty server_binding and sync_cursors tables', () async {
@@ -283,7 +285,7 @@ void main() {
     addTearDown(second.close);
     expect(await _rows(second, 'SELECT * FROM trackmetadata ORDER BY uuid_id'), before);
     final v = await second.customSelect('PRAGMA user_version').getSingle();
-    expect(v.data.values.single, 2);
+    expect(v.data.values.single, second.schemaVersion);
   });
 
   test('a failed upgrade rolls back completely and can be retried', () async {
@@ -321,7 +323,7 @@ void main() {
     final retried = await openUpgraded();
     addTearDown(retried.close);
     final v = await retried.customSelect('PRAGMA user_version').getSingle();
-    expect(v.data.values.single, 2);
+    expect(v.data.values.single, retried.schemaVersion);
     expect(
       (await retried.getSearchResults('knownprops')).tracks.single.read<String>('uuid_id'),
       _u3,
