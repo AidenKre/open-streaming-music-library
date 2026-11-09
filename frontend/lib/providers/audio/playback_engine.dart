@@ -239,7 +239,6 @@ abstract interface class PlaybackEngine {
 
   Stream<EngineTransportState> get transportStateStream;
   Stream<Duration> get positionStream;
-  Stream<Duration?> get durationStream;
   Stream<int?> get currentItemIdStream;
   Stream<UnavailableAdvance> get unavailableAdvanceStream;
   Stream<EngineLoadEvent> get loadEvents;

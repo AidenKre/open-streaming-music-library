@@ -28,7 +28,7 @@ class MiniPlayer extends ConsumerWidget {
     final colors = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 
-    final progress = duration.inMilliseconds > 0
+    final progress = duration != null && duration.inMilliseconds > 0
         ? position.inMilliseconds / duration.inMilliseconds
         : 0.0;
 

@@ -13,11 +13,13 @@ class _Queue extends QueueRepository {
     playPosition: i, uuidId: 't$i',
   ));
   int reads = 0;
+  Completer<void>? readGate;
   @override
   Future<List<QueuePlaybackEntry>> getPlaybackEntries(int sessionId, {
     int startPlayPosition = 0, int? limit,
   }) async {
     reads++;
+    await readGate?.future;
     final rows = entries.where((e) => e.playPosition >= startPlayPosition);
     return (limit == null ? rows : rows.take(limit)).toList();
   }
@@ -43,33 +45,44 @@ void main() {
     expect(window.nextForwardHydrationPlayPosition, 0, reason: 'read is only a proposal');
   });
 
-  test('an already loaded item needs no proposal or row read', () async {
-    expect(await window.proposeItemLoad(1, queue.entries[20], alreadyLoaded: true), isNull);
-    expect(queue.reads, 0);
+  test('a replacement sets the contiguous interval and a new revision', () {
+    final before = window.windowRevision;
+    window.replaceWindow(start: 28, end: 89);
+    expect(window.windowStartPlayPosition, 28);
+    expect(window.nextForwardHydrationPlayPosition, 89);
+    expect(window.windowRevision, greaterThan(before));
+    expect(window.coversQueue(120), isFalse);
+    window.replaceWindow(start: 0, end: 120);
+    expect(window.coversQueue(120), isTrue);
   });
 
-  test('an extension changes coverage only when acknowledged', () async {
-    final proposal = (await window.proposeItemLoad(1, queue.entries[40], alreadyLoaded: false))!;
-    expect(proposal.entries.map((e) => e.playPosition), List.generate(61, (i) => i + 28));
-    expect(window.nextForwardHydrationPlayPosition, 0);
-    window.acknowledge(proposal);
-    expect(window.nextForwardHydrationPlayPosition, 89);
+  test('an extension changes coverage only when acknowledged', () {
+    window.replaceWindow(start: 0, end: 20);
+    final proposal = QueueWindowProposal(const [], 70,
+        windowRevision: window.windowRevision);
+    expect(window.nextForwardHydrationPlayPosition, 20);
+    expect(window.acknowledge(proposal), isTrue);
+    expect(window.nextForwardHydrationPlayPosition, 70);
   });
 
   test('extension acknowledgement preserves farther existing coverage', () {
-    window.nextForwardHydrationPlayPosition = 100;
-    window.acknowledge(const QueueWindowProposal([], 20));
+    window.replaceWindow(start: 0, end: 100);
+    window.acknowledge(
+        QueueWindowProposal(const [], 20, windowRevision: window.windowRevision));
     expect(window.nextForwardHydrationPlayPosition, 100);
   });
 
-  test('explicit replacement acknowledges the supplied coverage', () {
-    window.nextForwardHydrationPlayPosition = 100;
-    window.acknowledge(const QueueWindowProposal([], 20, replaceCoverage: true));
-    expect(window.nextForwardHydrationPlayPosition, 20);
+  test('a proposal of a replaced window is not acknowledged', () {
+    window.replaceWindow(start: 0, end: 20);
+    final stale = QueueWindowProposal(const [], 70,
+        windowRevision: window.windowRevision);
+    window.replaceWindow(start: 50, end: 60);
+    expect(window.acknowledge(stale), isFalse);
+    expect(window.nextForwardHydrationPlayPosition, 60);
   });
 
   test('forward hydration proposes one 50-item chunk and awaits application', () async {
-    window.nextForwardHydrationPlayPosition = 5;
+    window.replaceWindow(start: 0, end: 5);
     final entered = Completer<QueueWindowProposal>();
     final release = Completer<void>();
     final applied = Completer<void>();
@@ -79,6 +92,7 @@ void main() {
         await release.future;
         window.acknowledge(proposal);
         applied.complete();
+        return true;
       });
     final proposal = await entered.future;
     expect(proposal.entries.map((e) => e.playPosition), List.generate(50, (i) => i + 5));
@@ -90,9 +104,37 @@ void main() {
     expect(queue.reads, 1, reason: 'buffer now exceeds the threshold');
   });
 
+  test('a chunk read across a replacement is dropped; a newer request runs',
+      () async {
+    window.replaceWindow(start: 0, end: 5);
+    final proposals = <QueueWindowProposal>[];
+    queue.readGate = Completer<void>();
+    window.scheduleForwardHydration(sessionId: 1, totalCount: 120,
+        currentPlayPosition: 0, apply: (p) async {
+      proposals.add(p);
+      return false;
+    });
+    window.replaceWindow(start: 40, end: 50);
+    window.scheduleForwardHydration(sessionId: 1, totalCount: 120,
+        currentPlayPosition: 40, context: 'fresh', apply: (p) async {
+      proposals.add(p);
+      return false;
+    });
+    queue.readGate!.complete();
+    queue.readGate = null;
+    await pumpEventQueue();
+    expect(proposals.map((p) => p.context), ['fresh'],
+        reason: 'the read across the replacement proposes nothing');
+    expect(proposals.single.entries.first.playPosition, 50);
+    expect(proposals.single.windowRevision, window.windowRevision);
+  });
+
   test('a full buffer, exhausted queue or disposed window schedules nothing', () async {
     var applications = 0;
-    Future<void> apply(QueueWindowProposal _) async => applications++;
+    Future<bool> apply(QueueWindowProposal _) async {
+      applications++;
+      return true;
+    }
     window.nextForwardHydrationPlayPosition = 80;
     window.scheduleForwardHydration(sessionId: 1, totalCount: 120, currentPlayPosition: 0, apply: apply);
     window.nextForwardHydrationPlayPosition = 120;

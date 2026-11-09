@@ -4,7 +4,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
+import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/providers/audio/now_playing_publisher.dart';
+import 'package:frontend/providers/audio/queue_warm_listener.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:frontend/ui/player_controller.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -63,6 +67,33 @@ void main() {
     ]);
   });
 
+  test('observers are kept alive from the session-ready signal on', () async {
+    var publishers = 0;
+    var warmers = 0;
+    final readiness = SessionReadiness();
+    final c = ProviderContainer(overrides: [
+      audioServiceProvider.overrideWithValue(bridge),
+      playerControlsProvider.overrideWithValue(FakePlayerControls()),
+      sessionReadinessProvider.overrideWithValue(readiness),
+      nowPlayingPublisherProvider.overrideWith((ref) {
+        publishers++;
+        return NowPlayingPublisher(bridge, CoverArtCacheManager.noop());
+      }),
+      queueWarmListenerProvider.overrideWith((ref) {
+        warmers++;
+        return _NoWarm();
+      }),
+    ]);
+    addTearDown(c.dispose);
+    c.listen(playbackWiringProvider, (_, _) {});
+    await pumpEventQueue();
+    expect((publishers, warmers), (0, 0),
+        reason: 'nothing builds the playback model before the session');
+    readiness.markReady();
+    await pumpEventQueue();
+    expect((publishers, warmers), (1, 1));
+  });
+
   test('a disposed scope unbinds; a newer scope keeps its binding', () async {
     final old = FakePlayerControls();
     final fresh = FakePlayerControls();
@@ -78,4 +109,9 @@ void main() {
     expect(old.calls, isEmpty);
     expect(fresh.calls, ['play']);
   });
+}
+
+class _NoWarm implements QueueWarmListener {
+  @override
+  void update(AudioState state, String quality) {}
 }

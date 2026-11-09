@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:drift/drift.dart';
+
 import 'package:frontend/database/database.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
 
@@ -45,6 +47,23 @@ class DownloadReconciliationService {
   /// Returns true iff any rows were updated.
   Future<bool> reconcile() {
     return _running ??= _run().whenComplete(() => _running = null);
+  }
+
+  /// Reconciles one track (asked by playback when a recorded file turned
+  /// out missing). Returns true iff its download columns were cleared.
+  Future<bool> reconcileTrack(String trackUuid) async {
+    final row = await (_db.select(_db.tracks)
+          ..where((t) => t.uuidId.equals(trackUuid)))
+        .getSingleOrNull();
+    final path = row?.filePath;
+    if (path == null || await _fileExists(path)) return false;
+    // Only the path that was checked: a download committed meanwhile wins.
+    final cleared = await (_db.update(_db.tracks)
+          ..where((t) => t.uuidId.equals(trackUuid) & t.filePath.equals(path)))
+        .write(clearedDownloadColumns);
+    if (cleared == 0) return false;
+    _statusReader.bumpVersion();
+    return true;
   }
 
   Future<bool> _run() async {

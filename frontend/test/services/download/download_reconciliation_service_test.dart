@@ -82,6 +82,39 @@ void main() {
     expect(state.quality, isNull);
   });
 
+  test('reconciles one track on request (5B.0d playback recovery)', () async {
+    await _insertTrack(db, 'a',
+        filePath: p.join(tmp.path, 'missing-a.m4a'),
+        downloadedBitrateKbps: 320, fileSizeBytes: 1, downloadedQuality: '320');
+    final kept = File(p.join(tmp.path, 'b.m4a'))..writeAsStringSync('x');
+    await _insertTrack(db, 'b',
+        filePath: kept.path,
+        downloadedBitrateKbps: 320, fileSizeBytes: 1, downloadedQuality: '320');
+    expect(await service.reconcileTrack('b'), isFalse);
+    expect(await service.reconcileTrack('a'), isTrue);
+    expect((await _readDownloadState(db, 'a')).filePath, isNull);
+    expect((await _readDownloadState(db, 'b')).filePath, kept.path);
+  });
+
+  test('a one-track reconcile keeps a path that changed meanwhile', () async {
+    await _insertTrack(db, 'a',
+        filePath: p.join(tmp.path, 'old-a.m4a'),
+        downloadedBitrateKbps: 320, fileSizeBytes: 1, downloadedQuality: '320');
+    final fresh = p.join(tmp.path, 'new-a.m4a');
+    final racing = DownloadReconciliationService(
+      db: db,
+      statusReader: reader,
+      fileExists: (path) async {
+        // A re-download commits a new path while the old one is checked.
+        await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
+            .write(TracksCompanion(filePath: Value(fresh)));
+        return false;
+      },
+    );
+    await racing.reconcileTrack('a');
+    expect((await _readDownloadState(db, 'a')).filePath, fresh);
+  });
+
   test('leaves tracks with on-disk files untouched', () async {
     final f = File(p.join(tmp.path, 'present.m4a'));
     await f.writeAsString('audio');

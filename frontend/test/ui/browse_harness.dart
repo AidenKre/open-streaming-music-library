@@ -164,7 +164,7 @@ class RecordingAudio extends AudioCoordinator {
     playback: PlaybackSlice(
       currentTrack: track,
       status: PlayerStatus.paused,
-      duration: const Duration(minutes: 3),
+      catalogDuration: const Duration(minutes: 3),
     ),
     queue: const QueueSlice(),
   );

@@ -85,7 +85,7 @@ class TestSeekAudioCoordinator extends AudioCoordinator {
         currentTrack: _track,
         status: PlayerStatus.playing,
         position: Duration(seconds: 30),
-        duration: Duration(minutes: 3),
+        catalogDuration: Duration(minutes: 3),
       ),
     );
   }

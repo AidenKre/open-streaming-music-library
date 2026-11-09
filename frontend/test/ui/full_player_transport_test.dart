@@ -35,7 +35,7 @@ Future<FakePlayerControls> _pump(
   WidgetTester tester, {
   PlayerStatus status = PlayerStatus.playing,
   bool? playWhenReady,
-  Duration duration = const Duration(minutes: 3),
+  Duration? duration = const Duration(minutes: 3),
 }) async {
   final controls = FakePlayerControls();
   final container = ProviderContainer(
@@ -49,7 +49,7 @@ Future<FakePlayerControls> _pump(
               // A playing status means play is desired (SC-27).
               playWhenReady: playWhenReady ?? status == PlayerStatus.playing,
               position: const Duration(seconds: 30),
-              duration: duration,
+              catalogDuration: duration,
             ),
           ),
         ),
@@ -82,6 +82,14 @@ void main() {
       expect(controls.calls, ['toggle']);
     });
   }
+
+  testWidgets('an unknown duration shows as unknown and cannot be scrubbed',
+      (t) async {
+    await _pump(t, duration: null);
+    expect(find.text('--:--'), findsOneWidget);
+    final slider = t.widget<Slider>(find.byKey(const Key('now_playing_seek_slider')));
+    expect(slider.onChanged, isNull);
+  });
 
   testWidgets('while loading with play desired the control shows pause',
       (t) async {

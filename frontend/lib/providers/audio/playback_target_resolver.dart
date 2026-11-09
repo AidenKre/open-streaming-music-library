@@ -1,18 +1,12 @@
 import 'dart:io';
 
+import 'package:frontend/providers/audio/playback_issue_bus.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+
+export 'package:frontend/providers/audio/playback_issue_bus.dart' show LocalFileMissing, PlaybackIssue;
 
 enum PlaybackSourceKind { local, remote }
 
-sealed class PlaybackResolutionIssue {
-  const PlaybackResolutionIssue();
-}
-
-final class LocalFileMissing extends PlaybackResolutionIssue {
-  const LocalFileMissing(this.trackUuid, this.path);
-  final String trackUuid;
-  final String path;
-}
 
 class PlaybackTarget {
   const PlaybackTarget(this.entry, this.sourceKind);
@@ -24,17 +18,19 @@ class PlaybackTarget {
 class PlaybackTargetResolution {
   const PlaybackTargetResolution(this.target, {this.issues = const []});
   final PlaybackTarget? target;
-  final List<PlaybackResolutionIssue> issues;
+  final List<PlaybackIssue> issues;
 }
 
-/// SC-27 invariant 8: decides, never applies or publishes. File checks stay
-/// synchronous during the 5B.0b extraction; 5B.0d makes them asynchronous.
+/// SC-27 invariant 8: decides, never applies or publishes; issues come back
+/// on success and on rejection. File checks are an async stat, off the
+/// event loop.
 class PlaybackTargetResolver {
-  PlaybackTargetResolver(this._repository, {bool Function(String)? fileExists})
-      : _fileExists = fileExists ?? ((path) => File(path).existsSync());
+  PlaybackTargetResolver(this._repository,
+      {Future<bool> Function(String)? fileExists})
+      : _fileExists = fileExists ?? ((path) => File(path).exists());
 
   final QueueRepository _repository;
-  final bool Function(String) _fileExists;
+  final Future<bool> Function(String) _fileExists;
 
   Future<PlaybackTargetResolution> resolveStart({
     required int sessionId,
@@ -43,10 +39,10 @@ class PlaybackTargetResolver {
     required bool offline,
   }) async {
     if (totalCount <= 0) return const PlaybackTargetResolution(null);
-    final issues = <PlaybackResolutionIssue>[];
+    final issues = <PlaybackIssue>[];
     final preferred = await _repository.getPlaybackEntryForItem(sessionId, preferredItemId);
     if (preferred != null) {
-      final target = _target(preferred, issues);
+      final target = await _target(preferred, issues);
       if (!offline || target.sourceKind == PlaybackSourceKind.local) {
         return PlaybackTargetResolution(target, issues: List.unmodifiable(issues));
       }
@@ -70,7 +66,7 @@ class PlaybackTargetResolver {
     bool includeStart = false,
   }) async {
     if (totalCount <= 0) return const PlaybackTargetResolution(null);
-    final issues = <PlaybackResolutionIssue>[];
+    final issues = <PlaybackIssue>[];
     PlaybackTarget? target;
     if (offline) {
       target = await _walk(sessionId, fromPlayPosition, direction, repeatMode,
@@ -84,15 +80,18 @@ class PlaybackTargetResolver {
       }
       final entries = await _repository.getPlaybackEntries(sessionId,
           startPlayPosition: position, limit: 1);
-      if (entries.isNotEmpty) target = _target(entries.first, issues);
+      if (entries.isNotEmpty) target = await _target(entries.first, issues);
     }
     return PlaybackTargetResolution(target, issues: List.unmodifiable(issues));
   }
 
-  PlaybackTarget _target(QueuePlaybackEntry entry, List<PlaybackResolutionIssue> issues) {
+  Future<PlaybackTarget> _target(
+      QueuePlaybackEntry entry, List<PlaybackIssue> issues) async {
     final path = entry.filePath;
     if (path != null && path.isNotEmpty) {
-      if (_fileExists(path)) return PlaybackTarget(entry, PlaybackSourceKind.local);
+      if (await _fileExists(path)) {
+        return PlaybackTarget(entry, PlaybackSourceKind.local);
+      }
       issues.add(LocalFileMissing(entry.uuidId, path));
     }
     return PlaybackTarget(entry, PlaybackSourceKind.remote);
@@ -100,7 +99,7 @@ class PlaybackTargetResolver {
 
   Future<PlaybackTarget?> _walk(int sessionId, int from, PlayOrderDirection direction,
       String repeatMode, int totalCount, bool includeStart,
-      List<PlaybackResolutionIssue> issues) async {
+      List<PlaybackIssue> issues) async {
     final entries = await _repository.getPlaybackEntries(sessionId);
     if (entries.isEmpty) return null;
     final byPosition = {for (final entry in entries) entry.playPosition: entry};
@@ -113,7 +112,7 @@ class PlaybackTargetResolver {
       }
       final entry = byPosition[position];
       if (entry == null) continue;
-      final target = _target(entry, issues);
+      final target = await _target(entry, issues);
       if (target.sourceKind == PlaybackSourceKind.local) return target;
     }
     return null;

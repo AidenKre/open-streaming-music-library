@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
@@ -37,7 +39,7 @@ void main() {
     db = AppDatabase(NativeDatabase.memory());
     queue = _Queue(db);
     existing.clear();
-    resolver = PlaybackTargetResolver(queue, fileExists: existing.contains);
+    resolver = PlaybackTargetResolver(queue, fileExists: (path) async => existing.contains(path));
   });
   tearDown(() => db.close());
 
@@ -130,4 +132,22 @@ void main() {
       expect(missing.single.path, '/missing');
     });
   }
+
+  test('the decision waits for an async file check', () async {
+    queue.entries = [entry(1, path: '/a'), entry(2)];
+    final stat = Completer<bool>();
+    final slow = PlaybackTargetResolver(queue, fileExists: (_) => stat.future);
+    var decided = false;
+    final pending = slow.resolveStart(sessionId: 1, preferredItemId: 1,
+        totalCount: 2, offline: true).then((r) {
+      decided = true;
+      return r;
+    });
+    await pumpEventQueue();
+    expect(decided, isFalse, reason: 'no decision before the stat answers');
+    stat.complete(true);
+    final result = await pending;
+    expect(result.target?.sourceKind, PlaybackSourceKind.local);
+    expect(result.issues, isEmpty);
+  });
 }

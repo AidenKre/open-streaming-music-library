@@ -16,7 +16,8 @@ final audioPositionProvider = Provider<Duration>(
   (ref) => ref.watch(audioProvider.select((s) => s.playback.position)),
 );
 
-final audioDurationProvider = Provider<Duration>(
+/// Best known duration; null = unknown (never zero).
+final audioDurationProvider = Provider<Duration?>(
   (ref) => ref.watch(audioProvider.select((s) => s.playback.duration)),
 );
 

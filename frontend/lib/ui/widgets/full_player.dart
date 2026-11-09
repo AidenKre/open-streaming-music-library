@@ -136,10 +136,10 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
           : (_pendingSeekPosition ?? position),
       duration,
     );
-    final sliderMax = duration.inMilliseconds > 0
-        ? duration.inMilliseconds.toDouble()
-        : 1.0;
-    final sliderValue = duration.inMilliseconds > 0
+    // Unknown (or zero-length) duration: nothing to scrub against.
+    final seekable = duration != null && duration.inMilliseconds > 0;
+    final sliderMax = seekable ? duration.inMilliseconds.toDouble() : 1.0;
+    final sliderValue = seekable
         ? displayedPosition.inMilliseconds
               .toDouble()
               .clamp(0.0, sliderMax)
@@ -207,15 +207,9 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                 key: const Key('now_playing_seek_slider'),
                 value: sliderValue,
                 max: sliderMax,
-                onChangeStart: duration.inMilliseconds > 0
-                    ? _handleSeekStart
-                    : null,
-                onChanged: duration.inMilliseconds > 0
-                    ? _handleSeekChanged
-                    : null,
-                onChangeEnd: duration.inMilliseconds > 0
-                    ? _handleSeekEnd
-                    : null,
+                onChangeStart: seekable ? _handleSeekStart : null,
+                onChanged: seekable ? _handleSeekChanged : null,
+                onChangeEnd: seekable ? _handleSeekEnd : null,
               ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -228,7 +222,7 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                       style: textTheme.bodySmall,
                     ),
                     Text(
-                      formatDuration(duration),
+                      duration == null ? '--:--' : formatDuration(duration),
                       key: const Key('now_playing_duration'),
                       style: textTheme.bodySmall,
                     ),
@@ -351,10 +345,12 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
   }
 
   /// Display bound only (the seek command is clamped by the model). An
-  /// unknown duration (zero today) bounds nothing: show the real position.
-  Duration _clampPosition(Duration position, Duration duration) {
+  /// unknown duration bounds nothing: show the real position.
+  Duration _clampPosition(Duration position, Duration? duration) {
     if (position.isNegative) return Duration.zero;
-    if (duration > Duration.zero && position > duration) return duration;
+    if (duration != null && duration > Duration.zero && position > duration) {
+      return duration;
+    }
     return position;
   }
 

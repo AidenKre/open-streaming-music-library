@@ -592,8 +592,6 @@ class JustAudioEngine implements PlaybackEngine {
   @override
   Stream<Duration> get positionStream => _player.positionStream;
   @override
-  Stream<Duration?> get durationStream => _player.durationStream;
-  @override
   Stream<int?> get currentItemIdStream => _currentItemIdController.stream;
   @override
   Stream<UnavailableAdvance> get unavailableAdvanceStream =>

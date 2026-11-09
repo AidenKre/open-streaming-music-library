@@ -18,8 +18,17 @@ class PlaybackSlice {
   /// SC-27 processing axis.
   final EngineProcessingState processing;
   final Duration position;
-  final Duration duration;
+
+  /// The catalog's duration of the current track; null = unknown.
+  final Duration? catalogDuration;
+
+  /// The engine-measured duration of the current source; null = unknown.
+  final Duration? measuredDuration;
   final double volume;
+
+  /// Best known duration (SC-27 invariant 15): measured, else catalog,
+  /// else unknown (null, never zero).
+  Duration? get duration => measuredDuration ?? catalogDuration;
 
   const PlaybackSlice({
     this.currentTrack,
@@ -27,7 +36,8 @@ class PlaybackSlice {
     this.playWhenReady = false,
     this.processing = EngineProcessingState.idle,
     this.position = Duration.zero,
-    this.duration = Duration.zero,
+    this.catalogDuration,
+    this.measuredDuration,
     this.volume = 1.0,
   });
 
@@ -38,7 +48,8 @@ class PlaybackSlice {
     bool? playWhenReady,
     EngineProcessingState? processing,
     Duration? position,
-    Duration? duration,
+    Object? catalogDuration = _unchanged,
+    Object? measuredDuration = _unchanged,
     double? volume,
   }) {
     return PlaybackSlice(
@@ -47,11 +58,19 @@ class PlaybackSlice {
       playWhenReady: playWhenReady ?? this.playWhenReady,
       processing: processing ?? this.processing,
       position: position ?? this.position,
-      duration: duration ?? this.duration,
+      // Pass null to clear (unknown); omit to keep.
+      catalogDuration: identical(catalogDuration, _unchanged)
+          ? this.catalogDuration
+          : catalogDuration as Duration?,
+      measuredDuration: identical(measuredDuration, _unchanged)
+          ? this.measuredDuration
+          : measuredDuration as Duration?,
       volume: volume ?? this.volume,
     );
   }
 }
+
+const Object _unchanged = Object();
 
 class QueueSlice {
   final int? sessionId;

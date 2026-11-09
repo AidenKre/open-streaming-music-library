@@ -43,7 +43,7 @@ AudioState _audioStateWith(
       status: status,
       // A playing status means play is desired (SC-27 desired transport).
       playWhenReady: playWhenReady ?? status == PlayerStatus.playing,
-      duration: const Duration(minutes: 3),
+      catalogDuration: const Duration(minutes: 3),
     ),
     queue: const QueueSlice(),
   );

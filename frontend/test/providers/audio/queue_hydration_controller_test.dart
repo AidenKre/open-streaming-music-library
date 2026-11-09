@@ -57,46 +57,36 @@ void main() {
     expect(entries.any((e) => e.playPosition == 40), isTrue);
   });
 
-  test('ensureItemLoaded is no-op when item already loaded', () async {
-    await fixture.insertSingles(['a', 'b']);
+  // 5B.0d: loading an item outside the window is a rebase by the core
+  // (audio_coordinator_test 'a distant jump rebases ...'); the window only
+  // proposes seeds and records the replaced interval.
+  test('a rebase seed is the bounded window around the target', () async {
+    await fixture.insertSingles(List.generate(80, (i) => 'track-${i + 1}'));
     final sessionId = await repo.createSessionFromExplicitList(
       sourceType: 'search',
-      trackUuids: const ['a', 'b'],
+      trackUuids: List.generate(80, (i) => 'track-${i + 1}'),
       currentIndex: 0,
     );
-
-    final entries = await repo.getPlaybackEntries(sessionId);
-    fakePlayer.preloadItems(entries);
-
-    final proposal = await hydration.proposeItemLoad(sessionId, entries.first,
-        alreadyLoaded: fakePlayer.hasItem(entries.first.itemId));
-    if (proposal != null) {
-      await fakePlayer.addEntries(proposal.entries);
-      hydration.acknowledge(proposal);
-    }
-
-    expect(fakePlayer.addedBatches, isEmpty);
+    final entries = await hydration.seedEntriesForPlayPosition(sessionId, 70);
+    expect(entries.first.playPosition, 70 - QueueWindow.seedPreviousCount);
+    expect(entries.last.playPosition, 79);
+    hydration.replaceWindow(
+        start: entries.first.playPosition, end: entries.last.playPosition + 1);
+    expect(hydration.windowStartPlayPosition, 58);
+    expect(hydration.nextForwardHydrationPlayPosition, 80);
+    expect(hydration.coversQueue(80), isFalse);
   });
 
-  test('ensureItemLoaded loads entries when item not present', () async {
+  test('a window over every row covers the queue', () async {
     await fixture.insertSingles(['a', 'b', 'c']);
     final sessionId = await repo.createSessionFromExplicitList(
       sourceType: 'search',
       trackUuids: const ['a', 'b', 'c'],
       currentIndex: 0,
     );
-
-    final entries = await repo.getPlaybackEntries(sessionId);
-
-    final proposal = await hydration.proposeItemLoad(sessionId, entries.last,
-        alreadyLoaded: fakePlayer.hasItem(entries.last.itemId));
-    if (proposal != null) {
-      await fakePlayer.addEntries(proposal.entries);
-      hydration.acknowledge(proposal);
-    }
-
-    expect(fakePlayer.addedBatches, isNotEmpty);
-    expect(fakePlayer.hasItem(entries.last.itemId), isTrue);
+    final entries = await hydration.seedEntriesForPlayPosition(sessionId, 0);
+    hydration.replaceWindow(start: 0, end: entries.last.playPosition + 1);
+    expect(hydration.coversQueue(3), isTrue);
   });
 
   test('scheduleForwardHydration loads when buffer is low', () async {
@@ -107,14 +97,14 @@ void main() {
       currentIndex: 0,
     );
 
-    hydration.nextForwardHydrationPlayPosition = 5;
+    hydration.replaceWindow(start: 0, end: 5);
     hydration.scheduleForwardHydration(
       sessionId: sessionId,
       totalCount: 100,
       currentPlayPosition: 0,
       apply: (proposal) async {
         await fakePlayer.addEntries(proposal.entries);
-        hydration.acknowledge(proposal);
+        return hydration.acknowledge(proposal);
       },
     );
 

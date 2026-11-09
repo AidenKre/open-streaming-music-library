@@ -381,7 +381,7 @@ void main() {
   group('locally playable lookup', () {
     ({QueueRepository store, PlaybackTargetResolver resolver}) repoWithFs(Set<String> existing) {
       final store = QueueRepository(db);
-      return (store: store, resolver: PlaybackTargetResolver(store, fileExists: existing.contains));
+      return (store: store, resolver: PlaybackTargetResolver(store, fileExists: (path) async => existing.contains(path)));
     }
 
     Future<void> markDownloaded(String uuid, String path) async {

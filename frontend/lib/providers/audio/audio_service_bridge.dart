@@ -68,18 +68,16 @@ class AudioServiceBridge extends BaseAudioHandler {
     onClick = null;
   }
 
-  /// Called by coordinator when the current track changes.
-  void updateNowPlaying(TrackUI track, {Uri? artUri}) {
+  /// Publishes now-playing. [duration] is the best known duration (the
+  /// engine-measured one, else the catalog's); null = unknown, so the OS
+  /// shows no duration rather than 0:00.
+  void updateNowPlaying(TrackUI track, {Uri? artUri, Duration? duration}) {
     mediaItem.add(MediaItem(
       id: track.uuidId,
       title: track.title ?? 'Unknown',
       artist: track.artist ?? '',
       album: track.album ?? '',
-      // Null = unknown: the OS shows no duration rather than 0:00.
-      duration: switch (track.duration) {
-        null => null,
-        final seconds => Duration(milliseconds: (seconds * 1000).round()),
-      },
+      duration: duration,
       artUri: artUri,
     ));
   }

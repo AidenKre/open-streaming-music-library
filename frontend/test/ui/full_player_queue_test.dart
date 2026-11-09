@@ -544,7 +544,7 @@ AudioState _audioStateFor({
     playback: PlaybackSlice(
       currentTrack: currentTrack,
       status: PlayerStatus.playing,
-      duration: const Duration(minutes: 3),
+      catalogDuration: const Duration(minutes: 3),
     ),
     queue: QueueSlice(
       sessionId: sessionId,
