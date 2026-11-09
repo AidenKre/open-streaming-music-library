@@ -106,7 +106,8 @@ void main() {
       currentPlayPosition: 0,
     );
 
-    await Future<void>.delayed(const Duration(milliseconds: 100));
+    await fakePlayer.firstAdd.future;
+    await pumpEventQueue();
 
     expect(fakePlayer.addedBatches, isNotEmpty);
     expect(hydration.nextForwardHydrationPlayPosition, greaterThan(5));
@@ -122,6 +123,7 @@ void main() {
 class _FakePlayer implements ConcatenatingPlayerController {
   final Set<int> _loadedItemIds = {};
   final List<List<QueuePlaybackEntry>> addedBatches = [];
+  final firstAdd = Completer<void>();
 
   void preloadItems(List<QueuePlaybackEntry> entries) {
     for (final entry in entries) {
@@ -138,6 +140,7 @@ class _FakePlayer implements ConcatenatingPlayerController {
     for (final entry in additions) {
       _loadedItemIds.add(entry.itemId);
     }
+    if (!firstAdd.isCompleted) firstAdd.complete();
   }
 
   @override

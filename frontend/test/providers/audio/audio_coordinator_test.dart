@@ -128,6 +128,117 @@ void main() {
     existingFiles.remove(path);
   }
 
+  group('5B.0a characterization', () {
+    test('the player fake seeds silently like the production adapter', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'test', trackUuids: ['a', 'b'],
+      );
+      final entries = await repo.getPlaybackEntries(sessionId, startPlayPosition: 0, limit: 2);
+      final events = <int?>[];
+      final sub = fakePlayer.currentItemIdStream.listen(events.add);
+      addTearDown(sub.cancel);
+      addTearDown(fakePlayer.dispose);
+      await fakePlayer.setSeed(entries, currentItemId: entries.first.itemId);
+      await pumpEventQueue();
+      expect(fakePlayer.currentItemId, entries.first.itemId);
+      expect(events, isEmpty, reason: 'structural seeding never emits a natural transition');
+    });
+
+    Future<ProviderContainer> start(List<String> uuids) async {
+      await fixture.insertSingles(uuids.toSet().toList());
+      final c = createContainer();
+      await repo.startupRead.future;
+      await c.read(audioProvider.notifier).playFromTrackList(
+        uuids, await fixture.track(uuids.first), sourceType: 'test',
+      );
+      await pumpEventQueue();
+      return c;
+    }
+
+    test('start, item change and stop publish the expected now-playing sequence', () async {
+      final c = await start(['a', 'b']);
+      expect(bridge.mediaItemEvents.map((e) => e?.id), [null, 'a']);
+      await c.read(audioProvider.notifier).skipNext();
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(bridge.mediaItemEvents.map((e) => e?.id), [null, 'a', 'b']);
+      await c.read(audioProvider.notifier).stop();
+      await pumpEventQueue();
+      expect(bridge.mediaItemEvents.map((e) => e?.id), [null, 'a', 'b', null]);
+      expect(bridge.mediaItemEvents.last, isNull);
+      expect(c.read(audioProvider).queue.sessionId, isNull);
+      expect(await repo.getActiveSession(), isNull);
+    });
+
+    test('reconcile of an empty queue clears now-playing and persisted session', () async {
+      final c = await start(['a']);
+      final id = c.read(audioProvider).queue.sessionId!;
+      await repo.removeTrackUuidsFromQueues(['a']);
+      await c.read(audioProvider.notifier).reconcileAfterSyncQueueMutation({id});
+      await pumpEventQueue();
+      expect(bridge.mediaItemEvents.last, isNull);
+      expect(c.read(currentTrackProvider), isNull);
+      expect(c.read(audioProvider).queue.sessionId, isNull);
+      expect(await repo.getActiveSession(), isNull);
+    });
+
+    test('duplicate track UUIDs retain distinct queue item identities', () async {
+      final c = await start(['a', 'b', 'a']);
+      final entries = await sessionTracksOf(c);
+      expect(entries.map((e) => e.uuidId), ['a', 'b', 'a']);
+      expect(entries.map((e) => e.itemId).toSet(), hasLength(3));
+      await c.read(audioProvider.notifier).skipToTrack(entries.last.itemId);
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(audioProvider).queue.currentItemId, entries.last.itemId);
+      expect(c.read(audioProvider).queue.currentPlayPosition, 2);
+      expect((await repo.getActiveSession())?.currentItemId, entries.last.itemId);
+    });
+
+    test('a delayed startup snapshot cannot replace newer explicit playback', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await repo.createSessionFromExplicitList(sourceType: 'saved', trackUuids: ['a']);
+      final release = Completer<void>();
+      repo.startupRelease = release;
+      final c = createContainer();
+      await repo.startupRead.future;
+      await c.read(audioProvider.notifier).play(await fixture.track('b'));
+      final currentSession = c.read(audioProvider).queue.sessionId;
+      release.complete();
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(audioProvider).queue.sessionId, currentSession);
+      expect(fakePlayer.seedCalls, hasLength(1));
+      expect(fakePlayer.currentUuid, 'b');
+      expect((await repo.getActiveSession())?.id, currentSession);
+    });
+
+    test('delayed artwork preserves the started identity and publishes once', () async {
+      await fixture.insertSingles(['a']);
+      await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('a'))).write(
+        const TrackmetadataCompanion(hasAlbumArt: Value(true), coverArtId: Value(7)),
+      );
+      final art = _GatedCoverArt();
+      initCoverArtCache(art);
+      final c = createContainer();
+      await repo.startupRead.future;
+      final starting = c.read(audioProvider.notifier).play(await fixture.track('a'));
+      await art.entered.future;
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(fakePlayer.currentUuid, 'a');
+      expect(bridge.mediaItemEvents.whereType<MediaItem>(), isEmpty);
+      final uri = Uri.parse('file:///test-art/a.png');
+      art.release.complete(uri);
+      await starting;
+      await pumpEventQueue();
+      final published = bridge.mediaItemEvents.whereType<MediaItem>().toList();
+      expect(published, hasLength(1));
+      expect(published.single.id, 'a');
+      expect(published.single.artUri, uri);
+    });
+  });
+
   group('5A.0 (SC-27, SC-15): lifecycle, admission closure, quiesce', () {
     Future<AudioCoordinator> playing(ProviderContainer c) async {
       await fixture.insertAlbum(
@@ -1766,12 +1877,26 @@ class _ObservedStartupRepository extends QueueRepository {
   _ObservedStartupRepository(super.db, {super.localFileExists});
 
   final startupRead = Completer<void>();
+  Completer<void>? startupRelease;
 
   @override
   Future<QueueSessionSnapshot?> getActiveSessionSnapshot() async {
     final result = await super.getActiveSessionSnapshot();
     if (!startupRead.isCompleted) startupRead.complete();
+    await startupRelease?.future;
     return result;
+  }
+}
+
+class _GatedCoverArt extends CoverArtCacheManager {
+  _GatedCoverArt() : super.noop();
+  final entered = Completer<void>();
+  final release = Completer<Uri?>();
+  @override
+  Future<Uri?> resolveArtUri({required bool hasAlbumArt, required int? coverArtId}) {
+    if (!hasAlbumArt || coverArtId == null) return Future.value(null);
+    entered.complete();
+    return release.future;
   }
 }
 
@@ -1837,7 +1962,7 @@ class FakeConcatenatingPlayerController
         shuffleEnabled: shuffleEnabled,
       ),
     );
-    _currentItemIdController.add(_committedCurrentItemId);
+    // Like production's structural mutation: commit identity silently.
     if (autoPlay) {
       playCalls++;
     }
