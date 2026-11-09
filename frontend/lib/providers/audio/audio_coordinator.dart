@@ -12,8 +12,9 @@ import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
-import 'package:frontend/providers/audio/queue_hydration_controller.dart';
+import 'package:frontend/providers/audio/queue_window.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
+import 'package:frontend/providers/audio/playback_target_resolver.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
@@ -28,9 +29,10 @@ class AudioCoordinator extends Notifier<AudioState> {
 
   late ConcatenatingPlayerController _player;
   late QueueRepository _queueRepo;
+  late PlaybackTargetResolver _targetResolver;
   late AudioServiceBridge _bridge;
   late QueueOrderManager _orderManager;
-  late QueueHydrationController _hydrationController;
+  late QueueWindow _window;
   late CoverArtCacheManager _coverArtCache;
 
   final List<StreamSubscription<Object?>> _subscriptions = [];
@@ -45,10 +47,11 @@ class AudioCoordinator extends Notifier<AudioState> {
   AudioState build() {
     _player = ref.read(concatenatingPlayerProvider);
     _queueRepo = ref.read(queueRepositoryProvider);
+    _targetResolver = ref.read(playbackTargetResolverProvider);
     _bridge = ref.read(audioServiceProvider);
     _coverArtCache = ref.read(coverArtCacheProvider);
     _orderManager = QueueOrderManager(_queueRepo);
-    _hydrationController = QueueHydrationController(_queueRepo, _player);
+    _window = ref.read(queueWindowProvider);
 
     // Push stream quality changes into the player so newly-built sources use
     // the user's current preset. The very first fire happens during build() —
@@ -123,7 +126,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
 
     ref.onDispose(() {
-      _hydrationController.dispose();
+      _window.dispose();
       for (final sub in _subscriptions) {
         sub.cancel();
       }
@@ -236,7 +239,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       );
       if (target == null) return;
 
-      await _hydrationController.ensureItemLoaded(sessionId, target);
+      await _ensureItemLoaded(sessionId, target);
       await _player.seekToItem(target.itemId);
       await _player.play();
     });
@@ -271,7 +274,7 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
-      await _hydrationController.ensureItemLoaded(sessionId, target);
+      await _ensureItemLoaded(sessionId, target);
       await _player.seekToItem(target.itemId);
       await _player.play();
     });
@@ -288,16 +291,18 @@ class AudioCoordinator extends Notifier<AudioState> {
       // Offline: if the user tapped a row whose file is no longer on disk,
       // walk forward (then backward) to the nearest locally playable entry.
       if (_isOffline) {
-        final playable = await _queueRepo.findLocallyPlayableFallback(
+        final resolution = await _targetResolver.resolveStart(
           sessionId: sessionId,
           preferredItemId: entry.itemId,
           totalCount: state.queue.totalCount,
+          offline: true,
         );
+        final playable = resolution.target?.entry;
         if (playable == null) return;
         entry = playable;
       }
 
-      await _hydrationController.ensureItemLoaded(sessionId, entry);
+      await _ensureItemLoaded(sessionId, entry);
       await _player.seekToItem(entry.itemId);
       await _player.play();
     });
@@ -344,27 +349,10 @@ class AudioCoordinator extends Notifier<AudioState> {
         return;
       }
 
-      await _queueRepo.prependManualItems(
+      await _applyQueueEdit(sessionId, currentItemId, () => _queueRepo.prependManualItems(
         sessionId,
         tracks.map((track) => track.uuidId).toList(growable: false),
-      );
-      await _orderManager.rebuildEffectiveOrder(
-        sessionId,
-        currentItemId: currentItemId,
-        preserveShuffledMainFuture: state.shuffle.shuffleOn,
-        isShuffleOn: state.shuffle.shuffleOn,
-      );
-      await _refreshLoadedEntriesMetadata(sessionId);
-      await _replaceLoadedFutureSuffixForCurrent(
-        sessionId,
-        currentItemId: currentItemId,
-      );
-      await _refreshCurrentQueueState(
-        sessionId,
-        preservePlaybackPosition: true,
-      );
-      _invalidateQueueTracks();
-      _scheduleForwardHydration();
+      ));
     });
   }
 
@@ -393,28 +381,35 @@ class AudioCoordinator extends Notifier<AudioState> {
       final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
       if (snapshot == null || snapshot.totalCount == 0) return;
 
-      await _queueRepo.appendManualItems(
+      await _applyQueueEdit(sessionId, currentItemId, () => _queueRepo.appendManualItems(
         sessionId,
         tracks.map((track) => track.uuidId).toList(growable: false),
-      );
-      await _orderManager.rebuildEffectiveOrder(
-        sessionId,
-        currentItemId: currentItemId,
-        preserveShuffledMainFuture: state.shuffle.shuffleOn,
-        isShuffleOn: state.shuffle.shuffleOn,
-      );
-      await _refreshLoadedEntriesMetadata(sessionId);
-      await _replaceLoadedFutureSuffixForCurrent(
-        sessionId,
-        currentItemId: currentItemId,
-      );
-      await _refreshCurrentQueueState(
-        sessionId,
-        preservePlaybackPosition: true,
-      );
-      _invalidateQueueTracks();
-      _scheduleForwardHydration();
+      ));
     });
+  }
+
+  /// The shared successful manual-queue edit sequence. Keep command and
+  /// persistence ordering unchanged during the 5B.0b extraction.
+  Future<void> _applyQueueEdit(int sessionId, int currentItemId,
+      Future<void> Function() mutate) async {
+    await mutate();
+    await _orderManager.rebuildEffectiveOrder(
+      sessionId,
+      currentItemId: currentItemId,
+      preserveShuffledMainFuture: state.shuffle.shuffleOn,
+      isShuffleOn: state.shuffle.shuffleOn,
+    );
+    await _refreshLoadedEntriesMetadata(sessionId);
+    await _replaceLoadedFutureSuffixForCurrent(
+      sessionId,
+      currentItemId: currentItemId,
+    );
+    await _refreshCurrentQueueState(
+      sessionId,
+      preservePlaybackPosition: true,
+    );
+    _invalidateQueueTracks();
+    _scheduleForwardHydration();
   }
 
   Future<void> removeFromQueue(int itemId) {
@@ -438,8 +433,9 @@ class AudioCoordinator extends Notifier<AudioState> {
       await _refreshLoadedEntriesMetadata(sessionId);
 
       if (removedEntry.playPosition <
-          _hydrationController.nextForwardHydrationPlayPosition) {
-        _hydrationController.nextForwardHydrationPlayPosition--;
+          _window.nextForwardHydrationPlayPosition) {
+        _window.acknowledge(QueueWindowProposal(const [],
+            _window.nextForwardHydrationPlayPosition - 1, replaceCoverage: true));
       }
 
       await _refreshCurrentQueueState(sessionId);
@@ -549,7 +545,7 @@ class AudioCoordinator extends Notifier<AudioState> {
           await _queueRepo.deactivateAll();
         }
 
-        _hydrationController.reset();
+        _window.reset();
         state = const AudioState();
         _updateBridgePlaybackState();
       } finally {
@@ -579,7 +575,7 @@ class AudioCoordinator extends Notifier<AudioState> {
         _playerIntendsPlaying = false;
         _bridge.clearNowPlaying();
         await _queueRepo.deactivateAll();
-        _hydrationController.reset();
+        _window.reset();
         state = state.copyWith(
           playback: state.playback.copyWith(
             clearTrack: true,
@@ -700,11 +696,13 @@ class AudioCoordinator extends Notifier<AudioState> {
         milliseconds: snapshot.session.currentPositionMs,
       );
       if (_isOffline) {
-        final fallback = await _queueRepo.findLocallyPlayableFallback(
+        final resolution = await _targetResolver.resolveStart(
           sessionId: snapshot.session.id,
           preferredItemId: snapshot.currentItem!.itemId,
           totalCount: snapshot.totalCount,
+          offline: true,
         );
+        final fallback = resolution.target?.entry;
         if (fallback == null) return;
         final usePreferred = fallback.itemId == snapshot.currentItem!.itemId;
         await _startSession(
@@ -736,7 +734,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       throw StateError('Cannot start an empty queue session');
     }
 
-    final seedEntries = await _hydrationController.seedEntriesForPlayPosition(
+    final seedEntries = await _window.seedEntriesForPlayPosition(
       sessionId,
       currentItem.playPosition,
     );
@@ -757,8 +755,8 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
     _playerIntendsPlaying = autoPlay;
 
-    _hydrationController.nextForwardHydrationPlayPosition =
-        seedEntries.map((entry) => entry.playPosition).reduce(max) + 1;
+    _window.acknowledge(QueueWindowProposal(const [],
+        seedEntries.map((entry) => entry.playPosition).reduce(max) + 1, replaceCoverage: true));
 
     final currentTrack = await _queueRepo.getTrackForItem(
       sessionId,
@@ -818,11 +816,13 @@ class AudioCoordinator extends Notifier<AudioState> {
       return false;
     }
 
-    final fallback = await _queueRepo.findLocallyPlayableFallback(
+    final resolution = await _targetResolver.resolveStart(
       sessionId: sessionId,
       preferredItemId: snapshot.currentItem!.itemId,
       totalCount: snapshot.totalCount,
+      offline: true,
     );
+    final fallback = resolution.target?.entry;
     if (fallback == null) {
       _setPlaybackStatus(PlayerStatus.idle);
       return false;
@@ -845,37 +845,15 @@ class AudioCoordinator extends Notifier<AudioState> {
     required int sessionId,
     required PlayOrderDirection direction,
   }) async {
-    final repeatModeName = state.queue.repeatMode.name;
-    if (_isOffline) {
-      return _queueRepo.findNextLocallyPlayableEntry(
-        sessionId: sessionId,
-        fromPlayPosition: state.queue.currentPlayPosition,
-        direction: direction,
-        repeatMode: repeatModeName,
-        totalCount: state.queue.totalCount,
-      );
-    }
-
-    final step = direction == PlayOrderDirection.forward ? 1 : -1;
-    var targetPlayPosition = state.queue.currentPlayPosition + step;
-    if (targetPlayPosition < 0 ||
-        targetPlayPosition >= state.queue.totalCount) {
-      if (state.queue.repeatMode != QueueRepeatMode.all ||
-          state.queue.totalCount == 0) {
-        return null;
-      }
-      targetPlayPosition = direction == PlayOrderDirection.forward
-          ? 0
-          : state.queue.totalCount - 1;
-    }
-
-    final entries = await _queueRepo.getPlaybackEntries(
-      sessionId,
-      startPlayPosition: targetPlayPosition,
-      limit: 1,
+    final resolution = await _targetResolver.resolveAdvance(
+      sessionId: sessionId,
+      fromPlayPosition: state.queue.currentPlayPosition,
+      direction: direction,
+      repeatMode: state.queue.repeatMode.name,
+      totalCount: state.queue.totalCount,
+      offline: _isOffline,
     );
-    if (entries.isEmpty) return null;
-    return entries.first;
+    return resolution.target?.entry;
   }
 
   Future<void> _onUnavailableAdvance(UnavailableAdvance event) async {
@@ -883,18 +861,20 @@ class AudioCoordinator extends Notifier<AudioState> {
     final sessionId = state.queue.sessionId;
     if (sessionId == null) return;
 
-    final target = await _queueRepo.findNextLocallyPlayableEntry(
+    final resolution = await _targetResolver.resolveAdvance(
       sessionId: sessionId,
       fromPlayPosition: event.playPosition,
       direction: PlayOrderDirection.forward,
       repeatMode: state.queue.repeatMode.name,
       totalCount: state.queue.totalCount,
+      offline: true,
     );
+    final target = resolution.target?.entry;
     if (target == null) {
       await _player.stop();
       return;
     }
-    await _hydrationController.ensureItemLoaded(sessionId, target);
+    await _ensureItemLoaded(sessionId, target);
     await _player.seekToItem(target.itemId);
     await _player.play();
   }
@@ -932,7 +912,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
     if (rebuiltCurrentEntry == null) return;
 
-    final windowEntries = await _hydrationController.seedEntriesForPlayPosition(
+    final windowEntries = await _window.seedEntriesForPlayPosition(
       sessionId,
       rebuiltCurrentEntry.playPosition,
     );
@@ -940,10 +920,10 @@ class AudioCoordinator extends Notifier<AudioState> {
       currentItemId: currentItemId,
       entries: windowEntries,
     );
-    _hydrationController.nextForwardHydrationPlayPosition =
+    _window.acknowledge(QueueWindowProposal(const [],
         windowEntries.isEmpty
         ? rebuiltCurrentEntry.playPosition + 1
-        : windowEntries.last.playPosition + 1;
+        : windowEntries.last.playPosition + 1, replaceCoverage: true));
     await _refreshCurrentQueueState(sessionId, preservePlaybackPosition: true);
     state = state.copyWith(shuffle: ShuffleSlice(shuffleOn: enable));
 
@@ -1019,25 +999,37 @@ class AudioCoordinator extends Notifier<AudioState> {
     final futureEntries = await _queueRepo.getPlaybackEntries(
       sessionId,
       startPlayPosition: currentEntry.playPosition + 1,
-      limit: QueueHydrationController.seedNextCount,
+      limit: QueueWindow.seedNextCount,
     );
     await _player.replaceFutureEntries(
       currentItemId: currentItemId,
       entries: futureEntries,
     );
-    _hydrationController.nextForwardHydrationPlayPosition =
+    _window.acknowledge(QueueWindowProposal(const [],
         futureEntries.isEmpty
         ? currentEntry.playPosition + 1
-        : futureEntries.last.playPosition + 1;
+        : futureEntries.last.playPosition + 1, replaceCoverage: true));
+  }
+
+  Future<void> _ensureItemLoaded(int sessionId, QueuePlaybackEntry entry) async {
+    final proposal = await _window.proposeItemLoad(sessionId, entry,
+        alreadyLoaded: _player.hasItem(entry.itemId));
+    if (proposal != null) await _applyWindowProposal(proposal);
+  }
+
+  Future<void> _applyWindowProposal(QueueWindowProposal proposal) async {
+    if (proposal.entries.isNotEmpty) await _player.addEntries(proposal.entries);
+    _window.acknowledge(proposal);
   }
 
   void _scheduleForwardHydration() {
     final sessionId = state.queue.sessionId;
     if (sessionId == null) return;
-    _hydrationController.scheduleForwardHydration(
+    _window.scheduleForwardHydration(
       sessionId: sessionId,
       totalCount: state.queue.totalCount,
       currentPlayPosition: state.queue.currentPlayPosition,
+      apply: _applyWindowProposal,
     );
     _scheduleQueueSync();
   }

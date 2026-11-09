@@ -2,6 +2,7 @@ import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:frontend/providers/audio/playback_target_resolver.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/repositories/queue_repository.dart';
@@ -378,8 +379,9 @@ void main() {
   );
 
   group('locally playable lookup', () {
-    QueueRepository repoWithFs(Set<String> existing) {
-      return QueueRepository(db, localFileExists: existing.contains);
+    ({QueueRepository store, PlaybackTargetResolver resolver}) repoWithFs(Set<String> existing) {
+      final store = QueueRepository(db);
+      return (store: store, resolver: PlaybackTargetResolver(store, fileExists: existing.contains));
     }
 
     Future<void> markDownloaded(String uuid, String path) async {
@@ -396,13 +398,13 @@ void main() {
         final existing = {'/tmp/a', '/tmp/d'};
 
         final localRepo = repoWithFs(existing);
-        final sessionId = await localRepo.createSessionFromExplicitList(
+        final sessionId = await localRepo.store.createSessionFromExplicitList(
           sourceType: 'custom',
           trackUuids: const ['a', 'b', 'c', 'd', 'e'],
           currentIndex: 0,
         );
 
-        final next = await localRepo.findNextLocallyPlayableEntry(
+        final next = await localRepo.resolver.resolveAdvance(offline: true,
           sessionId: sessionId,
           fromPlayPosition: 0,
           direction: PlayOrderDirection.forward,
@@ -410,7 +412,7 @@ void main() {
           totalCount: 5,
         );
 
-        expect(next?.uuidId, 'd');
+        expect(next.target?.entry.uuidId, 'd');
       },
     );
 
@@ -423,13 +425,13 @@ void main() {
         final existing = {'/tmp/a', '/tmp/e'};
 
         final localRepo = repoWithFs(existing);
-        final sessionId = await localRepo.createSessionFromExplicitList(
+        final sessionId = await localRepo.store.createSessionFromExplicitList(
           sourceType: 'custom',
           trackUuids: const ['a', 'b', 'c', 'd', 'e'],
           currentIndex: 4,
         );
 
-        final prev = await localRepo.findNextLocallyPlayableEntry(
+        final prev = await localRepo.resolver.resolveAdvance(offline: true,
           sessionId: sessionId,
           fromPlayPosition: 4,
           direction: PlayOrderDirection.backward,
@@ -437,7 +439,7 @@ void main() {
           totalCount: 5,
         );
 
-        expect(prev?.uuidId, 'a');
+        expect(prev.target?.entry.uuidId, 'a');
       },
     );
 
@@ -449,13 +451,13 @@ void main() {
         final existing = {'/tmp/a'};
 
         final localRepo = repoWithFs(existing);
-        final sessionId = await localRepo.createSessionFromExplicitList(
+        final sessionId = await localRepo.store.createSessionFromExplicitList(
           sourceType: 'custom',
           trackUuids: const ['a', 'b', 'c'],
           currentIndex: 0,
         );
 
-        final wrapped = await localRepo.findNextLocallyPlayableEntry(
+        final wrapped = await localRepo.resolver.resolveAdvance(offline: true,
           sessionId: sessionId,
           fromPlayPosition: 0,
           direction: PlayOrderDirection.forward,
@@ -463,7 +465,7 @@ void main() {
           totalCount: 3,
         );
 
-        expect(wrapped?.uuidId, 'a');
+        expect(wrapped.target?.entry.uuidId, 'a');
       },
     );
 
@@ -473,13 +475,13 @@ void main() {
         await fixture.insertSingles(['a', 'b', 'c']);
 
         final localRepo = repoWithFs(const <String>{});
-        final sessionId = await localRepo.createSessionFromExplicitList(
+        final sessionId = await localRepo.store.createSessionFromExplicitList(
           sourceType: 'custom',
           trackUuids: const ['a', 'b', 'c'],
           currentIndex: 0,
         );
 
-        final result = await localRepo.findNextLocallyPlayableEntry(
+        final result = await localRepo.resolver.resolveAdvance(offline: true,
           sessionId: sessionId,
           fromPlayPosition: 0,
           direction: PlayOrderDirection.forward,
@@ -487,7 +489,7 @@ void main() {
           totalCount: 3,
         );
 
-        expect(result, isNull);
+        expect(result.target, isNull);
       },
     );
 
@@ -499,13 +501,13 @@ void main() {
         await markDownloaded('b', '/tmp/present');
 
         final localRepo = repoWithFs({'/tmp/present'});
-        final sessionId = await localRepo.createSessionFromExplicitList(
+        final sessionId = await localRepo.store.createSessionFromExplicitList(
           sourceType: 'custom',
           trackUuids: const ['a', 'b'],
           currentIndex: 0,
         );
 
-        final result = await localRepo.findNextLocallyPlayableEntry(
+        final result = await localRepo.resolver.resolveAdvance(offline: true,
           sessionId: sessionId,
           fromPlayPosition: 0,
           direction: PlayOrderDirection.forward,
@@ -514,7 +516,7 @@ void main() {
           includeStart: true,
         );
 
-        expect(result?.uuidId, 'b');
+        expect(result.target?.entry.uuidId, 'b');
       },
     );
 
@@ -524,21 +526,21 @@ void main() {
       final existing = {'/tmp/b'};
 
       final localRepo = repoWithFs(existing);
-      final sessionId = await localRepo.createSessionFromExplicitList(
+      final sessionId = await localRepo.store.createSessionFromExplicitList(
         sourceType: 'custom',
         trackUuids: const ['a', 'b', 'c'],
         currentIndex: 1,
       );
-      final preferred = (await localRepo.getSessionSnapshot(sessionId))!
+      final preferred = (await localRepo.store.getSessionSnapshot(sessionId))!
           .currentItem!;
 
-      final result = await localRepo.findLocallyPlayableFallback(
+      final result = await localRepo.resolver.resolveStart(offline: true,
         sessionId: sessionId,
         preferredItemId: preferred.itemId,
         totalCount: 3,
       );
 
-      expect(result?.uuidId, 'b');
+      expect(result.target?.entry.uuidId, 'b');
     });
 
     test(
@@ -550,21 +552,21 @@ void main() {
         final existing = {'/tmp/a', '/tmp/e'};
 
         final localRepo = repoWithFs(existing);
-        final sessionId = await localRepo.createSessionFromExplicitList(
+        final sessionId = await localRepo.store.createSessionFromExplicitList(
           sourceType: 'custom',
           trackUuids: const ['a', 'b', 'c', 'd', 'e'],
           currentIndex: 2,
         );
-        final preferred = (await localRepo.getSessionSnapshot(sessionId))!
+        final preferred = (await localRepo.store.getSessionSnapshot(sessionId))!
             .currentItem!;
 
-        final result = await localRepo.findLocallyPlayableFallback(
+        final result = await localRepo.resolver.resolveStart(offline: true,
           sessionId: sessionId,
           preferredItemId: preferred.itemId,
           totalCount: 5,
         );
 
-        expect(result?.uuidId, 'e');
+        expect(result.target?.entry.uuidId, 'e');
       },
     );
   });

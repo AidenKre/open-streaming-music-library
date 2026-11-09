@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
+import 'package:frontend/providers/audio/playback_target_resolver.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
@@ -61,7 +62,7 @@ void main() {
     db = AppDatabase(NativeDatabase.memory());
     await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     existingFiles.clear();
-    repo = _ObservedStartupRepository(db, localFileExists: existingFiles.contains);
+    repo = _ObservedStartupRepository(db);
     fixture = _LibraryFixture(db);
     fakePlayer = FakeConcatenatingPlayerController();
     bridge = RecordingAudioServiceBridge();
@@ -92,6 +93,8 @@ void main() {
         concatenatingPlayerProvider.overrideWithValue(fakePlayer),
         audioServiceProvider.overrideWithValue(bridge),
         queueRepositoryProvider.overrideWithValue(repo),
+        playbackTargetResolverProvider.overrideWith((ref) =>
+          PlaybackTargetResolver(repo, fileExists: existingFiles.contains)),
         downloadStatusVersionProvider.overrideWith(
           (ref) => downloadStatusController.stream,
         ),
@@ -237,6 +240,36 @@ void main() {
       expect(published.single.id, 'a');
       expect(published.single.artUri, uri);
     });
+  });
+
+  test('window coverage cannot advance while engine addition is pending', () async {
+    final uuids = List.generate(100, (i) => 't$i');
+    await fixture.insertSingles(uuids);
+    final c = createContainer();
+    await repo.startupRead.future;
+    final notifier = c.read(audioProvider.notifier);
+    await notifier.playFromTrackList(uuids, await fixture.track('t0'), sourceType: 'test');
+    final window = c.read(queueWindowProvider);
+    final before = fakePlayer.seedCalls.single.entries.last.playPosition + 1;
+    expect(window.nextForwardHydrationPlayPosition, before);
+    final release = Completer<void>();
+    final entered = Completer<void>();
+    fakePlayer.addEntriesRelease = release;
+    fakePlayer.addEntriesEntered = entered;
+    final target = (await sessionTracksOf(c)).last;
+    final skipping = notifier.skipToTrack(target.itemId);
+    await entered.future;
+    try {
+      expect(window.nextForwardHydrationPlayPosition, before,
+          reason: 'unapplied sources do not count as coverage');
+    } finally {
+      release.complete();
+      await skipping;
+      await pumpEventQueue();
+    }
+    expect(window.nextForwardHydrationPlayPosition, 100);
+    expect(fakePlayer.addedBatches.last.last.playPosition, 99);
+    expect(c.read(audioProvider).queue.currentItemId, target.itemId);
   });
 
   group('5A.0 (SC-27, SC-15): lifecycle, admission closure, quiesce', () {
@@ -1874,7 +1907,7 @@ Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
 }
 
 class _ObservedStartupRepository extends QueueRepository {
-  _ObservedStartupRepository(super.db, {super.localFileExists});
+  _ObservedStartupRepository(super.db);
 
   final startupRead = Completer<void>();
   Completer<void>? startupRelease;
@@ -1914,6 +1947,8 @@ class FakeConcatenatingPlayerController
   int? _committedCurrentItemId;
   Duration _position = Duration.zero;
   bool _disposed = false;
+  Completer<void>? addEntriesEntered;
+  Completer<void>? addEntriesRelease;
 
   final List<SeedCall> seedCalls = [];
   final List<List<QueuePlaybackEntry>> addedBatches = [];
@@ -1970,6 +2005,14 @@ class FakeConcatenatingPlayerController
 
   @override
   Future<void> addEntries(List<QueuePlaybackEntry> entries) async {
+    final release = addEntriesRelease;
+    if (release != null) {
+      final entered = addEntriesEntered;
+      addEntriesEntered = null;
+      if (entered != null && !entered.isCompleted) entered.complete();
+      await release.future;
+      addEntriesRelease = null;
+    }
     final additions = entries
         .where((entry) => !hasItem(entry.itemId))
         .toList(growable: false);

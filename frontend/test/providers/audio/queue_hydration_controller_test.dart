@@ -3,13 +3,11 @@ import 'dart:async';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:just_audio/just_audio.dart' as ja;
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
-import 'package:frontend/providers/audio/concatenating_player_controller.dart';
-import 'package:frontend/providers/audio/queue_hydration_controller.dart';
+import 'package:frontend/providers/audio/queue_window.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import '../../helpers/server_binding.dart';
 
@@ -17,7 +15,7 @@ void main() {
   late AppDatabase db;
   late QueueRepository repo;
   late _FakePlayer fakePlayer;
-  late QueueHydrationController hydration;
+  late QueueWindow hydration;
   late _LibraryFixture fixture;
 
   setUpAll(() {
@@ -29,7 +27,7 @@ void main() {
     await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     repo = QueueRepository(db);
     fakePlayer = _FakePlayer();
-    hydration = QueueHydrationController(repo, fakePlayer);
+    hydration = QueueWindow(repo);
     fixture = _LibraryFixture(db);
   });
 
@@ -52,10 +50,10 @@ void main() {
     expect(entries, isNotEmpty);
     expect(entries.length,
         lessThanOrEqualTo(
-            QueueHydrationController.seedPreviousCount +
-            QueueHydrationController.seedNextCount + 1));
+            QueueWindow.seedPreviousCount +
+            QueueWindow.seedNextCount + 1));
     expect(entries.first.playPosition,
-        greaterThanOrEqualTo(40 - QueueHydrationController.seedPreviousCount));
+        greaterThanOrEqualTo(40 - QueueWindow.seedPreviousCount));
     expect(entries.any((e) => e.playPosition == 40), isTrue);
   });
 
@@ -70,7 +68,12 @@ void main() {
     final entries = await repo.getPlaybackEntries(sessionId);
     fakePlayer.preloadItems(entries);
 
-    await hydration.ensureItemLoaded(sessionId, entries.first);
+    final proposal = await hydration.proposeItemLoad(sessionId, entries.first,
+        alreadyLoaded: fakePlayer.hasItem(entries.first.itemId));
+    if (proposal != null) {
+      await fakePlayer.addEntries(proposal.entries);
+      hydration.acknowledge(proposal);
+    }
 
     expect(fakePlayer.addedBatches, isEmpty);
   });
@@ -85,7 +88,12 @@ void main() {
 
     final entries = await repo.getPlaybackEntries(sessionId);
 
-    await hydration.ensureItemLoaded(sessionId, entries.last);
+    final proposal = await hydration.proposeItemLoad(sessionId, entries.last,
+        alreadyLoaded: fakePlayer.hasItem(entries.last.itemId));
+    if (proposal != null) {
+      await fakePlayer.addEntries(proposal.entries);
+      hydration.acknowledge(proposal);
+    }
 
     expect(fakePlayer.addedBatches, isNotEmpty);
     expect(fakePlayer.hasItem(entries.last.itemId), isTrue);
@@ -104,6 +112,10 @@ void main() {
       sessionId: sessionId,
       totalCount: 100,
       currentPlayPosition: 0,
+      apply: (proposal) async {
+        await fakePlayer.addEntries(proposal.entries);
+        hydration.acknowledge(proposal);
+      },
     );
 
     await fakePlayer.firstAdd.future;
@@ -120,101 +132,20 @@ void main() {
   });
 }
 
-class _FakePlayer implements ConcatenatingPlayerController {
+class _FakePlayer {
   final Set<int> _loadedItemIds = {};
   final List<List<QueuePlaybackEntry>> addedBatches = [];
   final firstAdd = Completer<void>();
-
-  void preloadItems(List<QueuePlaybackEntry> entries) {
-    for (final entry in entries) {
-      _loadedItemIds.add(entry.itemId);
-    }
-  }
-
-  @override
+  void preloadItems(List<QueuePlaybackEntry> entries) =>
+      _loadedItemIds.addAll(entries.map((entry) => entry.itemId));
   Future<void> addEntries(List<QueuePlaybackEntry> entries) async {
-    final additions =
-        entries.where((e) => !_loadedItemIds.contains(e.itemId)).toList();
+    final additions = entries.where((entry) => !_loadedItemIds.contains(entry.itemId)).toList();
     if (additions.isEmpty) return;
     addedBatches.add(additions);
-    for (final entry in additions) {
-      _loadedItemIds.add(entry.itemId);
-    }
+    preloadItems(additions);
     if (!firstAdd.isCompleted) firstAdd.complete();
   }
-
-  @override
   bool hasItem(int itemId) => _loadedItemIds.contains(itemId);
-
-  @override
-  List<int> get loadedItemIds => _loadedItemIds.toList();
-
-  @override
-  int get queueLength => _loadedItemIds.length;
-
-  @override
-  int? get currentIndex => null;
-  @override
-  int? get currentItemId => null;
-  @override
-  String? get currentUuid => null;
-  @override
-  Duration get position => Duration.zero;
-
-  @override
-  Stream<ja.PlayerState> get playerStateStream => const Stream.empty();
-  @override
-  Stream<Duration> get positionStream => const Stream.empty();
-  @override
-  Stream<Duration?> get durationStream => const Stream.empty();
-  @override
-  Stream<int?> get currentItemIdStream => const Stream.empty();
-  @override
-  Stream<UnavailableAdvance> get unavailableAdvanceStream =>
-      const Stream.empty();
-
-  @override
-  Future<void> setSeed(List<QueuePlaybackEntry> entries,
-      {required int currentItemId,
-      Duration initialPosition = Duration.zero,
-      bool autoPlay = false,
-      bool shuffleEnabled = false}) async {}
-  @override
-  Future<void> replaceFutureEntries(
-      {required int currentItemId,
-      required List<QueuePlaybackEntry> entries}) async {}
-  @override
-  Future<void> rebuildAroundCurrent(
-      {required int currentItemId,
-      required List<QueuePlaybackEntry> entries}) async {}
-  @override
-  void replaceLoadedEntriesMetadata(List<QueuePlaybackEntry> entries) {}
-  @override
-  Future<void> refreshLoadedSourcesForAvailabilityChanges(
-      List<QueuePlaybackEntry> entries) async {}
-  @override
-  Future<void> removeItem(int itemId) async {}
-  @override
-  Future<void> seekToItem(int itemId, {Duration position = Duration.zero}) async {}
-  @override
-  Future<void> play() async {}
-  @override
-  Future<void> pause() async {}
-  @override
-  Future<void> seek(Duration position) async {}
-  @override
-  Future<void> stop() async {}
-  @override
-  Future<void> setVolume(double volume) async {}
-  @override
-  Future<void> setLoopMode(ja.LoopMode mode) async {}
-  @override
-  void setStreamQuality(String quality) {}
-  @override
-  Future<void> rebuildCurrentSource(String quality, Duration seekTo) async {}
-  @override
-  Future<void> rebuildAllSources(String quality, Duration seekTo) async {}
-  @override
   void dispose() {}
 }
 
