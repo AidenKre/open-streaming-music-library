@@ -5,14 +5,16 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import '../helpers/server_binding.dart';
 
 void main() {
   late AppDatabase db;
   late QueueRepository repo;
   late _LibraryFixture fixture;
 
-  setUp(() {
+  setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     repo = QueueRepository(db);
     fixture = _LibraryFixture(db);
   });

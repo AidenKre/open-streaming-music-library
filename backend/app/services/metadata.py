@@ -1,4 +1,5 @@
 import json
+import math
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -215,7 +216,7 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
         codec = str(codec)
 
     metadata.codec = codec
-    metadata.duration = float(audio_stream.get("duration", 0.0))
+    metadata.duration = _parse_float(audio_stream.get("duration"))
     # FLAC (and some other containers) carry no stream-level bit_rate; fall
     # back to format.bit_rate, which ffprobe derives from file size/duration
     # (so it includes embedded art -- a small overstatement beats not
@@ -225,8 +226,8 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
         stream_bitrate if stream_bitrate is not None
         else _bitrate_kbps(json_data.get("format", {}).get("bit_rate"))
     )
-    metadata.sample_rate_hz = int(audio_stream.get("sample_rate", 0))
-    metadata.channels = int(audio_stream.get("channels", 0))
+    metadata.sample_rate_hz = _parse_int(audio_stream.get("sample_rate"))
+    metadata.channels = _parse_int(audio_stream.get("channels"))
 
     metadata.has_album_art = has_album_art
 
@@ -281,6 +282,21 @@ def extract_cover_art_bytes(file_path: Path) -> bytes | None:
         return None
 
     return result.stdout
+
+
+def _parse_float(value: object) -> float | None:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _parse_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _bitrate_kbps(bit_rate: object) -> float | None:

@@ -10,6 +10,9 @@ import 'package:frontend/services/recovery/recovery_service.dart';
 /// Records every trigger it recovers for, in order. Used to assert the
 /// priority-sorted, trigger-filtered invocation contract.
 class _Recording implements RecoverableService {
+  @override
+  bool get requiresBinding => false; // local: never awaits the gate
+
   _Recording(this.label, this.priority, this.triggers, this.log);
 
   final String label;
@@ -29,6 +32,9 @@ class _Recording implements RecoverableService {
 
 /// Throws on recover to verify per-member try/catch isolation.
 class _Throwing implements RecoverableService {
+  @override
+  bool get requiresBinding => false; // local: never awaits the gate
+
   _Throwing(this.priority, this.triggers, this.log);
 
   final int priority;
@@ -49,6 +55,9 @@ class _Throwing implements RecoverableService {
 /// Blocks inside [recover] until [release] is completed, so a test can hold a
 /// run open and fire a second [RecoveryService.runFor] against it.
 class _Blocking implements RecoverableService {
+  @override
+  bool get requiresBinding => false; // local: never awaits the gate
+
   _Blocking(this.triggers, this.log);
 
   @override

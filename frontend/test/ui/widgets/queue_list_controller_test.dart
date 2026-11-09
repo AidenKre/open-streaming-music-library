@@ -11,6 +11,7 @@ import 'package:frontend/ui/widgets/queue_list_controller.dart';
 
 import '../browse_harness.dart';
 import '../fake_player_controls.dart';
+import '../../helpers/server_binding.dart';
 
 /// The full player's queue list paging, now in a controller (real in-memory
 /// queue tables; only the player input is faked).
@@ -42,8 +43,9 @@ void main() {
     );
   }
 
-  setUp(() {
+  setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     repo = QueueRepository(db);
     player = FakePlayerControls();
     offline = TestOffline(false);

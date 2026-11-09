@@ -1784,17 +1784,15 @@ void main() {
   });
 
   group('schema', () {
-    // Schema history was reset during beta: the current definitions are v1 and
-    // onCreate is the only creation path. This sanity check pins the reset —
-    // user_version lands at 1 and the newest columns exist from day one. When
-    // the first real migration is added, follow the ground rules documented on
-    // AppDatabase.migration (test it by opening a REAL previous-version file).
-    test('fresh database is created at version 1 with the full current shape',
+    // A fresh install lands directly on the latest schema version with the
+    // newest columns present (upgrades are covered by the real-file migration
+    // tests under test/database/ and test/drift/).
+    test('fresh database is created at the latest version with the full current shape',
         () async {
       final version = await db
           .customSelect('PRAGMA user_version')
           .getSingle();
-      expect(version.read<int>('user_version'), 1);
+      expect(version.read<int>('user_version'), db.schemaVersion);
 
       for (final col in ['original_values_json', 'rejection_reason']) {
         final hit = await db

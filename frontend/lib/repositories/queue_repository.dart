@@ -4,6 +4,7 @@ import 'package:drift/drift.dart';
 
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 
 abstract final class QueueItemTypes {
   static const main = 'main';
@@ -65,14 +66,45 @@ class QueueTrackRemovalResult {
   const QueueTrackRemovalResult({required this.affectedSessionIds});
 }
 
+/// The queue store. Every public writer is fenced (SC-01 rule 4, D16): the
+/// repository belongs to one session scope, pins the binding token
+/// (`local_binding_id`) on its first write, and runs each write in a
+/// transaction that asserts the binding row still carries it. After a reset
+/// (row deleted) or a re-bind (new row), this instance's writes throw
+/// [BindingFencedException] and change nothing.
 class QueueRepository {
   final AppDatabase _db;
   // Indirection so tests can drive the "is this file actually on disk?" check
   // without touching the filesystem. Production stays a real existsSync().
   final bool Function(String path) _localFileExists;
+  final ServerBindingRepository _binding;
+  String? _token;
+  bool _closed = false;
 
-  QueueRepository(this._db, {bool Function(String path)? localFileExists})
-    : _localFileExists = localFileExists ?? ((path) => File(path).existsSync());
+  QueueRepository(
+    this._db, {
+    bool Function(String path)? localFileExists,
+    ServerBindingRepository? binding,
+  }) : _localFileExists =
+           localFileExists ?? ((path) => File(path).existsSync()),
+       _binding = binding ?? ServerBindingRepository(_db);
+
+  /// Its session scope is gone: every later write is refused, so a lane step
+  /// that outlives a reset can't pin the NEXT session's token.
+  void close() => _closed = true;
+
+  /// Runs [body] as one fenced write transaction, pinning the token on the
+  /// first write. No binding row: refused, nothing pinned.
+  Future<T> _fenced<T>(Future<T> Function() body) async {
+    if (_closed) throw BindingFencedException('<closed>');
+    var token = _token;
+    if (token == null) {
+      token = (await _binding.current())?.localBindingId;
+      if (token == null) throw BindingFencedException('<no binding>');
+      _token = token;
+    }
+    return _binding.runFenced(token, body);
+  }
 
   bool _isLocallyPlayable(QueuePlaybackEntry entry) {
     final path = entry.filePath;
@@ -89,8 +121,8 @@ class QueueRepository {
     bool shuffleEnabled = false,
     bool downloadedOnly = false,
   }) {
-    return _db.transaction(() async {
-      await deactivateAll();
+    return _fenced(() async {
+      await _deactivateAll();
 
       final sessionId = await _createSessionRow(
         sourceType: sourceType,
@@ -144,7 +176,7 @@ class QueueRepository {
           usePlayOrder: false,
         );
         futureMainIds.shuffle();
-        await rebuildFutureSuffix(
+        await _rebuildFutureSuffix(
           sessionId,
           currentItemId: currentItemId,
           mainFutureItemIds: futureMainIds,
@@ -163,8 +195,8 @@ class QueueRepository {
     String repeatMode = 'off',
     bool shuffleEnabled = false,
   }) {
-    return _db.transaction(() async {
-      await deactivateAll();
+    return _fenced(() async {
+      await _deactivateAll();
 
       final sessionId = await _createSessionRow(
         sourceType: sourceType,
@@ -224,7 +256,7 @@ class QueueRepository {
           usePlayOrder: false,
         );
         futureMainIds.shuffle();
-        await rebuildFutureSuffix(
+        await _rebuildFutureSuffix(
           sessionId,
           currentItemId: currentItemId,
           mainFutureItemIds: futureMainIds,
@@ -633,66 +665,88 @@ class QueueRepository {
     int? resumeMainItemId,
     bool updateResumeMainItemId = false,
   }) {
-    return (_db.update(
-      _db.queueSessions,
-    )..where((s) => s.id.equals(sessionId))).write(
-      QueueSessionsCompanion(
-        currentItemId: Value(currentItemId),
-        resumeMainItemId: updateResumeMainItemId
-            ? Value(resumeMainItemId)
-            : const Value.absent(),
-        currentPositionMs: Value(positionMs),
-        updatedAt: Value(_timestampSeconds()),
-      ),
+    return _fenced(
+      () =>
+          (_db.update(
+            _db.queueSessions,
+          )..where((s) => s.id.equals(sessionId))).write(
+            QueueSessionsCompanion(
+              currentItemId: Value(currentItemId),
+              resumeMainItemId: updateResumeMainItemId
+                  ? Value(resumeMainItemId)
+                  : const Value.absent(),
+              currentPositionMs: Value(positionMs),
+              updatedAt: Value(_timestampSeconds()),
+            ),
+          ),
     );
   }
 
   Future<void> updateRepeatMode(int sessionId, String mode) {
-    return (_db.update(
-      _db.queueSessions,
-    )..where((s) => s.id.equals(sessionId))).write(
-      QueueSessionsCompanion(
-        repeatMode: Value(mode),
-        updatedAt: Value(_timestampSeconds()),
-      ),
+    return _fenced(
+      () =>
+          (_db.update(
+            _db.queueSessions,
+          )..where((s) => s.id.equals(sessionId))).write(
+            QueueSessionsCompanion(
+              repeatMode: Value(mode),
+              updatedAt: Value(_timestampSeconds()),
+            ),
+          ),
     );
   }
 
   Future<void> updateShuffleEnabled(int sessionId, bool enabled) {
-    return (_db.update(
-      _db.queueSessions,
-    )..where((s) => s.id.equals(sessionId))).write(
-      QueueSessionsCompanion(
-        shuffleEnabled: Value(enabled),
-        updatedAt: Value(_timestampSeconds()),
-      ),
+    return _fenced(
+      () =>
+          (_db.update(
+            _db.queueSessions,
+          )..where((s) => s.id.equals(sessionId))).write(
+            QueueSessionsCompanion(
+              shuffleEnabled: Value(enabled),
+              updatedAt: Value(_timestampSeconds()),
+            ),
+          ),
     );
   }
 
-  Future<void> replacePlayOrder(int sessionId, List<int> itemIds) {
-    return _db.transaction(() async {
-      await (_db.delete(
-        _db.queueSessionPlayOrder,
-      )..where((row) => row.sessionId.equals(sessionId))).go();
+  Future<void> replacePlayOrder(int sessionId, List<int> itemIds) =>
+      _fenced(() => _replacePlayOrder(sessionId, itemIds));
 
-      await _db.batch((batch) {
-        for (var i = 0; i < itemIds.length; i++) {
-          batch.insert(
-            _db.queueSessionPlayOrder,
-            QueueSessionPlayOrderCompanion.insert(
-              sessionId: sessionId,
-              playPosition: i,
-              itemId: itemIds[i],
-            ),
-          );
-        }
-      });
+  Future<void> _replacePlayOrder(int sessionId, List<int> itemIds) async {
+    await (_db.delete(
+      _db.queueSessionPlayOrder,
+    )..where((row) => row.sessionId.equals(sessionId))).go();
 
-      await _touchSession(sessionId);
+    await _db.batch((batch) {
+      for (var i = 0; i < itemIds.length; i++) {
+        batch.insert(
+          _db.queueSessionPlayOrder,
+          QueueSessionPlayOrderCompanion.insert(
+            sessionId: sessionId,
+            playPosition: i,
+            itemId: itemIds[i],
+          ),
+        );
+      }
     });
+
+    await _touchSession(sessionId);
   }
 
   Future<void> rebuildFutureSuffix(
+    int sessionId, {
+    required int currentItemId,
+    required List<int> mainFutureItemIds,
+  }) => _fenced(
+    () => _rebuildFutureSuffix(
+      sessionId,
+      currentItemId: currentItemId,
+      mainFutureItemIds: mainFutureItemIds,
+    ),
+  );
+
+  Future<void> _rebuildFutureSuffix(
     int sessionId, {
     required int currentItemId,
     required List<int> mainFutureItemIds,
@@ -713,7 +767,7 @@ class QueueRepository {
       excludedItemIds: prefixIds,
     );
 
-    await replacePlayOrder(sessionId, [
+    await _replacePlayOrder(sessionId, [
       ...prefixIds,
       ...manualFutureIds,
       ...mainFutureItemIds,
@@ -721,7 +775,7 @@ class QueueRepository {
   }
 
   Future<void> prependManualItems(int sessionId, List<String> uuids) {
-    return _db.transaction(() async {
+    return _fenced(() async {
       if (uuids.isEmpty) return;
 
       await _shiftSessionItemPositionsUp(
@@ -756,7 +810,7 @@ class QueueRepository {
   }
 
   Future<void> appendManualItems(int sessionId, List<String> uuids) {
-    return _db.transaction(() async {
+    return _fenced(() async {
       if (uuids.isEmpty) return;
 
       final startPosition = await _countQueueTypeItems(
@@ -789,7 +843,7 @@ class QueueRepository {
   }
 
   Future<void> removeItem(int sessionId, int itemId) {
-    return _db.transaction(() async {
+    return _fenced(() async {
       final itemRow = await _db
           .customSelect(
             'SELECT queue_type, position '
@@ -842,11 +896,11 @@ class QueueRepository {
   Future<QueueTrackRemovalResult> removeTrackUuidsFromQueues(
     List<String> uuids,
   ) {
-    return _db.transaction(
-      () => removeTrackUuidsFromQueuesInTransaction(uuids),
-    );
+    return _fenced(() => removeTrackUuidsFromQueuesInTransaction(uuids));
   }
 
+  /// Unfenced: runs inside the caller's transaction, which must itself be
+  /// fenced (SyncService applies a page under its own binding token).
   Future<QueueTrackRemovalResult> removeTrackUuidsFromQueuesInTransaction(
     List<String> uuids,
   ) async {
@@ -886,7 +940,9 @@ class QueueRepository {
     return QueueTrackRemovalResult(affectedSessionIds: affectedSessionIds);
   }
 
-  Future<void> deactivateAll() {
+  Future<void> deactivateAll() => _fenced(_deactivateAll);
+
+  Future<void> _deactivateAll() {
     return (_db.update(
       _db.queueSessions,
     )..where((s) => s.isActive.equals(true))).write(

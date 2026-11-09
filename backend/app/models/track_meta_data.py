@@ -18,11 +18,11 @@ class TrackMetaData(BaseModel):
     disc_number: int | None = None
 
     codec: str | None = None
-    duration: float = 0.0
+    duration: float | None = None
     # None = unknown (ffprobe reported no bitrate); 0.0 is a real reading.
     bitrate_kbps: float | None = None
-    sample_rate_hz: int = 0
-    channels: int = 0
+    sample_rate_hz: int | None = None
+    channels: int | None = None
 
     has_album_art: bool = False
     cover_art_id: int | None = None
@@ -30,8 +30,8 @@ class TrackMetaData(BaseModel):
     def is_empty(self) -> bool:
         return (
             self.codec is None
-            and self.duration == 0.0
-            and not self.bitrate_kbps
-            and self.sample_rate_hz == 0
-            and self.channels == 0
+            and self.duration is None
+            and self.bitrate_kbps is None
+            and self.sample_rate_hz is None
+            and self.channels is None
         )

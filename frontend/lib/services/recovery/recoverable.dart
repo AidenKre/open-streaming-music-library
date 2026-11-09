@@ -40,6 +40,10 @@ abstract class RecoverableService {
   /// call repeatedly — recovery edges can flap (offline↔online) and resume
   /// can fire back-to-back with cold start.
   Future<void> recover(RecoveryTrigger trigger);
+
+  /// Whether this member makes network requests and so must await the SC-01
+  /// binding gate before its first one. Fail-closed: every member declares it.
+  bool get requiresBinding;
 }
 
 /// Priority slots that encode the order recovery steps must run in.

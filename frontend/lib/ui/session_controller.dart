@@ -23,6 +23,28 @@ abstract interface class SessionControls implements Listenable {
 
   Future<void> connect(String url);
 
+  /// Set when a login found a different server than the one this library
+  /// is bound to: the URL awaiting the user's confirmed reset (SC-01 rule
+  /// 1). The view asks; nothing was saved yet.
+  String? get pendingServerSwitch;
+
+  /// The user confirmed: reset local data, keep the new URL, and rebind.
+  Future<void> confirmServerSwitch();
+
+  /// The user cancelled: back to the login screen, the URL not saved.
+  void cancelServerSwitch();
+
+  /// What a reset would lose, for the confirmation copy (SC-15).
+  Future<List<String>> pendingLossSummaries();
+
+  /// Blocked: the server at the saved URL is a different library (SC-01
+  /// rule 1). Network work waits; local playback and browsing keep working.
+  bool get serverBlocked;
+
+  /// Blocked banner's Reset (confirmed by the view): reset local data, keep
+  /// the URL, and bind to the server there.
+  Future<void> resetBlockedServer();
+
   /// Reset local data and disconnect (confirmed by the caller's view).
   Future<void> disconnect();
 
@@ -43,16 +65,24 @@ final sessionControlsProvider = Provider<SessionControls>((ref) {
 });
 
 class SessionController extends ChangeNotifier implements SessionControls {
-  SessionController(this._ref);
+  SessionController(this._ref) {
+    _blocked = _service.serverBlocked..addListener(_onBlockedChanged);
+  }
 
   final Ref _ref;
   SessionPhase _phase = SessionPhase.starting;
   String? _connectError;
   LocalResetException? _resetFailure;
+  String? _pendingServerSwitch;
   bool _started = false;
   bool _disposed = false;
 
   SessionService get _service => _ref.read(sessionServiceProvider);
+  late final ValueListenable<bool> _blocked;
+
+  void _onBlockedChanged() {
+    if (!_disposed) notifyListeners();
+  }
 
   @override
   SessionPhase get phase => _phase;
@@ -82,18 +112,62 @@ class SessionController extends ChangeNotifier implements SessionControls {
 
   @override
   Future<void> connect(String url) async {
-    final error = await _service.connect(url);
+    final outcome = await _service.connect(url);
     if (_disposed) return;
-    _connectError = error;
-    _set(error == null ? SessionPhase.live : SessionPhase.signedOut);
+    switch (outcome) {
+      case ConnectSucceeded():
+        _connectError = null;
+        _set(SessionPhase.live);
+      case ConnectFailed(:final message):
+        _connectError = message;
+        _set(SessionPhase.signedOut);
+      case ConnectDifferentServer(:final url):
+        _connectError = null;
+        _pendingServerSwitch = url;
+        _set(SessionPhase.signedOut);
+    }
   }
 
   @override
-  Future<void> disconnect() async {
+  String? get pendingServerSwitch => _pendingServerSwitch;
+
+  @override
+  Future<void> confirmServerSwitch() async {
+    final url = _pendingServerSwitch;
+    if (url == null) return;
+    _pendingServerSwitch = null;
+    await _runReset(() => _service.resetForNewServer(url));
+  }
+
+  @override
+  void cancelServerSwitch() {
+    _pendingServerSwitch = null;
+    if (!_disposed) notifyListeners();
+  }
+
+  @override
+  Future<List<String>> pendingLossSummaries() =>
+      _service.pendingLossSummaries();
+
+  @override
+  Future<void> disconnect() => _runReset(_service.resetLocalData);
+
+  @override
+  bool get serverBlocked => _blocked.value;
+
+  @override
+  Future<void> resetBlockedServer() =>
+      _runReset(_service.resetForBlockedServer);
+
+  /// resetting -> resetComplete around one model reset; a second reset
+  /// while one runs is ignored.
+  Future<void> _runReset(
+    Future<LocalResetException?> Function() reset,
+  ) async {
     if (_phase == SessionPhase.resetting) return;
     _connectError = null;
     _set(SessionPhase.resetting);
-    final failure = await _service.resetLocalData();
+    final failure = await reset();
     if (_disposed) return;
     _resetFailure = failure;
     _set(SessionPhase.resetComplete);
@@ -114,6 +188,7 @@ class SessionController extends ChangeNotifier implements SessionControls {
   @override
   void dispose() {
     _disposed = true;
+    _blocked.removeListener(_onBlockedChanged);
     super.dispose();
   }
 }

@@ -24,9 +24,13 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/ui/playback_wiring.dart';
+import 'package:frontend/ui/player_controller.dart';
+import '../../helpers/server_binding.dart';
 
 void main() {
   late AppDatabase db;
@@ -39,7 +43,7 @@ void main() {
   final Set<String> existingFiles = <String>{};
   late StreamController<int> downloadStatusController;
 
-  setUp(() {
+  setUp(() async {
     SharedPreferences.setMockInitialValues({});
     // The real settings and warm services are built by AudioCoordinator.
     // Keep their incidental requests in memory: localhost might be a real
@@ -55,6 +59,7 @@ void main() {
     }));
     initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     existingFiles.clear();
     repo = _ObservedStartupRepository(db, localFileExists: existingFiles.contains);
     fixture = _LibraryFixture(db);
@@ -122,6 +127,163 @@ void main() {
     );
     existingFiles.remove(path);
   }
+
+  group('5A.0 (SC-27, SC-15): lifecycle, admission closure, quiesce', () {
+    Future<AudioCoordinator> playing(ProviderContainer c) async {
+      await fixture.insertAlbum(
+        artist: 'Artist',
+        album: 'Album',
+        uuids: ['a', 'b', 'c'],
+      );
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromQueue(
+        track: await fixture.track('a'),
+        sourceType: 'album',
+        artistId: 1,
+        albumId: 1,
+        orderParams: [OrderParameter(column: 'track_number')],
+      );
+      await Future<void>.delayed(Duration.zero);
+      return notifier;
+    }
+
+    Future<int> sessionCount() async =>
+        (await db.select(db.queueSessions).get()).length;
+
+    test('lifecycle is none until the session is ready, then active', () async {
+      final readiness = SessionReadiness();
+      final c = createContainer(readiness: readiness);
+      final notifier = c.read(audioProvider.notifier);
+      await Future<void>.delayed(Duration.zero);
+      expect(notifier.lifecycle, PlaybackLifecycle.none);
+      readiness.markReady();
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(notifier.lifecycle, PlaybackLifecycle.active);
+    });
+
+    test('quiesce closes admission synchronously, then reaches quiesced',
+        () async {
+      final notifier = await playing(createContainer());
+      expect(notifier.lifecycle, PlaybackLifecycle.active);
+      final quiescing = notifier.quiesce();
+      expect(notifier.lifecycle, PlaybackLifecycle.stopping);
+      // A command issued in the same turn, before quiesce settles, is refused.
+      final sessionsBefore = await sessionCount();
+      await notifier.playFromQueue(
+        track: await fixture.track('b'),
+        sourceType: 'album',
+        artistId: 1,
+        albumId: 1,
+        orderParams: [OrderParameter(column: 'track_number')],
+      );
+      await quiescing;
+      expect(notifier.lifecycle, PlaybackLifecycle.quiesced);
+      expect(await sessionCount(), sessionsBefore);
+    });
+
+    // Audit 5A.0(a) #6: once the reset fence deleted the binding row, a
+    // cursor save (admitted lane step or position tick) is a quiet no-op,
+    // never an uncaught BindingFencedException.
+    test('a cursor save after the reset fence is a quiet no-op', () async {
+      final notifier = await playing(createContainer());
+      await ServerBindingRepository(db).fence();
+      await expectLater(notifier.pause(), completes);
+    });
+
+    test('quiesce stops audio', () async {
+      final notifier = await playing(createContainer());
+      final stopsBefore = fakePlayer.stopCalls;
+      await notifier.quiesce();
+      expect(fakePlayer.stopCalls, greaterThan(stopsBefore));
+    });
+
+    test('quiesced is terminal: every later command is a no-op', () async {
+      final c = createContainer();
+      final notifier = await playing(c);
+      await notifier.quiesce();
+      final state = c.read(audioProvider);
+      final plays = fakePlayer.playCalls;
+      final pauses = fakePlayer.pauseCalls;
+      final seeds = fakePlayer.seedCalls.length;
+      final sessions = await sessionCount();
+
+      await notifier.resume();
+      await notifier.play(await fixture.track('b'));
+      await notifier.togglePlayPause();
+      await notifier.skipNext();
+      await notifier.skipPrevious();
+      await notifier.seek(const Duration(seconds: 5));
+      await notifier.toggleShuffle();
+      await notifier.addToQueue([await fixture.track('c')]);
+      await notifier.playNext([await fixture.track('c')]);
+      await notifier.playFromQueue(
+        track: await fixture.track('c'),
+        sourceType: 'album',
+        artistId: 1,
+        albumId: 1,
+        orderParams: [OrderParameter(column: 'track_number')],
+      );
+      final volumeBefore = fakePlayer.lastVolume;
+      await notifier.setVolume(0.13); // audit 5A.0(c) #11
+      await notifier.quiesce(); // idempotent
+      expect(fakePlayer.lastVolume, volumeBefore);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getDouble('audioVolume'), isNot(0.13));
+
+      expect(notifier.lifecycle, PlaybackLifecycle.quiesced);
+      expect(c.read(audioProvider), state);
+      expect(fakePlayer.playCalls, plays);
+      expect(fakePlayer.pauseCalls, pauses);
+      expect(fakePlayer.seedCalls.length, seeds);
+      expect(await sessionCount(), sessions);
+    });
+
+    test('an OS media input after quiesce changes nothing', () async {
+      final c = createContainer();
+      final notifier = await playing(c);
+      await notifier.quiesce();
+      final plays = fakePlayer.playCalls;
+      final controls = c.read(playerControlsProvider);
+      await controls.click(MediaButton.media);
+      await controls.togglePlayPause();
+      await controls.skipNext();
+      expect(fakePlayer.playCalls, plays);
+      expect(notifier.lifecycle, PlaybackLifecycle.quiesced);
+    });
+
+    test('quiesce waits for lane work already admitted', () async {
+      final c = createContainer();
+      await fixture.insertAlbum(
+        artist: 'Artist',
+        album: 'Album',
+        uuids: ['a', 'b', 'c'],
+      );
+      final notifier = c.read(audioProvider.notifier);
+      var started = false;
+      final start = notifier
+          .playFromQueue(
+            track: await fixture.track('a'),
+            sourceType: 'album',
+            artistId: 1,
+            albumId: 1,
+            orderParams: [OrderParameter(column: 'track_number')],
+          )
+          .then((_) => started = true);
+      await notifier.quiesce();
+      expect(started, isTrue, reason: 'admitted before closure, settled first');
+      await start;
+    });
+
+    test('the reset quiesces playback as its first participant', () async {
+      final c = createContainer();
+      final notifier = await playing(c);
+      final participants = c.read(localQuiescablesProvider);
+      expect(participants.first.quiesceName, 'playback');
+      await participants.first.quiesce();
+      expect(notifier.lifecycle, PlaybackLifecycle.quiesced);
+    });
+  });
 
   group('4A.0b: transport rules decided in the model', () {
     Future<AudioCoordinator> playing(ProviderContainer c) async {

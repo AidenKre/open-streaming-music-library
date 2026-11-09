@@ -7,6 +7,8 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/change_entry_dto.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
+import 'package:frontend/repositories/sync_cursor_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class SyncResult {
@@ -19,71 +21,128 @@ class SyncResult {
   });
 }
 
+/// The server answered with a `latestRevision` below the `after` this client
+/// requested: it was restored from an older backup (SC-01 rule 5). Nothing
+/// from that response was applied.
+class ServerRegressedException implements Exception {
+  ServerRegressedException({
+    required this.requestedAfter,
+    required this.latestRevision,
+  });
+  final int requestedAfter;
+  final int latestRevision;
+
+  @override
+  String toString() =>
+      'ServerRegressedException(requested after $requestedAfter, '
+      'server latest $latestRevision)';
+}
+
 /// Drives revision-based incremental sync: pages the `/changes` stream,
 /// applies the interleaved upsert/delete entries into the local database in
 /// revision order, advances the watermark, and rebuilds search indexes.
+///
+/// Every local write is fenced (SC-01 rule 4) by [bindingToken], the
+/// `local_binding_id` captured when the sync task started: once a reset
+/// deletes or a re-bind replaces the binding row, a late write throws
+/// [BindingFencedException] and changes nothing.
 class SyncService {
   final AppDatabase _db;
   final TracksApi _api;
   final QueueRepository _queueRepo;
   final SharedPreferences _prefs;
+  final String _bindingToken;
+  final ServerBindingRepository _binding;
+  final SyncCursorStore _cursors;
 
   SyncService({
     required AppDatabase db,
     required TracksApi api,
     required QueueRepository queueRepository,
     required SharedPreferences prefs,
+    required String bindingToken,
   }) : _db = db,
        _api = api,
        _queueRepo = queueRepository,
-       _prefs = prefs;
+       _prefs = prefs,
+       _bindingToken = bindingToken,
+       _binding = ServerBindingRepository(db),
+       _cursors = SyncCursorStore(db);
 
-  // Last monotonic revision the client has applied. Sent as `after_revision`
-  // and advanced per page; absence means a full resync from 0.
-  static const lastRevisionKey = 'lastRevision';
+  /// The binding token this run's writes are fenced by (SC-01 rule 4), for
+  /// work sharing the run's critical section (the edit outbox flush).
+  String get bindingToken => _bindingToken;
+
+  /// The pre-SC-02 SharedPreferences key of the catalog watermark, read once
+  /// and removed by [SyncCursorStore.migrateLegacyCatalogCursor].
+  static const lastRevisionKey = SyncCursorStore.legacyCatalogPrefKey;
 
   Future<SyncResult> syncChanges() async {
-    var after = _prefs.getInt(lastRevisionKey) ?? 0;
+    // The catalog watermark (last monotonic revision applied) lives in
+    // `sync_cursors.catalog` (SC-02); a pre-SC-02 pref moves there once.
+    await _cursors.migrateLegacyCatalogCursor(
+      _prefs,
+      transaction: (body) => _binding.runFenced(_bindingToken, body),
+    );
+    var after = await _cursors.read(SyncStream.catalog);
     final affectedQueueSessionIds = <int>{};
     final deletedTrackUuids = <String>{};
 
     // Page through the revision-ordered change stream. Upserts and deletes
     // interleave by revision; apply them in order so a later delete of a
-    // uuid wins over an earlier upsert. Persist the watermark per page —
-    // re-applying a page is idempotent (DoUpdate upserts, uuid-keyed
-    // deletes), so a crash mid-sync just resumes from the last saved page.
+    // uuid wins over an earlier upsert. Each page and its cursor advance
+    // commit in one fenced transaction, so a crash or failure mid-page
+    // resumes from the last committed page.
     while (true) {
-      final response = await _api.getChangesPage(afterRevision: after);
-      await _applyChanges(
-        response.changes,
-        affectedQueueSessionIds: affectedQueueSessionIds,
-        deletedTrackUuids: deletedTrackUuids,
-      );
-      final cursor = response.nextCursor;
-      if (cursor != null) {
-        final lastAppliedRevision = response.changes.isEmpty
-            ? null
-            : response.changes.last.revision;
-        if (cursor <= after ||
-            (lastAppliedRevision != null && cursor < lastAppliedRevision)) {
-          throw FormatException(
-            'Invalid non-advancing changes cursor: $cursor after $after',
-          );
-        }
-        // More pages remain. Advance by the server's cursor (the highest
-        // revision it consumed) rather than the last applied entry: a row may
-        // have been concurrently deleted mid-read and dropped from `changes`,
-        // and trusting the cursor both avoids stalling and is a safe watermark
-        // (that row's delete carries a higher revision and arrives later).
-        after = cursor;
-        await _prefs.setInt(lastRevisionKey, after);
-      } else {
-        // Final page: persist the highest revision actually seen, if any.
-        if (response.changes.isNotEmpty) {
-          await _prefs.setInt(lastRevisionKey, response.changes.last.revision);
-        }
-        break;
+      final requestedAfter = after;
+      final response = await _api.getChangesPage(afterRevision: requestedAfter);
+      // SC-01 rule 5: compare with the `after` this request sent, never with
+      // the cursor after applying.
+      if (response.latestRevision < requestedAfter) {
+        throw ServerRegressedException(
+          requestedAfter: requestedAfter,
+          latestRevision: response.latestRevision,
+        );
       }
+      final cursor = response.nextCursor;
+      final lastAppliedRevision = response.changes.isEmpty
+          ? null
+          : response.changes.last.revision;
+      if (cursor != null &&
+          (cursor <= requestedAfter ||
+              (lastAppliedRevision != null && cursor < lastAppliedRevision))) {
+        throw FormatException(
+          'Invalid non-advancing changes cursor: $cursor after $requestedAfter',
+        );
+      }
+      // More pages remain: advance by the server's cursor (the highest
+      // revision it consumed) rather than the last applied entry: a row may
+      // have been concurrently deleted mid-read and dropped from `changes`,
+      // and trusting the cursor both avoids stalling and is a safe watermark
+      // (that row's delete carries a higher revision and arrives later).
+      // Final page: the highest revision actually seen, if any.
+      final newCursor = cursor ?? lastAppliedRevision;
+      final localFilePaths = <String>[];
+      await _binding.runFenced(_bindingToken, () async {
+        await _applyChanges(
+          response.changes,
+          affectedQueueSessionIds: affectedQueueSessionIds,
+          deletedTrackUuids: deletedTrackUuids,
+          localFilePaths: localFilePaths,
+        );
+        if (newCursor != null) {
+          await _cursors.write(SyncStream.catalog, newCursor);
+        }
+        // Final page: the first complete catalog sync since binding (Phase 5
+        // §3a), committed with that page.
+        if (cursor == null) {
+          await _binding.markCatalogReconciledInTransaction();
+        }
+      });
+      // Only once the deletes are committed.
+      await _deleteLocalFiles(localFilePaths);
+      if (cursor == null) break;
+      after = cursor;
     }
 
     await _db.rebuildFtsIndexes();
@@ -109,27 +168,34 @@ class SyncService {
   }) async {
     final affectedQueueSessionIds = <int>{};
     final deletedTrackUuids = <String>{};
-    final before = await _db.readTrackFtsEntry(uuidId);
+    ClientTrackDto? dto;
     try {
-      final dto = await _api.getTrack(uuidId);
-      await _upsertTracks([dto]);
+      dto = await _api.getTrack(uuidId);
     } on ApiException catch (e) {
-      if (e.statusCode == 404 || e.statusCode == 410) {
+      // 404/410: gone on the server -> delete locally (dto stays null).
+      if (e.statusCode != 404 && e.statusCode != 410) rethrow;
+    }
+    final localFilePaths = <String>[];
+    await _binding.runFenced(_bindingToken, () async {
+      final before = await _db.readTrackFtsEntry(uuidId);
+      if (dto != null) {
+        await _upsertTracks([dto]);
+      } else {
         await _deleteTracks(
           [uuidId],
           affectedQueueSessionIds: affectedQueueSessionIds,
           deletedTrackUuids: deletedTrackUuids,
+          localFilePaths: localFilePaths,
         );
-      } else {
-        rethrow;
       }
-    }
-    // Targeted FTS maintenance: exactly one track row changed, so apply a
-    // per-row fts_tracks delta instead of the O(library) rebuild. The upsert
-    // may also have created/renamed/pruned parent rows, so re-derive just the
-    // two small parent indexes.
-    await _db.applyTrackFtsDelta(uuidId, before);
-    if (rebuildParentFts) await _db.rebuildParentFtsIndexes();
+      // Targeted FTS maintenance: exactly one track row changed, so apply a
+      // per-row fts_tracks delta instead of the O(library) rebuild. The
+      // upsert may also have created/renamed/pruned parent rows, so
+      // re-derive just the two small parent indexes.
+      await _db.applyTrackFtsDelta(uuidId, before);
+      if (rebuildParentFts) await _db.rebuildParentFtsIndexes();
+    });
+    await _deleteLocalFiles(localFilePaths);
     return SyncResult(
       affectedQueueSessionIds: affectedQueueSessionIds,
       deletedTrackUuids: deletedTrackUuids,
@@ -143,6 +209,7 @@ class SyncService {
     List<ChangeEntryDto> changes, {
     required Set<int> affectedQueueSessionIds,
     required Set<String> deletedTrackUuids,
+    required List<String> localFilePaths,
   }) async {
     var i = 0;
     while (i < changes.length) {
@@ -160,6 +227,7 @@ class SyncService {
             [for (final e in run) e.uuidId],
             affectedQueueSessionIds: affectedQueueSessionIds,
             deletedTrackUuids: deletedTrackUuids,
+            localFilePaths: localFilePaths,
           );
       }
       i = j;
@@ -255,10 +323,14 @@ class SyncService {
     );
   }
 
+  /// Must run inside the caller's fenced transaction. Adds the deleted
+  /// tracks' downloaded files to [localFilePaths]; the caller deletes them
+  /// only after that transaction commits.
   Future<void> _deleteTracks(
     List<String> uuids, {
     required Set<int> affectedQueueSessionIds,
     required Set<String> deletedTrackUuids,
+    required List<String> localFilePaths,
   }) async {
     // FKs on trackmetadata.uuid_id → tracks.uuid_id (and queue_session_items)
     // force child-first deletes. We chunk to keep the IN list bounded — SQLite
@@ -270,7 +342,6 @@ class SyncService {
         i,
         i + chunkSize > uuids.length ? uuids.length : i + chunkSize,
       );
-      final localFilePaths = <String>[];
       deletedTrackUuids.addAll(chunk);
       await _db.transaction(() async {
         final queueRemoval = await _queueRepo
@@ -283,7 +354,6 @@ class SyncService {
         await (_db.delete(_db.tracks)..where((t) => t.uuidId.isIn(chunk))).go();
         await _pruneOrphanParents();
       });
-      await _deleteLocalFiles(localFilePaths);
     }
   }
 

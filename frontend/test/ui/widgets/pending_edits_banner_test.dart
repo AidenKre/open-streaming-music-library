@@ -13,6 +13,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/ui/edit_controller.dart';
+import '../../helpers/server_binding.dart';
 
 void main() {
   testWidgets('rejected edit is visible with its reason and dismissible',
@@ -22,6 +23,7 @@ void main() {
       MockClient((_) async => http.Response('', 404)),
     );
     final db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     addTearDown(db.close);
     await db.customStatement(
       'INSERT INTO pending_edits (uuid_id, values_json, write_mode, status, '
@@ -60,6 +62,7 @@ void main() {
 
   testWidgets('pending-only state shows a passive banner', (tester) async {
     final db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     addTearDown(db.close);
     await db.customStatement(
       'INSERT INTO pending_edits (uuid_id, values_json, write_mode, status, '
@@ -85,6 +88,7 @@ void main() {
 
   testWidgets('Dismiss goes through EditControls (SC-26)', (tester) async {
     final db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     addTearDown(db.close);
     await db.customStatement(
       'INSERT INTO pending_edits (uuid_id, values_json, write_mode, status, '

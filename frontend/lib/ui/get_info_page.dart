@@ -239,8 +239,15 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
           final kbps => '${kbps.round()} kbps',
         },
       ),
-      ('Sample rate', '${_track.sampleRateHz} Hz'),
-      ('Channels', '${_track.channels}'),
+      // Null = unknown, shown as '—' by _displayValue (never 'null Hz').
+      (
+        'Sample rate',
+        switch (_track.sampleRateHz) {
+          null => null,
+          final hz => '$hz Hz',
+        },
+      ),
+      ('Channels', _track.channels?.toString()),
       ('Path', _track.filePath),
     ];
     return [

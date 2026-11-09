@@ -16,8 +16,10 @@ import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
+import '../../helpers/server_binding.dart';
 
 /// End-to-end across the conversion -> sync -> stale-download seam: the REAL
 /// jobs notifier polls a fake `/jobs`, a Done transition fires the REAL
@@ -176,6 +178,7 @@ void main() {
     ConversionJobsNotifier.pollInterval = interval;
     SharedPreferences.setMockInitialValues({});
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db);
     server = _FakeServer();
     ApiClient.initForTest('http://test:8080', server.client);
     await _insertDownloadedTrack(db);
@@ -195,6 +198,7 @@ void main() {
       ProviderScope(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          autoVerifiedGateOverride(),
           offlineModeProvider.overrideWith(_Online.new),
           settingsProvider.overrideWith(_FixedSettings.new),
         ],
@@ -204,6 +208,11 @@ void main() {
     await tester.pump();
     final container = ProviderScope.containerOf(
       tester.element(find.byType(StaleDownloadsBanner)),
+    );
+    // The session's connection is verified (conversion settling is a
+    // network-backed recovery member, which only runs once it is).
+    await tester.runAsync(
+      () => container.read(serverBindingGateProvider).awaitVerified(),
     );
     final history = <List<ConversionJob>>[];
     container.listen(

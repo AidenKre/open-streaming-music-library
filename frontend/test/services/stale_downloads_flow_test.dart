@@ -15,6 +15,7 @@ import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/sync_service.dart';
+import '../helpers/server_binding.dart';
 
 /// End-to-end-ish: a real `/changes` sync, a real download pipeline and the
 /// SQL stale query the banner watches, wired against one mock server.
@@ -114,6 +115,7 @@ void main() {
       api: TracksApi(),
       queueRepository: QueueRepository(db),
       prefs: await SharedPreferences.getInstance(),
+      bindingToken: await seedTestBinding(db),
     );
     browse = BrowseRepository(db);
   });

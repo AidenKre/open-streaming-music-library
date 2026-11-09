@@ -5,6 +5,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
+import 'package:frontend/repositories/sync_cursor_store.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/edit_sync_mutex.dart';
 import 'package:frontend/services/sync_service.dart';
@@ -22,12 +25,25 @@ final tracksApiProvider = Provider<TracksApi>((ref) => TracksApi());
 
 final jobsApiProvider = Provider<JobsApi>((ref) => JobsApi());
 
+/// Scope-bound: closed (refusing writes) when its session scope is disposed.
 final queueRepositoryProvider = Provider<QueueRepository>((ref) {
-  return QueueRepository(ref.read(databaseProvider));
+  final repo = QueueRepository(ref.read(databaseProvider));
+  ref.onDispose(repo.close);
+  return repo;
 });
 
 final browseRepositoryProvider = Provider<BrowseRepository>((ref) {
   return BrowseRepository(ref.read(databaseProvider));
+});
+
+final serverBindingRepositoryProvider = Provider<ServerBindingRepository>((
+  ref,
+) {
+  return ServerBindingRepository(ref.read(databaseProvider));
+});
+
+final syncCursorStoreProvider = Provider<SyncCursorStore>((ref) {
+  return SyncCursorStore(ref.read(databaseProvider));
 });
 
 class TrackSyncState {
@@ -99,11 +115,17 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
   /// after this call* has completed: if a sync is already in flight (whose
   /// pull may predate the caller's precondition) it is awaited first and
   /// then a fresh one is run. Returns true only when that fresh pull
-  /// succeeded; false when offline or the pull failed (the error is still
-  /// published on [state]). Used where a stale local revision would be sent
+  /// succeeded; false when offline, when no connection is verified (SC-01:
+  /// it never waits on the binding gate), or the pull failed (the error is
+  /// still published on [state]). Used where a stale local revision would be sent
   /// to the server (e.g. the convert flow's `base_revision`) and after a
   /// server-side change the client must pick up (a finished conversion).
   Future<bool> syncFresh() async {
+    // No verified connection: fail now rather than wait on the gate (or on a
+    // run that waits on it) -- this is a user-facing, bounded call.
+    if (ref.read(serverBindingGateProvider).state is! BindingVerified) {
+      return false;
+    }
     // Bounded: each in-flight run we wait out finishes in finite time, and
     // a fresh entrant can't slip in between our null check and
     // `_runGuarded`'s synchronous isSyncing claim (no awaits between them).
@@ -125,7 +147,9 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     // (the pull does a blind full-row upsert). Flushing first also satisfies
     // "flush before pull on reconnect" since this runs from the recovery edge.
     final ran = await _runGuarded((service) async {
-      await ref.read(editOutboxProvider).flushLocked();
+      await ref
+          .read(editOutboxProvider)
+          .flushLocked(bindingToken: service.bindingToken);
       return service.syncChanges();
     }, library: true);
     // Finish take-server resolutions deferred while offline or mid-sync —
@@ -167,8 +191,9 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     if (ref.read(offlineModeProvider)) return Future.value(false);
     final current = state.value;
     if (current != null && current.isSyncing) return Future.value(false);
-    // Synchronously claims the slot: `_runGuardedBody` publishes
-    // isSyncing:true before its first await.
+    // `_inFlightRun` is the synchronous claim while `_runGuardedBody` awaits
+    // the binding gate (before it publishes isSyncing:true).
+    if (_inFlightRun != null) return Future.value(false);
     final run = _runGuardedBody(op, library: library);
     _inFlightRun = run;
     return run.whenComplete(() {
@@ -187,8 +212,21 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     // tick will pick up everything that changed while we were dark.
     if (ref.read(offlineModeProvider)) return false;
 
+    // SC-01 rules 1 and 4: wait until the binding gate has verified the
+    // current connection, and capture its token; every write of this run is
+    // fenced by it. A gate closed with the scope (reset/disconnect) skips
+    // silently (no state, no error).
+    final String bindingToken;
+    try {
+      bindingToken = await ref.read(serverBindingGateProvider).awaitVerified();
+    } on BindingGateClosedException {
+      return false;
+    }
+    if (ref.read(offlineModeProvider)) return false;
+
     // No awaits between this check and the isSyncing:true publish below, so
-    // two entrants can't both pass the guard.
+    // two entrants can't both pass the guard ([_runGuarded] also holds the
+    // `_inFlightRun` claim across the gate wait above).
     final current = state.value;
     if (current != null && current.isSyncing) return false;
 
@@ -208,6 +246,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         api: ref.read(tracksApiProvider),
         queueRepository: ref.read(queueRepositoryProvider),
         prefs: await ref.read(sharedPreferencesProvider.future),
+        bindingToken: bindingToken,
       );
       final mutex = ref.read(editSyncMutexProvider);
       final result = await mutex.run(() => op(service));

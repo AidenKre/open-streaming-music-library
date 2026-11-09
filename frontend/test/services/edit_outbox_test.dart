@@ -16,7 +16,10 @@ import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/edit_outbox.dart';
+import 'package:frontend/services/server_binding_gate.dart';
+import '../helpers/server_binding.dart';
 
 class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._v);
@@ -72,11 +75,20 @@ Future<void> _seedTrack(
   );
 }
 
+/// An in-memory database with a live session binding (SC-01): the outbox's
+/// take-server refetch is a fenced write and no-ops without one.
+Future<AppDatabase> _boundDb() async {
+  final db = AppDatabase(NativeDatabase.memory());
+  await seedTestBinding(db);
+  return db;
+}
+
 ProviderContainer _container(
   AppDatabase db, {
   bool offline = false,
   required Future<http.Response> Function(Map<String, dynamic> body) onPatch,
   Future<http.Response> Function(String uuidId)? onGetTrack,
+  ServerBindingGate? gate,
 }) {
   _patchCalls.clear();
   ApiClient.initForTest(
@@ -102,6 +114,10 @@ ProviderContainer _container(
   );
   final c = ProviderContainer(overrides: [
     databaseProvider.overrideWithValue(db),
+    if (gate != null)
+      serverBindingGateProvider.overrideWithValue(gate)
+    else
+      autoVerifiedGateOverride(),
     tracksApiProvider.overrideWithValue(TracksApi()),
     offlineModeProvider.overrideWith(() => _StubOffline(offline)),
   ]);
@@ -153,7 +169,7 @@ void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
   test('enqueue coalesces values, escalates write mode, keeps first base', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox = _container(db, onPatch: (_) async => _ok()).read(editOutboxProvider);
@@ -186,7 +202,7 @@ void main() {
   });
 
   test('flush 200 sends base_revision + write_mode then deletes the row', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox = _container(db, onPatch: (_) async => _ok()).read(editOutboxProvider);
@@ -207,7 +223,7 @@ void main() {
   });
 
   test('flush 409 marks the row conflicted with the server revision', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox =
@@ -227,7 +243,7 @@ void main() {
   });
 
   test('flush 404 marks the row rejected until dismissed (track gone)', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox = _container(db, onPatch: (_) async => http.Response('', 404))
@@ -254,7 +270,7 @@ void main() {
   });
 
   test('keep-mine rebases onto the server revision and re-flushes', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     // First flush conflicts (server at 9); then the retry succeeds.
@@ -280,7 +296,7 @@ void main() {
 
   test('resolveKeepMine is idempotent — a stale second call is a no-op',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 9);
     // Seed an already-conflicted row directly (rather than via enqueue+flush)
@@ -306,7 +322,7 @@ void main() {
 
   test('re-editing a conflicted row rebases base onto the server revision',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox =
@@ -335,7 +351,7 @@ void main() {
   });
 
   test('a failing row does not block the rest of the outbox flush', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, uuid: 'u1', revision: 5);
     await _seedTrack(db,
@@ -369,7 +385,7 @@ void main() {
 
   test('master-write toggle with no field edits queues an empty-field re-tag',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox =
@@ -392,7 +408,7 @@ void main() {
 
   test('take-server lands on current server truth via single-track refetch',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Old', artist: 'OldA', revision: 5);
     // The server moved on to "Server" (revision 9) — exactly the value the
@@ -443,7 +459,7 @@ void main() {
 
   test('flush 200 records the returned revision so the next edit rebases',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     // Tiny server model: an edit succeeds only when base_revision matches, and
@@ -506,7 +522,7 @@ void main() {
 
     test('a successful flush on a current download does not make it stale',
         () async {
-      final db = AppDatabase(NativeDatabase.memory());
+      final db = await _boundDb();
       addTearDown(db.close);
       await _seedTrack(db, revision: 5);
       await markDownloaded(db, 5);
@@ -529,7 +545,7 @@ void main() {
 
     test('a successful flush on an already-stale download keeps it stale',
         () async {
-      final db = AppDatabase(NativeDatabase.memory());
+      final db = await _boundDb();
       addTearDown(db.close);
       await _seedTrack(db, revision: 5);
       // Downloaded at 4; a server-side change (e.g. conversion) took it to 5.
@@ -556,7 +572,7 @@ void main() {
       'server audio/artwork is unchanged',
       () async {
         for (final serverCodec in [null, 'aac']) {
-          final db = AppDatabase(NativeDatabase.memory());
+          final db = await _boundDb();
           addTearDown(db.close);
           await _seedTrack(db, revision: 5);
           await markDownloaded(db, 5);
@@ -603,7 +619,7 @@ void main() {
       'a self-resolved 409 keeps the download stale when a pull already '
       'applied a server change (e.g. a conversion) to the local row',
       () async {
-        final db = AppDatabase(NativeDatabase.memory());
+        final db = await _boundDb();
         addTearDown(db.close);
         await _seedTrack(db, revision: 5);
         await markDownloaded(db, 5);
@@ -653,7 +669,7 @@ void main() {
 
   test('flush 422 reverts the optimistic write and surfaces a rejection',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Old', revision: 5);
     // FastAPI-style string detail (e.g. the empty-track guard) — it becomes
@@ -699,9 +715,41 @@ void main() {
     expect(await db.select(db.pendingEdits).get(), isEmpty);
   });
 
+  test('flush 422 with a validation-list detail shows the generic reason',
+      () async {
+    final db = await _boundDb();
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', revision: 5);
+    // Pydantic's list detail is developer text, not a user-facing reason.
+    final outbox = _container(
+      db,
+      onPatch: (_) async => http.Response(
+        jsonEncode({
+          'detail': [
+            {'loc': ['body', 'year'], 'msg': 'Input should be a valid integer'},
+          ],
+        }),
+        422,
+        headers: {'content-type': 'application/json'},
+      ),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Rejected'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush();
+
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'rejected');
+    expect(row.rejectionReason, 'Rejected by the server (invalid or locked field)');
+  });
+
   test('flush 422 must not revert over newer server truth pulled while pending',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Old', revision: 5);
     final outbox = _container(db, onPatch: (_) async => http.Response('', 422))
@@ -738,7 +786,7 @@ void main() {
 
   test('a committed PATCH whose response was lost must not conflict with itself',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     // Tiny server model: attempt 1 COMMITS (revision 5 -> 6) but the
@@ -808,7 +856,7 @@ void main() {
   test(
       'empty-edit master-retag batch that 409s must not be silently dropped',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox = _container(
@@ -839,7 +887,7 @@ void main() {
 
   test('NFD edit applied server-side as NFC must not conflict with itself',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     const decomposed = 'Café'; // e + combining acute accent (NFD)
@@ -888,7 +936,7 @@ void main() {
 
   test('take-server while offline must not permanently lose server truth',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Old', revision: 5);
     // Simulate the state after a prior ONLINE session: the flush 409ed (row
@@ -948,7 +996,7 @@ void main() {
 
   test('re-editing a track with an outstanding take-server marker starts fresh',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Mine', revision: 5); // optimistic value lingers
     // A take-server resolution made offline: the refetch couldn't run, so the
@@ -985,7 +1033,7 @@ void main() {
   });
 
   test('re-editing a track with a rejected edit starts fresh', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Mine', revision: 5);
     // A permanently-rejected batch: the optimistic write was already
@@ -1023,7 +1071,7 @@ void main() {
   test(
       'resolveTakeServer marker write cannot be raced by a concurrent enqueue',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Mine', revision: 5);
     await db.customStatement(
@@ -1068,6 +1116,7 @@ void main() {
       () async {
     final db = _CountingDb();
     addTearDown(db.close);
+    await seedTestBinding(db);
     await _seedTrack(db, uuid: 'u1', title: 'Mine', revision: 5);
     await _seedTrack(db, uuid: 'u2', title: 'Yours', revision: 5);
     await db.customStatement(
@@ -1098,7 +1147,7 @@ void main() {
 
   test('take-server marker reaping must not race a concurrent re-edit',
       () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, title: 'Mine', revision: 5);
     await db.customStatement(
@@ -1150,7 +1199,7 @@ void main() {
   });
 
   test('flush is a no-op while offline', () async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
     final outbox = _container(db, offline: true, onPatch: (_) async => _ok())
@@ -1166,5 +1215,217 @@ void main() {
 
     expect(_patchCalls, isEmpty);
     expect(await db.select(db.pendingEdits).get(), hasLength(1));
+  });
+
+  // SC-01 rules 1 and 4: the outbox's network flush waits for a verified
+  // connection, and every state write is fenced by the session binding, so an
+  // answer or edit that outlives a reset (or a re-bind) changes nothing in
+  // the new store and is never sent to another server.
+  group('fenced by the session binding (SC-01)', () {
+    Future<({AppDatabase db, Completer<http.Response> answer, Future<void> flush})>
+        flushInFlight() async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, title: 'Old', revision: 5);
+      final answer = Completer<http.Response>();
+      final outbox = _container(db, onPatch: (_) => answer.future)
+          .read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'Mine'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+      final flush = outbox.flush();
+      for (var i = 0; i < 100 && _patchCalls.isEmpty; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(_patchCalls, hasLength(1), reason: 'the PATCH is in flight');
+      return (db: db, answer: answer, flush: flush);
+    }
+
+    Future<({String status, int revision, String title})> state(
+        AppDatabase db) async {
+      final row = await db.select(db.pendingEdits).getSingle();
+      final revision = (await db
+              .customSelect("SELECT revision FROM tracks WHERE uuid_id = 'u1'")
+              .getSingle())
+          .read<int>('revision');
+      final title = (await db
+              .customSelect(
+                  "SELECT title FROM trackmetadata WHERE uuid_id = 'u1'")
+              .getSingle())
+          .read<String>('title');
+      return (status: row.status, revision: revision, title: title);
+    }
+
+    final answers = <String, http.Response Function()>{
+      '200': _ok,
+      '409': () => _conflict(9),
+      '404': () => http.Response('{"detail":"Track not found"}', 404,
+          headers: {'content-type': 'application/json'}),
+      '410': () => http.Response('{"detail":"gone"}', 410,
+          headers: {'content-type': 'application/json'}),
+      '422': () => http.Response(jsonEncode({'detail': 'locked field'}), 422,
+          headers: {'content-type': 'application/json'}),
+    };
+
+    for (final entry in answers.entries) {
+      test('a ${entry.key} that lands after the reset fence changes nothing',
+          () async {
+        final f = await flushInFlight();
+        final before = await state(f.db);
+        await ServerBindingRepository(f.db).fence();
+        f.answer.complete(entry.value());
+        await f.flush;
+        expect(await state(f.db), before);
+      });
+    }
+
+    test('a 200 that lands after a re-bind changes nothing', () async {
+      final f = await flushInFlight();
+      final before = await state(f.db);
+      await ServerBindingRepository(f.db).fence();
+      await seedTestBinding(f.db); // the rebuilt scope's provisional row
+      f.answer.complete(_ok());
+      await f.flush;
+      expect(await state(f.db), before);
+    });
+
+    test('flush waits for a verified connection before its first request',
+        () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, revision: 5);
+      final controlled = ControlledGate(db);
+      addTearDown(controlled.dispose);
+      final outbox = _container(db,
+              gate: controlled.gate, onPatch: (_) async => _ok())
+          .read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'Mine'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+      final flush = outbox.flush();
+      await pumpEventQueue();
+      expect(_patchCalls, isEmpty, reason: 'no connection verified yet');
+
+      unawaited(controlled.gate.startConnection('http://localhost:8000'));
+      await pumpEventQueue();
+      controlled.respond('inst-1');
+      await flush;
+      expect(_patchCalls, hasLength(1));
+      expect(await db.select(db.pendingEdits).get(), isEmpty);
+    });
+
+    // Audit 5A.0(c) #5: the 409 "already applied" resolution (the server
+    // holds the user's own values) is fenced too.
+    test('a 409 resolved as already applied after the fence changes nothing',
+        () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, title: 'Old', revision: 5);
+      final serverTruth = Completer<http.Response>();
+      final outbox = _container(
+        db,
+        onPatch: (_) async => _conflict(9),
+        onGetTrack: (_) => serverTruth.future,
+      ).read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'Mine'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+      final flush = outbox.flush();
+      for (var i = 0; i < 100 && _patchCalls.isEmpty; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      await pumpEventQueue();
+      final before = await state(db);
+      await ServerBindingRepository(db).fence();
+      serverTruth.complete(_trackResponse(title: 'Mine', revision: 9));
+      await flush;
+      expect(await state(db), before);
+    });
+
+    // Audit 5A.0(c) #4 (D16): a flush waiting for a verified connection
+    // never holds the edit mutex, so editing keeps working meanwhile.
+    test('editing is not blocked while a flush waits for verification',
+        () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, revision: 5);
+      final controlled = ControlledGate(db);
+      addTearDown(controlled.dispose);
+      final outbox = _container(db,
+              gate: controlled.gate, onPatch: (_) async => _ok())
+          .read(editOutboxProvider);
+      unawaited(outbox.flush()); // waits on the unverified gate
+      await pumpEventQueue();
+      var enqueued = false;
+      unawaited(outbox
+          .enqueue(
+            uuidId: 'u1',
+            edit: const MetadataEdit.empty().set('title', 'Mine'),
+            writeMode: EditWriteMode.dbOnly,
+            baseRevision: 5,
+          )
+          .then((_) => enqueued = true));
+      await pumpEventQueue();
+      expect(enqueued, isTrue, reason: 'the edit did not wait for the gate');
+      expect(await db.select(db.pendingEdits).get(), hasLength(1));
+    });
+
+    test('an edit made once the binding is gone writes nothing', () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, title: 'Old', revision: 5);
+      final outbox = _container(db, onPatch: (_) async => _ok())
+          .read(editOutboxProvider);
+      await ServerBindingRepository(db).fence();
+      await expectLater(
+        outbox.enqueue(
+          uuidId: 'u1',
+          edit: const MetadataEdit.empty().set('title', 'Mine'),
+          writeMode: EditWriteMode.dbOnly,
+          baseRevision: 5,
+        ),
+        throwsA(isA<BindingFencedException>()),
+      );
+      expect(await db.select(db.pendingEdits).get(), isEmpty);
+      final title = (await db
+              .customSelect(
+                  "SELECT title FROM trackmetadata WHERE uuid_id = 'u1'")
+              .getSingle())
+          .read<String>('title');
+      expect(title, 'Old');
+    });
+
+    test('resolutions made once the binding is gone change nothing', () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, revision: 5);
+      await db.customStatement(
+        'INSERT INTO pending_edits (uuid_id, values_json, write_mode, '
+        'base_revision, status, server_revision, updated_at) VALUES '
+        "('u1', '{\"title\":\"Mine\"}', 'db_only', 5, 'conflicted', 9, 0)",
+      );
+      final outbox = _container(db, onPatch: (_) async => _ok())
+          .read(editOutboxProvider);
+      await ServerBindingRepository(db).fence();
+      final before = (await db.select(db.pendingEdits).getSingle()).toJson();
+      for (final resolve in <Future<void> Function()>[
+        () => outbox.resolveKeepMine('u1'),
+        () => outbox.resolveTakeServer('u1'),
+        () => outbox.dismissRejected('u1'),
+      ]) {
+        await expectLater(resolve(), throwsA(isA<BindingFencedException>()));
+      }
+      expect((await db.select(db.pendingEdits).getSingle()).toJson(), before);
+      expect(_patchCalls, isEmpty);
+    });
   });
 }

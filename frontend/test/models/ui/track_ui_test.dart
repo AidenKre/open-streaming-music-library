@@ -1,3 +1,4 @@
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
@@ -135,7 +136,7 @@ void main() {
     test('formats seconds only', () {
       final ui = TrackUI.fromDrift(
         _track,
-        _fullMeta.copyWith(duration: 0.0),
+        _fullMeta.copyWith(duration: Value(0.0)),
       );
       expect(ui.formattedDuration, '0:00');
     });
@@ -143,7 +144,7 @@ void main() {
     test('truncates fractional seconds', () {
       final ui = TrackUI.fromDrift(
         _track,
-        _fullMeta.copyWith(duration: 59.9),
+        _fullMeta.copyWith(duration: Value(59.9)),
       );
       expect(ui.formattedDuration, '0:59');
     });
@@ -151,7 +152,7 @@ void main() {
     test('formats minutes and seconds', () {
       final ui = TrackUI.fromDrift(
         _track,
-        _fullMeta.copyWith(duration: 65.0),
+        _fullMeta.copyWith(duration: Value(65.0)),
       );
       expect(ui.formattedDuration, '1:05');
     });
@@ -159,7 +160,7 @@ void main() {
     test('formats hours, minutes, and seconds', () {
       final ui = TrackUI.fromDrift(
         _track,
-        _fullMeta.copyWith(duration: 3661.0),
+        _fullMeta.copyWith(duration: Value(3661.0)),
       );
       expect(ui.formattedDuration, '1:01:01');
     });
@@ -167,7 +168,7 @@ void main() {
     test('formats days, hours, minutes, and seconds', () {
       final ui = TrackUI.fromDrift(
         _track,
-        _fullMeta.copyWith(duration: 90061.0),
+        _fullMeta.copyWith(duration: Value(90061.0)),
       );
       expect(ui.formattedDuration, '1:01:01:01');
     });

@@ -2,13 +2,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/settings/settings_registry.dart';
 import 'package:frontend/ui/settings_controller.dart';
+import 'package:frontend/ui/widgets/reset_confirm_sheet.dart';
 
 /// Phase 4's own Settings sections and rows, registered through the SC-21
 /// registry like any later phase's (nothing is special-cased in the page).
@@ -57,8 +57,8 @@ final phase4SettingsRows = <SettingsRowContribution>[
 /// Quality changes round-trip through the backend (the PUT pre-transcodes
 /// server-side); offline the PUT would retry and fail, so the dropdowns are
 /// disabled with an explanation. Local settings stay usable offline.
-Widget _offlineTooltip({required bool isOffline, required Widget child}) {
-  if (!isOffline) return child;
+Widget _offlineTooltip({required bool canChange, required Widget child}) {
+  if (canChange) return child;
   return Tooltip(message: 'Unavailable while offline', child: child);
 }
 
@@ -90,11 +90,13 @@ class _StreamQualityRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SettingsValue(
       builder: (context, ref, settings) {
-        final isOffline = ref.watch(offlineModeProvider);
+        final canChange = ref
+            .watch(settingsControlsProvider)
+            .canChangeServerQuality;
         return ListTile(
           title: const Text('Stream quality'),
           subtitle: _offlineTooltip(
-            isOffline: isOffline,
+            canChange: canChange,
             child: DropdownButton<String>(
               isExpanded: true,
               value: settings.streamQuality,
@@ -102,7 +104,7 @@ class _StreamQualityRow extends StatelessWidget {
                 for (final q in qualityPresets)
                   DropdownMenuItem(value: q, child: Text(qualityLabel(q))),
               ],
-              onChanged: isOffline
+              onChanged: !canChange
                   ? null
                   : (value) {
                       if (value != null && value != settings.streamQuality) {
@@ -205,14 +207,16 @@ class _DownloadQualityRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SettingsValue(
       builder: (context, ref, settings) {
-        final isOffline = ref.watch(offlineModeProvider);
+        final canChange = ref
+            .watch(settingsControlsProvider)
+            .canChangeServerQuality;
         return ListTile(
           title: const Text('Download quality'),
           subtitle: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               _offlineTooltip(
-                isOffline: isOffline,
+                canChange: canChange,
                 child: DropdownButton<String>(
                   isExpanded: true,
                   value: settings.downloadQuality,
@@ -220,7 +224,7 @@ class _DownloadQualityRow extends StatelessWidget {
                     for (final q in qualityPresets)
                       DropdownMenuItem(value: q, child: Text(qualityLabel(q))),
                   ],
-                  onChanged: isOffline
+                  onChanged: !canChange
                       ? null
                       : (value) {
                           if (value != null) {
@@ -290,56 +294,19 @@ class _DisconnectRow extends ConsumerWidget {
       title: const Text('Disconnect'),
       subtitle: const Text('Reset this device and return to the login screen'),
       onTap: () async {
-        final confirmed = await _confirmDisconnect(context);
+        final session = ref.read(sessionControlsProvider);
+        final losses = await session.pendingLossSummaries();
+        if (!context.mounted) return;
+        final confirmed = await showDisconnectConfirmSheet(
+          context,
+          losses: losses,
+        );
         if (!confirmed || !context.mounted) return;
         // Success ends the session: the session host and every session
         // route go with it. A partial reset is shown honestly first.
-        unawaited(ref.read(sessionControlsProvider).disconnect());
+        unawaited(session.disconnect());
       },
     );
   }
 
-  /// A bottom sheet with explicit cancel/confirm that pops only itself.
-  Future<bool> _confirmDisconnect(BuildContext context) async {
-    return await showModalBottomSheet<bool>(
-          context: context,
-          isScrollControlled: true,
-          builder: (ctx) => SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text(
-                    'Reset and disconnect?',
-                    style: Theme.of(ctx).textTheme.titleLarge,
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'This deletes the local library database, downloads, caches, '
-                    'queue, playback state, and saved settings on this device.',
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      TextButton(
-                        onPressed: () => Navigator.of(ctx).pop(false),
-                        child: const Text('Cancel'),
-                      ),
-                      const SizedBox(width: 8),
-                      FilledButton(
-                        onPressed: () => Navigator.of(ctx).pop(true),
-                        child: const Text('Reset and disconnect'),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ) ??
-        false;
-  }
 }

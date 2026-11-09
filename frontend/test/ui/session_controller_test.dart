@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -16,6 +17,20 @@ class _FakeService extends SessionService {
   _FakeService(super.ref);
   SessionStart start = const SessionStart(SessionStartKind.signedOut);
   String? connectError;
+  bool differentServer = false;
+  List<String> losses = const [];
+  final switchedTo = <String>[];
+  final blocked = ValueNotifier<bool>(false);
+  int blockedResets = 0;
+  @override
+  ValueListenable<bool> get serverBlocked => blocked;
+  @override
+  Future<LocalResetException?> resetForBlockedServer() async {
+    blockedResets++;
+    await resetGate?.future;
+    return resetFailure;
+  }
+
   LocalResetException? resetFailure;
   Completer<void>? resetGate;
   int resets = 0;
@@ -30,7 +45,22 @@ class _FakeService extends SessionService {
   }
 
   @override
-  Future<String?> connect(String url) async => connectError;
+  Future<ConnectOutcome> connect(String url) async {
+    if (differentServer) return ConnectDifferentServer(url);
+    final error = connectError;
+    return error == null ? const ConnectSucceeded() : ConnectFailed(error);
+  }
+
+  @override
+  Future<List<String>> pendingLossSummaries() async => losses;
+
+  @override
+  Future<LocalResetException?> resetForNewServer(String url) async {
+    switchedTo.add(url);
+    await resetGate?.future;
+    return resetFailure;
+  }
+
   @override
   Future<LocalResetException?> resetLocalData() async {
     resets++;
@@ -136,6 +166,84 @@ void main() {
         expect(session().resetFailure, isNull);
       },
     );
+
+    group('a login finds a different server (SC-01 rule 1)', () {
+      Future<int> askSwitch() async {
+        await session().start();
+        service.differentServer = true;
+        var notified = 0;
+        session().addListener(() => notified++);
+        await session().connect('http://b');
+        return notified;
+      }
+
+      test('asks first: still signed out, nothing reset, no error', () async {
+        final notified = await askSwitch();
+        expect(session().phase, SessionPhase.signedOut);
+        expect(session().pendingServerSwitch, 'http://b');
+        expect(session().connectError, isNull);
+        expect(notified, greaterThan(0));
+        expect(service.switchedTo, isEmpty);
+        expect(service.resets, 0);
+      });
+
+      test('cancel: back to the login screen, nothing reset', () async {
+        await askSwitch();
+        session().cancelServerSwitch();
+        expect(session().pendingServerSwitch, isNull);
+        expect(session().phase, SessionPhase.signedOut);
+        expect(service.switchedTo, isEmpty);
+      });
+
+      test('confirm: resetting, then complete; the reset keeps the new URL',
+          () async {
+        await askSwitch();
+        service.resetGate = Completer<void>();
+        final done = session().confirmServerSwitch();
+        expect(session().phase, SessionPhase.resetting);
+        expect(session().pendingServerSwitch, isNull);
+        service.resetGate!.complete();
+        await done;
+        expect(service.switchedTo, ['http://b']);
+        expect(service.resets, 0, reason: 'not the URL-dropping disconnect');
+        expect(session().phase, SessionPhase.resetComplete);
+      });
+    });
+
+    test('the blocked state mirrors the model and notifies the view',
+        () async {
+      var notified = 0;
+      session().addListener(() => notified++);
+      expect(session().serverBlocked, isFalse);
+      service.blocked.value = true;
+      expect(session().serverBlocked, isTrue);
+      expect(notified, 1);
+      service.blocked.value = false;
+      expect(session().serverBlocked, isFalse);
+      expect(notified, 2);
+    });
+
+    test('Reset on the blocked banner: resetting, then complete, through '
+        "the model's keep-the-URL reset", () async {
+      service.start = const SessionStart(SessionStartKind.online);
+      await session().start();
+      service.resetGate = Completer<void>();
+      final done = session().resetBlockedServer();
+      expect(session().phase, SessionPhase.resetting);
+      service.resetGate!.complete();
+      await done;
+      expect(service.blockedResets, 1);
+      expect(service.resets, 0);
+      expect(session().phase, SessionPhase.resetComplete);
+    });
+
+    test('the loss summaries come from the model', () async {
+      service.losses = ['2 unsent metadata edits'];
+      expect(
+        await session().pendingLossSummaries(),
+        ['2 unsent metadata edits'],
+      );
+    });
   });
 
   group('StartupGate renders the session controller', () {
@@ -194,6 +302,45 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
       expect(rebuilt, 1);
+    });
+
+    group('a login finds a different server', () {
+      Future<FakeSessionControls> ask(WidgetTester tester) async {
+        final fake = await pump(tester, SessionPhase.signedOut);
+        fake.lossSummaries = ['2 unsent metadata edits'];
+        fake.askServerSwitch('http://b');
+        await tester.pump();
+        await tester.pump();
+        // Let the confirmation finish its entrance (a bottom sheet slides in).
+        await tester.pump(const Duration(milliseconds: 400));
+        return fake;
+      }
+
+      testWidgets('asks to confirm, naming the server and what will be lost',
+          (tester) async {
+        await ask(tester);
+        expect(find.text('Connect to a different server?'), findsOneWidget);
+        expect(find.textContaining('http://b'), findsOneWidget);
+        expect(find.textContaining('2 unsent metadata edits'), findsOneWidget);
+        expect(find.text('Reset and connect'), findsOneWidget);
+      });
+
+      testWidgets('cancel goes back to the login screen', (tester) async {
+        final fake = await ask(tester);
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+        expect(fake.calls, contains('cancelServerSwitch'));
+        expect(fake.calls, isNot(contains('confirmServerSwitch')));
+        expect(find.byType(LoginPage), findsOneWidget);
+      });
+
+      testWidgets('confirm resets and keeps the URL', (tester) async {
+        final fake = await ask(tester);
+        await tester.tap(find.text('Reset and connect'));
+        await tester.pumpAndSettle();
+        expect(fake.calls, contains('confirmServerSwitch'));
+        expect(fake.calls, isNot(contains('cancelServerSwitch')));
+      });
     });
 
     testWidgets('without a rebuild hook, a finished reset returns to login', (

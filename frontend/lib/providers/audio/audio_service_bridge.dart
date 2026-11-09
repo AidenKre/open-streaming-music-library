@@ -75,7 +75,11 @@ class AudioServiceBridge extends BaseAudioHandler {
       title: track.title ?? 'Unknown',
       artist: track.artist ?? '',
       album: track.album ?? '',
-      duration: Duration(milliseconds: (track.duration * 1000).round()),
+      // Null = unknown: the OS shows no duration rather than 0:00.
+      duration: switch (track.duration) {
+        null => null,
+        final seconds => Duration(milliseconds: (seconds * 1000).round()),
+      },
       artUri: artUri,
     ));
   }

@@ -21,11 +21,12 @@ class TrackUI {
   final int? trackNumber;
   final int? discNumber;
   final String? codec;
-  final double duration;
-  /// Null when the server doesn't know it; 0 is a real reading.
+  // Audio properties: null when the server doesn't know them; 0 is a real
+  // reading (SC-16l).
+  final double? duration;
   final double? bitrateKbps;
-  final int sampleRateHz;
-  final int channels;
+  final int? sampleRateHz;
+  final int? channels;
   final bool hasAlbumArt;
   final int? coverArtId;
   // Bitrate of the file actually on disk. Null until a download completes.
@@ -156,7 +157,10 @@ class TrackUI {
     );
   }
 
+  /// `m:ss` (or longer), or '—' when the duration is unknown.
   String get formattedDuration {
+    final duration = this.duration;
+    if (duration == null) return '—';
     final totalSeconds = duration.truncate();
     final seconds = totalSeconds % 60;
     final minutes = (totalSeconds ~/ 60) % 60;
@@ -188,10 +192,10 @@ class TrackUI {
       trackNumber: row.readNullable<int>('track_number'),
       discNumber: row.readNullable<int>('disc_number'),
       codec: row.readNullable<String>('codec'),
-      duration: row.read<double>('duration'),
+      duration: row.readNullable<double>('duration'),
       bitrateKbps: row.readNullable<double>('bitrate_kbps'),
-      sampleRateHz: row.read<int>('sample_rate_hz'),
-      channels: row.read<int>('channels'),
+      sampleRateHz: row.readNullable<int>('sample_rate_hz'),
+      channels: row.readNullable<int>('channels'),
       hasAlbumArt: row.read<bool>('has_album_art'),
       coverArtId: row.readNullable<int>('cover_art_id'),
       downloadedBitrateKbps: row.readNullable<int>('downloaded_bitrate_kbps'),

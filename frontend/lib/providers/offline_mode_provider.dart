@@ -29,6 +29,11 @@ class OfflineModeNotifier extends Notifier<bool> {
 
   Timer? _pollTimer;
   bool _pollInFlight = false;
+
+  /// Whether health polling is scheduled (tests assert a blocked session
+  /// never polls).
+  @visibleForTesting
+  bool get isPolling => _pollTimer?.isActive ?? false;
   bool _disposed = false;
 
   @override

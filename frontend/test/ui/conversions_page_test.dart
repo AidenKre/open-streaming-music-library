@@ -17,7 +17,11 @@ import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
+import 'package:frontend/services/conversion/conversion_service.dart';
+import 'package:frontend/ui/conversion_controller.dart';
 import 'package:frontend/ui/conversions_page.dart';
+
+import 'fake_conversion_controls.dart';
 
 class _FixedConversionJobs extends ConversionJobsNotifier {
   _FixedConversionJobs(this._jobs, {this.enqueueError});
@@ -171,9 +175,12 @@ void main() {
     List<ConversionJob> jobs, {
     _FixedConversionJobs? notifier,
     _StubSync? sync,
+    ConversionControls? controls,
   }) {
     return ProviderScope(
       overrides: [
+        if (controls != null)
+          conversionControlsProvider.overrideWithValue(controls),
         databaseProvider.overrideWithValue(db),
         currentTrackProvider.overrideWithValue(null),
         conversionJobsProvider.overrideWith(
@@ -222,6 +229,49 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(notifier.cancelCalls, 1);
+  });
+
+  // SC-26: the page's inputs go to the ConversionControls controller.
+  testPage('Cancel is the controller\'s; its failure is shown', (tester) async {
+    await _insertTrack(db, 'abc');
+    final controls = FakeConversionControls(
+      cancelError: "Couldn't cancel the conversion. Try again.",
+    );
+    await tester.pumpWidget(
+      wrap([_job(jobId: 7, status: 'queued')], controls: controls),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
+    expect(controls.calls, ['cancel 7']);
+    expect(
+      find.text("Couldn't cancel the conversion. Try again."),
+      findsOneWidget,
+    );
+  });
+
+  testPage('Retry starts the controller\'s flow with the failed job\'s '
+      'target', (tester) async {
+    await _insertTrack(db, 'abc');
+    final controls = FakeConversionControls(
+      prep: const ConversionRefused('Nope.'),
+    );
+    await tester.pumpWidget(
+      wrap([
+        _job(
+          jobId: 3,
+          status: 'failed',
+          targetCodec: 'aac',
+          targetBitrate: 192,
+          errorText: 'boom',
+        ),
+      ], controls: controls),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Retry'));
+    await tester.pumpAndSettle();
+    expect(controls.calls, ['begin abc aac 192', 'end abc']);
+    expect(find.text('Nope.'), findsOneWidget);
   });
 
   testPage('running job shows an indeterminate progress indicator', (tester) async {

@@ -4,6 +4,7 @@ import 'package:frontend/ui/shell/app_shell.dart';
 import 'package:frontend/ui/login_page.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/session_controller.dart';
+import 'package:frontend/ui/widgets/reset_confirm_sheet.dart';
 
 /// Renders the session phase: splash while starting/resetting, the login
 /// screen, or the app. Every input goes to [SessionControls]; the rules live
@@ -20,6 +21,7 @@ class StartupGate extends ConsumerStatefulWidget {
 class _StartupGateState extends ConsumerState<StartupGate> {
   late final SessionControls _session = ref.read(sessionControlsProvider);
   bool _finishingReset = false;
+  bool _askingServerSwitch = false;
 
   @override
   void initState() {
@@ -38,6 +40,38 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     if (!mounted) return;
     setState(() {});
     if (_session.phase == SessionPhase.resetComplete) _finishReset();
+    if (_session.pendingServerSwitch != null) _askServerSwitch();
+  }
+
+  /// A login found a different server: confirm the reset, naming what it
+  /// loses (SC-01 rule 1, SC-15), with the shared reset confirmation. One
+  /// at a time; dismissing counts as Cancel.
+  Future<void> _askServerSwitch() async {
+    final url = _session.pendingServerSwitch;
+    if (_askingServerSwitch || url == null) return;
+    _askingServerSwitch = true;
+    try {
+      final losses = await _session.pendingLossSummaries();
+      if (!mounted) return;
+      final confirmed = await showResetConfirmSheet(
+        context,
+        title: 'Connect to a different server?',
+        body:
+            'The server at $url is not the one this library belongs to. '
+            'Connecting resets this device: the local library, downloads, '
+            'queue and settings are deleted.',
+        confirmLabel: 'Reset and connect',
+        losses: losses,
+      );
+      if (!mounted) return;
+      if (confirmed) {
+        await _session.confirmServerSwitch();
+      } else {
+        _session.cancelServerSwitch();
+      }
+    } finally {
+      _askingServerSwitch = false;
+    }
   }
 
   /// Show a partial reset honestly, then rebuild the provider scope (or, in

@@ -3,11 +3,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/home/home_page.dart';
 import 'package:frontend/ui/search_page.dart';
+import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/shell/glass.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/widgets/offline_banner.dart';
 import 'package:frontend/ui/widgets/pending_edits_banner.dart';
+import 'package:frontend/ui/widgets/server_blocked_banner.dart';
 import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
@@ -178,6 +180,7 @@ class AppShellState extends ConsumerState<AppShell> {
   /// at most the body's height and scrolls (navigation first in view) on
   /// impractically short windows instead of overflowing.
   Widget _bottomStack(double bodyHeight, bool isOffline) {
+    final session = ref.watch(sessionControlsProvider);
     return ConstrainedBox(
       constraints: BoxConstraints(maxHeight: bodyHeight),
       child: MeasuredSize(
@@ -200,14 +203,22 @@ class AppShellState extends ConsumerState<AppShell> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    _BannerRegion(
-                      key: AppShell.bannerRegionKey,
-                      maxHeight: bodyHeight * 0.3,
-                      banners: [
-                        const PendingEditsBanner(),
-                        const StaleDownloadsBanner(),
-                        if (isOffline) const OfflineBanner(),
-                      ],
+                    // Blocked (different server) behaves as offline, so its
+                    // banner replaces the offline one (SC-01 rule 1).
+                    ListenableBuilder(
+                      listenable: session,
+                      builder: (context, _) => _BannerRegion(
+                        key: AppShell.bannerRegionKey,
+                        maxHeight: bodyHeight * 0.3,
+                        banners: [
+                          const PendingEditsBanner(),
+                          const StaleDownloadsBanner(),
+                          if (session.serverBlocked)
+                            const ServerBlockedBanner()
+                          else if (isOffline)
+                            const OfflineBanner(),
+                        ],
+                      ),
                     ),
                     const MiniPlayer(),
                     NavigationBar(

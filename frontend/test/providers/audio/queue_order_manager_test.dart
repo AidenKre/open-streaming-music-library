@@ -8,6 +8,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import '../../helpers/server_binding.dart';
 
 void main() {
   test('shuffleItems produces a permutation of the input', () {
@@ -39,8 +40,9 @@ void main() {
     late QueueOrderManager orderManager;
     late _LibraryFixture fixture;
 
-    setUp(() {
+    setUp(() async {
       db = AppDatabase(NativeDatabase.memory());
+      await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
       repo = QueueRepository(db);
       orderManager = QueueOrderManager(repo);
       fixture = _LibraryFixture(db);

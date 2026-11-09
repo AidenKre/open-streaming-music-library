@@ -11,6 +11,7 @@ import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/providers/audio/concatenating_player_controller.dart';
 import 'package:frontend/providers/audio/queue_hydration_controller.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import '../../helpers/server_binding.dart';
 
 void main() {
   late AppDatabase db;
@@ -23,8 +24,9 @@ void main() {
     ApiClient.init('http://localhost:8080');
   });
 
-  setUp(() {
+  setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     repo = QueueRepository(db);
     fakePlayer = _FakePlayer();
     hydration = QueueHydrationController(repo, fakePlayer);

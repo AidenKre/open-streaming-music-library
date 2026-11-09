@@ -2,16 +2,10 @@ import 'package:flutter/material.dart';
 
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/services/conversion/conversion_service.dart';
 
-/// Result of [showConvertTargetSheet]: the chosen target codec, plus a
-/// bitrate when the codec is lossy (null for a lossless target).
-@immutable
-class ConvertTargetChoice {
-  final String codec;
-  final int? bitrateKbps;
-
-  const ConvertTargetChoice({required this.codec, required this.bitrateKbps});
-}
+export 'package:frontend/services/conversion/conversion_service.dart'
+    show ConvertTargetChoice;
 
 /// Two-step bottom sheet: pick a target codec from [allowedTargets] (already
 /// filtered for this track -- see [ConversionCapabilities.allowedFor]), then,

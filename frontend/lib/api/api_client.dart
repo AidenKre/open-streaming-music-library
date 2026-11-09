@@ -17,6 +17,54 @@ class ApiException implements Exception {
 
   ApiException(this.statusCode, this.message);
 
+  late final Object? _detail = _parseDetail();
+
+  Object? _parseDetail() {
+    try {
+      final body = jsonDecode(message);
+      return body is Map ? body['detail'] : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? get errorCode {
+    final value = details?['error'];
+    return value is String ? value : null;
+  }
+
+  bool? get retryable {
+    final value = details?['retryable'];
+    return value is bool ? value : null;
+  }
+
+  Map<String, dynamic>? get details {
+    final detail = _detail;
+    return detail is Map<String, dynamic> ? detail : null;
+  }
+
+  /// Lets legacy callers keep showing only string-detail rejections.
+  bool get hasStringDetail => _detail is String;
+
+  String? get detailMessage {
+    final detail = _detail;
+    if (detail is String && detail.isNotEmpty) return detail;
+    if (detail is List) {
+      final messages = [
+        for (final item in detail)
+          if (item is Map && item['msg'] is String) item['msg'] as String,
+      ];
+      if (messages.isNotEmpty) return messages.join('; ');
+    }
+    if (detail is Map) {
+      for (final key in const ['message', 'msg', 'error']) {
+        final value = detail[key];
+        if (value is String && value.isNotEmpty) return value;
+      }
+    }
+    return null;
+  }
+
   @override
   String toString() => 'ApiException($statusCode): $message';
 }

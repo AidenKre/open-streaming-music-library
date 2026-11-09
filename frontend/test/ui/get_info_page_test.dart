@@ -13,6 +13,7 @@ import 'package:frontend/ui/get_info_page.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/ui/edit_controller.dart';
+import '../helpers/server_binding.dart';
 
 class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._v);
@@ -81,6 +82,7 @@ Future<AppDatabase> _pump(
   addTearDown(tester.view.resetDevicePixelRatio);
 
   final db = AppDatabase(NativeDatabase.memory());
+  await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
   addTearDown(db.close);
   if (seed != null) await seed(db);
   await tester.pumpWidget(

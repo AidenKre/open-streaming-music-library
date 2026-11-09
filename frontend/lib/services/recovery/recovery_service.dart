@@ -1,12 +1,15 @@
+import 'dart:async';
 import 'dart:developer' as developer;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 
 /// Drives best-effort "catch up after a gap" work across the app.
 ///
@@ -14,6 +17,13 @@ import 'package:frontend/services/recovery/recoverable.dart';
 /// the members that opted into the firing [RecoveryTrigger], sorts by
 /// descending [RecoverableService.recoveryPriority], and invokes each inside
 /// its own try/catch so a failure in one subsystem cannot strand the rest.
+///
+/// SC-01 rule 1: members that need no network ([RecoverableService.
+/// requiresBinding] false) run right away; the network-backed ones run only
+/// once the binding gate has verified the current connection.
+/// `networkRecovered` and `appResume` are connection edges, so each starts a
+/// new verification first. A different server keeps the network-backed
+/// members waiting (blocked); the gate closing with the scope ends the run.
 ///
 /// Unlike [LocalResetService] this **never throws**: recovery is background
 /// catch-up reached through fire-and-forget call sites, so failures are logged
@@ -26,25 +36,43 @@ class RecoveryService {
   final Ref _ref;
 
   /// One in-flight run per trigger. A second [runFor] for a trigger that is
-  /// still running dedupes onto the live run instead of starting a parallel
-  /// one — this absorbs the offline↔online *flap* (and back-to-back
-  /// cold-start/resume) without dropping a different trigger's work, since
-  /// distinct triggers keep independent entries.
+  /// still running its members dedupes onto the live run instead of
+  /// starting a parallel one — this absorbs the offline↔online *flap* (and
+  /// back-to-back cold-start/resume) without dropping a different trigger's
+  /// work, since distinct triggers keep independent entries. A run that is
+  /// only WAITING on the binding gate releases its entry, so a later edge
+  /// still re-verifies and runs its local members (D12, D14).
   final Map<RecoveryTrigger, Future<void>> _inFlight = {};
+
+  /// The network-backed phase per trigger, waiting on the binding gate or
+  /// running: later runs of the trigger join it instead of duplicating it.
+  final Map<RecoveryTrigger, Future<void>> _networkPhase = {};
 
   /// Runs every member registered for [trigger], in priority order. Safe to
   /// fire-and-forget: the returned future always completes normally.
   Future<void> runFor(RecoveryTrigger trigger) {
-    // NB: the `whenComplete` callback must be a statement body, not an arrow.
-    // `Map.remove` returns the removed value — here the in-flight future
-    // itself — and an arrow callback would hand that back to `whenComplete`,
-    // which then waits on the very future it is completing (self-deadlock).
-    return _inFlight[trigger] ??= _run(trigger).whenComplete(() {
-      _inFlight.remove(trigger);
-    });
+    final running = _inFlight[trigger];
+    if (running != null) return running;
+    final done = Completer<void>();
+    _inFlight[trigger] = done.future;
+    void release() {
+      if (identical(_inFlight[trigger], done.future)) {
+        _inFlight.remove(trigger);
+      }
+    }
+
+    _run(trigger, release)
+        .catchError((Object e, StackTrace st) {
+          developer.log('recovery run failed', name: 'recovery', error: e);
+        })
+        .whenComplete(() {
+          release();
+          done.complete();
+        });
+    return done.future;
   }
 
-  Future<void> _run(RecoveryTrigger trigger) async {
+  Future<void> _run(RecoveryTrigger trigger, void Function() release) async {
     final members =
         _ref
             .read(recoverablesProvider)
@@ -52,25 +80,66 @@ class RecoveryService {
             .toList()
           ..sort((a, b) => b.recoveryPriority.compareTo(a.recoveryPriority));
 
+    // A connection edge re-verifies the binding, for the network-backed
+    // members (the only ones that need it).
+    final networked = members.where((m) => m.requiresBinding).toList();
+    final gate = networked.isEmpty
+        ? null
+        : _ref.read(serverBindingGateProvider);
+    if (gate != null &&
+        (trigger == RecoveryTrigger.networkRecovered ||
+            trigger == RecoveryTrigger.appResume)) {
+      unawaited(gate.startConnection(ApiClient.instance.baseUrl));
+    }
+
+    await _runAll(trigger, members.where((m) => !m.requiresBinding));
+    if (gate == null) return;
+    // Waiting on the gate can take arbitrarily long (offline, a different
+    // server): don't let it swallow later edges of this trigger.
+    release();
+    // NB: a statement body, not an arrow — `Map.remove` returns the phase
+    // future itself, and whenComplete would then wait on it (self-deadlock).
+    await (_networkPhase[trigger] ??= _runNetworked(
+      trigger,
+      gate,
+      networked,
+    ).whenComplete(() {
+      _networkPhase.remove(trigger);
+    }));
+  }
+
+  Future<void> _runNetworked(
+    RecoveryTrigger trigger,
+    ServerBindingGate gate,
+    List<RecoverableService> networked,
+  ) async {
+    try {
+      await gate.awaitVerified();
+    } on BindingGateClosedException {
+      // The scope was disposed (reset/disconnect): nothing left to catch up.
+      return;
+    }
+    await _runAll(trigger, networked);
+  }
+
+  /// Invokes each of [group] in order, isolating failures (one broken
+  /// subsystem must not stop the others catching up); failures are logged,
+  /// never surfaced — recovery is best-effort.
+  Future<void> _runAll(
+    RecoveryTrigger trigger,
+    Iterable<RecoverableService> group,
+  ) async {
     final failures = <RecoveryFailure>[];
-    for (final member in members) {
+    for (final member in group) {
       try {
         await member.recover(trigger);
       } catch (e, st) {
-        // Continue — one broken subsystem must not stop the others catching
-        // up. Failures are aggregated and logged below; recovery is
-        // best-effort so there is nothing to surface to the caller.
         failures.add(RecoveryFailure(member.runtimeType, e, st));
       }
     }
-
     if (failures.isNotEmpty) {
       final ex = RecoveryException(trigger, failures);
-      developer.log(
-        ex.toString(),
-        name: 'recovery',
-        error: ex,
-      );
+      developer.log(ex.toString(), name: 'recovery', error: ex);
     }
   }
 }
@@ -140,6 +209,9 @@ class _SyncRecoverable implements RecoverableService {
   final Ref _ref;
 
   @override
+  bool get requiresBinding => true;
+
+  @override
   int get recoveryPriority => RecoveryPriority.sync;
 
   @override
@@ -161,6 +233,9 @@ class _AppInfoRecoverable implements RecoverableService {
   final Ref _ref;
 
   @override
+  bool get requiresBinding => true;
+
+  @override
   int get recoveryPriority => RecoveryPriority.appInfo;
 
   @override
@@ -178,6 +253,9 @@ class _AppInfoRecoverable implements RecoverableService {
 class _ResumeDownloadsRecoverable implements RecoverableService {
   _ResumeDownloadsRecoverable(this._ref);
   final Ref _ref;
+
+  @override
+  bool get requiresBinding => true;
 
   @override
   int get recoveryPriority => RecoveryPriority.resumeDownloads;
@@ -202,6 +280,9 @@ class _ResumeConversionsRecoverable implements RecoverableService {
   final Ref _ref;
 
   @override
+  bool get requiresBinding => true;
+
+  @override
   int get recoveryPriority => RecoveryPriority.resumeConversions;
 
   @override
@@ -223,6 +304,9 @@ class _ResumeConversionsRecoverable implements RecoverableService {
 class _ReconcileDownloadsRecoverable implements RecoverableService {
   _ReconcileDownloadsRecoverable(this._ref);
   final Ref _ref;
+
+  @override
+  bool get requiresBinding => false;
 
   @override
   int get recoveryPriority => RecoveryPriority.reconcileDownloads;

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -8,13 +9,30 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/quality_presets.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/settings_service.dart';
 
-ProviderContainer _containerWith(SharedPreferences prefs) {
+import '../helpers/server_binding.dart';
+
+/// A session scope: a bound database and a connection that verifies at
+/// once (the backend reconcile is a gated network runner, SC-01 rule 1).
+Future<ProviderContainer> _containerWith(
+  SharedPreferences prefs, {
+  ServerBindingGate? gate,
+}) async {
+  final db = AppDatabase(NativeDatabase.memory());
+  addTearDown(db.close);
+  await seedTestBinding(db);
   return ProviderContainer(overrides: [
     sharedPreferencesProvider.overrideWith((_) async => prefs),
+    databaseProvider.overrideWithValue(db),
+    if (gate != null)
+      serverBindingGateProvider.overrideWithValue(gate)
+    else
+      autoVerifiedGateOverride(),
   ]);
 }
 
@@ -34,7 +52,7 @@ void main() {
 
   test('build returns original/original on first launch', () async {
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     final settings = await container.read(settingsProvider.future);
@@ -48,7 +66,7 @@ void main() {
       'settings.downloadQuality': '320',
     });
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     final settings = await container.read(settingsProvider.future);
@@ -62,7 +80,7 @@ void main() {
       'settings.downloadQuality': '500',
     });
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     final settings = await container.read(settingsProvider.future);
@@ -77,7 +95,7 @@ void main() {
       'http://localhost:8000',
       MockClient((_) async => http.Response('{}', 200)),
     );
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -97,7 +115,7 @@ void main() {
       'http://localhost:8000',
       MockClient((_) async => http.Response('{}', 200)),
     );
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -114,7 +132,7 @@ void main() {
 
   test('setStreamQualityTemporary does not persist', () async {
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -133,7 +151,7 @@ void main() {
   test('setStreamQualityTemporary overrides persisted quality', () async {
     SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -145,7 +163,7 @@ void main() {
 
   test('setDownloadQuality persists and updates state', () async {
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -160,7 +178,7 @@ void main() {
 
   test('notifyStaleDownloads defaults to true', () async {
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     final settings = await container.read(settingsProvider.future);
@@ -169,7 +187,7 @@ void main() {
 
   test('setNotifyStaleDownloads persists and updates state', () async {
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -184,7 +202,7 @@ void main() {
 
   test('setStreamQualityFull rejects invalid values', () async {
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -196,7 +214,7 @@ void main() {
 
   test('setStreamQualityTemporary rejects invalid values', () async {
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -228,7 +246,7 @@ void main() {
       'settings.downloadQuality': '320',
     });
     final prefs = await SharedPreferences.getInstance();
-    final container = _containerWith(prefs);
+    final container = await _containerWith(prefs);
     addTearDown(container.dispose);
 
     await container.read(settingsProvider.future);
@@ -256,7 +274,7 @@ void main() {
         }),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       await container.read(settingsProvider.future);
@@ -283,7 +301,7 @@ void main() {
         }),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       await container.read(settingsProvider.future);
@@ -312,7 +330,7 @@ void main() {
         MockClient((_) => getCompleter.future),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       // build() must NOT wait on the GET — the local pref is published
@@ -329,6 +347,45 @@ void main() {
       expect(prefs.getString('settings.streamQuality'), '128');
     });
 
+    // SC-01 rule 1 (found live, 5-T19(c)): the reconcile reads the server's
+    // setting, so it waits for a verified connection: never adopt another
+    // server's value before the binding check.
+    test('the backend reconcile waits for a verified connection', () async {
+      SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
+      final prefs = await SharedPreferences.getInstance();
+      var requests = 0;
+      ApiClient.initForTest(
+        'http://localhost:8000',
+        MockClient((_) async {
+          requests++;
+          return qualityResponse('128');
+        }),
+      );
+      final db = AppDatabase(NativeDatabase.memory());
+      addTearDown(db.close);
+      await seedTestBinding(db);
+      final controlled = ControlledGate(db);
+      addTearDown(controlled.dispose);
+      final container = ProviderContainer(overrides: [
+        sharedPreferencesProvider.overrideWith((_) async => prefs),
+        databaseProvider.overrideWithValue(db),
+        serverBindingGateProvider.overrideWithValue(controlled.gate),
+      ]);
+      addTearDown(container.dispose);
+
+      await container.read(settingsProvider.future);
+      await pumpEventQueue();
+      expect(requests, 0, reason: 'no request before verification');
+      expect(container.read(settingsProvider).value!.streamQuality, '256');
+
+      unawaited(controlled.gate.startConnection('http://localhost:8000'));
+      await pumpEventQueue();
+      controlled.respond('inst-1');
+      await container.read(settingsProvider.notifier).debugBackendSyncDone;
+      expect(requests, 1);
+      expect(container.read(settingsProvider).value!.streamQuality, '128');
+    });
+
     test('backend reconcile updates state to backend value', () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
@@ -337,7 +394,7 @@ void main() {
         MockClient((_) async => qualityResponse('128')),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       await container.read(settingsProvider.future);
@@ -358,7 +415,7 @@ void main() {
         MockClient((_) async => qualityResponse('128')),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       await container.read(settingsProvider.future);
@@ -383,7 +440,7 @@ void main() {
       );
       SettingsNotifier.backendSyncTimeout = const Duration(milliseconds: 50);
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       final settings = await container.read(settingsProvider.future);
@@ -403,7 +460,7 @@ void main() {
         MockClient((_) async => throw Exception('network error')),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       final settings = await container.read(settingsProvider.future);
@@ -424,7 +481,7 @@ void main() {
             )),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       await container.read(settingsProvider.future);
@@ -446,7 +503,7 @@ void main() {
         }),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       final settings = await container.read(settingsProvider.future);
@@ -473,7 +530,7 @@ void main() {
       );
       SettingsNotifier.backendSyncTimeout = const Duration(seconds: 5);
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       // build() publishes local prefs immediately.
@@ -509,7 +566,7 @@ void main() {
         MockClient((_) => getCompleter.future),
       );
 
-      final container = _containerWith(prefs);
+      final container = await _containerWith(prefs);
       addTearDown(container.dispose);
 
       await container.read(settingsProvider.future);

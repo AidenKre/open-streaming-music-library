@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:drift/native.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -8,9 +9,13 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/database/database.dart';
+import 'package:frontend/providers/providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/login_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
+
+import '../helpers/server_binding.dart';
 
 /// Forces [offlineModeProvider] to a starting value without running the real
 /// health-poll timer. [OfflineModeNotifier.exitOffline] still works because
@@ -49,8 +54,16 @@ void main() {
       'http://localhost:8000',
       MockClient((_) async => http.Response('{"message": "Healthy"}', 200)),
     );
+    // SC-01: connect writes the binding row and verifies the server's
+    // identity through the binding gate (probe answered immediately).
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
     final container = ProviderContainer(
-      overrides: [offlineModeProvider.overrideWith(() => _StubOffline(true))],
+      overrides: [
+        offlineModeProvider.overrideWith(() => _StubOffline(true)),
+        databaseProvider.overrideWithValue(db),
+        autoVerifiedGateOverride(startOnRead: false),
+      ],
     );
     addTearDown(container.dispose);
 

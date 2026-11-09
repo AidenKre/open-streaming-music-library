@@ -5,6 +5,10 @@ import 'package:frontend/services/settings_service.dart';
 /// model `SettingsNotifier` owns persistence, the backend pre-transcode
 /// call and their rules.
 abstract interface class SettingsControls {
+  /// Whether the server quality rows accept a change now (the model's rule,
+  /// D29); the rows show their disabled-with-explanation state otherwise.
+  bool get canChangeServerQuality;
+
   /// Persist as the default and ask the server to pre-transcode.
   Future<void> setStreamQualityDefault(String quality);
 
@@ -16,14 +20,22 @@ abstract interface class SettingsControls {
   Future<void> setNotifyStaleDownloads(bool notify);
 }
 
+/// Watches the model's rule so watchers of the controller rebuild when it
+/// changes.
 final settingsControlsProvider = Provider<SettingsControls>(
-  (ref) => SettingsController(ref),
+  (ref) => SettingsController(
+    ref,
+    canChangeServerQuality: ref.watch(canChangeServerQualityProvider),
+  ),
 );
 
 class SettingsController implements SettingsControls {
-  SettingsController(this._ref);
+  SettingsController(this._ref, {required this.canChangeServerQuality});
 
   final Ref _ref;
+
+  @override
+  final bool canChangeServerQuality;
 
   SettingsNotifier get _settings => _ref.read(settingsProvider.notifier);
 

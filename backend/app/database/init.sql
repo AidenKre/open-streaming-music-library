@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS artists (
-    "id" INTEGER PRIMARY KEY,
+    "id" INTEGER PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,
     "name_lower" TEXT NOT NULL GENERATED ALWAYS AS (LOWER("name")) STORED UNIQUE
 );
@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS artists (
 CREATE INDEX IF NOT EXISTS idx_artists_name_lower ON artists("name_lower");
 
 CREATE TABLE IF NOT EXISTS albums (
-    "id" INTEGER PRIMARY KEY,
+    "id" INTEGER PRIMARY KEY AUTOINCREMENT,
     "name" TEXT,
     "name_lower" TEXT GENERATED ALWAYS AS (LOWER("name")) STORED,
     "artist_id" INTEGER NOT NULL,

@@ -11,6 +11,7 @@ import 'package:frontend/services/edit_sync_mutex.dart';
 import 'package:frontend/ui/edit_controller.dart';
 
 import '../ui/browse_harness.dart';
+import '../helpers/server_binding.dart';
 
 /// Save rules that lived in GetInfoPage (SC-26: model).
 void main() {
@@ -19,6 +20,7 @@ void main() {
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     await seedLibrary(db, const [
       SeedTrack(uuid: 'u1', title: 'Song', artistId: 1, artist: 'Abba',
           albumId: 1, album: 'Arrival'),

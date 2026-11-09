@@ -117,7 +117,7 @@ def _probe_source_params(source: Path, source_codec: Optional[str]) -> Optional[
 
 def _probe_intrinsic_fields(
     path: Path, target_codec: str
-) -> tuple[str, Optional[float], int, int]:
+) -> tuple[str, Optional[float], Optional[int], Optional[int]]:
     """Re-probe a converted file to get the codec/bitrate/sample_rate/channels
     that actually landed, using the same builder as ingestion so stored
     values match it exactly (including its format.bit_rate fallback for

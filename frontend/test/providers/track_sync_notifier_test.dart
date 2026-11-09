@@ -12,17 +12,20 @@ import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
+import 'package:frontend/repositories/sync_cursor_store.dart';
 import 'package:frontend/services/sync_service.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../helpers/server_binding.dart';
 
 class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
@@ -178,8 +181,9 @@ void main() {
   late ProviderContainer container;
   late Directory tempDir;
 
-  setUp(() {
+  setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db);
     tempDir = Directory.systemTemp.createTempSync('track_sync_notifier_test_');
     SharedPreferences.setMockInitialValues({});
   });
@@ -200,6 +204,7 @@ void main() {
     container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        autoVerifiedGateOverride(),
         tracksApiProvider.overrideWithValue(TracksApi()),
         offlineModeProvider.overrideWith(() => _StubOffline(offline)),
         if (localCoverArtStore != null)
@@ -215,6 +220,9 @@ void main() {
 
   Future<void> waitForBuild(ProviderContainer c) async {
     await c.read(trackSyncProvider.future);
+    // A session's connection is verified before user-driven syncFresh runs
+    // (it fails fast otherwise; audit 5A.0(a) #2).
+    await c.read(serverBindingGateProvider).awaitVerified();
   }
 
   group('TrackSyncNotifier', () {
@@ -246,8 +254,7 @@ void main() {
         expect(tracks.map((t) => t.uuidId).toSet(), {'uuid-1', 'uuid-2'});
         expect((await db.select(db.trackmetadata).get()).length, 2);
 
-        final prefs = await SharedPreferences.getInstance();
-        expect(prefs.getInt(SyncService.lastRevisionKey), 2);
+        expect(await SyncCursorStore(db).read(SyncStream.catalog), 2);
       },
     );
 
@@ -356,8 +363,7 @@ void main() {
         expect(afterParams, ['0', '1', '2']);
         expect((await db.select(db.tracks).get()).length, 3);
 
-        final prefs = await SharedPreferences.getInstance();
-        expect(prefs.getInt(SyncService.lastRevisionKey), 3);
+        expect(await SyncCursorStore(db).read(SyncStream.catalog), 3);
       },
     );
 
@@ -541,8 +547,10 @@ void main() {
         ApiClient.initForTest(
           'http://localhost:8000',
           MockClient(
+            // Caught up at revision 1 (a lower latestRevision would be a
+            // restored server, SC-01 rule 5).
             (req) async => req.url.path.endsWith('/changes')
-                ? _changesResponse(const [])
+                ? _changesResponse(const [], latestRevision: 1)
                 : Response(jsonEncode(_trackJson('uuid-1')), 200),
           ),
         );
@@ -573,8 +581,7 @@ void main() {
 
       expect(callCount, 0);
       expect(await db.select(db.tracks).get(), isEmpty);
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getInt(SyncService.lastRevisionKey), isNull);
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 0);
     });
 
     test(
@@ -605,8 +612,7 @@ void main() {
         expect((await db.select(db.tracks).get()).map((t) => t.uuidId), [
           'uuid-1',
         ]);
-        final prefs = await SharedPreferences.getInstance();
-        expect(prefs.getInt(SyncService.lastRevisionKey), 1);
+        expect(await SyncCursorStore(db).read(SyncStream.catalog), 1);
         expect(c.read(trackSyncProvider).value!.error, isNotNull);
 
         ApiClient.initForTest(
@@ -622,7 +628,7 @@ void main() {
           (await db.select(db.tracks).get()).map((t) => t.uuidId).toSet(),
           {'uuid-1', 'uuid-2'},
         );
-        expect(prefs.getInt(SyncService.lastRevisionKey), 2);
+        expect(await SyncCursorStore(db).read(SyncStream.catalog), 2);
         expect(c.read(trackSyncProvider).value!.error, isNull);
       },
     );
@@ -660,8 +666,7 @@ void main() {
         await c.read(trackSyncProvider.notifier).sync();
 
         expect(await db.select(db.tracks).get(), isEmpty);
-        final prefs = await SharedPreferences.getInstance();
-        expect(prefs.getInt(SyncService.lastRevisionKey), 5);
+        expect(await SyncCursorStore(db).read(SyncStream.catalog), 5);
         expect(
           c.read(trackSyncProvider).value!.error,
           contains('FormatException'),
@@ -679,8 +684,7 @@ void main() {
       await waitForBuild(c);
       await c.read(trackSyncProvider.notifier).sync();
 
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getInt(SyncService.lastRevisionKey), isNull);
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 0);
       expect(
         c.read(trackSyncProvider).value!.error,
         contains('Invalid non-advancing changes cursor'),
@@ -720,8 +724,7 @@ void main() {
         await c.read(trackSyncProvider.notifier).sync();
 
         expect(await db.select(db.tracks).get(), isEmpty);
-        final prefs = await SharedPreferences.getInstance();
-        expect(prefs.getInt(SyncService.lastRevisionKey), 5);
+        expect(await SyncCursorStore(db).read(SyncStream.catalog), 5);
         expect(
           c.read(trackSyncProvider).value!.error,
           contains('Change uuid_id must match track uuid_id'),
@@ -886,8 +889,7 @@ void main() {
           )
           .get();
       expect(dropAlbumFts, isEmpty);
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getInt(SyncService.lastRevisionKey), 3);
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 3);
     });
 
     test('sync tombstones fence active download jobs', () async {
@@ -1207,8 +1209,7 @@ void main() {
 
       expect(call, 2);
       expect(afterParams, ['0', '5']);
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getInt(SyncService.lastRevisionKey), 6);
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 6);
     });
 
     test('resuming from a saved watermark is idempotent', () async {
@@ -1234,8 +1235,7 @@ void main() {
       expect((await db.select(db.tracks).get()).map((t) => t.uuidId).toSet(), {
         'uuid-3',
       });
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getInt(SyncService.lastRevisionKey), 3);
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 3);
     });
 
     test('first sync does not wipe existing local rows', () async {
@@ -1265,8 +1265,7 @@ void main() {
         'existing-local-row',
         'uuid-current',
       });
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getInt(SyncService.lastRevisionKey), 1);
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 1);
     });
 
     test('upsert preserves local download metadata', () async {

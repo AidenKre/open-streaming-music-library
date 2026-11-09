@@ -20,13 +20,15 @@ import 'package:frontend/ui/widgets/full_player.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 import 'fake_player_controls.dart';
+import '../helpers/server_binding.dart';
 
 void main() {
   late AppDatabase db;
   late QueueRepository repo;
 
-  setUp(() {
+  setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     repo = QueueRepository(db);
   });
 

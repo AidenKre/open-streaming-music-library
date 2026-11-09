@@ -9,11 +9,12 @@ class TrackMetadataDto {
   final int? trackNumber;
   final int? discNumber;
   final String? codec;
-  final double duration;
-  /// Null when the server doesn't know it; 0 is a real reading.
+  // Audio properties: null when the server doesn't know them; 0 is a real
+  // reading (SC-16l).
+  final double? duration;
   final double? bitrateKbps;
-  final int sampleRateHz;
-  final int channels;
+  final int? sampleRateHz;
+  final int? channels;
   final bool hasAlbumArt;
   final int? coverArtId;
   final int? artistId;
@@ -52,10 +53,10 @@ class TrackMetadataDto {
       trackNumber: (json['track_number'] as num?)?.toInt(),
       discNumber: (json['disc_number'] as num?)?.toInt(),
       codec: json['codec'] as String?,
-      duration: (json['duration'] as num).toDouble(),
+      duration: (json['duration'] as num?)?.toDouble(),
       bitrateKbps: (json['bitrate_kbps'] as num?)?.toDouble(),
-      sampleRateHz: (json['sample_rate_hz'] as num).toInt(),
-      channels: (json['channels'] as num).toInt(),
+      sampleRateHz: (json['sample_rate_hz'] as num?)?.toInt(),
+      channels: (json['channels'] as num?)?.toInt(),
       hasAlbumArt: json['has_album_art'] as bool? ?? false,
       coverArtId: (json['cover_art_id'] as num?)?.toInt(),
       artistId: (json['artist_id'] as num?)?.toInt(),

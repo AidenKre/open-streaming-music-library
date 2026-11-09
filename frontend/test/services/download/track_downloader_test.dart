@@ -35,10 +35,10 @@ Future<void> _insertTrack(
         TrackmetadataCompanion.insert(
           uuidId: uuid,
           codec: Value(codec),
-          duration: 120,
+          duration: const Value(120),
           bitrateKbps: const Value(320),
-          sampleRateHz: 44100,
-          channels: 2,
+          sampleRateHz: const Value(44100),
+          channels: const Value(2),
         ),
       );
 }

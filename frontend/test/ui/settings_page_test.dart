@@ -32,6 +32,7 @@ Widget _wrap(
   SharedPreferences prefs, {
   Future<void> Function()? onDisconnect,
   bool offline = false,
+  List<String> losses = const [],
 }) {
   return ProviderScope(
     overrides: [
@@ -39,7 +40,8 @@ Widget _wrap(
       offlineModeProvider.overrideWith(() => _StubOffline(offline)),
       if (onDisconnect != null)
         sessionControlsProvider.overrideWithValue(
-          FakeSessionControls(onDisconnect: onDisconnect),
+          FakeSessionControls(onDisconnect: onDisconnect)
+            ..lossSummaries = losses,
         ),
     ],
     child: MaterialApp(
@@ -266,6 +268,26 @@ void main() {
     expect(find.text('Reset and disconnect?'), findsOneWidget);
   });
 
+  // SC-15: the confirmation names what will be lost.
+  testWidgets('the Disconnect confirmation lists what will be lost', (
+    tester,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await tester.pumpWidget(
+      _wrap(
+        prefs,
+        onDisconnect: () async {},
+        losses: ['2 unsent metadata edits'],
+      ),
+    );
+    await tester.pumpAndSettle();
+    await _toBottom(tester);
+    await tester.tap(find.text('Disconnect'));
+    await tester.pumpAndSettle();
+    expect(find.text('Reset and disconnect?'), findsOneWidget);
+    expect(find.textContaining('2 unsent metadata edits'), findsOneWidget);
+  });
+
   testWidgets('Settings opened from tab navigator keeps disconnect available', (
     tester,
   ) async {
@@ -472,6 +494,43 @@ void main() {
       expect(fake.calls, ['default 320', 'session 192']);
     });
 
+    // D29: the rows follow the controller's computed rule; they no longer
+    // decide the offline rule themselves.
+    for (final (offline, allowed) in [(false, false), (true, true)]) {
+      testWidgets(
+          'server quality rows follow canChangeServerQuality '
+          '(offline: $offline, allowed: $allowed)', (tester) async {
+        final prefs = await SharedPreferences.getInstance();
+        await tester.pumpWidget(ProviderScope(
+          overrides: [
+            sharedPreferencesProvider.overrideWith((_) async => prefs),
+            offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+            settingsControlsProvider.overrideWithValue(
+              _FakeSettings(canChangeServerQuality: allowed),
+            ),
+          ],
+          child: MaterialApp(
+            theme: ThemeData(splashFactory: NoSplash.splashFactory),
+            home: const SettingsPage(),
+          ),
+        ));
+        await tester.pumpAndSettle();
+        final dropdowns = tester
+            .widgetList<DropdownButton<String>>(
+              find.byType(DropdownButton<String>),
+            )
+            .toList();
+        expect(dropdowns, hasLength(2));
+        for (final d in dropdowns) {
+          expect(d.onChanged == null, !allowed);
+        }
+        expect(
+          find.byTooltip('Unavailable while offline'),
+          allowed ? findsNothing : findsNWidgets(2),
+        );
+      });
+    }
+
     testWidgets('download quality and the stale switch', (tester) async {
       await pump(tester);
       final downloadDropdown = find.byType(DropdownButton<String>);
@@ -487,6 +546,9 @@ void main() {
 }
 
 class _FakeSettings implements SettingsControls {
+  _FakeSettings({this.canChangeServerQuality = true});
+  @override
+  final bool canChangeServerQuality;
   final calls = <String>[];
   @override
   Future<void> setStreamQualityDefault(String quality) async =>

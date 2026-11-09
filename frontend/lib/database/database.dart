@@ -8,6 +8,8 @@ import 'package:frontend/services/local_resettable.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'database.steps.dart';
+
 part 'database.g.dart';
 
 // ── Table definitions ──────────────────────────────────────────────────
@@ -145,11 +147,12 @@ class Trackmetadata extends Table {
   IntColumn get trackNumber => integer().nullable()();
   IntColumn get discNumber => integer().nullable()();
   TextColumn get codec => text().nullable()();
-  RealColumn get duration => real()();
-  // Null = unknown (the server couldn't determine it); 0 is a real value.
+  // Audio properties: null = unknown (the server couldn't determine it); 0
+  // is a real value, never a stand-in for unknown (SC-16l).
+  RealColumn get duration => real().nullable()();
   RealColumn get bitrateKbps => real().nullable()();
-  IntColumn get sampleRateHz => integer()();
-  IntColumn get channels => integer()();
+  IntColumn get sampleRateHz => integer().nullable()();
+  IntColumn get channels => integer().nullable()();
   BoolColumn get hasAlbumArt => boolean().withDefault(const Constant(false))();
   IntColumn get coverArtId => integer().nullable()();
 
@@ -257,6 +260,41 @@ class PendingEdits extends Table {
 
   @override
   Set<Column> get primaryKey => {uuidId};
+}
+
+/// The server this database's catalog belongs to (SC-01). Holds exactly one
+/// row whenever a session URL exists; [id] is pinned to 1 so a second row
+/// can never be inserted.
+class ServerBinding extends Table {
+  // drift_dev reads the CHECK statically; the getter is never invoked.
+  IntColumn get id =>
+      // ignore: recursive_getters
+      integer().withDefault(const Constant(1)).check(id.equals(1))();
+
+  /// The server's persistent instance id. Null = provisional/legacy binding
+  /// (not yet learned from `/app/info`).
+  TextColumn get instanceId => text().nullable()();
+
+  /// Random UUID minted when the row is created.
+  TextColumn get localBindingId => text()();
+  TextColumn get lastBaseUrl => text()();
+
+  /// UTC milliseconds since epoch.
+  IntColumn get boundAt => integer()();
+  BoolColumn get catalogReconciledAtBinding =>
+      boolean().withDefault(const Constant(false))();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+/// Per-stream sync cursors (SC-02), e.g. the catalog `/changes` cursor.
+class SyncCursors extends Table {
+  TextColumn get stream => text()();
+  IntColumn get value => integer()();
+
+  @override
+  Set<Column> get primaryKey => {stream};
 }
 
 // ── Column allowlists (mirrors backend database.py) ─────────────────────
@@ -797,30 +835,44 @@ String _quoteSqlIdentifier(String identifier) {
     QueueSessionItems,
     QueueSessionPlayOrder,
     PendingEdits,
+    ServerBinding,
+    SyncCursors,
   ],
 )
 class AppDatabase extends _$AppDatabase implements LocalResettable {
   AppDatabase(super.e);
 
-  /// Schema history was reset during beta: the current table definitions ARE
-  /// version 1 and there is no upgrade path from the pre-reset versions (an
+  /// Schema history was reset during beta: version 1 is the post-reset
+  /// baseline and there is no upgrade path from the pre-reset versions (an
   /// old-beta database must go through the local-reset flow once).
   ///
-  /// Ground rules for the first post-reset migration (learned the hard way —
-  /// an unguarded ALTER once bricked every upgrading install):
+  /// Migration pattern (every schema change follows it):
   ///
-  ///  1. `m.createTable(...)` always emits the table's CURRENT Dart shape.
-  ///     A column ALTER for a table introduced in version N must therefore be
-  ///     guarded `from >= N`, or upgraders that just created the table will
-  ///     crash on "duplicate column name".
-  ///  2. Every schema bump ships with a test that opens a real previous-version
+  ///  1. Change the table classes, bump [schemaVersion], then run
+  ///     `dart run drift_dev make-migrations`. It exports the frozen snapshot
+  ///     `drift_schemas/default/drift_schema_vN.json`, regenerates
+  ///     `database.steps.dart` and the versioned test schemas under
+  ///     `test/drift/`.
+  ///  2. Add one `fromXToY` step to the [stepByStep] call in [migration].
+  ///     Each step only sees the generated `SchemaY` snapshot, never the
+  ///     current Dart tables, so an older upgrader can't be handed a later
+  ///     table shape (an unguarded ALTER against the current shape once
+  ///     bricked every upgrading install).
+  ///  3. Every bump ships with a test that opens a real previous-version
   ///     database file and runs the actual `onUpgrade` — never a hand-replayed
-  ///     statement list, which is exactly what masked the bug above.
-  ///  3. Once the schema stabilizes, adopt drift's exported-schema tooling
-  ///     (`drift_dev schema` + step-by-step migrations) so upgrades are
-  ///     generated against frozen snapshots instead of hand-written.
+  ///     statement list — and checks the result equals a fresh install.
+  ///  4. The whole upgrade is atomic: [migration] runs every step inside one
+  ///     `transaction` that also sets `PRAGMA user_version` to the target, so
+  ///     a failing step rolls back all of its DDL/DML and the version
+  ///     advances only with a successful migration (drift itself neither
+  ///     wraps `onUpgrade` nor writes the version until after `beforeOpen`).
+  ///     New steps get this for free; never commit or open a nested
+  ///     transaction inside a step.
+  ///  5. A `TableMigration` rebuild renumbers trackmetadata's implicit rowid,
+  ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
+  ///     [rebuildFtsIndexes] afterwards.
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -829,6 +881,46 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       for (final stmt in _ftsStatements) {
         await customStatement(stmt);
       }
+    },
+    onUpgrade: (m, from, to) => transaction(() async {
+      await _upgradeSteps(m, from, to);
+      // Committed together with the steps: drift writes the version only
+      // after beforeOpen, outside this transaction, so its later write is a
+      // harmless repeat and a crash in between can't re-run a done upgrade.
+      await customStatement('PRAGMA user_version = $to');
+    }),
+  );
+
+  /// Every per-version step; run only through [migration]'s transaction.
+  OnUpgrade get _upgradeSteps => stepByStep(
+    from1To2: (m, schema) async {
+      // SC-01 / SC-02: created empty; rows come from the session flow.
+      await m.createTable(schema.serverBinding);
+      await m.createTable(schema.syncCursors);
+      // SC-16l: audio properties become nullable and local zeros (the old
+      // "unknown" stand-in) become NULL. Bitrate was already nullable.
+      final tm = schema.trackmetadata;
+      await m.alterTable(
+        // ignore: experimental_member_use
+        TableMigration(
+          tm,
+          columnTransformer: {
+            tm.duration: const CustomExpression<double>('NULLIF(duration, 0)'),
+            tm.sampleRateHz: const CustomExpression<int>(
+              'NULLIF(sample_rate_hz, 0)',
+            ),
+            tm.channels: const CustomExpression<int>('NULLIF(channels, 0)'),
+          },
+        ),
+      );
+      // The rebuild renumbered trackmetadata rowids (fts_tracks' key), so
+      // re-derive the FTS indexes. The FTS tables live outside drift's
+      // exported schema (onCreate adds them), so ensure they exist first:
+      // a no-op on a real v1 file, required by the generated verifier.
+      for (final stmt in _ftsStatements) {
+        await customStatement(stmt);
+      }
+      await rebuildFtsIndexes();
     },
   );
 
@@ -1184,25 +1276,34 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   /// `take_server` rows are excluded at the source: they are resolution
   /// markers awaiting their refetch, not user-visible outbox rows.
   Stream<({int pending, int conflicted, int rejected})>
-      watchPendingEditCounts() {
-    return customSelect(
-      "SELECT "
-      "SUM(CASE WHEN status = 'conflicted' THEN 1 ELSE 0 END) AS conflicted, "
-      "SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected, "
-      "COUNT(*) AS total FROM pending_edits "
-      "WHERE status IN ('pending', 'conflicted', 'rejected')",
-      readsFrom: {pendingEdits},
-    ).watch().map((rows) {
-      final row = rows.first;
-      final conflicted = row.readNullable<int>('conflicted') ?? 0;
-      final rejected = row.readNullable<int>('rejected') ?? 0;
-      final total = row.read<int>('total');
-      return (
-        pending: total - conflicted - rejected,
-        conflicted: conflicted,
-        rejected: rejected,
-      );
-    });
+      watchPendingEditCounts() =>
+          _pendingEditCountsQuery().watch().map(_editCounts);
+
+  /// One-shot form of [watchPendingEditCounts] (same definition).
+  Future<({int pending, int conflicted, int rejected})> pendingEditCounts() =>
+      _pendingEditCountsQuery().get().then(_editCounts);
+
+  Selectable<QueryRow> _pendingEditCountsQuery() => customSelect(
+    "SELECT "
+    "SUM(CASE WHEN status = 'conflicted' THEN 1 ELSE 0 END) AS conflicted, "
+    "SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected, "
+    "COUNT(*) AS total FROM pending_edits "
+    "WHERE status IN ('pending', 'conflicted', 'rejected')",
+    readsFrom: {pendingEdits},
+  );
+
+  static ({int pending, int conflicted, int rejected}) _editCounts(
+    List<QueryRow> rows,
+  ) {
+    final row = rows.first;
+    final conflicted = row.readNullable<int>('conflicted') ?? 0;
+    final rejected = row.readNullable<int>('rejected') ?? 0;
+    final total = row.read<int>('total');
+    return (
+      pending: total - conflicted - rejected,
+      conflicted: conflicted,
+      rejected: rejected,
+    );
   }
 
   // ── Track queries ─────────────────────────────────────────────────────

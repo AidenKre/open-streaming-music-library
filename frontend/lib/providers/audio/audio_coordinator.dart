@@ -17,6 +17,7 @@ import 'package:frontend/providers/audio/queue_order_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/queue_warm_service.dart';
 import 'package:frontend/services/session_readiness.dart';
@@ -36,6 +37,8 @@ class AudioCoordinator extends Notifier<AudioState> {
   Future<void> _mutationTail = Future<void>.value();
   bool _stopInProgress = false;
   bool _playerIntendsPlaying = false;
+  PlaybackLifecycle _lifecycle = PlaybackLifecycle.none;
+  Future<void>? _quiescing;
   DateTime? _lastPositionSave;
 
   @override
@@ -126,6 +129,17 @@ class AudioCoordinator extends Notifier<AudioState> {
       }
       _player.dispose();
     });
+
+    // Lifecycle none -> active with the session-ready signal, independent of
+    // the volume restore (restore order itself is unchanged).
+    unawaited(
+      ref.read(sessionReadinessProvider).ready.then((_) {
+        if (!ref.mounted) return;
+        if (_lifecycle == PlaybackLifecycle.none) {
+          _lifecycle = PlaybackLifecycle.active;
+        }
+      }),
+    );
 
     Future.microtask(_restoreStartupState);
     return const AudioState();
@@ -486,6 +500,42 @@ class AudioCoordinator extends Notifier<AudioState> {
     await _persistPlaybackCursor();
   }
 
+  /// Whether the playback runtime accepts work (SC-27 lifecycle axis).
+  PlaybackLifecycle get lifecycle => _lifecycle;
+
+  bool get _admissionClosed =>
+      _lifecycle == PlaybackLifecycle.stopping ||
+      _lifecycle == PlaybackLifecycle.quiesced;
+
+  /// SC-15 reset participant: closes admission synchronously (`stopping`),
+  /// lets lane work admitted before that settle, stops audio and the OS
+  /// media session, then reaches the terminal `quiesced`. No DB writes: the
+  /// reset's fence already made durable writes no-ops and the wipe follows.
+  /// Idempotent.
+  Future<void> quiesce() {
+    if (_lifecycle == PlaybackLifecycle.quiesced) return Future.value();
+    final inFlight = _quiescing;
+    if (inFlight != null) return inFlight;
+    _lifecycle = PlaybackLifecycle.stopping;
+    // Chained on the lane directly: _serialize no longer admits anything.
+    final future = _mutationTail.then((_) async {
+      // Never cleared: quiesced is terminal, so late player events stay
+      // ignored.
+      _stopInProgress = true;
+      try {
+        _playerIntendsPlaying = false;
+        await _player.stop();
+        _bridge.clearNowPlaying();
+        _setPlaybackStatus(PlayerStatus.idle);
+        _updateBridgePlaybackState();
+      } finally {
+        _lifecycle = PlaybackLifecycle.quiesced;
+      }
+    });
+    _mutationTail = future.catchError((_) {});
+    return _quiescing = future;
+  }
+
   Future<void> stop() {
     return _serialize(() async {
       _stopInProgress = true;
@@ -587,6 +637,7 @@ class AudioCoordinator extends Notifier<AudioState> {
   }
 
   Future<void> setVolume(double volume) async {
+    if (_admissionClosed) return;
     await _player.setVolume(volume);
     state = state.copyWith(playback: state.playback.copyWith(volume: volume));
     final prefs = await ref.read(sharedPreferencesProvider.future);
@@ -722,9 +773,7 @@ class AudioCoordinator extends Notifier<AudioState> {
         currentTrack: currentTrack.track,
         status: autoPlay ? PlayerStatus.playing : PlayerStatus.paused,
         position: initialPosition,
-        duration: Duration(
-          milliseconds: (currentTrack.track.duration * 1000).round(),
-        ),
+        duration: _playbackDuration(currentTrack.track.duration),
       ),
       queue: state.queue.copyWith(
         sessionId: sessionId,
@@ -921,9 +970,7 @@ class AudioCoordinator extends Notifier<AudioState> {
         position: preservePlaybackPosition
             ? state.playback.position
             : Duration.zero,
-        duration: Duration(
-          milliseconds: (currentTrack.track.duration * 1000).round(),
-        ),
+        duration: _playbackDuration(currentTrack.track.duration),
       ),
       queue: state.queue.copyWith(
         currentItemId: currentTrack.itemId,
@@ -1032,9 +1079,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       playback: state.playback.copyWith(
         currentTrack: currentTrack.track,
         position: Duration.zero,
-        duration: Duration(
-          milliseconds: (currentTrack.track.duration * 1000).round(),
-        ),
+        duration: _playbackDuration(currentTrack.track.duration),
       ),
       queue: state.queue.copyWith(
         currentItemId: currentTrack.itemId,
@@ -1086,6 +1131,8 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
     _updateBridgePlaybackState();
 
+    // Once a quiesce closed admission, nothing is persisted any more.
+    if (_admissionClosed) return;
     final now = DateTime.now();
     if (_lastPositionSave == null ||
         now.difference(_lastPositionSave!) > const Duration(seconds: 5)) {
@@ -1103,16 +1150,25 @@ class AudioCoordinator extends Notifier<AudioState> {
     final currentItemId = state.queue.currentItemId;
     if (sessionId == null || currentItemId == null) return;
 
-    await _queueRepo.updatePlaybackCursor(
-      sessionId: sessionId,
-      currentItemId: currentItemId,
-      positionMs: resetPosition ? 0 : state.playback.position.inMilliseconds,
-      resumeMainItemId: resumeMainItemId,
-      updateResumeMainItemId: updateResumeMainItemId,
-    );
+    try {
+      await _queueRepo.updatePlaybackCursor(
+        sessionId: sessionId,
+        currentItemId: currentItemId,
+        positionMs: resetPosition ? 0 : state.playback.position.inMilliseconds,
+        resumeMainItemId: resumeMainItemId,
+        updateResumeMainItemId: updateResumeMainItemId,
+      );
+    } on BindingFencedException {
+      // The reset fence deleted the binding: this session's cursor no longer
+      // has a store to go to. A quiet no-op (SC-01 rule 4).
+    }
   }
 
+  /// Runs [action] on the playback lane. Once a quiesce has closed
+  /// admission (`stopping`/`quiesced`) nothing is admitted: the action is
+  /// dropped and a completed future returned.
   Future<void> _serialize(Future<void> Function() action) {
+    if (_admissionClosed) return Future.value();
     final future = _mutationTail.then((_) => action());
     _mutationTail = future.catchError((_) {});
     return future;
@@ -1166,3 +1222,10 @@ class AudioCoordinator extends Notifier<AudioState> {
     return playerState.playing ? PlayerStatus.playing : PlayerStatus.paused;
   }
 }
+
+/// Catalog seconds -> the playback state's duration. AudioState still uses
+/// Duration.zero for "unknown" (a known bug that 5B.0d fixes by making it
+/// nullable), so an unknown catalog duration maps to that representation.
+Duration _playbackDuration(double? seconds) => seconds == null
+    ? Duration.zero
+    : Duration(milliseconds: (seconds * 1000).round());

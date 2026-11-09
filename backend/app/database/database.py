@@ -1,12 +1,14 @@
 import re
 import sqlite3
 import unicodedata
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Flag, auto
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
+from app.database.table_rebuild import rebuild_tables
 from app.models.album import Album
 from app.models.artist import Artist
 from app.models.cover_art import CoverArt
@@ -298,6 +300,62 @@ def _track_select_columns(*extra_columns: str) -> str:
     return columns
 
 
+def _rebuild_parent_tables(conn: sqlite3.Connection) -> None:
+    # Keep these definitions and indexes aligned with the parent DDL in init.sql.
+    parents = (
+        (
+            "artists",
+            "id, name",
+            '''CREATE TABLE artists_new (
+                "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+                "name" TEXT NOT NULL,
+                "name_lower" TEXT NOT NULL GENERATED ALWAYS AS (LOWER("name")) STORED UNIQUE
+            )''',
+            (
+                'CREATE INDEX IF NOT EXISTS idx_artists_name_lower ON artists("name_lower")',
+            ),
+        ),
+        (
+            "albums",
+            "id, name, artist_id, year, is_single_grouping",
+            '''CREATE TABLE albums_new (
+                "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+                "name" TEXT,
+                "name_lower" TEXT GENERATED ALWAYS AS (LOWER("name")) STORED,
+                "artist_id" INTEGER NOT NULL,
+                "year" INTEGER,
+                "is_single_grouping" INTEGER NOT NULL DEFAULT 0 CHECK ("is_single_grouping" IN (0,1)),
+                FOREIGN KEY ("artist_id") REFERENCES artists("id")
+            )''',
+            (
+                'CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_regular '
+                'ON albums("name_lower", "artist_id") WHERE "is_single_grouping" = 0',
+                'CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_singles '
+                'ON albums("artist_id", COALESCE("year", -1)) WHERE "is_single_grouping" = 1',
+                'CREATE INDEX IF NOT EXISTS idx_albums_name_lower ON albums("name_lower")',
+                'CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums("artist_id")',
+            ),
+        ),
+    )
+    for table, columns, create_sql, indexes in parents:
+        existing = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        # Older partial databases may lack parents. Already-upgraded tables
+        # retain their sequence, including IDs whose rows have been deleted.
+        if existing is None or "AUTOINCREMENT" in existing[0].upper():
+            continue
+        conn.execute(create_sql)
+        # Explicit IDs seed sqlite_sequence to at least the copied maximum.
+        conn.execute(
+            f"INSERT INTO {table}_new ({columns}) SELECT {columns} FROM {table}"
+        )
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+        for index_sql in indexes:
+            conn.execute(index_sql)
+
+
 class Database:
     def __init__(self, context: DatabaseContext):
         self.context = context
@@ -335,7 +393,7 @@ class Database:
     # older version than they actually had (init.sql already creates the v3
     # ``app_settings`` table), which would have made any future v3→v4
     # migration spuriously re-create existing tables.
-    LATEST_SCHEMA_VERSION = 9
+    LATEST_SCHEMA_VERSION = 11
 
     def initialize(self) -> bool:
         if self.context.database_path.exists():
@@ -347,6 +405,7 @@ class Database:
                 init_script = f.read()
             with self._connection(commit=True) as conn:
                 conn.executescript(init_script)
+                self._ensure_server_instance_id(conn)
                 conn.execute(f"PRAGMA user_version = {self.LATEST_SCHEMA_VERSION}")
             return True
         except Exception as e:
@@ -577,6 +636,34 @@ class Database:
                         "UPDATE trackmetadata SET bitrate_kbps = NULL WHERE bitrate_kbps = 0"
                     )
                 conn.execute("PRAGMA user_version = 9")
+
+            if version < 10:
+                print("Migrating database to version 10: unknown audio properties become NULL")
+                # Normalize legacy unknown sentinels without bumping revisions:
+                # downloaded audio has not changed.
+                has_trackmetadata = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trackmetadata'"
+                ).fetchone() is not None
+                if has_trackmetadata:
+                    for column in ("duration", "sample_rate_hz", "channels"):
+                        conn.execute(
+                            f"UPDATE trackmetadata SET {column} = NULL WHERE {column} = 0"
+                        )
+                conn.execute("PRAGMA user_version = 10")
+
+            self._ensure_server_instance_id(conn)
+
+        # The ladder's connection must commit and close before the dedicated
+        # rebuild connection disables foreign keys and begins its transaction.
+        if version < 11:
+            database_path = self.context.database_path
+            rebuild_tables(
+                database_path,
+                target_version=11,
+                rebuild=_rebuild_parent_tables,
+                backup_path=database_path.with_name(database_path.name + ".pre-v11.bak"),
+                verify_tables=("artists", "albums"),
+            )
 
     @staticmethod
     def _next_revision(conn) -> int:
@@ -1325,8 +1412,8 @@ class Database:
         uuid_id: str,
         codec: str,
         bitrate_kbps: Optional[float],
-        sample_rate_hz: int,
-        channels: int,
+        sample_rate_hz: Optional[int],
+        channels: Optional[int],
         file_path: Optional[str] = None,
         inplace_journal: Optional[tuple[str, str]] = None,
     ) -> tuple[int, Optional[int]]:
@@ -1370,8 +1457,8 @@ class Database:
         uuid_id: str,
         codec: str,
         bitrate_kbps: Optional[float],
-        sample_rate_hz: int,
-        channels: int,
+        sample_rate_hz: Optional[int],
+        channels: Optional[int],
         file_path: Optional[str] = None,
     ) -> int:
         """Pure-DB sibling of ``_update_track_metadata``: writes only the
@@ -2119,6 +2206,24 @@ class Database:
             return False
 
     # ── App settings ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_server_instance_id(conn: sqlite3.Connection) -> None:
+        # Partial legacy databases may not yet have the settings table.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_settings ("
+            "key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
+            ("server_instance_id", str(uuid.uuid4())),
+        )
+
+    def get_server_instance_id(self) -> str:
+        instance_id = self.get_setting("server_instance_id")
+        if instance_id is None:
+            raise RuntimeError("Server instance identity has not been initialized")
+        return instance_id
 
     def get_setting(self, key: str) -> str | None:
         try:

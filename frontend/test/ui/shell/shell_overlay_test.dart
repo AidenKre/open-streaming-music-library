@@ -14,6 +14,7 @@ import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/widgets/offline_banner.dart';
 import 'package:frontend/ui/widgets/pending_edits_banner.dart';
+import 'package:frontend/ui/widgets/server_blocked_banner.dart';
 import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
 
 import '../browse_harness.dart';
@@ -49,12 +50,17 @@ void main() {
     await h.dispose();
   });
 
-  Future<void> pumpShell(WidgetTester tester) async {
+  Future<void> pumpShell(
+    WidgetTester tester, {
+    FakeSessionControls? session,
+  }) async {
     await tester.pumpWidget(
       h.wrap(
         const SessionHost(root: AppShell()),
         overrides: [
-          sessionControlsProvider.overrideWithValue(FakeSessionControls()),
+          sessionControlsProvider.overrideWithValue(
+            session ?? FakeSessionControls(),
+          ),
         ],
       ),
     );
@@ -168,6 +174,29 @@ void main() {
     expect(top(StaleDownloadsBanner), lessThanOrEqualTo(top(OfflineBanner)));
     expect(top(OfflineBanner), lessThan(top(MiniPlayer)));
     expect(top(MiniPlayer), lessThan(top(NavigationBar)));
+    await teardownTree(tester);
+  });
+
+  // SC-01 rule 1: blocked behaves as offline, but says why and offers the
+  // way out instead of the generic offline banner.
+  testWidgets('a blocked session shows its banner instead of the offline one',
+      (tester) async {
+    final session = FakeSessionControls()..serverBlocked = true;
+    await pumpShell(tester, session: session);
+    h.offline.set(true);
+    await tester.pumpAndSettle();
+    final stack = find.byKey(AppShell.bottomStackKey);
+    expect(
+      find.descendant(of: stack, matching: find.byType(ServerBlockedBanner)),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Different server'), findsOneWidget);
+    expect(find.byType(OfflineBanner), findsNothing);
+
+    session.setBlocked(false);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Different server'), findsNothing);
+    expect(find.byType(OfflineBanner), findsOneWidget);
     await teardownTree(tester);
   });
 }

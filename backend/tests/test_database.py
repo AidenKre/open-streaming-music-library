@@ -3877,7 +3877,7 @@ class TestConversionJobs:
         database = self._db(tmp_path)
         with database._connection() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version == Database.LATEST_SCHEMA_VERSION == 9
+            assert version == Database.LATEST_SCHEMA_VERSION
             # Table must actually exist and be queryable, not just declared.
             conn.execute("SELECT * FROM conversion_jobs LIMIT 0")
             columns = [r[1] for r in conn.execute("PRAGMA table_info(conversion_jobs)")]
@@ -4086,4 +4086,5 @@ class TestUnknownBitrateMigration:
         # A legacy 0 was ingest's stand-in for "ffprobe reported nothing".
         assert rows == {"zero": None, "known": 320.0, "unknown": None}
         assert revisions_after == revisions_before  # no spurious "changed" flags
-        assert version == 9
+        # The ladder continues past v9 to the latest schema.
+        assert version == Database.LATEST_SCHEMA_VERSION

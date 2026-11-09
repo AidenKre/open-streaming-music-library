@@ -23,6 +23,7 @@ import 'package:frontend/services/local_reset_service.dart';
 
 class _ResetAudioCoordinator extends AudioCoordinator {
   int stopCalls = 0;
+  int quiesceCalls = 0;
 
   @override
   AudioState build() => const AudioState();
@@ -32,6 +33,9 @@ class _ResetAudioCoordinator extends AudioCoordinator {
     stopCalls++;
     state = const AudioState();
   }
+
+  @override
+  Future<void> quiesce() async => quiesceCalls++;
 }
 
 class _StubOffline extends OfflineModeNotifier {
@@ -169,7 +173,9 @@ void main() {
 
       await container.read(localResetServiceProvider).reset();
 
-      expect(audio.stopCalls, 1);
+      // SC-15: playback is quiesced (the first participant), not wiped.
+      expect(audio.quiesceCalls, 1);
+      expect(audio.stopCalls, 0);
       // Reset deliberately does NOT publish a `true → false` offline
       // transition — that would fire the app-level recovery listener (sync,
       // resume downloads) against state mid-wipe. The notifier itself is
@@ -234,12 +240,20 @@ void main() {
         registered.any((r) => r is CoverArtCacheManager),
         isTrue,
       );
-      // 4 direct + 4 adapters = 8 reset steps total.
-      expect(registered.length, 8);
+      // 4 direct + 3 adapters = 7 reset steps total (playback is a quiesce
+      // participant, not a wipe step).
+      expect(registered.length, 7);
     });
   });
 
   group('LocalResetService priority ordering', () {
+    // SC-15: every reset fences first (deletes the binding row), so each
+    // container needs a database even when the wipe steps are fakes; no
+    // quiesce participants (these tests are about the wipe bands).
+    late AppDatabase orderDb;
+    setUp(() => orderDb = AppDatabase(NativeDatabase.memory()));
+    tearDown(() => orderDb.close());
+
     test(
       'runs resettables in strict descending priority order regardless of '
       'registration order',
@@ -259,6 +273,8 @@ void main() {
 
         final container = ProviderContainer(
           overrides: [
+            databaseProvider.overrideWithValue(orderDb),
+            localQuiescablesProvider.overrideWithValue(const []),
             localResettablesProvider.overrideWithValue(registry),
           ],
         );
@@ -285,6 +301,8 @@ void main() {
         final log = <String>[];
         final container = ProviderContainer(
           overrides: [
+            databaseProvider.overrideWithValue(orderDb),
+            localQuiescablesProvider.overrideWithValue(const []),
             localResettablesProvider.overrideWithValue(<LocalResettable>[
               _Recording('first', 100, log),
               _Throwing(50, log),
@@ -317,6 +335,8 @@ void main() {
         final log = <String>[];
         final container = ProviderContainer(
           overrides: [
+            databaseProvider.overrideWithValue(orderDb),
+            localQuiescablesProvider.overrideWithValue(const []),
             localResettablesProvider.overrideWithValue(<LocalResettable>[
               _Throwing(100, log),
               _Recording('middle', 50, log),
@@ -345,6 +365,8 @@ void main() {
         final log = <String>[];
         final container = ProviderContainer(
           overrides: [
+            databaseProvider.overrideWithValue(orderDb),
+            localQuiescablesProvider.overrideWithValue(const []),
             localResettablesProvider.overrideWithValue(<LocalResettable>[
               _Recording('a', 100, log),
               _Recording('b', 50, log),
@@ -363,6 +385,8 @@ void main() {
       final log = <String>[];
       final container = ProviderContainer(
         overrides: [
+          databaseProvider.overrideWithValue(orderDb),
+          localQuiescablesProvider.overrideWithValue(const []),
           localResettablesProvider.overrideWithValue(<LocalResettable>[
             _Recording('a', 50, log),
             _Recording('b', 50, log),

@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.config import settings
+from app.core.instance_lock import acquire_instance_lock
 from app.database import (
     AlbumOrderParameter,
     AlbumRowFilterParameter,
@@ -53,6 +54,7 @@ from app.models import (
 )
 from app.core.media_types import CODEC_MIME, MIME_EXTENSION, is_lossless
 from app.models.edit_fields import EDIT_FIELD_SPECS
+from app.models.api_return_models import ServerInfo
 from app.services.metadata import TagWriteError
 from app.services.track_edit import (
     TrackPatchRequest,
@@ -103,11 +105,13 @@ from app.services.transcoder import SUPPORTED_TARGET_CODECS
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     startup_event()
-    yield
-    shutdown_event()
+    try:
+        yield
+    finally:
+        shutdown_event()
 
 
-# TODO: Implement locking so that only one uvicorn worker runs startup sequence. Use fasteners with a locking file.
+# The POSIX instance lock guards startup before migrations; run with --workers 1.
 # TODO: Dependency inject depends on get_database into api endpoints (and make the new function needed for this)
 app = FastAPI(lifespan=lifespan)
 
@@ -144,6 +148,15 @@ def startup_event():
     app.state.track_locks = TrackLocks()
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
+    app.state.instance_lock = acquire_instance_lock(settings.app_data_dir)
+    try:
+        _startup_locked()
+    except BaseException:
+        app.state.instance_lock.release()
+        raise
+
+
+def _startup_locked():
     settings.music_library_dir.mkdir(parents=True, exist_ok=True)
     settings.import_dir.mkdir(parents=True, exist_ok=True)
 
@@ -311,17 +324,22 @@ def startup_event():
 
 
 def shutdown_event():
-    watcher = getattr(app.state, "file_watcher", None)
-    if watcher:
-        watcher.stop_file_watcher()
-    # Conversion ffmpeg runs in its own session (killpg-able), so it would
-    # outlive this process; the job itself is failed by the next startup.
-    orchestrator = getattr(app.state, "conversion_orchestrator", None)
-    if orchestrator:
-        orchestrator.shutdown()
-    coordinator = getattr(app.state, "encoder_coordinator", None)
-    if coordinator:
-        coordinator.shutdown()
+    try:
+        watcher = getattr(app.state, "file_watcher", None)
+        if watcher:
+            watcher.stop_file_watcher()
+        # Conversion ffmpeg runs in its own session (killpg-able), so it would
+        # outlive this process; the job itself is failed by the next startup.
+        orchestrator = getattr(app.state, "conversion_orchestrator", None)
+        if orchestrator:
+            orchestrator.shutdown()
+        coordinator = getattr(app.state, "encoder_coordinator", None)
+        if coordinator:
+            coordinator.shutdown()
+    finally:
+        instance_lock = getattr(app.state, "instance_lock", None)
+        if instance_lock is not None:
+            instance_lock.release()
 
 
 @app.get("/tracks", response_model=GetTracksResponse)
@@ -1099,7 +1117,9 @@ def get_app_info():
         ConversionTargetInfo(codec=codec, is_lossless=is_lossless(codec))
         for codec in sorted(SUPPORTED_TARGET_CODECS & available_encoders)
     ]
+    database: Database = cast(Database, app.state.database)
     return AppInfoResponse(
+        server=ServerInfo(instance_id=database.get_server_instance_id()),
         entities={
             "track": EntityInfo(
                 fields=track_fields, actions=["convert"] if targets else []

@@ -13,8 +13,11 @@ import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/edit_sync_mutex.dart';
+import 'package:frontend/services/local_resettable.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 
 EditWriteMode _parseMode(String wire) =>
     wire == 'db_and_master' ? EditWriteMode.dbAndMaster : EditWriteMode.dbOnly;
@@ -32,18 +35,45 @@ enum EditSavePlan { noChanges, confirmMasterWrite, ready }
 /// The coalescing outbox for track metadata edits. One row per track; an edit
 /// writes optimistically to the local DB and queues here, then flushes via
 /// PATCH — online or on reconnect — through one path.
-class EditOutbox {
+///
+/// Every state write is fenced by the session binding (SC-01 rule 4): a
+/// user-initiated write captures `local_binding_id` when it starts, a flush
+/// uses the token of the verified connection it was sent on, and the write
+/// runs in a transaction that asserts the binding row still carries it. An
+/// answer or edit that outlives a reset (or a re-bind) changes nothing.
+class EditOutbox implements LossReporter {
   EditOutbox({
     required this.db,
     required this.api,
     required this.mutex,
     required this.ref,
-  });
+    ServerBindingRepository? binding,
+  }) : binding = binding ?? ServerBindingRepository(db);
 
   final AppDatabase db;
   final TracksApi api;
   final AsyncMutex mutex;
   final Ref ref;
+  final ServerBindingRepository binding;
+
+  /// The current binding token, captured when a user-initiated write starts
+  /// (before waiting on the mutex). No binding row: refused.
+  Future<String> _captureToken() async {
+    final token = (await binding.current())?.localBindingId;
+    if (token == null) throw BindingFencedException('<no binding>');
+    return token;
+  }
+
+  /// Unresolved edits a reset would discard, by the same definition as the
+  /// pending-edits surface (pending + conflicted + rejected: a rejected edit
+  /// still holds the user's values).
+  @override
+  Future<String?> pendingLossSummary() async {
+    final counts = await db.pendingEditCounts();
+    final n = counts.pending + counts.conflicted + counts.rejected;
+    if (n == 0) return null;
+    return '$n unsent metadata edit${n == 1 ? '' : 's'}';
+  }
 
   /// What a Get info save must do first. A DB-only save with no edited
   /// field is a no-op. [enqueue] monotonically escalates the write mode
@@ -115,10 +145,11 @@ class EditOutbox {
     // An empty edit is still queued when it escalates to a master-file write
     // (re-tag the file from current DB values); only a no-op DB-only edit exits.
     if (edit.isEmpty && writeMode == EditWriteMode.dbOnly) return;
+    final token = await _captureToken();
     // Held under the shared mutex so a concurrent `/changes` pull can't land its
     // blind full-row upsert between the optimistic write and the queue write and
-    // clobber the just-applied edit.
-    await mutex.run(() async {
+    // clobber the just-applied edit. Both writes are one fenced transaction.
+    await mutex.run(() => binding.runFenced(token, () async {
       final existing = await (db.select(db.pendingEdits)
             ..where((t) => t.uuidId.equals(uuidId)))
           .getSingleOrNull();
@@ -180,16 +211,29 @@ class EditOutbox {
               updatedAt: Value(DateTime.now().millisecondsSinceEpoch),
             ),
           );
-    });
+    }));
   }
 
-  /// Flush all pending rows. Held under the shared mutex so a `/changes` pull
-  /// cannot interleave (and clobber an in-flight edit).
-  Future<void> flush() => mutex.run(flushLocked);
+  /// Flush all pending rows. Waits for a verified connection first (SC-01
+  /// rule 1) WITHOUT holding the edit mutex, so a blocked server can't
+  /// freeze editing; then flushes under the shared mutex so a `/changes`
+  /// pull cannot interleave (and clobber an in-flight edit).
+  Future<void> flush() async {
+    if (ref.read(offlineModeProvider)) return;
+    final String token;
+    try {
+      token = await ref.read(serverBindingGateProvider).awaitVerified();
+    } on BindingGateClosedException {
+      return;
+    }
+    await mutex.run(() => flushLocked(bindingToken: token));
+  }
 
   /// Flush variant for callers that already hold the mutex (the sync pull path,
-  /// which flushes-then-pulls in one critical section).
-  Future<void> flushLocked() async {
+  /// which flushes-then-pulls in one critical section). Every write a
+  /// response causes is fenced by [bindingToken], the verified connection's
+  /// binding token.
+  Future<void> flushLocked({required String bindingToken}) async {
     if (ref.read(offlineModeProvider)) return;
     final rows = await (db.select(db.pendingEdits)
           ..where((t) => t.status.equals('pending')))
@@ -199,7 +243,7 @@ class EditOutbox {
     // rather than paying one round trip per row sequentially.
     await Future.wait(rows.map((row) async {
       try {
-        await _flushOne(row);
+        await _flushOne(row, bindingToken);
       } catch (e) {
         // Network error / unexpected 5xx after retries: leave this row pending
         // and move on, so one stuck track can't block the rest of the outbox.
@@ -208,7 +252,7 @@ class EditOutbox {
     }));
   }
 
-  Future<void> _flushOne(PendingEdit row) async {
+  Future<void> _flushOne(PendingEdit row, String bindingToken) async {
     final values = (jsonDecode(row.valuesJson) as Map).cast<String, dynamic>();
     final body = <String, dynamic>{
       ...values,
@@ -222,19 +266,22 @@ class EditOutbox {
       // value (which would 409 against this client's own edit), then drop the
       // row. This path holds the shared mutex, so the write can't race a pull.
       final newRevision = resp['revision'];
-      if (newRevision is int) {
-        // A 200 means the server held exactly `base_revision` right before
-        // this edit (anything else 409s), so a download current as of that
-        // revision differs from server truth only by this user's own edit --
-        // carry it forward rather than flag the user's own save as a stale
-        // download. Server-originated changes never pass through here.
-        await db.recordOwnEditRevision(
-          row.uuidId,
-          newRevision,
-          currentAsOf: row.baseRevision,
-        );
-      }
-      await _delete(row.uuidId);
+      await binding.runFenced(bindingToken, () async {
+        if (newRevision is int) {
+          // A 200 means the server held exactly `base_revision` right before
+          // this edit (anything else 409s), so a download current as of that
+          // revision differs from server truth only by this user's own edit
+          // -- carry it forward rather than flag the user's own save as a
+          // stale download. Server-originated changes never pass through
+          // here.
+          await db.recordOwnEditRevision(
+            row.uuidId,
+            newRevision,
+            currentAsOf: row.baseRevision,
+          );
+        }
+        await _delete(row.uuidId);
+      });
     } on ApiException catch (e) {
       switch (e.statusCode) {
         case 409:
@@ -244,13 +291,16 @@ class EditOutbox {
           // if every field this batch touched already holds our value, the
           // edit IS applied: reconcile and drop the row instead of prompting
           // the user to resolve a conflict against their own values.
-          if (await _resolveIfAlreadyApplied(row)) return;
-          await (db.update(db.pendingEdits)
-                ..where((t) => t.uuidId.equals(row.uuidId)))
-              .write(PendingEditsCompanion(
-            status: const Value('conflicted'),
-            serverRevision: Value(_serverRevisionFrom(e)),
-          ));
+          if (await _resolveIfAlreadyApplied(row, bindingToken)) return;
+          await binding.runFenced(
+            bindingToken,
+            () => (db.update(db.pendingEdits)
+                  ..where((t) => t.uuidId.equals(row.uuidId)))
+                .write(PendingEditsCompanion(
+              status: const Value('conflicted'),
+              serverRevision: Value(_serverRevisionFrom(e)),
+            )),
+          );
         case 404:
         case 410:
           // Track gone server-side: revert the (guarded) optimistic write and
@@ -258,16 +308,23 @@ class EditOutbox {
           // save silently un-happening needs a surface. The stale local track
           // itself is removed by the next `/changes` pull (the delete
           // tombstone carries a revision above the watermark).
-          await _revertToSnapshot(row);
-          await _markRejected(row.uuidId, 'Track no longer exists on the server');
+          await binding.runFenced(bindingToken, () async {
+            await _revertToSnapshot(row);
+            await _markRejected(
+              row.uuidId,
+              'Track no longer exists on the server',
+            );
+          });
         case 422:
           // Permanent rejection (capability drift / locked field / validation):
           // revert the optimistic write to the pre-edit snapshot so the local
           // DB doesn't keep a value the server refused, refresh caps, and keep
           // the row as a visible rejection until the user dismisses it.
-          await _revertToSnapshot(row);
+          await binding.runFenced(bindingToken, () async {
+            await _revertToSnapshot(row);
+            await _markRejected(row.uuidId, _rejectionReasonFrom(e));
+          });
           ref.invalidate(appInfoProvider);
-          await _markRejected(row.uuidId, _rejectionReasonFrom(e));
         default:
           rethrow; // 5xx etc. — retry later
       }
@@ -279,7 +336,10 @@ class EditOutbox {
   /// transport retry) or a value-identical concurrent edit. The local base
   /// revision is raised to the server's and the row dropped. Best-effort: any
   /// refetch failure returns false and the normal conflict path proceeds.
-  Future<bool> _resolveIfAlreadyApplied(PendingEdit row) async {
+  Future<bool> _resolveIfAlreadyApplied(
+    PendingEdit row,
+    String bindingToken,
+  ) async {
     final ClientTrackDto dto;
     try {
       dto = await api.getTrack(row.uuidId);
@@ -323,15 +383,17 @@ class EditOutbox {
     // while no `/changes` pull has applied anything since the edit's base: a
     // pull could already have overwritten it with server truth (e.g. a
     // conversion), which would then trivially "match" the server.
-    final localRevision = await _localRevision(row.uuidId);
-    final carryForward = localRevision == row.baseRevision &&
-        await _audioAndArtUnchanged(row.uuidId, dto);
-    await db.recordOwnEditRevision(
-      row.uuidId,
-      dto.revision,
-      currentAsOf: carryForward ? row.baseRevision : null,
-    );
-    await _delete(row.uuidId);
+    await binding.runFenced(bindingToken, () async {
+      final localRevision = await _localRevision(row.uuidId);
+      final carryForward = localRevision == row.baseRevision &&
+          await _audioAndArtUnchanged(row.uuidId, dto);
+      await db.recordOwnEditRevision(
+        row.uuidId,
+        dto.revision,
+        currentAsOf: carryForward ? row.baseRevision : null,
+      );
+      await _delete(row.uuidId);
+    });
     developer.log('409 was our own applied edit — resolved: ${row.uuidId}',
         name: 'EditOutbox');
     return true;
@@ -386,9 +448,10 @@ class EditOutbox {
 
   /// "Keep my edit": rebase onto the server's current revision and re-queue.
   Future<void> resolveKeepMine(String uuidId) async {
+    final token = await _captureToken();
     // Held under the shared mutex so this read-modify-write can't race a
     // concurrent enqueue() reading stale (pre-rebase) row state.
-    final rebased = await mutex.run(() async {
+    final rebased = await mutex.run(() => binding.runFenced(token, () async {
       final row = await (db.select(db.pendingEdits)
             ..where((t) => t.uuidId.equals(uuidId))
             ..where((t) => t.status.equals('conflicted')))
@@ -401,7 +464,7 @@ class EditOutbox {
         serverRevision: const Value(null),
       ));
       return true;
-    });
+    }));
     if (rebased) await flush();
   }
 
@@ -422,12 +485,17 @@ class EditOutbox {
     // concurrent enqueue() reading the pre-marker row state — otherwise a
     // fresh edit could coalesce onto the just-discarded batch before this
     // write lands, silently undoing the "take server" choice.
+    final token = await _captureToken();
     await mutex.run(
-      () => (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
-          .write(const PendingEditsCompanion(
-        status: Value('take_server'),
-        serverRevision: Value(null),
-      )),
+      () => binding.runFenced(
+        token,
+        () => (db.update(db.pendingEdits)
+              ..where((t) => t.uuidId.equals(uuidId)))
+            .write(const PendingEditsCompanion(
+          status: Value('take_server'),
+          serverRevision: Value(null),
+        )),
+      ),
     );
     await _refetchTakeServer(uuidId);
   }
@@ -440,6 +508,10 @@ class EditOutbox {
     String uuidId, {
     bool rebuildParentFts = true,
   }) async {
+    // The reap is fenced by the binding the refetch started under; a reset
+    // in between makes it a no-op (swallowed: nothing left to reap).
+    final token = (await binding.current())?.localBindingId;
+    if (token == null) return;
     final refreshed = await ref
         .read(trackSyncProvider.notifier)
         .refreshTrack(uuidId, rebuildParentFts: rebuildParentFts);
@@ -448,12 +520,19 @@ class EditOutbox {
     // a re-edit queued behind the refetch replaces the row with a fresh
     // pending batch that must survive (deleting it would silently discard a
     // save the user was already told succeeded).
-    await mutex.run(
-      () => (db.delete(db.pendingEdits)
-            ..where((t) => t.uuidId.equals(uuidId))
-            ..where((t) => t.status.equals('take_server')))
-          .go(),
-    );
+    try {
+      await mutex.run(
+        () => binding.runFenced(
+          token,
+          () => (db.delete(db.pendingEdits)
+                ..where((t) => t.uuidId.equals(uuidId))
+                ..where((t) => t.status.equals('take_server')))
+              .go(),
+        ),
+      );
+    } on BindingFencedException {
+      // Reset (or re-bind) since the refetch started: leave the new store be.
+    }
   }
 
   /// Finish take-server resolutions whose refetch couldn't run when the user
@@ -490,13 +569,16 @@ class EditOutbox {
   /// `detail` FastAPI sends for domain rejections like an empty-track edit);
   /// generic fallback for shapes we can't parse (pydantic's list detail).
   String _rejectionReasonFrom(ApiException e) {
-    final detail = _parseErrorBody(e)?['detail'];
-    if (detail is String && detail.isNotEmpty) return detail;
+    final detail = e.hasStringDetail ? e.detailMessage : null;
+    if (detail != null) return detail;
     return 'Rejected by the server (invalid or locked field)';
   }
 
   /// Dismiss a rejected edit from the banner/sheet.
-  Future<void> dismissRejected(String uuidId) => _delete(uuidId);
+  Future<void> dismissRejected(String uuidId) async {
+    final token = await _captureToken();
+    await binding.runFenced(token, () => _delete(uuidId));
+  }
 
   Stream<List<PendingEdit>> watchConflicts() {
     return (db.select(db.pendingEdits)
@@ -514,20 +596,8 @@ class EditOutbox {
       (db.delete(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId))).go();
 
   int? _serverRevisionFrom(ApiException e) {
-    final detail = _parseErrorBody(e)?['detail'];
-    final rev = detail is Map ? detail['current_revision'] : null;
+    final rev = e.details?['current_revision'];
     return rev is int ? rev : null;
-  }
-
-  /// Decodes `e.message` as a JSON object, or null if it isn't valid JSON /
-  /// isn't a JSON object.
-  Map<String, dynamic>? _parseErrorBody(ApiException e) {
-    try {
-      final body = jsonDecode(e.message);
-      return body is Map ? body.cast<String, dynamic>() : null;
-    } catch (_) {
-      return null;
-    }
   }
 }
 
@@ -537,6 +607,7 @@ final editOutboxProvider = Provider<EditOutbox>((ref) {
     api: ref.read(tracksApiProvider),
     mutex: ref.read(editSyncMutexProvider),
     ref: ref,
+    binding: ref.read(serverBindingRepositoryProvider),
   );
 });
 

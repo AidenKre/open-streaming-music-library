@@ -30,3 +30,20 @@ class ResetPriority {
   static const clearPreferences = 10;
   static const clearTransport = 0;
 }
+
+/// SC-15 step 2 participant: stops timers, cancels network work and settles
+/// in-flight DB work when a reset starts (after the fence). Registered in
+/// `localQuiescablesProvider`; best effort, bounded by a timeout.
+abstract interface class Quiescable {
+  /// Names the participant in reset diagnostics.
+  String get quiesceName;
+
+  Future<void> quiesce();
+}
+
+/// Contributes a line to the Disconnect confirmation's "will be lost" copy
+/// (SC-15), or null when it has nothing pending. Registered in
+/// `lossReportersProvider`.
+abstract interface class LossReporter {
+  Future<String?> pendingLossSummary();
+}

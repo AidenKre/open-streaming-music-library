@@ -7,6 +7,7 @@ import 'package:frontend/repositories/collection_ordering.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
 import '../ui/browse_harness.dart';
+import '../helpers/server_binding.dart';
 
 /// Ordering primitives shared by the browse watch queries and the queue
 /// insert (real in-memory SQLite). Expected orders are written out by hand,
@@ -14,7 +15,10 @@ import '../ui/browse_harness.dart';
 void main() {
   late AppDatabase db;
 
-  setUp(() => db = AppDatabase(NativeDatabase.memory()));
+  setUp(() async {
+    db = AppDatabase(NativeDatabase.memory());
+    await seedTestBinding(db); // SC-01: queue writes are fenced
+  });
   tearDown(() => db.close());
 
   group('track ORDER BY: nullsAs and caseInsensitive', () {

@@ -9,6 +9,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/quality_presets.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 
 /// Whether a stream quality change is persistent or session-only.
 enum QualityChangeKind { full, temporary }
@@ -167,9 +168,13 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
   }
 
   /// Fetches the authoritative stream quality from the backend and folds it
-  /// into [local], returning the merged settings. On any failure (no URL,
-  /// offline, timeout, network error, invalid response), returns [local]
-  /// unchanged. Persists the fetched value so offline restarts use it.
+  /// into [local], returning the merged settings. Like every network runner
+  /// it first awaits a verified connection (SC-01 rule 1), so it never asks
+  /// (or adopts a setting from) a server the binding hasn't verified; only
+  /// this background reconcile waits, `build()` already returned [local].
+  /// On any failure (no URL, offline, gate closed, timeout, network error,
+  /// invalid response), returns [local] unchanged. Persists the fetched
+  /// value so offline restarts use it.
   Future<AppSettings> _syncQualityFromBackend(
     AppSettings local,
     SharedPreferences prefs,
@@ -179,6 +184,8 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     // SharedPreferences remains in effect; next online startup will refresh.
     if (ref.read(offlineModeProvider)) return local;
     try {
+      await ref.read(serverBindingGateProvider).awaitVerified();
+      if (!ref.mounted || ref.read(offlineModeProvider)) return local;
       // Single-attempt policy bounded by backendSyncTimeout: a slow or
       // unreachable backend must not strand the reconcile forever, and
       // exhaustion still goes through the offline hook so a real outage
@@ -289,6 +296,14 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 
 final settingsProvider =
     AsyncNotifierProvider<SettingsNotifier, AppSettings>(SettingsNotifier.new);
+
+/// Whether the server-side quality settings (stream/download quality) can be
+/// changed now. They round-trip through the backend, which pre-transcodes;
+/// offline the PUT would retry and fail. The rule lives here (D29); the
+/// Settings rows only show it.
+final canChangeServerQualityProvider = Provider<bool>(
+  (ref) => !ref.watch(offlineModeProvider),
+);
 
 /// Synchronous read of the current effective stream quality (temporary takes
 /// precedence over persisted). Falls back to `original` only while the

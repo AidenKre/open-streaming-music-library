@@ -12,6 +12,11 @@ class FakeSessionControls extends ChangeNotifier implements SessionControls {
   String? connectError;
   @override
   LocalResetException? resetFailure;
+  @override
+  String? pendingServerSwitch;
+  List<String> lossSummaries = const [];
+  @override
+  bool serverBlocked = false;
   final Future<void> Function()? onDisconnect;
   final calls = <String>[];
 
@@ -34,6 +39,37 @@ class FakeSessionControls extends ChangeNotifier implements SessionControls {
 
   @override
   void acknowledgeReset() => calls.add('acknowledgeReset');
+
+  /// A login found a different server at [url] (SC-01 rule 1).
+  void askServerSwitch(String? url) {
+    pendingServerSwitch = url;
+    notifyListeners();
+  }
+
+  @override
+  Future<void> confirmServerSwitch() async {
+    calls.add('confirmServerSwitch');
+    pendingServerSwitch = null;
+    notifyListeners();
+  }
+
+  @override
+  void cancelServerSwitch() {
+    calls.add('cancelServerSwitch');
+    pendingServerSwitch = null;
+    notifyListeners();
+  }
+
+  @override
+  Future<List<String>> pendingLossSummaries() async => lossSummaries;
+
+  void setBlocked(bool blocked) {
+    serverBlocked = blocked;
+    notifyListeners();
+  }
+
+  @override
+  Future<void> resetBlockedServer() async => calls.add('resetBlockedServer');
 
   @override
   Future<void> onSessionActivated() async => calls.add('activated');

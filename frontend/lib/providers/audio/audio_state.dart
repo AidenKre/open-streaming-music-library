@@ -110,3 +110,11 @@ class AudioState {
     );
   }
 }
+
+/// SC-27 lifecycle axis: does the playback runtime accept work?
+/// Independent of the desired transport and the processing state.
+///  * [none]: no live session yet (commands still run as before).
+///  * [active]: the session is ready.
+///  * [stopping]: a quiesce closed admission; admitted work is settling.
+///  * [quiesced]: terminal; the instance is discarded by the scope rebuild.
+enum PlaybackLifecycle { none, active, stopping, quiesced }
