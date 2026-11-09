@@ -98,6 +98,14 @@ class BrowseRepository {
     );
   }
 
+  /// Live list of downloads that failed to play although their file exists
+  /// (Phase 5 decision 6).
+  Stream<List<TrackUI>> watchDamagedDownloads() {
+    return _db.watchDamagedDownloads().map(
+      (rows) => rows.map(TrackUI.fromQueryRow).toList(growable: false),
+    );
+  }
+
   // ── Track loading for queue operations ──────────────────────────────────
 
   /// The current state of a single track, or null if it no longer exists.
@@ -203,6 +211,7 @@ class BrowseRepository {
         downloadedAtRevision: s.downloadedAtRevision,
         downloadedCodec: s.downloadedCodec,
         staleDismissedAtRevision: s.staleDismissedAtRevision,
+        damagedFilePath: s.damagedFilePath,
       );
     }).toList(growable: false);
   }

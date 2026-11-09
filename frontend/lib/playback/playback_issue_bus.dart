@@ -31,9 +31,21 @@ final class LocalFileMissing extends PlaybackIssue {
   String toString() => 'LocalFileMissing($trackUuid, $path)';
 }
 
-/// How a source failure was classified (SC-27 §2.9). Only
-/// [missingLocalFile] and [gone] are confirmed; only they auto-skip.
-enum SourceFailureKind { missingLocalFile, gone, transient, unknown }
+/// How a source failure was classified (SC-27 §2.9). [missingLocalFile],
+/// [damagedLocalFile] and [gone] are confirmed and recovered (a stream
+/// fallback online, a skip offline; gone always skips). A transient stream
+/// failure is skipped only offline (decision 1); unknown never skips.
+enum SourceFailureKind {
+  missingLocalFile,
+
+  /// The recorded download is on disk but failed to play (decision 6). Not
+  /// yet proof of damage (review major 1): online it streams and is marked
+  /// damaged only once that stream plays; offline it is skipped, unmarked.
+  damagedLocalFile,
+  gone,
+  transient,
+  unknown,
+}
 
 /// A source failed to load or play, after classification.
 final class PlaybackSourceFailed extends PlaybackIssue {
@@ -46,16 +58,6 @@ final class PlaybackSourceFailed extends PlaybackIssue {
 
   @override
   String toString() => 'PlaybackSourceFailed($trackUuid, $kind, $errorCode)';
-}
-
-/// Recovery skipped through every item of a failure run without playing
-/// one; playback stopped instead of looping.
-final class PlaybackRecoveryExhausted extends PlaybackIssue {
-  const PlaybackRecoveryExhausted(this.sessionId);
-  final int sessionId;
-
-  @override
-  String toString() => 'PlaybackRecoveryExhausted($sessionId)';
 }
 
 /// An internal playback task failed (its error sink, SC-27 invariant 13).

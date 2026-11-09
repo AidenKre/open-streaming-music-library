@@ -8,6 +8,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_focus.dart';
 import 'package:frontend/playback/audio_state.dart';
+import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_engine.dart';
 import 'package:frontend/playback/queue_window.dart';
 import 'package:frontend/playback/source_failure_classifier.dart';
@@ -79,6 +80,7 @@ class QueuePlayer extends Notifier<AudioState>
   late Clock _clock;
   late PlaybackIssueBus _issues;
   late SourceFailureClassifier _classifier;
+  late LocalSourcePolicy _localSources;
 
   /// Monotonic time since the last throttled cursor save (SC-20).
   MonotonicStopwatch? _sinceCursorSave;
@@ -94,7 +96,14 @@ class QueuePlayer extends Notifier<AudioState>
     _clock = ref.read(clockProvider);
     _issues = ref.read(playbackIssueBusProvider);
     _classifier = ref.read(sourceFailureClassifierProvider);
+    _localSources = ref.read(localSourcePolicyProvider);
     _focus.bind(AudioOutput.queue, this);
+
+    // Decision 1 (5B.0d M2): a stream that failed transiently while online
+    // is rescued under the offline policy once the app knows it is offline.
+    ref.listen<bool>(offlineModeProvider, (previous, offline) {
+      if (previous == false && offline) _rescueStreamFailureOffline();
+    });
 
     // Push stream quality changes into the player so newly-built sources use
     // the user's current preset. The very first fire happens during build() —
@@ -165,6 +174,7 @@ class QueuePlayer extends Notifier<AudioState>
         () => _onSourceFailure(
               itemId: failure.source?.itemId,
               trackUuid: failure.source?.trackUuid,
+              sourcePath: failure.source?.localPath,
               sourceKey: failure.source?.sourceId,
               uncertain: failure.uncertain,
               errorCode: failure.errorCode,
@@ -875,6 +885,7 @@ class QueuePlayer extends Notifier<AudioState>
       revision: _player.playlistRevision,
       itemId: currentItem.itemId,
       trackUuid: currentTrack.track.uuidId,
+      sourcePath: _seededPath(seedEntries, currentItem.itemId),
     );
 
     _window.replaceWindow(
@@ -939,6 +950,19 @@ class QueuePlayer extends Notifier<AudioState>
     } catch (error, stackTrace) {
       // Callers never depend on it: the next resume reconciles again.
       developer.log('Reconciling a missing download failed',
+          name: 'QueuePlayer', error: error, stackTrace: stackTrace);
+    }
+  }
+
+  Future<void> _markDamagedDownload(String trackUuid, String path) async {
+    if (!ref.mounted) return;
+    try {
+      await ref
+          .read(downloadReconciliationServiceProvider)
+          .markDamaged(trackUuid, path);
+    } catch (error, stackTrace) {
+      // The recovery still streams or skips; the next failure marks it.
+      developer.log('Marking a damaged download failed',
           name: 'QueuePlayer', error: error, stackTrace: stackTrace);
     }
   }
@@ -1147,8 +1171,9 @@ class QueuePlayer extends Notifier<AudioState>
   /// rebased around [entry] instead of gaining a distant range, so a
   /// natural advance can never skip positions.
   Future<void> _ensureItemLoaded(int sessionId, QueuePlaybackEntry entry,
-      {PlaybackTransitionCause cause = PlaybackTransitionCause.userSkip}) async {
-    if (_player.hasItem(entry.itemId)) return;
+      {PlaybackTransitionCause cause = PlaybackTransitionCause.userSkip,
+      bool reseed = false}) async {
+    if (!reseed && _player.hasItem(entry.itemId)) return;
     final entries =
         await _window.seedEntriesForPlayPosition(sessionId, entry.playPosition);
     if (entries.isEmpty) return;
@@ -1158,6 +1183,7 @@ class QueuePlayer extends Notifier<AudioState>
       revision: _player.playlistRevision,
       itemId: entry.itemId,
       trackUuid: entry.uuidId,
+      sourcePath: _seededPath(entries, entry.itemId),
     );
     _window.replaceWindow(
       start: entries.first.playPosition,
@@ -1312,15 +1338,58 @@ class QueuePlayer extends Notifier<AudioState>
   final Set<int> _failedItems = {};
   bool _recoveryExhausted = false;
 
+  /// The current item's stream failed transiently while online: going
+  /// offline skips it (decision 1). Part of the failure run.
+  ({int sessionId, int itemId})? _transientStreamFailure;
+
   /// The latest seed: its playlist revision (its load events carry it) and
   /// the item it seeded, which is what a failed load is about (the
   /// published state may not have caught up yet after a rebase).
-  ({int revision, int itemId, String trackUuid})? _seed;
+  ({int revision, int itemId, String trackUuid, String? sourcePath})? _seed;
+
+  /// A download that failed to play online and now streams, waiting for
+  /// evidence before it is marked damaged (review major 1): the stream of
+  /// the same item playing shows the device can play audio, so the file is
+  /// at fault. Anything else (the stream fails too, the user moves on, a new
+  /// session) drops the suspicion without a mark, so a platform failure can
+  /// never mark downloads. Offline nothing is suspected or marked.
+  ({int sessionId, int itemId, String trackUuid, String path})?
+      _damageEvidence;
+
+  void _dropDamageEvidence() {
+    final evidence = _damageEvidence;
+    if (evidence == null) return;
+    _damageEvidence = null;
+    _localSources.clearSuspect(evidence.trackUuid, evidence.path);
+  }
+
+  /// The local file the engine seeds [itemId] from (it plays a recorded
+  /// download), or null for a stream.
+  String? _seededPath(List<QueuePlaybackEntry> entries, int itemId) {
+    final entry = entries.where((e) => e.itemId == itemId).firstOrNull;
+    return entry == null ? null : _localSources.localPathFor(entry);
+  }
 
   void _resetFailureRun() {
+    _dropDamageEvidence();
     _attemptedSources.clear();
     _failedItems.clear();
     _recoveryExhausted = false;
+    _transientStreamFailure = null;
+  }
+
+  void _rescueStreamFailureOffline() {
+    final failure = _transientStreamFailure;
+    if (failure == null) return;
+    _transientStreamFailure = null;
+    _runTask('offline stream rescue', () async {
+      if (state.queue.sessionId != failure.sessionId ||
+          state.queue.currentItemId != failure.itemId ||
+          _recoveryExhausted) {
+        return; // the decision is stale
+      }
+      await _skipFailedItem(failure.sessionId, failure.itemId);
+    });
   }
 
   void _onLoadEvent(EngineLoadEvent event) {
@@ -1331,9 +1400,11 @@ class QueuePlayer extends Notifier<AudioState>
     if (seed == null || event.playlistRevision != seed.revision) return;
     final itemId = seed.itemId;
     final trackUuid = seed.trackUuid;
+    final sourcePath = seed.sourcePath;
     _offLaneTask('load failure', () => _onSourceFailure(
           itemId: itemId,
           trackUuid: trackUuid,
+          sourcePath: sourcePath,
           sourceKey: -event.playlistRevision,
           uncertain: false,
           errorCode: event.errorCode,
@@ -1343,14 +1414,20 @@ class QueuePlayer extends Notifier<AudioState>
 
   /// Classifies a failed source off the lane (the check may wait on the
   /// network; pause, stop and focus loss must not), then applies the
-  /// recovery in the lane only if the same item is still current. A confirmed
-  /// missing file falls back to the stream online (never the same missing
-  /// URI) or is skipped offline; a confirmed gone track is skipped;
-  /// transient and unknown failures never skip. A failure run that would
-  /// return to an item it already skipped stops instead of looping.
+  /// recovery in the lane only if the same item is still current. It is
+  /// classified by what the failing source loaded ([sourcePath]: its local
+  /// file, null for a stream), not the catalog's current path, which may
+  /// have changed since (a download committed meanwhile). A confirmed
+  /// missing or damaged file (the damaged one is kept, decision 6) falls
+  /// back to the stream online (never the same missing URI) or is skipped
+  /// offline; a confirmed gone track is skipped; a transient stream failure
+  /// is skipped offline (now, or once the app goes offline); other transient
+  /// and unknown failures never skip. A failure run that would return to an
+  /// item it already skipped stops instead of looping.
   Future<void> _onSourceFailure({
     required int? itemId,
     required String? trackUuid,
+    required String? sourcePath,
     required int? sourceKey,
     required bool uncertain,
     int? errorCode,
@@ -1365,6 +1442,15 @@ class QueuePlayer extends Notifier<AudioState>
     }
     // A source reported again is not classified (or probed) again.
     if (sourceKey != null && !_attemptedSources.add(sourceKey)) return;
+    // The stream standing in for a suspected download failed too: there is
+    // no evidence against the file (major 1).
+    final evidence = _damageEvidence;
+    if (evidence != null &&
+        sourcePath == null &&
+        evidence.sessionId == sessionId &&
+        evidence.itemId == itemId) {
+      _dropDamageEvidence();
+    }
     // The entry joins the catalog: a tombstoned track has none, but the
     // failing source's identity still names it.
     final entry = await _queueRepo.getPlaybackEntryForItem(sessionId, itemId);
@@ -1372,16 +1458,51 @@ class QueuePlayer extends Notifier<AudioState>
     if (uuid == null) return;
     final kind = await _classifier.classify(
         trackUuid: uuid,
-        filePath: entry?.filePath,
+        filePath: sourcePath,
         uncertain: false);
     if (kind == SourceFailureKind.missingLocalFile) {
       // The catalog stops claiming the download, so every later rebuild
       // (rebase, refresh, reseed) loads the stream, and a later failure is
-      // classified as a stream failure.
-      await reportIssues([LocalFileMissing(uuid, entry!.filePath!)]);
+      // classified as a stream failure. (Only that path: a newer download
+      // is kept.)
+      await reportIssues([LocalFileMissing(uuid, sourcePath!)]);
+    } else if (kind == SourceFailureKind.damagedLocalFile && !_isOffline) {
+      // A present download that failed (decision 6) is only suspected
+      // (major 1): it streams (the recovery below) and is marked damaged
+      // once that stream plays. Offline it is skipped and never marked: a
+      // platform failure there would else mark every download in the run.
+      _dropDamageEvidence();
+      _localSources.suspect(uuid, sourcePath!);
+      _damageEvidence = (
+        sessionId: sessionId,
+        itemId: itemId,
+        trackUuid: uuid,
+        path: sourcePath,
+      );
     }
     _issues.publish(PlaybackSourceFailed(uuid, kind,
         errorCode: errorCode, errorMessage: errorMessage));
+    // A stream (no recorded download) that fails transiently: offline, it is
+    // unavailable like any streaming item and is skipped to the next
+    // downloaded one (decision 1); online it never skips, but going offline
+    // later still rescues it. The classifier's own track check may be what
+    // took the app offline, so offline is read after classifying.
+    final streamed = sourcePath == null;
+    if (kind == SourceFailureKind.transient && streamed) {
+      if (_isOffline) {
+        _runTask('source recovery', () async {
+          if (state.queue.sessionId != sessionId ||
+              state.queue.currentItemId != itemId ||
+              _recoveryExhausted) {
+            return; // the decision is stale
+          }
+          await _skipFailedItem(sessionId, itemId);
+        });
+      } else {
+        _transientStreamFailure = (sessionId: sessionId, itemId: itemId);
+      }
+      return;
+    }
     if (kind == SourceFailureKind.transient ||
         kind == SourceFailureKind.unknown) {
       return;
@@ -1402,18 +1523,25 @@ class QueuePlayer extends Notifier<AudioState>
       case SourceFailureKind.transient:
       case SourceFailureKind.unknown:
         return;
-      case SourceFailureKind.missingLocalFile when !_isOffline && entry != null:
+      case SourceFailureKind.missingLocalFile ||
+              SourceFailureKind.damagedLocalFile
+          when !_isOffline && entry != null:
         await _player.refreshLoadedSourcesForAvailabilityChanges([
+          // The stream stand-in: no file, but its codecs, so an "original"
+          // stream of a codec this device can't decode streams transcoded.
           QueuePlaybackEntry(
             itemId: entry.itemId,
             queueType: entry.queueType,
             canonicalPosition: entry.canonicalPosition,
             playPosition: entry.playPosition,
             uuidId: entry.uuidId,
+            downloadedCodec: entry.downloadedCodec,
+            sourceCodec: entry.sourceCodec,
           ),
         ]);
         return;
       case SourceFailureKind.missingLocalFile:
+      case SourceFailureKind.damagedLocalFile:
       case SourceFailureKind.gone:
         await _skipFailedItem(sessionId, itemId);
     }
@@ -1429,18 +1557,51 @@ class QueuePlayer extends Notifier<AudioState>
       _recoveryExhausted = true;
       await _player.stop();
       _setPlayWhenReady(false);
-      _issues.publish(PlaybackRecoveryExhausted(sessionId));
+      // No summary issue (user decision 2026-11-07): each failed item
+      // already published its PlaybackSourceFailed; a future error banner
+      // adds a summary issue only if it needs one.
+      developer.log(
+          target == null
+              ? 'Recovery stopped: no playable item after the failed one'
+              : 'Recovery stopped: every item in the failure run failed',
+          name: 'QueuePlayer');
       return;
     }
+    // Re-seeded, not seeked (live gate 2026-11-07): after a failed load the
+    // plugin sits idle with its platform deactivated, and on macOS a seek
+    // (or a later play) never loads the target. A new seed replaces the
+    // playlist, does not wait behind the failed native work, and loads.
     await _ensureItemLoaded(sessionId, target,
-        cause: PlaybackTransitionCause.naturalAdvance);
-    await _player.seekToItem(target.itemId,
-        cause: PlaybackTransitionCause.naturalAdvance);
+        cause: PlaybackTransitionCause.naturalAdvance, reseed: true);
     if (state.playback.playWhenReady) await _player.play();
+  }
+
+  /// The stream standing in for a suspected download plays: the device
+  /// plays audio, so the file is damaged (major 1). Marked off the lane;
+  /// the suspicion stays until the mark is written, so no rebuild meanwhile
+  /// returns to the file.
+  void _checkDamageEvidence(PlaybackObservation observation) {
+    final evidence = _damageEvidence;
+    final source = observation.source;
+    if (evidence == null ||
+        source == null ||
+        !observation.playing ||
+        observation.processingState != EngineProcessingState.ready ||
+        state.queue.sessionId != evidence.sessionId ||
+        source.itemId != evidence.itemId ||
+        source.localPath != null) {
+      return;
+    }
+    _damageEvidence = null; // confirmed: a reset no longer drops it
+    _offLaneTask('damage mark', () async {
+      await _markDamagedDownload(evidence.trackUuid, evidence.path);
+      _localSources.clearSuspect(evidence.trackUuid, evidence.path);
+    });
   }
 
   void _onObservation(PlaybackObservation observation) {
     if (_stopInProgress || observation.uncertain) return;
+    _checkDamageEvidence(observation);
     final playingItem = observation.source?.itemId;
     if (observation.playing &&
         observation.processingState == EngineProcessingState.ready &&

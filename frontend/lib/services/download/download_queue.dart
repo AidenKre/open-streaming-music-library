@@ -46,6 +46,9 @@ class DownloadJob {
   // fully written and the DB updated atomically. If the replacement fails or
   // is cancelled, the old file and the DB row stay untouched.
   final String? replacesFilePath;
+  // Set when "original" was asked for a codec this device can't decode
+  // (its user-facing name): the job downloads [quality] (AAC) instead.
+  final String? unsupportedCodec;
 
   const DownloadJob({
     required this.uuidId,
@@ -56,6 +59,7 @@ class DownloadJob {
     this.albumId,
     this.artistId,
     this.replacesFilePath,
+    this.unsupportedCodec,
   });
 
   bool get isQueued => status is Queued;
@@ -72,6 +76,7 @@ class DownloadJob {
     quality: quality,
     status: status,
     replacesFilePath: replacesFilePath,
+    unsupportedCodec: unsupportedCodec,
   );
 }
 

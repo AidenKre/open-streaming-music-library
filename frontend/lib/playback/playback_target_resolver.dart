@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_issue_bus.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
@@ -26,11 +27,16 @@ class PlaybackTargetResolution {
 /// event loop.
 class PlaybackTargetResolver {
   PlaybackTargetResolver(this._repository,
-      {Future<bool> Function(String)? fileExists})
-      : _fileExists = fileExists ?? ((path) => File(path).exists());
+      {Future<bool> Function(String)? fileExists,
+      LocalSourcePolicy? localSources})
+      : _fileExists = fileExists ?? ((path) => File(path).exists()),
+        _localSources = localSources ?? LocalSourcePolicy();
 
   final QueueRepository _repository;
   final Future<bool> Function(String) _fileExists;
+
+  /// Whether an entry plays from its download (shared with the engine).
+  final LocalSourcePolicy _localSources;
 
   Future<PlaybackTargetResolution> resolveStart({
     required int sessionId,
@@ -89,8 +95,8 @@ class PlaybackTargetResolver {
 
   Future<PlaybackTarget> _target(
       QueuePlaybackEntry entry, List<PlaybackIssue> issues) async {
-    final path = entry.filePath;
-    if (path != null && path.isNotEmpty) {
+    final path = _localSources.localPathFor(entry);
+    if (path != null) {
       if (await _fileExists(path)) {
         return PlaybackTarget(entry, PlaybackSourceKind.local);
       }

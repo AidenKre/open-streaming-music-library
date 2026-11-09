@@ -88,12 +88,16 @@ class _DownloadTile extends StatelessWidget {
         ? 'Failed: ${status.message}'
         : [artistPart, sizePart].where((s) => s != null && s.isNotEmpty).join(' \u2022 ');
 
+    // "Original" of a codec this device can't play downloads transcoded.
+    final quality = job.unsupportedCodec == null
+        ? job.quality
+        : '${job.quality} (this device can’t play ${job.unsupportedCodec})';
     return ListTile(
       title: Text(job.title ?? job.uuidId, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: subtitle.isEmpty
-          ? Text('Quality: ${job.quality}')
+          ? Text('Quality: $quality')
           : Text(
-              '$subtitle • ${job.quality}',
+              '$subtitle • $quality',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),

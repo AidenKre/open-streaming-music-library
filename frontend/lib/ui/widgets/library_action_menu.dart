@@ -40,7 +40,8 @@ final class LibraryMenuDownload extends LibraryMenuEntry {
 ///
 /// Every entry acts on [scope] through [actions]; enablement comes only from
 /// [availability] (play/queue: `canPlay`; Download: `canDownload`; Delete:
-/// `hasAnyDownloaded`). Navigation entries are the surface's callbacks
+/// `hasAnyDownloaded`; a damaged track download: its re-download and the
+/// Delete of the kept file). Navigation entries are the surface's callbacks
 /// (`library_routes.dart`), shown only when supplied. Surface-specific rows
 /// (Convert, Cancel conversion) come in through [extraActions], last.
 List<LibraryMenuEntry> buildLibraryActionMenu(
@@ -52,6 +53,9 @@ List<LibraryMenuEntry> buildLibraryActionMenu(
   List<LibraryMenuEntry> extraActions = const [],
 }) {
   final isTrack = scope is TrackScope;
+  // Decision 6: a damaged download replaces the Download row with its
+  // re-download and offers the Delete of the kept file.
+  final damaged = scope is TrackScope && scope.track.isDownloadDamaged;
   final canPlay = availability.canPlay;
   return [
     if (onOpenDetail != null)
@@ -78,7 +82,19 @@ List<LibraryMenuEntry> buildLibraryActionMenu(
     ),
     // Download (the missing tracks) and Delete are independent: a partially
     // downloaded collection shows both.
-    if (availability.canDownload)
+    if (damaged) ...[
+      LibraryMenuAction(
+        icon: Icons.report_problem_outlined,
+        label: 'Damaged download: re-download',
+        onSelected:
+            availability.canDownload ? () => actions.download(scope) : null,
+      ),
+      LibraryMenuAction(
+        icon: Icons.delete_outline,
+        label: 'Delete damaged file',
+        onSelected: () => actions.deleteDownloads(scope),
+      ),
+    ] else if (availability.canDownload)
       LibraryMenuDownload(
         onDownload: () => actions.download(scope),
         onDownloadAtQuality: (q) => actions.downloadAtQuality(scope, q),

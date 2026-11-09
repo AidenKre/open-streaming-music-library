@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/ui/get_info_page.dart';
@@ -100,6 +101,49 @@ void main() {
     expect(tester.widget<TrackTile>(find.byType(TrackTile)).isDimmed, isFalse);
     await tester.tap(find.text('Local'));
     expect(tapped, isTrue);
+    await teardownTree(tester);
+  });
+
+  // Review major 1 (user, 2026-11-09): a codec this device can't decode is
+  // shown, and its download doesn't play offline.
+  testWidgets('a download in an undecodable codec says so and is inert '
+      'offline', (tester) async {
+    var tapped = false;
+    final track = tracks['local']!.copyWith(downloadedCodec: 'alac');
+    await tester.pumpWidget(harness.wrap(
+      Scaffold(
+          body: LibraryTrackTile(track: track, onTap: () => tapped = true)),
+      offline: true,
+      overrides: [
+        libraryActionsProvider.overrideWithValue(actions),
+        codecSupportProvider.overrideWithValue(
+            const CodecSupport({AudioCodecFamily.mp3, AudioCodecFamily.aac})),
+      ],
+    ));
+    await tester.pump();
+    expect(find.text('Unsupported codec'), findsOneWidget);
+    expect(tester.widget<TrackTile>(find.byType(TrackTile)).unsupportedCodec,
+        'ALAC');
+    expect(tester.widget<TrackTile>(find.byType(TrackTile)).isInteractive,
+        isFalse);
+    await tester.tap(find.text('Local'));
+    expect(tapped, isFalse);
+    // Still a download: the user can delete it.
+    await tester.tap(find.byIcon(Icons.more_vert));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<ListTile>(find.widgetWithText(ListTile, 'Delete download')).enabled,
+      isTrue,
+    );
+    await teardownTree(tester);
+  });
+
+  testWidgets('a decodable track shows no codec warning', (tester) async {
+    await tester.pumpWidget(host(
+      LibraryTrackTile(track: tracks['local']!, onTap: () {}),
+    ));
+    await tester.pump();
+    expect(find.text('Unsupported codec'), findsNothing);
     await teardownTree(tester);
   });
 

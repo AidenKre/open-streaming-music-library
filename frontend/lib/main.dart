@@ -8,6 +8,7 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_service_bridge.dart';
+import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_lifecycle_service.dart';
@@ -41,11 +42,14 @@ Future<void> main() async {
       androidNotificationOngoing: true,
     ),
   );
+  // Which codecs this device can decode, asked once (review major 1).
+  final codecSupport = await CodecSupport.probe();
   runApp(
     FrontendApp(
       db: db,
       audioHandler: audioHandler,
       coverArtStore: coverArtStore,
+      codecSupport: codecSupport,
     ),
   );
 }
@@ -54,12 +58,14 @@ class FrontendApp extends StatefulWidget {
   final AppDatabase db;
   final AudioServiceBridge audioHandler;
   final LocalCoverArtStore coverArtStore;
+  final CodecSupport codecSupport;
 
   const FrontendApp({
     super.key,
     required this.db,
     required this.audioHandler,
     required this.coverArtStore,
+    this.codecSupport = const CodecSupport.unknown(),
   });
 
   @override
@@ -81,6 +87,7 @@ class _FrontendAppState extends State<FrontendApp> {
         databaseProvider.overrideWithValue(widget.db),
         audioServiceProvider.overrideWithValue(widget.audioHandler),
         localCoverArtStoreProvider.overrideWithValue(widget.coverArtStore),
+        codecSupportProvider.overrideWithValue(widget.codecSupport),
       ],
       child: Frontend(onLocalResetComplete: _resetProviderScope),
     );

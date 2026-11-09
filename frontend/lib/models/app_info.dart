@@ -142,6 +142,14 @@ class AppInfo {
   /// The server's `history` feature block version (SC-03), null when the
   /// server doesn't advertise history sync (an older server, or a malformed
   /// block): local recording continues, the endpoints are not called.
+  ///
+  /// TODO(SC-03): this is the only feature block today, so it is parsed ad
+  /// hoc. When the second one arrives (`uploads` in Phase 7, or
+  /// `library_tools` in Phase 8, whichever lands first), build SC-03's typed
+  /// feature-block parser (`HistoryFeature?`, `UploadsFeature?`, ...;
+  /// unknown blocks absent, unknown fields tolerated) and one provider per
+  /// feature, and move `history` onto it. Do not add a second ad-hoc field
+  /// like this one (user decision 2026-11-07).
   final int? historyVersion;
 
   const AppInfo({

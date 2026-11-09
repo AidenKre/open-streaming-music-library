@@ -130,6 +130,118 @@ void main() {
         unregisterCanceller: () {},
       );
 
+  // Review major 1: a truncated body is never committed (it would only fail
+  // at playback and look damaged).
+  test('a body shorter than Content-Length fails and commits nothing',
+      () async {
+    await _insertTrack(db, 'abc');
+    final downloader = buildDownloader(MockClient.streaming((req, _) async =>
+        http.StreamedResponse(Stream.value([1, 2]), 200, contentLength: 5)));
+    final outcome = await downloader.download(
+      job: _job('abc'),
+      generationCheck: () => true,
+      onProgress: (_) {},
+      registerCanceller: (_) {},
+      unregisterCanceller: () {},
+    );
+    expect(outcome.kind, DownloadOutcomeKind.otherFailure);
+    expect(outcome.errorMessage, contains('2 of 5 bytes'));
+    expect((await _row(db, 'abc')).filePath, isNull);
+    expect(tempDir.listSync(recursive: true).whereType<File>()
+        .where((f) => f.path.contains('abc')), isEmpty,
+        reason: 'the partial file is removed');
+  });
+
+  test('a body of unknown length is accepted', () async {
+    await _insertTrack(db, 'abc');
+    final downloader = buildDownloader(MockClient.streaming((req, _) async =>
+        http.StreamedResponse(Stream.value([1, 2]), 200)));
+    final outcome = await downloader.download(
+      job: _job('abc'),
+      generationCheck: () => true,
+      onProgress: (_) {},
+      registerCanceller: (_) {},
+      unregisterCanceller: () {},
+    );
+    expect(outcome.kind, DownloadOutcomeKind.success);
+  });
+
+  // Decision 6: a new download of a damaged track replaces the damaged file.
+  group('a damaged download', () {
+    test('a new download clears the mark and removes the damaged file',
+        () async {
+      await _insertTrack(db, 'abc');
+      final damaged = File('${tempDir.path}/abc.bad.m4a');
+      await damaged.writeAsBytes([9]);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
+          .write(TracksCompanion(damagedFilePath: Value(damaged.path)));
+      final outcome = await run(
+          buildDownloader(
+              MockClient((_) async => http.Response.bytes([1, 2], 200))),
+          _job('abc'));
+      expect(outcome.kind, DownloadOutcomeKind.success);
+      final row = await _row(db, 'abc');
+      expect(row.damagedFilePath, isNull);
+      expect(File(row.filePath!).existsSync(), isTrue);
+      expect(damaged.existsSync(), isFalse);
+    });
+
+    test('review: a fence right after the commit write still removes the '
+        'damaged copy', () async {
+      await _insertTrack(db, 'abc');
+      // A clean run counts the generation checks; the last one follows the
+      // DB write.
+      var checks = 0;
+      await buildDownloader(
+              MockClient((_) async => http.Response.bytes([1], 200)))
+          .download(
+        job: _job('abc'),
+        generationCheck: () => ++checks > 0,
+        onProgress: (_) {},
+        registerCanceller: (_) {},
+        unregisterCanceller: () {},
+      );
+      final damaged = File('${tempDir.path}/abc.old.flac');
+      await damaged.writeAsBytes([9]);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
+          .write(clearedDownloadColumns.copyWith(
+              damagedFilePath: Value(damaged.path)));
+      var n = 0;
+      final outcome = await buildDownloader(
+              MockClient((_) async => http.Response.bytes([1, 2], 200)))
+          .download(
+        job: _job('abc'),
+        generationCheck: () => ++n < checks, // fenced after the write
+        onProgress: (_) {},
+        registerCanceller: (_) {},
+        unregisterCanceller: () {},
+      );
+      expect(outcome.kind, DownloadOutcomeKind.cancelled);
+      final row = await _row(db, 'abc');
+      expect((row.filePath, row.damagedFilePath), (null, null));
+      expect(damaged.existsSync(), isFalse, reason: 'no orphan left behind');
+    });
+
+    test('a damaged file at the destination path is simply replaced',
+        () async {
+      await _insertTrack(db, 'abc');
+      final first = await run(
+          buildDownloader(MockClient((_) async => http.Response.bytes([1], 200))),
+          _job('abc'));
+      expect(first.kind, DownloadOutcomeKind.success);
+      final path = (await _row(db, 'abc')).filePath!;
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
+          .write(clearedDownloadColumns.copyWith(damagedFilePath: Value(path)));
+      await run(
+          buildDownloader(
+              MockClient((_) async => http.Response.bytes([1, 2, 3], 200))),
+          _job('abc'));
+      final row = await _row(db, 'abc');
+      expect((row.filePath, row.damagedFilePath), (path, null));
+      expect(File(path).lengthSync(), 3, reason: 'the new bytes, kept');
+    });
+  });
+
   group('downloadedAtRevision', () {
     test('uses X-Track-Revision when the server sends it', () async {
       await _insertTrack(db, 'abc', revision: 7, codec: 'flac');

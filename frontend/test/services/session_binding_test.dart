@@ -337,6 +337,91 @@ void main() {
     });
   });
 
+  // Review major 2 (user, 2026-11-09): a reset that never finished its wipe
+  // (the app was killed, or a wipe step failed) is finished at the next
+  // launch or login, before anything binds, so no server adopts the store.
+  group('an interrupted reset', () {
+    ProviderContainer scopeWith(List<LocalResettable> wipe) {
+      final scope = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          serverBindingGateProvider.overrideWithValue(controlled.gate),
+          localQuiescablesProvider.overrideWithValue(const []),
+          localResettablesProvider.overrideWithValue(wipe),
+        ],
+      );
+      addTearDown(scope.dispose);
+      return scope;
+    }
+
+    for (final fenced in [false, true]) {
+      test('is finished at launch before the saved URL binds '
+          '(${fenced ? 'killed after the fence' : 'killed before the fence'})',
+          () async {
+        if (!fenced) {
+          await seedTestBinding(db, baseUrl: 'http://a', instanceId: 'inst-1');
+        }
+        SharedPreferences.setMockInitialValues(
+            {'serverUrl': 'http://a', 'resetPending': true});
+        ApiClient.initForTest('http://a', _health(200));
+        final scope = scopeWith([_ClearPrefs()]);
+        final start =
+            await scope.read(sessionServiceProvider).resumeSavedSession();
+        expect(start.kind, SessionStartKind.resetFinished);
+        expect(await repo().current(), isNull,
+            reason: 'no row for the next server to adopt');
+        final prefs = await SharedPreferences.getInstance();
+        expect(prefs.getString('serverUrl'), isNull);
+        expect(prefs.getBool('resetPending'), isNull);
+        await pumpEventQueue();
+        expect(controlled.pendingProbes, 0, reason: 'nothing was verified');
+      });
+    }
+
+    test('a launch whose wipe fails again signs out with the error and binds '
+        'nothing', () async {
+      SharedPreferences.setMockInitialValues(
+          {'serverUrl': 'http://a', 'resetPending': true});
+      ApiClient.initForTest('http://a', _health(200));
+      final failingDb = _FailingDbWipe();
+      addTearDown(failingDb.close);
+      final scope = scopeWith([failingDb]);
+      final start =
+          await scope.read(sessionServiceProvider).resumeSavedSession();
+      expect(start.kind, SessionStartKind.signedOut);
+      expect(start.error, contains('earlier reset'));
+      expect(await repo().current(), isNull);
+      expect((await SharedPreferences.getInstance()).getBool('resetPending'),
+          isTrue, reason: 'tried again at the next launch or login');
+    });
+
+    test('a login is refused until the wipe succeeds', () async {
+      SharedPreferences.setMockInitialValues({'resetPending': true});
+      ApiClient.initForTest('http://b', _health(200));
+      final failingDb = _FailingDbWipe();
+      addTearDown(failingDb.close);
+      final scope = scopeWith([failingDb]);
+      final outcome = await scope.read(sessionServiceProvider).connect('http://b');
+      expect(outcome, isA<ConnectFailed>());
+      expect(await repo().current(), isNull);
+      await pumpEventQueue();
+      expect(controlled.pendingProbes, 0);
+    });
+
+    test('a login after a successful finish connects as usual', () async {
+      SharedPreferences.setMockInitialValues({'resetPending': true});
+      ApiClient.initForTest('http://b', _health(200));
+      final scope = scopeWith([_ClearPrefs()]);
+      final outcome = scope.read(sessionServiceProvider).connect('http://b');
+      await pumpEventQueue();
+      controlled.respond('inst-2');
+      expect(await outcome, isA<ConnectSucceeded>());
+      expect((await repo().current())!.instanceId, 'inst-2');
+      expect((await SharedPreferences.getInstance()).getBool('resetPending'),
+          isNull);
+    });
+  });
+
   group('confirmed switch to a different server (resetForNewServer)', () {
     ProviderContainer resetScope({
       ServerBindingRepository? binding,

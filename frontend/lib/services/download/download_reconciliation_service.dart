@@ -66,13 +66,31 @@ class DownloadReconciliationService {
     return true;
   }
 
+  /// Marks a download that is on disk but failed to play as damaged
+  /// (decision 6; playback marks only with evidence). `file_path` and the
+  /// other download columns are kept, so a re-download uses the original
+  /// quality; the mark alone makes it an unusable download
+  /// (`usableDownloadPredicate`): the track streams online and is skipped
+  /// offline. The file is kept. Only the path that failed: a download
+  /// committed meanwhile wins. Returns true iff the row changed.
+  Future<bool> markDamaged(String trackUuid, String path) async {
+    final changed = await (_db.update(_db.tracks)
+          ..where((t) =>
+              t.uuidId.equals(trackUuid) &
+              t.filePath.equals(path) &
+              t.damagedFilePath.isNull()))
+        .write(TracksCompanion(damagedFilePath: Value(path)));
+    if (changed == 0) return false;
+    _statusReader.bumpVersion();
+    return true;
+  }
+
   Future<bool> _run() async {
     final rows = await _db
         .customSelect(
           'SELECT uuid_id, file_path FROM tracks WHERE file_path IS NOT NULL',
         )
         .get();
-    if (rows.isEmpty) return false;
 
     final missing = <String>[];
     for (var i = 0; i < rows.length; i += _batchSize) {
@@ -88,12 +106,35 @@ class DownloadReconciliationService {
       }
     }
 
-    if (missing.isEmpty) return false;
+    // A damaged file (decision 6) is its `file_path`, checked above. A store
+    // from before 2026-11-09 may hold a damaged path with `file_path`
+    // cleared; one removed outside the app is forgotten too.
+    final damaged = await _db
+        .customSelect(
+          'SELECT uuid_id, damaged_file_path FROM tracks '
+          'WHERE damaged_file_path IS NOT NULL AND file_path IS NULL',
+        )
+        .get();
+    final damagedGone = <(String, String)>[];
+    for (final r in damaged) {
+      final path = r.read<String>('damaged_file_path');
+      if (!await _fileExists(path)) {
+        damagedGone.add((r.read<String>('uuid_id'), path));
+      }
+    }
+
+    if (missing.isEmpty && damagedGone.isEmpty) return false;
 
     await _db.transaction(() async {
       for (final uuid in missing) {
         await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuid)))
             .write(clearedDownloadColumns);
+      }
+      for (final (uuid, path) in damagedGone) {
+        await (_db.update(_db.tracks)
+              ..where((t) =>
+                  t.uuidId.equals(uuid) & t.damagedFilePath.equals(path)))
+            .write(const TracksCompanion(damagedFilePath: Value(null)));
       }
     });
 

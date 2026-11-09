@@ -10,7 +10,16 @@ import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/session_readiness.dart';
 
-enum SessionStartKind { signedOut, online, offline }
+enum SessionStartKind {
+  signedOut,
+  online,
+  offline,
+
+  /// Launch finished a reset that had been interrupted (review major 2):
+  /// local data is wiped and nothing is signed in. Like any finished reset,
+  /// the provider scope is rebuilt next.
+  resetFinished,
+}
 
 /// How a launch with (or without) a saved server URL starts.
 class SessionStart {
@@ -72,6 +81,17 @@ class SessionService {
   /// session becomes ready on its verdict; a different server leaves the app
   /// blocked: offline, with no health polling to flip it back.
   Future<SessionStart> resumeSavedSession() async {
+    // A reset that never finished its wipe is finished first, before the
+    // saved URL creates a binding row on top of the old store (major 2).
+    final pending = await _completePendingReset();
+    switch (pending) {
+      case null:
+        break;
+      case _PendingResetDone():
+        return const SessionStart(SessionStartKind.resetFinished);
+      case _PendingResetFailed(:final message):
+        return SessionStart(SessionStartKind.signedOut, error: message);
+    }
     final prefs = await _ref.read(sharedPreferencesProvider.future);
     final url = prefs.getString(serverUrlKey);
     if (url == null) return const SessionStart(SessionStartKind.signedOut);
@@ -101,6 +121,11 @@ class SessionService {
   /// different server than the bound one changes nothing: the user decides
   /// whether to reset ([ConnectDifferentServer]).
   Future<ConnectOutcome> connect(String url) async {
+    // A reset the launch could not finish blocks every login until its
+    // wipe succeeds: no server may adopt the old store (major 2).
+    if (await _completePendingReset() case _PendingResetFailed(:final message)) {
+      return ConnectFailed(message);
+    }
     ApiClient.init(url);
     final result = await ApiClient.instance.healthCheck(retry: false);
     if (result.status != HealthStatus.ok) {
@@ -266,6 +291,21 @@ class SessionService {
   Future<LocalResetException?> resetLocalData() async =>
       (await _reset()).failure;
 
+  /// Finishes an interrupted reset (major 2), if there is one: null when
+  /// none was pending.
+  Future<_PendingReset?> _completePendingReset() async {
+    final resets = _ref.read(localResetServiceProvider);
+    try {
+      if (!await resets.hasPendingReset()) return null;
+      await resets.completePendingReset();
+      return const _PendingResetDone();
+    } catch (e) {
+      return _PendingResetFailed(
+          'An earlier reset could not finish clearing local data, so no '
+          'server can be connected yet ($e). Connecting tries again.');
+    }
+  }
+
   /// Runs the local reset. [aborted]: the fence did not hold (or the reset
   /// failed unexpectedly), so nothing may be assumed wiped.
   Future<({LocalResetException? failure, bool aborted})> _reset() async {
@@ -286,3 +326,16 @@ class SessionService {
 }
 
 final sessionServiceProvider = Provider<SessionService>(SessionService.new);
+
+sealed class _PendingReset {
+  const _PendingReset();
+}
+
+final class _PendingResetDone extends _PendingReset {
+  const _PendingResetDone();
+}
+
+final class _PendingResetFailed extends _PendingReset {
+  const _PendingResetFailed(this.message);
+  final String message;
+}

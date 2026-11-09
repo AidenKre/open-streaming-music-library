@@ -60,11 +60,18 @@ class EngineSourceIdentity {
     required this.sessionId,
     required this.itemId,
     required this.trackUuid,
+    this.localPath,
   });
   final int sourceId;
   final int? sessionId;
   final int itemId;
   final String trackUuid;
+
+  /// The local file this source plays, or null for a stream. Fixed for the
+  /// source's life (so not part of equality: [sourceId] already is). A
+  /// failure is classified by what the failing source actually loaded, not
+  /// by the catalog's current path (review 2026-11-07).
+  final String? localPath;
 
   @override
   bool operator ==(Object other) =>

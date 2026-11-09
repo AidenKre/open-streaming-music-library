@@ -103,11 +103,12 @@ class SessionController extends ChangeNotifier implements SessionControls {
     final start = await _service.resumeSavedSession();
     if (_disposed) return;
     _connectError = start.error;
-    _set(
-      start.kind == SessionStartKind.signedOut
-          ? SessionPhase.signedOut
-          : SessionPhase.live,
-    );
+    _set(switch (start.kind) {
+      SessionStartKind.signedOut => SessionPhase.signedOut,
+      // An interrupted reset was finished: rebuild like any finished reset.
+      SessionStartKind.resetFinished => SessionPhase.resetComplete,
+      SessionStartKind.online || SessionStartKind.offline => SessionPhase.live,
+    });
   }
 
   @override

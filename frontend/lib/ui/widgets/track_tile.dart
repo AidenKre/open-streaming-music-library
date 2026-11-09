@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
@@ -24,6 +25,10 @@ class TrackTile extends StatelessWidget {
   final bool isInteractive;
   final Widget? trailing;
 
+  /// The codec this device can't decode (its user-facing name), shown as
+  /// "Unsupported codec" (review major 1); null when it plays.
+  final String? unsupportedCodec;
+
   /// The row's action menu (from `buildLibraryActionMenu`), behind the
   /// overflow button. Empty: no overflow button (e.g. full-player queue rows).
   final List<LibraryMenuEntry> menu;
@@ -38,6 +43,7 @@ class TrackTile extends StatelessWidget {
     this.isDimmed = false,
     this.isInteractive = true,
     this.trailing,
+    this.unsupportedCodec,
   });
 
   @override
@@ -129,6 +135,19 @@ class TrackTile extends StatelessWidget {
                         Icons.sync,
                         size: 16,
                         color: colors.primary,
+                      ),
+                    ),
+                  ],
+                  if (trailing == null && unsupportedCodec != null) ...[
+                    const SizedBox(width: 8),
+                    Tooltip(
+                      message: 'This device can’t play $unsupportedCodec. '
+                          'Online it streams transcoded; offline it is '
+                          'skipped.',
+                      child: Text(
+                        'Unsupported codec',
+                        style: textTheme.labelSmall
+                            ?.copyWith(color: colors.error),
                       ),
                     ),
                   ],
@@ -249,6 +268,8 @@ class LibraryTrackTile extends ConsumerWidget {
     return TrackTile(
       track: track,
       trailing: trailing,
+      unsupportedCodec:
+          ref.watch(codecSupportProvider).unsupportedCodecOf(track),
       conversionJob: conversionJob,
       // Offline, a track that can't play stays visible but dimmed and inert.
       isDimmed: !availability.canPlay,

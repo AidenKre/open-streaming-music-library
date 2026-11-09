@@ -46,8 +46,19 @@ class TrackUI {
   final String? downloadedCodec;
   // Re-arms when `revision` climbs past this value again after a dismiss.
   final int? staleDismissedAtRevision;
+  // A download that failed to play although its file exists (see the
+  // column's doc comment on `Tracks`). The file and its download columns
+  // are kept, but it is not a usable download: the track streams online and
+  // is skipped offline until it is re-downloaded.
+  final String? damagedFilePath;
 
-  bool get isDownloaded => filePath != null;
+  /// A usable download: a recorded file that is not marked damaged. Dart
+  /// mirror of `usableDownloadPredicate` (database.dart).
+  bool get isDownloaded => filePath != null && damagedFilePath == null;
+
+  /// The download failed to play and is kept for the user to re-download
+  /// or delete (Phase 5 decision 6).
+  bool get isDownloadDamaged => damagedFilePath != null;
 
   /// A downloaded file whose track has since changed on the server (its
   /// revision moved past the one this file is current as of) and the user
@@ -98,6 +109,7 @@ class TrackUI {
     this.downloadedAtRevision,
     this.downloadedCodec,
     this.staleDismissedAtRevision,
+    this.damagedFilePath,
   });
 
   static const Object _sentinel = Object();
@@ -111,6 +123,7 @@ class TrackUI {
     Object? downloadedAtRevision = _sentinel,
     Object? downloadedCodec = _sentinel,
     Object? staleDismissedAtRevision = _sentinel,
+    Object? damagedFilePath = _sentinel,
   }) {
     return TrackUI(
       uuidId: uuidId,
@@ -154,6 +167,9 @@ class TrackUI {
       staleDismissedAtRevision: staleDismissedAtRevision == _sentinel
           ? this.staleDismissedAtRevision
           : staleDismissedAtRevision as int?,
+      damagedFilePath: damagedFilePath == _sentinel
+          ? this.damagedFilePath
+          : damagedFilePath as String?,
     );
   }
 
@@ -205,6 +221,9 @@ class TrackUI {
       downloadedCodec: row.readNullable<String>('downloaded_codec'),
       staleDismissedAtRevision:
           row.readNullable<int>('stale_dismissed_at_revision'),
+      damagedFilePath: row.data.containsKey('damaged_file_path')
+          ? row.readNullable<String>('damaged_file_path')
+          : null,
     );
   }
 
@@ -239,6 +258,7 @@ class TrackUI {
       downloadedAtRevision: track.downloadedAtRevision,
       downloadedCodec: track.downloadedCodec,
       staleDismissedAtRevision: track.staleDismissedAtRevision,
+      damagedFilePath: track.damagedFilePath,
     );
   }
 }

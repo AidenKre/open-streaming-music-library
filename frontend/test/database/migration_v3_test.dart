@@ -101,7 +101,7 @@ void main() {
       addTearDown(db.close);
       expect(
         (await _rows(db, 'PRAGMA user_version')).single.values.single,
-        3,
+        db.schemaVersion, // the full chain runs to the current version
       );
       final tables = {
         for (final r in await _rows(

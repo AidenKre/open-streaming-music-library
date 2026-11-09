@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
 import 'package:frontend/services/download/track_downloader.dart';
@@ -61,6 +62,28 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   // Provides the current stream quality for server warm calls.
   final String Function()? _streamQualityFn;
 
+  /// Which codecs this device can decode (review major 1).
+  final CodecSupport Function()? _codecSupportFn;
+
+  /// The quality [track] is actually downloaded at when [quality] is asked:
+  /// "original" passes the source codec through, so a codec this device
+  /// can't decode is downloaded at the best transcoded quality (AAC) and the
+  /// job names the codec (user, 2026-11-09).
+  ({String quality, String? unsupportedCodec}) _deliveredQuality(
+    TrackUI track,
+    String quality,
+  ) {
+    final codecs = _codecSupportFn?.call();
+    if (quality != originalQuality || codecs == null) {
+      return (quality: quality, unsupportedCodec: null);
+    }
+    final label = codecs.unsupportedLabel(track.codec);
+    if (label == null || !codecs.canDecode(AudioCodecFamily.aac.name)) {
+      return (quality: quality, unsupportedCodec: null);
+    }
+    return (quality: transcodedFallbackQuality, unsupportedCodec: label);
+  }
+
   late final DownloadQueue _queue;
   late final TrackDownloader _downloader;
   late final WorkerPool _pool;
@@ -110,9 +133,11 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     ApiClient? apiClient,
     bool Function()? isOfflineFn,
     void Function()? onNetworkFailure,
+    CodecSupport Function()? codecSupportFn,
   }) : _db = db,
        _warmService = warmService,
-       _streamQualityFn = streamQualityFn {
+       _streamQualityFn = streamQualityFn,
+       _codecSupportFn = codecSupportFn {
     _status = DownloadStatusReader(db: db);
     _queue = DownloadQueue();
     _queue.addListener(notifyListeners);
@@ -165,6 +190,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     List<TrackUI> tracks, {
     required String quality,
     required Map<String, String> replacements,
+    bool explicitQuality = false,
   }) async {
     final existingByUuid = {for (final j in _queue.state.jobs) j.uuidId: j};
     // Tracks both pre-existing queued/active jobs AND uuids already added in
@@ -178,11 +204,14 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
 
     for (final t in tracks) {
       if (seenUuids.contains(t.uuidId)) continue;
-      final replaces = replacements[t.uuidId];
+      // A damaged download (decision 6) is replaced like a re-download: the
+      // kept file stays until the new one is committed.
+      final replaces = replacements[t.uuidId] ??
+          (t.isDownloadDamaged ? t.filePath : null);
       // Fresh (non-replacement) jobs skip when a file is already on disk;
       // replacement jobs deliberately keep going — that's the whole point.
       if (replaces == null &&
-          t.filePath != null &&
+          t.isDownloaded &&
           await File(t.filePath!).exists()) {
         continue; // already downloaded
       }
@@ -191,6 +220,15 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
         continue;
       }
       seenUuids.add(t.uuidId);
+      // A damaged download is replaced at the quality it was downloaded at
+      // (kept with the mark), unless a quality was explicitly chosen.
+      final stored = t.downloadedQuality;
+      final requested = !explicitQuality &&
+              t.isDownloadDamaged &&
+              isValidQuality(stored)
+          ? stored!
+          : quality;
+      final delivered = _deliveredQuality(t, requested);
       additions.add(
         DownloadJob(
           uuidId: t.uuidId,
@@ -198,9 +236,10 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
           artist: t.artist,
           albumId: t.albumId,
           artistId: t.artistId,
-          quality: quality,
+          quality: delivered.quality,
           status: const Queued(),
           replacesFilePath: replaces,
+          unsupportedCodec: delivered.unsupportedCodec,
         ),
       );
     }
@@ -256,7 +295,9 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     final replacements = <String, String>{};
     for (final t in tracks) {
       final hasFile = t.filePath != null && await File(t.filePath!).exists();
-      if (hasFile && !force && _qualityMatches(t, quality)) {
+      // A damaged download is never "already at this quality".
+      if (hasFile && !force && !t.isDownloadDamaged &&
+          _qualityMatches(t, _deliveredQuality(t, quality).quality)) {
         continue; // already at the requested quality
       }
       if (hasFile) {
@@ -273,6 +314,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       toEnqueue,
       quality: quality,
       replacements: replacements,
+      explicitQuality: true,
     );
   }
 
@@ -311,6 +353,22 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// quality group is queued independently, so one failing group doesn't
   /// stop the rest. Returns how many tracks could not be queued.
   Future<int> redownloadStale(
+    List<TrackUI> tracks, {
+    required String fallbackQuality,
+  }) =>
+      _redownloadAtStoredQuality(tracks, fallbackQuality: fallbackQuality);
+
+  /// Replaces damaged downloads (decision 6) at the quality each was
+  /// downloaded at (kept with the mark), [fallbackQuality] when unknown.
+  /// The damaged file stays until the new download is committed. Returns
+  /// how many tracks could not be scheduled.
+  Future<int> redownloadDamaged(
+    List<TrackUI> tracks, {
+    required String fallbackQuality,
+  }) =>
+      _redownloadAtStoredQuality(tracks, fallbackQuality: fallbackQuality);
+
+  Future<int> _redownloadAtStoredQuality(
     List<TrackUI> tracks, {
     required String fallbackQuality,
   }) async {
@@ -362,8 +420,8 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   @override
   Future<void> resetLocalState() => resetAndDeleteFiles();
 
-  /// Removes the local file (if any) and clears `tracks.file_path` so the
-  /// track reverts to streaming. Cover art is intentionally NOT deleted: it
+  /// Removes the local file (if any), and a kept damaged copy, and clears
+  /// `tracks.file_path` so the track reverts to streaming. Cover art is intentionally NOT deleted: it
   /// may be referenced by other tracks the user has downloaded.
   ///
   /// Cancels any queued/active download for [uuidId] first so a late
@@ -373,8 +431,10 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     final row = await (_db.select(
       _db.tracks,
     )..where((t) => t.uuidId.equals(uuidId))).getSingleOrNull();
-    if (row != null && row.filePath != null) {
-      final f = File(row.filePath!);
+    // A kept damaged copy (decision 6) goes with it.
+    for (final path in [row?.filePath, row?.damagedFilePath]) {
+      if (path == null) continue;
+      final f = File(path);
       if (await f.exists()) {
         try {
           await f.delete();
@@ -408,16 +468,18 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       final placeholders = List.filled(chunk.length, '?').join(', ');
       final rows = await _db
           .customSelect(
-            'SELECT uuid_id, file_path FROM tracks '
-            'WHERE uuid_id IN ($placeholders) AND file_path IS NOT NULL',
+            'SELECT uuid_id, file_path, damaged_file_path FROM tracks '
+            'WHERE uuid_id IN ($placeholders) '
+            'AND (file_path IS NOT NULL OR damaged_file_path IS NOT NULL)',
             variables: chunk.map(Variable.withString).toList(),
           )
           .get();
 
       // 2. Delete files from disk (best-effort — orphan files are harmless).
       for (final row in rows) {
-        final path = row.readNullable<String>('file_path');
-        if (path != null) {
+        for (final column in const ['file_path', 'damaged_file_path']) {
+          final path = row.readNullable<String>(column);
+          if (path == null) continue;
           final f = File(path);
           try {
             if (await f.exists()) await f.delete();

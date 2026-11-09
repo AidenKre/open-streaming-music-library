@@ -74,6 +74,12 @@ class ClickRecorder {
         } on BindingFencedException {
           // That binding's store is gone (a reset): drop its clicks only.
           _pending.removeWhere((p) => p.token == next.token);
+        } on ArgumentError catch (error) {
+          // A payload that can never be valid (as for listens): retrying it
+          // would hold back every later click.
+          developer.log('Dropping an invalid click', name: 'ClickRecorder',
+              error: error);
+          _pending.remove(next);
         } catch (error, stackTrace) {
           developer.log('Recording a click failed; it will be retried',
               name: 'ClickRecorder', error: error, stackTrace: stackTrace);

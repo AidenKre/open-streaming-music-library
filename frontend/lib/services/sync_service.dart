@@ -368,16 +368,19 @@ class SyncService {
     final placeholders = List.filled(uuids.length, '?').join(', ');
     final rows = await _db
         .customSelect(
-          'SELECT file_path FROM tracks '
-          'WHERE uuid_id IN ($placeholders) AND file_path IS NOT NULL',
+          'SELECT file_path, damaged_file_path FROM tracks '
+          'WHERE uuid_id IN ($placeholders) '
+          'AND (file_path IS NOT NULL OR damaged_file_path IS NOT NULL)',
           variables: uuids.map(Variable.withString).toList(),
         )
         .get();
 
-    return rows
-        .map((row) => row.readNullable<String>('file_path'))
-        .nonNulls
-        .toList(growable: false);
+    // A kept damaged copy (decision 6) is a local file of the track too.
+    return [
+      for (final row in rows)
+        for (final column in const ['file_path', 'damaged_file_path'])
+          ?row.readNullable<String>(column),
+    ];
   }
 
   Future<void> _deleteLocalFiles(List<String> paths) async {

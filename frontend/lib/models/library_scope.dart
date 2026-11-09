@@ -64,10 +64,12 @@ final class TrackScope extends LibraryScope {
   bool operator ==(Object other) =>
       other is TrackScope &&
       other.track.uuidId == track.uuidId &&
-      other.track.isDownloaded == track.isDownloaded;
+      other.track.isDownloaded == track.isDownloaded &&
+      other.track.isDownloadDamaged == track.isDownloadDamaged;
 
   @override
-  int get hashCode => Object.hash(TrackScope, track.uuidId, track.isDownloaded);
+  int get hashCode => Object.hash(
+      TrackScope, track.uuidId, track.isDownloaded, track.isDownloadDamaged);
 
   @override
   String toString() => 'TrackScope(${track.uuidId})';

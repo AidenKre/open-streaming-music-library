@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/playback_availability.dart';
+import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download/download_reconciliation_service.dart';
@@ -36,6 +37,7 @@ final downloadManagerProvider = Provider<DownloadManager>((ref) {
     directoryProvider: ref.read(downloadDirectoryProvider),
     warmService: ref.read(queueWarmServiceProvider),
     streamQualityFn: () => ref.read(streamQualityProvider),
+    codecSupportFn: () => ref.read(codecSupportProvider),
     isOfflineFn: () => providerDisposed ? true : ref.read(offlineModeProvider),
     onNetworkFailure: () {
       if (providerDisposed) return;
@@ -194,6 +196,7 @@ final playbackAvailabilityProvider =
     ) {
       final offline = ref.watch(offlineModeProvider);
       ({int total, int downloaded})? counts;
+      var undecodable = 0;
       switch (scope) {
         case AlbumScope(:final albumId):
           final map = ref.watch(_albumDownloadCountsMapProvider).value;
@@ -203,18 +206,26 @@ final playbackAvailabilityProvider =
           final map = ref.watch(_artistDownloadCountsMapProvider).value;
           if (map == null) return PlaybackAvailability.unknown(offline: offline);
           counts = map[artistId];
+        // A download in a codec this device can't decode is still a
+        // download (Delete applies) but doesn't play offline (review major
+        // 1). Album/artist counts above are by download only; offline
+        // playback skips such a track.
         case TrackScope(:final track):
+          final codecs = ref.watch(codecSupportProvider);
           counts = (total: 1, downloaded: track.isDownloaded ? 1 : 0);
+          undecodable = track.isDownloaded && !codecs.playsDownload(track) ? 1 : 0;
         case TracksScope(:final tracks):
-          counts = (
-            total: tracks.length,
-            downloaded: tracks.where((t) => t.isDownloaded).length,
-          );
+          final codecs = ref.watch(codecSupportProvider);
+          final downloaded = tracks.where((t) => t.isDownloaded).toList();
+          counts = (total: tracks.length, downloaded: downloaded.length);
+          undecodable =
+              downloaded.where((t) => !codecs.playsDownload(t)).length;
       }
       if (counts == null) return PlaybackAvailability.unknown(offline: offline);
       return PlaybackAvailability.of(
         offline: offline,
         downloaded: counts.downloaded,
         total: counts.total,
+        undecodable: undecodable,
       );
     });

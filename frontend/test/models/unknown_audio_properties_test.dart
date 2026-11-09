@@ -78,6 +78,21 @@ void main() {
       expect(dto.channels, isNull);
     });
 
+    // Review (2026-11-07): a pre-v10 server sends 0 as its "unknown"
+    // stand-in, and its later v10 upgrade bumps no revision, so the client
+    // would keep the 0 forever. None of these can really be 0.
+    test("a legacy server's 0 stand-in parses as unknown", () {
+      final dto = TrackMetadataDto.fromJson({
+        ..._knownJson,
+        'duration': 0,
+        'sample_rate_hz': 0,
+        'channels': 0,
+      });
+      expect(dto.duration, isNull);
+      expect(dto.sampleRateHz, isNull);
+      expect(dto.channels, isNull);
+    });
+
     test('known values still parse', () {
       final dto = TrackMetadataDto.fromJson(Map.of(_knownJson));
       expect(dto.duration, 61.5);

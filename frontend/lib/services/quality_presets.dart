@@ -15,6 +15,10 @@ const List<String> qualityPresets = <String>[
   '128',
 ];
 
+/// The best transcoded preset (AAC): what an "original" request becomes for
+/// a codec this device cannot decode (review major 1).
+const String transcodedFallbackQuality = '320';
+
 bool isValidQuality(String? quality) {
   if (quality == null) return false;
   return qualityPresets.contains(quality);

@@ -235,9 +235,20 @@ class EditOutbox implements LossReporter {
   /// binding token.
   Future<void> flushLocked({required String bindingToken}) async {
     if (ref.read(offlineModeProvider)) return;
-    final rows = await (db.select(db.pendingEdits)
-          ..where((t) => t.status.equals('pending')))
-        .get();
+    // The token may predate a reset fence (the flush waited on the mutex
+    // meanwhile): read the rows only while the binding still carries it, so
+    // edits the reset sheet said will be lost are never sent (review
+    // 2026-11-07).
+    final List<PendingEdit> rows;
+    try {
+      rows = await binding.runFenced(
+          bindingToken,
+          () => (db.select(db.pendingEdits)
+                ..where((t) => t.status.equals('pending')))
+              .get());
+    } on BindingFencedException {
+      return;
+    }
     // Each row is an independent per-uuid PATCH with no shared mutable state
     // or ordering dependency between tracks, so flush them concurrently
     // rather than paying one round trip per row sequentially.
@@ -253,6 +264,9 @@ class EditOutbox implements LossReporter {
   }
 
   Future<void> _flushOne(PendingEdit row, String bindingToken) async {
+    // Re-checked per row, right before its request: a fence may land while
+    // other rows are in flight.
+    if ((await binding.current())?.localBindingId != bindingToken) return;
     final values = (jsonDecode(row.valuesJson) as Map).cast<String, dynamic>();
     final body = <String, dynamic>{
       ...values,

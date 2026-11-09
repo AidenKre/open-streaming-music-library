@@ -20,9 +20,17 @@ class QueuePlaybackEntry {
   final int playPosition;
   final String uuidId;
 
-  /// Local download path for this track, if it has been downloaded. The
-  /// player consults this to prefer file:// playback over streaming.
+  /// Local download path for this track, if it has a usable download (a
+  /// damaged one, Phase 5 decision 6, reads null: it streams). The player
+  /// consults this to prefer file:// playback over streaming.
   final String? filePath;
+
+  /// The codec of the downloaded file (null: unknown or no download).
+  final String? downloadedCodec;
+
+  /// The source's codec, which an "original" stream passes through (null:
+  /// unknown).
+  final String? sourceCodec;
 
   const QueuePlaybackEntry({
     required this.itemId,
@@ -31,8 +39,20 @@ class QueuePlaybackEntry {
     required this.playPosition,
     required this.uuidId,
     this.filePath,
+    this.downloadedCodec,
+    this.sourceCodec,
   });
 }
+
+/// Columns of a [QueuePlaybackEntry] row (aliases `po`, `qsi`, `t`). The
+/// file path is the usable download only (`usableDownloadPredicate`).
+const _playbackEntryColumns =
+    'po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
+    'po.play_position, qsi.uuid_id, '
+    'CASE WHEN $usableDownloadPredicate THEN t.file_path END AS file_path, '
+    't.downloaded_codec, '
+    '(SELECT tm.codec FROM trackmetadata AS tm '
+    'WHERE tm.uuid_id = qsi.uuid_id) AS source_codec';
 
 class QueueTrackEntry extends QueuePlaybackEntry {
   final TrackUI track;
@@ -318,8 +338,7 @@ class QueueRepository {
     ];
 
     var sql =
-        'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-        'po.play_position, qsi.uuid_id, t.file_path '
+        'SELECT $_playbackEntryColumns '
         'FROM queue_session_play_order AS po '
         'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
         'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
@@ -345,8 +364,7 @@ class QueueRepository {
     final placeholders = List.filled(ids.length, '?').join(', ');
     final rows = await _db
         .customSelect(
-          'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id, t.file_path '
+          'SELECT $_playbackEntryColumns '
           'FROM queue_session_play_order AS po '
           'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
           'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
@@ -367,8 +385,7 @@ class QueueRepository {
   ) async {
     final row = await _db
         .customSelect(
-          'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id, t.file_path '
+          'SELECT $_playbackEntryColumns '
           'FROM queue_session_play_order AS po '
           'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
           'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
@@ -1279,7 +1296,7 @@ class QueueRepository {
       args.add(albumId);
     }
     if (downloadedOnly) {
-      whereClauses.add('t.file_path IS NOT NULL');
+      whereClauses.add(usableDownloadPredicate);
     }
 
     final orderClause = _buildTrackOrderClause(orderBy);
@@ -1314,6 +1331,8 @@ class QueueRepository {
       playPosition: row.read<int>('play_position'),
       uuidId: row.read<String>('uuid_id'),
       filePath: row.readNullable<String>('file_path'),
+      downloadedCodec: row.readNullable<String>('downloaded_codec'),
+      sourceCodec: row.readNullable<String>('source_codec'),
     );
   }
 

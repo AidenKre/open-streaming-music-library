@@ -43,11 +43,19 @@ void main() {
     expect(await classify(path: '/gone'), SourceFailureKind.missingLocalFile);
   });
 
-  test('a present file that fails is unknown, never skipped as gone',
+  // Decision 6 (user, 2026-11-07): a file that is on disk but fails to play
+  // is a damaged download, not unknown (it was never skipped as gone).
+  test('a present file that fails is a damaged download, never gone',
       () async {
     files.add('/here');
-    expect(await classify(path: '/here'), SourceFailureKind.unknown);
+    expect(await classify(path: '/here'), SourceFailureKind.damagedLocalFile);
     expect(probes, 0);
+  });
+
+  test('an uncertain failure of a present file stays unknown', () async {
+    files.add('/here');
+    expect(await classify(path: '/here', uncertain: true),
+        SourceFailureKind.unknown);
   });
 
   test("a track the local catalog no longer has (tombstone) is gone", () async {

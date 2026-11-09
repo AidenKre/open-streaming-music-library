@@ -152,7 +152,14 @@ class ListenTracker {
       trackUuid: source.trackUuid,
       startedAtUtcMs: nowUtcMs,
     );
-    current.trackLength ??= o.duration;
+    // The first known length. A zero duration is no reading (the plugin's
+    // placeholder before the media is parsed): a later real one fills it.
+    final duration = o.duration;
+    if (current.trackLength == null &&
+        duration != null &&
+        duration > Duration.zero) {
+      current.trackLength = duration;
+    }
 
     if (active) {
       _accumulator.sample(

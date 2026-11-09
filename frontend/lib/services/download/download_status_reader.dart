@@ -38,8 +38,8 @@ class DownloadStatusReader {
     final placeholders = List.filled(unique.length, '?').join(', ');
     final rows = await _db
         .customSelect(
-          'SELECT uuid_id, file_path FROM tracks '
-          'WHERE uuid_id IN ($placeholders) AND file_path IS NOT NULL',
+          'SELECT t.uuid_id, t.file_path FROM tracks AS t '
+          'WHERE t.uuid_id IN ($placeholders) AND $usableDownloadPredicate',
           variables: unique.map(Variable.withString).toList(),
         )
         .get();

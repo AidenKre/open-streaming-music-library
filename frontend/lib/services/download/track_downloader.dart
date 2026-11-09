@@ -227,6 +227,17 @@ class TrackDownloader {
         return DownloadOutcome.cancelled;
       }
 
+      // A body that ended early (or ran long) is never committed: a
+      // truncated file would only fail later at playback, looking damaged
+      // (review major 1). Unknown length (chunked, compressed) can't be
+      // checked.
+      final expected = response.contentLength;
+      if (expected != null && expected >= 0 && received != expected) {
+        await _deleteIfExists(partial);
+        return DownloadOutcome.otherFailure(
+            'Incomplete download: received $received of $expected bytes');
+      }
+
       // Parse the actual bitrate the server served (may differ from source).
       final bitrateHeader = response.headers['x-audio-bitrate-kbps'];
       final downloadedBitrate = bitrateHeader != null
@@ -331,11 +342,18 @@ class TrackDownloader {
       return false;
     }
 
+    // A damaged copy (decision 6) is superseded by this download: the
+    // write clears its mark and the file is removed once the swap is in.
+    final damagedFilePath = (await (_db.select(_db.tracks)
+              ..where((t) => t.uuidId.equals(uuidId)))
+            .getSingleOrNull())
+        ?.damagedFilePath;
     final updatedRows =
         await (_db.update(
           _db.tracks,
         )..where((t) => t.uuidId.equals(uuidId))).write(
           TracksCompanion(
+            damagedFilePath: const Value(null),
             filePath: Value(destination.path),
             downloadedBitrateKbps: Value(downloadedBitrate),
             fileSizeBytes: Value(received),
@@ -357,6 +375,11 @@ class TrackDownloader {
       if (replacesFilePath != null && replacesFilePath != destination.path) {
         await _deleteIfExists(File(replacesFilePath));
       }
+      // The write above already cleared the damaged mark, so nothing else
+      // would remove the damaged copy.
+      if (damagedFilePath != null && damagedFilePath != destination.path) {
+        await _deleteIfExists(File(damagedFilePath));
+      }
       return false;
     }
 
@@ -366,6 +389,9 @@ class TrackDownloader {
     // is harmless.
     if (replacesFilePath != null && replacesFilePath != destination.path) {
       await _deleteIfExists(File(replacesFilePath));
+    }
+    if (damagedFilePath != null && damagedFilePath != destination.path) {
+      await _deleteIfExists(File(damagedFilePath));
     }
     return true;
   }
@@ -461,14 +487,17 @@ class TrackDownloader {
   Future<void> deleteKnownDownloadedFiles() async {
     final rows = await _db
         .customSelect(
-          'SELECT file_path FROM tracks WHERE file_path IS NOT NULL',
+          'SELECT file_path, damaged_file_path FROM tracks '
+          'WHERE file_path IS NOT NULL OR damaged_file_path IS NOT NULL',
           readsFrom: {_db.tracks},
         )
         .get();
     for (final row in rows) {
-      final path = row.readNullable<String>('file_path');
-      if (path == null) continue;
-      await _deleteIfExists(File(path));
+      // A kept damaged copy (decision 6) too.
+      for (final column in const ['file_path', 'damaged_file_path']) {
+        final path = row.readNullable<String>(column);
+        if (path != null) await _deleteIfExists(File(path));
+      }
     }
   }
 

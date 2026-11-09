@@ -1615,6 +1615,32 @@ void main() {
     expect(row.filePath, isNull);
   });
 
+  // Decision 6: Delete on a damaged download removes the kept file too.
+  for (final bulk in [false, true]) {
+    test('${bulk ? 'deleteDownloadsForUuids' : 'deleteDownload'} removes a '
+        'damaged file and clears the mark', () async {
+      final damaged = p.join(tempDir.path, 'damaged.audio');
+      await File(damaged).writeAsBytes([9]);
+      await _insertTrack(db, 'abc');
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
+          .write(TracksCompanion(damagedFilePath: Value(damaged)));
+      final manager = buildManager(
+        client: MockClient((_) async => http.Response('', 404)),
+      );
+      addTearDown(manager.dispose);
+      if (bulk) {
+        await manager.deleteDownloadsForUuids(['abc']);
+      } else {
+        await manager.deleteDownload('abc');
+      }
+      expect(File(damaged).existsSync(), isFalse);
+      final row = await (db.select(
+        db.tracks,
+      )..where((t) => t.uuidId.equals('abc'))).getSingle();
+      expect((row.filePath, row.damagedFilePath), (null, null));
+    });
+  }
+
   test('deleteDownload tolerates a missing file on disk', () async {
     final missingPath = p.join(tempDir.path, 'missing.audio');
     await _insertTrack(db, 'abc', filePath: missingPath);

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/playback/audio_state.dart';
+import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/player_controller.dart';
@@ -127,6 +128,8 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
     final textTheme = Theme.of(context).textTheme;
 
     if (track == null) return const SizedBox.shrink();
+    final unsupportedCodec =
+        ref.watch(codecSupportProvider).unsupportedCodecOf(track);
 
     _clearPendingSeekIfApplied(position);
 
@@ -201,6 +204,18 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
+              // A codec this device can't decode only ever plays as a
+              // transcoded stream (review major 1).
+              if (unsupportedCodec != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  'Unsupported codec: this device can\u2019t play '
+                  '$unsupportedCodec, so a transcoded copy plays',
+                  key: const Key('now_playing_unsupported_codec'),
+                  style: textTheme.bodySmall?.copyWith(color: colors.error),
+                  textAlign: TextAlign.center,
+                ),
+              ],
               const SizedBox(height: 24),
               // Seek slider
               Slider(

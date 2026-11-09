@@ -145,8 +145,17 @@ class ListenRecorder {
   void _apply(ListenUpdate update) {
     final closed = update.closed;
     final current = update.current;
+    final previous = _current;
     _current = current;
     if (closed != null) unawaited(_enqueue(() => _finish(closed)));
+    // A listen that ended without being closed proved nothing (the tracker
+    // drops a zero-credit listen at its close, e.g. a stop whose own sample
+    // withdrew the credit): its draft, if any, goes (review 2026-11-07).
+    if (previous != null &&
+        previous.generation != closed?.generation &&
+        previous.generation != current?.generation) {
+      unawaited(_enqueue(() => _discard(previous)));
+    }
     // A listen's credit can be withdrawn (a stall settles, a stale anchor is
     // corrected): one that proves nothing keeps no draft, which would else
     // block the next draft (one accumulating row) and land as a play at the
@@ -159,14 +168,32 @@ class ListenRecorder {
     }
   }
 
-  /// Deletes the draft of a listen that no longer proves any credit.
+  /// Deletes the draft of a listen that no longer proves any credit. A
+  /// failed delete is remembered and retried before the next draft write:
+  /// a leftover accumulating draft would block every later checkpoint (one
+  /// accumulating row) and land as a phantom play at the next start.
   Future<void> _discard(ListenOccurrence occurrence) async {
     final listen = _listens.remove(occurrence.generation);
     if (listen == null) return;
+    await _deleteDraft(listen);
+  }
+
+  final _undeleted = <_Listen>[];
+
+  Future<void> _deleteDraft(_Listen listen) async {
     try {
       await _history.deleteDraft(listen.token, listen.uuid);
     } on BindingFencedException {
       // its store is gone already
+    } catch (_) {
+      _undeleted.add(listen);
+      rethrow;
+    }
+  }
+
+  Future<void> _retryUndeleted() async {
+    while (_undeleted.isNotEmpty) {
+      await _deleteDraft(_undeleted.removeAt(0));
     }
   }
 
@@ -201,6 +228,8 @@ class ListenRecorder {
     // A finalization that could not even freeze may still hold the one
     // accumulating row: land it before this listen's first draft.
     if (!known && _unfrozen) await _retryFrozen();
+    // Likewise a zero-credit draft whose delete failed.
+    if (!known && _undeleted.isNotEmpty) await _retryUndeleted();
     final listen = await _listenFor(occurrence);
     final sessionId = occurrence.sessionId;
     if (listen == null || sessionId == null) return;

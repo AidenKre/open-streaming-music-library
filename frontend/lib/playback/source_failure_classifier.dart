@@ -13,7 +13,8 @@ import 'package:frontend/providers/providers.dart';
 /// Decides what a source failure means (SC-27 §2.9; decide-only, like the
 /// target resolver). The plugin's error carries no HTTP status, so:
 ///  * [SourceFailureKind.missingLocalFile] only after an async stat finds
-///    the recorded file absent;
+///    the recorded file absent, [SourceFailureKind.damagedLocalFile] when
+///    it is present (it failed to play);
 ///  * [SourceFailureKind.gone] only after an authoritative check: the
 ///    track's sync tombstone (no longer in the local catalog) or a 404/410
 ///    from a bounded `GET /tracks/{uuid}`;
@@ -41,8 +42,13 @@ class SourceFailureClassifier {
     // Without a settled identity nothing can be confirmed.
     if (uncertain) return SourceFailureKind.unknown;
     if (filePath != null && filePath.isNotEmpty) {
+      // A file on disk that failed to play is a suspected damaged download
+      // (decision 6). The plugin gives no portable decode error, so this is
+      // only "present but failed": playback marks it damaged only with
+      // evidence (review major 1) and never deletes the file, so a
+      // misjudged one costs only a stream or a skip.
       return await fileExists(filePath)
-          ? SourceFailureKind.unknown
+          ? SourceFailureKind.damagedLocalFile
           : SourceFailureKind.missingLocalFile;
     }
     if (!await trackKnownLocally(trackUuid)) return SourceFailureKind.gone;

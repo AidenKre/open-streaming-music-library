@@ -17,4 +17,10 @@ class FakeDownloadsControls implements DownloadsControls {
     calls.add('redownload ${tracks.map((t) => t.uuidId).join(',')}');
     return (failed: 0, total: tracks.length);
   }
+  @override
+  Future<void> redownloadDamaged(List<TrackUI> tracks) async =>
+      calls.add('redownloadDamaged ${tracks.map((t) => t.uuidId).join(',')}');
+  @override
+  Future<void> deleteDamaged(String uuidId) async =>
+      calls.add('deleteDamaged $uuidId');
 }

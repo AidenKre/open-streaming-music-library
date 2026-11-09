@@ -377,7 +377,8 @@ class HistoryRepository {
             .go();
       });
 
-  /// Quarantines [eventUuid] (excluded from upload until cleared).
+  /// Quarantines [eventUuid] (excluded from upload until cleared), only
+  /// while it is still pending upload.
   Future<void> recordFailure(
     String bindingToken,
     String eventUuid, {
@@ -391,6 +392,14 @@ class HistoryRepository {
     required String reason,
     String? detail,
   }) async {
+    // Only a still-pending event is held back: a response handled after the
+    // event was resolved meanwhile (Keep server version, an echo) would
+    // otherwise leave a failure nothing can clear (review 2026-11-07).
+    final pending = await (_db.select(_db.historyEvents)
+          ..where((t) =>
+              t.eventUuid.equals(eventUuid) & t.pendingUpload.equals(true)))
+        .getSingleOrNull();
+    if (pending == null) return;
     await _db.into(_db.historySyncFailures).insertOnConflictUpdate(
       HistorySyncFailuresCompanion.insert(
         eventUuid: eventUuid,
@@ -423,7 +432,11 @@ class HistoryRepository {
     'SELECT (SELECT COUNT(*) FROM history_events h '
     'WHERE pending_upload = 1 AND NOT EXISTS '
     '(SELECT 1 FROM history_sync_failures f WHERE f.event_uuid = h.event_uuid)) '
-    'AS pending, (SELECT COUNT(*) FROM history_sync_failures) AS quarantined',
+    // Held back = a failure of an event still pending (a failure left on a
+    // resolved event is not unsent history).
+    'AS pending, (SELECT COUNT(*) FROM history_sync_failures f WHERE EXISTS '
+    '(SELECT 1 FROM history_events h WHERE h.event_uuid = f.event_uuid '
+    'AND h.pending_upload = 1)) AS quarantined',
     readsFrom: {_db.historyEvents, _db.historySyncFailures},
   );
 

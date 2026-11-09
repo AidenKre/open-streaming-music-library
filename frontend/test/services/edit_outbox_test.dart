@@ -1282,6 +1282,30 @@ void main() {
       });
     }
 
+    test('review: a flush holding a pre-fence token sends nothing', () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, title: 'Old', revision: 5);
+      final token =
+          (await ServerBindingRepository(db).current())!.localBindingId;
+      final outbox =
+          _container(db, onPatch: (_) async => _ok()).read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'Mine'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+      await pumpEventQueue();
+      _patchCalls.clear();
+      // The flush took its token, then waited on the edit mutex while the
+      // reset fence committed (the sheet said these edits will be lost).
+      await ServerBindingRepository(db).fence();
+      await outbox.flushLocked(bindingToken: token);
+      expect(_patchCalls, isEmpty, reason: 'no PATCH after the fence');
+      expect((await db.select(db.pendingEdits).get()).single.status, 'pending');
+    });
+
     test('a 200 that lands after a re-bind changes nothing', () async {
       final f = await flushInFlight();
       final before = await state(f.db);

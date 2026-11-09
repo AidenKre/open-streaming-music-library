@@ -94,6 +94,16 @@ void main() {
       expect(session().phase, SessionPhase.live);
     });
 
+    // Review major 2: launch finished an interrupted reset; it ends like any
+    // finished reset (the view rebuilds the scope), with no failure to show.
+    test('a launch that finished an interrupted reset completes a reset',
+        () async {
+      service.start = const SessionStart(SessionStartKind.resetFinished);
+      await session().start();
+      expect(session().phase, SessionPhase.resetComplete);
+      expect(session().resetFailure, isNull);
+    });
+
     test(
       'readiness is not the controller\'s rule (the model marks it)',
       () async {

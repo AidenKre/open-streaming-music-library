@@ -53,14 +53,21 @@ class TrackMetadataDto {
       trackNumber: (json['track_number'] as num?)?.toInt(),
       discNumber: (json['disc_number'] as num?)?.toInt(),
       codec: json['codec'] as String?,
-      duration: (json['duration'] as num?)?.toDouble(),
+      duration: _positiveOrUnknown(json['duration'])?.toDouble(),
       bitrateKbps: (json['bitrate_kbps'] as num?)?.toDouble(),
-      sampleRateHz: (json['sample_rate_hz'] as num?)?.toInt(),
-      channels: (json['channels'] as num?)?.toInt(),
+      sampleRateHz: _positiveOrUnknown(json['sample_rate_hz'])?.toInt(),
+      channels: _positiveOrUnknown(json['channels'])?.toInt(),
       hasAlbumArt: json['has_album_art'] as bool? ?? false,
       coverArtId: (json['cover_art_id'] as num?)?.toInt(),
       artistId: (json['artist_id'] as num?)?.toInt(),
       albumId: (json['album_id'] as num?)?.toInt(),
     );
   }
+
+  /// Duration, sample rate and channels are never really 0: a pre-v10
+  /// server sends 0 as its "unknown" stand-in (SC-16l), and its later
+  /// upgrade bumps no revision, so the value would stay forever. Unknown is
+  /// null (the unknown-vs-zero rule).
+  static num? _positiveOrUnknown(Object? value) =>
+      value is num && value > 0 ? value : null;
 }

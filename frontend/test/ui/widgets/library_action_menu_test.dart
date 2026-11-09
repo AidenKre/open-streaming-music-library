@@ -7,9 +7,11 @@ import 'package:frontend/ui/widgets/library_action_menu.dart';
 
 import '../fake_library_actions.dart';
 
-TrackUI _track(String uuid, {bool downloaded = false}) => TrackUI(
+TrackUI _track(String uuid, {bool downloaded = false, bool damaged = false}) =>
+    TrackUI(
   uuidId: uuid,
   filePath: downloaded ? '/f/$uuid' : null,
+  damagedFilePath: damaged ? '/f/$uuid' : null,
   createdAt: 0,
   lastUpdated: 0,
   duration: 1,
@@ -137,6 +139,40 @@ void main() {
         _describe(buildLibraryActionMenu(scope, _a(true, 1, 1),
             actions: actions, onGetInfo: () {})),
         ['Get Info', 'Play Next', 'Add to Queue', 'Delete download'],
+      );
+    });
+
+    // Decision 6: a damaged download offers its re-download (online) and
+    // the Delete of the kept file in place of the plain Download row.
+    test('a damaged download: re-download online, delete the kept file', () {
+      final scope = TrackScope(_track('u1', damaged: true));
+      final entries = buildLibraryActionMenu(scope, _a(false, 0, 1),
+          actions: actions, onGetInfo: () {});
+      expect(_describe(entries), [
+        'Get Info',
+        'Play Next',
+        'Add to Queue',
+        'Damaged download: re-download',
+        'Delete damaged file',
+      ]);
+      for (final e in entries.whereType<LibraryMenuAction>().skip(3)) {
+        e.onSelected!();
+      }
+      expect(actions.calls, ['download track(u1)', 'deleteDownloads track(u1)']);
+    });
+
+    test('a damaged download offline: the re-download needs the server', () {
+      final scope = TrackScope(_track('u1', damaged: true));
+      expect(
+        _describe(buildLibraryActionMenu(scope, _a(true, 0, 1),
+            actions: actions, onGetInfo: () {})),
+        [
+          'Get Info',
+          'Play Next (disabled)',
+          'Add to Queue (disabled)',
+          'Damaged download: re-download (disabled)',
+          'Delete damaged file',
+        ],
       );
     });
 

@@ -204,6 +204,13 @@ void main() {
     expect(current!.trackLength, const Duration(seconds: 200));
   });
 
+  test('review: a zero duration is not a known length; a later real one is',
+      () {
+    obs(0, 0, duration: Duration.zero);
+    obs(1, 1, duration: const Duration(seconds: 200));
+    expect(current!.trackLength, const Duration(seconds: 200));
+  });
+
   group('PR 5B audit (a)', () {
     test('the final sample before completion or stop is credited', () {
       for (final end in ['completed', 'stop']) {

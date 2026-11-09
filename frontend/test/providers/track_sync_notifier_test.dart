@@ -835,10 +835,15 @@ void main() {
       });
       final downloadedFile = File('${tempDir.path}/uuid-drop.audio')
         ..writeAsBytesSync([1, 2, 3]);
+      // Review (decision 6): a kept damaged copy goes with the track too.
+      // (A row holds one or the other; both columns are collected.)
+      final damagedFile = File('${tempDir.path}/uuid-drop.damaged.audio')
+        ..writeAsBytesSync([9]);
       await (db.update(
         db.tracks,
       )..where((t) => t.uuidId.equals('uuid-drop'))).write(
         TracksCompanion(
+          damagedFilePath: Value(damagedFile.path),
           filePath: Value(downloadedFile.path),
           downloadedBitrateKbps: const Value(320),
           fileSizeBytes: const Value(3),
@@ -857,6 +862,7 @@ void main() {
         'uuid-keep',
       });
       expect(downloadedFile.existsSync(), isFalse);
+      expect(damagedFile.existsSync(), isFalse);
       final dropFts = await db
           .customSelect(
             "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Drop\"*'",

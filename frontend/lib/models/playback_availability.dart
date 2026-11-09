@@ -22,19 +22,28 @@ enum LocalCoverage {
 @immutable
 final class PlaybackAvailability {
   /// The counts are not known yet.
-  const PlaybackAvailability.unknown({required this.offline}) : coverage = null;
+  const PlaybackAvailability.unknown({required this.offline})
+      : coverage = null,
+        hasUndecodable = false;
 
-  const PlaybackAvailability._(this.offline, this.coverage);
+  const PlaybackAvailability._(this.offline, this.coverage,
+      {this.hasUndecodable = false});
 
+  /// [undecodable]: how many of the [downloaded] tracks are in a codec this
+  /// device can't decode (review major 1): still downloads (Delete applies),
+  /// but they don't play offline.
   factory PlaybackAvailability.of({
     required bool offline,
     required int downloaded,
     required int total,
+    int undecodable = 0,
   }) {
     assert(
       downloaded >= 0 && total >= 0 && downloaded <= total,
       'invalid counts $downloaded/$total',
     );
+    assert(undecodable >= 0 && undecodable <= downloaded,
+        'invalid undecodable count $undecodable/$downloaded');
     final LocalCoverage coverage;
     if (total == 0 || downloaded == 0) {
       coverage = LocalCoverage.remote;
@@ -43,10 +52,14 @@ final class PlaybackAvailability {
     } else {
       coverage = LocalCoverage.partial;
     }
-    return PlaybackAvailability._(offline, coverage);
+    return PlaybackAvailability._(offline, coverage,
+        hasUndecodable: undecodable > 0);
   }
 
   final bool offline;
+
+  /// Some downloads are in a codec this device can't decode.
+  final bool hasUndecodable;
 
   /// Null while unknown.
   final LocalCoverage? coverage;
@@ -61,7 +74,8 @@ final class PlaybackAvailability {
   /// Play / Play next / Add to queue. Online everything streams. Offline only
   /// a fully downloaded scope may play, so a queue action never enqueues
   /// streaming-only tracks (Phase 6 deliberately makes `partial` playable).
-  bool get canPlay => !offline || isFullyDownloaded;
+  /// A download this device can't decode doesn't play offline either.
+  bool get canPlay => !offline || (isFullyDownloaded && !hasUndecodable);
 
   /// Download (the missing tracks) needs the server and something missing.
   bool get canDownload => !offline && !isFullyDownloaded;
@@ -70,12 +84,14 @@ final class PlaybackAvailability {
   bool operator ==(Object other) =>
       other is PlaybackAvailability &&
       other.offline == offline &&
-      other.coverage == coverage;
+      other.coverage == coverage &&
+      other.hasUndecodable == hasUndecodable;
 
   @override
-  int get hashCode => Object.hash(offline, coverage);
+  int get hashCode => Object.hash(offline, coverage, hasUndecodable);
 
   @override
   String toString() =>
-      'PlaybackAvailability(offline: $offline, coverage: ${coverage?.name ?? 'unknown'})';
+      'PlaybackAvailability(offline: $offline, coverage: ${coverage?.name ?? 'unknown'}'
+      '${hasUndecodable ? ', undecodable downloads' : ''})';
 }

@@ -24,6 +24,7 @@ import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/playback/audio_service_bridge.dart';
 import 'package:frontend/playback/audio_focus.dart';
 import 'package:frontend/playback/just_audio_engine.dart';
+import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_engine.dart';
 
 import 'audio_focus_test.dart' show FakeAudioSessionPort;
@@ -296,28 +297,79 @@ void main() {
       expect((await repo.getActiveSession())?.id, currentSession);
     });
 
-    test('delayed artwork preserves the started identity and publishes once', () async {
-      await fixture.insertSingles(['a']);
-      await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('a'))).write(
-        const TrackmetadataCompanion(hasAlbumArt: Value(true), coverArtId: Value(7)),
-      );
-      final art = _GatedCoverArt();
+    Future<_GatedCoverArt> withArt(List<String> uuids, {Uri? local}) async {
+      await fixture.insertSingles(uuids);
+      for (final (i, uuid) in uuids.indexed) {
+        await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals(uuid)))
+            .write(TrackmetadataCompanion(
+                hasAlbumArt: const Value(true), coverArtId: Value(7 + i)));
+      }
+      final art = _GatedCoverArt(local: local);
       initCoverArtCache(art);
+      return art;
+    }
+
+    // Decision 7 (user, 2026-11-07): the OS gets the metadata at once; the
+    // art follows when its location resolves (it never holds the title).
+    test('delayed artwork: metadata publishes at once, the art follows',
+        () async {
+      final art = await withArt(['a']);
       final c = createContainer();
       await repo.startupRead.future;
       final starting = play(c, await fixture.track('a'));
       await art.entered.future;
+      await pumpEventQueue();
       expect(c.read(currentTrackProvider)?.uuidId, 'a');
-      expect(fakePlayer.currentUuid, 'a');
-      expect(bridge.mediaItemEvents.whereType<MediaItem>(), isEmpty);
+      final early = bridge.mediaItemEvents.whereType<MediaItem>().toList();
+      expect(early.map((m) => (m.id, m.artUri)), [('a', null)]);
       final uri = Uri.parse('file:///test-art/a.png');
       art.release.complete(uri);
       await starting;
       await pumpEventQueue();
       final published = bridge.mediaItemEvents.whereType<MediaItem>().toList();
-      expect(published, hasLength(1));
-      expect(published.single.id, 'a');
-      expect(published.single.artUri, uri);
+      expect(published.map((m) => (m.id, m.artUri)), [('a', null), ('a', uri)]);
+    });
+
+    test('review: a same-item republish (measured duration) keeps the art',
+        () async {
+      final art = await withArt(['a']);
+      final c = createContainer();
+      await repo.startupRead.future;
+      final starting = play(c, await fixture.track('a'));
+      await art.entered.future;
+      final uri = Uri.parse('file:///test-art/a.png');
+      art.release.complete(uri);
+      await starting;
+      await pumpEventQueue();
+      fakePlayer.emitObservation(duration: const Duration(seconds: 201));
+      await pumpEventQueue();
+      final published = bridge.mediaItemEvents.whereType<MediaItem>().toList();
+      expect(published.last.duration, const Duration(seconds: 201));
+      expect(published.last.artUri, uri, reason: 'no blank art on an edit');
+    });
+
+    test('artwork that never resolves still publishes the metadata', () async {
+      final art = await withArt(['a']);
+      final c = createContainer();
+      await repo.startupRead.future;
+      unawaited(play(c, await fixture.track('a')));
+      await art.entered.future;
+      await pumpEventQueue();
+      final published = bridge.mediaItemEvents.whereType<MediaItem>().toList();
+      expect(published.map((m) => (m.id, m.artUri)), [('a', null)]);
+      expect(published.single.title, isNotEmpty);
+    });
+
+    test('locally stored artwork publishes once, with the art', () async {
+      final uri = Uri.parse('file:///local-art/7.png');
+      final art = await withArt(['a'], local: uri);
+      final c = createContainer();
+      await repo.startupRead.future;
+      await play(c, await fixture.track('a'));
+      await pumpEventQueue();
+      final published = bridge.mediaItemEvents.whereType<MediaItem>().toList();
+      expect(published.map((m) => (m.id, m.artUri)), [('a', uri)]);
+      expect(art.resolveCalls, 0, reason: 'no async lookup for local art');
     });
   });
 
@@ -555,8 +607,13 @@ void main() {
       await starting;
       await skipping;
       await pumpEventQueue();
-      expect(bridge.mediaItemEvents.whereType<MediaItem>().map((m) => m.id),
-          ['b']);
+      // The metadata never waited for the art (decision 7): a was shown at
+      // once; its late art must not replace b.
+      expect(
+          bridge.mediaItemEvents
+              .whereType<MediaItem>()
+              .map((m) => (m.id, m.artUri)),
+          [('a', null), ('b', null)]);
     });
 
     test('a clear drops artwork still pending for the cleared item',
@@ -578,7 +635,13 @@ void main() {
       await starting;
       await stopping;
       await pumpEventQueue();
-      expect(bridge.mediaItemEvents.whereType<MediaItem>(), isEmpty);
+      // a's metadata was published at once (decision 7); its late art is
+      // not published after the clear.
+      expect(
+          bridge.mediaItemEvents
+              .whereType<MediaItem>()
+              .map((m) => (m.id, m.artUri)),
+          [('a', null)]);
       expect(bridge.mediaItemEvents.last, isNull);
     });
 
@@ -678,7 +741,148 @@ void main() {
       await fail();
       expect(issues, contains(const LocalFileMissing('a', '/dl/a')));
       expect(c.read(currentTrackProvider)?.uuidId, 'b');
-      expect(fakePlayer.seekCauses.last, PlaybackTransitionCause.naturalAdvance);
+      // A recovery skip re-seeds at the target (live gate: a seek after a
+      // failed load never loads on macOS).
+      expect(
+          (fakePlayer.seedCalls.last.currentItemId,
+              fakePlayer.seedCalls.last.cause),
+          ((await sessionTracksOf(c)).firstWhere((e) =>
+                  e.uuidId == c.read(currentTrackProvider)?.uuidId).itemId,
+              PlaybackTransitionCause.naturalAdvance));
+    });
+
+    // Decision 6 (user, 2026-11-07): a download on disk that fails to play
+    // is damaged. It is kept, stops being claimed as a download, and the
+    // undecided play streams online or skips offline.
+    Future<String?> damagedPathOf(String uuid) async =>
+        (await (db.select(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+                .getSingle())
+            .damagedFilePath;
+
+    // Review major 1 (user, 2026-11-09): marked only with evidence. Online
+    // the failing download streams and is marked once that stream plays;
+    // offline it is skipped and never marked.
+    test('online, a damaged download streams and is marked once the stream '
+        'plays', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('a')))
+          .write(const TrackmetadataCompanion(codec: Value('alac')));
+      existingFiles.add('/dl/a');
+      final c = await playingList(const ['a', 'b']);
+      final seeks = fakePlayer.seekedItems.length;
+      await fail();
+      await fail(); // the same source reported again: handled once
+      expect(issues.whereType<PlaybackSourceFailed>().map((i) => i.kind),
+          [SourceFailureKind.damagedLocalFile]);
+      expect(await damagedPathOf('a'), isNull, reason: 'no evidence yet');
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'), isTrue,
+          reason: 'every rebuild streams it meanwhile');
+      expect(fakePlayer.refreshedSources.single.newHasFile, isFalse,
+          reason: 'the current source is rebuilt as the stream, once');
+      expect(fakePlayer.refreshedSources.single.entry?.sourceCodec, 'alac',
+          reason: 'the stand-in keeps its codecs (an undecodable "original" '
+              'streams transcoded)');
+      expect(fakePlayer.seekedItems, hasLength(seeks), reason: 'no skip');
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+
+      fakePlayer.emitObservation(playing: true); // the stream plays
+      await pumpEventQueue();
+      expect(await damagedPathOf('a'), '/dl/a');
+      expect((await fixture.track('a')).filePath, '/dl/a',
+          reason: 'kept with its details; the mark makes it unusable');
+      expect(existingFiles, contains('/dl/a'), reason: 'never deleted');
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'), isFalse,
+          reason: 'the mark took over');
+    });
+
+    test('online, when the stream fails too, nothing is marked', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      existingFiles.add('/dl/a');
+      trackStatuses['a'] = 200;
+      final c = await playingList(const ['a', 'b']);
+      await fail();
+      await fail(sourceId: 4242); // the stream standing in fails as well
+      expect(issues.whereType<PlaybackSourceFailed>().map((i) => i.kind),
+          [SourceFailureKind.damagedLocalFile, SourceFailureKind.unknown]);
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'), isFalse,
+          reason: 'no evidence against the file: it is tried again later');
+      fakePlayer.emitObservation(playing: true); // a later play proves nothing
+      await pumpEventQueue();
+      expect(await damagedPathOf('a'), isNull);
+    });
+
+    test('online, moving on before the stream plays marks nothing', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      existingFiles.add('/dl/a');
+      final c = await playingList(const ['a', 'b']);
+      await fail();
+      await c.read(queuePlayerProvider.notifier).skipNext();
+      await pumpEventQueue();
+      fakePlayer.emitObservation(playing: true); // b plays
+      await pumpEventQueue();
+      expect(await damagedPathOf('a'), isNull);
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'), isFalse);
+    });
+
+    test('review: a stream failing after its download committed never marks '
+        'the new download damaged', () async {
+      await fixture.insertSingles(['a', 'b']);
+      trackStatuses['a'] = 200; // the server still has it
+      final c = await playingList(const ['a', 'b']); // a streams
+      await markDownloaded('a', '/dl/a'); // its download commits meanwhile
+      await fail(); // then the (stream) source fails
+      expect(issues.whereType<PlaybackSourceFailed>().map((i) => i.kind),
+          [SourceFailureKind.unknown],
+          reason: 'classified as the stream it was, not the new file');
+      expect((await fixture.track('a')).filePath, '/dl/a', reason: 'kept');
+      expect(await damagedPathOf('a'), isNull);
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+    });
+
+    test('offline, a damaged download is skipped and never marked', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      await markDownloaded('b', '/dl/b');
+      existingFiles.addAll(['/dl/a', '/dl/b']);
+      final c = await playingList(const ['a', 'b'], offline: true);
+      await fail();
+      expect(issues.whereType<PlaybackSourceFailed>().map((i) => i.kind),
+          [SourceFailureKind.damagedLocalFile]);
+      expect(await damagedPathOf('a'), isNull);
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'), isFalse);
+      expect(existingFiles, contains('/dl/a'));
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      // A recovery skip re-seeds at the target (live gate: a seek after a
+      // failed load never loads on macOS).
+      expect(
+          (fakePlayer.seedCalls.last.currentItemId,
+              fakePlayer.seedCalls.last.cause),
+          ((await sessionTracksOf(c)).firstWhere((e) =>
+                  e.uuidId == c.read(currentTrackProvider)?.uuidId).itemId,
+              PlaybackTransitionCause.naturalAdvance));
+    });
+
+    test('offline, a platform failure of every download marks none and stops '
+        'after one pass (major 1 cascade)', () async {
+      const uuids = ['a', 'b', 'c', 'd'];
+      await fixture.insertSingles(uuids);
+      for (final u in uuids) {
+        await markDownloaded(u, '/dl/$u');
+        existingFiles.add('/dl/$u');
+      }
+      final c = await playingList(uuids, offline: true);
+      for (var i = 0; i < uuids.length + 2; i++) {
+        await fail();
+      }
+      for (final u in uuids) {
+        expect(await damagedPathOf(u), isNull, reason: u);
+      }
+      expect(issues.whereType<PlaybackSourceFailed>(), hasLength(uuids.length),
+          reason: 'the loop guard stops the run after one pass');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
     });
 
     test('a track deleted on the server (404) is gone and skipped', () async {
@@ -712,6 +916,90 @@ void main() {
           [SourceFailureKind.transient]);
       expect(c.read(currentTrackProvider)?.uuidId, 'a');
       expect(fakePlayer.stopCalls, 0);
+    });
+
+    // Decision 1 (user, 2026-11-07; 5B.0d M2): offline, a failed stream is
+    // treated like an unavailable item and playback moves on to the next
+    // downloaded one. Online behaviour is unchanged.
+    Future<(ProviderContainer, _MutableOffline)> streamingOnline() async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await markDownloaded('c', '/dl/c');
+      existingFiles.add('/dl/c');
+      final offline = _MutableOffline();
+      final c = createContainer(offlineNotifier: () => offline);
+      issues = [];
+      c.read(playbackIssueBusProvider).issues.listen(issues.add);
+      await playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('a'), sourceType: 'test');
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      return (c, offline);
+    }
+
+    test('offline, a failed stream skips to the next downloaded item',
+        () async {
+      final (c, offline) = await streamingOnline();
+      offline.set(true); // the network dropped
+      await pumpEventQueue();
+      await fail(); // then the stream errors
+      expect(issues.whereType<PlaybackSourceFailed>().map((i) => i.kind),
+          [SourceFailureKind.transient]);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c',
+          reason: 'b is not downloaded; c is');
+      // A recovery skip re-seeds at the target (live gate: a seek after a
+      // failed load never loads on macOS).
+      expect(
+          (fakePlayer.seedCalls.last.currentItemId,
+              fakePlayer.seedCalls.last.cause),
+          ((await sessionTracksOf(c)).firstWhere((e) =>
+                  e.uuidId == c.read(currentTrackProvider)?.uuidId).itemId,
+              PlaybackTransitionCause.naturalAdvance));
+    });
+
+    test('a stream failing as the network drops is rescued once offline is '
+        'known', () async {
+      final (c, offline) = await streamingOnline();
+      final gate = probeGate = Completer<void>();
+      final failing = fail(); // the track check is waiting for an answer
+      await pumpEventQueue();
+      offline.set(true); // the check's own network failure enters offline
+      gate.complete(); // no answer
+      await failing;
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    test('a transient stream failure online is rescued when the app goes '
+        'offline later', () async {
+      final (c, offline) = await streamingOnline();
+      await fail(); // no answer, still online: no skip
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      offline.set(true);
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    test('going offline rescues nothing once the user moved on', () async {
+      final (c, offline) = await streamingOnline();
+      await fail();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.skipToTrack((await sessionTracksOf(c))[1].itemId);
+      await pumpEventQueue();
+      offline.set(true);
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'b',
+          reason: "b's stream did not fail; it is not skipped");
+    });
+
+    test('going offline rescues nothing once the failed stream played',
+        () async {
+      final (c, offline) = await streamingOnline();
+      await fail();
+      fakePlayer.emitObservation(playing: true); // the stream recovered
+      await pumpEventQueue();
+      offline.set(true);
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
     });
 
     test('a failure of a track the server still has is unknown, no skip',
@@ -802,8 +1090,8 @@ void main() {
       for (var i = 0; i < 4; i++) {
         await fail();
       }
-      expect(issues.whereType<PlaybackRecoveryExhausted>(), hasLength(1));
       expect(fakePlayer.stopCalls, 1);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
       expect(fakePlayer.seekedItems.length, lessThanOrEqualTo(2),
           reason: 'a and b are skipped once; c would wrap back to a');
     });
@@ -819,7 +1107,7 @@ void main() {
       for (var i = 0; i < 4; i++) {
         await fail();
       }
-      expect(issues.whereType<PlaybackRecoveryExhausted>(), hasLength(1));
+      expect(fakePlayer.stopCalls, 1, reason: 'the failure run stopped');
       final before = issues.whereType<PlaybackSourceFailed>().length;
       await c.read(queuePlayerProvider.notifier).resume(); // the user taps Play
       await fail(sourceId: 4242);
@@ -1820,8 +2108,8 @@ void main() {
         fakePlayer.emitSourceFailure();
         await pumpEventQueue();
       }
-      expect(issues.whereType<PlaybackRecoveryExhausted>(), hasLength(1));
       expect(fakePlayer.stopCalls, 1);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
       expect(
           issues.whereType<PlaybackSourceFailed>().map((i) => i.trackUuid),
           unorderedEquals(uuids),
@@ -1923,7 +2211,7 @@ void main() {
         fakePlayer.emitSourceFailure();
         await pumpEventQueue();
       }
-      expect(issues.whereType<PlaybackRecoveryExhausted>(), hasLength(1));
+      expect(fakePlayer.stopCalls, 1, reason: 'the failure run stopped');
       final failures = issues.whereType<PlaybackSourceFailed>().length;
       await notifier.skipToTrack((await sessionTracksOf(c))[1].itemId);
       fakePlayer.emitSourceFailure(sourceId: 4242);
@@ -4102,14 +4390,20 @@ class _ObservedStartupRepository extends QueueRepository {
 }
 
 class _GatedCoverArt extends CoverArtCacheManager {
-  _GatedCoverArt() : super.noop();
+  _GatedCoverArt({this.local}) : super.noop();
+  final Uri? local;
   final entered = Completer<void>();
   final release = Completer<Uri?>();
+  int resolveCalls = 0;
+  @override
+  Uri? localArtUri(int coverArtId) => local;
   @override
   Future<Uri?> resolveArtUri({required bool hasAlbumArt, required int? coverArtId}) {
     if (!hasAlbumArt || coverArtId == null) return Future.value(null);
-    entered.complete();
-    return release.future;
+    resolveCalls++;
+    if (!entered.isCompleted) entered.complete();
+    // Only the first lookup is gated; later items resolve to no art.
+    return resolveCalls == 1 ? release.future : Future.value(null);
   }
 }
 
@@ -4262,6 +4556,7 @@ class FakePlaybackEngine
           itemId: newEntry.itemId,
           oldHadFile: oldHadFile,
           newHasFile: newHasFile,
+          entry: newEntry,
         ),
       );
       if (newEntry.itemId == _committedCurrentItemId &&
@@ -4415,7 +4710,9 @@ class FakePlaybackEngine
               sourceId: sourceId ?? entry.itemId + _failureSourceIds,
               sessionId: null,
               itemId: entry.itemId,
-              trackUuid: entry.uuidId),
+              trackUuid: entry.uuidId,
+              // Like the engine: what the loaded source plays.
+              localPath: (entry.filePath?.isEmpty ?? true) ? null : entry.filePath),
       uncertain: uncertain,
       errorCode: code,
     ));
@@ -4588,11 +4885,13 @@ class RefreshedSource {
   final int itemId;
   final bool oldHadFile;
   final bool newHasFile;
+  final QueuePlaybackEntry? entry;
 
   const RefreshedSource({
     required this.itemId,
     required this.oldHadFile,
     required this.newHasFile,
+    this.entry,
   });
 }
 

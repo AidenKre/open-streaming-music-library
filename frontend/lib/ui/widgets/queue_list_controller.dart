@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/playback_availability.dart';
+import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
@@ -76,6 +77,7 @@ final queueListControllerFactoryProvider =
         repository: ref.read(queueRepositoryProvider),
         player: ref.read(playerControlsProvider),
         isOffline: () => ref.read(offlineModeProvider),
+        codecs: () => ref.read(codecSupportProvider),
       ),
     );
 
@@ -84,9 +86,11 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     required QueueRepository repository,
     required PlayerControls player,
     required bool Function() isOffline,
+    CodecSupport Function()? codecs,
   }) : _repo = repository,
        _player = player,
-       _isOffline = isOffline;
+       _isOffline = isOffline,
+       _codecs = codecs ?? (() => const CodecSupport.unknown());
 
   static const pageSize = 80;
   static const initialLeadingCount = 40;
@@ -95,6 +99,9 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
   final QueueRepository _repo;
   final PlayerControls _player;
   final bool Function() _isOffline;
+
+  /// A download in a codec this device can't decode doesn't play offline.
+  final CodecSupport Function() _codecs;
 
   List<QueueTrackEntry> _tracks = const [];
   int _startPlayPosition = 0;
@@ -114,6 +121,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
   @override
   List<QueueRow> get rows {
     final offline = _isOffline();
+    final codecs = _codecs();
     return [
       for (final e in _tracks)
         QueueRow(
@@ -121,6 +129,8 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
           PlaybackAvailability.of(
             offline: offline,
             downloaded: e.track.isDownloaded ? 1 : 0,
+            undecodable:
+                e.track.isDownloaded && !codecs.playsDownload(e.track) ? 1 : 0,
             total: 1,
           ),
         ),

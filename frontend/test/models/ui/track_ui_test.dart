@@ -381,7 +381,9 @@ void main() {
         const values = <int?>[null, 4, 5, 6];
         var i = 0;
         final expected = <String, bool>{};
-        for (final hasFile in [true, false]) {
+        // Damaged (decision 6): the file is kept, but it is not a usable
+        // download, so never stale.
+        for (final (hasFile, damaged) in [(true, false), (false, false), (true, true)]) {
           for (final rev in values) {
             for (final dl in values) {
               for (final dismissed in values) {
@@ -389,8 +391,10 @@ void main() {
                 await db.customStatement(
                   'INSERT INTO tracks (uuid_id, created_at, last_updated, '
                   'revision, file_path, downloaded_at_revision, '
-                  'stale_dismissed_at_revision) VALUES (?, 0, 0, ?, ?, ?, ?)',
-                  [uuid, rev, hasFile ? '/f/$uuid' : null, dl, dismissed],
+                  'stale_dismissed_at_revision, damaged_file_path) '
+                  'VALUES (?, 0, 0, ?, ?, ?, ?, ?)',
+                  [uuid, rev, hasFile ? '/f/$uuid' : null, dl, dismissed,
+                   damaged ? '/f/$uuid' : null],
                 );
                 await db.customStatement(
                   'INSERT INTO trackmetadata (uuid_id, duration, '
@@ -411,6 +415,7 @@ void main() {
                   hasAlbumArt: false,
                   downloadedAtRevision: dl,
                   staleDismissedAtRevision: dismissed,
+                  damagedFilePath: damaged ? '/f/$uuid' : null,
                 ).isStaleDownload;
               }
             }

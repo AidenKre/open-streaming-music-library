@@ -45,6 +45,8 @@ class _GatedHistory extends HistoryRepository {
       failures--;
       throw StateError('disk full');
     }
+    // Like the real repository: a payload that can never be valid.
+    if (event.entityRef.isEmpty) throw ArgumentError('empty entity_ref');
     inserted.add((bindingToken, event.entityRef));
   }
 }
@@ -84,6 +86,19 @@ void main() {
     history.fencedTokens.add('b1'); // b1's store was reset
     await recorder.record(const HistoryIntent.track('b'));
     expect(history.inserted, [('b2', 'b')]);
+  });
+
+  test('review: a click that can never be valid is dropped, not retried '
+      'ahead of the rest', () async {
+    final db = AppDatabase(NativeDatabase.memory());
+    addTearDown(db.close);
+    final history = _GatedHistory(db);
+    final recorder = ClickRecorder(
+        history: history, binding: _Binding(db), clock: FakeClock());
+    await recorder.record(const HistoryIntent.track(''));
+    await recorder.record(const HistoryIntent.track('a'));
+    await recorder.record(const HistoryIntent.track('b'));
+    expect(history.inserted, [('b1', 'a'), ('b1', 'b')]);
   });
 
   test('unsaved clicks are bounded; the oldest are dropped first', () async {

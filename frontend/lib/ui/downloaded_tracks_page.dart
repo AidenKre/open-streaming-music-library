@@ -8,6 +8,7 @@ import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
+import 'package:frontend/ui/widgets/damaged_downloads_section.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
@@ -81,6 +82,7 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          const DamagedDownloadsSection(),
           header,
           Expanded(
             child: paginatedItems.isEmpty && !hasMore

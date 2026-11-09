@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/playback/codec_support.dart';
+import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
@@ -167,5 +169,29 @@ void main() {
     final result = await pending;
     expect(result.target?.sourceKind, PlaybackSourceKind.local);
     expect(result.issues, isEmpty);
+  });
+
+  // Review major 1: the resolver uses the playback policy, so a download in a
+  // codec this device can't decode, or one suspected after a failure, is not
+  // a local target (offline it is skipped, never retried as a file).
+  test('offline, an undecodable or suspected download is skipped', () async {
+    final policy = LocalSourcePolicy(
+        codecs: const CodecSupport({AudioCodecFamily.mp3}));
+    final withPolicy = PlaybackTargetResolver(queue,
+        fileExists: (path) async => existing.contains(path),
+        localSources: policy);
+    queue.entries = [
+      QueuePlaybackEntry(itemId: 1, queueType: QueueItemTypes.main,
+          canonicalPosition: 0, playPosition: 0, uuidId: 't1',
+          filePath: '/a', downloadedCodec: 'flac'),
+      entry(2, path: '/b'),
+      entry(3, path: '/c'),
+    ];
+    existing.addAll(['/a', '/b', '/c']);
+    policy.suspect('t2', '/b');
+    final result = await withPolicy.resolveStart(sessionId: 1,
+        preferredItemId: 1, totalCount: 3, offline: true);
+    expect(result.target?.entry.itemId, 3);
+    expect(result.issues, isEmpty, reason: 'neither file is missing');
   });
 }

@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 
 import 'package:just_audio/just_audio.dart' as ja;
 
+import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_engine.dart';
 import 'package:frontend/playback/track_cache_manager.dart';
 import 'package:frontend/repositories/queue_repository.dart';
@@ -70,15 +71,20 @@ class JustAudioEngine implements PlaybackEngine {
   /// Audio focus gate at the single play() choke point (SC-27 invariant 5).
   final Future<bool> Function()? _beforePlay;
 
+  /// Whether an entry plays from its download (shared with the resolver
+  /// and the queue player).
+  final LocalSourcePolicy _localSources;
+
   /// Quality preset applied to NEW source URIs. Existing in-flight sources
   /// keep whatever quality they were created with — quality switches take
   /// effect at the next track boundary.
   String _streamQuality = originalQuality;
 
   JustAudioEngine(this._player, {bool Function()? isOfflineFn,
-      Future<bool> Function()? beforePlay})
+      Future<bool> Function()? beforePlay, LocalSourcePolicy? localSources})
       : _isOfflineFn = isOfflineFn ?? (() => false),
-        _beforePlay = beforePlay {
+        _beforePlay = beforePlay,
+        _localSources = localSources ?? LocalSourcePolicy() {
     _currentIndexSubscription = _player.currentIndexStream.listen(
       _onCurrentIndexChanged,
     );
@@ -92,6 +98,7 @@ class JustAudioEngine implements PlaybackEngine {
   factory JustAudioEngine.create({
     bool Function()? isOfflineFn,
     Future<bool> Function()? beforePlay,
+    LocalSourcePolicy? localSources,
     ja.AudioPlayer Function({required bool handleInterruptions})? newPlayer,
   }) {
     // Interruptions and noisy output are routed through AudioFocus into
@@ -103,6 +110,7 @@ class JustAudioEngine implements PlaybackEngine {
       build(handleInterruptions: false),
       isOfflineFn: isOfflineFn,
       beforePlay: beforePlay,
+      localSources: localSources,
     );
   }
 
@@ -142,6 +150,20 @@ class JustAudioEngine implements PlaybackEngine {
       _wantPlaying = false;
       _emitTransport();
     }
+    if (_failedSinceLoad) {
+      // Live gate (2026-11-07, macOS): after a source error the plugin sits
+      // deactivated, or stuck loading the dead source, with `playing` still
+      // true, so a seek, a play or a plain new seed never starts the next
+      // item (a new load would also interrupt the stuck activation). A stop
+      // resets it; just_audio applies it synchronously, before the load
+      // below. It is not a reverted play: the desired transport (decided
+      // just above) stays.
+      _failedSinceLoad = false;
+      _playIssued = false;
+      unawaited(_player.stop().catchError((Object error) {
+        developer.log('Reset stop failed', name: 'JustAudioEngine', error: error);
+      }));
+    }
 
     final seed = () async {
       try {
@@ -171,6 +193,10 @@ class JustAudioEngine implements PlaybackEngine {
         }
         // The playlist itself was set before the load failed.
         _applied = _seeded(sources);
+        // The load event is this failure's report; the copy the plugin also
+        // put on its error stream (Android) is not re-reported at settle.
+        _heldFailure = null;
+        _failedSinceLoad = true;
         developer.log('Load failed', name: 'JustAudioEngine', error: error);
         _emitLoad(revision, EngineLoadOutcome.failed,
             errorCode: error.code, errorMessage: error.message);
@@ -179,6 +205,7 @@ class JustAudioEngine implements PlaybackEngine {
             error: error, stackTrace: stackTrace);
         if (generation == _generation) {
           _applied = _seeded(sources);
+          _heldFailure = null; // reported by the load event
           _emitLoad(revision, EngineLoadOutcome.failed,
               errorMessage: '$error');
         } else {
@@ -374,9 +401,12 @@ class JustAudioEngine implements PlaybackEngine {
     final changes = <_SourceAvailabilityChange>[];
     for (final old in _issued) {
       final newEntry = byItemId[old.entry.itemId] ?? old.entry;
-      final oldKind = _sourceKindFor(old.entry);
+      // What the source was built from, not what its entry says now: the
+      // policy may have changed its mind about the same entry (a suspect).
+      final oldPath = old.identity.localPath;
+      final oldKind = oldPath != null ? _SourceKind.file : _SourceKind.stream;
       final newKind = _sourceKindFor(newEntry);
-      if (oldKind == newKind && old.entry.filePath == newEntry.filePath) {
+      if (oldKind == newKind && oldPath == _localSources.localPathFor(newEntry)) {
         continue;
       }
       final replacement = _newSource(newEntry);
@@ -456,17 +486,16 @@ class JustAudioEngine implements PlaybackEngine {
     });
   }
 
-  /// Whether [entry] should play from a local file. Decided purely from the
-  /// DB-provided `file_path`: the DownloadReconciliationService is the single
+  /// Whether [entry] should play from a local file. Decided from the
+  /// DB-provided `file_path` (a usable download only) through the shared
+  /// [LocalSourcePolicy]: the DownloadReconciliationService is the single
   /// authority for whether a downloaded file is present (it nulls stale paths
   /// on startup and on every app resume), and app-initiated deletes null the
   /// path synchronously. Trusting it keeps this off the event loop — the old
   /// per-build/per-transition `File.existsSync()` blocked the isolate and could
   /// misclassify a present file as a stream on a transient stat failure.
-  bool _hasLocalFile(QueuePlaybackEntry entry) {
-    final localPath = entry.filePath;
-    return localPath != null && localPath.isNotEmpty;
-  }
+  bool _hasLocalFile(QueuePlaybackEntry entry) =>
+      _localSources.localPathFor(entry) != null;
 
   _SourceKind _sourceKindFor(QueuePlaybackEntry entry) {
     return _hasLocalFile(entry) ? _SourceKind.file : _SourceKind.stream;
@@ -479,6 +508,10 @@ class JustAudioEngine implements PlaybackEngine {
     if (_indexOf(_issued, itemId) == null) {
       throw StateError('Cannot seek to an item that has not been hydrated');
     }
+    // A failure held for the item being left is not the target's (review
+    // 2026-11-07): the core has moved on, and at the seek's settle it would
+    // be blamed on the wrong source.
+    if (itemId != _committedCurrentItemId) _heldFailure = null;
     // The issued model moves at once (callers see the new current item);
     // observations settle on it once the plugin has applied the seek.
     _commitCurrentItem(itemId, emit: true);
@@ -569,6 +602,7 @@ class JustAudioEngine implements PlaybackEngine {
     if (_isDisposed) return;
     _wantPlaying = false;
     _playIssued = false;
+    _heldFailure = null; // stopped: nothing left to recover
     _emitTransport();
     _direct(_player.stop(), 'stop');
     _observe(cause: PlaybackTransitionCause.stop);
@@ -739,7 +773,10 @@ class JustAudioEngine implements PlaybackEngine {
           itemId: unavailable.itemId,
           playPosition: unavailable.playPosition,
         ));
-        // The core is rescuing: nothing trustworthy to attribute yet.
+        // The core is rescuing: nothing trustworthy to attribute yet, and
+        // a held failure (the unavailable item's) must not reach a later,
+        // unrelated settle.
+        _heldFailure = null;
         _emitObservation(_settled, cause: settledCause, uncertain: true);
         return;
       }
@@ -763,6 +800,7 @@ class JustAudioEngine implements PlaybackEngine {
   /// plugin reverted (audio-session activation failed) clears it.
   void _onPluginState(ja.PlayerState state) {
     _processing = _processingFrom(state.processingState);
+    if (_processing == EngineProcessingState.ready) _failedSinceLoad = false;
     if (_processing == EngineProcessingState.completed &&
         _pendingTransitions > 0) {
       // A rebuild or refresh removes a source before inserting its
@@ -799,6 +837,7 @@ class JustAudioEngine implements PlaybackEngine {
   /// recovery belong to the playback core).
   void _onSourceError(ja.PlayerException error) {
     if (_isDisposed || _sourceFailuresController.isClosed) return;
+    _failedSinceLoad = true;
     final uncertain = _pendingTransitions > 0;
     final failure = EngineSourceFailure(
       playlistRevision: _playlistRevision,
@@ -816,6 +855,10 @@ class JustAudioEngine implements PlaybackEngine {
 
   /// An uncertain failure waiting for its transition to settle.
   ja.PlayerException? _heldFailure;
+
+  /// A source failed since the plugin last became ready: the next seed
+  /// resets the plugin first (see [setSeed]).
+  bool _failedSinceLoad = false;
 
   /// At settle: if the plugin stopped on the failure, it was the settled
   /// current source's (a failure during an insert or rebuild would else be
@@ -964,19 +1007,23 @@ class JustAudioEngine implements PlaybackEngine {
           sessionId: _sessionId,
           itemId: entry.itemId,
           trackUuid: entry.uuidId,
+          localPath: _localSources.localPathFor(entry),
         ),
       );
 
   ja.AudioSource _audioSourceFor(QueuePlaybackEntry entry) {
-    if (_hasLocalFile(entry)) {
+    final localPath = _localSources.localPathFor(entry);
+    if (localPath != null) {
       // Local file is always served verbatim — quality preset doesn't apply.
       return ja.AudioSource.uri(
-        Uri.file(entry.filePath!),
+        Uri.file(localPath),
         tag: entry.itemId,
       );
     }
     return ja.AudioSource.uri(
-      buildTrackStreamUri(entry.uuidId, quality: _streamQuality),
+      // A codec this device can't decode streams transcoded (major 1).
+      buildTrackStreamUri(entry.uuidId,
+          quality: _localSources.streamQualityFor(entry, _streamQuality)),
       tag: entry.itemId,
     );
   }

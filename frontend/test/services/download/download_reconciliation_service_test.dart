@@ -30,6 +30,11 @@ Future<void> _insertTrack(
       );
 }
 
+Future<String?> _damagedPath(AppDatabase db, String uuid) async =>
+    (await (db.select(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+            .getSingle())
+        .damagedFilePath;
+
 Future<({String? filePath, int? bitrate, int? size, String? quality})>
     _readDownloadState(AppDatabase db, String uuid) async {
   final row = await (db.select(db.tracks)
@@ -94,6 +99,69 @@ void main() {
     expect(await service.reconcileTrack('a'), isTrue);
     expect((await _readDownloadState(db, 'a')).filePath, isNull);
     expect((await _readDownloadState(db, 'b')).filePath, kept.path);
+  });
+
+  // Decision 6: a download that exists but failed to play.
+  group('markDamaged', () {
+    test('marks the path damaged and keeps the download and its details '
+        '(2026-11-09: the re-download knows the original quality)', () async {
+      await _insertTrack(db, 'a',
+          filePath: '/dl/a.m4a',
+          downloadedBitrateKbps: 320, fileSizeBytes: 9, downloadedQuality: '320');
+      final before = reader.downloadStatusVersion.value;
+      expect(await service.markDamaged('a', '/dl/a.m4a'), isTrue);
+      final state = await _readDownloadState(db, 'a');
+      expect(state,
+          (filePath: '/dl/a.m4a', bitrate: 320, size: 9, quality: '320'));
+      expect(await _damagedPath(db, 'a'), '/dl/a.m4a');
+      expect(reader.downloadStatusVersion.value, before + 1);
+      // A second mark of the same file changes nothing.
+      expect(await service.markDamaged('a', '/dl/a.m4a'), isFalse);
+      expect(reader.downloadStatusVersion.value, before + 1);
+    });
+
+    test('a damaged download is not a usable one: no Downloaded status',
+        () async {
+      final file = File(p.join(tmp.path, 'a.m4a'))..writeAsStringSync('x');
+      await _insertTrack(db, 'a', filePath: file.path);
+      expect(await reader.downloadedUuidsForUuids(['a']), {'a'});
+      await service.markDamaged('a', file.path);
+      expect(await reader.downloadedUuidsForUuids(['a']), isEmpty);
+    });
+
+    test('the full reconcile clears a damaged download whose file is gone',
+        () async {
+      await _insertTrack(db, 'a',
+          filePath: p.join(tmp.path, 'gone.m4a'), downloadedQuality: '320');
+      await service.markDamaged('a', p.join(tmp.path, 'gone.m4a'));
+      expect(await service.reconcile(), isTrue);
+      expect((await _readDownloadState(db, 'a')).filePath, isNull);
+      expect(await _damagedPath(db, 'a'), isNull);
+    });
+
+    test('a path that changed meanwhile (a new download) wins', () async {
+      await _insertTrack(db, 'a', filePath: '/dl/new-a.m4a');
+      expect(await service.markDamaged('a', '/dl/old-a.m4a'), isFalse);
+      expect((await _readDownloadState(db, 'a')).filePath, '/dl/new-a.m4a');
+      expect(await _damagedPath(db, 'a'), isNull);
+    });
+
+    test('the full reconcile forgets a pre-2026-11-09 damaged file (path '
+        'moved off file_path) that is gone, keeps one that is still there',
+        () async {
+      final kept = File(p.join(tmp.path, 'kept.m4a'));
+      await kept.writeAsString('bad audio');
+      await _insertTrack(db, 'a');
+      await _insertTrack(db, 'b');
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
+          .write(TracksCompanion(
+              damagedFilePath: Value(p.join(tmp.path, 'gone.m4a'))));
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('b')))
+          .write(TracksCompanion(damagedFilePath: Value(kept.path)));
+      expect(await service.reconcile(), isTrue);
+      expect(await _damagedPath(db, 'a'), isNull);
+      expect(await _damagedPath(db, 'b'), kept.path);
+    });
   });
 
   test('a one-track reconcile keeps a path that changed meanwhile', () async {

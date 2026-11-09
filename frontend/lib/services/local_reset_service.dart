@@ -30,6 +30,12 @@ import 'package:frontend/services/server_binding_gate.dart';
 ///     so a failure in one subsystem cannot strand the rest in a
 ///     half-reset state.
 ///
+/// A durable `resetPending` flag (review major 2, user 2026-11-09) is saved
+/// before the fence and cleared only once every wipe step succeeded. A reset
+/// the app was killed in, or whose wipe failed, is finished by
+/// [completePendingReset] at the next launch or login, before anything
+/// binds or syncs, so the next server can never adopt the old store.
+///
 /// Quiesce and wipe failures are aggregated into one [LocalResetException].
 /// New subsystems join by implementing [Quiescable] / [LocalResettable]
 /// (or adding a thin adapter) and registering in the providers — no edits
@@ -74,21 +80,34 @@ class LocalResetService {
   static const uncountedLossSummary =
       'Some unsent changes could not be counted';
 
+  /// The SharedPreferences key of the durable reset marker. The prefs wipe
+  /// keeps it; only a fully successful wipe removes it.
+  static const resetPendingKey = 'resetPending';
+
+  /// A reset started and has not finished its wipe (killed, or a wipe step
+  /// failed): [completePendingReset] must run before anything binds.
+  Future<bool> hasPendingReset() async {
+    final prefs = await _ref.read(sharedPreferencesProvider.future);
+    return prefs.getBool(resetPendingKey) ?? false;
+  }
+
   Future<void> reset() async {
-    // 1. Fence. The generation bump happens before the first await.
+    // 1. Fence. The generation bump happens before the first await. The
+    // pending marker is saved first: a kill from here on is finished by the
+    // next launch.
     _generation++;
     try {
+      final prefs = await _ref.read(sharedPreferencesProvider.future);
+      if (!await prefs.setBool(resetPendingKey, true)) {
+        throw StateError('the reset marker could not be saved');
+      }
       await _ref.read(serverBindingRepositoryProvider).fence();
     } catch (e) {
-      // A wipe would most likely fail too: report and stop.
+      // A wipe would most likely fail too: report and stop. (A saved marker
+      // makes the next launch wipe anyway, as the user asked for.)
       throw LocalResetAbortedException(e);
     }
-    // The fence stops local writes; the gate must stop handing out the old
-    // verified token too, or a request started now (an edit flush, a sync)
-    // would still reach the server with what the user was told is lost.
-    if (_ref.exists(serverBindingGateProvider)) {
-      _ref.read(serverBindingGateProvider).stop();
-    }
+    _stopGate();
 
     final failures = <LocalResetFailure>[];
 
@@ -102,8 +121,47 @@ class LocalResetService {
     }
 
     // 3. Wipe.
+    await _wipe(failures);
+    if (failures.isNotEmpty) {
+      throw LocalResetException(failures);
+    }
+  }
+
+  /// Finishes a reset that never completed its wipe (review major 2): the
+  /// app was killed during it, or a wipe step failed. Fence and wipe again;
+  /// nothing runs yet, so there is nothing to quiesce. Clears the marker
+  /// only when the whole wipe succeeds; throws like [reset] otherwise.
+  Future<void> completePendingReset() async {
+    _generation++;
+    try {
+      await _ref.read(serverBindingRepositoryProvider).fence();
+    } catch (e) {
+      throw LocalResetAbortedException(e);
+    }
+    _stopGate();
+    final failures = <LocalResetFailure>[];
+    await _wipe(failures);
+    if (failures.isNotEmpty) {
+      throw LocalResetException(failures);
+    }
+  }
+
+  /// The fence stops local writes; the gate must stop handing out the old
+  /// verified token too, or a request started now (an edit flush, a sync)
+  /// would still reach the server with what the user was told is lost.
+  void _stopGate() {
+    if (_ref.exists(serverBindingGateProvider)) {
+      _ref.read(serverBindingGateProvider).stop();
+    }
+  }
+
+  /// Runs every wipe step, then clears the pending marker if all of them
+  /// succeeded. A marker that can't be cleared is reported (else a later
+  /// launch would wipe the next session).
+  Future<void> _wipe(List<LocalResetFailure> failures) async {
     final resettables = [..._ref.read(localResettablesProvider)]
       ..sort((a, b) => b.resetPriority.compareTo(a.resetPriority));
+    var wiped = true;
     for (final r in resettables) {
       try {
         await r.resetLocalState();
@@ -112,10 +170,17 @@ class LocalResetService {
         // half-reset state. Failures are aggregated and rethrown below so
         // the caller can surface the partial-reset condition to the user.
         failures.add(LocalResetFailure(r.runtimeType, e, st, participant: r));
+        wiped = false;
       }
     }
-    if (failures.isNotEmpty) {
-      throw LocalResetException(failures);
+    if (!wiped) return; // the marker stays: the next launch wipes again
+    try {
+      final prefs = await _ref.read(sharedPreferencesProvider.future);
+      if (!await prefs.remove(resetPendingKey)) {
+        throw StateError('the reset marker could not be cleared');
+      }
+    } catch (e, st) {
+      failures.add(LocalResetFailure(LocalResetService, e, st));
     }
   }
 }
@@ -283,7 +348,14 @@ class _PrefsClearResettable implements LocalResettable {
   @override
   Future<void> resetLocalState() async {
     final prefs = await _ref.read(sharedPreferencesProvider.future);
-    await prefs.clear();
+    // Everything but the pending-reset marker, which only a completed wipe
+    // removes (LocalResetService._wipe).
+    for (final key in prefs.getKeys().toList()) {
+      if (key == LocalResetService.resetPendingKey) continue;
+      if (!await prefs.remove(key)) {
+        throw StateError('preference "$key" could not be cleared');
+      }
+    }
   }
 }
 

@@ -74,4 +74,18 @@ void main() {
       PlaybackAvailability.unknown(offline: true),
     );
   });
+
+  // Review major 1: a download in a codec this device can't decode is still
+  // a download (Delete applies) but doesn't play offline.
+  test('an undecodable download does not play offline but can be deleted',
+      () {
+    final offline =
+        PlaybackAvailability.of(offline: true, downloaded: 1, total: 1, undecodable: 1);
+    expect(offline.canPlay, isFalse);
+    expect(offline.hasAnyDownloaded, isTrue);
+    expect(offline.canDownload, isFalse);
+    expect(PlaybackAvailability.of(offline: false, downloaded: 1, total: 1, undecodable: 1).canPlay,
+        isTrue, reason: 'online it streams transcoded');
+    expect(offline == PlaybackAvailability.of(offline: true, downloaded: 1, total: 1), isFalse);
+  });
 }

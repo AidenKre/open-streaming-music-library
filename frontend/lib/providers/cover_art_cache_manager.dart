@@ -101,6 +101,14 @@ class CoverArtCacheManager implements LocalResettable {
   @override
   Future<void> resetLocalState() => clear();
 
+  /// The `file://` URI of locally downloaded art, known without waiting;
+  /// null when it isn't stored locally (then use [resolveArtUri]).
+  Uri? localArtUri(int coverArtId) {
+    final local = _localStore;
+    if (local == null || !local.has(coverArtId)) return null;
+    return Uri.file(local.fileFor(coverArtId).path);
+  }
+
   /// Resolves the best available [Uri] for [MediaItem.artUri].
   ///
   /// Returns a `file://` URI when the image is available locally (either via
@@ -112,10 +120,8 @@ class CoverArtCacheManager implements LocalResettable {
   }) async {
     if (!hasAlbumArt || coverArtId == null) return null;
 
-    final local = _localStore;
-    if (local != null && local.has(coverArtId)) {
-      return Uri.file(local.fileFor(coverArtId).path);
-    }
+    final local = localArtUri(coverArtId);
+    if (local != null) return local;
 
     final url = _url(coverArtId);
     final cache = _cache;

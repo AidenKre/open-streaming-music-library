@@ -15,6 +15,7 @@ import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
@@ -246,6 +247,87 @@ void main() {
     });
   });
 
+  // Review major 2 (user, 2026-11-09): a durable marker makes an interrupted
+  // or failed reset finish before anything binds.
+  group('the pending-reset marker', () {
+    late AppDatabase markerDb;
+    late SharedPreferences markerPrefs;
+    setUp(() async {
+      SharedPreferences.setMockInitialValues({'serverUrl': 'http://a'});
+      markerPrefs = await SharedPreferences.getInstance();
+      markerDb = AppDatabase(NativeDatabase.memory());
+    });
+    tearDown(() => markerDb.close());
+
+    ProviderContainer containerWith(List<LocalResettable> registry,
+        {List<Quiescable> quiescables = const [],
+        ServerBindingRepository? bindings}) {
+      final c = ProviderContainer(overrides: [
+        databaseProvider.overrideWithValue(markerDb),
+        sharedPreferencesProvider.overrideWith((_) async => markerPrefs),
+        localQuiescablesProvider.overrideWithValue(quiescables),
+        localResettablesProvider.overrideWithValue(registry),
+        if (bindings != null)
+          serverBindingRepositoryProvider.overrideWithValue(bindings),
+      ]);
+      addTearDown(c.dispose);
+      return c;
+    }
+
+    test('is set before the fence, survives the wipe, and is cleared once '
+        'every step succeeded', () async {
+      final seen = <bool?>[];
+      final c = containerWith([
+        _Probe(() => seen.add(markerPrefs.getBool('resetPending'))),
+        _PrefsWipe(markerPrefs),
+        _Probe(() => seen.add(markerPrefs.getBool('resetPending'))),
+      ]);
+      await c.read(localResetServiceProvider).reset();
+      expect(seen, [true, true], reason: 'set during the whole wipe');
+      expect(markerPrefs.getBool('resetPending'), isNull);
+      expect(await c.read(localResetServiceProvider).hasPendingReset(),
+          isFalse);
+    });
+
+    test('a failed wipe step keeps it', () async {
+      final c = containerWith([_Throwing(10, [])]);
+      await expectLater(c.read(localResetServiceProvider).reset(),
+          throwsA(isA<LocalResetException>()));
+      expect(await c.read(localResetServiceProvider).hasPendingReset(),
+          isTrue);
+    });
+
+    test('a fence that fails aborts with the marker kept', () async {
+      final c = containerWith([], bindings: _FailingFence(markerDb));
+      await expectLater(c.read(localResetServiceProvider).reset(),
+          throwsA(isA<LocalResetAbortedException>()));
+      expect(markerPrefs.getBool('resetPending'), isTrue);
+    });
+
+    test('completePendingReset fences and wipes without quiescing, then '
+        'clears it', () async {
+      final log = <String>[];
+      final quiesce = _CountingQuiescable();
+      final c = containerWith([_Recording('wipe', 10, log)],
+          quiescables: [quiesce]);
+      await markerPrefs.setBool('resetPending', true);
+      await c.read(serverBindingRepositoryProvider).ensureProvisional('http://a');
+      await c.read(localResetServiceProvider).completePendingReset();
+      expect(log, ['wipe']);
+      expect(quiesce.calls, 0);
+      expect(await c.read(serverBindingRepositoryProvider).current(), isNull);
+      expect(markerPrefs.getBool('resetPending'), isNull);
+    });
+
+    test('a completion whose wipe fails keeps it', () async {
+      final c = containerWith([_Throwing(10, [])]);
+      await markerPrefs.setBool('resetPending', true);
+      await expectLater(c.read(localResetServiceProvider).completePendingReset(),
+          throwsA(isA<LocalResetException>()));
+      expect(markerPrefs.getBool('resetPending'), isTrue);
+    });
+  });
+
   group('LocalResetService priority ordering', () {
     // SC-15: every reset fences first (deletes the binding row), so each
     // container needs a database even when the wipe steps are fakes; no
@@ -404,4 +486,41 @@ void main() {
       expect(log.toSet(), {'a', 'b', 'c'});
     });
   });
+}
+
+class _Probe implements LocalResettable {
+  _Probe(this.onReset);
+  final void Function() onReset;
+  @override
+  int get resetPriority => ResetPriority.wipeDatabase;
+  @override
+  Future<void> resetLocalState() async => onReset();
+}
+
+/// The production prefs wipe's contract: everything but the marker.
+class _PrefsWipe implements LocalResettable {
+  _PrefsWipe(this.prefs);
+  final SharedPreferences prefs;
+  @override
+  int get resetPriority => ResetPriority.clearPreferences;
+  @override
+  Future<void> resetLocalState() async {
+    for (final key in prefs.getKeys().toList()) {
+      if (key != LocalResetService.resetPendingKey) await prefs.remove(key);
+    }
+  }
+}
+
+class _CountingQuiescable implements Quiescable {
+  int calls = 0;
+  @override
+  String get quiesceName => 'counting';
+  @override
+  Future<void> quiesce() async => calls++;
+}
+
+class _FailingFence extends ServerBindingRepository {
+  _FailingFence(super.db);
+  @override
+  Future<void> fence() async => throw StateError('disk full');
 }

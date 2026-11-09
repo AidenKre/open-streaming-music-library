@@ -4,8 +4,9 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/settings_service.dart';
 
-/// Download-queue and stale-download input (SC-26 `DownloadsController`):
-/// the Downloading page and the stale-downloads sheet. Library-scope
+/// Download-queue, stale- and damaged-download input (SC-26
+/// `DownloadsController`): the Downloading page, the stale-downloads sheet
+/// and the Downloaded page's damaged section. Library-scope
 /// downloads/deletes stay on `LibraryActions`.
 abstract interface class DownloadsControls {
   void clearFinished();
@@ -18,6 +19,13 @@ abstract interface class DownloadsControls {
 
   /// Re-download stale copies; how many of [tracks] could not be queued.
   Future<({int failed, int total})> redownloadStale(List<TrackUI> tracks);
+
+  /// Re-download damaged copies at the default download quality; the new
+  /// download replaces the damaged file (decision 6).
+  Future<void> redownloadDamaged(List<TrackUI> tracks);
+
+  /// Delete a damaged copy (its kept file) for good.
+  Future<void> deleteDamaged(String uuidId);
 }
 
 final downloadsControlsProvider = Provider<DownloadsControls>(
@@ -56,4 +64,16 @@ class DownloadsController implements DownloadsControls {
         );
     return (failed: failed, total: tracks.length);
   }
+
+  @override
+  Future<void> redownloadDamaged(List<TrackUI> tracks) => _ref
+      .read(downloadManagerProvider)
+      .redownloadDamaged(
+        tracks,
+        fallbackQuality: _ref.read(downloadQualityProvider),
+      );
+
+  @override
+  Future<void> deleteDamaged(String uuidId) =>
+      _ref.read(downloadManagerProvider).deleteDownload(uuidId);
 }

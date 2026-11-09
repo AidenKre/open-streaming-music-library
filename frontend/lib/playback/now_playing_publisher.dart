@@ -12,9 +12,10 @@ import 'package:frontend/providers/cover_art_cache_manager.dart';
 
 /// OS media-session output (SC-27 observer): publishes now-playing and the
 /// playback state from the core's coherent published state. It never
-/// mutates playback state (invariant 10). Latest wins on
-/// `(sessionId, itemId)`: artwork still resolving for an item that is no
-/// longer current, or after the notification was cleared, is dropped.
+/// mutates playback state (invariant 10). Metadata publishes at once and
+/// the artwork follows. Latest wins on `(sessionId, itemId)`: artwork still
+/// resolving for an item that is no longer current, or after the
+/// notification was cleared, is dropped.
 class NowPlayingPublisher {
   NowPlayingPublisher(this._bridge, this._art, {Clock clock = const SystemClock()})
       : _stopwatch = clock.stopwatch();
@@ -28,6 +29,11 @@ class NowPlayingPublisher {
   Duration _lastPublishedAt = Duration.zero;
   ({int sessionId, int itemId})? _current;
   Object? _currentMetadata;
+
+  /// The art location last published for [_current] (kept across a
+  /// same-item republish, e.g. the measured duration arriving).
+  Uri? _currentArt;
+  ({bool hasAlbumArt, int? coverArtId})? _currentArtSource;
   int _generation = 0;
   bool _cleared = true;
   ({bool playing, PlayerStatus status, int? itemId})? _lastState;
@@ -50,6 +56,8 @@ class NowPlayingPublisher {
       if (_current == null && _cleared) return;
       _current = null;
       _currentMetadata = null;
+      _currentArt = null;
+      _currentArtSource = null;
       _generation++;
       _cleared = true;
       _bridge.clearNowPlaying();
@@ -61,22 +69,36 @@ class NowPlayingPublisher {
     final metadata = (track.title, track.artist, track.album, duration,
         track.hasAlbumArt, track.coverArtId);
     if (key == _current && metadata == _currentMetadata) return;
+    final coverArtId = track.coverArtId;
+    final artSource = (hasAlbumArt: track.hasAlbumArt, coverArtId: coverArtId);
+    // Same item and the same artwork: the art already shown stays.
+    final keptArt =
+        key == _current && artSource == _currentArtSource ? _currentArt : null;
+    _currentArtSource = artSource;
     _current = key;
     _currentMetadata = metadata;
     final generation = ++_generation;
+    _cleared = false;
+    // The metadata never waits for the art (user decision 2026-11-07): an
+    // unresolved lookup would leave the previous track's title on the lock
+    // screen. Locally stored art is known at once, so most items publish
+    // once; otherwise the art follows when its location resolves.
+    final localArt = keptArt ??
+        (track.hasAlbumArt && coverArtId != null
+            ? _art.localArtUri(coverArtId)
+            : null);
+    _currentArt = localArt;
+    _bridge.updateNowPlaying(track, artUri: localArt, duration: duration);
+    if (localArt != null || !track.hasAlbumArt || coverArtId == null) return;
     unawaited(_art
-        .resolveArtUri(
-            hasAlbumArt: track.hasAlbumArt, coverArtId: track.coverArtId)
+        .resolveArtUri(hasAlbumArt: true, coverArtId: coverArtId)
         .then((artUri) {
-      if (generation != _generation) return; // superseded or cleared
-      _cleared = false;
+      if (artUri == null || generation != _generation) return;
+      _currentArt = artUri;
       _bridge.updateNowPlaying(track, artUri: artUri, duration: duration);
     }).catchError((Object error, StackTrace stackTrace) {
       developer.log('Artwork lookup failed', name: 'NowPlayingPublisher',
           error: error, stackTrace: stackTrace);
-      if (generation != _generation) return;
-      _cleared = false;
-      _bridge.updateNowPlaying(track, duration: duration);
     }));
   }
 

@@ -39,6 +39,16 @@ class _FlakyHistory extends HistoryRepository {
     return super.freezeDraft(bindingToken, listenUuid, play);
   }
 
+  int failDeletes = 0;
+  @override
+  Future<void> deleteDraft(String bindingToken, String listenUuid) {
+    if (failDeletes > 0) {
+      failDeletes--;
+      throw StateError('disk full');
+    }
+    return super.deleteDraft(bindingToken, listenUuid);
+  }
+
   int failCheckpoints = 0;
   Completer<void>? checkpointGate;
   @override
@@ -344,6 +354,38 @@ void main() {
       await recorder.quiesce();
       final again = await history.drafts();
       expect(again.map((d) => d.trackUuid), ['t2'], reason: 'no phantom t1 at the next start');
+    });
+
+    test('review: a stop whose own sample withdraws the credit leaves no '
+        'draft', () async {
+      await recorder.start();
+      await at(0, 0);
+      await at(1.5, 1.5); // drafted, under 2 s: still provisional
+      expect(await history.drafts(), hasLength(1));
+      await at(2, 0, playing: false, state: EngineProcessingState.idle,
+          cause: PlaybackTransitionCause.stop); // the closing sample is behind
+      expect(await history.drafts(), isEmpty, reason: 'nothing was heard');
+      for (var t = 3; t <= 10; t++) {
+        await at(t.toDouble(), t - 3.0, item: 2);
+      }
+      expect((await history.drafts()).single.trackUuid, 't2');
+      expect(errors, isEmpty, reason: 'the accumulating slot was free');
+    });
+
+    test('review: a failed draft delete is retried before the next draft',
+        () async {
+      await recorder.start();
+      history.failDeletes = 1;
+      await at(0, 0);
+      await at(3, 3);
+      await at(3.5, 0, state: EngineProcessingState.buffering); // withdrawn
+      await at(4, 0, item: 2, cause: PlaybackTransitionCause.userSkip);
+      for (var t = 5; t <= 12; t++) {
+        await at(t.toDouble(), t - 4.0, item: 2);
+      }
+      expect((await history.drafts()).map((d) => d.trackUuid), ['t2'],
+          reason: 'the leftover t1 draft was deleted on the retry');
+      expect(errors.where((e) => '$e'.contains('UNIQUE')), isEmpty);
     });
 
     test('a decrease in credit is checkpointed at once', () async {

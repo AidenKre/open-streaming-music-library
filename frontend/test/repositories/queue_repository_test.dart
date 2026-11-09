@@ -378,6 +378,68 @@ void main() {
     },
   );
 
+  // Phase 5 decision 6 (2026-11-09): a damaged download keeps file_path,
+  // but it is not a usable download.
+  test('a damaged download is no local source and no Downloaded-only track',
+      () async {
+    await fixture.insertSingles(['dl', 'damaged']);
+    for (final uuid in const ['dl', 'damaged']) {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+          .write(TracksCompanion(filePath: Value('/tmp/$uuid.audio')));
+    }
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals('damaged')))
+        .write(const TracksCompanion(
+            damagedFilePath: Value('/tmp/damaged.audio')));
+
+    final all = await repo.createSessionFromQuery(
+      sourceType: 'library',
+      currentUuid: 'dl',
+      orderBy: [OrderParameter(column: 'uuid_id')],
+    );
+    final entries = await repo.getPlaybackEntries(all);
+    expect(entries.map((e) => (e.uuidId, e.filePath)),
+        [('damaged', null), ('dl', '/tmp/dl.audio')]);
+    final damagedItem = entries.first.itemId;
+    expect((await repo.getPlaybackEntryForItem(all, damagedItem))!.filePath,
+        isNull);
+    expect(
+        (await repo.getPlaybackEntriesForItemIds(all, [damagedItem]))
+            .single
+            .filePath,
+        isNull);
+
+    final downloaded = await repo.createSessionFromQuery(
+      sourceType: 'library',
+      currentUuid: 'dl',
+      orderBy: [OrderParameter(column: 'uuid_id')],
+      downloadedOnly: true,
+    );
+    expect((await repo.getPlaybackEntries(downloaded)).map((e) => e.uuidId),
+        ['dl']);
+  });
+
+  // Review major 1: entries carry the codecs the playback policy checks.
+  test('playback entries carry the download and source codecs', () async {
+    await fixture.insertSingles(['a', 'b']);
+    await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('a')))
+        .write(const TrackmetadataCompanion(codec: Value('flac')));
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
+        .write(const TracksCompanion(
+            filePath: Value('/tmp/a.m4a'), downloadedCodec: Value('aac')));
+    final session = await repo.createSessionFromQuery(
+      sourceType: 'library',
+      currentUuid: 'a',
+      orderBy: [OrderParameter(column: 'uuid_id')],
+    );
+    final entries = await repo.getPlaybackEntries(session);
+    expect(entries.map((e) => (e.uuidId, e.downloadedCodec, e.sourceCodec)),
+        [('a', 'aac', 'flac'), ('b', null, null)]);
+    expect(
+        (await repo.getPlaybackEntryForItem(session, entries.first.itemId))!
+            .sourceCodec,
+        'flac');
+  });
+
   group('locally playable lookup', () {
     ({QueueRepository store, PlaybackTargetResolver resolver}) repoWithFs(Set<String> existing) {
       final store = QueueRepository(db);

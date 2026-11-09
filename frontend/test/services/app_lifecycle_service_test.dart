@@ -1,5 +1,6 @@
 import 'dart:ui' show AppLifecycleState;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -88,17 +89,52 @@ void main() {
     expect(recorderBuilds, 0);
   });
 
-  for (final state in AppLifecycleState.values) {
-    test('${state.name}: history polls only when resumed; the recorder hears '
-        'every state', () {
-      final c = scope();
-      c.read(recoveryServiceProvider);
-      c.listen(listenRecorderProvider, (_, _) {});
-      c.read(appLifecycleServiceProvider).changed(state);
-      expect(triggers.foreground, [state == AppLifecycleState.resumed]);
-      expect(recovery.runs,
-          state == AppLifecycleState.resumed ? [RecoveryTrigger.appResume] : []);
-      expect(recorder.states, [state]);
-    });
+  void onPlatform(TargetPlatform platform) {
+    debugDefaultTargetPlatformOverride = platform;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+  }
+
+  for (final platform in [TargetPlatform.android, TargetPlatform.iOS]) {
+    for (final state in AppLifecycleState.values) {
+      test('${platform.name} ${state.name}: history polls only when resumed; '
+          'the recorder hears every state', () {
+        onPlatform(platform);
+        final c = scope();
+        c.read(recoveryServiceProvider);
+        c.listen(listenRecorderProvider, (_, _) {});
+        c.read(appLifecycleServiceProvider).changed(state);
+        expect(triggers.foreground, [state == AppLifecycleState.resumed]);
+        expect(recovery.runs,
+            state == AppLifecycleState.resumed ? [RecoveryTrigger.appResume] : []);
+        expect(recorder.states, [state]);
+      });
+    }
+  }
+
+  // Desktop: `inactive` is a visible window without focus (5A M6, user
+  // decision 2026-11-07): the history poll keeps running; only a hidden
+  // (or paused/detached) window counts as background.
+  for (final platform in [
+    TargetPlatform.macOS,
+    TargetPlatform.windows,
+    TargetPlatform.linux,
+  ]) {
+    for (final state in AppLifecycleState.values) {
+      final polls = state == AppLifecycleState.resumed ||
+          state == AppLifecycleState.inactive;
+      test('${platform.name} ${state.name}: history polls '
+          '${polls ? 'while the window is visible' : 'not at all'}', () {
+        onPlatform(platform);
+        final c = scope();
+        c.read(recoveryServiceProvider);
+        c.listen(listenRecorderProvider, (_, _) {});
+        c.read(appLifecycleServiceProvider).changed(state);
+        expect(triggers.foreground, [polls]);
+        // Recovery still runs only on a real resume (focus regained).
+        expect(recovery.runs,
+            state == AppLifecycleState.resumed ? [RecoveryTrigger.appResume] : []);
+        expect(recorder.states, [state]);
+      });
+    }
   }
 }

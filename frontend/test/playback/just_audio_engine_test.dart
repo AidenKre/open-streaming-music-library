@@ -6,6 +6,7 @@ import 'package:mocktail/mocktail.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/playback/just_audio_engine.dart';
+import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_engine.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
@@ -422,6 +423,44 @@ void main() {
       await pumpEventQueue();
       expect(calls, ['remove@1', 'insert@1']);
       expect(controller!.loadedItemIds, [1, 2, 3]);
+    });
+
+    // Review major 1: a download suspected after a failure streams, even
+    // though its entry still records the file, until playback resolves it.
+    test('a suspected download is rebuilt as the stream and stays one',
+        () async {
+      final policy = LocalSourcePolicy();
+      final engine = JustAudioEngine(player, localSources: policy);
+      addTearDown(engine.dispose);
+      load.complete(null);
+      final seed = [
+        _entry(itemId: 1, playPosition: 0, uuidId: 'a', filePath: '/a'),
+        _entry(itemId: 2, playPosition: 1, uuidId: 'b'),
+      ];
+      await engine.setSeed(seed, currentItemId: 1);
+      await pumpEventQueue();
+      final failures = <EngineSourceFailure>[];
+      final sub = engine.sourceFailures.listen(failures.add);
+      final calls = <String>[];
+      when(() => player.removeAudioSourceAt(any())).thenAnswer((i) async {
+        calls.add('remove@${i.positionalArguments[0]}');
+      });
+      when(() => player.insertAudioSource(any(), any())).thenAnswer((i) async {
+        calls.add('insert@${i.positionalArguments[0]}');
+      });
+      policy.suspect('a', '/a');
+      await engine.refreshLoadedSourcesForAvailabilityChanges(seed);
+      await pumpEventQueue();
+      expect(calls, ['remove@0', 'insert@0'],
+          reason: 'the same entry, now a stream');
+      await engine.refreshLoadedSourcesForAvailabilityChanges(seed);
+      await pumpEventQueue();
+      expect(calls, hasLength(2), reason: 'already a stream: no rebuild');
+      errorController.add(ja.PlayerException(0, 'x', 0));
+      await pumpEventQueue();
+      expect(failures.single.source?.localPath, isNull,
+          reason: 'its failure is a stream failure');
+      await sub.cancel();
     });
 
     test('offline, a vanished current file is handed to the rescue',
@@ -950,6 +989,149 @@ void main() {
         }
       }
       await sub.cancel();
+    });
+
+    // Live gate (2026-11-07, macOS): after a source error the plugin sits
+    // deactivated (or stuck loading the dead source) with `playing` still
+    // true, so neither a seek, a play nor a plain new seed starts the next
+    // item. The next seed resets the plugin first.
+    test('live gate: the first seed after a source error stops the plugin '
+        'first; later seeds do not', () async {
+      final calls = <String>[];
+      when(() => player.stop()).thenAnswer((_) async => calls.add('stop'));
+      when(
+        () => player.setAudioSources(
+          any(),
+          initialIndex: any(named: 'initialIndex'),
+          initialPosition: any(named: 'initialPosition'),
+        ),
+      ).thenAnswer((invocation) async {
+        calls.add('load');
+        currentIndex = invocation.namedArguments[#initialIndex] as int? ?? 0;
+        return const Duration(minutes: 3);
+      });
+      await controller!.setSeed([_entry(itemId: 1, playPosition: 0)],
+          currentItemId: 1);
+      await pumpEventQueue();
+      expect(calls, ['load']);
+      errorController.add(ja.PlayerException(-1004, 'cannot connect', 0));
+      await pumpEventQueue();
+      calls.clear();
+      await controller!.setSeed([_entry(itemId: 2, playPosition: 1)],
+          currentItemId: 2);
+      await pumpEventQueue();
+      expect(calls, ['stop', 'load'], reason: 'reset, then load the target');
+      calls.clear();
+      await controller!.setSeed([_entry(itemId: 3, playPosition: 2)],
+          currentItemId: 3);
+      await pumpEventQueue();
+      expect(calls, ['load'], reason: 'no error since: no reset');
+    });
+
+    test('live gate: the reset keeps a desired play (the core plays on)',
+        () async {
+      when(() => player.stop()).thenAnswer((_) async {});
+      when(() => player.play()).thenAnswer((_) async {});
+      final seen = <EngineTransportState>[];
+      final sub = controller!.transportStateStream.listen(seen.add);
+      await controller!.setSeed([_entry(itemId: 1, playPosition: 0)],
+          currentItemId: 1, autoPlay: true);
+      await pumpEventQueue();
+      when(() => player.playing).thenReturn(true); // the play was issued
+      errorController.add(ja.PlayerException(-1004, 'cannot connect', 0));
+      await pumpEventQueue();
+      // The recovery re-seeds without autoPlay and plays only if the
+      // desired transport is still playing.
+      await controller!.setSeed([_entry(itemId: 2, playPosition: 1)],
+          currentItemId: 2);
+      await pumpEventQueue();
+      expect(seen.last.playing, isTrue,
+          reason: 'the reset stop is not a dropped or reverted play');
+      await sub.cancel();
+    });
+
+    // Review (2026-11-07): a held failure belongs to the source the plugin
+    // was on; a seek elsewhere, a stop or the seed's own load failure must
+    // not re-report it against another item (since decision 6 that could
+    // mark a healthy download damaged).
+    group('review: a held failure is not blamed on another item', () {
+      Future<List<EngineSourceFailure>> holdDuringInsert() async {
+        when(() => player.play()).thenAnswer((_) async {});
+        await controller!.setSeed([
+          _entry(itemId: 1, playPosition: 0, uuidId: 'u1'),
+          _entry(itemId: 2, playPosition: 1, uuidId: 'u2'),
+        ], currentItemId: 1, sessionId: 4);
+        await pumpEventQueue();
+        final failures = <EngineSourceFailure>[];
+        addTearDown(controller!.sourceFailures.listen(failures.add).cancel);
+        return failures;
+      }
+
+      test('a seek to another item drops the held failure', () async {
+        final failures = await holdDuringInsert();
+        final insert = Completer<void>();
+        when(() => player.insertAudioSource(any(), any()))
+            .thenAnswer((_) => insert.future);
+        await controller!.addEntries([_entry(itemId: 3, playPosition: 2)]);
+        errorController.add(ja.PlayerException(404, 'not found', 0));
+        await pumpEventQueue();
+        expect(failures.single.uncertain, isTrue);
+        await controller!.seekToItem(2); // the core moves on to item 2
+        when(() => player.processingState).thenReturn(ja.ProcessingState.idle);
+        insert.complete();
+        await pumpEventQueue();
+        expect(failures, hasLength(1),
+            reason: "item 1's failure is not re-reported as item 2's");
+      });
+
+      test('a stop drops the held failure', () async {
+        final failures = await holdDuringInsert();
+        when(() => player.stop()).thenAnswer((_) async {});
+        final insert = Completer<void>();
+        when(() => player.insertAudioSource(any(), any()))
+            .thenAnswer((_) => insert.future);
+        await controller!.addEntries([_entry(itemId: 3, playPosition: 2)]);
+        errorController.add(ja.PlayerException(404, 'not found', 0));
+        await pumpEventQueue();
+        await controller!.stop();
+        when(() => player.processingState).thenReturn(ja.ProcessingState.idle);
+        insert.complete();
+        await pumpEventQueue();
+        expect(failures, hasLength(1), reason: 'stopped: nothing to recover');
+      });
+
+      test("a seed whose load fails reports it once, as the load event",
+          () async {
+        final failures = <EngineSourceFailure>[];
+        final loads = <EngineLoadEvent>[];
+        final subs = [
+          controller!.sourceFailures.listen(failures.add),
+          controller!.loadEvents.listen(loads.add),
+        ];
+        when(
+          () => player.setAudioSources(
+            any(),
+            initialIndex: any(named: 'initialIndex'),
+            initialPosition: any(named: 'initialPosition'),
+          ),
+        ).thenAnswer((_) async {
+          // Like Android: the error reaches the error stream AND fails the
+          // load.
+          errorController.add(ja.PlayerException(0, 'decode', 0));
+          await pumpEventQueue();
+          throw ja.PlayerException(0, 'decode', 0);
+        });
+        when(() => player.processingState).thenReturn(ja.ProcessingState.idle);
+        await controller!.setSeed([_entry(itemId: 1, playPosition: 0)],
+            currentItemId: 1);
+        await pumpEventQueue();
+        expect(loads.map((e) => e.outcome), [EngineLoadOutcome.failed]);
+        expect(failures.where((f) => !f.uncertain), isEmpty,
+            reason: 'no second, certain report of the same failure');
+        for (final sub in subs) {
+          await sub.cancel();
+        }
+      });
     });
 
     test('branch audit: a completion while the engine replaces sources is not '

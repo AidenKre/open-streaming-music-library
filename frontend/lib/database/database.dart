@@ -94,6 +94,16 @@ class Tracks extends Table {
   // SECOND server-side change re-surfaces the stale warning even if the
   // first one was dismissed.
   IntColumn get staleDismissedAtRevision => integer().nullable()();
+  // The download at this path failed to play although the device can play
+  // audio (damaged; Phase 5 decision 6, marked only with evidence). It is the
+  // path in `file_path`, which is kept with the other download columns, so a
+  // re-download knows the original quality and Delete knows the file. Every
+  // "usable download" rule ([usableDownloadPredicate]) excludes it: online
+  // the track streams, offline it is skipped. The file is never deleted
+  // automatically; a re-download or the user's Delete removes it. Null = not
+  // damaged. (A store from before the 2026-11-09 change may hold a damaged
+  // path with `file_path` cleared; cleanup reads both columns.)
+  TextColumn get damagedFilePath => text().nullable()();
 
   @override
   Set<Column> get primaryKey => {uuidId};
@@ -825,8 +835,17 @@ const trackSelectColumns =
     'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
     't.revision, '
     't.downloaded_bitrate_kbps, t.file_size_bytes, t.downloaded_quality, '
-    't.downloaded_at_revision, t.downloaded_codec, t.stale_dismissed_at_revision';
+    't.downloaded_at_revision, t.downloaded_codec, t.stale_dismissed_at_revision, '
+    't.damaged_file_path';
 const _selectColumns = trackSelectColumns;
+
+/// SQL test, over a `tracks` row aliased `t`, for a download the app can
+/// use: the file is recorded and not marked damaged (Phase 5 decision 6).
+/// The one definition behind every "is it downloaded?" rule (the Downloaded
+/// filter, counts, stale downloads, playback entries). Must agree with
+/// `TrackUI.isDownloaded`.
+const usableDownloadPredicate =
+    '(t.file_path IS NOT NULL AND t.damaged_file_path IS NULL)';
 
 /// SQL form of the stale-download rule, over a `tracks` row aliased `t`: the
 /// track has a downloaded file, its revision moved past the one the file is
@@ -836,7 +855,7 @@ const _selectColumns = trackSelectColumns;
 /// already-loaded rows; `test/models/ui/track_ui_test.dart` asserts the two
 /// agree over every null/ordering combination.
 const staleDownloadPredicate =
-    't.file_path IS NOT NULL '
+    '$usableDownloadPredicate '
     'AND t.revision > t.downloaded_at_revision '
     'AND (t.stale_dismissed_at_revision IS NULL '
     'OR t.revision > t.stale_dismissed_at_revision)';
@@ -848,7 +867,7 @@ const staleDownloadPredicate =
 String _hasDownloadedTrack(String column, String owner) =>
     'EXISTS (SELECT 1 FROM trackmetadata tm '
     'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-    'WHERE tm.$column = $owner AND t.file_path IS NOT NULL)';
+    'WHERE tm.$column = $owner AND $usableDownloadPredicate)';
 
 /// Scalar subquery picking the cover art for the tracks whose
 /// `trackmetadata.[column]` equals [owner]: the lowest-numbered track with
@@ -866,7 +885,7 @@ String _coverArtSubquery(
     'WHERE tm.$column = $owner '
     'AND tm.has_album_art = 1 '
     'AND tm.cover_art_id IS NOT NULL '
-    '${downloadedOnly ? 'AND t.file_path IS NOT NULL ' : ''}'
+    '${downloadedOnly ? 'AND $usableDownloadPredicate ' : ''}'
     'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
     'LIMIT 1';
 
@@ -876,6 +895,7 @@ String _coverArtSubquery(
 /// Must stay in sync with the columns `TrackDownloader` writes on commit.
 const clearedDownloadColumns = TracksCompanion(
   filePath: Value(null),
+  damagedFilePath: Value(null),
   downloadedBitrateKbps: Value(null),
   fileSizeBytes: Value(null),
   downloadedQuality: Value(null),
@@ -962,7 +982,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
   ///     [rebuildFtsIndexes] afterwards.
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   StreamQueryUpdateRules get streamUpdateRules => StreamQueryUpdateRules([
@@ -1033,6 +1053,10 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       await m.createIndex(schema.idxHistoryEventsKindOccurred);
       await m.createIndex(schema.idxActiveListensAccumulating);
       await customStatement(_historyContentTriggerV3);
+    },
+    from3To4: (m, schema) async {
+      // Decision 6: damaged downloads (nullable; existing rows read NULL).
+      await m.addColumn(schema.tracks, schema.tracks.damagedFilePath);
     },
   );
 
@@ -1384,6 +1408,19 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     ).watch();
   }
 
+  /// Downloads that failed to play although their file exists (decision 6),
+  /// kept for the user to re-download or delete.
+  Stream<List<QueryRow>> watchDamagedDownloads() {
+    return customSelect(
+      'SELECT $_selectColumns '
+      'FROM trackmetadata AS tm '
+      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
+      'WHERE t.damaged_file_path IS NOT NULL '
+      'ORDER BY tm.title COLLATE NOCASE, tm.uuid_id',
+      readsFrom: {trackmetadata, tracks},
+    ).watch();
+  }
+
   /// Live counts of outstanding edits for the pending-edits surface.
   /// `take_server` rows are excluded at the source: they are resolution
   /// markers awaiting their refetch, not user-visible outbox rows.
@@ -1458,7 +1495,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
 
     if (downloadedOnly) {
-      whereClauses.add('t.file_path IS NOT NULL');
+      whereClauses.add(usableDownloadPredicate);
     }
 
     // Cursor filter
@@ -1670,6 +1707,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
         int? downloadedAtRevision,
         String? downloadedCodec,
         int? staleDismissedAtRevision,
+        String? damagedFilePath,
       })
     >
   >
@@ -1679,7 +1717,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     final rows = await customSelect(
       'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes, '
       'downloaded_quality, revision, downloaded_at_revision, downloaded_codec, '
-      'stale_dismissed_at_revision '
+      'stale_dismissed_at_revision, damaged_file_path '
       'FROM tracks WHERE uuid_id IN ($placeholders)',
       variables: uuids.map(Variable.withString).toList(),
       readsFrom: {tracks},
@@ -1697,14 +1735,15 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
           staleDismissedAtRevision: r.readNullable<int>(
             'stale_dismissed_at_revision',
           ),
+          damagedFilePath: r.readNullable<String>('damaged_file_path'),
         ),
     };
   }
 
   Stream<({int count, int totalBytes})> watchDownloadedStats() {
     return customSelect(
-      'SELECT COUNT(*) AS c, COALESCE(SUM(file_size_bytes), 0) AS total_bytes '
-      'FROM tracks WHERE file_path IS NOT NULL',
+      'SELECT COUNT(*) AS c, COALESCE(SUM(t.file_size_bytes), 0) AS total_bytes '
+      'FROM tracks AS t WHERE $usableDownloadPredicate',
       readsFrom: {tracks},
     ).watch().map(
       (rows) => (
@@ -1874,7 +1913,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
     final rows = await customSelect(
       'SELECT tm.$groupColumn AS aid, COUNT(*) AS total, '
-      'SUM(CASE WHEN t.file_path IS NOT NULL THEN 1 ELSE 0 END) AS downloaded '
+      'SUM(CASE WHEN $usableDownloadPredicate THEN 1 ELSE 0 END) AS downloaded '
       'FROM trackmetadata tm '
       'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
       '$whereClause'

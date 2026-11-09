@@ -401,6 +401,21 @@ void main() {
       );
     });
 
+    test('review: a 409 handled after Keep server version quarantines '
+        'nothing', () async {
+      await repo.insertLocal(token, _event('mine', seconds: 30.5));
+      // The user resolves while a POST of the old payload is in flight…
+      await repo.keepServerVersion(token, _server(_event('mine', seconds: 99.0), 12));
+      // …then the POST's 409 is handled.
+      await repo.recordFailure(token, 'mine', reason: 'conflict');
+      expect(
+        await db.customSelect('SELECT * FROM history_sync_failures').get(),
+        isEmpty,
+        reason: 'the event is no longer pending: nothing to hold back',
+      );
+      expect(await repo.counts(), (pending: 0, quarantined: 0));
+    });
+
     test('a no-op when the local payload already equals the server\'s',
         () async {
       await repo.insertLocal(token, _event('mine', seconds: 30.5));
