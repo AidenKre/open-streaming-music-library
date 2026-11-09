@@ -3,14 +3,16 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
-import 'package:frontend/providers/audio/audio_dependencies.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
+import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/history/history_providers.dart';
+import 'package:frontend/services/history/listen_recorder.dart';
 import 'package:frontend/services/local_resettable.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 
 /// Coordinates a full local reset of frontend-owned state in three steps
 /// (SC-15):
@@ -81,6 +83,12 @@ class LocalResetService {
       // A wipe would most likely fail too: report and stop.
       throw LocalResetAbortedException(e);
     }
+    // The fence stops local writes; the gate must stop handing out the old
+    // verified token too, or a request started now (an edit flush, a sync)
+    // would still reach the server with what the user was told is lost.
+    if (_ref.exists(serverBindingGateProvider)) {
+      _ref.read(serverBindingGateProvider).stop();
+    }
 
     final failures = <LocalResetFailure>[];
 
@@ -89,7 +97,7 @@ class LocalResetService {
       try {
         await q.quiesce().timeout(quiesceTimeout);
       } catch (e, st) {
-        failures.add(LocalResetFailure(q.runtimeType, e, st));
+        failures.add(LocalResetFailure(q.runtimeType, e, st, quiesce: true));
       }
     }
 
@@ -121,7 +129,12 @@ class LocalResetFailure {
     this.error,
     this.stackTrace, {
     this.participant,
+    this.quiesce = false,
   });
+
+  /// A quiesce step failed or timed out: the wipe still ran, and the fence
+  /// keeps its late work out of the new store, so nothing was left behind.
+  final bool quiesce;
 
   final Type subsystem;
 
@@ -164,7 +177,11 @@ class LocalResetAbortedException implements Exception {
 /// the fence and before the wipe. Playback goes first; later phases' runners
 /// register after it.
 final localQuiescablesProvider = Provider<List<Quiescable>>((ref) {
-  return <Quiescable>[_PlaybackQuiescable(ref), _HistoryQuiescable(ref)];
+  return <Quiescable>[
+    _PlaybackQuiescable(ref),
+    _ListenQuiescable(ref),
+    _HistoryQuiescable(ref),
+  ];
 });
 
 /// Contributors to the Disconnect confirmation's "will be lost" copy, in
@@ -219,7 +236,24 @@ class _PlaybackQuiescable implements Quiescable {
   String get quiesceName => 'playback';
 
   @override
-  Future<void> quiesce() => _ref.read(audioProvider.notifier).quiesce();
+  Future<void> quiesce() => _ref.read(queuePlayerProvider.notifier).quiesce();
+}
+
+/// Listen recording, after playback (SC-15): stops taking observations
+/// and waits out its write in flight. Never builds a recorder.
+class _ListenQuiescable implements Quiescable {
+  _ListenQuiescable(this._ref);
+  final Ref _ref;
+
+  @override
+  String get quiesceName => 'listens';
+
+  @override
+  Future<void> quiesce() async {
+    if (_ref.exists(listenRecorderProvider)) {
+      await _ref.read(listenRecorderProvider).quiesce();
+    }
+  }
 }
 
 class _OfflineExitResettable implements LocalResettable {
@@ -273,9 +307,14 @@ class _HistoryQuiescable implements Quiescable {
   String get quiesceName => 'history';
 
   @override
-  Future<void> quiesce() {
-    _ref.read(historySyncTriggersProvider).dispose();
-    return _ref.read(historyRunnerProvider).quiesce();
+  Future<void> quiesce() async {
+    // Never builds them just to stop them.
+    if (_ref.exists(historySyncTriggersProvider)) {
+      _ref.read(historySyncTriggersProvider).dispose();
+    }
+    if (_ref.exists(historyRunnerProvider)) {
+      await _ref.read(historyRunnerProvider).quiesce();
+    }
   }
 }
 
@@ -286,8 +325,12 @@ class _HistoryLossReporter implements LossReporter {
 
   @override
   Future<String?> pendingLossSummary() async {
-    final counts = await _ref.read(historyRepositoryProvider).counts();
-    final n = counts.pending + counts.quarantined;
+    final repository = _ref.read(historyRepositoryProvider);
+    final counts = await repository.counts();
+    // Listens not yet saved as events (in progress, or a frozen failed
+    // finalization) are unsent history too: the wipe deletes them.
+    final drafts = (await repository.drafts()).length;
+    final n = counts.pending + counts.quarantined + drafts;
     if (n == 0) return null;
     return '$n unsent history event${n == 1 ? '' : 's'}';
   }

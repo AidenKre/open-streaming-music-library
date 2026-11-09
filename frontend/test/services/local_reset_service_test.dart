@@ -8,10 +8,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_dependencies.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -21,7 +21,7 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/local_reset_service.dart';
 
-class _ResetAudioCoordinator extends AudioCoordinator {
+class _ResetQueuePlayer extends QueuePlayer {
   int stopCalls = 0;
   int quiesceCalls = 0;
 
@@ -89,7 +89,7 @@ void main() {
     late LocalCoverArtStore coverStore;
     late DownloadManager downloadManager;
     late SharedPreferences prefs;
-    late _ResetAudioCoordinator audio;
+    late _ResetQueuePlayer audio;
     late ProviderContainer container;
 
     setUp(() async {
@@ -114,7 +114,7 @@ void main() {
         coverArtStore: coverStore,
         directoryProvider: () async => tempDir,
       );
-      audio = _ResetAudioCoordinator();
+      audio = _ResetQueuePlayer();
 
       container = ProviderContainer(
         overrides: [
@@ -123,7 +123,7 @@ void main() {
           localCoverArtStoreProvider.overrideWithValue(coverStore),
           downloadManagerProvider.overrideWithValue(downloadManager),
           coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
-          audioProvider.overrideWith(() => audio),
+          queuePlayerProvider.overrideWith(() => audio),
           offlineModeProvider.overrideWith(() => _StubOffline(true)),
         ],
       );

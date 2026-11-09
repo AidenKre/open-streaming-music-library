@@ -176,6 +176,20 @@ void main() {
       expect((await rows()).first['pending_upload'], 1, reason: 'retained, not dropped');
     });
 
+    // Branch audit 5A M4: the batch query is bounded; a page made only of
+    // oversized rows (quarantined as they are read) must not end the batch.
+    test('a run of oversized rows longer than a batch does not hide the rest',
+        () async {
+      for (var i = 0; i < 4; i++) {
+        await repo.insertLocal(token, _event('big$i', ref: 'r' * 256));
+      }
+      await repo.insertLocal(token, _event('small'));
+      final small = utf8.encode(jsonEncode({'events': [_event('small').toJson()]})).length;
+      final batch = await repo.nextUploadBatch(token, maxEvents: 2, maxBytes: small);
+      expect(batch?.eventUuids, ['small']);
+      expect(await repo.counts(), (pending: 1, quarantined: 4));
+    });
+
     test('quarantined events are skipped; the rest still upload', () async {
       await repo.insertLocal(token, _event('bad'));
       await repo.insertLocal(token, _event('good'));

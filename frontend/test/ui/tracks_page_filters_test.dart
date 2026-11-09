@@ -608,7 +608,7 @@ void main() {
 
       await tester.tap(find.text('Kept Song'));
       await tester.pumpAndSettle();
-      // The stored list may hold streaming-only uuids; the real coordinator
+      // The stored list may hold streaming-only uuids; the real queue player
       // skips them offline (`_startSessionWithOfflinePolicy`).
       expect(h.audio.calls.single['uuid'], 'd1');
       expect(h.audio.calls.single['uuids'], unorderedEquals(['d1', 's1']));

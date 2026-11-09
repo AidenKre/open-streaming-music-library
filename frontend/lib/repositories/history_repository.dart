@@ -40,6 +40,36 @@ class HistoryUploadBatch {
 /// Diagnostics counts.
 typedef HistorySyncCounts = ({int pending, int quarantined});
 
+/// A durable listen in progress (`active_listens`): the future play event
+/// UUID, its queue identity and its persisted credit. A draft whose
+/// finalization failed is frozen with its [finalPayload].
+class ListenDraft {
+  const ListenDraft({
+    required this.listenUuid,
+    required this.queueSessionId,
+    required this.queueItemId,
+    required this.trackUuid,
+    required this.startedAt,
+    required this.durationSeconds,
+    required this.accumulatedMicros,
+    required this.lastCheckpointAt,
+    this.finalPayload,
+  });
+  final String listenUuid;
+  final int queueSessionId;
+  final int queueItemId;
+  final String trackUuid;
+  final int startedAt;
+  final double? durationSeconds;
+  final int accumulatedMicros;
+  final int lastCheckpointAt;
+  final HistoryEventPayload? finalPayload;
+  bool get finalizing => finalPayload != null;
+}
+
+/// How a draft finalization ended.
+enum DraftFinalization { inserted, alreadyPresent, conflict }
+
 /// The local history store (Phase 5 §3/§4, SC-01 rule 4, SC-02, SC-11).
 /// Every write runs in a transaction fenced by the session binding token.
 class HistoryRepository {
@@ -55,6 +85,122 @@ class HistoryRepository {
 
   static const maxBatchEvents = 200;
   static const maxBatchBytes = 256 * 1024;
+
+  // ---- listen drafts (active_listens, Phase 5 §3/§7) ------------------
+
+  /// Creates or checkpoints an accumulating listen draft (fenced). A
+  /// frozen (finalizing) draft is never changed: its payload is final.
+  Future<void> checkpointDraft(String bindingToken, ListenDraft draft) =>
+      _binding.runFenced(bindingToken, () async {
+        final existing = await _draftRow(draft.listenUuid);
+        if (existing != null && existing.state == 'finalizing') return;
+        await _db.into(_db.activeListens).insertOnConflictUpdate(
+              ActiveListensCompanion.insert(
+                listenUuid: draft.listenUuid,
+                queueSessionId: draft.queueSessionId,
+                queueItemId: draft.queueItemId,
+                trackUuid: draft.trackUuid,
+                startedAt: draft.startedAt,
+                durationSeconds: Value(draft.durationSeconds),
+                accumulatedMicros: draft.accumulatedMicros,
+                lastCheckpointAt: draft.lastCheckpointAt,
+                state: 'accumulating',
+              ),
+            );
+      });
+
+  /// Freezes a draft whose finalization failed: it keeps exactly this
+  /// payload (retried later, never re-accumulated). Several frozen drafts
+  /// may coexist; at most one accumulates.
+  Future<void> freezeDraft(
+          String bindingToken, String listenUuid, HistoryEventPayload play) =>
+      _binding.runFenced(bindingToken, () async {
+        await (_db.update(_db.activeListens)
+              ..where((l) => l.listenUuid.equals(listenUuid)))
+            .write(ActiveListensCompanion(
+          state: const Value('finalizing'),
+          finalPayloadJson: Value(jsonEncode(play.toJson())),
+        ));
+      });
+
+  /// Inserts the play event (event UUID = listen UUID, pending upload) and
+  /// deletes its draft in one fenced transaction. A repeated finalization
+  /// (after a crash) is idempotent when the stored event matches; a
+  /// different stored payload is a conflict: nothing is overwritten and
+  /// the draft is kept.
+  Future<DraftFinalization> finalizeDraft(
+      String bindingToken, HistoryEventPayload play) async {
+    try {
+      _validatePayload(play);
+    } on HistoryProtocolException catch (e) {
+      throw ArgumentError(e.message);
+    }
+    final result = await _binding.runFenced(bindingToken, () async {
+      final stored = await localPayload(play.eventUuid);
+      if (stored != null) {
+        if (!stored.samePayload(play)) return DraftFinalization.conflict;
+        await _deleteDraftRow(play.eventUuid);
+        return DraftFinalization.alreadyPresent;
+      }
+      await _db.into(_db.historyEvents).insert(
+            _values(play).copyWith(pendingUpload: const Value(true)),
+          );
+      await _deleteDraftRow(play.eventUuid);
+      return DraftFinalization.inserted;
+    });
+    if (result == DraftFinalization.inserted) _onLocalInsert?.call();
+    return result;
+  }
+
+  /// Deletes a draft (a listen that ended without credit).
+  Future<void> deleteDraft(String bindingToken, String listenUuid) =>
+      _binding.runFenced(bindingToken, () => _deleteDraftRow(listenUuid));
+
+  /// Every draft, oldest start first.
+  Future<List<ListenDraft>> drafts() async {
+    final rows = await (_db.select(_db.activeListens)
+          ..orderBy([(l) => OrderingTerm(expression: l.startedAt)]))
+        .get();
+    return [
+      for (final row in rows)
+        ListenDraft(
+          listenUuid: row.listenUuid,
+          queueSessionId: row.queueSessionId,
+          queueItemId: row.queueItemId,
+          trackUuid: row.trackUuid,
+          startedAt: row.startedAt,
+          durationSeconds: row.durationSeconds,
+          accumulatedMicros: row.accumulatedMicros,
+          lastCheckpointAt: row.lastCheckpointAt,
+          finalPayload: row.finalPayloadJson == null
+              ? null
+              : _payloadFromJson(jsonDecode(row.finalPayloadJson!)),
+        ),
+    ];
+  }
+
+  Future<ActiveListen?> _draftRow(String listenUuid) =>
+      (_db.select(_db.activeListens)
+            ..where((l) => l.listenUuid.equals(listenUuid)))
+          .getSingleOrNull();
+
+  Future<void> _deleteDraftRow(String listenUuid) =>
+      (_db.delete(_db.activeListens)
+            ..where((l) => l.listenUuid.equals(listenUuid)))
+          .go();
+
+  static HistoryEventPayload _payloadFromJson(Object? json) {
+    final map = json as Map<String, Object?>;
+    return HistoryEventPayload(
+      eventUuid: map['event_uuid'] as String,
+      kind: map['kind'] as String,
+      entityType: map['entity_type'] as String,
+      entityRef: map['entity_ref'] as String,
+      occurredAt: map['occurred_at'] as int,
+      secondsPlayed: (map['seconds_played'] as num?)?.toDouble(),
+      trackLength: (map['track_length'] as num?)?.toDouble(),
+    );
+  }
 
   /// A locally produced event: inserted pending, atomically.
   Future<void> insertLocal(String bindingToken, HistoryEventPayload event) async {
@@ -87,26 +233,44 @@ class HistoryRepository {
     if (eventLimit <= 0) return null;
     final history = _db.historyEvents;
     final failures = _db.historySyncFailures;
+    // At most one batch of rows per read. Oversized rows are quarantined as
+    // they are read (and leave the query), so a page holding only them is
+    // followed by the next one.
     final query = _db.select(history).join([
       leftOuterJoin(failures, failures.eventUuid.equalsExp(history.eventUuid)),
     ])
       ..where(history.pendingUpload.equals(true) & failures.eventUuid.isNull())
-      ..orderBy([OrderingTerm.asc(history.localId)]);
+      ..orderBy([OrderingTerm.asc(history.localId)])
+      ..limit(eventLimit);
     final events = <HistoryEventPayload>[];
-    var body = _encode(events);
-    for (final row in await query.get()) {
-      final event = _payload(row.readTable(history));
-      if (_encode([event]).length > byteLimit) {
-        await _recordFailureIn(event.eventUuid, reason: 'oversized');
-        continue;
+    // The body is `{"events":[e1,e2,...]}`: its size is the frame plus each
+    // event's own encoding plus the separating commas.
+    var size = _emptyBodyBytes;
+    while (events.isEmpty) {
+      final rows = await query.get();
+      if (rows.isEmpty) return null;
+      var full = false;
+      for (final row in rows) {
+        final event = _payload(row.readTable(history));
+        final bytes = _eventBytes(event);
+        if (_emptyBodyBytes + bytes > byteLimit) {
+          await _recordFailureIn(event.eventUuid, reason: 'oversized');
+          continue;
+        }
+        final next = size + bytes + (events.isEmpty ? 0 : 1);
+        if (next > byteLimit) {
+          full = true;
+          break;
+        }
+        events.add(event);
+        size = next;
       }
-      final candidate = _encode([...events, event]);
-      if (candidate.length > byteLimit) break;
-      events.add(event);
-      body = candidate;
-      if (events.length == eventLimit) break;
+      if (full || rows.length < eventLimit) break;
     }
-    return events.isEmpty ? null : HistoryUploadBatch(events, body);
+    if (events.isEmpty) return null;
+    final body = _encode(events);
+    assert(body.length == size, 'batch size accounting drifted');
+    return HistoryUploadBatch(events, body);
   });
 
   /// Clears `pending_upload` only for [submitted] UUIDs the server
@@ -244,6 +408,17 @@ class HistoryRepository {
   Stream<HistorySyncCounts> watchCounts() =>
       _countsQuery().watchSingle().map(_countsFrom);
 
+  /// Live count of frozen listen drafts (failed finalizations kept for a
+  /// retry).
+  Stream<int> watchFrozenListenCount() {
+    final count = _db.activeListens.listenUuid.count();
+    return (_db.selectOnly(_db.activeListens)
+          ..addColumns([count])
+          ..where(_db.activeListens.state.equals('finalizing')))
+        .map((row) => row.read(count) ?? 0)
+        .watchSingle();
+  }
+
   Selectable<QueryRow> _countsQuery() => _db.customSelect(
     'SELECT (SELECT COUNT(*) FROM history_events h '
     'WHERE pending_upload = 1 AND NOT EXISTS '
@@ -271,6 +446,11 @@ class HistoryRepository {
               ..where((t) => t.reason.equals('conflict').not()))
             .go();
       });
+
+  static final _emptyBodyBytes = _encode(const []).length;
+
+  static int _eventBytes(HistoryEventPayload event) =>
+      utf8.encode(jsonEncode(event.toJson())).length;
 
   static Uint8List _encode(List<HistoryEventPayload> events) => Uint8List.fromList(
     utf8.encode(jsonEncode({'events': [for (final event in events) event.toJson()]})),

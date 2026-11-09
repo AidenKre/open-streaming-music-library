@@ -282,6 +282,24 @@ void main() {
       expect(fake.calls, ['start', 'connect http://x']);
     });
 
+    testWidgets('a quiesce timeout alone (the wipe completed) is not shown as '
+        'data left behind (live gate)', (tester) async {
+      var rebuilt = 0;
+      final fake = await pump(
+        tester,
+        SessionPhase.resetting,
+        onLocalResetComplete: () => rebuilt++,
+      );
+      fake.set(SessionPhase.resetComplete, failure: LocalResetException([
+        LocalResetFailure(int, TimeoutException('history pass in flight'),
+            StackTrace.empty, quiesce: true),
+      ]));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(find.text('Reset incomplete'), findsNothing);
+      expect(rebuilt, 1);
+    });
+
     testWidgets('a partial reset is shown, then the scope is rebuilt', (
       tester,
     ) async {
@@ -292,7 +310,10 @@ void main() {
         onLocalResetComplete: () => rebuilt++,
       );
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
-      fake.set(SessionPhase.resetComplete, failure: LocalResetException([]));
+      fake.set(SessionPhase.resetComplete, failure: LocalResetException([
+        LocalResetFailure(int, StateError('wipe failed'), StackTrace.empty,
+            participant: Object()),
+      ]));
       // The splash spinner animates forever: bounded pumps, not settle.
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));

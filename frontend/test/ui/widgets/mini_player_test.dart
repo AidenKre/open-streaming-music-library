@@ -6,9 +6,9 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/player_controller.dart';
@@ -49,9 +49,9 @@ AudioState _audioStateWith(
   );
 }
 
-class _TestAudioCoordinator extends AudioCoordinator {
+class _TestQueuePlayer extends QueuePlayer {
   final AudioState _state;
-  _TestAudioCoordinator(this._state);
+  _TestQueuePlayer(this._state);
 
   @override
   AudioState build() => _state;
@@ -71,8 +71,8 @@ Future<void> _pumpMiniPlayer(
   final container = ProviderContainer(
     overrides: [
       databaseProvider.overrideWithValue(db),
-      audioProvider.overrideWith(
-        () => _TestAudioCoordinator(_audioStateWith(track,
+      queuePlayerProvider.overrideWith(
+        () => _TestQueuePlayer(_audioStateWith(track,
             status: status, playWhenReady: playWhenReady)),
       ),
       if (controls != null) playerControlsProvider.overrideWithValue(controls),

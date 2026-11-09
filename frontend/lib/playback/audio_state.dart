@@ -1,0 +1,155 @@
+import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/playback_engine.dart';
+
+enum PlayerStatus { idle, loading, playing, paused }
+
+enum QueueRepeatMode { off, all, one }
+
+class PlaybackSlice {
+  final TrackUI? currentTrack;
+
+  /// Presentation summary of the axes below (idle/loading/playing/paused).
+  final PlayerStatus status;
+
+  /// SC-27 desired-transport axis: did the user ask for audio? Independent
+  /// of [processing] (what the engine is doing) and of the lifecycle.
+  final bool playWhenReady;
+
+  /// SC-27 processing axis.
+  final EngineProcessingState processing;
+  final Duration position;
+
+  /// The catalog's duration of the current track; null = unknown.
+  final Duration? catalogDuration;
+
+  /// The engine-measured duration of the current source; null = unknown.
+  final Duration? measuredDuration;
+  final double volume;
+
+  /// Best known duration (SC-27 invariant 15): measured, else catalog,
+  /// else unknown (null, never zero).
+  Duration? get duration => measuredDuration ?? catalogDuration;
+
+  const PlaybackSlice({
+    this.currentTrack,
+    this.status = PlayerStatus.idle,
+    this.playWhenReady = false,
+    this.processing = EngineProcessingState.idle,
+    this.position = Duration.zero,
+    this.catalogDuration,
+    this.measuredDuration,
+    this.volume = 1.0,
+  });
+
+  PlaybackSlice copyWith({
+    TrackUI? currentTrack,
+    bool clearTrack = false,
+    PlayerStatus? status,
+    bool? playWhenReady,
+    EngineProcessingState? processing,
+    Duration? position,
+    Object? catalogDuration = _unchanged,
+    Object? measuredDuration = _unchanged,
+    double? volume,
+  }) {
+    return PlaybackSlice(
+      currentTrack: clearTrack ? null : (currentTrack ?? this.currentTrack),
+      status: status ?? this.status,
+      playWhenReady: playWhenReady ?? this.playWhenReady,
+      processing: processing ?? this.processing,
+      position: position ?? this.position,
+      // Pass null to clear (unknown); omit to keep.
+      catalogDuration: identical(catalogDuration, _unchanged)
+          ? this.catalogDuration
+          : catalogDuration as Duration?,
+      measuredDuration: identical(measuredDuration, _unchanged)
+          ? this.measuredDuration
+          : measuredDuration as Duration?,
+      volume: volume ?? this.volume,
+    );
+  }
+}
+
+const Object _unchanged = Object();
+
+class QueueSlice {
+  final int? sessionId;
+  final int? currentItemId;
+  final int currentPlayPosition;
+  final int totalCount;
+  final QueueRepeatMode repeatMode;
+  final int queueVersion;
+
+  const QueueSlice({
+    this.sessionId,
+    this.currentItemId,
+    this.currentPlayPosition = 0,
+    this.totalCount = 0,
+    this.repeatMode = QueueRepeatMode.off,
+    this.queueVersion = 0,
+  });
+
+  QueueSlice copyWith({
+    int? sessionId,
+    bool clearSession = false,
+    int? currentItemId,
+    bool clearCurrentItem = false,
+    int? currentPlayPosition,
+    int? totalCount,
+    QueueRepeatMode? repeatMode,
+    int? queueVersion,
+  }) {
+    return QueueSlice(
+      sessionId: clearSession ? null : (sessionId ?? this.sessionId),
+      currentItemId: clearCurrentItem
+          ? null
+          : (currentItemId ?? this.currentItemId),
+      currentPlayPosition: currentPlayPosition ?? this.currentPlayPosition,
+      totalCount: totalCount ?? this.totalCount,
+      repeatMode: repeatMode ?? this.repeatMode,
+      queueVersion: queueVersion ?? this.queueVersion,
+    );
+  }
+}
+
+class ShuffleSlice {
+  final bool shuffleOn;
+
+  const ShuffleSlice({this.shuffleOn = false});
+
+  ShuffleSlice copyWith({bool? shuffleOn}) {
+    return ShuffleSlice(shuffleOn: shuffleOn ?? this.shuffleOn);
+  }
+}
+
+class AudioState {
+  final PlaybackSlice playback;
+  final QueueSlice queue;
+  final ShuffleSlice shuffle;
+
+  const AudioState({
+    this.playback = const PlaybackSlice(),
+    this.queue = const QueueSlice(),
+    this.shuffle = const ShuffleSlice(),
+  });
+
+  AudioState copyWith({
+    PlaybackSlice? playback,
+    QueueSlice? queue,
+    ShuffleSlice? shuffle,
+  }) {
+    return AudioState(
+      playback: playback ?? this.playback,
+      queue: queue ?? this.queue,
+      shuffle: shuffle ?? this.shuffle,
+    );
+  }
+}
+
+/// SC-27 lifecycle axis: does the playback runtime accept work?
+/// Independent of the desired transport and the processing state.
+///  * [none]: no live session yet (commands still run as before).
+///  * [active]: the session is ready.
+///  * [stopping]: a quiesce closed admission; admitted work is settling.
+///  * [quiesced]: terminal; the instance is discarded by the scope rebuild.
+enum PlaybackLifecycle { none, active, stopping, quiesced }

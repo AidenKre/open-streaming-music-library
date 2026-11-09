@@ -5,14 +5,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/models/history_intent.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/playback_requests.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
@@ -152,8 +154,11 @@ class EmptyConversionJobs extends ConversionJobsNotifier {
 }
 
 /// Records play calls instead of driving the real audio stack.
-class RecordingAudio extends AudioCoordinator {
+class RecordingAudio extends QueuePlayer {
   final List<Map<String, Object?>> calls = [];
+
+  /// Click intents of the requests recorded in [calls], in order.
+  final List<HistoryIntent?> intents = [];
 
   @override
   AudioState build() => const AudioState();
@@ -168,55 +173,41 @@ class RecordingAudio extends AudioCoordinator {
     ),
     queue: const QueueSlice(),
   );
+}
+
+/// Records submitted playback requests into [audio]'s calls in its call
+/// format (5B.1: LibraryActions submits requests) and their intents.
+class RecordingRequests extends PlaybackRequests {
+  RecordingRequests(super.ref, this.audio);
+  final RecordingAudio audio;
 
   @override
-  Future<void> playFromQueue({
-    required TrackUI track,
-    required String sourceType,
-    int? artistId,
-    int? albumId,
-    List<OrderParameter> orderParams = const [],
-    bool downloadedOnly = false,
-  }) async {
-    calls.add({
-      'method': 'playFromQueue',
-      'uuid': track.uuidId,
-      'sourceType': sourceType,
-      'artistId': artistId,
-      'albumId': albumId,
-      'orderParams': orderParams,
-      'downloadedOnly': downloadedOnly,
+  Future<PlaybackOutcome> submit(PlaybackRequest request) async {
+    audio.intents.add(request.intent);
+    audio.calls.add(switch (request) {
+      PlayQuery() => {
+          'method': 'playFromQueue',
+          'uuid': request.currentUuid,
+          'sourceType': request.source.sourceType,
+          'artistId': request.source.artistId,
+          'albumId': request.source.albumId,
+          'orderParams': request.order,
+          'downloadedOnly': request.downloadedOnly,
+        },
+      PlayList() => {
+          'method': 'playFromTrackList',
+          'uuids': request.uuids,
+          'uuid': request.uuids[request.startIndex],
+          'sourceType': request.source.sourceType,
+        },
+      Enqueue() => {
+          'method': request.position == EnqueuePosition.next
+              ? 'playNext'
+              : 'addToQueue',
+          'uuids': request.uuids,
+        },
     });
-  }
-
-  @override
-  Future<void> playFromTrackList(
-    List<String> uuids,
-    TrackUI startTrack, {
-    required String sourceType,
-  }) async {
-    calls.add({
-      'method': 'playFromTrackList',
-      'uuids': uuids,
-      'uuid': startTrack.uuidId,
-      'sourceType': sourceType,
-    });
-  }
-
-  @override
-  Future<void> playNext(List<TrackUI> tracks) async {
-    calls.add({
-      'method': 'playNext',
-      'uuids': tracks.map((t) => t.uuidId).toList(),
-    });
-  }
-
-  @override
-  Future<void> addToQueue(List<TrackUI> tracks) async {
-    calls.add({
-      'method': 'addToQueue',
-      'uuids': tracks.map((t) => t.uuidId).toList(),
-    });
+    return const Accepted(1);
   }
 }
 
@@ -268,7 +259,9 @@ class BrowseHarness {
         trackSyncProvider.overrideWith(StubTrackSync.new),
         appInfoProvider.overrideWith((ref) async => appInfo),
         conversionJobsProvider.overrideWith(EmptyConversionJobs.new),
-        audioProvider.overrideWith(() => audio),
+        queuePlayerProvider.overrideWith(() => audio),
+        playbackRequestsProvider
+            .overrideWith((ref) => RecordingRequests(ref, audio)),
         if (repository != null)
           browseRepositoryProvider.overrideWithValue(repository),
         ...overrides,

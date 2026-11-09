@@ -1,3 +1,4 @@
+import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/shell/app_shell.dart';
@@ -80,7 +81,13 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     if (_finishingReset) return;
     _finishingReset = true;
     final failure = _session.resetFailure;
-    if (failure != null) {
+    // Only a failed wipe leaves data behind. A quiesce step that failed or
+    // timed out (a request still in flight) is logged: the wipe ran and the
+    // fence keeps its late work out of the new store.
+    if (failure != null && failure.failures.every((f) => f.quiesce)) {
+      developer.log('Reset completed; quiesce issues: $failure', name: 'StartupGate');
+    }
+    if (failure != null && failure.failures.any((f) => !f.quiesce)) {
       await showDialog<void>(
         context: context,
         builder: (ctx) => AlertDialog(

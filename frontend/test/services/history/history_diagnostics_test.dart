@@ -130,6 +130,29 @@ void main() {
     expect(d.pending, 1);
   });
 
+  test('frozen listens and the last listen error are shown (§7)', () async {
+    final c = scope(runner: _RecordingRunner());
+    c.listen(historyDiagnosticsProvider, (_, _) {});
+    await next(c, (d) => d.frozenListens == 0 && d.listenError == null);
+    final repo = c.read(historyRepositoryProvider);
+    await repo.checkpointDraft(token, const ListenDraft(
+      listenUuid: '55555555-5555-4555-8555-555555555555',
+      queueSessionId: 1, queueItemId: 1, trackUuid: 't-1',
+      startedAt: 1000, durationSeconds: null,
+      accumulatedMicros: 2000000, lastCheckpointAt: 3000,
+    ));
+    await pumpEventQueue();
+    expect(c.read(historyDiagnosticsProvider).value?.frozenListens, 0,
+        reason: 'a listen in progress is not waiting to be saved');
+    await repo.freezeDraft(token, '55555555-5555-4555-8555-555555555555',
+        _event('55555555-5555-4555-8555-555555555555', seconds: 2));
+    await next(c, (d) => d.frozenListens == 1);
+    c.read(listenRecordingErrorProvider).value = 'Bad state: disk full';
+    final d = await next(c, (d) => d.listenError != null);
+    expect(d.listenError, 'Bad state: disk full');
+    expect(d.frozenListens, 1);
+  });
+
   for (final disposeWhilePending in [false, true]) {
     test('late conflict lookup cannot publish after ${disposeWhilePending ? 'dispose' : 'resolution'}', () async {
       final repository = _GatedPayloadRepository(db);

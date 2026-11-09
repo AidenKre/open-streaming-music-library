@@ -16,7 +16,7 @@ import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';

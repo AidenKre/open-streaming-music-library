@@ -94,6 +94,10 @@ void main() {
       ('restored', const HistoryDiagnostics(serverRegressed: true, pending: 1),
           'Server history looks restored'),
       ('error', const HistoryDiagnostics(lastError: 'boom'), 'Last sync failed'),
+      ('listen not saved', const HistoryDiagnostics(listenError: 'disk full'),
+          'A listen could not be saved'),
+      ('frozen listens', const HistoryDiagnostics(frozenListens: 2),
+          '2 listens waiting to be saved'),
     ]) {
       testWidgets('summarizes: $label', (tester) async {
         await pump(tester, diag);
@@ -127,6 +131,17 @@ void main() {
       await tester.tap(find.widgetWithText(FilledButton, 'Retry'));
       await tester.pumpAndSettle();
       expect(controls.calls, ['retry']);
+    });
+
+    testWidgets('listen recording failures and the checkpoint limitation are '
+        'shown (Phase 5 §7)', (tester) async {
+      await page(tester, const HistoryDiagnostics(
+        frozenListens: 1, listenError: 'Bad state: disk full',
+      ));
+      expect(find.textContaining('Listens waiting to be saved: 1'),
+          findsOneWidget);
+      expect(find.textContaining('Bad state: disk full'), findsOneWidget);
+      expect(find.textContaining('last 5 seconds'), findsOneWidget);
     });
 
     testWidgets('waiting for server support is explained, not "offline"',

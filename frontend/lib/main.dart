@@ -6,10 +6,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/audio/audio_dependencies.dart';
-import 'package:frontend/providers/audio/audio_service_bridge.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
+import 'package:frontend/playback/audio_service_bridge.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/app_lifecycle_service.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
@@ -134,16 +135,8 @@ class _FrontendState extends ConsumerState<Frontend>
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    ref
-        .read(historySyncTriggersProvider)
-        .setForeground(state == AppLifecycleState.resumed);
-    if (state == AppLifecycleState.resumed) {
-      unawaited(
-        ref.read(recoveryServiceProvider).runFor(RecoveryTrigger.appResume),
-      );
-    }
-  }
+  void didChangeAppLifecycleState(AppLifecycleState state) =>
+      ref.read(appLifecycleServiceProvider).changed(state);
 
   @override
   Widget build(BuildContext context) {

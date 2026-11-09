@@ -1,3 +1,4 @@
+import 'package:frontend/services/server_binding_gate.dart';
 // SC-15: reset lifecycle fence -> quiesce -> wipe.
 //  1. Fence (first, awaited): bump the in-memory generation synchronously,
 //     then delete the SC-01 binding row. If the delete fails, ABORT before
@@ -85,10 +86,12 @@ void main() {
     List<LossReporter> reporters = const [],
     ServerBindingRepository? binding,
     Duration quiesceTimeout = const Duration(seconds: 5),
+    bool gate = false,
   }) {
     final c = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        if (gate) autoVerifiedGateOverride(),
         if (binding != null)
           serverBindingRepositoryProvider.overrideWithValue(binding),
         localQuiescablesProvider.overrideWithValue(quiescables),
@@ -180,6 +183,36 @@ void main() {
       throwsA(isA<LocalResetException>()),
     );
     expect(log, ['quiesce:stuck', 'quiesce:next', 'wipe:db']);
+  });
+
+  test('branch audit: failures carry their stage (quiesce vs wipe)', () async {
+    final c = container(
+      quiescables: [
+        _Quiesce('runner', log, onQuiesce: () async => throw StateError('q')),
+      ],
+      resettables: [_Wipe('db', log, onReset: () async => throw StateError('w'))],
+    );
+    final error = await c.read(localResetServiceProvider).reset()
+        .then<Object?>((_) => null, onError: (Object e) => e);
+    final failures = (error! as LocalResetException).failures;
+    expect(failures.map((f) => (f.quiesce, '${f.error}')).toList(), [
+      (true, 'Bad state: q'),
+      (false, 'Bad state: w'),
+    ]);
+  });
+
+  test('branch audit (5A.0 m1): after the fence the gate stops handing out '
+      'the verified token', () async {
+    final c = container(quiescables: [], gate: true);
+    final gate = c.read(serverBindingGateProvider);
+    expect(await gate.awaitVerified(), isNotEmpty);
+    await c.read(localResetServiceProvider).reset();
+    var got = false;
+    unawaited(gate.awaitVerified().then((_) => got = true, onError: (_) {}));
+    await pumpEventQueue();
+    expect(got, isFalse,
+        reason: 'no request (an edit flush, a sync) may use the old token mid-reset');
+    expect(gate.state, isNot(isA<BindingVerified>()));
   });
 
   test('a clean reset reports nothing', () async {

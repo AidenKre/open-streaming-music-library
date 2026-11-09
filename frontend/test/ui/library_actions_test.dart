@@ -4,10 +4,12 @@ import 'dart:io';
 import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/models/history_intent.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
@@ -97,7 +99,9 @@ void main() {
         databaseProvider.overrideWithValue(db),
         browseRepositoryProvider.overrideWithValue(repo),
         downloadManagerProvider.overrideWithValue(downloads),
-        audioProvider.overrideWith(() => audio),
+        queuePlayerProvider.overrideWith(() => audio),
+        playbackRequestsProvider
+            .overrideWith((ref) => RecordingRequests(ref, audio)),
         offlineModeProvider.overrideWith(() => offline),
         downloadQualityProvider.overrideWithValue('320'),
       ],
@@ -264,5 +268,45 @@ void main() {
     expect(audio.calls, [
       {'method': 'playNext', 'uuids': ['c-z', 'c-a']},
     ]);
+  });
+
+  group('5B.1: accepted intents and outcomes', () {
+    Future<TrackUI> trackOf(String uuid) async =>
+        (await repo.getTracksForScope(const ArtistScope(artistId: 1), offline: false))
+            .firstWhere((t) => t.uuidId == uuid);
+
+    test('a one-track scope carries a track click intent', () async {
+      final track = await trackOf('n1');
+      await container.read(libraryActionsProvider).playNext(TrackScope(track));
+      await container.read(libraryActionsProvider).addToQueue(TrackScope(track));
+      expect(audio.intents, const [
+        HistoryIntent.track('n1'),
+        HistoryIntent.track('n1'),
+      ]);
+    });
+
+    test('album and artist scopes carry no click until Phase 6', () async {
+      await container
+          .read(libraryActionsProvider)
+          .addToQueue(const AlbumScope(artistId: 1, albumId: 2));
+      await container.read(libraryActionsProvider).playNext(const ArtistScope(artistId: 1));
+      expect(audio.intents, [null, null]);
+    });
+
+    test('row taps click the tapped track and surface the outcome', () async {
+      final tracks = await repo.getTracksForScope(const ArtistScope(artistId: 1),
+          offline: false);
+      final outcome = await container
+          .read(libraryActionsProvider)
+          .playFromList(tracks, 1, source: 'search');
+      expect(outcome, isA<Accepted>());
+      expect(audio.intents.single,
+          HistoryIntent.track(tracks[1].uuidId));
+      final query = await container
+          .read(libraryActionsProvider)
+          .playQuery(tracks[0], downloadedOnly: false);
+      expect(query, isA<Accepted>());
+      expect(audio.intents.last, HistoryIntent.track(tracks[0].uuidId));
+    });
   });
 }

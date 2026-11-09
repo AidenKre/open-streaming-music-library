@@ -2,8 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/player_controller.dart';
@@ -413,7 +413,7 @@ class _QueueViewState extends ConsumerState<_QueueView> {
   }
 
   int get _totalCount =>
-      ref.read(audioProvider.select((s) => s.queue.totalCount));
+      ref.read(queuePlayerProvider.select((s) => s.queue.totalCount));
 
   void _onScroll() {
     if (!_scrollController.hasClients ||
@@ -516,14 +516,14 @@ class _QueueViewState extends ConsumerState<_QueueView> {
 
   @override
   Widget build(BuildContext context) {
-    final sessionId = ref.watch(audioProvider.select((s) => s.queue.sessionId));
+    final sessionId = ref.watch(queuePlayerProvider.select((s) => s.queue.sessionId));
     final queueVersion = ref.watch(
-      audioProvider.select((s) => s.queue.queueVersion),
+      queuePlayerProvider.select((s) => s.queue.queueVersion),
     );
     final currentPlayPosition = ref.watch(queueCurrentPlayPositionProvider);
     final currentItemId = ref.watch(queueCurrentItemIdProvider);
     final totalCount = ref.watch(
-      audioProvider.select((s) => s.queue.totalCount),
+      queuePlayerProvider.select((s) => s.queue.totalCount),
     );
     // Observed only so rows re-derive their model availability on a flip.
     ref.watch(offlineModeProvider);

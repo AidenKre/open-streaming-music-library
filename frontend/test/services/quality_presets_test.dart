@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
-import 'package:frontend/providers/audio/track_cache_manager.dart';
+import 'package:frontend/playback/track_cache_manager.dart';
 import 'package:frontend/services/quality_presets.dart';
 
 void main() {

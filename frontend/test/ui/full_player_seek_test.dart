@@ -3,15 +3,15 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
 
 void main() {
   testWidgets('seek slider only commits one seek on release', (tester) async {
     final container = ProviderContainer(
-      overrides: [audioProvider.overrideWith(TestSeekAudioCoordinator.new)],
+      overrides: [queuePlayerProvider.overrideWith(TestSeekQueuePlayer.new)],
     );
     addTearDown(container.dispose);
 
@@ -26,7 +26,7 @@ void main() {
     await tester.pumpAndSettle();
 
     final notifier =
-        container.read(audioProvider.notifier) as TestSeekAudioCoordinator;
+        container.read(queuePlayerProvider.notifier) as TestSeekQueuePlayer;
     final sliderFinder = find.byKey(const Key('now_playing_seek_slider'));
     final sliderBox = tester.renderObject<RenderBox>(sliderFinder);
     final start = sliderBox.localToGlobal(
@@ -61,7 +61,7 @@ void main() {
   });
 }
 
-class TestSeekAudioCoordinator extends AudioCoordinator {
+class TestSeekQueuePlayer extends QueuePlayer {
   final List<Duration> seekCalls = [];
 
   static const _track = TrackUI(

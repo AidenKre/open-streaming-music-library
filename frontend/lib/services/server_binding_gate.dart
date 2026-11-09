@@ -113,6 +113,7 @@ class ServerBindingGate {
     _retryTimer?.cancel();
     _retryTimer = null;
     _verifiedToken = null;
+    _backoff.reset(); // a new connection: not the last outage's delay
     return _verify(++_generation, baseUrl, reportOffline);
   }
 

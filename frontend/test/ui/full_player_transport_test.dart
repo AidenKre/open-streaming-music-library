@@ -2,9 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
 
@@ -24,7 +24,7 @@ const _track = TrackUI(
   hasAlbumArt: false,
 );
 
-class _StateOnly extends AudioCoordinator {
+class _StateOnly extends QueuePlayer {
   _StateOnly(this._initial);
   final AudioState _initial;
   @override
@@ -40,7 +40,7 @@ Future<FakePlayerControls> _pump(
   final controls = FakePlayerControls();
   final container = ProviderContainer(
     overrides: [
-      audioProvider.overrideWith(
+      queuePlayerProvider.overrideWith(
         () => _StateOnly(
           AudioState(
             playback: PlaybackSlice(

@@ -8,7 +8,7 @@ import 'package:path/path.dart' as p;
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/audio/track_cache_manager.dart';
+import 'package:frontend/playback/track_cache_manager.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';

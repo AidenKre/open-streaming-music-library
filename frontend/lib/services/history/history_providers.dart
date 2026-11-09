@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/history_api.dart';
@@ -11,6 +12,15 @@ import 'package:frontend/services/background/single_flight_runner.dart';
 import 'package:frontend/services/history/history_sync_service.dart';
 import 'package:frontend/services/history/history_sync_triggers.dart';
 import 'package:frontend/services/server_binding_gate.dart';
+
+/// The last listen recording failure of this scope (Phase 5 §7 "visible
+/// error"), written by the ListenRecorder's error sink, shown by the
+/// history diagnostics.
+final listenRecordingErrorProvider = Provider<ValueNotifier<String?>>((ref) {
+  final error = ValueNotifier<String?>(null);
+  ref.onDispose(error.dispose);
+  return error;
+});
 
 /// The scope's history store.
 final Provider<HistoryRepository> historyRepositoryProvider = Provider<HistoryRepository>(
@@ -45,6 +55,10 @@ final historySyncServiceProvider = Provider<HistorySyncService>((ref) {
       } catch (_) {
         return null;
       }
+    },
+    // A fresh /app/info read (the capability recheck while waiting).
+    refreshCapabilities: () async {
+      if (ref.mounted) ref.invalidate(appInfoProvider);
     },
   );
 });

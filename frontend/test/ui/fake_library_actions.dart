@@ -1,5 +1,6 @@
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/ui/library_actions.dart';
 
 /// Records every library action as `method scope[ extra]`, for widget tests
@@ -16,31 +17,41 @@ class FakeLibraryActions implements LibraryActionControls {
   };
 
   @override
-  Future<void> playNext(LibraryScope scope) async =>
-      calls.add('playNext ${describe(scope)}');
+  Future<PlaybackOutcome> playNext(LibraryScope scope) async {
+    calls.add('playNext ${describe(scope)}');
+    return const Accepted(1);
+  }
 
   @override
-  Future<void> addToQueue(LibraryScope scope) async =>
-      calls.add('addToQueue ${describe(scope)}');
+  Future<PlaybackOutcome> addToQueue(LibraryScope scope) async {
+    calls.add('addToQueue ${describe(scope)}');
+    return const Accepted(1);
+  }
 
   @override
-  Future<void> playFromList(
+  Future<PlaybackOutcome> playFromList(
     List<TrackUI> tracks,
     int startIndex, {
     required String source,
-  }) async => calls.add(
-    'playFromList ${tracks.map((t) => t.uuidId).join(',')} @$startIndex $source',
-  );
+  }) async {
+    calls.add(
+      'playFromList ${tracks.map((t) => t.uuidId).join(',')} @$startIndex $source',
+    );
+    return const Accepted(1);
+  }
 
   @override
-  Future<void> playQuery(
+  Future<PlaybackOutcome> playQuery(
     TrackUI track, {
     AlbumScope? album,
     required bool downloadedOnly,
-  }) async => calls.add(
-    'playQuery ${track.uuidId} ${album == null ? 'library' : describe(album)}'
-    ' downloadedOnly=$downloadedOnly',
-  );
+  }) async {
+    calls.add(
+      'playQuery ${track.uuidId} ${album == null ? 'library' : describe(album)}'
+      ' downloadedOnly=$downloadedOnly',
+    );
+    return const Accepted(1);
+  }
 
   @override
   Future<void> download(LibraryScope scope) async =>

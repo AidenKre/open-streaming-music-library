@@ -19,7 +19,7 @@ import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';

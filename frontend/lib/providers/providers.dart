@@ -178,7 +178,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
 
   /// Runs one sync operation with the shared guards: offline no-ops,
   /// `isSyncing` serializes concurrent entrants (two operations publishing
-  /// the same mutation version would make the audio coordinator's
+  /// the same mutation version would make the queue player's
   /// `<=`-version guard drop the second one's queue reconciliation), the op
   /// executes under the edit/sync mutex, and the result is mapped onto the
   /// state that is current AT PUBLISH TIME. Returns true when [op] ran and

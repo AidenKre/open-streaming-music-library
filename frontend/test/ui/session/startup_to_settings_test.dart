@@ -98,7 +98,12 @@ void main() {
     tester,
   ) async {
     await pumpLiveApp(tester);
-    service.failure = LocalResetException([]);
+    // A wipe step failed (data left behind); quiesce-only issues are not
+    // shown (live gate, 2026-11-07).
+    service.failure = LocalResetException([
+      LocalResetFailure(int, StateError('wipe failed'), StackTrace.empty,
+          participant: Object()),
+    ]);
     await openSettingsAndConfirmDisconnect(tester);
     expect(find.text('Reset incomplete'), findsOneWidget);
     await tester.tap(find.text('OK'));

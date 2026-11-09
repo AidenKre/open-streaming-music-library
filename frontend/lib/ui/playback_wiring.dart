@@ -1,9 +1,10 @@
 import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/providers/audio/audio_dependencies.dart';
-import 'package:frontend/providers/audio/now_playing_publisher.dart';
-import 'package:frontend/providers/audio/queue_warm_listener.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
+import 'package:frontend/playback/now_playing_publisher.dart';
+import 'package:frontend/playback/queue_warm_listener.dart';
+import 'package:frontend/services/history/listen_recorder.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/ui/player_controller.dart';
 
@@ -17,7 +18,8 @@ import 'package:frontend/ui/player_controller.dart';
 /// Lives under `ui/` because it binds to a controller; the playback model
 /// never imports `ui/` (D14). Binding never builds the playback model; the
 /// first OS command does, and queue restore waits for the session (B8).
-/// The playback observers (OS now-playing, queue warm) are kept alive from
+/// The playback observers (OS now-playing, queue warm, listen recording)
+/// are kept alive from
 /// the session-ready signal on, which is also when they first build the
 /// model (SC-27 principle 13).
 class PlaybackWiring {
@@ -43,6 +45,9 @@ final playbackWiringProvider = Provider<PlaybackWiring>((ref) {
     if (!ref.mounted) return;
     ref.listen(nowPlayingPublisherProvider, (_, _) {});
     ref.listen(queueWarmListenerProvider, (_, _) {});
+    // Listen accounting starts behind its startup barrier (5B.3).
+    ref.listen(listenRecorderProvider, (_, _) {});
+    unawaited(ref.read(listenRecorderProvider).start());
   }));
   return wiring;
 });

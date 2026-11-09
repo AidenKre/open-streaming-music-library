@@ -1,3 +1,4 @@
+import 'dart:developer' as developer;
 import 'package:drift/drift.dart';
 
 import 'package:frontend/database/database.dart';
@@ -107,11 +108,13 @@ class QueueRepository {
     String repeatMode = 'off',
     bool shuffleEnabled = false,
     bool downloadedOnly = false,
+    bool activate = true,
   }) {
     return _fenced(() async {
-      await _deactivateAll();
+      if (activate) await _deactivateAll();
 
       final sessionId = await _createSessionRow(
+        active: activate,
         sourceType: sourceType,
         sourceArtistId: sourceArtistId,
         sourceAlbumId: sourceAlbumId,
@@ -181,11 +184,13 @@ class QueueRepository {
     int currentIndex = 0,
     String repeatMode = 'off',
     bool shuffleEnabled = false,
+    bool activate = true,
   }) {
     return _fenced(() async {
-      await _deactivateAll();
+      if (activate) await _deactivateAll();
 
       final sessionId = await _createSessionRow(
+        active: activate,
         sourceType: sourceType,
         sourceArtistId: sourceArtistId,
         sourceAlbumId: sourceAlbumId,
@@ -843,6 +848,79 @@ class QueueRepository {
 
   Future<void> deactivateAll() => _fenced(_deactivateAll);
 
+  /// Makes a prepared (inactive) session the active one (SC-27): in one
+  /// fenced transaction the others are deactivated and it is activated. A
+  /// session that no longer exists changes nothing and throws.
+  Future<void> activateSession(int sessionId) => _fenced(() async {
+        await _db.transaction(() async {
+          final session = await (_db.select(_db.queueSessions)
+                ..where((s) => s.id.equals(sessionId)))
+              .getSingleOrNull();
+          if (session == null) {
+            throw StateError('Prepared session $sessionId is gone');
+          }
+          await _deactivateAll();
+          await (_db.update(_db.queueSessions)
+                ..where((s) => s.id.equals(sessionId)))
+              .write(QueueSessionsCompanion(
+            isActive: const Value(true),
+            updatedAt: Value(_timestampSeconds()),
+          ));
+        });
+      });
+
+  /// Deletes a prepared session that was never activated (a rejected or
+  /// superseded request). The active session is never discarded.
+  Future<bool> discardSession(int sessionId) => _fenced(() async {
+        return _db.transaction(() async {
+          final session = await (_db.select(_db.queueSessions)
+                ..where((s) => s.id.equals(sessionId) & s.isActive.equals(false)))
+              .getSingleOrNull();
+          if (session == null) return false;
+          await _deleteSessions([sessionId]);
+          return true;
+        });
+      });
+
+  /// Deletes every inactive session (at startup: prepared sessions of a
+  /// previous run and queues the user replaced). Returns how many.
+  Future<int> pruneInactiveSessions() => _fenced(() async {
+        return _db.transaction(() async {
+          final ids = await (_db.selectOnly(_db.queueSessions)
+                ..addColumns([_db.queueSessions.id])
+                ..where(_db.queueSessions.isActive.equals(false)))
+              .map((row) => row.read(_db.queueSessions.id)!)
+              .get();
+          await _deleteSessions(ids);
+          return ids.length;
+        });
+      });
+
+  Future<int>? _startupPrune;
+
+  /// The scope's one startup prune (a repository instance lives for one
+  /// session scope). Everything that prepares or restores a session awaits
+  /// it first, so it can never delete a session prepared in this scope.
+  Future<int> pruneInactiveSessionsOnce() =>
+      _startupPrune ??= pruneInactiveSessions().catchError((Object error) {
+        // Pruning is housekeeping: a failure skips it (retried next time).
+        _startupPrune = null;
+        developer.log('Pruning inactive queue sessions failed',
+            name: 'QueueRepository', error: error);
+        return 0;
+      });
+
+  Future<void> _deleteSessions(List<int> ids) async {
+    if (ids.isEmpty) return;
+    await (_db.delete(_db.queueSessionPlayOrder)
+          ..where((o) => o.sessionId.isIn(ids)))
+        .go();
+    await (_db.delete(_db.queueSessionItems)
+          ..where((i) => i.sessionId.isIn(ids)))
+        .go();
+    await (_db.delete(_db.queueSessions)..where((s) => s.id.isIn(ids))).go();
+  }
+
   Future<void> _deactivateAll() {
     return (_db.update(
       _db.queueSessions,
@@ -855,6 +933,7 @@ class QueueRepository {
   }
 
   Future<int> _createSessionRow({
+    required bool active,
     required String sourceType,
     int? sourceArtistId,
     int? sourceAlbumId,
@@ -866,7 +945,7 @@ class QueueRepository {
         .into(_db.queueSessions)
         .insert(
           QueueSessionsCompanion.insert(
-            isActive: const Value(true),
+            isActive: Value(active),
             createdAt: now,
             updatedAt: now,
             sourceType: sourceType,

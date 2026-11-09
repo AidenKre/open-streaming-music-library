@@ -120,6 +120,14 @@ class ServerBindingRepository {
         );
   }
 
+  /// Clears `catalog_reconciled_at_binding` (fenced): a server restored from
+  /// a backup may reissue parent ids, so the local parents no longer match
+  /// the server's until a reset.
+  Future<void> clearCatalogReconciled(String token) => runFenced(token, () async {
+        await _db.update(_db.serverBinding).write(
+            const ServerBindingCompanion(catalogReconciledAtBinding: Value(false)));
+      });
+
   /// Deletes the binding row: the first step of a reset. Every token
   /// captured before this point is fenced from then on.
   Future<void> fence() => _db.delete(_db.serverBinding).go();

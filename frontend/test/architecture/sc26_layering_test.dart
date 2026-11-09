@@ -31,6 +31,7 @@ void main() {
         'lib/api',
         'lib/database',
         'lib/models',
+        'lib/playback',
         'lib/providers',
         'lib/repositories',
         'lib/services',

@@ -13,7 +13,7 @@ import 'browse_harness.dart';
 import 'fake_library_actions.dart';
 
 /// SC-26: every row tap on today's pages goes to LibraryActionControls
-/// (never to the coordinator), with the right scope, list and filter.
+/// (never to the queue player), with the right scope, list and filter.
 void main() {
   late AppDatabase db;
   late BrowseHarness harness;

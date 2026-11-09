@@ -43,7 +43,8 @@ class HistorySyncStatus {
 /// verified connection the pass fails with the offline wait and the next
 /// connection edge requests it again. Upload failures don't stop the pull;
 /// a 409 or 413/422 quarantines the affected events (retained, never
-/// rewritten) and the healthy ones continue. A fenced write (a reset) ends
+/// rewritten) and the healthy ones continue; a refusal that names no event
+/// halves the batch until the refused event stands alone. A fenced write (a reset) ends
 /// the pass quietly.
 class HistorySyncService {
   HistorySyncService({
@@ -53,6 +54,7 @@ class HistorySyncService {
     required String? Function() verifiedToken,
     required bool Function() isOffline,
     required Future<bool?> Function() supportsHistory,
+    Future<void> Function()? refreshCapabilities,
     this.maxBatchesPerPass = 10,
     this.maxPagesPerPass = 10,
     this.pageSize = 200,
@@ -61,7 +63,8 @@ class HistorySyncService {
        _cursors = cursors,
        _verifiedToken = verifiedToken,
        _isOffline = isOffline,
-       _supportsHistory = supportsHistory;
+       _supportsHistory = supportsHistory,
+       _refreshCapabilities = refreshCapabilities;
 
   final HistoryRepository _repository;
   final HistoryApi _api;
@@ -69,6 +72,7 @@ class HistorySyncService {
   final String? Function() _verifiedToken;
   final bool Function() _isOffline;
   final Future<bool?> Function() _supportsHistory;
+  final Future<void> Function()? _refreshCapabilities;
 
   final int maxBatchesPerPass;
   final int maxPagesPerPass;
@@ -101,10 +105,26 @@ class HistorySyncService {
   /// This pass quarantined events (a 409 or 413/422): not a clean pass.
   bool _quarantinedThisPass = false;
 
+  /// The event cap for upload batches. A 413 (or a 422 that names no event)
+  /// on a batch of several events halves it, and the smaller size is kept
+  /// for later passes: whatever refused the body (a proxy's size limit)
+  /// usually still does. Only an event refused on its own is quarantined.
+  int _batchEvents = HistoryRepository.maxBatchEvents;
+
   Future<PassOutcome> runPass(Set<String> reasons) async {
     if (_isOffline()) return const PassFailed(BackoffReason.offline);
     final token = _verifiedToken();
     if (token == null) return const PassFailed(BackoffReason.offline);
+    // A server found without support is rechecked through its capabilities
+    // (/app/info), never by calling the history endpoints again (Phase 5
+    // §5); a cached "supported" may predate the 404 that set this.
+    if (_status.value.waitingForServerSupport) {
+      try {
+        await _refreshCapabilities?.call();
+      } catch (_) {
+        // the capability read below decides
+      }
+    }
     final supported = await _supportsHistory();
     if (!_canRequest(token)) return const PassFailed(BackoffReason.offline);
     if (supported == null) {
@@ -125,11 +145,13 @@ class HistorySyncService {
       }
       final pull = await _pull(token);
       if (pull is PassFailed) return pull;
+      if (upload is PassFailed) return upload;
       if (_status.value.blockedConflicts.isNotEmpty ||
           _status.value.serverRegressed) {
-        return const PassDone();
+        // A blocked pull is a diagnostic, not a long wait; uploads that
+        // still have work go on.
+        return upload is PassMoreWork ? const PassMoreWork() : const PassDone();
       }
-      if (upload is PassFailed) return upload;
       // Clean: clear the last error, unless this pass quarantined events
       // (they stay visible in diagnostics until resolved).
       if (!_quarantinedThisPass) _update(lastError: null);
@@ -140,6 +162,11 @@ class HistorySyncService {
     } on BindingFencedException {
       // A reset fenced this session's store: nothing left to sync.
       return const PassDone();
+    } catch (error) {
+      // Anything else (a local database error, a bug) is visible in the
+      // diagnostics instead of only in the runner's log.
+      _update(lastError: '$error');
+      return const PassFailed(BackoffReason.transient);
     }
   }
 
@@ -156,7 +183,8 @@ class HistorySyncService {
   /// stopped (the pull still runs, except for a missing endpoint).
   Future<PassOutcome> _upload(String token) async {
     for (var i = 0; i < maxBatchesPerPass; i++) {
-      final batch = await _repository.nextUploadBatch(token);
+      final batch =
+          await _repository.nextUploadBatch(token, maxEvents: _batchEvents);
       if (batch == null) return const PassDone();
       if (!_canRequest(token)) return const PassFailed(BackoffReason.offline);
       try {
@@ -184,6 +212,8 @@ class HistorySyncService {
               return const PassFailed(BackoffReason.transient);
             }
             await _quarantine(token, ids, 'conflict', e.detailMessage);
+          case 413 when batch.events.length > 1:
+            _batchEvents = batch.events.length ~/ 2;
           case 413:
             await _quarantine(token, batch.eventUuids, 'rejected', e.detailMessage);
           case 422:
@@ -195,6 +225,10 @@ class HistorySyncService {
                   loc[2] is int && loc[2] >= 0 && loc[2] < batch.events.length) {
                 indices.add(loc[2] as int);
               }
+            }
+            if (indices.isEmpty && batch.events.length > 1) {
+              _batchEvents = batch.events.length ~/ 2;
+              continue;
             }
             final ids = indices.isEmpty ? batch.eventUuids : [
               for (final index in indices) batch.events[index].eventUuid,
@@ -261,6 +295,9 @@ class HistorySyncService {
       return const PassFailed(BackoffReason.transient);
     } on ApiException catch (e) {
       _update(lastError: e.detailMessage ?? e.toString());
+      // A missing endpoint is a server without history support, like a
+      // missing upload endpoint: wait for the capability, don't retry.
+      if (e.statusCode == 404) return _capabilityMissing();
       return const PassFailed(BackoffReason.transient);
     } on NetworkException catch (e) {
       _update(lastError: e.toString());

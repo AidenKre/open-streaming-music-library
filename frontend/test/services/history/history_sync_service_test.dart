@@ -163,6 +163,88 @@ void main() {
     });
   });
 
+  group('branch audit (5A)', () {
+    test('M1: a blocked pull keeps the upload\'s outcome (transient failure, '
+        'more work)', () async {
+      api.onChanges = (_) => HistoryPage(
+        events: [_server('srv', 5, seconds: 99)], nextCursor: null, latestRevision: 5,
+      );
+      await repo.insertLocal(token, _event('srv', seconds: 30.5)); // the conflict
+      await repo.insertLocal(token, _event('other'));
+      api.onPost = (_) => throw _http(503, {'code': 'history_unavailable', 'message': 'busy'});
+      final s = service();
+      final out = await s.runPass({'poll'});
+      expect(s.status.value.blockedConflicts, isNotEmpty);
+      expect(out, isA<PassFailed>().having((f) => f.reason, 'reason', BackoffReason.transient),
+          reason: 'the failed upload still backs off and retries');
+    });
+
+    test('M1: a blocked pull with uploads left to do asks for more work',
+        () async {
+      api.onChanges = (_) => HistoryPage(
+        events: [_server('srv', 5, seconds: 99)], nextCursor: null, latestRevision: 5,
+      );
+      await repo.insertLocal(token, _event('srv', seconds: 30.5));
+      for (var i = 0; i < 250; i++) {
+        await repo.insertLocal(token, _event('bulk-$i'));
+      }
+      api.onPost = (batch) => batch.eventUuids;
+      final out = await service(batches: 1).runPass({'poll'});
+      expect(out, isA<PassMoreWork>());
+    });
+
+    test('M3: an unexpected error reaches diagnostics and backs off', () async {
+      await repo.insertLocal(token, _event('a'));
+      api.onPost = (_) => throw StateError('disk I/O error');
+      final s = service();
+      final out = await s.runPass({'poll'});
+      expect(out, isA<PassFailed>().having((f) => f.reason, 'reason', BackoffReason.transient));
+      expect(s.status.value.lastError, contains('disk I/O error'));
+    });
+  });
+
+  group('live gate: a server that loses the capability (5-T11)', () {
+    test('a pull 404 means the capability is missing, not a transient error',
+        () async {
+      api.onChanges = (_) => throw _http(404, {'code': 'not_found', 'message': 'Not Found'});
+      final s = service();
+      final out = await s.runPass({'timer'});
+      expect(out, isA<PassFailed>().having((f) => f.reason, 'reason', BackoffReason.capabilityMissing));
+      expect(s.status.value.waitingForServerSupport, isTrue);
+    });
+
+    test('while waiting for support, a pass rechecks capabilities before any '
+        'history request', () async {
+      var refreshes = 0;
+      var serverSupports = false; // what a fresh /app/info would say
+      final s = HistorySyncService(
+        repository: repo, api: api, cursors: cursors,
+        verifiedToken: () => token, isOffline: () => false,
+        supportsHistory: () async => supported,
+        refreshCapabilities: () async {
+          refreshes++;
+          supported = serverSupports;
+        },
+      );
+      api.onChanges = (_) => throw _http(404, {'code': 'not_found', 'message': 'Not Found'});
+      await repo.insertLocal(token, _event('a'));
+      api.onPost = (_) => throw _http(404, {'code': 'not_found', 'message': 'Not Found'});
+      await s.runPass({'timer'}); // the cached capability still said yes: one 404
+      final calls = api.posted.length + api.pulledAfter.length;
+      expect(await s.runPass({'localInsert'}), isA<PassFailed>());
+      expect(await s.runPass({'timer'}), isA<PassFailed>());
+      expect(refreshes, 2, reason: 'each pass while waiting rechecks /app/info');
+      expect(api.posted.length + api.pulledAfter.length, calls,
+          reason: 'no history request while the server lacks support');
+      serverSupports = true; // the server gained support
+      api.onPost = (batch) => batch.eventUuids;
+      api.onChanges = (_) => const HistoryPage(events: [], nextCursor: null, latestRevision: 0);
+      expect(await s.runPass({'appResume'}), isA<PassDone>());
+      expect(s.status.value.waitingForServerSupport, isFalse);
+      expect(await pending(), {'a': 0}, reason: 'the backlog uploads once supported');
+    });
+  });
+
   // Audit 5A(a) #1: an unknown capability (app info not loaded) is a short
   // transient wait, never "the server lacks history".
   test('an unknown capability is transient, not "waiting for support"',
@@ -288,6 +370,67 @@ void main() {
       });
     }
 
+    // Branch audit 5A M2: a body-size refusal (a proxy with a smaller
+    // limit) or an index-less 422 says nothing about which event is bad:
+    // the batch is halved until the refused event stands alone, and only
+    // that event is quarantined.
+    test('a 413 halves the batch; only an event refused alone is held back',
+        () async {
+      for (final id in ['a', 'b', 'big', 'c', 'd']) {
+        await repo.insertLocal(token, _event(id));
+      }
+      api.onPost = (batch) {
+        if (batch.eventUuids.length > 2 || batch.eventUuids.contains('big')) {
+          throw _http(413, {'error': 'too_large', 'message': 'no', 'retryable': false});
+        }
+        return batch.eventUuids;
+      };
+      final s = service();
+      await s.runPass({'timer'});
+      expect(await failures(), {'big': 'rejected'});
+      expect(await pending(), {'a': 0, 'b': 0, 'big': 1, 'c': 0, 'd': 0});
+      expect(api.posted.first, ['a', 'b', 'big', 'c', 'd']);
+      expect(api.posted.where((p) => p.contains('big')).last, ['big'],
+          reason: 'quarantined only once it was refused alone');
+    });
+
+    test('an index-less 422 halves the batch the same way', () async {
+      for (final id in ['a', 'bad', 'c']) {
+        await repo.insertLocal(token, _event(id));
+      }
+      api.onPost = (batch) {
+        if (batch.eventUuids.contains('bad')) {
+          throw _http(422, {'error': 'rejected', 'message': 'no', 'retryable': false});
+        }
+        return batch.eventUuids;
+      };
+      await service().runPass({'timer'});
+      expect(await failures(), {'bad': 'rejected'});
+      expect(await pending(), {'a': 0, 'bad': 1, 'c': 0});
+    });
+
+    test('the halved batch size carries to the next pass', () async {
+      for (final id in ['a', 'b', 'c', 'd']) {
+        await repo.insertLocal(token, _event(id));
+      }
+      api.onPost = (batch) {
+        if (batch.eventUuids.length > 1) {
+          throw _http(413, {'error': 'too_large', 'message': 'no', 'retryable': false});
+        }
+        return batch.eventUuids;
+      };
+      final s = service();
+      await s.runPass({'timer'});
+      expect(await failures(), isEmpty);
+      expect(await pending(), {'a': 0, 'b': 0, 'c': 0, 'd': 0});
+      await repo.insertLocal(token, _event('e'));
+      await repo.insertLocal(token, _event('f'));
+      final before = api.posted.length;
+      await s.runPass({'timer'});
+      expect(api.posted.sublist(before), [['e'], ['f']],
+          reason: 'no new 413 round trip for the same limit');
+    });
+
     // Audit 5A(a) #5: only the events the server names are held back.
     test('a 422 quarantines only the indexed event', () async {
       for (final id in ['a', 'bad', 'c']) {
@@ -406,8 +549,9 @@ void main() {
       final s = service();
       final out = await s.runPass({'poll'});
       // Audit 5A(a) #2: a diagnostic, not a 30-minute wait that would park
-      // uploads of everything else.
-      expect(out, isA<PassDone>());
+      // uploads of everything else. (Branch audit: the unacknowledged upload
+      // is no longer hidden by the block: a short transient retry.)
+      expect(out, isA<PassFailed>().having((f) => f.reason, 'reason', BackoffReason.transient));
       expect(s.status.value.blockedConflicts.single.payload.secondsPlayed, 99);
       expect(await cursors.read(SyncStream.history), 0);
       // After "Keep server version" the next pass pages on and clears it.

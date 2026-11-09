@@ -99,6 +99,11 @@ class SyncService {
       // SC-01 rule 5: compare with the `after` this request sent, never with
       // the cursor after applying.
       if (response.latestRevision < requestedAfter) {
+        try {
+          await _binding.clearCatalogReconciled(_bindingToken);
+        } on BindingFencedException {
+          // a reset is under way: nothing to clear
+        }
         throw ServerRegressedException(
           requestedAfter: requestedAfter,
           latestRevision: response.latestRevision,

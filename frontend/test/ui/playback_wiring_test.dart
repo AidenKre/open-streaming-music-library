@@ -1,13 +1,15 @@
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
-import 'package:frontend/providers/audio/audio_dependencies.dart';
-import 'package:frontend/providers/audio/audio_service_bridge.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
-import 'package:frontend/providers/audio/now_playing_publisher.dart';
-import 'package:frontend/providers/audio/queue_warm_listener.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
+import 'package:frontend/playback/audio_service_bridge.dart';
+import 'package:frontend/playback/audio_state.dart';
+import 'package:frontend/playback/now_playing_publisher.dart';
+import 'package:frontend/playback/queue_warm_listener.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:frontend/services/history/listen_recorder.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:frontend/ui/player_controller.dart';
@@ -83,6 +85,7 @@ void main() {
         warmers++;
         return _NoWarm();
       }),
+      listenRecorderProvider.overrideWith((ref) => _FakeRecorder()),
     ]);
     addTearDown(c.dispose);
     c.listen(playbackWiringProvider, (_, _) {});
@@ -92,6 +95,33 @@ void main() {
     readiness.markReady();
     await pumpEventQueue();
     expect((publishers, warmers), (1, 1));
+  });
+
+  test('the listen recorder is built and started once the session is ready',
+      () async {
+    final recorder = _FakeRecorder();
+    var builds = 0;
+    final readiness = SessionReadiness();
+    final c = ProviderContainer(overrides: [
+      audioServiceProvider.overrideWithValue(bridge),
+      playerControlsProvider.overrideWithValue(FakePlayerControls()),
+      sessionReadinessProvider.overrideWithValue(readiness),
+      nowPlayingPublisherProvider.overrideWith(
+          (ref) => NowPlayingPublisher(bridge, CoverArtCacheManager.noop())),
+      queueWarmListenerProvider.overrideWith((ref) => _NoWarm()),
+      listenRecorderProvider.overrideWith((ref) {
+        builds++;
+        return recorder;
+      }),
+    ]);
+    addTearDown(c.dispose);
+    c.listen(playbackWiringProvider, (_, _) {});
+    await pumpEventQueue();
+    expect((builds, recorder.starts), (0, 0));
+    readiness.markReady();
+    await pumpEventQueue();
+    expect((builds, recorder.starts), (1, 1));
+    expect(c.exists(listenRecorderProvider), isTrue, reason: 'kept alive');
   });
 
   test('a disposed scope unbinds; a newer scope keeps its binding', () async {
@@ -114,4 +144,20 @@ void main() {
 class _NoWarm implements QueueWarmListener {
   @override
   void update(AudioState state, String quality) {}
+}
+
+class _FakeRecorder implements ListenRecorder {
+  int starts = 0;
+  int checkpoints = 0;
+  int quiesces = 0;
+  @override
+  Future<void> start() async => starts++;
+  @override
+  Future<void> checkpoint() async => checkpoints++;
+  @override
+  Future<void> appLifecycleChanged(AppLifecycleState state) async {}
+  @override
+  Future<void> quiesce() async => quiesces++;
+  @override
+  Future<void> get idle async {}
 }

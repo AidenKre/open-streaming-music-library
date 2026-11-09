@@ -1,7 +1,7 @@
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_providers.dart';
 
 /// Every transport and queue input (SC-27): the mini player, the full
 /// player and the OS media session (lock screen, notification, macOS Now
@@ -37,7 +37,7 @@ class PlayerController implements PlayerControls {
 
   final Ref _ref;
 
-  AudioCoordinator get _player => _ref.read(audioProvider.notifier);
+  QueuePlayer get _player => _ref.read(queuePlayerProvider.notifier);
 
   @override
   Future<void> togglePlayPause() => _player.togglePlayPause();

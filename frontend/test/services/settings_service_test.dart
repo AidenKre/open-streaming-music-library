@@ -407,7 +407,7 @@ void main() {
     test('backend reconcile leaves streamQualityChangeKind null (no rebuild)',
         () async {
       // A silent backend sync must not look like a user change-kind, or the
-      // AudioCoordinator would rebuild the whole playlist on startup.
+      // QueuePlayer would rebuild the whole playlist on startup.
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
       ApiClient.initForTest(

@@ -19,6 +19,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/background/backoff_schedule.dart';
 import 'package:frontend/services/background/single_flight_runner.dart';
+import 'package:frontend/repositories/history_repository.dart';
 import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/history/history_sync_triggers.dart';
 import 'package:frontend/services/local_reset_service.dart';
@@ -115,12 +116,19 @@ void main() {
     ]);
   });
 
-  test('reset quiesces history right after playback', () async {
+  test('reset quiesces history after playback and listen recording',
+      () async {
     final runner = _RecordingRunner();
     final c = scope(runner: runner);
     final participants = c.read(localQuiescablesProvider);
-    expect(participants.map((p) => p.quiesceName), ['playback', 'history']);
-    await participants[1].quiesce();
+    expect(participants.map((p) => p.quiesceName),
+        ['playback', 'listens', 'history']);
+    final history = participants.singleWhere((p) => p.quiesceName == 'history');
+    await history.quiesce();
+    expect(runner.quiesced, 0, reason: 'nothing built: nothing to stop (branch audit 5A N1)');
+    c.read(historyRunnerProvider); // the app builds it at startup
+    await participants.singleWhere((p) => p.quiesceName == 'history')
+        .quiesce();
     expect(runner.quiesced, 1);
   });
 
@@ -135,6 +143,14 @@ void main() {
     await repo.recordFailure(token, 'b', reason: 'conflict');
     expect(await reset.pendingLossSummaries(), ['2 unsent history events'],
         reason: 'quarantined events are unsent too');
+    // Branch audit (5A M5): listens not yet saved as events are unsent too.
+    await repo.checkpointDraft(token, const ListenDraft(
+      listenUuid: '66666666-6666-4666-8666-666666666666',
+      queueSessionId: 1, queueItemId: 1, trackUuid: 't-1',
+      startedAt: 1000, durationSeconds: null,
+      accumulatedMicros: 3000000, lastCheckpointAt: 4000,
+    ));
+    expect(await reset.pendingLossSummaries(), ['3 unsent history events']);
   });
 
   test('offline mode suspends and resumes the foreground poll', () async {

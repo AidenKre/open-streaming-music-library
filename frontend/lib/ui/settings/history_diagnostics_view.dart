@@ -41,6 +41,11 @@ String _summaryText(HistoryDiagnostics d) {
     );
   }
   if (d.lastError != null) return 'Last sync failed';
+  if (d.frozenListens > 0) {
+    return _count(d.frozenListens, '1 listen waiting to be saved',
+        'listens waiting to be saved');
+  }
+  if (d.listenError != null) return 'A listen could not be saved';
   return 'Up to date';
 }
 
@@ -91,6 +96,15 @@ class _HistorySyncDetail extends ConsumerWidget {
           Text('Waiting to upload: ${d.pending}'),
           Text('Held back: ${d.quarantined}'),
           if (d.lastError != null) Text('Last error: ${d.lastError}'),
+          if (d.frozenListens > 0)
+            Text('Listens waiting to be saved: ${d.frozenListens}'),
+          if (d.listenError != null)
+            Text('Last listen recording error: ${d.listenError}'),
+          const Text(
+            'Listening time is saved as you play. If the app is closed '
+            'unexpectedly, about the last 5 seconds of playback may not be '
+            'counted (more if the system suspended the app).',
+          ),
           if (d.waitingForServerSupport) ...[
             const SizedBox(height: 12),
             const Text('Waiting for server history support'),

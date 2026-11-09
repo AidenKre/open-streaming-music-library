@@ -31,7 +31,7 @@ class AppSettings {
   final String? temporaryStreamQuality;
 
   /// Tracks what kind of change last updated the stream quality, so the
-  /// AudioCoordinator can decide how much of the playlist to rebuild.
+  /// QueuePlayer can decide how much of the playlist to rebuild.
   final QualityChangeKind? streamQualityChangeKind;
 
   final String downloadQuality;
@@ -142,7 +142,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
         return;
       }
       // A backend reconcile is a silent sync — clear any pending change-kind so
-      // the AudioCoordinator's streamQualityProvider listener doesn't mistake
+      // the QueuePlayer's streamQualityProvider listener doesn't mistake
       // it for a user-initiated full/temporary change and rebuild the playlist.
       state = AsyncData(
         current.copyWith(
@@ -202,7 +202,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       await prefs.setString(_streamQualityKey, quality as String);
       if (local.persistedStreamQuality == quality) return local;
       // Intentionally do NOT set streamQualityChangeKind so the
-      // AudioCoordinator doesn't attempt a playlist rebuild at startup.
+      // QueuePlayer doesn't attempt a playlist rebuild at startup.
       return local.copyWith(persistedStreamQuality: quality);
     } catch (e) {
       developer.log(

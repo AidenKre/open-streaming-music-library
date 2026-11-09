@@ -5,9 +5,9 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
-const _adapter = 'lib/providers/audio/just_audio_engine.dart';
-const _interface = 'lib/providers/audio/playback_engine.dart';
-const _sessionAdapter = 'lib/providers/audio/audio_session_port.dart';
+const _adapter = 'lib/playback/just_audio_engine.dart';
+const _interface = 'lib/playback/playback_engine.dart';
+const _sessionAdapter = 'lib/playback/audio_session_port.dart';
 
 /// Files in lib/ that import or export [package] (either quote style).
 List<String> _referencing(String package, {required String except}) {
@@ -44,5 +44,40 @@ void main() {
     expect(source, contains('abstract interface class PlaybackEngine'));
     expect(source, isNot(contains('just_audio')));
     expect(source, isNot(contains('audio_session')));
+  });
+
+  // SC-05 (5B.1, D34): playback starts only through PlaybackRequests.submit;
+  // the playback model has no request entry points of its own.
+  test('the playback model declares none of the old entry points', () {
+    final source =
+        File('lib/playback/queue_player.dart').readAsStringSync();
+    for (final legacy in [
+      RegExp(r'Future<void> play\('),
+      RegExp(r'\bplayFromQueue\('),
+      RegExp(r'\bplayFromTrackList\('),
+      RegExp(r'\bplayNext\('),
+      RegExp(r'\baddToQueue\('),
+    ]) {
+      expect(legacy.hasMatch(source), isFalse, reason: legacy.pattern);
+    }
+  });
+
+  // SC-05 invariant 9: one emit site; one admission path.
+  test('only PlaybackRequests emits clicks and drives admission', () {
+    const owner = 'lib/playback/playback_requests.dart';
+    final allowed = {
+      'clickRecorderProvider': {owner, 'lib/services/history/click_recorder.dart'},
+      'ClickRecorder(': {'lib/services/history/click_recorder.dart'},
+      'admitReplacement(': {owner, 'lib/playback/queue_player.dart'},
+      'activatePreparedSession(': {owner, 'lib/playback/queue_player.dart'},
+    };
+    final offenders = [
+      for (final file in _dartFiles('lib'))
+        for (final MapEntry(key: pattern, value: owners) in allowed.entries)
+          if (!owners.contains(file.path) &&
+              file.readAsStringSync().contains(pattern))
+            '${file.path}: $pattern',
+    ];
+    expect(offenders, isEmpty);
   });
 }

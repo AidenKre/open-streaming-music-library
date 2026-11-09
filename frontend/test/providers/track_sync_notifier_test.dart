@@ -446,7 +446,7 @@ void main() {
       'refreshTrack cannot publish the same mutation version as a concurrent sync',
       () async {
         // Both operations locally delete a track, so each publishes a
-        // mutation-version bump. The audio coordinator drops any state whose
+        // mutation-version bump. The queue player drops any state whose
         // version is <= the last one it saw, so two concurrent operations
         // publishing the SAME version silently lose one reconciliation.
         // refreshTrack must serialize with sync via the isSyncing guard.

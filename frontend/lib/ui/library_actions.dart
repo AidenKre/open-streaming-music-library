@@ -1,7 +1,8 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/history_intent.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/collection_ordering.dart';
@@ -15,16 +16,16 @@ import 'package:frontend/services/settings_service.dart';
 /// `library_routes.dart`; busy state belongs to the page controller that
 /// shows it). Each method resolves membership through the model
 /// (`BrowseRepository.getTracksForScope`, passing only the observed offline
-/// state) and submits to the model. Phase 5B swaps the playback calls to
-/// `PlaybackRequests.submit` here without touching any widget.
+/// state) and submits typed requests to `PlaybackRequests.submit`, whose
+/// outcome it returns.
 abstract interface class LibraryActionControls {
-  Future<void> playNext(LibraryScope scope);
+  Future<PlaybackOutcome> playNext(LibraryScope scope);
 
-  Future<void> addToQueue(LibraryScope scope);
+  Future<PlaybackOutcome> addToQueue(LibraryScope scope);
 
   /// Play an explicit ordered list (e.g. search results) from
   /// [startIndex].
-  Future<void> playFromList(
+  Future<PlaybackOutcome> playFromList(
     List<TrackUI> tracks,
     int startIndex, {
     required String source,
@@ -33,7 +34,7 @@ abstract interface class LibraryActionControls {
   /// A browse row tap: play [album]'s list (or, null, the library's) from
   /// [track], in the list's [CollectionOrdering], keeping the list's
   /// [downloadedOnly] filter so the queue is what the list shows.
-  Future<void> playQuery(
+  Future<PlaybackOutcome> playQuery(
     TrackUI track, {
     AlbumScope? album,
     required bool downloadedOnly,
@@ -62,52 +63,59 @@ class LibraryActions implements LibraryActionControls {
       .getTracksForScope(scope, offline: _ref.read(offlineModeProvider));
 
   @override
-  Future<void> playNext(LibraryScope scope) async {
+  Future<PlaybackOutcome> playNext(LibraryScope scope) async {
     final tracks = await _members(scope);
-    if (!_ref.mounted || tracks.isEmpty) return;
-    await _ref.read(audioProvider.notifier).playNext(tracks);
+    if (!_ref.mounted || tracks.isEmpty) return const RejectedEmpty();
+    return _ref.read(playbackRequestsProvider).submit(Enqueue(
+          [for (final t in tracks) t.uuidId],
+          EnqueuePosition.next,
+          intent: HistoryIntent.forScope(scope),
+        ));
   }
 
   @override
-  Future<void> addToQueue(LibraryScope scope) async {
+  Future<PlaybackOutcome> addToQueue(LibraryScope scope) async {
     final tracks = await _members(scope);
-    if (!_ref.mounted || tracks.isEmpty) return;
-    await _ref.read(audioProvider.notifier).addToQueue(tracks);
+    if (!_ref.mounted || tracks.isEmpty) return const RejectedEmpty();
+    return _ref.read(playbackRequestsProvider).submit(Enqueue(
+          [for (final t in tracks) t.uuidId],
+          EnqueuePosition.end,
+          intent: HistoryIntent.forScope(scope),
+        ));
   }
 
   @override
-  Future<void> playFromList(
+  Future<PlaybackOutcome> playFromList(
     List<TrackUI> tracks,
     int startIndex, {
     required String source,
   }) async {
     // A stale tap (the list changed under it) has nothing to start.
-    if (startIndex < 0 || startIndex >= tracks.length) return;
-    await _ref
-        .read(audioProvider.notifier)
-        .playFromTrackList(
+    if (startIndex < 0 || startIndex >= tracks.length) {
+      return const RejectedEmpty();
+    }
+    return _ref.read(playbackRequestsProvider).submit(PlayList(
           [for (final t in tracks) t.uuidId],
-          tracks[startIndex],
-          sourceType: source,
-        );
+          startIndex,
+          ListSource(source),
+          intent: HistoryIntent.forScope(TrackScope(tracks[startIndex])),
+        ));
   }
 
   @override
-  Future<void> playQuery(
+  Future<PlaybackOutcome> playQuery(
     TrackUI track, {
     AlbumScope? album,
     required bool downloadedOnly,
   }) {
-    return _ref
-        .read(audioProvider.notifier)
-        .playFromQueue(
-          track: track,
-          sourceType: browseQueueSource(album),
-          artistId: album?.artistId,
-          albumId: album?.albumId,
-          orderParams: CollectionOrdering.tracksFor(album),
+    return _ref.read(playbackRequestsProvider).submit(PlayQuery(
+          source: BrowseSource(browseQueueSource(album),
+              artistId: album?.artistId, albumId: album?.albumId),
+          currentUuid: track.uuidId,
+          order: CollectionOrdering.tracksFor(album),
           downloadedOnly: downloadedOnly,
-        );
+          intent: HistoryIntent.forScope(TrackScope(track)),
+        ));
   }
 
   @override

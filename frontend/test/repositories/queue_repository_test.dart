@@ -2,7 +2,7 @@ import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:frontend/providers/audio/playback_target_resolver.dart';
+import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/repositories/queue_repository.dart';
@@ -615,6 +615,79 @@ void main() {
       ]);
     },
   );
+
+  group('5B.1 (SC-05/SC-27): prepared sessions', () {
+    Future<QueueSession?> active() => repo.getActiveSession();
+
+    test('preparing a session leaves the active one untouched', () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final current = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['a', 'b']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['c'], activate: false);
+      expect((await active())?.id, current);
+      final snapshot = await repo.getSessionSnapshot(prepared);
+      expect(snapshot?.session.isActive, isFalse);
+      expect(snapshot?.currentItem?.uuidId, 'c');
+      final query = await repo.createSessionFromQuery(
+          sourceType: 'library', currentUuid: 'b', activate: false);
+      expect((await active())?.id, current);
+      expect((await repo.getSessionSnapshot(query))?.session.isActive, isFalse);
+    });
+
+    test('activating a prepared session makes it the only active one',
+        () async {
+      await fixture.insertSingles(['a', 'b']);
+      final current = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['a']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['b'], activate: false);
+      await repo.activateSession(prepared);
+      expect((await active())?.id, prepared);
+      expect((await repo.getSessionSnapshot(current))?.session.isActive,
+          isFalse);
+    });
+
+    test('activating a session that is gone fails and changes nothing',
+        () async {
+      await fixture.insertSingles(['a', 'b']);
+      final current = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['a']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['b'], activate: false);
+      await repo.discardSession(prepared);
+      await expectLater(repo.activateSession(prepared), throwsStateError);
+      expect((await active())?.id, current);
+    });
+
+    test('discarding removes a prepared session, never the active one',
+        () async {
+      await fixture.insertSingles(['a', 'b']);
+      final current = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['a']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['b'], activate: false);
+      expect(await repo.discardSession(prepared), isTrue);
+      expect(await repo.getSessionSnapshot(prepared), isNull);
+      expect(await _playOrderCount(db, prepared), 0);
+      expect(await repo.discardSession(current), isFalse);
+      expect((await active())?.id, current);
+    });
+
+    test('startup pruning deletes every inactive session', () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final first = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['a']);
+      final current = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['b']); // deactivates first
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['c'], activate: false);
+      expect(await repo.pruneInactiveSessions(), 2);
+      expect(await repo.getSessionSnapshot(first), isNull);
+      expect(await repo.getSessionSnapshot(prepared), isNull);
+      expect((await active())?.id, current);
+    });
+  });
 }
 
 Future<int> _playOrderCount(AppDatabase db, int sessionId) async {

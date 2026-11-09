@@ -25,6 +25,8 @@ class HistoryDiagnostics {
     this.waitingForServerSupport = false,
     this.serverRegressed = false,
     this.conflicts = const [],
+    this.frozenListens = 0,
+    this.listenError,
   });
 
   /// Unsent events still eligible for upload.
@@ -37,6 +39,13 @@ class HistoryDiagnostics {
   final bool waitingForServerSupport;
   final bool serverRegressed;
   final List<HistoryConflictPair> conflicts;
+
+  /// Listens whose finalization failed, kept with their final payload and
+  /// retried (Phase 5 §7).
+  final int frozenListens;
+
+  /// The last listen recording failure this run (§7 "visible error").
+  final String? listenError;
 }
 
 /// The live history diagnostics: the store's counts plus the sync status,
@@ -45,6 +54,8 @@ class HistoryDiagnostics {
 final historyDiagnosticsProvider = StreamProvider<HistoryDiagnostics>((ref) {
   final repository = ref.read(historyRepositoryProvider);
   final status = ref.read(historySyncServiceProvider).status;
+  final listenError = ref.read(listenRecordingErrorProvider);
+  var frozenListens = 0;
   final controller = StreamController<HistoryDiagnostics>();
   HistorySyncCounts? counts;
   var closed = false;
@@ -69,12 +80,19 @@ final historyDiagnosticsProvider = StreamProvider<HistoryDiagnostics>((ref) {
         waitingForServerSupport: s.waitingForServerSupport,
         serverRegressed: s.serverRegressed,
         conflicts: conflicts,
+        frozenListens: frozenListens,
+        listenError: listenError.value,
       ),
     );
   }
 
   void onStatus() => unawaited(publish());
   status.addListener(onStatus);
+  listenError.addListener(onStatus);
+  final frozenSub = repository.watchFrozenListenCount().listen((n) {
+    frozenListens = n;
+    unawaited(publish());
+  }, onError: controller.addError);
   final countsSub = repository.watchCounts().listen((c) {
     counts = c;
     unawaited(publish());
@@ -82,6 +100,8 @@ final historyDiagnosticsProvider = StreamProvider<HistoryDiagnostics>((ref) {
   ref.onDispose(() {
     closed = true;
     status.removeListener(onStatus);
+    listenError.removeListener(onStatus);
+    unawaited(frozenSub.cancel());
     unawaited(countsSub.cancel());
     unawaited(controller.close());
   });

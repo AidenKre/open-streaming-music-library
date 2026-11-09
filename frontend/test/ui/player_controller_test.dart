@@ -1,13 +1,13 @@
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/ui/player_controller.dart';
 
 /// Records every model command the controller forwards.
-class _RecordingCoordinator extends AudioCoordinator {
+class _RecordingQueuePlayer extends QueuePlayer {
   final calls = <String>[];
   @override
   AudioState build() => const AudioState();
@@ -38,12 +38,12 @@ class _RecordingCoordinator extends AudioCoordinator {
 }
 
 void main() {
-  late _RecordingCoordinator audio;
+  late _RecordingQueuePlayer audio;
   late ProviderContainer c;
 
   setUp(() {
-    audio = _RecordingCoordinator();
-    c = ProviderContainer(overrides: [audioProvider.overrideWith(() => audio)]);
+    audio = _RecordingQueuePlayer();
+    c = ProviderContainer(overrides: [queuePlayerProvider.overrideWith(() => audio)]);
   });
   tearDown(() => c.dispose());
 

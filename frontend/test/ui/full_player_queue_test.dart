@@ -8,9 +8,9 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/audio/audio_coordinator.dart';
-import 'package:frontend/providers/audio/audio_providers.dart';
-import 'package:frontend/providers/audio/audio_state.dart';
+import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
@@ -48,7 +48,7 @@ void main() {
       databaseProvider.overrideWithValue(db),
       queueRepositoryProvider.overrideWithValue(failingRepo),
       playerControlsProvider.overrideWithValue(FakePlayerControls()),
-      audioProvider.overrideWith(() => _TestQueueAudioCoordinator(_audioStateFor(
+      queuePlayerProvider.overrideWith(() => _TestQueuePlayer(_audioStateFor(
         sessionId: sessionId,
         currentItemId: snapshot.currentItem!.itemId,
         currentPlayPosition: 0,
@@ -100,8 +100,8 @@ void main() {
       final atStartContainer = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
-          audioProvider.overrideWith(
-            () => _TestQueueAudioCoordinator(
+          queuePlayerProvider.overrideWith(
+            () => _TestQueuePlayer(
               _audioStateFor(
                 sessionId: sessionId,
                 currentItemId: currentItem.itemId,
@@ -135,8 +135,8 @@ void main() {
       final afterManualContainer = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
-          audioProvider.overrideWith(
-            () => _TestQueueAudioCoordinator(
+          queuePlayerProvider.overrideWith(
+            () => _TestQueuePlayer(
               _audioStateFor(
                 sessionId: sessionId,
                 currentItemId: currentItem.itemId,
@@ -180,7 +180,7 @@ void main() {
         currentIndex: 0,
       );
       final snapshot = (await repo.getSessionSnapshot(sessionId))!;
-      final notifier = _MutableTestQueueAudioCoordinator(
+      final notifier = _MutableTestQueuePlayer(
         _audioStateFor(
           sessionId: sessionId,
           currentItemId: snapshot.currentItem!.itemId,
@@ -192,7 +192,7 @@ void main() {
       final container = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
-          audioProvider.overrideWith(() => notifier),
+          queuePlayerProvider.overrideWith(() => notifier),
         ],
       );
       addTearDown(container.dispose);
@@ -252,8 +252,8 @@ void main() {
         overrides: [
           databaseProvider.overrideWithValue(db),
           offlineModeProvider.overrideWith(() => _StubOffline(offline)),
-          audioProvider.overrideWith(
-            () => _TestQueueAudioCoordinator(
+          queuePlayerProvider.overrideWith(
+            () => _TestQueuePlayer(
               _audioStateFor(
                 sessionId: sessionId,
                 currentItemId: snapshot.currentItem!.itemId,
@@ -324,8 +324,8 @@ void main() {
       final container = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
-          audioProvider.overrideWith(
-            () => _TestQueueAudioCoordinator(
+          queuePlayerProvider.overrideWith(
+            () => _TestQueuePlayer(
               _audioStateFor(
                 sessionId: sessionId,
                 currentItemId: snapshot.currentItem!.itemId,
@@ -400,8 +400,8 @@ void main() {
       overrides: [
         databaseProvider.overrideWithValue(db),
         playerControlsProvider.overrideWithValue(controls),
-        audioProvider.overrideWith(
-          () => _TestQueueAudioCoordinator(
+        queuePlayerProvider.overrideWith(
+          () => _TestQueuePlayer(
             _audioStateFor(
               sessionId: sessionId,
               currentItemId: snapshot.currentItem!.itemId,
@@ -439,8 +439,8 @@ void main() {
     final container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
-        audioProvider.overrideWith(
-          () => _TestQueueAudioCoordinator(
+        queuePlayerProvider.overrideWith(
+          () => _TestQueuePlayer(
             _audioStateFor(
               sessionId: 1,
               currentItemId: 1,
@@ -596,19 +596,19 @@ class _FailOnceQueueRepository extends QueueRepository {
   }
 }
 
-class _TestQueueAudioCoordinator extends AudioCoordinator {
+class _TestQueuePlayer extends QueuePlayer {
   final AudioState _initialState;
 
-  _TestQueueAudioCoordinator(this._initialState);
+  _TestQueuePlayer(this._initialState);
 
   @override
   AudioState build() => _initialState;
 }
 
-class _MutableTestQueueAudioCoordinator extends AudioCoordinator {
+class _MutableTestQueuePlayer extends QueuePlayer {
   final AudioState _initialState;
 
-  _MutableTestQueueAudioCoordinator(this._initialState);
+  _MutableTestQueuePlayer(this._initialState);
 
   @override
   AudioState build() => _initialState;

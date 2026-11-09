@@ -400,7 +400,7 @@ void main() {
       expect(remote.dimmed, isTrue);
       expect(remote.onTap, isNull);
       // The downloaded one still plays — just itself and the others the
-      // list holds; the coordinator skips what it can't play.
+      // list holds; the queue player skips what it can't play.
       final local = tester.widget<LibraryCard>(
         find.ancestor(
           of: find.text('Blue 1'),

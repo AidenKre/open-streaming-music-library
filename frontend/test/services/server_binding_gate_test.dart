@@ -254,6 +254,26 @@ void main() {
       expect(await gate.awaitVerified(), token);
     });
 
+    test('branch audit (5A.0 m5): a new connection starts its backoff over',
+        () async {
+      unawaited(gate.startConnection('http://a'));
+      await settle();
+      for (var i = 0; i < 6; i++) {
+        probes.last.completeError(NetworkException('down', attemptsMade: 1));
+        await settle();
+        timers.scheduled.last.fire(); // the retry
+        await settle();
+      }
+      final grown = timers.scheduled.last.delay;
+      unawaited(gate.startConnection('http://a')); // a fresh connection
+      await settle();
+      probes.last.completeError(NetworkException('down', attemptsMade: 1));
+      await settle();
+      expect(timers.scheduled.last.delay, lessThan(grown),
+          reason: 'not the previous outage\'s capped delay');
+      expect(timers.scheduled.last.delay, timers.scheduled.first.delay);
+    });
+
     test('each connection is verified again before awaiters proceed', () async {
       unawaited(gate.startConnection('http://a'));
       await settle();

@@ -287,6 +287,20 @@ void main() {
       expect(await reconciled(), isFalse);
     });
 
+    test('branch audit (5A.0 m4): a detected restore clears an earlier mark',
+        () async {
+      await binding.runFenced(token, () => binding.markCatalogReconciledInTransaction());
+      expect(await reconciled(), isTrue);
+      await db.transaction(() => cursors.write(SyncStream.catalog, 5));
+      pages[5] = _page([], latest: 3);
+      await expectLater(
+        (await service()).syncChanges(),
+        throwsA(isA<ServerRegressedException>()),
+      );
+      expect(await reconciled(), isFalse,
+          reason: 'a restored server may reissue parent ids');
+    });
+
     test('a regressed server does not', () async {
       await db.transaction(() => cursors.write(SyncStream.catalog, 5));
       pages[5] = _page([], latest: 3);
