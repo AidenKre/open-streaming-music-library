@@ -117,7 +117,7 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
   @override
   Widget build(BuildContext context) {
     final track = ref.watch(currentTrackProvider);
-    final status = ref.watch(audioStatusProvider);
+    final playWhenReady = ref.watch(audioPlayWhenReadyProvider);
     final position = ref.watch(audioPositionProvider);
     final duration = ref.watch(audioDurationProvider);
     final volume = ref.watch(audioVolumeProvider);
@@ -259,7 +259,7 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                   const SizedBox(width: 16),
                   IconButton(
                     icon: Icon(
-                      status == PlayerStatus.playing
+                      playWhenReady
                           ? Icons.pause_circle_filled
                           : Icons.play_circle_filled,
                     ),

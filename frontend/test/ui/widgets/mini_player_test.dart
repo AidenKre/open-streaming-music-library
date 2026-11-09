@@ -35,11 +35,14 @@ TrackUI _track({bool hasAlbumArt = false, int? coverArtId}) {
 AudioState _audioStateWith(
   TrackUI track, {
   PlayerStatus status = PlayerStatus.paused,
+  bool? playWhenReady,
 }) {
   return AudioState(
     playback: PlaybackSlice(
       currentTrack: track,
       status: status,
+      // A playing status means play is desired (SC-27 desired transport).
+      playWhenReady: playWhenReady ?? status == PlayerStatus.playing,
       duration: const Duration(minutes: 3),
     ),
     queue: const QueueSlice(),
@@ -58,6 +61,7 @@ Future<void> _pumpMiniPlayer(
   WidgetTester tester,
   TrackUI track, {
   PlayerStatus status = PlayerStatus.paused,
+  bool? playWhenReady,
   FakePlayerControls? controls,
   bool inColumn = false,
 }) async {
@@ -68,7 +72,8 @@ Future<void> _pumpMiniPlayer(
     overrides: [
       databaseProvider.overrideWithValue(db),
       audioProvider.overrideWith(
-        () => _TestAudioCoordinator(_audioStateWith(track, status: status)),
+        () => _TestAudioCoordinator(_audioStateWith(track,
+            status: status, playWhenReady: playWhenReady)),
       ),
       if (controls != null) playerControlsProvider.overrideWithValue(controls),
     ],
@@ -141,6 +146,16 @@ void main() {
         expect(controls.calls, ['toggle']);
       });
     }
+
+    testWidgets('while loading with play desired the control shows pause', (
+      tester,
+    ) async {
+      final controls = FakePlayerControls();
+      await _pumpMiniPlayer(tester, _track(),
+          status: PlayerStatus.loading, playWhenReady: true, controls: controls);
+      await tester.tap(find.byIcon(Icons.pause));
+      expect(controls.calls, ['toggle']);
+    });
 
     testWidgets('shuffle, previous, next and repeat buttons', (tester) async {
       final controls = FakePlayerControls();

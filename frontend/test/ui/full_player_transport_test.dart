@@ -34,6 +34,7 @@ class _StateOnly extends AudioCoordinator {
 Future<FakePlayerControls> _pump(
   WidgetTester tester, {
   PlayerStatus status = PlayerStatus.playing,
+  bool? playWhenReady,
   Duration duration = const Duration(minutes: 3),
 }) async {
   final controls = FakePlayerControls();
@@ -45,6 +46,8 @@ Future<FakePlayerControls> _pump(
             playback: PlaybackSlice(
               currentTrack: _track,
               status: status,
+              // A playing status means play is desired (SC-27).
+              playWhenReady: playWhenReady ?? status == PlayerStatus.playing,
               position: const Duration(seconds: 30),
               duration: duration,
             ),
@@ -79,6 +82,14 @@ void main() {
       expect(controls.calls, ['toggle']);
     });
   }
+
+  testWidgets('while loading with play desired the control shows pause',
+      (t) async {
+    final controls =
+        await _pump(t, status: PlayerStatus.loading, playWhenReady: true);
+    await t.tap(find.byIcon(Icons.pause_circle_filled));
+    expect(controls.calls, ['toggle']);
+  });
 
   testWidgets('transport buttons and volume go to PlayerControls', (t) async {
     final controls = await _pump(t);

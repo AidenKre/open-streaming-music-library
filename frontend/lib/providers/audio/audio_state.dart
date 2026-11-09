@@ -1,4 +1,5 @@
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/providers/audio/playback_engine.dart';
 
 enum PlayerStatus { idle, loading, playing, paused }
 
@@ -6,7 +7,16 @@ enum QueueRepeatMode { off, all, one }
 
 class PlaybackSlice {
   final TrackUI? currentTrack;
+
+  /// Presentation summary of the axes below (idle/loading/playing/paused).
   final PlayerStatus status;
+
+  /// SC-27 desired-transport axis: did the user ask for audio? Independent
+  /// of [processing] (what the engine is doing) and of the lifecycle.
+  final bool playWhenReady;
+
+  /// SC-27 processing axis.
+  final EngineProcessingState processing;
   final Duration position;
   final Duration duration;
   final double volume;
@@ -14,6 +24,8 @@ class PlaybackSlice {
   const PlaybackSlice({
     this.currentTrack,
     this.status = PlayerStatus.idle,
+    this.playWhenReady = false,
+    this.processing = EngineProcessingState.idle,
     this.position = Duration.zero,
     this.duration = Duration.zero,
     this.volume = 1.0,
@@ -23,6 +35,8 @@ class PlaybackSlice {
     TrackUI? currentTrack,
     bool clearTrack = false,
     PlayerStatus? status,
+    bool? playWhenReady,
+    EngineProcessingState? processing,
     Duration? position,
     Duration? duration,
     double? volume,
@@ -30,6 +44,8 @@ class PlaybackSlice {
     return PlaybackSlice(
       currentTrack: clearTrack ? null : (currentTrack ?? this.currentTrack),
       status: status ?? this.status,
+      playWhenReady: playWhenReady ?? this.playWhenReady,
+      processing: processing ?? this.processing,
       position: position ?? this.position,
       duration: duration ?? this.duration,
       volume: volume ?? this.volume,

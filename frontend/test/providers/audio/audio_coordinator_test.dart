@@ -5,10 +5,11 @@ import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:just_audio/just_audio.dart' as ja;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:just_audio/just_audio.dart' as ja;
+import 'package:mocktail/mocktail.dart';
 
 import 'package:frontend/providers/audio/playback_target_resolver.dart';
 import 'package:frontend/api/api_client.dart';
@@ -20,7 +21,11 @@ import 'package:frontend/providers/audio/audio_coordinator.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
 import 'package:frontend/providers/audio/audio_providers.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
-import 'package:frontend/providers/audio/concatenating_player_controller.dart';
+import 'package:frontend/providers/audio/audio_focus.dart';
+import 'package:frontend/providers/audio/just_audio_engine.dart';
+import 'package:frontend/providers/audio/playback_engine.dart';
+
+import 'audio_focus_test.dart' show FakeAudioSessionPort;
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -38,8 +43,9 @@ void main() {
   late _ObservedStartupRepository repo;
   late _LibraryFixture fixture;
   ProviderContainer? container;
-  late FakeConcatenatingPlayerController fakePlayer;
+  late FakePlaybackEngine fakePlayer;
   late RecordingAudioServiceBridge bridge;
+  late FakeAudioSessionPort sessionPort;
 
   final Set<String> existingFiles = <String>{};
   late StreamController<int> downloadStatusController;
@@ -64,14 +70,16 @@ void main() {
     existingFiles.clear();
     repo = _ObservedStartupRepository(db);
     fixture = _LibraryFixture(db);
-    fakePlayer = FakeConcatenatingPlayerController();
+    fakePlayer = FakePlaybackEngine();
     bridge = RecordingAudioServiceBridge();
+    sessionPort = FakeAudioSessionPort();
     downloadStatusController = StreamController<int>.broadcast();
   });
 
   tearDown(() async {
     await bridge.disposeBridge();
     container?.dispose();
+    await sessionPort.controller.close();
     await downloadStatusController.close();
     await db.close();
   });
@@ -80,6 +88,8 @@ void main() {
     bool offline = false,
     SessionReadiness? readiness,
     OfflineModeNotifier Function()? offlineNotifier,
+    PlaybackEngine? engine,
+    AudioFocus? focus,
   }) {
     container = ProviderContainer(
       overrides: [
@@ -90,8 +100,10 @@ void main() {
         if (offlineNotifier != null)
           offlineModeProvider.overrideWith(offlineNotifier),
         databaseProvider.overrideWithValue(db),
-        concatenatingPlayerProvider.overrideWithValue(fakePlayer),
+        playbackEngineProvider.overrideWithValue(engine ?? fakePlayer),
+        if (focus != null) audioFocusProvider.overrideWithValue(focus),
         audioServiceProvider.overrideWithValue(bridge),
+        audioSessionPortProvider.overrideWithValue(sessionPort),
         queueRepositoryProvider.overrideWithValue(repo),
         playbackTargetResolverProvider.overrideWith((ref) =>
           PlaybackTargetResolver(repo, fileExists: existingFiles.contains)),
@@ -270,6 +282,192 @@ void main() {
     expect(window.nextForwardHydrationPlayPosition, 100);
     expect(fakePlayer.addedBatches.last.last.playPosition, 99);
     expect(c.read(audioProvider).queue.currentItemId, target.itemId);
+  });
+
+  group('5B.0c (SC-27): the core carries session and cause in-band', () {
+    test('seeds carry their session; a reconcile seeds as a continuation',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(const ['a', 'b', 'c'],
+          await fixture.track('b'), sourceType: 'search');
+      final sessionId = c.read(audioProvider).queue.sessionId!;
+      expect(fakePlayer.seedCalls.last.sessionId, sessionId);
+      expect(fakePlayer.seedCalls.last.cause,
+          PlaybackTransitionCause.queueReplacement);
+      await repo.removeTrackUuidsFromQueues(const ['c']);
+      await notifier.reconcileAfterSyncQueueMutation({sessionId});
+      expect(fakePlayer.seedCalls, hasLength(2));
+      expect(fakePlayer.seedCalls.last.sessionId, sessionId);
+      expect(fakePlayer.seedCalls.last.cause,
+          PlaybackTransitionCause.reconcileContinuation);
+    });
+
+    test('a reconcile that loses the current item replaces, not continues',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(const ['a', 'b', 'c'],
+          await fixture.track('b'), sourceType: 'search');
+      final sessionId = c.read(audioProvider).queue.sessionId!;
+      await repo.removeTrackUuidsFromQueues(const ['b']);
+      await notifier.reconcileAfterSyncQueueMutation({sessionId});
+      expect(fakePlayer.seedCalls.last.cause,
+          PlaybackTransitionCause.queueReplacement);
+    });
+
+    test('user skips are user skips; an automatic hop is a natural advance',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await markDownloaded('a', '/dl/a');
+      await markDownloaded('c', '/dl/c');
+      final c = createContainer();
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(const ['a', 'b', 'c'],
+          await fixture.track('a'), sourceType: 'search');
+      await notifier.skipNext();
+      expect(fakePlayer.seekCauses.last, PlaybackTransitionCause.userSkip);
+      final b = (await repo.getPlaybackEntries(
+              c.read(audioProvider).queue.sessionId!))
+          .firstWhere((e) => e.uuidId == 'b');
+      fakePlayer.emitUnavailableAdvance(
+          UnavailableAdvance(itemId: b.itemId, playPosition: b.playPosition));
+      await pumpEventQueue();
+      expect(fakePlayer.seekCauses.last,
+          PlaybackTransitionCause.naturalAdvance);
+    });
+  });
+
+  group('5B.0c (SC-27): single-owner audio focus routes OS events', () {
+    Future<AudioCoordinator> playingQueue(ProviderContainer c) async {
+      await fixture.insertSingles(['a', 'b']);
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(const ['a', 'b'],
+          await fixture.track('a'), sourceType: 'search');
+      return notifier;
+    }
+
+    Future<void> emit(AudioSessionEvent event) async {
+      sessionPort.emit(event);
+      await pumpEventQueue();
+    }
+
+    test('an interruption pauses playback and its end resumes it', () async {
+      final c = createContainer();
+      await playingQueue(c);
+      final plays = fakePlayer.playCalls;
+      await emit(const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      expect(fakePlayer.pauseCalls, 1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      await emit(const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      expect(fakePlayer.playCalls, plays + 1);
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
+    });
+
+    test('a pause by the user during an interruption is never undone',
+        () async {
+      final c = createContainer();
+      final notifier = await playingQueue(c);
+      await emit(const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      await notifier.pause();
+      final plays = fakePlayer.playCalls;
+      await emit(const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      expect(fakePlayer.playCalls, plays);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('an interruption of paused audio does not start it', () async {
+      final c = createContainer();
+      final notifier = await playingQueue(c);
+      await notifier.pause();
+      final plays = fakePlayer.playCalls;
+      await emit(const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      await emit(const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      expect(fakePlayer.playCalls, plays);
+    });
+
+    test('an interruption whose end may not resume stays paused', () async {
+      final c = createContainer();
+      await playingQueue(c);
+      final plays = fakePlayer.playCalls;
+      await emit(const AudioInterruptionBegan(AudioInterruptionKind.unknown));
+      await emit(const AudioInterruptionEnded(AudioInterruptionKind.unknown));
+      expect(fakePlayer.playCalls, plays);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('unplugged headphones pause, and a later interruption end does not '
+        'resume', () async {
+      final c = createContainer();
+      await playingQueue(c);
+      await emit(const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      await emit(const AudioBecameNoisy());
+      final plays = fakePlayer.playCalls;
+      await emit(const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      expect(fakePlayer.playCalls, plays);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('unplugged headphones pause playing audio', () async {
+      final c = createContainer();
+      await playingQueue(c);
+      await emit(const AudioBecameNoisy());
+      expect(fakePlayer.pauseCalls, 1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('after quiesce, OS events change nothing', () async {
+      final c = createContainer();
+      final notifier = await playingQueue(c);
+      await notifier.quiesce();
+      final pauses = fakePlayer.pauseCalls;
+      await emit(const AudioBecameNoisy());
+      await emit(const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      expect(fakePlayer.pauseCalls, pauses);
+    });
+
+    test('a disposed core releases the queue output', () async {
+      final focus = AudioFocus(sessionPort);
+      addTearDown(focus.dispose);
+      final c = createContainer(focus: focus);
+      c.read(audioProvider);
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+      // Let the container's startup loads (settings, restore) finish first.
+      await repo.startupRead.future;
+      await pumpEventQueue();
+      c.dispose();
+      container = null;
+      expect(await focus.beforePlay(AudioOutput.queue), isFalse);
+    });
+
+    test('focus loss pauses at once while the real engine load is stalled',
+        () async {
+      final plugin = _StalledPlugin();
+      final engine = JustAudioEngine(plugin);
+      final c = createContainer(engine: engine);
+      await fixture.insertSingles(['a']);
+      final notifier = c.read(audioProvider.notifier);
+      await notifier.playFromTrackList(const ['a'], await fixture.track('a'),
+          sourceType: 'search');
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      await emit(const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      verify(() => plugin.pause()).called(1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      await emit(const AudioBecameNoisy());
+      await notifier.resume();
+      await emit(const AudioBecameNoisy());
+      verify(() => plugin.pause()).called(1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('the playback core owns the queue output while it lives', () async {
+      final c = createContainer();
+      c.read(audioProvider);
+      final focus = c.read(audioFocusProvider);
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+    });
   });
 
   group('5A.0 (SC-27, SC-15): lifecycle, admission closure, quiesce', () {
@@ -458,7 +656,7 @@ void main() {
 
     test('togglePlayPause pauses while playing', () async {
       final notifier = await playing(createContainer());
-      fakePlayer.emitPlayerState(ja.PlayerState(true, ja.ProcessingState.ready));
+      fakePlayer.emitPlayerState(EngineTransportState(true, EngineProcessingState.ready));
       await Future<void>.delayed(Duration.zero);
       final pausesBefore = fakePlayer.pauseCalls;
       final playsBefore = fakePlayer.playCalls;
@@ -478,7 +676,7 @@ void main() {
     test('back-to-back toggles are decided at execution, not at call time',
         () async {
       final notifier = await playing(createContainer());
-      fakePlayer.emitPlayerState(ja.PlayerState(true, ja.ProcessingState.ready));
+      fakePlayer.emitPlayerState(EngineTransportState(true, EngineProcessingState.ready));
       await Future<void>.delayed(Duration.zero);
       final pauses = fakePlayer.pauseCalls;
       final plays = fakePlayer.playCalls;
@@ -488,20 +686,71 @@ void main() {
       expect(fakePlayer.playCalls, plays + 1);
     });
 
-    test('while loading, toggle resumes, matching the play icon (no pause)',
+    // D26 (5B.0c): re-specified from 4A.0b's "while loading, toggle
+    // resumes, matching the play icon". The principle is kept -- the toggle
+    // acts on what the play/pause control shows -- but the control now
+    // shows the desired-transport axis: while loading with play desired it
+    // shows pause, and a tap pauses.
+    test('while loading with play desired, toggle pauses, matching the icon',
         () async {
-      // The play/pause icon and the OS state render from the published
-      // status; the toggle must act on the same thing the user sees.
       final c = createContainer();
       final notifier = await playing(c);
-      fakePlayer.emitPlayerState(ja.PlayerState(true, ja.ProcessingState.loading));
+      fakePlayer.emitPlayerState(EngineTransportState(true, EngineProcessingState.loading));
       await Future<void>.delayed(Duration.zero);
       expect(c.read(audioStatusProvider), PlayerStatus.loading);
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
       final pauses = fakePlayer.pauseCalls;
       final plays = fakePlayer.playCalls;
       await notifier.togglePlayPause();
-      expect(fakePlayer.pauseCalls, pauses);
-      expect(fakePlayer.playCalls, plays + 1);
+      expect(fakePlayer.pauseCalls, pauses + 1);
+      expect(fakePlayer.playCalls, plays);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('buffering while playing and while paused are distinct states',
+        () async {
+      final c = createContainer();
+      final notifier = await playing(c);
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.buffering));
+      await pumpEventQueue();
+      var playback = c.read(audioProvider).playback;
+      expect(playback.playWhenReady, isTrue);
+      expect(playback.processing, EngineProcessingState.buffering);
+      await notifier.pause();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.buffering));
+      await pumpEventQueue();
+      playback = c.read(audioProvider).playback;
+      expect(playback.playWhenReady, isFalse);
+      expect(playback.processing, EngineProcessingState.buffering);
+      expect(c.read(audioProvider.notifier).lifecycle,
+          PlaybackLifecycle.active, reason: 'lifecycle is a separate axis');
+    });
+
+    test('the OS media state reports desired transport while buffering',
+        () async {
+      final c = createContainer();
+      await playing(c);
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.buffering));
+      await pumpEventQueue();
+      expect(bridge.playbackStateEvents.last.playing, isTrue);
+    });
+
+    test('reaching the end of the queue clears desired transport', () async {
+      final c = createContainer();
+      await playing(c);
+      // The engine is the authoritative echo of desired transport: at the
+      // end of the queue it reports desired play cleared (engine test
+      // 'reaching the end pauses the plugin'). The core publishes it.
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      final playback = c.read(audioProvider).playback;
+      expect(playback.playWhenReady, isFalse);
+      expect(playback.processing, EngineProcessingState.completed);
+      expect(playback.status, PlayerStatus.idle);
     });
 
     test('back-to-back toggles from paused alternate too', () async {
@@ -1255,15 +1504,15 @@ void main() {
 
     await notifier.cycleQueueRepeatMode();
     expect(c.read(audioProvider).queue.repeatMode, QueueRepeatMode.all);
-    expect(fakePlayer.lastLoopMode, ja.LoopMode.all);
+    expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
 
     await notifier.cycleQueueRepeatMode();
     expect(c.read(audioProvider).queue.repeatMode, QueueRepeatMode.one);
-    expect(fakePlayer.lastLoopMode, ja.LoopMode.one);
+    expect(fakePlayer.lastLoopMode, EngineLoopMode.one);
 
     await notifier.cycleQueueRepeatMode();
     expect(c.read(audioProvider).queue.repeatMode, QueueRepeatMode.off);
-    expect(fakePlayer.lastLoopMode, ja.LoopMode.off);
+    expect(fakePlayer.lastLoopMode, EngineLoopMode.off);
   });
 
   test('stop resets state and deactivates session', () async {
@@ -1370,8 +1619,8 @@ void main() {
       final cB = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
-          concatenatingPlayerProvider.overrideWithValue(
-            FakeConcatenatingPlayerController(),
+          playbackEngineProvider.overrideWithValue(
+            FakePlaybackEngine(),
           ),
           audioServiceProvider.overrideWithValue(bridge),
         ],
@@ -1876,7 +2125,7 @@ void main() {
       await notifier.seek(const Duration(seconds: 12));
 
       fakePlayer.emitPlayerState(
-        ja.PlayerState(true, ja.ProcessingState.buffering),
+        EngineTransportState(true, EngineProcessingState.buffering),
       );
       await Future<void>.delayed(Duration.zero);
       expect(c.read(audioProvider).playback.status, PlayerStatus.loading);
@@ -1933,9 +2182,9 @@ class _GatedCoverArt extends CoverArtCacheManager {
   }
 }
 
-class FakeConcatenatingPlayerController
-    implements ConcatenatingPlayerController {
-  final _playerStateController = StreamController<ja.PlayerState>.broadcast();
+class FakePlaybackEngine
+    implements PlaybackEngine {
+  final _playerStateController = StreamController<EngineTransportState>.broadcast();
   final _positionController = StreamController<Duration>.broadcast();
   final _durationController = StreamController<Duration?>.broadcast();
   final _currentItemIdController = StreamController<int?>.broadcast();
@@ -1956,10 +2205,11 @@ class FakeConcatenatingPlayerController
   final List<List<QueuePlaybackEntry>> rebuildCalls = [];
   final List<int> removedItems = [];
   final List<int> seekedItems = [];
+  final List<PlaybackTransitionCause> seekCauses = [];
   int playCalls = 0;
   int pauseCalls = 0;
   int stopCalls = 0;
-  ja.LoopMode? lastLoopMode;
+  EngineLoopMode? lastLoopMode;
   double? lastVolume;
   String? lastStreamQuality;
 
@@ -1978,6 +2228,8 @@ class FakeConcatenatingPlayerController
   Future<void> setSeed(
     List<QueuePlaybackEntry> entries, {
     required int currentItemId,
+    int? sessionId,
+    PlaybackTransitionCause cause = PlaybackTransitionCause.queueReplacement,
     Duration initialPosition = Duration.zero,
     bool autoPlay = false,
     bool shuffleEnabled = false,
@@ -1992,6 +2244,8 @@ class FakeConcatenatingPlayerController
       SeedCall(
         entries: List<QueuePlaybackEntry>.from(_loadedEntries),
         currentItemId: currentItemId,
+        sessionId: sessionId,
+        cause: cause,
         initialPosition: initialPosition,
         autoPlay: autoPlay,
         shuffleEnabled: shuffleEnabled,
@@ -2151,25 +2405,25 @@ class FakeConcatenatingPlayerController
   Future<void> seekToItem(
     int itemId, {
     Duration position = Duration.zero,
+    PlaybackTransitionCause cause = PlaybackTransitionCause.userSkip,
   }) async {
     final index = _loadedEntries.indexWhere((entry) => entry.itemId == itemId);
     if (index < 0) {
       throw StateError('Item $itemId is not loaded');
     }
     seekedItems.add(itemId);
+    seekCauses.add(cause);
     _currentLocalIndex = index;
     _committedCurrentItemId = itemId;
     _position = position;
     _currentItemIdController.add(itemId);
   }
 
-  @override
   int? get currentIndex => _currentLocalIndex;
 
   @override
   int? get currentItemId => _committedCurrentItemId;
 
-  @override
   String? get currentUuid {
     if (_currentLocalIndex == null ||
         _currentLocalIndex! < 0 ||
@@ -2181,6 +2435,21 @@ class FakeConcatenatingPlayerController
 
   @override
   Duration get position => _position;
+
+  @override
+  int playlistRevision = 0;
+
+  @override
+  Stream<EngineLoadEvent> get loadEvents => const Stream.empty();
+
+  @override
+  Stream<EngineSourceFailure> get sourceFailures => const Stream.empty();
+
+  @override
+  final int runtimeId = 1;
+
+  @override
+  Stream<PlaybackObservation> get observations => const Stream.empty();
 
   @override
   int get queueLength => _loadedEntries.length;
@@ -2220,12 +2489,13 @@ class FakeConcatenatingPlayerController
   }
 
   @override
-  Future<void> setLoopMode(ja.LoopMode mode) async {
+  Future<void> setLoopMode(EngineLoopMode mode) async {
     lastLoopMode = mode;
   }
 
   @override
-  Stream<ja.PlayerState> get playerStateStream => _playerStateController.stream;
+  Stream<EngineTransportState> get transportStateStream =>
+      _playerStateController.stream;
 
   @override
   Stream<Duration> get positionStream => _positionController.stream;
@@ -2240,7 +2510,7 @@ class FakeConcatenatingPlayerController
   Stream<UnavailableAdvance> get unavailableAdvanceStream =>
       _unavailableAdvanceController.stream;
 
-  void emitPlayerState(ja.PlayerState state) {
+  void emitPlayerState(EngineTransportState state) {
     _playerStateController.add(state);
   }
 
@@ -2294,6 +2564,8 @@ class RefreshedSource {
 class SeedCall {
   final List<QueuePlaybackEntry> entries;
   final int currentItemId;
+  final int? sessionId;
+  final PlaybackTransitionCause cause;
   final Duration initialPosition;
   final bool autoPlay;
   final bool shuffleEnabled;
@@ -2301,6 +2573,8 @@ class SeedCall {
   const SeedCall({
     required this.entries,
     required this.currentItemId,
+    required this.sessionId,
+    required this.cause,
     required this.initialPosition,
     required this.autoPlay,
     required this.shuffleEnabled,
@@ -2451,3 +2725,37 @@ class _LibraryFixture {
     await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
   }
 }
+
+/// A just_audio player whose load never completes (5-A18's stalled stream).
+class _StalledPlugin extends Mock implements ja.AudioPlayer {
+  _StalledPlugin() {
+    registerFallbackValue(_FakeAudioSource());
+    registerFallbackValue(Duration.zero);
+    registerFallbackValue(ja.LoopMode.off);
+    when(() => setAudioSources(any(),
+            initialIndex: any(named: 'initialIndex'),
+            initialPosition: any(named: 'initialPosition')))
+        .thenAnswer((_) => Completer<Duration?>().future);
+    when(() => play()).thenAnswer((_) => Completer<void>().future);
+    when(() => pause()).thenAnswer((_) => Completer<void>().future);
+    when(() => stop()).thenAnswer((_) => Completer<void>().future);
+    when(() => setLoopMode(any())).thenAnswer((_) async {});
+    when(() => setVolume(any())).thenAnswer((_) async {});
+    when(() => dispose()).thenAnswer((_) async {});
+    when(() => playing).thenReturn(false);
+    when(() => processingState).thenReturn(ja.ProcessingState.loading);
+    when(() => duration).thenReturn(null);
+    when(() => position).thenReturn(Duration.zero);
+    when(() => speed).thenReturn(1.0);
+    when(() => currentIndex).thenReturn(0);
+    when(() => currentIndexStream).thenAnswer((_) => const Stream.empty());
+    when(() => playerStateStream).thenAnswer((_) => const Stream.empty());
+    when(() => positionStream).thenAnswer((_) => const Stream.empty());
+    when(() => durationStream).thenAnswer((_) => const Stream.empty());
+    when(() => positionDiscontinuityStream)
+        .thenAnswer((_) => const Stream.empty());
+    when(() => errorStream).thenAnswer((_) => const Stream.empty());
+  }
+}
+
+class _FakeAudioSource extends Fake implements ja.AudioSource {}

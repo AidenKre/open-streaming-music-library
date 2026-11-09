@@ -20,7 +20,7 @@ class MiniPlayer extends ConsumerWidget {
     final track = ref.watch(currentTrackProvider);
     if (track == null) return const SizedBox.shrink();
 
-    final status = ref.watch(audioStatusProvider);
+    final playWhenReady = ref.watch(audioPlayWhenReadyProvider);
     final position = ref.watch(audioPositionProvider);
     final duration = ref.watch(audioDurationProvider);
     final shuffleOn = ref.watch(shuffleProvider);
@@ -133,9 +133,7 @@ class MiniPlayer extends ConsumerWidget {
                 ),
                 IconButton(
                   icon: Icon(
-                    status == PlayerStatus.playing
-                        ? Icons.pause
-                        : Icons.play_arrow,
+                    playWhenReady ? Icons.pause : Icons.play_arrow,
                   ),
                   // The model decides play vs pause when the command runs.
                   onPressed: () =>

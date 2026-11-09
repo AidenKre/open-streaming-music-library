@@ -13,9 +13,9 @@ import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'audio_coordinator_test.dart' show FakeConcatenatingPlayerController;
+import 'audio_coordinator_test.dart' show FakePlaybackEngine;
 
-class _HeldVolumePlayer extends FakeConcatenatingPlayerController {
+class _HeldVolumePlayer extends FakePlaybackEngine {
   final volumeStarted = Completer<void>();
   final releaseVolume = Completer<void>();
 
@@ -42,7 +42,7 @@ void main() {
           databaseProvider.overrideWithValue(db),
           sharedPreferencesProvider.overrideWith((ref) async => prefs),
           streamQualityProvider.overrideWithValue('original'),
-          concatenatingPlayerProvider.overrideWithValue(player),
+          playbackEngineProvider.overrideWithValue(player),
           audioServiceProvider.overrideWithValue(bridge),
         ],
       );

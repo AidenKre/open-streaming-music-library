@@ -24,6 +24,11 @@ final audioStatusProvider = Provider<PlayerStatus>(
   (ref) => ref.watch(audioProvider.select((s) => s.playback.status)),
 );
 
+/// Desired transport: what the play/pause control shows and toggles.
+final audioPlayWhenReadyProvider = Provider<bool>(
+  (ref) => ref.watch(audioProvider.select((s) => s.playback.playWhenReady)),
+);
+
 final audioVolumeProvider = Provider<double>(
   (ref) => ref.watch(audioProvider.select((s) => s.playback.volume)),
 );

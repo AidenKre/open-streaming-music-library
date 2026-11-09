@@ -2,16 +2,16 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:just_audio/just_audio.dart' as ja;
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/audio/audio_dependencies.dart';
+import 'package:frontend/providers/audio/audio_focus.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
 import 'package:frontend/providers/audio/audio_state.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
-import 'package:frontend/providers/audio/concatenating_player_controller.dart';
+import 'package:frontend/providers/audio/playback_engine.dart';
 import 'package:frontend/providers/audio/queue_window.dart';
 import 'package:frontend/providers/audio/queue_order_manager.dart';
 import 'package:frontend/providers/audio/playback_target_resolver.dart';
@@ -24,34 +24,53 @@ import 'package:frontend/services/queue_warm_service.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/services/settings_service.dart';
 
-class AudioCoordinator extends Notifier<AudioState> {
+/// The playback core (SC-27 `QueuePlayer`; renamed after 5B.3). Invariants:
+///  1. It alone writes playback state; each publication is coherent
+///     (identity, position and duration belong to the same item).
+///  2. Lifecycle ([lifecycle]), desired transport and processing are
+///     independent axes (see [PlaybackSlice]).
+///  3. The lane serializes command issuance only: engine commands return
+///     once issued and loads complete as engine events, so pause, stop and
+///     focus loss never wait behind a load.
+///  4. Lane code never awaits a public, lane-enqueuing method.
+///  5. Audio focus events arrive as commands through the lane
+///     ([AudioFocusOwner]); the engine gates audible output on focus.
+///  12. Quiesce closes admission synchronously; quiesced is terminal.
+class AudioCoordinator extends Notifier<AudioState>
+    implements AudioFocusOwner {
   static const _volumePreferenceKey = 'audioVolume';
 
-  late ConcatenatingPlayerController _player;
+  late PlaybackEngine _player;
   late QueueRepository _queueRepo;
   late PlaybackTargetResolver _targetResolver;
   late AudioServiceBridge _bridge;
   late QueueOrderManager _orderManager;
   late QueueWindow _window;
   late CoverArtCacheManager _coverArtCache;
+  late AudioFocus _focus;
+
+  /// Set when an OS interruption paused playing audio; any later transport
+  /// command by the user clears it, so their choice is never undone.
+  bool _resumeAfterInterruption = false;
 
   final List<StreamSubscription<Object?>> _subscriptions = [];
   Future<void> _mutationTail = Future<void>.value();
   bool _stopInProgress = false;
-  bool _playerIntendsPlaying = false;
   PlaybackLifecycle _lifecycle = PlaybackLifecycle.none;
   Future<void>? _quiescing;
   DateTime? _lastPositionSave;
 
   @override
   AudioState build() {
-    _player = ref.read(concatenatingPlayerProvider);
+    _player = ref.read(playbackEngineProvider);
     _queueRepo = ref.read(queueRepositoryProvider);
     _targetResolver = ref.read(playbackTargetResolverProvider);
     _bridge = ref.read(audioServiceProvider);
     _coverArtCache = ref.read(coverArtCacheProvider);
     _orderManager = QueueOrderManager(_queueRepo);
     _window = ref.read(queueWindowProvider);
+    _focus = ref.read(audioFocusProvider);
+    _focus.bind(AudioOutput.queue, this);
 
     // Push stream quality changes into the player so newly-built sources use
     // the user's current preset. The very first fire happens during build() —
@@ -103,7 +122,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       );
     });
 
-    _subscriptions.add(_player.playerStateStream.listen(_onPlayerStateChanged));
+    _subscriptions.add(_player.transportStateStream.listen(_onPlayerStateChanged));
     _subscriptions.add(_player.positionStream.listen(_onPositionChanged));
     _subscriptions.add(
       _player.durationStream.listen((duration) {
@@ -126,6 +145,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
 
     ref.onDispose(() {
+      _focus.release(AudioOutput.queue, this);
       _window.dispose();
       for (final sub in _subscriptions) {
         sub.cancel();
@@ -447,13 +467,12 @@ class AudioCoordinator extends Notifier<AudioState> {
   /// Play/pause toggle, decided here when the command executes (inside the
   /// serial lane), never by a view or the OS: two quick taps alternate, and
   /// the OS media button and in-app buttons can't disagree (SC-27). It acts
-  /// on the published status -- what the play/pause icon and the OS state
-  /// show -- so a tap during a load resumes, as the icon promises. (5B.0c
-  /// splits desired transport into its own published axis.)
+  /// on the desired-transport axis -- what the play/pause control and the
+  /// OS state show -- so a tap while loading with play desired pauses.
   Future<void> togglePlayPause() {
     return _serialize(() async {
       if (state.queue.sessionId == null) return;
-      if (state.playback.status == PlayerStatus.playing) {
+      if (state.playback.playWhenReady) {
         await _pauseInLane();
       } else {
         await _resumeInLane();
@@ -470,9 +489,39 @@ class AudioCoordinator extends Notifier<AudioState> {
 
   Future<void> pause() => _serialize(_pauseInLane);
 
+  /// OS interruption began (SC-27 invariant 5): pause playing audio and
+  /// remember to resume it when the interruption ends.
+  @override
+  void onInterruptionBegan() {
+    unawaited(_serialize(() async {
+      if (!state.playback.playWhenReady) return;
+      await _pauseInLane();
+      _resumeAfterInterruption = true;
+    }));
+  }
+
+  @override
+  void onInterruptionEnded({required bool shouldResume}) {
+    unawaited(_serialize(() async {
+      final resume = _resumeAfterInterruption && shouldResume;
+      _resumeAfterInterruption = false;
+      if (resume && state.queue.sessionId != null) await _resumeInLane();
+    }));
+  }
+
+  /// Headphones unplugged: pause, like a user pause.
+  @override
+  void onBecameNoisy() {
+    unawaited(_serialize(() async {
+      if (state.playback.playWhenReady) await _pauseInLane();
+      _resumeAfterInterruption = false;
+    }));
+  }
+
   // Lane bodies (invariant: lane code never awaits a public lane method).
   Future<void> _resumeInLane() async {
-    _playerIntendsPlaying = true;
+    _resumeAfterInterruption = false;
+    _setPlayWhenReady(true);
     await _player.play();
     // Mirror of _pauseInLane: publish the command's result so a toggle
     // queued behind it alternates. A buffering engine corrects it to
@@ -484,7 +533,8 @@ class AudioCoordinator extends Notifier<AudioState> {
   }
 
   Future<void> _pauseInLane() async {
-    _playerIntendsPlaying = false;
+    _resumeAfterInterruption = false;
+    _setPlayWhenReady(false);
     await _player.pause();
     // The paused state is the result of this command: publish it now so a
     // toggle queued behind it decides from it (the engine's own state event
@@ -519,10 +569,15 @@ class AudioCoordinator extends Notifier<AudioState> {
       // ignored.
       _stopInProgress = true;
       try {
-        _playerIntendsPlaying = false;
         await _player.stop();
         _bridge.clearNowPlaying();
-        _setPlaybackStatus(PlayerStatus.idle);
+        state = state.copyWith(
+          playback: state.playback.copyWith(
+            status: PlayerStatus.idle,
+            playWhenReady: false,
+            processing: EngineProcessingState.idle,
+          ),
+        );
         _updateBridgePlaybackState();
       } finally {
         _lifecycle = PlaybackLifecycle.quiesced;
@@ -536,7 +591,6 @@ class AudioCoordinator extends Notifier<AudioState> {
     return _serialize(() async {
       _stopInProgress = true;
       try {
-        _playerIntendsPlaying = false;
         await _player.stop();
         _bridge.clearNowPlaying();
 
@@ -563,16 +617,13 @@ class AudioCoordinator extends Notifier<AudioState> {
 
       final previousCurrentItemId = state.queue.currentItemId;
       final previousPosition = state.playback.position;
-      final wasPlaying =
-          _playerIntendsPlaying ||
-          state.playback.status == PlayerStatus.playing;
+      final wasPlaying = state.playback.playWhenReady;
       final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
 
       if (snapshot == null ||
           snapshot.currentItem == null ||
           snapshot.totalCount == 0) {
         await _player.stop();
-        _playerIntendsPlaying = false;
         _bridge.clearNowPlaying();
         await _queueRepo.deactivateAll();
         _window.reset();
@@ -580,6 +631,8 @@ class AudioCoordinator extends Notifier<AudioState> {
           playback: state.playback.copyWith(
             clearTrack: true,
             status: PlayerStatus.idle,
+            playWhenReady: false,
+            processing: EngineProcessingState.idle,
             position: Duration.zero,
             duration: Duration.zero,
           ),
@@ -602,6 +655,10 @@ class AudioCoordinator extends Notifier<AudioState> {
         autoPlay: wasPlaying,
         initialPosition: preservePosition ? previousPosition : Duration.zero,
         overrideCurrentItem: nextCurrentItem,
+        // Only a reconcile that keeps the current item continues it.
+        cause: preservePosition
+            ? PlaybackTransitionCause.reconcileContinuation
+            : PlaybackTransitionCause.queueReplacement,
       );
       await _persistPlaybackCursor(
         resetPosition: !preservePosition,
@@ -727,6 +784,7 @@ class AudioCoordinator extends Notifier<AudioState> {
     required bool autoPlay,
     Duration initialPosition = Duration.zero,
     QueuePlaybackEntry? overrideCurrentItem,
+    PlaybackTransitionCause cause = PlaybackTransitionCause.queueReplacement,
   }) async {
     final snapshot = await _queueRepo.getSessionSnapshot(sessionId);
     final currentItem = overrideCurrentItem ?? snapshot?.currentItem;
@@ -745,6 +803,8 @@ class AudioCoordinator extends Notifier<AudioState> {
     await _player.setSeed(
       seedEntries,
       currentItemId: currentItem.itemId,
+      sessionId: sessionId,
+      cause: cause,
       initialPosition: initialPosition,
       autoPlay: autoPlay,
       shuffleEnabled: snapshot.session.shuffleEnabled,
@@ -753,7 +813,6 @@ class AudioCoordinator extends Notifier<AudioState> {
     await _player.setLoopMode(
       _loopModeFrom(_repeatModeFrom(snapshot.session.repeatMode)),
     );
-    _playerIntendsPlaying = autoPlay;
 
     _window.acknowledge(QueueWindowProposal(const [],
         seedEntries.map((entry) => entry.playPosition).reduce(max) + 1, replaceCoverage: true));
@@ -770,6 +829,7 @@ class AudioCoordinator extends Notifier<AudioState> {
       playback: state.playback.copyWith(
         currentTrack: currentTrack.track,
         status: autoPlay ? PlayerStatus.playing : PlayerStatus.paused,
+        playWhenReady: autoPlay,
         position: initialPosition,
         duration: _playbackDuration(currentTrack.track.duration),
       ),
@@ -875,7 +935,8 @@ class AudioCoordinator extends Notifier<AudioState> {
       return;
     }
     await _ensureItemLoaded(sessionId, target);
-    await _player.seekToItem(target.itemId);
+    await _player.seekToItem(target.itemId,
+        cause: PlaybackTransitionCause.naturalAdvance);
     await _player.play();
   }
 
@@ -1095,26 +1156,26 @@ class AudioCoordinator extends Notifier<AudioState> {
     _scheduleForwardHydration();
   }
 
-  void _onPlayerStateChanged(ja.PlayerState playerState) {
+  /// The engine is the authoritative echo of desired transport (it also
+  /// clears it at the end of the queue); both axes are published as
+  /// reported, plus the derived status.
+  void _onPlayerStateChanged(EngineTransportState playerState) {
     if (_stopInProgress) return;
-    _playerIntendsPlaying = playerState.playing;
-
-    if (playerState.processingState == ja.ProcessingState.completed) {
-      _playerIntendsPlaying = false;
-      state = state.copyWith(
-        playback: state.playback.copyWith(status: PlayerStatus.idle),
-      );
-      _updateBridgePlaybackState();
+    final completed =
+        playerState.processingState == EngineProcessingState.completed;
+    final next = state.playback.copyWith(
+      playWhenReady: playerState.playing,
+      processing: playerState.processingState,
+      status: completed ? PlayerStatus.idle : _mapStatus(playerState),
+    );
+    final previous = state.playback;
+    if (next.playWhenReady == previous.playWhenReady &&
+        next.processing == previous.processing &&
+        next.status == previous.status) {
       return;
     }
-
-    final nextStatus = _mapStatus(playerState);
-    if (nextStatus != state.playback.status) {
-      state = state.copyWith(
-        playback: state.playback.copyWith(status: nextStatus),
-      );
-      _updateBridgePlaybackState();
-    }
+    state = state.copyWith(playback: next);
+    _updateBridgePlaybackState();
   }
 
   void _onPositionChanged(Duration position) {
@@ -1172,14 +1233,21 @@ class AudioCoordinator extends Notifier<AudioState> {
     );
   }
 
+  void _setPlayWhenReady(bool value) {
+    state = state.copyWith(
+      playback: state.playback.copyWith(playWhenReady: value),
+    );
+  }
+
   void _setPlaybackStatus(PlayerStatus status) {
     state = state.copyWith(playback: state.playback.copyWith(status: status));
   }
 
   void _updateBridgePlaybackState() {
     final status = state.playback.status;
+    // The OS shows the desired transport (pause while buffering a play).
     _bridge.updatePlaybackState(
-      playing: status == PlayerStatus.playing,
+      playing: state.playback.playWhenReady,
       processingState: AudioServiceBridge.processingStateFrom(status),
       position: state.playback.position,
     );
@@ -1193,22 +1261,22 @@ class AudioCoordinator extends Notifier<AudioState> {
     };
   }
 
-  static ja.LoopMode _loopModeFrom(QueueRepeatMode mode) {
+  static EngineLoopMode _loopModeFrom(QueueRepeatMode mode) {
     return switch (mode) {
-      QueueRepeatMode.off => ja.LoopMode.off,
-      QueueRepeatMode.all => ja.LoopMode.all,
-      QueueRepeatMode.one => ja.LoopMode.one,
+      QueueRepeatMode.off => EngineLoopMode.off,
+      QueueRepeatMode.all => EngineLoopMode.all,
+      QueueRepeatMode.one => EngineLoopMode.one,
     };
   }
 
-  static PlayerStatus _mapStatus(ja.PlayerState playerState) {
+  static PlayerStatus _mapStatus(EngineTransportState playerState) {
     final processingState = playerState.processingState;
-    if (processingState == ja.ProcessingState.loading ||
-        processingState == ja.ProcessingState.buffering) {
+    if (processingState == EngineProcessingState.loading ||
+        processingState == EngineProcessingState.buffering) {
       return PlayerStatus.loading;
     }
-    if (processingState == ja.ProcessingState.completed ||
-        processingState == ja.ProcessingState.idle) {
+    if (processingState == EngineProcessingState.completed ||
+        processingState == EngineProcessingState.idle) {
       return PlayerStatus.idle;
     }
     return playerState.playing ? PlayerStatus.playing : PlayerStatus.paused;

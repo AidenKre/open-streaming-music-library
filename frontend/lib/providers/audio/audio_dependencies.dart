@@ -1,7 +1,10 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/providers/audio/audio_focus.dart';
 import 'package:frontend/providers/audio/audio_service_bridge.dart';
-import 'package:frontend/providers/audio/concatenating_player_controller.dart';
+import 'package:frontend/providers/audio/audio_session_port.dart';
+import 'package:frontend/providers/audio/just_audio_engine.dart';
+import 'package:frontend/providers/audio/playback_engine.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -16,13 +19,22 @@ final playbackTargetResolverProvider = Provider<PlaybackTargetResolver>((ref) =>
 final queueWindowProvider = Provider<QueueWindow>((ref) =>
     QueueWindow(ref.read(queueRepositoryProvider)));
 
-final concatenatingPlayerProvider =
-    Provider<ConcatenatingPlayerController>((ref) {
-  final controller = ConcatenatingPlayerController.create(
+final audioSessionPortProvider =
+    Provider<AudioSessionPort>((ref) => AudioSessionAdapter());
+
+final audioFocusProvider = Provider<AudioFocus>((ref) {
+  final focus = AudioFocus(ref.read(audioSessionPortProvider));
+  ref.onDispose(focus.dispose);
+  return focus;
+});
+
+final playbackEngineProvider = Provider<PlaybackEngine>((ref) {
+  final engine = JustAudioEngine.create(
     isOfflineFn: () => ref.read(offlineModeProvider),
+    beforePlay: () => ref.read(audioFocusProvider).beforePlay(AudioOutput.queue),
   );
-  ref.onDispose(controller.dispose);
-  return controller;
+  ref.onDispose(engine.dispose);
+  return engine;
 });
 
 final audioServiceProvider = Provider<AudioServiceBridge>((ref) {
