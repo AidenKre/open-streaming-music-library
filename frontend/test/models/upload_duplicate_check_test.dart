@@ -1,7 +1,7 @@
 // Phase 7B.1c: an item's `duplicate_check` (spec §4 GET item; SC-25
 // DuplicateReport), in the wire shape 7A.2c builds at read time
-// (phase-7a2c `backend/app/models/uploads.py` DuplicateCheckOut, commit
-// 6bfeb1f; review r1 #1 realigned the client to it):
+// (`backend/app/models/uploads.py` DuplicateCheckOut; review r1 #1
+// realigned the client to it):
 //   {version, status: complete|failed, no_duplicates_found,
 //    exact|fingerprint: {subject_state, library_pending, library_failed,
 //                        library_not_comparable} | null,

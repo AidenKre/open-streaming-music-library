@@ -13,8 +13,10 @@ import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/library_search_field.dart';
 import 'package:frontend/ui/widgets/search_status.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
+import 'package:frontend/models/library_scope.dart';
 
 import 'browse_harness.dart';
+import '../helpers/library_seed.dart' show SeedTrack, markDownloaded, seedLibrary;
 
 void main() {
   late AppDatabase db;
@@ -80,7 +82,7 @@ void main() {
   }
 
   const root = Scaffold(body: TracksPage(browseAll: true));
-  const detail = Scaffold(body: TracksPage(artistId: 1, albumId: 10));
+  const detail = Scaffold(body: TracksPage.album(AlbumScope(artistId: 1, albumId: 10)));
 
   CursorPaginationMixin<TrackUI> pageState(WidgetTester tester) =>
       tester.state(find.byType(TracksPage)) as CursorPaginationMixin<TrackUI>;

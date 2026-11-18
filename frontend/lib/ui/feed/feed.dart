@@ -5,9 +5,12 @@ import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/feed/new_activity_notice.dart';
 import 'package:frontend/ui/feed/rail_anchor.dart';
+import 'package:frontend/ui/home/home_sections.dart' show RailEngagement;
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/track_card.dart';
+
+export 'package:frontend/ui/home/home_sections.dart' show RailEngagement;
 
 /// One item of a feed rail (a presentation type; SC-26 keeps it in ui/).
 /// Every entity has a stable key — (type, backend identity), so artist 7
@@ -129,33 +132,6 @@ abstract class FeedSection {
 }
 
 enum RailState { loading, ready, error }
-
-/// Whether the user is looking into a rail (Phase 9 §5): at its start offset
-/// or scrolled in, and whether a pointer is down on it.
-@immutable
-class RailEngagement {
-  const RailEngagement({required this.atStart, required this.pointerDown});
-
-  final bool atStart;
-  final bool pointerDown;
-
-  /// At the start with no pointer down: changing the items moves nothing
-  /// under the user.
-  bool get atRest => atStart && !pointerDown;
-
-  @override
-  bool operator ==(Object other) =>
-      other is RailEngagement &&
-      other.atStart == atStart &&
-      other.pointerDown == pointerDown;
-
-  @override
-  int get hashCode => Object.hash(atStart, pointerDown);
-
-  @override
-  String toString() =>
-      'RailEngagement(atStart: $atStart, pointerDown: $pointerDown)';
-}
 
 /// A surface-supplied notice floated over a rail ([NewActivityNotice]).
 @immutable

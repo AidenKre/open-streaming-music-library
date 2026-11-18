@@ -9,8 +9,8 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : AudioServiceActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        // Which of the server's codecs this device can decode (Phase 5 review
-        // major 1). Read once at startup by CodecSupport.probe.
+        // Which of the server's codecs this device can decode. Read once at
+        // startup by CodecSupport.probe.
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "osml/codecs")
             .setMethodCallHandler { call, result ->
                 if (call.method == "decodableAudioCodecs") {

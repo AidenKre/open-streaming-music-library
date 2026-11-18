@@ -14,7 +14,6 @@ The real app's wiring (outermost, every route) is tested in
 import asyncio
 import contextlib
 import hashlib
-import sqlite3
 
 import pytest
 from fastapi import Depends, FastAPI, Request
@@ -27,6 +26,7 @@ from app.database.database import Database, DatabaseContext
 from tests.auth_helpers import create_session
 from tests.owned_database import add_test_user
 from tests.schema_fixtures import INIT_SQL
+from tests.sqlite_helpers import sql_exec
 
 
 @pytest.fixture
@@ -36,15 +36,6 @@ def db(tmp_path):
     )
     assert database.initialize()
     return database
-
-
-def _sql(db, statement, params=()):
-    conn = sqlite3.connect(db.context.database_path)
-    try:
-        conn.execute(statement, params)
-        conn.commit()
-    finally:
-        conn.close()
 
 
 class _Toy:
@@ -163,7 +154,7 @@ def test_a_bad_authorization_header_is_invalid_token(client, toy, header):
 
 def test_a_valid_api_token_reaches_the_handler_with_its_principal(client, toy, db):
     user_id = add_test_user(db, "sam")
-    _sql(db, "UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
+    sql_exec(db, "UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
     tokens = create_session(db, user_id)
 
     response = client.get("/private", headers={"Authorization": f"Bearer {tokens.token}"})

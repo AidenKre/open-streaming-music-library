@@ -19,7 +19,6 @@ class FakeUploadsControls extends ChangeNotifier implements UploadsControls {
   final visibility = <bool>[];
   bool disposed = false;
   final children = <String, ChildListState>{};
-  ReviewTagsOutcome reviewOutcome = ReviewTagsOutcome.notAvailableYet;
 
   void set({UploadsOverview? overview, UploadsNotice? notice, bool? adding}) {
     if (overview != null) this.overview = overview;
@@ -50,12 +49,6 @@ class FakeUploadsControls extends ChangeNotifier implements UploadsControls {
   Future<void> retry(String itemUuid) async => calls.add('retry $itemUuid');
 
   @override
-  ReviewTagsOutcome reviewTags(String itemUuid) {
-    calls.add('reviewTags $itemUuid');
-    return reviewOutcome;
-  }
-
-  @override
   void dismissNotice() {
     calls.add('dismissNotice');
     notice = null;
@@ -66,8 +59,13 @@ class FakeUploadsControls extends ChangeNotifier implements UploadsControls {
   ChildListState? childrenOf(String parentItemUuid) => children[parentItemUuid];
 
   @override
-  Future<void> loadChildren(String batchUuid, String parentItemUuid) async =>
-      calls.add('loadChildren $batchUuid/$parentItemUuid');
+  Future<void> loadChildren(
+    String batchUuid,
+    String parentItemUuid, {
+    bool quiet = false,
+  }) async => calls.add(
+    'loadChildren $batchUuid/$parentItemUuid${quiet ? ' quiet' : ''}',
+  );
 
   @override
   void dispose() {
@@ -122,8 +120,12 @@ UploadsOverview fakeUploadsOverview(
   UploadsAvailability availability = UploadsAvailability.available,
   String? limits,
   UploadCounts? counts,
+  Set<String> otherDeviceSending = const {},
+  bool transfersPaused = false,
 }) => UploadsOverview(
   availability: availability,
+  otherDeviceSending: otherDeviceSending,
+  transfersPaused: transfersPaused,
   rows: rows,
   counts:
       counts ??

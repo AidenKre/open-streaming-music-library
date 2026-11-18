@@ -426,6 +426,7 @@ class TestReleaseIfUnreferenced:
         assert not path.exists()
         assert manager.get_album_art(cover_art_id) is None
 
+    @pytest.mark.requires_chmod_denial
     def test_a_read_only_cover_folder_keeps_the_row_until_it_is_writable(self, tmp_path: Path):
         manager = _create_manager(tmp_path)
         cover_art_id = manager.add_album_art(_make_png_bytes())
@@ -433,12 +434,6 @@ class TestReleaseIfUnreferenced:
         folder = path.parent
         folder.chmod(0o555)
         try:
-            try:
-                path.with_name("probe").touch()
-            except PermissionError:
-                pass
-            else:
-                pytest.skip("this user can write into a read-only folder")
             with pytest.raises(OSError):
                 manager.release_if_unreferenced(cover_art_id)
             assert path.exists()

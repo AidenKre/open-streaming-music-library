@@ -20,7 +20,7 @@ from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services.deletion_worker import DeletionExecutor
 from tests.deletion_world import SpyCache, accept_job, item
-from tests.test_jobs_api import _post_job
+from tests.jobs_api_fixtures import _post_job
 
 WAIT_S = 30
 

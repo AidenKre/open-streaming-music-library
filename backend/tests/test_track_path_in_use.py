@@ -16,7 +16,7 @@ from app.database import ANY_OWNER
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from tests.owned_database import add_test_user
-from tests.test_track_editor import _add_track, _db
+from tests.track_editor_fixtures import _add_track, _db
 
 NFC_CAFE = "Café"
 NFD_CAFE = "Café"

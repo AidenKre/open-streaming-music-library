@@ -14,14 +14,9 @@ import pytest
 from app.services.audio_identity import ExactUnavailable
 from app.services.identity_wakeup import IdentityWakeup
 from tests.identity_worker_fakes import FakeCompute, bytes_digest, make_worker
-from tests.identity_worker_fixtures import add_track, identity, make_db
+from tests.identity_worker_fixtures import add_track, identity
 
 WAIT = 10  # generous upper bound for an event; a passing run never waits this long
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -108,15 +103,15 @@ def test_stop_kills_the_running_child_and_joins(db, music, stop_after):
     started = threading.Event()
     children = []
 
-    def slow_compute(path, codec_hint, *, registry, job_id, low_priority):
+    def slow_compute(path, codec_hint, *, options):
         child = subprocess.Popen(["sleep", "30"], start_new_session=True)
         children.append(child)
-        registry.register(job_id, child)
+        options.registry.register(options.job_id, child)
         started.set()
         try:
             child.wait()
         finally:
-            registry.discard(job_id)
+            options.registry.discard(options.job_id)
         return ExactUnavailable("failed", "killed")
 
     worker = make_worker(db, compute=slow_compute)
@@ -143,7 +138,7 @@ def test_a_join_that_times_out_reports_the_thread_alive(db, music):
     release = threading.Event()
     started = threading.Event()
 
-    def stuck(path, codec_hint, **kwargs):  # ignores the kill
+    def stuck(path, codec_hint, *, options):  # ignores the kill
         started.set()
         release.wait(WAIT)
         return ExactUnavailable("failed", "killed")

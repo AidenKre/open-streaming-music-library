@@ -17,6 +17,7 @@ from app.models import Track, TrackMetaData
 from app.models.history import HistoryEvent
 from app.services.encoder_coordinator import PrefetchOutcome
 from tests.owned_database import add_test_user
+from tests.sqlite_helpers import sql_rows
 
 
 def _track(source, title, artist="Radiohead", album="OK Computer"):
@@ -54,14 +55,6 @@ def _sam_parent_ids(client, uuid_id):
         conn.close()
 
 
-def _rows(client, sql, params=()):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
-
-
 # ── single-resource routes: 404 ──────────────────────────────────────────────
 
 def test_get_track_of_another_user_is_404(two_users):
@@ -89,7 +82,7 @@ def test_post_job_for_another_users_track_is_404_and_queues_nothing(two_users):
     })
 
     assert r.status_code == 404, r.text
-    assert _rows(client, "SELECT id FROM conversion_jobs") == []
+    assert sql_rows(client, "SELECT id FROM conversion_jobs") == []
 
 
 def test_master_patch_of_another_users_track_is_404_and_changes_nothing(two_users):
@@ -100,7 +93,7 @@ def test_master_patch_of_another_users_track_is_404_and_changes_nothing(two_user
     })
 
     assert r.status_code == 404, r.text
-    assert _rows(
+    assert sql_rows(
         client, "SELECT title FROM trackmetadata WHERE uuid_id = ?", (theirs.uuid_id,)
     ) == [("Lucky",)]
 
@@ -150,7 +143,7 @@ def test_db_only_patch_of_another_users_track_is_404_and_changes_nothing(two_use
     })
 
     assert r.status_code == 404, r.text
-    assert _rows(
+    assert sql_rows(
         client, "SELECT title FROM trackmetadata WHERE uuid_id = ?", (theirs.uuid_id,)
     ) == [("Lucky",)]
 
@@ -211,7 +204,7 @@ def _history_event():
 
 def _sam_library(client):
     db = client.app.state.database
-    [(sam,)] = _rows(client, "SELECT id FROM users WHERE username_key = 'sam'")
+    [(sam,)] = sql_rows(client, "SELECT id FROM users WHERE username_key = 'sam'")
     return Library(db, sam)
 
 
@@ -265,7 +258,7 @@ def test_cancelling_another_users_job_answers_cancelled_false_and_leaves_it(two_
     r = client.delete(f"/jobs/{their_job}")
 
     assert (r.status_code, r.json()) == (200, {"cancelled": False})
-    assert _rows(client, "SELECT status FROM conversion_jobs WHERE id = ?", (their_job,)) == [
+    assert sql_rows(client, "SELECT status FROM conversion_jobs WHERE id = ?", (their_job,)) == [
         ("queued",)
     ]
 

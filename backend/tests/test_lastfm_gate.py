@@ -151,9 +151,9 @@ def test_try_later_answers_hold_every_request_on_the_ladder():
 def test_any_answer_that_is_not_try_later_resets_the_ladder(kind):
     gate, clock, _ = _gate()
     _request(gate, clock, answer=LATER)
-    _request(gate, clock, answer=LATER)  # the ladder is now at 5 minutes
+    _, end_second = _request(gate, clock, answer=LATER)  # the ladder is now at 5 minutes
     start, end = _request(gate, clock, answer=Answer(kind, error_code=13))
-    assert start  # third request went out after 5 minutes
+    assert start - end_second == pytest.approx(300)  # third request went out after 5 minutes
 
     start_after_reset, end2 = _request(gate, clock, answer=LATER)
     assert start_after_reset - end == pytest.approx(GAP)
@@ -396,26 +396,26 @@ def test_wake_releases_a_waiter_blocked_behind_a_request_so_it_can_cancel():
     assert outcome == {"b": "cancelled"}
 
 
-@pytest.mark.parametrize("refusal", ["busy", "cancelled", "stopped-then-not"])
+@pytest.mark.parametrize("refusal", ["busy", "cancelled"])
 def test_the_gate_is_usable_after_a_refusal(refusal):
     gate, clock, state = _gate()
-    _request(gate, clock)
+    _, end = _request(gate, clock)
+    clock.advance(2)  # refused mid-gap, so a refusal that took a slot would move the next start
     if refusal == "busy":
         with pytest.raises(GateBusy):
             with gate.enter(max_wait_s=1.0):
                 pass
-    elif refusal == "cancelled":
+    else:
         cancel = threading.Event()
         cancel.set()
         with pytest.raises(GateCancelled):
             with gate.enter(cancel=cancel):
                 pass
-    else:
-        clock.advance(GAP)
 
     start, _ = _request(gate, clock, max_wait_s=None)
 
-    assert start is not None
+    # The refused attempt took no slot: the next request keeps the one gap.
+    assert start - end == pytest.approx(GAP)
 
 
 def test_a_thread_waiting_behind_a_request_goes_next_once_it_ends():
@@ -470,8 +470,9 @@ def test_a_waiter_whose_budget_is_already_spent_sends_nothing(bound):
         with gate.enter(max_wait_s=bound):
             pytest.fail("sent with no time left")
 
+    due = clock.now
     start, _ = _request(gate, clock, max_wait_s=10.0)
-    assert start is not None
+    assert start == due  # the gate stayed free: the next request goes out at once
 
 
 class _BrokenStop(LastfmState):

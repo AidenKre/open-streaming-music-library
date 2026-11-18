@@ -194,13 +194,13 @@ def test_matcher_version_changes_with_the_algorithm_and_diversity_rule(
 
 
 def test_adding_the_fingerprint_layer_changed_the_matcher_version():
-    # 6.5B.2b review F1: at INT 4b0f8f1 (exact-only finder) the default parameters
+    # While the finder was exact-only, the default parameters
     # gave "a7762fe0622b563d". Rows matched then must be re-matched once the finder
     # also has the fingerprint layer, so the version must differ.
     assert matcher_version(_defaults()) != "a7762fe0622b563d"
 
 
-# s7-fingerprint-search: the default version at 90b36274 (search +-24 around 0 only,
+# The default version before the fingerprint search change (search +-24 around 0 only,
 # possible 0.85). Pairs stored under it must be re-matched in the background.
 BEFORE_SEARCH_FIX = "846d5c929870979d"
 
@@ -216,7 +216,7 @@ def test_the_search_change_alone_gives_a_new_matcher_version():
     assert matcher_version(pinned) != BEFORE_SEARCH_FIX
 
 
-# Round 2 (possible 0.70, window 7 s): the default version at eeffbd73 (round 1:
+# Round 2 (possible 0.70, window 7 s): the default version before it (round 1:
 # possible 0.80, 3 s window, the length-implied search). It must change again.
 BEFORE_WINDOW_CHANGE = "cce4c5cc8e71a4f4"
 

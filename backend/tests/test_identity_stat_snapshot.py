@@ -12,13 +12,14 @@ from pathlib import Path
 
 import pytest
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services.import_outcome import ImportOutcome
 from tests.test_identity_conversion import _conversion_world
 from tests.test_identity_ingest import _flac, _pipeline, _row, env  # noqa: F401  (env is a fixture)
-from tests.test_identity_writers import _current, _identity, db  # noqa: F401  (db is a fixture)
+from tests.identity_rows import _identity
+from tests.test_identity_writers import _current
 
 STAT = ("stat_size", "stat_mtime_ns", "stat_inode")
 

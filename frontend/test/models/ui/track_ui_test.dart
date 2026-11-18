@@ -1,4 +1,4 @@
-import 'package:drift/drift.dart' show Value;
+import 'package:drift/drift.dart' show QueryRow, Value;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
@@ -291,6 +291,35 @@ void main() {
       );
       final ui = TrackUI.fromQueryRow(rows.first);
       expect(ui.coverArtId, isNull);
+    });
+
+    // U29-A-02 (unknown is not "not damaged"): every track query selects
+    // damaged_file_path. A row from a query that forgot it must fail, not
+    // read as an undamaged download.
+    test('a damaged copy is read from the row; a row without the '
+        'damaged_file_path column fails instead of reading "not damaged"',
+        () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, file_path, damaged_file_path, "
+        "created_at, last_updated) VALUES ('qr-dmg', NULL, '/f/qr-dmg', 1, 1)",
+      );
+      await db.customStatement(
+        "INSERT INTO trackmetadata (uuid_id, has_album_art) "
+        "VALUES ('qr-dmg', 0)",
+      );
+      final row = (await db.getTrackByUuid('qr-dmg')).single;
+      final damaged = TrackUI.fromQueryRow(row);
+      expect(damaged.damagedFilePath, '/f/qr-dmg');
+      expect(damaged.isDownloadDamaged, isTrue);
+
+      final withoutColumn = QueryRow(
+        Map.of(row.data)..remove('damaged_file_path'),
+        db,
+      );
+      expect(
+        () => TrackUI.fromQueryRow(withoutColumn),
+        throwsA(isA<StateError>()),
+      );
     });
   });
 

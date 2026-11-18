@@ -11,11 +11,12 @@ from unittest.mock import patch
 from app.database import DatabaseContext
 from app.models import Track, TrackMetaData
 from app.services import audio_identity
-from app.services.audio_identity import KIND_PCM, AudioIdentity, ExactAudioHash, ExactUnavailable
+from app.services.audio_identity import KIND_PCM, AudioIdentity, ExactAudioHash, ExactUnavailable, compute_identity
 from app.services.cover_art_manager import CoverArtContext, CoverArtManager
 from app.services.pipeline import make_pipeline
 from tests.owned_database import OwnedTestDatabase
 from tests.schema_fixtures import INIT_SQL
+from tests.tool_call_capture import tool_call
 
 META = TrackMetaData(title="Song", artist="Artist", album="Album", codec="flac", duration=1.0)
 
@@ -42,9 +43,21 @@ class Rig:
         self.root = self.organizer.ctx.music_library_dir
         self.folder = self.root / "Artist" / "Album"
         self.decoded: list[Path] = []
+        # A path here does not hash: the value is the ExactUnavailable reason
+        # its decode reports (a (state, reason) tuple for another state), or an
+        # exception the compute raises.
+        self.failures: dict[Path, object] = {}
 
         def fake_compute(path, codec_hint, **kwargs):
+            tool_call(compute_identity, path, codec_hint, **kwargs)
             self.decoded.append(Path(path))
+            if Path(path) in self.failures:  # a None reason is a failure too
+                failure = self.failures[Path(path)]
+                if isinstance(failure, BaseException):
+                    raise failure
+                state, reason = failure if isinstance(failure, tuple) else ("failed", failure)
+                return AudioIdentity(exact=ExactUnavailable(state, reason),
+                                     tool_versions="ffmpeg 9", computed_at=1)
             return identity_of(Path(path).read_bytes().split(b"|")[0].decode())
 
         monkeypatch.setattr(audio_identity, "compute_identity", fake_compute)

@@ -20,19 +20,12 @@ from concurrent.futures import Future
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.instance_lock import InstanceLockHeld, acquire_instance_lock
 from app.services import identity_worker as identity_worker_mod
+from tests.worker_app_fixtures import _lock_is_held
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 
 ON = {"ENABLE_IDENTITY_WORKER": "true"}
 ON_WATCH = {**ON, "ENABLE_FILE_WATCHER": "true"}
-
-
-def _lock_is_held(data_dir) -> bool:
-    try:
-        acquire_instance_lock(data_dir).release()
-    except InstanceLockHeld:
-        return True
-    return False
 
 
 def _add_track_without_identity(db_path, file_path, owner_id) -> str:
@@ -40,8 +33,8 @@ def _add_track_without_identity(db_path, file_path, owner_id) -> str:
     conn = sqlite3.connect(db_path)
     try:
         track_id = conn.execute(
-            "INSERT INTO tracks (uuid_id, file_path, owner_id) VALUES (?, ?, ?)",
-            (uuid_id, str(file_path), owner_id),
+            f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, owner_id) VALUES (?, {PATH_MARKS}, ?)",
+            (uuid_id, *path_values(file_path), owner_id),
         ).lastrowid
         conn.execute(
             "INSERT INTO trackmetadata (track_id, uuid_id, codec, has_album_art) VALUES (?, ?, 'flac', 0)",
@@ -217,8 +210,10 @@ def test_the_instance_lock_is_kept_until_a_slow_worker_ends(configure_app, fake_
 
 def test_a_shutdown_step_that_raises_before_the_join_still_keeps_the_lock_while_the_worker_lives(
         configure_app, fake_worker, monkeypatch, tmp_path):
-    # Review r1 R1-14: the join is never reached, so only shutdown's final
-    # "is the worker still alive" check can keep the lock.
+    # Review r1 R1-14: a step that raises before the join does not release the
+    # lock under a live worker. Since BE-LIFE round 2 the raise skips no later
+    # step, so the join still runs; the worker outlives it, and only shutdown's
+    # final "is the worker still alive" check can keep the lock.
     main = configure_app(env=ON)
 
     def broken_stop_watchers(*args, **kwargs):
@@ -227,14 +222,15 @@ def test_a_shutdown_step_that_raises_before_the_join_still_keeps_the_lock_while_
     with pytest.raises(RuntimeError, match="would not stop"):
         with TestClient(main.app):
             [worker] = fake_worker.instances
+            worker.join_ends_thread = False
             monkeypatch.setattr(main, "stop_watchers", broken_stop_watchers)
 
-    assert "join" not in worker.events and worker.is_alive()
+    assert "join" in worker.events and worker.is_alive()
     assert _lock_is_held(tmp_path / "data")
 
     worker.finish()
     assert not _lock_is_held(tmp_path / "data")
-    # The steps the raise skipped, so no executor thread outlives the test.
+    # Already stopped by the teardown; stopping again is harmless.
     for name in ("conversion_orchestrator", "encoder_coordinator"):
         service = getattr(main.app.state, name, None)
         if service is not None:

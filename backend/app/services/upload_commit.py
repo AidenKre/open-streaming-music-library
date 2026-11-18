@@ -18,6 +18,7 @@ from app.core.internal_dirs import is_internal_path
 from app.models.track_meta_data import TrackMetaData
 from app.services import audio_identity, metadata, organizer, upload_recovery, upload_validation
 from app.services.audio_identity import ExactAudioHash, identity_to_columns
+from app.services.ffmpeg_runner import ToolOptions
 from app.services.media_input import demuxer_for
 from app.services.metadata import is_wav
 from app.services.path_sanitize import (
@@ -390,9 +391,8 @@ class UploadCommitWorker(PollingWorkerThread):
         if will_tag:
             # The tag writer produces the work file from the staged source.
             self._process_step(
-                self._write_tags, source, work, metadata.build_ffmpeg_tags(edits),
-                registry=self._registry, job_id=job_id,
-                input_format=self._input_format(claimed))
+                self._tool_step, self._write_tags, source, work, metadata.build_ffmpeg_tags(edits),
+                job_id=job_id, input_format=self._input_format(claimed))
             _fsync_file(work)
             if os.path.getsize(work) > reserve:
                 raise OSError("tag-written work file larger than its reservation")
@@ -407,8 +407,7 @@ class UploadCommitWorker(PollingWorkerThread):
         if self._interrupted():
             return None
 
-        probed = self._process_step(
-            self._probe, work, registry=self._registry, job_id=job_id, low_priority=True)
+        probed = self._process_step(self._tool_step, self._probe, work, job_id=job_id, low_priority=True)
         if self._interrupted():
             return None
         tags = probed["tags"]
@@ -443,6 +442,12 @@ class UploadCommitWorker(PollingWorkerThread):
             final_path=str(final_path), final_metadata=json.dumps(final),
             identity_columns=identity_to_columns(identity), digest_check=digest_check,
             reservation_id=self._reservation_id, now=int(self._clock()))
+
+    def _tool_step(self, fn, *args, job_id, low_priority=False, input_format=None):
+        """``fn(*args, options=...)`` as one process step: killable through this
+        worker's registry under the step's job id."""
+        return fn(*args, options=ToolOptions(registry=self._registry, job_id=job_id,
+                                             low_priority=low_priority, input_format=input_format))
 
     @staticmethod
     def _input_format(claimed):
@@ -484,7 +489,7 @@ class UploadCommitWorker(PollingWorkerThread):
         ``(identity to insert, digest_check)``."""
         staged = staged_identity_from_row(claimed["identity"])
         work_hash = self._process_step(
-            self._compute_exact, work, probed["codec"], registry=self._registry,
+            self._tool_step, self._compute_exact, work, probed["codec"],
             job_id=job_id, low_priority=True, input_format=self._input_format(claimed))
         if not isinstance(work_hash, ExactAudioHash):
             return staged, "unverified"

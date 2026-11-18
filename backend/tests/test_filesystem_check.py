@@ -18,18 +18,12 @@ import pytest
 from app.library import library_root
 from app.services import filesystem_check
 from app.services.filesystem_check import warn_other_filesystems
-from tests.identity_worker_fixtures import make_db
 from tests.owned_database import add_test_user
 
 OPERATOR = "uvicorn.error"
 LIBRARY_LINE = ("only uploads work there; edits, conversions, deletions and import-folder imports"
                 " fail")
 IMPORT_LINE = "files dropped there are not imported"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

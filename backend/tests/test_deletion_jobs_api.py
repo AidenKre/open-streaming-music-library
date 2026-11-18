@@ -12,7 +12,6 @@ this piece: every item stays ``pending``. A new job wakes the deletion worker.
 """
 
 import json
-import sqlite3
 import uuid
 
 import pytest
@@ -20,6 +19,7 @@ import pytest
 from app.library import Library
 from app.models import Track, TrackMetaData
 from tests.owned_database import add_test_user
+from tests.sqlite_helpers import sql_rows
 
 PATH = "/tracks/deletions"
 OP = "11111111-1111-4111-8111-111111111111"
@@ -47,17 +47,9 @@ def _body(*targets, op=OP, confirmed_count=None):
     }
 
 
-def _rows(client, sql, params=()):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
-
-
 def _counts(client):
     return tuple(
-        _rows(client, f"SELECT COUNT(*) FROM {t}")[0][0]
+        sql_rows(client, f"SELECT COUNT(*) FROM {t}")[0][0]
         for t in ("operation_receipts", "deletion_jobs", "deletion_job_items")
     )
 
@@ -111,8 +103,8 @@ def test_a_job_is_accepted_with_202_and_pending_items_in_request_order(client):
     assert job["item_count"] == 2
     assert job["items"] == [_pending(B, 2), _pending(A, 1)]
     assert isinstance(job["created_at"], int)
-    assert _rows(client, "SELECT status FROM deletion_jobs") == [("accepted",)]
-    assert _rows(client, "SELECT uuid_id, position, status FROM deletion_job_items"
+    assert sql_rows(client, "SELECT status FROM deletion_jobs") == [("accepted",)]
+    assert sql_rows(client, "SELECT uuid_id, position, status FROM deletion_job_items"
                          " ORDER BY position") == [(B, 0, "pending"), (A, 1, "pending")]
 
 
@@ -134,7 +126,7 @@ def test_an_exact_replay_answers_the_same_job_without_a_second_row(client):
 def test_a_changed_body_under_the_same_uuid_is_409_operation_conflict(client, changed):
     client.post(PATH, json=_body((A, 1), (B, 2)))
     counts = _counts(client)
-    items = _rows(client, "SELECT * FROM deletion_job_items ORDER BY position")
+    items = sql_rows(client, "SELECT * FROM deletion_job_items ORDER BY position")
 
     response = client.post(PATH, json=changed)
 
@@ -142,7 +134,7 @@ def test_a_changed_body_under_the_same_uuid_is_409_operation_conflict(client, ch
     detail = response.json()["detail"]
     assert (detail["error"], detail["retryable"]) == ("operation_conflict", False)
     assert _counts(client) == counts
-    assert _rows(client, "SELECT * FROM deletion_job_items ORDER BY position") == items
+    assert sql_rows(client, "SELECT * FROM deletion_job_items ORDER BY position") == items
 
 
 def test_a_hundred_targets_are_accepted(client):
@@ -166,8 +158,8 @@ def test_targets_are_never_looked_up_so_nothing_executes(client, me, tmp_path):
     assert response.json()["items"] == [_pending(live.uuid_id, live.revision)]
     assert me.get_track_by_uuid(live.uuid_id).revision == live.revision
     assert path.read_bytes() == b"audio"
-    assert _rows(client, "SELECT COUNT(*) FROM deletion_journal") == [(0,)]
-    assert _rows(client, "SELECT COUNT(*) FROM track_tombstones") == [(0,)]
+    assert sql_rows(client, "SELECT COUNT(*) FROM deletion_journal") == [(0,)]
+    assert sql_rows(client, "SELECT COUNT(*) FROM track_tombstones") == [(0,)]
 
 
 def test_a_foreign_target_is_accepted_exactly_like_an_unknown_one(client):

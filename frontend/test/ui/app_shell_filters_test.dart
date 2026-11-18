@@ -7,6 +7,7 @@ import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 
 import 'browse_harness.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// Shell-level integration: the real AppShell (IndexedStack of per-tab
 /// navigators) over a real in-memory DB, checking how the Phase 3 pieces fit

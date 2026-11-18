@@ -97,6 +97,24 @@ Future<void> _waitFor(bool Function() condition) async {
   throw StateError('condition was not met in time');
 }
 
+/// Counts every UPDATE that sets a non-null `tracks.file_path` (a recorded
+/// download; inserts are not counted) from now on, so a test can show a worker never recorded its
+/// file even when a later clean-up step cleared the row again.
+Future<Future<int> Function()> _countFilePathWrites(AppDatabase db) async {
+  await db.customStatement(
+    'CREATE TEMP TABLE file_path_writes (uuid_id TEXT NOT NULL)',
+  );
+  await db.customStatement(
+    'CREATE TEMP TRIGGER count_file_path_writes AFTER UPDATE OF file_path '
+    'ON main.tracks WHEN NEW.file_path IS NOT NULL BEGIN '
+    'INSERT INTO file_path_writes VALUES (NEW.uuid_id); END',
+  );
+  return () async => (await db
+          .customSelect('SELECT COUNT(*) AS n FROM file_path_writes')
+          .getSingle())
+      .read<int>('n');
+}
+
 class _StreamingClient extends http.BaseClient {
   _StreamingClient(this.stream);
 
@@ -361,20 +379,26 @@ void main() {
         if (!hookEntered.isCompleted) hookEntered.complete();
         await releaseHook.future;
       };
+      // Reached only after the partial was renamed into place.
+      var renamed = false;
+      manager.testHookBeforeDbWrite = (_) async => renamed = true;
 
       await manager.enqueueTracks([_track('abc')], quality: '320');
       await hookEntered.future;
 
       // Kick off the reset; it must finish even though the worker is paused
-      // mid-commit (the partial download was already drained).
+      // mid-commit (the partial download was already drained). The reset
+      // bumps the generation before its call returns (the first statement of
+      // WorkerPool.reset, reached with no suspension), so the hook is
+      // released at once: no wait, and no order left to timing.
       final resetFuture = manager.resetAndDeleteFiles();
-      // Yield once so resetAndDeleteFiles has a chance to bump the generation
-      // before we let the hook proceed.
-      await Future<void>.delayed(const Duration(milliseconds: 10));
       releaseHook.complete();
       await resetFuture;
       await _waitForFinish(manager);
 
+      // The reset's own wipe would hide a late commit; the worker must not
+      // have moved the file into place at all.
+      expect(renamed, isFalse, reason: 'the rename was refused');
       final row = await db.select(db.tracks).getSingle();
       expect(row.filePath, isNull);
       expect(Directory(p.join(tempDir.path, 'tracks')).existsSync(), isFalse);
@@ -410,15 +434,20 @@ void main() {
           .toList();
       expect(renamed, hasLength(1));
       final destinationPath = renamed.first.path;
+      final fileWrites = await _countFilePathWrites(db);
 
+      // The reset bumps the generation before its call returns, so the
+      // hook is released at once (no wait).
       final resetFuture = manager.resetAndDeleteFiles();
-      await Future<void>.delayed(const Duration(milliseconds: 10));
       releaseHook.complete();
       await resetFuture;
       await _waitForFinish(manager);
 
-      // _deleteKnownDownloadedFiles couldn't have caught this file (it had no
-      // DB row at reset time). The commit guard must have cleaned it up.
+      // The reset's delete of the recorded files could not have caught this
+      // file (no row named it at reset time). The commit guard must have
+      // cleaned it up, and never recorded it (the reset's wipe would hide a
+      // row written late).
+      expect(await fileWrites(), 0, reason: 'the DB write was refused');
       expect(File(destinationPath).existsSync(), isFalse);
       final row = await db.select(db.tracks).getSingle();
       expect(row.filePath, isNull);
@@ -448,8 +477,14 @@ void main() {
     var resetCompleted = false;
     final resetFuture = manager.resetAndDeleteFiles();
     unawaited(resetFuture.whenComplete(() => resetCompleted = true));
-    await Future<void>.delayed(const Duration(milliseconds: 20));
+    // A reset that did not wait for the worker would clear the queue next,
+    // with no I/O in between: a drained event queue (not a clock) is enough
+    // for it to show. The file deletion after it needs real I/O, so the
+    // cleared queue is the check, not only the completion.
+    await pumpEventQueue();
 
+    expect(manager.snapshot(), isNotEmpty,
+        reason: 'the reset is still waiting for the worker');
     expect(resetCompleted, isFalse);
 
     releaseHook.complete();
@@ -490,35 +525,6 @@ void main() {
     await future;
     expect(completed, isTrue);
     expect(manager.snapshot(), isEmpty);
-  });
-
-  test('downloadedUuidsForUuids uses async I/O for existence checks', () async {
-    // Same async-ness assertion as above, but for the second site that was
-    // converted from existsSync() to await file.exists().
-    final manager = buildManager(
-      client: MockClient((_) async => http.Response.bytes([1], 200)),
-    );
-    addTearDown(manager.dispose);
-
-    final uuids = <String>[];
-    for (var i = 0; i < 10; i++) {
-      final filePath = p.join(tempDir.path, 'p-$i.audio');
-      await File(filePath).writeAsBytes([1]);
-      await _insertTrack(db, 'p-$i', filePath: filePath);
-      uuids.add('p-$i');
-    }
-
-    var completed = false;
-    final future = manager.downloadedUuidsForUuids(uuids)
-        .then((set) {
-      completed = true;
-      return set;
-    });
-    await Future<void>.value();
-    expect(completed, isFalse,
-        reason: 'downloadedUuidsForUuids must not block on existsSync');
-    final result = await future;
-    expect(result, equals(uuids.toSet()));
   });
 
   test('transcoded response (m4a header) saves as .m4a', () async {
@@ -779,7 +785,8 @@ void main() {
   );
 
   test(
-    'enqueueTracksAtQuality skips when stored bitrate matches requested',
+    'enqueueTracksAtQuality skips when the stored quality matches the '
+    'requested one',
     () async {
       final existingPath = p.join(tempDir.path, 'existing.audio');
       await File(existingPath).writeAsBytes([9, 9]);
@@ -788,6 +795,7 @@ void main() {
         'abc',
         filePath: existingPath,
         downloadedBitrateKbps: 320,
+        downloadedQuality: '320',
       );
 
       var requestCount = 0;
@@ -804,6 +812,7 @@ void main() {
           'abc',
           filePath: existingPath,
           downloadedBitrateKbps: 320,
+          downloadedQuality: '320',
         ),
       ], quality: '320');
 
@@ -856,7 +865,12 @@ void main() {
       );
 
       await manager.enqueueTracksAtQuality(
-        [_track('abc', filePath: existingPath, downloadedBitrateKbps: 320)],
+        [
+          _track('abc',
+              filePath: existingPath,
+              downloadedBitrateKbps: 320,
+              downloadedQuality: '320'),
+        ],
         quality: '320',
         force: true,
       );
@@ -944,8 +958,8 @@ void main() {
   );
 
   test(
-    'enqueueTracksAtQuality deletes stale file and re-downloads when bitrate '
-    'differs',
+    'enqueueTracksAtQuality deletes stale file and re-downloads when the '
+    'stored quality differs',
     () async {
       final existingPath = p.join(tempDir.path, 'tracks', 'existing.audio');
       await Directory(p.dirname(existingPath)).create(recursive: true);
@@ -955,6 +969,7 @@ void main() {
         'abc',
         filePath: existingPath,
         downloadedBitrateKbps: 128,
+        downloadedQuality: '128',
       );
 
       var requestCount = 0;
@@ -976,6 +991,7 @@ void main() {
           'abc',
           filePath: existingPath,
           downloadedBitrateKbps: 128,
+          downloadedQuality: '128',
         ),
       ], quality: '320');
       await _waitForFinish(manager);
@@ -1000,11 +1016,9 @@ void main() {
   test(
     'enqueueTracksAtQuality always re-downloads when quality is original',
     () async {
-      // The source's true bitrate isn't known to the client, so an
-      // already-downloaded file at any bitrate must NOT match a request for
-      // `original` — we conservatively re-download. Regressing this branch
-      // (returning true for original) would silently restore the old no-op
-      // bug for users picking "Download at Original" on a 320 kbps copy.
+      // A copy downloaded at a bitrate preset must NOT match a request for
+      // `original`: picking "Download at Original" on a 320 kbps copy
+      // re-downloads it.
       final existingPath = p.join(tempDir.path, 'tracks', 'existing.audio');
       await Directory(p.dirname(existingPath)).create(recursive: true);
       await File(existingPath).writeAsBytes([5, 5, 5]);
@@ -1013,6 +1027,7 @@ void main() {
         'abc',
         filePath: existingPath,
         downloadedBitrateKbps: 320,
+        downloadedQuality: '320',
       );
 
       var requestCount = 0;
@@ -1034,6 +1049,7 @@ void main() {
           'abc',
           filePath: existingPath,
           downloadedBitrateKbps: 320,
+          downloadedQuality: '320',
         ),
       ], quality: originalQuality);
       await _waitForFinish(manager);
@@ -1233,6 +1249,31 @@ void main() {
     },
   );
 
+  // Section 6 #2 (owner, 2026-11-17: no data from before Phase M is ever
+  // opened again): a download without a stored quality has no bitrate
+  // fallback; it is never "already at this quality".
+  test('enqueueTracksAtQuality: a copy without a stored quality is replaced '
+      'even when its bitrate matches', () async {
+    final existingPath = p.join(tempDir.path, 'tracks', 'abc.mp3');
+    await Directory(p.dirname(existingPath)).create(recursive: true);
+    await File(existingPath).writeAsBytes([9]);
+    await _insertTrack(db, 'abc',
+        filePath: existingPath, downloadedBitrateKbps: 320);
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response('', 500)),
+    );
+    addTearDown(manager.dispose);
+
+    await manager.enqueueTracksAtQuality([
+      _track('abc', filePath: existingPath, downloadedBitrateKbps: 320),
+    ], quality: '320');
+
+    final job = manager.snapshot().single;
+    expect(job.uuidId, 'abc');
+    expect(job.replacesFilePath, existingPath);
+    await _waitForFinish(manager);
+  });
+
   test(
     'enqueueTracksAtQuality replacement: failure preserves old file and DB row',
     () async {
@@ -1288,18 +1329,18 @@ void main() {
   );
 
   test(
-    'enqueueTracksAtQuality replacement: cancel before rename preserves old '
-    'file and DB row',
+    // Was "... cancel before rename preserves old file and DB row": the
+    // test forces an error, not a cancellation (U24-FE-DL-A-13).
+    'enqueueTracksAtQuality replacement: a failure before the rename '
+    'preserves the old file and DB row',
     () async {
-      // The replacement worker is parked just before the partial→destination
-      // rename, then the user requests a delete on a DIFFERENT uuid (no-op
-      // for our subject) while we flip the worker's generation via the test
-      // hook. The contract under test: a replacement worker that bails before
-      // the DB swap must not mutate the OLD file or the OLD DB row.
+      // The replacement worker fails just before the partial→destination
+      // rename. The contract under test: a replacement worker that bails
+      // before the DB swap must not mutate the OLD file or the OLD DB row.
       //
-      // We force cancellation by writing a hook that throws — the downloader
-      // treats this as an error path, cleans up the partial, and never
-      // touches the destination or DB row.
+      // The pre-rename hook throws: the downloader treats this as an error
+      // path, cleans up the partial, and never touches the destination or
+      // the DB row.
       final existingPath = p.join(tempDir.path, 'old-working-copy.mp3');
       await File(existingPath).writeAsBytes([9, 9, 9, 9]);
       await _insertTrack(
@@ -1515,14 +1556,35 @@ void main() {
     final stream = StreamController<List<int>>.broadcast();
     final manager = buildManager(client: _StreamingClient(stream.stream));
 
+    // Reached only by a worker that goes on to commit.
+    var reachedCommit = false;
+    manager.testHookBeforeRename = (_) async => reachedCommit = true;
+    final fileWrites = await _countFilePathWrites(db);
+
     await manager.enqueueTracks([_track('abc')], quality: '320');
-    await _waitFor(() => manager.snapshot().any((job) => job.isActive));
+    // The worker is listening and has opened its partial file.
+    Iterable<File> partials() {
+      final dir = Directory(p.join(tempDir.path, 'tracks'));
+      if (!dir.existsSync()) return const [];
+      return dir
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.endsWith('.partial'));
+    }
+
+    await _waitFor(() => partials().isNotEmpty);
 
     manager.dispose();
-    stream.add([1, 2, 3]);
+    // The whole body (contentLength 10): a worker that was not cancelled
+    // would commit it.
+    stream.add(List.filled(10, 1));
     await stream.close();
-    await Future<void>.delayed(const Duration(milliseconds: 20));
+    // The worker's own end: its partial file is deleted (cancelled) or
+    // renamed (committing, after the hook below has been reached).
+    await _waitFor(() => partials().isEmpty);
 
+    expect(reachedCommit, isFalse, reason: 'the worker did not commit');
+    expect(await fileWrites(), 0);
     final row = await (db.select(
       db.tracks,
     )..where((t) => t.uuidId.equals('abc'))).getSingle();
@@ -1561,7 +1623,11 @@ void main() {
     addTearDown(manager.dispose);
 
     await manager.enqueueTracks([_track('abc')], quality: '320');
-    await Future<void>.delayed(const Duration(milliseconds: 20));
+    // enqueueTracks schedules (WorkerPool.pump, synchronous) before it
+    // returns: a job started while offline would be active already.
+    expect(manager.snapshot().first.isQueued, isTrue);
+    // Nor does one start a little later (a deferred schedule).
+    await pumpEventQueue();
     expect(manager.snapshot().first.isQueued, isTrue);
 
     offline = false;
@@ -1758,18 +1824,23 @@ void main() {
         if (!hookEntered.isCompleted) hookEntered.complete();
         await releaseHook.future;
       };
+      // Reached only after the partial was renamed into place.
+      var renamed = false;
+      manager.testHookBeforeDbWrite = (_) async => renamed = true;
 
       await manager.enqueueTracks([_track('abc')], quality: '320');
       await hookEntered.future;
 
-      // Kick off delete; it must await the fenced worker. Yield once so the
-      // fence flag is set before we let the hook proceed.
+      // Kick off delete; it must await the fenced worker. deleteDownload
+      // sets the fence before its call returns (the first statement of
+      // WorkerPool.fenceUuid, reached with no suspension), so the hook is
+      // released at once: no wait, and no order left to timing.
       final deleteFuture = manager.deleteDownload('abc');
-      await Future<void>.delayed(const Duration(milliseconds: 10));
       releaseHook.complete();
       await deleteFuture;
       await _waitForFinish(manager);
 
+      expect(renamed, isFalse, reason: 'the rename was refused');
       final row = await (db.select(
         db.tracks,
       )..where((t) => t.uuidId.equals('abc'))).getSingle();
@@ -1819,46 +1890,25 @@ void main() {
           .toList();
       expect(renamed, hasLength(1));
       final destinationPath = renamed.first.path;
+      final fileWrites = await _countFilePathWrites(db);
 
+      // deleteDownload sets the fence before its call returns, so the hook
+      // is released at once (no wait).
       final deleteFuture = manager.deleteDownload('abc');
-      await Future<void>.delayed(const Duration(milliseconds: 10));
       releaseHook.complete();
       await deleteFuture;
       await _waitForFinish(manager);
 
       // The downloader's between-rename-and-DB-write fence check must have
       // cleaned this up; deleteDownload couldn't have seen the path because
-      // no DB row referenced it.
+      // no DB row referenced it. Nor was the file ever recorded (a later
+      // clean-up would hide a row written late).
+      expect(await fileWrites(), 0, reason: 'the DB write was refused');
       expect(File(destinationPath).existsSync(), isFalse);
       final row = await (db.select(
         db.tracks,
       )..where((t) => t.uuidId.equals('abc'))).getSingle();
       expect(row.filePath, isNull);
-    },
-  );
-
-  test(
-    'downloadedUuidsForUuids only includes uuids whose file is on disk',
-    () async {
-      final present = p.join(tempDir.path, 'present.audio');
-      final missing = p.join(tempDir.path, 'missing.audio');
-      await File(present).writeAsBytes([1]);
-      await _insertTrack(db, 'present', filePath: present);
-      await _insertTrack(db, 'missing', filePath: missing);
-      await _insertTrack(db, 'never');
-
-      final manager = buildManager(
-        client: MockClient((_) async => http.Response('', 404)),
-      );
-      addTearDown(manager.dispose);
-
-      final result = await manager.downloadedUuidsForUuids([
-        'present',
-        'missing',
-        'never',
-        'unknown',
-      ]);
-      expect(result, {'present'});
     },
   );
 

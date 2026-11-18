@@ -8,6 +8,9 @@ import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/services/session_service.dart';
 
+/// The Create account page states the minimum it checks.
+export 'package:frontend/services/account_rules.dart' show minPasswordLength;
+
 enum SessionPhase {
   starting,
   serverAddress,
@@ -46,11 +49,22 @@ abstract interface class SessionControls implements Listenable {
   /// not be saved; null otherwise.
   String? get signInNotSavedNotice;
 
+  /// The "Reset incomplete" dialog's sentence for [resetFailure] when a step
+  /// other than stopping failed and [signInNotSavedNotice] does not apply;
+  /// null otherwise. Never a failure's own text.
+  String? get resetIncompleteMessage;
+
   /// True when the launch itself failed (a fault thrown while resuming the
   /// saved session), not when the stored sign-in could not be read: the
   /// [SessionPhase.credentialsUnavailable] screen then names the saved
   /// session.
   bool get launchFailed;
+
+  /// True when this device's database was made by another version of the
+  /// app and cannot be opened (launch, connect or sign-in met it): the
+  /// [SessionPhase.credentialsUnavailable] screen then says so and offers
+  /// the reset ([disconnect]) instead of a retry.
+  bool get databaseRefused;
 
   /// The saved server's URL, shown on the Log in screen.
   String? get serverUrl;
@@ -163,6 +177,7 @@ class SessionController extends ChangeNotifier implements SessionControls {
   bool _started = false;
   bool _disposed = false;
   bool _launchFailed = false;
+  bool _databaseRefused = false;
 
   /// Shown on the server-address screen when connecting threw (the address
   /// could not be saved on this device).
@@ -217,7 +232,22 @@ class SessionController extends ChangeNotifier implements SessionControls {
     _signingIn = true;
     _authError = null;
     try {
-      final outcome = await run();
+      SignInOutcome outcome;
+      try {
+        outcome = await run();
+      } catch (e) {
+        // A fault the model did not turn into an outcome ends the attempt
+        // with the sign-in's own failure sentence (pre-merge review A5-03).
+        developer.log(
+          'Signing in failed: ${e.runtimeType}',
+          name: 'SessionController',
+        );
+        if (isDatabaseRefusal(e)) {
+          _showDatabaseRefused();
+          return;
+        }
+        outcome = const SignInFailed('Could not sign in.');
+      }
       await _applySignIn(outcome);
     } finally {
       _signingIn = false;
@@ -319,7 +349,12 @@ class SessionController extends ChangeNotifier implements SessionControls {
   String? get signInNotSavedNotice =>
       SignInNotSavedFailure.noticeFor(_resetFailure);
   @override
+  String? get resetIncompleteMessage =>
+      ResetIncompleteNotice.messageFor(_resetFailure);
+  @override
   bool get launchFailed => _launchFailed;
+  @override
+  bool get databaseRefused => _databaseRefused;
 
   void _set(SessionPhase phase) {
     _phase = phase;
@@ -339,6 +374,7 @@ class SessionController extends ChangeNotifier implements SessionControls {
         name: 'SessionController',
       );
       _launchFailed = true;
+      _databaseRefused = isDatabaseRefusal(e);
       if (!_disposed) _set(SessionPhase.credentialsUnavailable);
       return;
     }
@@ -368,6 +404,10 @@ class SessionController extends ChangeNotifier implements SessionControls {
         'Connecting failed: ${e.runtimeType}',
         name: 'SessionController',
       );
+      if (isDatabaseRefusal(e)) {
+        _showDatabaseRefused();
+        return;
+      }
       _connectError = connectSaveFailedMessage;
       if (!_disposed) _set(SessionPhase.serverAddress);
       return;
@@ -386,6 +426,16 @@ class SessionController extends ChangeNotifier implements SessionControls {
         _pendingServerSwitch = url;
         _set(SessionPhase.serverAddress);
     }
+  }
+
+  /// The database of another version, met by connect or sign-in: the same
+  /// screen as at launch (pre-merge review D3-01).
+  void _showDatabaseRefused() {
+    if (_disposed) return;
+    _databaseRefused = true;
+    _connectError = null;
+    _authError = null;
+    _set(SessionPhase.credentialsUnavailable);
   }
 
   @override
@@ -449,6 +499,9 @@ class SessionController extends ChangeNotifier implements SessionControls {
   @override
   Future<void> acknowledgeReset() async {
     _resetFailure = null;
+    // Asked again by the next launch, connect or sign-in, which find the
+    // database again if the reset could not replace it.
+    _databaseRefused = false;
     await _service.reloadSession();
     if (_disposed) return;
     _set(SessionPhase.serverAddress);

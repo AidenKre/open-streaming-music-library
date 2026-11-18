@@ -30,17 +30,10 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/server_binding.dart';
+import '../helpers/test_offline.dart';
 
 const _bound = '3f1c2a9e-7b4d-4e2a-9c1f-0a1b2c3d4e5f';
 const _other = '9d8e7f6a-5b4c-4d3e-8f2a-1b0c9d8e7f6a';
-
-class _Online extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
 
 class _History extends HistoryApi {
   _History(ApiClient client, this.stamp) : super(api: client);
@@ -93,7 +86,7 @@ void main() {
         appInfoProvider.overrideWith(
           (ref) async => AppInfo.fromJson({'history': {'version': 1}}),
         ),
-        offlineModeProvider.overrideWith(_Online.new),
+        offlineModeProvider.overrideWith(() => TestOffline(false)),
         serverBindingGateProvider.overrideWithValue(controlled.gate),
       ],
     );

@@ -77,6 +77,21 @@ class TrackUI {
     return revision! > staleDismissedAtRevision!;
   }
 
+  /// The current value of the editable field [key] (a key of
+  /// `defaultEditableTrackFields`); null for an unknown key.
+  Object? editableValue(String key) => switch (key) {
+        'title' => title,
+        'artist' => artist,
+        'album' => album,
+        'album_artist' => albumArtist,
+        'year' => year,
+        'date' => date,
+        'genre' => genre,
+        'track_number' => trackNumber,
+        'disc_number' => discNumber,
+        _ => null,
+      };
+
   String get subtitle =>
       [artist ?? 'Unknown Artist', album].whereType<String>().join(' \u2014 ');
 
@@ -213,10 +228,19 @@ class TrackUI {
       downloadedCodec: row.readNullable<String>('downloaded_codec'),
       staleDismissedAtRevision:
           row.readNullable<int>('stale_dismissed_at_revision'),
-      damagedFilePath: row.data.containsKey('damaged_file_path')
-          ? row.readNullable<String>('damaged_file_path')
-          : null,
+      damagedFilePath: _damagedFilePath(row),
     );
+  }
+
+  /// The kept damaged copy's path. Every track query selects this column
+  /// (`trackSelectColumns`). A row without it comes from a query that forgot
+  /// it and fails here: drift reads a missing column as null, which would show
+  /// the track as "not damaged" (unknown is not false).
+  static String? _damagedFilePath(QueryRow row) {
+    if (!row.data.containsKey('damaged_file_path')) {
+      throw StateError('track row without damaged_file_path');
+    }
+    return row.readNullable<String>('damaged_file_path');
   }
 
   factory TrackUI.fromDrift(Track track, TrackmetadataData meta) {

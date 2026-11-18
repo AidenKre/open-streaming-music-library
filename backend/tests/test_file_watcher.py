@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -92,18 +93,28 @@ class TestWaitUntilStable:
         assert file_watcher.wait_until_stable(path, timeout=1, interval=0.01, quiet_window=0.03) is True
 
     def test_wait_until_stable__file_keeps_changing_until_timeout__returns_false(self, tmp_path: Path):
+        """Other-issues row 3: the timeout is longer than the quiet window, so
+        only the writes keep the file from counting as stable (an unchanged
+        file is stable here after 2 s, TestQuietWindow). The clock is fake."""
         path = tmp_path / "changing.bin"
         path.write_bytes(b"initial")
+        clock = _FakeClock()
+        writes = []
 
-        real_sleep = time.sleep
-
-        def mutate_on_sleep(seconds: float):
+        def write_then_sleep(seconds: float):
             with open(path, "ab") as f:
                 f.write(b"x")
-            real_sleep(min(seconds, 0.001))
+            writes.append(seconds)
+            clock.sleep(seconds)
 
-        with patch("app.services.file_watcher.time.sleep", side_effect=mutate_on_sleep):
-            assert file_watcher.wait_until_stable(path, timeout=0.05, interval=0.01) is False
+        with patch("app.services.file_watcher.time.sleep", side_effect=write_then_sleep):
+            assert file_watcher.wait_until_stable(
+                path, timeout=10, interval=0.2, quiet_window=2.0, clock=clock
+            ) is False
+
+        assert clock.now >= 10  # it ran to the timeout
+        assert len(writes) > 40  # the file changed on every poll
+        assert path.stat().st_size == len(b"initial") + len(writes)
 
     def test_wait_until_stable__missing_file__returns_false(self, tmp_path: Path):
         assert file_watcher.wait_until_stable(tmp_path / "missing.txt", timeout=0.05, interval=0.01) is False
@@ -525,3 +536,100 @@ class TestAFileThatChangedDuringItsAttemptIsTriedAgain:
 
         submit.assert_not_called()
         assert path not in watcher.processed
+
+
+@pytest.mark.usefixtures("fast_stability_poll")
+class TestTheStartupScanUsesTheNameRuleOfNewFiles:
+    """Owner's decision 9 (b), 2026-11-17: a file already in an import folder
+    at start that is neither audio nor an archive is skipped quietly, by the
+    same name rule a newly created file gets (``_on_event``). Audio files and
+    archives already there are still imported; dot folders and macOS ``._``
+    companions are skipped as before."""
+
+    @staticmethod
+    def _tree(root: Path, *names: str) -> list[Path]:
+        paths = []
+        for name in names:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"bytes of " + name.encode())
+            paths.append(path)
+        return paths
+
+    def test_files_that_are_neither_audio_nor_archives_are_not_attempted(
+        self, tmp_path: Path, capsys, caplog
+    ):
+        root = tmp_path / "import"
+        imported = self._tree(root, "01.flac", "Album/02.MP3", "box.zip", "Album/set.tar.gz")
+        other = self._tree(root, "cover.jpg", "album.cue", "notes.txt", ".DS_Store",
+                           "Album/folder.png", "Album/rip.log", "Album/no-extension")
+        skipped = self._tree(root, "._01.flac", ".imported/old.zip", ".hidden/03.flac")
+        seen: list[Path] = []
+        watcher = FileWatcher(import_dir=root, on_file=lambda p: seen.append(p) or True)
+
+        with caplog.at_level(logging.DEBUG):
+            watcher.scan_existing()
+            watcher.executor.shutdown(wait=True)
+
+        assert sorted(seen) == sorted(imported)
+        assert watcher.processed == set()
+        # Quiet: no stability wait was started for them and no line names them.
+        printed = capsys.readouterr().out
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        for path in other + skipped:
+            assert path.name not in printed
+            assert str(path) not in logged
+        assert all(p.read_bytes() == b"bytes of " + p.relative_to(root).as_posix().encode()
+                   for p in other + skipped)
+
+    def test_a_scan_of_one_folder_uses_the_same_rule(self, tmp_path: Path):
+        """The signup scan of one user's folder (``scan_existing(folder)``)."""
+        root = tmp_path / "import-users"
+        sams = self._tree(root, "sam/a.flac", "sam/x/b.zip")
+        self._tree(root, "sam/cover.jpg", "sam/x/album.cue", "alex/c.flac")
+        seen: list[Path] = []
+        watcher = FileWatcher(import_dir=root, on_file=lambda p: seen.append(p) or True)
+
+        watcher.scan_existing(root / "sam")
+        watcher.executor.shutdown(wait=True)
+
+        assert sorted(seen) == sorted(sams)
+
+    def test_at_start_the_operator_log_names_only_what_was_imported(
+        self, tmp_path: Path, monkeypatch, caplog
+    ):
+        """Through a real ``Ingestor``: before decision 9 (b) every start logged
+        ``import failed: <path> (not_audio)`` for ``cover.jpg`` and
+        ``album.cue``; now neither is attempted, while the audio file and the
+        archive are imported as before."""
+        import zipfile
+
+        from app.services import ingestion
+        from app.services.import_outcome import ImportOutcome
+        from app.services.ingestion import Ingestor, IngestorContext
+
+        monkeypatch.setattr(ingestion, "does_music_pass_quick_check", lambda path: True)
+        organized: list[str] = []
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        ingestor = Ingestor(IngestorContext(
+            workspace_dir=workspace,
+            organize_function=lambda p: organized.append(p.name) or ImportOutcome.IMPORTED))
+        root = tmp_path / "import"
+        cover, cue, _flac = self._tree(root, "cover.jpg", "album.cue", "01.flac")
+        with zipfile.ZipFile(root / "box.zip", "w") as z:
+            z.writestr("Box/a.flac", b"audio-a")
+        watcher = FileWatcher(
+            import_dir=root,
+            on_file=lambda p: ingestor.ingest_file(p, imported_dir=root / ".imported"),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            watcher.scan_existing()
+            watcher.executor.shutdown(wait=True)
+
+        assert sorted(organized) == ["01.flac", "a.flac"]
+        assert not (root / "box.zip").exists()  # every audio file imported: deleted (DEV-M-10)
+        assert cover.exists() and cue.exists()  # left where they are
+        assert [r.getMessage() for r in caplog.records
+                if "not_audio" in r.getMessage() or "import failed" in r.getMessage()] == []

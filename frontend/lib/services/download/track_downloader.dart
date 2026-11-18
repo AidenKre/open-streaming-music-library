@@ -2,7 +2,8 @@ import 'dart:async';
 import 'dart:developer' as developer;
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Value, Variable;
+import 'package:drift/drift.dart'
+    show BooleanExpressionOperators, Value, Variable;
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
@@ -10,7 +11,7 @@ import 'package:path/path.dart' as p;
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/playback/track_cache_manager.dart';
+import 'package:frontend/playback/stream_uris.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:frontend/services/download/download_queue.dart';
@@ -116,6 +117,11 @@ class TrackDownloader {
   /// wraps this with `@visibleForTesting`.
   Future<void> Function(String uuidId)? testHookBeforeDbWrite;
 
+  /// Test seam fired after the row swap committed, before the commit's last
+  /// check: a person's cancel landing here loses to the download.
+  @visibleForTesting
+  Future<void> Function(String uuidId)? testHookAfterRecord;
+
   /// Downloads one job. Returns the outcome.
   ///
   /// [generationCheck] is polled before each commit window; when it returns
@@ -127,13 +133,21 @@ class TrackDownloader {
   /// [registerCanceller] is invoked once with a future-producing function
   /// that, when called, cancels the HTTP stream cleanly. [unregisterCanceller]
   /// is invoked once the stream has finished (regardless of outcome).
+  ///
+  /// [isCancelled] is the person's cancel of this job: it stops the work at
+  /// every check up to the row swap; after the swap the download wins.
   Future<DownloadOutcome> download({
     required DownloadJob job,
     required bool Function() generationCheck,
     required void Function(double progress) onProgress,
     required void Function(Future<void> Function() canceller) registerCanceller,
     required void Function() unregisterCanceller,
+    bool Function()? isCancelled,
   }) async {
+    // Still wanted: no reset or fence, and not cancelled by the person
+    // ([isCancelled], other-issues row 74). Only the commit's last check,
+    // after the row swap, ignores a person's cancel ([_commitDownload]).
+    bool live() => generationCheck() && !(isCancelled?.call() ?? false);
     // Guarded: an escaped exception would leave the job stuck `active`.
     final Directory dir;
     try {
@@ -141,7 +155,7 @@ class TrackDownloader {
     } catch (e) {
       return DownloadOutcome.otherFailure(e.toString());
     }
-    if (!generationCheck()) {
+    if (!live()) {
       return DownloadOutcome.cancelled;
     }
 
@@ -184,7 +198,7 @@ class TrackDownloader {
       // failed and it stays stuck in `active`.
       return DownloadOutcome.otherFailure(e.toString());
     }
-    if (!generationCheck()) {
+    if (!live()) {
       return DownloadOutcome.cancelled;
     }
 
@@ -228,7 +242,7 @@ class TrackDownloader {
       try {
         subscription = response.stream.listen(
           (chunk) {
-            if (!generationCheck()) {
+            if (!live()) {
               return;
             }
             sink.add(chunk);
@@ -249,7 +263,7 @@ class TrackDownloader {
           },
           cancelOnError: true,
         );
-        if (!generationCheck()) {
+        if (!live()) {
           await subscription.cancel();
           if (!streamDone.isCompleted) {
             streamDone.completeError(_DownloadCancelled());
@@ -262,7 +276,7 @@ class TrackDownloader {
         await sink.close();
       }
 
-      if (!generationCheck()) {
+      if (!live()) {
         await _deleteIfExists(partial);
         return DownloadOutcome.cancelled;
       }
@@ -288,7 +302,8 @@ class TrackDownloader {
         uuidId: job.uuidId,
         partial: partial,
         destination: destination,
-        generationCheck: generationCheck,
+        generationCheck: live,
+        fenceCheck: generationCheck,
         downloadedBitrate: downloadedBitrate,
         downloadedQuality: job.quality,
         downloadedCodec: resolveDownloadedCodec(
@@ -351,6 +366,7 @@ class TrackDownloader {
     required File partial,
     required File destination,
     required bool Function() generationCheck,
+    required bool Function() fenceCheck,
     required int? downloadedBitrate,
     required String downloadedQuality,
     required String? downloadedCodec,
@@ -362,19 +378,13 @@ class TrackDownloader {
     // for the same path waits for it. Late-branch destination files are
     // enqueued for durable cleanup (never deleted in place) and attempted
     // only after the lock is released (cleanRows takes the same lock).
-    List<int> swapIds = const [];
-    String? swapBindingToken;
-    List<int> lateIds = const [];
-    String? lateToken;
-    var late = false;
-    (Object, StackTrace)? recordFailure;
-    final proceed = await _ownedCleanup.withPathLock(destination.path, () async {
+    final step = await _ownedCleanup.withPathLock(destination.path, () async {
       final beforeRename = testHookBeforeRename;
       if (beforeRename != null) await beforeRename(uuidId);
 
       if (!generationCheck()) {
         await _deleteIfExists(partial);
-        return false;
+        return const _CommitStep(committed: false);
       }
 
       if (await destination.exists()) await destination.delete();
@@ -383,11 +393,10 @@ class TrackDownloader {
       final beforeDbWrite = testHookBeforeDbWrite;
       if (beforeDbWrite != null) await beforeDbWrite(uuidId);
 
-      Future<void> enqueueLate({bool clearRow = false}) async {
-        late = true;
-        lateToken = (await ServerBindingRepository(_db).current())
+      Future<_CleanupRows> enqueueLate({bool clearRow = false}) async {
+        final token = (await ServerBindingRepository(_db).current())
             ?.localBindingId;
-        lateIds = await _db.transaction(() async {
+        final ids = await _db.transaction(() async {
           if (clearRow) {
             await (_db.update(_db.tracks)
                   ..where((t) => t.uuidId.equals(uuidId)))
@@ -395,8 +404,9 @@ class TrackDownloader {
           }
           return _ownedCleanup.enqueueInTransaction([
             destination.path,
-          ], localBindingId: lateToken);
+          ], localBindingId: token);
         });
+        return (ids: ids, token: token);
       }
 
       // Reset/fence happened between rename and DB write. The destination
@@ -405,8 +415,7 @@ class TrackDownloader {
       // on the invariant that a failed replacement preserves the working
       // copy.
       if (!generationCheck()) {
-        await enqueueLate();
-        return false;
+        return _CommitStep(committed: false, late: await enqueueLate());
       }
 
       // One transaction swaps the row and enqueues the files it stops
@@ -456,50 +465,53 @@ class TrackDownloader {
           );
         });
       } catch (e, st) {
-        recordFailure = (e, st);
+        _CleanupRows? late;
         try {
-          await enqueueLate();
+          late = await enqueueLate();
         } catch (_) {}
-        return false;
+        return _CommitStep(committed: false, late: late, failure: (e, st));
       }
-      swapIds = swap.ids;
-      swapBindingToken = swapToken;
+      final superseded = (ids: swap.ids, token: swapToken);
       if (swap.rows == 0) {
-        await enqueueLate();
-        return false;
+        return _CommitStep(
+          committed: false,
+          superseded: superseded,
+          late: await enqueueLate(),
+        );
       }
-      if (!generationCheck()) {
+      final afterRecord = testHookAfterRecord;
+      if (afterRecord != null) await afterRecord(uuidId);
+      // After the swap only a reset or a delete fence undoes the download: a
+      // person's cancel landing now loses (review F1), so a re-download never
+      // ends with neither the old nor the new file.
+      if (!fenceCheck()) {
         // The same transaction drops the reference and enqueues the file.
-        await enqueueLate(clearRow: true);
-        return false;
+        return _CommitStep(
+          committed: false,
+          superseded: superseded,
+          late: await enqueueLate(clearRow: true),
+        );
       }
-      return true;
+      return _CommitStep(committed: true, superseded: superseded);
     });
     // Cleanup runs only now, after the path lock is released (cleanRows takes
     // the same lock) and outside any transaction.
     final outcomes = <OwnedCleanupOutcome>[];
-    if (swapIds.isNotEmpty) {
+    for (final rows in [step.superseded, step.late]) {
+      if (rows == null || rows.ids.isEmpty) continue;
       outcomes.addAll(
         (await _ownedCleanup.cleanRows(
-          swapIds,
-          bindingToken: swapBindingToken,
-        )).values,
-      );
-    }
-    if (late) {
-      outcomes.addAll(
-        (await _ownedCleanup.cleanRows(
-          lateIds,
-          bindingToken: lateToken,
+          rows.ids,
+          bindingToken: rows.token,
         )).values,
       );
     }
     if (outcomes.contains(OwnedCleanupOutcome.failed)) {
       _onOwnedCleanupPending?.call();
     }
-    final failure = recordFailure;
+    final failure = step.failure;
     if (failure != null) Error.throwWithStackTrace(failure.$1, failure.$2);
-    return proceed;
+    return step.committed;
   }
 
   /// The track's local revision and source codec right now (both null for an
@@ -575,7 +587,9 @@ class TrackDownloader {
     final coverArtId = row.readNullable<int>('cover_art_id');
     final hasAlbumArt = row.read<bool>('has_album_art');
     if (!hasAlbumArt || coverArtId == null) return;
-    if (_coverArtStore.has(coverArtId)) return;
+    // Asked after any removal of this cover under way (a delete of another
+    // download): a cover about to go is fetched again.
+    if (await _coverArtStore.holds(coverArtId)) return;
     await _coverArtStore.download(coverArtId);
   }
 
@@ -642,22 +656,11 @@ class TrackDownloader {
           FileSystemEntityType.directory) {
         return;
       }
-      final rows = await _db
-          .customSelect(
-            'SELECT file_path, damaged_file_path FROM tracks '
-            'WHERE file_path IS NOT NULL OR damaged_file_path IS NOT NULL',
-            readsFrom: {_db.tracks},
-          )
-          .get();
       final namedPaths = <String>{};
       final namedBasenames = <String>{};
-      for (final row in rows) {
-        for (final column in const ['file_path', 'damaged_file_path']) {
-          final path = row.readNullable<String>(column);
-          if (path == null) continue;
-          namedPaths.add(path);
-          namedBasenames.add(p.basename(path));
-        }
+      for (final path in await _db.ownedTrackFilePaths()) {
+        namedPaths.add(path);
+        namedBasenames.add(p.basename(path));
       }
       final entries = await dir.list(followLinks: false).toList();
       final candidates = <String>[];
@@ -717,22 +720,81 @@ class TrackDownloader {
     }
   }
 
-  /// Deletes the file at every `tracks.file_path` recorded in the DB.
-  /// Best-effort — orphan files are harmless.
-  Future<void> deleteKnownDownloadedFiles() async {
-    final rows = await _db
-        .customSelect(
-          'SELECT file_path, damaged_file_path FROM tracks '
-          'WHERE file_path IS NOT NULL OR damaged_file_path IS NOT NULL',
-          readsFrom: {_db.tracks},
-        )
-        .get();
-    for (final row in rows) {
-      // A kept damaged copy (decision 6) too.
-      for (final column in const ['file_path', 'damaged_file_path']) {
-        final path = row.readNullable<String>(column);
-        if (path != null) await _deleteIfExists(File(path));
+  /// The reset's delete of the downloads (the owner, 2026-11-17: "route the
+  /// reset through the same checks"). One transaction clears every track's
+  /// download columns and queues each recorded file and kept damaged copy
+  /// for the owned-file clean-up, which deletes only what it can prove is
+  /// the app's own: inside the downloads folder (by path and after
+  /// resolving links), an ordinary file (a link is never followed), its size
+  /// and modification time as recorded. Then the downloads folder goes as a
+  /// whole, with every entry left in it: the app's own folder; a link in it
+  /// is removed as a link, never followed.
+  ///
+  /// Files an earlier delete left queued for the clean-up are attempted too.
+  /// A recorded or queued file that is still on the device afterwards
+  /// (outside the folder, by path or through a link) is left where it is
+  /// and reported once: this throws [DownloadsLeftByReset]. Its row no longer names it,
+  /// so a rerun of the reset finds nothing to report.
+  Future<void> deleteDownloadsForReset() async {
+    final String? token;
+    final List<String> paths;
+    final List<int> ids;
+    try {
+      token = (await ServerBindingRepository(_db).current())?.localBindingId;
+      (paths, ids) = await _db.transaction(() async {
+        final recorded = await _db.ownedTrackFilePaths();
+        await (_db.update(_db.tracks)
+              ..where(
+                (t) => t.filePath.isNotNull() | t.damagedFilePath.isNotNull(),
+              ))
+            .write(clearedDownloadColumns);
+        // Files an earlier delete queued and no track names any more are
+        // the previous user's too: attempted and looked for like the rest.
+        final queued =
+            await _db.select(_db.ownedFileCleanupEntries).get();
+        final newIds = await _ownedCleanup.enqueueInTransaction(
+          recorded,
+          localBindingId: token,
+        );
+        return (
+          [...recorded, for (final r in queued) r.path],
+          [...newIds, for (final r in queued) r.id],
+        );
+      });
+    } catch (_) {
+      // The folder still goes; the failure is the reset's to report.
+      await deleteDownloadDirectory();
+      rethrow;
+    }
+    await _ownedCleanup.cleanRows(ids, bindingToken: token);
+    // Where each recorded file really is (its folder's links resolved, the
+    // file itself not followed), read before the folder goes. Whatever the
+    // clean-up decided, every one is looked for again below.
+    final recorded = [for (final path in paths) await _realLocation(path)];
+    final root = await _realLocation(
+      p.join((await _directoryProvider()).path, 'tracks'),
+    );
+    await deleteDownloadDirectory();
+    var left = 0;
+    for (final path in recorded) {
+      // A file the folder's removal took was the app's own.
+      if (path == root || p.isWithin(root, path)) continue;
+      if (await FileSystemEntity.type(path, followLinks: false) !=
+          FileSystemEntityType.notFound) {
+        left++;
       }
+    }
+    if (left > 0) throw DownloadsLeftByReset(left);
+  }
+
+  /// [path] with its folder's links resolved; the last part is not followed.
+  /// Unchanged when the folder cannot be resolved (it does not exist).
+  static Future<String> _realLocation(String path) async {
+    try {
+      final folder = await Directory(p.dirname(path)).resolveSymbolicLinks();
+      return p.join(folder, p.basename(path));
+    } on FileSystemException {
+      return p.normalize(path);
     }
   }
 
@@ -757,4 +819,51 @@ class TrackDownloader {
       }
     } catch (_) {}
   }
+}
+
+/// Clean-up rows a commit step enqueued, with the binding token they were
+/// enqueued under.
+typedef _CleanupRows = ({List<int> ids, String? token});
+
+/// What one commit step under the path lock decided, for the clean-up and
+/// the answer that follow once the lock is released.
+class _CommitStep {
+  const _CommitStep({
+    required this.committed,
+    this.superseded,
+    this.late,
+    this.failure,
+  });
+
+  /// The row now names the new file.
+  final bool committed;
+
+  /// The files the row swap stopped referencing (the replaced file, a
+  /// superseded damaged copy); null when no swap ran.
+  final _CleanupRows? superseded;
+
+  /// The new file, enqueued because it ended up referenced by no row (a
+  /// fence or reset, a vanished row, a failed record step); null otherwise.
+  final _CleanupRows? late;
+
+  /// A record step that threw: rethrown after the clean-up attempt.
+  final (Object, StackTrace)? failure;
+}
+
+/// What the reset says about downloaded files it left on the device
+/// (shown in the "Reset incomplete" dialog). Proposed wording, for the
+/// owner.
+const downloadsLeftByResetMessage =
+    'Downloaded files outside this app’s downloads folder were left where '
+    'they are. The app will not delete them.';
+
+/// A reset left recorded downloads it could not prove are the app's own:
+/// [count] of them are still on the device.
+class DownloadsLeftByReset implements Exception {
+  const DownloadsLeftByReset(this.count);
+
+  final int count;
+
+  @override
+  String toString() => downloadsLeftByResetMessage;
 }

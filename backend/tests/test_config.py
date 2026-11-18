@@ -41,3 +41,10 @@ def test_default_directories_are_absolute(in_tmp):
     assert settings.music_library_dir == in_tmp / "music"
     assert settings.app_data_dir == in_tmp / "data"
     assert settings.user_import_dir == in_tmp / "import-users"
+
+
+def test_the_listen_address_is_not_a_setting():
+    # uvicorn's --host and --port choose where the server listens; no code read
+    # these settings, so a HOST line in .env only suggested a change that never
+    # happened (pre-merge H1-03).
+    assert not {"host", "port", "debug"} & set(Settings.model_fields)

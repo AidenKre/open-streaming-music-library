@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from app.services.lastfm_outbox import lastfm_track_fields
+from app.services.lastfm_rules import lastfm_track_fields
 
 NOTICE_MAX_WAIT_S = 10
 
@@ -61,6 +61,10 @@ class NowPlayingNotices:
                 return False
             del self._by_owner[notice.owner_id]
             return True
+
+    def remaining_s(self, notice: Notice) -> float:
+        """How much longer ``notice`` may wait, on the clock it was queued on."""
+        return NOTICE_MAX_WAIT_S - (self._clock() - notice.queued_at)
 
     def discard(self, notice: Notice) -> None:
         with self._lock:

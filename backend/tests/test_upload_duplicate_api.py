@@ -216,6 +216,50 @@ def test_a_staged_item_gone_after_validation_reads_as_unavailable(env):
     assert (match["item_uuid"], match["available"], match["staged_item"]) == (first["item_uuid"], False, None)
 
 
+def test_a_staged_match_that_was_cancelled_reads_as_unavailable(env):
+    # Pre-merge A4-04: nothing can be published from a cancelled upload, so it
+    # reads like a gone one, as a deleted library track does.
+    first = env.stage(content=b"same", progress_at=1)
+    later = env.stage(content=b"same", progress_at=2)
+    env.validate(runs=2)
+    [match] = env.get(later)["duplicate_check"]["matches"]
+    assert (match["item_uuid"], match["available"]) == (first["item_uuid"], True)
+
+    cancelled = env.client.delete(f"/tracks/uploads/items/{first['item_uuid']}")
+    assert cancelled.status_code == 200, cancelled.text
+    [match] = env.get(later)["duplicate_check"]["matches"]
+
+    assert (match["item_uuid"], match["available"], match["staged_item"]) == (first["item_uuid"], False, None)
+
+
+@pytest.mark.parametrize(("state", "fields"), [
+    ("expired", ""),
+    ("imported", ", result_track_uuid = 'planted-track', result_revision = 1"),
+    ("failed", ", error_code = 'upload_interrupted'"),
+], ids=["expired", "imported", "failed"])
+def test_a_staged_match_that_ended_reads_as_unavailable(env, state, fields):
+    first = env.stage(content=b"same", progress_at=1)
+    later = env.stage(content=b"same", progress_at=2)
+    env.validate(runs=2)
+    sql(env.db, f"UPDATE upload_items SET state = ?{fields} WHERE item_uuid = ?", (state, first["item_uuid"]))
+
+    [match] = env.get(later)["duplicate_check"]["matches"]
+
+    assert (match["item_uuid"], match["available"], match["staged_item"]) == (first["item_uuid"], False, None)
+
+
+@pytest.mark.parametrize("state", ["review_ready", "committing", "duplicate_conflict"])
+def test_a_staged_match_still_staged_reads_as_available(env, state):
+    first = env.stage(content=b"same", progress_at=1)
+    later = env.stage(content=b"same", progress_at=2)
+    env.validate(runs=2)
+    sql(env.db, "UPDATE upload_items SET state = ? WHERE item_uuid = ?", (state, first["item_uuid"]))
+
+    [match] = env.get(later)["duplicate_check"]["matches"]
+
+    assert (match["available"], match["staged_item"]["filename"]) == (True, "a.flac")
+
+
 def test_a_failed_check_is_reported_failed_never_as_none_found(env):
     staged = env.stage()
     env.validate()

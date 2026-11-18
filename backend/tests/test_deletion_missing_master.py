@@ -14,9 +14,9 @@ from tests.deletion_world import (
     journal,
     make_executor,
     revision,
-    sql,
     tombstone,
 )
+from tests.track_paths import set_track_path
 
 
 @pytest.fixture
@@ -53,8 +53,7 @@ def test_a_missing_master_is_a_catalog_only_deletion(world, folder_exists):
 
 def test_a_missing_master_outside_the_root_is_still_rejected(world, tmp_path):
     uuid_id = add_master(world, "A/a.flac", create_file=False)
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
-        (str(tmp_path / "outside" / "gone.flac"), uuid_id))
+    set_track_path(world.db, uuid_id, tmp_path / "outside" / "gone.flac")
     op = accept_job(world, (uuid_id, revision(world, uuid_id)))
 
     make_executor(world).run_one()

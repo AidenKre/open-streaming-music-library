@@ -3,7 +3,6 @@
 import time
 
 import anyio.to_thread
-from contextlib import contextmanager
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -11,6 +10,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import ClientDisconnect
 from pydantic import ValidationError
 
+from app.core.api_errors import answer_errors
 from app.core.byte_range import ranged_file_response
 from app.core.bounded_body import bounded_body, validation_error_422
 from app.library import Library, current_library
@@ -37,14 +37,10 @@ def upload_clock() -> int:
     return int(time.time())
 
 
-@contextmanager
 def _api_errors():
     """Every upload route runs its service call inside this: UploadError
     becomes the SC-22 HTTP error."""
-    try:
-        yield
-    except UploadError as exc:
-        raise exc.to_http() from exc
+    return answer_errors(UploadError)
 
 
 @router.post("")

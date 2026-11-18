@@ -1,4 +1,5 @@
 import 'dart:io' show SocketException;
+import 'dart:io' as io;
 
 import 'package:file/file.dart';
 import 'package:file/memory.dart';
@@ -11,6 +12,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:frontend/services/local_cover_art_store.dart';
 
 class MockCacheManager extends Mock implements BaseCacheManager {}
 
@@ -221,6 +223,83 @@ void main() {
       final noop = CoverArtCacheManager.noop();
       // Should not throw
       noop.prefetch([1, 2, 3]);
+    });
+  });
+
+  // U25-A-07: art downloaded to this device is served from its file, with no
+  // cache lookup and no network fetch.
+  group('with a local store', () {
+    late io.Directory dir;
+    late LocalCoverArtStore store;
+    late CoverArtCacheManager withStore;
+
+    setUp(() {
+      dir = io.Directory.systemTemp.createTempSync('cover_art_local_');
+      final api = testApiClient(
+        'http://localhost:8000',
+        MockClient((_) async => http.Response('', 500)),
+      );
+      store = LocalCoverArtStore(dir, api);
+      store.fileFor(7).writeAsBytesSync([1, 2, 3]);
+      withStore = CoverArtCacheManager(
+        api: api,
+        cache: mockCache,
+        localStore: store,
+      );
+    });
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    test('imageProvider reads a stored cover from its file', () {
+      final provider = withStore.imageProvider(7);
+      expect(provider, isA<FileImage>());
+      expect((provider as FileImage).file.path, store.fileFor(7).path);
+      verifyZeroInteractions(mockCache);
+    });
+
+    test('imageProvider goes through the cache for a cover not stored', () {
+      final provider = withStore.imageProvider(8);
+      expect(provider, isA<CoverArtImageProvider>());
+      expect(
+        (provider as CoverArtImageProvider).url,
+        'http://localhost:8000/cover_art/8',
+      );
+    });
+
+    test('prefetch skips stored covers and fetches the others', () {
+      when(
+        () => mockCache.getSingleFile(any()),
+      ).thenAnswer((_) async => FakeFileInfo('/tmp/cover.jpg').file);
+
+      withStore.prefetch([7, 8]);
+
+      verify(
+        () => mockCache.getSingleFile('http://localhost:8000/cover_art/8'),
+      ).called(1);
+      verifyNever(
+        () => mockCache.getSingleFile('http://localhost:8000/cover_art/7'),
+      );
+    });
+
+    test('localArtUri is the stored file, null when not stored', () {
+      expect(withStore.localArtUri(7), Uri.file(store.fileFor(7).path));
+      expect(withStore.localArtUri(8), isNull);
+    });
+
+    test('resolveArtUri answers with the stored file before the cache',
+        () async {
+      final uri = await withStore.resolveArtUri(
+        hasAlbumArt: true,
+        coverArtId: 7,
+      );
+      expect(uri, Uri.file(store.fileFor(7).path));
+      verifyZeroInteractions(mockCache);
+    });
+
+    test('clear empties the local store as well as the cache', () async {
+      when(() => mockCache.emptyCache()).thenAnswer((_) async {});
+      await withStore.clear();
+      verify(() => mockCache.emptyCache()).called(1);
+      expect(store.has(7), isFalse);
     });
   });
 }

@@ -40,8 +40,9 @@ from app.services.recovery_audio import PROBE_OK, PROBE_REFUSED, PROBE_UNKNOWN, 
 from app.services import journal_settle
 from app.services.conversion import reconcile_conversion_jobs
 from app.services.track_editor import reconcile_journal
+from tests.crash import Crash
 from tests.test_conversion import _second_owner
-from tests.test_track_editor import _db
+from tests.track_editor_fixtures import _db
 
 OPERATOR = "uvicorn.error"
 
@@ -666,6 +667,32 @@ def test_f2_a_failed_adoption_puts_the_staged_copy_back_and_keeps_the_row(tmp_pa
     assert _rows(w) == [] and _db_path(w) == str(w.paths["R"])
 
 
+def test_an_adoption_the_database_refuses_puts_the_staged_copy_back_and_keeps_the_row(
+    tmp_path, monkeypatch, caplog
+):
+    """Pre-merge PM-BE-PATHKEY: the track's file is missing and its staged copy
+    is adopted at the row's new path, which recovery found unclaimed; another
+    track's row names it by the time the track is pointed there. The database
+    refuses (the unique index on the folded path): the copy goes back to
+    staging and the row is kept with the reason recovery gives for a claimed
+    path. The next start sees the claim and uses the recovered name."""
+    w = world(tmp_path, intent="convert", db_at="O", o=0, n=0, t=1, claim=("N",))
+    monkeypatch.setattr(w.db, "track_path_in_use", lambda *args, **kwargs: False)
+
+    run(w, caplog)
+
+    assert w.paths["T"].read_bytes() == C_TEMP  # back where the row expects it
+    assert not os.path.lexists(w.paths["N"]) and not w.paths["R"].exists()
+    assert len(_rows(w)) == 1 and _db_path(w) == str(w.paths["O"])
+    assert [r.getMessage() for r in caplog.records if "kept" in r.getMessage()] == [
+        f"journal entry {w.entry_id} for track {w.uuid} kept: another track's file is at the path"]
+
+    monkeypatch.undo()
+    run(w)
+    assert _rows(w) == [] and _db_path(w) == str(w.paths["R"])
+    assert w.paths["R"].read_bytes() == C_TEMP
+
+
 def test_f2_a_staged_copy_that_could_not_become_a_track_is_put_back(tmp_path, monkeypatch):
     w = world(tmp_path, intent="convert", db_at="N", o=0, n=1, t=1, contents={"T": b"B|temp"})
     _fail(monkeypatch, w.db, "add_track")
@@ -733,15 +760,11 @@ def test_f6_a_symlink_at_new_path_is_no_proof_that_the_old_master_is_redundant(
 # --- review round 1 of the table (s8-recovery-settle-review-table.md) -------------------------------
 
 
-class _Kill(BaseException):
-    """A process killed mid-recovery: nothing after this point runs, no put-back."""
-
-
 def _killed_at(monkeypatch, db, name):
     real = getattr(db, name)
 
     def kill(*args, **kwargs):
-        raise _Kill()
+        raise Crash()
 
     monkeypatch.setattr(db, name, kill)
     monkeypatch.setattr(journal_settle, "move_back", lambda *a, **k: False)
@@ -757,7 +780,7 @@ def test_r1_a_kill_after_the_staged_copy_moved_never_costs_the_foreign_audio_at_
     and the staged copy ends as the track's file."""
     w = world(tmp_path, intent=intent, db_at="O", o=0, n=1, t=1, contents={"N": b"B|foreign"})
     _killed_at(monkeypatch, w.db, "refresh_track_audio_properties")
-    with pytest.raises(_Kill):
+    with pytest.raises(Crash):
         reconcile_journal(w.db, w.tmp, read_audio=fake_read)
     monkeypatch.undo()
 
@@ -779,7 +802,7 @@ def test_r1_a_kill_after_a_staged_copy_was_placed_under_the_recovered_name_settl
     staged copy, which the next start settles (a track, never unreferenced)."""
     w = world(tmp_path, intent="convert", db_at="N", o=0, n=1, t=1, contents={"T": b"B|temp"})
     _killed_at(monkeypatch, w.db, "add_track")
-    with pytest.raises(_Kill):
+    with pytest.raises(Crash):
         reconcile_journal(w.db, w.tmp, read_audio=fake_read)
     monkeypatch.undo()
 
@@ -915,7 +938,7 @@ def test_r1_a_staged_copy_an_earlier_run_placed_is_no_proof_that_the_old_file_is
     w = world(tmp_path, intent="convert", db_at="N", o=1, n=1, t=1,
               contents={"O": b"T|slow", "T": b"B|temp"})
     _killed_at(monkeypatch, w.db, "delete_journal_entry")  # after placement and registration
-    with pytest.raises(_Kill):
+    with pytest.raises(Crash):
         reconcile_journal(w.db, w.tmp, read_audio=fake_read)
     monkeypatch.undo()
     assert str(w.paths["R"]) in _track_paths(w) and not w.paths["T"].exists()

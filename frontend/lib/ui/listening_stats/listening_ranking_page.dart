@@ -5,8 +5,10 @@ import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/new_activity_notice.dart';
 import 'package:frontend/ui/listening_stats/listening_ranking_controller.dart';
 import 'package:frontend/ui/listening_stats/listening_stats_format.dart';
-import 'package:frontend/ui/listening_stats/top_lists.dart';
+import 'package:frontend/ui/listening_stats/stats_ranked_card_view.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
+import 'package:frontend/ui/widgets/playback_notice.dart';
 
 /// Opens "See all" for [kind] over the statistics page's [token].
 void openListeningRanking(
@@ -134,7 +136,7 @@ class _ListeningRankingPageState extends ConsumerState<ListeningRankingPage> {
     if (_controls.notice != SnapshotStaleness.fresh) {
       return NewActivityNotice(
         message: _controls.notice == SnapshotStaleness.historyChanged
-            ? 'Listening history changed'
+            ? 'This page is out of date.'
             : 'New listening activity',
         actionLabel: 'Refresh',
         onRefresh: _controls.refresh,
@@ -156,14 +158,9 @@ class _ListeningRankingPageState extends ConsumerState<ListeningRankingPage> {
       if (!_controls.failed) {
         return const Center(child: CircularProgressIndicator());
       }
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Couldn’t load.'),
-            TextButton(onPressed: _controls.retry, child: const Text('Retry')),
-          ],
-        ),
+      return LoadFailureNotice(
+        message: 'Couldn’t load.',
+        onRetry: _controls.retry,
       );
     }
     if (cards.isEmpty && !_controls.hasMore) {
@@ -192,9 +189,10 @@ class _ListeningRankingPageState extends ConsumerState<ListeningRankingPage> {
                     mainAxisExtent: statsRankedCardHeight(context),
                   ),
                   delegate: SliverChildBuilderDelegate(
-                    (context, i) => StatsRankedCardView(
+                    (_, i) => StatsRankedCardView(
                       card: cards[i],
-                      onPlayTrack: _controls.playTrack,
+                      onPlayTrack: (t) =>
+                          showPlaybackOutcome(context, _controls.playTrack(t)),
                     ),
                     childCount: cards.length,
                   ),

@@ -9,6 +9,7 @@ import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/listening_stats.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/listening_stats_repository.dart';
 
@@ -86,6 +87,11 @@ void main() {
   });
 
   group('pendingListens (review r1 F2)', () {
+    final now = DateTime.utc(2026, 11, 18, 12).millisecondsSinceEpoch;
+
+    // C2-01 (pre-merge review) turned this test around: a future-dated
+    // pending listen is "not counted yet" on the page, so it is not among
+    // the listens the totals include (it was counted here before).
     test('counts only counted plays still waiting to upload', () async {
       await insert(pending: true);
       await insert(pending: true, atMs: DateTime.utc(2999).millisecondsSinceEpoch);
@@ -94,14 +100,27 @@ void main() {
       await insert(seconds: 0, pending: true);
       await insert(seconds: null, pending: true);
       final last = await insert(entityType: 'album', pending: true);
-      expect(await repo.pendingListens(last), 2);
+      expect(await repo.pendingListens(StatsRange.allTime, last, now), 1);
     });
 
     test('the boundary bounds the count', () async {
       final first = await insert(pending: true);
       await insert(pending: true);
-      expect(await repo.pendingListens(first), 1);
-      expect(await repo.pendingListens(0), 0);
+      expect(await repo.pendingListens(StatsRange.allTime, first, now), 1);
+      expect(await repo.pendingListens(StatsRange.allTime, 0, now), 0);
+    });
+
+    // C2-01: "Includes N listens from this device not uploaded yet" speaks of
+    // the totals on screen: only listens inside the shown range count.
+    test('pendingListens counts only listens inside the shown range',
+        () async {
+      const day = 86400000;
+      await insert(pending: true, atMs: now - 3 * day);
+      await insert(pending: true, atMs: now - 40 * day);
+      await insert(pending: true, atMs: DateTime.utc(2999).millisecondsSinceEpoch);
+      final last = await insert(atMs: now - day);
+      expect(await repo.pendingListens(StatsRange.last7Days, last, now), 1);
+      expect(await repo.pendingListens(StatsRange.allTime, last, now), 2);
     });
   });
 }

@@ -28,6 +28,7 @@ import 'package:frontend/ui/listening_stats/stats_ranked_card.dart';
 
 import '../fake_library_actions.dart';
 import 'stats_model_fakes.dart';
+import '../../helpers/listening_stats_builder.dart';
 
 TrackUI track(String uuid, String title, {int artistId = 1}) => TrackUI(
   uuidId: uuid,
@@ -51,24 +52,14 @@ const one = AlbumUI(id: 10, artistId: 1, name: 'One');
 /// A 30-day snapshot whose top lists are written by hand: two same-title
 /// tracks (uuid order decides nothing here: the order is the snapshot's).
 ListeningStats withTops(StatsRange range, {int now = 1800000000000}) =>
-    ListeningStats(
+    listeningStatsOf(
       range: range,
       window: range.resolve(now),
       boundaryLocalId: 42,
-      totals: ListeningTotals(
-        listeningSeconds: 900,
-        qualifiedPlays: 6,
-        uniqueTracks: 2,
-        activeDays: 2,
-      ),
-      unavailable: const ListeningSubtotal(
-        listeningSeconds: 0,
-        qualifiedPlays: 0,
-      ),
-      futureTimestampCount: 0,
-      overlongListenCount: 0,
-      buckets: const [],
-      chartCapped: false,
+      seconds: 900,
+      qualifiedPlays: 6,
+      uniqueTracks: 2,
+      activeDays: 2,
       topTracks: [
         RankedEntry(
           entity: track('t-b', 'Same', artistId: 2),

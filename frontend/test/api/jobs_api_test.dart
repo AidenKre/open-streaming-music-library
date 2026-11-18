@@ -217,4 +217,47 @@ void main() {
       expect(cancelled, isTrue);
     });
   });
+
+  // B.13 (U16-FE-API-B-04): a malformed answer is a FormatException, the one
+  // failure type for bad server data (it was a TypeError from a cast).
+  group('JobsApi: a malformed answer is a FormatException', () {
+    JobsApi api(Object body) => JobsApi(
+      api: testApiClient(
+        'http://localhost:8000',
+        MockClient((req) async => Response(jsonEncode(body), 200)),
+      ),
+    );
+
+    for (final (label, body) in <(String, Object)>[
+      ('data is not a list', {'data': 'x'}),
+      ('a job is not an object', {'data': [1]}),
+      ('nextCursor is a string', {'data': [], 'nextCursor': '5'}),
+      ('nextCursor is not a whole number', {'data': [], 'nextCursor': 5.5}),
+    ]) {
+      test('getJobsPage: $label', () async {
+        await expectLater(
+          api(body).getJobsPage(),
+          throwsA(isA<FormatException>()),
+        );
+      });
+    }
+
+    test('getJobsPage: a missing or null data list is an empty page; '
+        'a null nextCursor is the last page', () async {
+      final missing = await api({'nextCursor': null}).getJobsPage();
+      expect(missing.jobs, isEmpty);
+      expect(missing.nextCursor, isNull);
+      final nulled = await api({'data': null}).getJobsPage();
+      expect(nulled.jobs, isEmpty);
+    });
+
+    for (final (label, body) in <(String, Object)>[
+      ('cancelled is missing', <String, Object>{}),
+      ('cancelled is not a boolean', {'cancelled': 'yes'}),
+    ]) {
+      test('cancelJob: $label', () async {
+        await expectLater(api(body).cancelJob(1), throwsA(isA<FormatException>()));
+      });
+    }
+  });
 }

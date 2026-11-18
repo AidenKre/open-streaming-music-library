@@ -13,6 +13,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/upload_review_rules.dart';
+import 'package:frontend/services/uploads/uploads_overview.dart';
+
+import '../../helpers/fake_uploads_api.dart' show itemJson;
+import '../../helpers/upload_intent_record.dart';
 
 UploadItem _item({
   String state = 'review_ready',
@@ -21,44 +25,28 @@ UploadItem _item({
   String? result,
   Map<String, dynamic>? error,
 }) => UploadItem.fromJson({
-  'item_uuid': 'i-1',
-  'batch_uuid': 'b-1',
-  'parent_item_uuid': null,
-  'filename': 'disc1/song.flac',
-  'selection_index': 0,
-  'member_order_key': '',
-  'state': state,
-  'expected_bytes': 3,
-  'expected_sha256': null,
-  'received_bytes': 3,
-  'review_version': version,
-  'error': error,
-  'created_at': 1,
-  'updated_at': 1,
+  ...itemJson(
+    'i-1',
+    filename: 'disc1/song.flac',
+    state: state,
+    expectedBytes: 3,
+    receivedBytes: 3,
+    reviewVersion: version,
+    error: error,
+  ),
   'tag_write_supported': tagWrite,
   'result_track_uuid': result,
 });
 
 UploadIntentRecord _intent(String state, {String? code, String uuid = 'i-1',
-    String batch = 'b-1', String? sha256}) => UploadIntentRecord(
-  itemUuid: uuid,
+    String batch = 'b-1', String? sha256}) => intentRecord(
+  uuid,
   batchUuid: batch,
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: 'song.flac',
-  lastState: state,
+  state: state,
   lastErrorCode: code,
-  lastErrorMessage: null,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
   localBindingId: 'bind',
-  createdAtMs: 0,
-  updatedAtMs: 0,
-  expectedLength: null,
   expectedSha256: sha256,
-  descriptor: null,
 );
 
 ReviewItemView _view(UploadItem item, {UploadIntentRecord? intent,
@@ -282,5 +270,102 @@ void main() {
               .errorText,
           notHere);
     });
+  });
+
+  // Refactor APP-UPLOAD (sign-off s7-app-texts, cascade-8 review #1): the
+  // review page reads the other-device check the way the Uploads page does,
+  // so both pages say the same thing about an item in every state.
+  group('another device is sending the upload', () {
+    test('a waiting row of an upload being sent says so on the review page',
+        () {
+      final v = ReviewItemView.of(
+        item: _item(state: 'allocated'),
+        intent: _intent('on_other_device'),
+        online: true,
+        otherDeviceSending: {'b-1'},
+      );
+      expect(v.statusText, 'Waiting for the file');
+      expect(v.errorText, 'Another device is sending this upload.');
+    });
+
+    test('the review page and the Uploads page show the same status and '
+        'detail in every state', () {
+      const states = [
+        'allocating', 'allocated', 'transferring', 'receiving', 'validating',
+        'review_ready', 'committing', 'imported', 'duplicate', 'expanded',
+        'failed', 'duplicate_conflict', 'expired', 'cancelled', 'cancelling',
+        'source_changed', 'needs_reselect', 'rejected', 'on_other_device',
+        'review_submitted', 'teleporting',
+      ];
+      for (final state in states) {
+        for (final code in [null, 'upload_source_missing', 'upload_slots_busy']) {
+          for (final sha in [null, 'ab' * 32]) {
+            for (final sending in [<String>{}, {'b-1'}]) {
+              for (final a in [
+                UploadsAvailability.available,
+                UploadsAvailability.offline,
+              ]) {
+                for (final paused in [false, true]) {
+                  final intent = _intent(state, code: code, sha256: sha);
+                  final row = UploadsOverview.of(
+                    intents: [intent],
+                    progress: const {},
+                    availability: a,
+                    otherDeviceSending: sending,
+                    transfersPaused: paused,
+                  ).rows.single;
+                  final view = ReviewItemView.of(
+                    item: _item(state: state),
+                    intent: intent,
+                    online: a == UploadsAvailability.available,
+                    otherDeviceSending: sending,
+                    transfersPaused: paused,
+                  );
+                  expect(
+                    (view.statusText, view.errorText),
+                    (row.statusText, row.detailText),
+                    reason: '$state $code here=${sha != null} '
+                        'sending=$sending $a paused=$paused',
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+  });
+
+  // Refactor APP-UPLOAD: a file of an unpacked archive whose copy the server
+  // lost reads the same on the review page as in the archive's file list.
+  test('a lost file of an archive says to add the archive again', () {
+    final child = UploadItem.fromJson({
+      ..._item(state: 'failed', error: {'code': 'upload_source_missing'})
+          .toJson(),
+      'parent_item_uuid': 'zip-1',
+    });
+    final v = ReviewItemView.of(item: child, online: true);
+    expect(
+      v.errorText,
+      'The server no longer has this file from the archive. Add the archive '
+      'again to upload it.',
+    );
+  });
+
+  // Review F7: without a local record the review reads the server's state,
+  // with no bytes on this device, through the same check as the Uploads page.
+  test('an item with no local record that the server is receiving reads as '
+      'sent from another device; offline it reads Paused', () {
+    final online = ReviewItemView.of(
+      item: _item(state: 'receiving'),
+      online: true,
+    );
+    expect(online.statusText, 'Uploading from another device');
+    expect(online.errorText, 'Another device is sending this upload.');
+    final offline = ReviewItemView.of(
+      item: _item(state: 'receiving'),
+      online: false,
+    );
+    expect(offline.statusText, 'Paused');
   });
 }

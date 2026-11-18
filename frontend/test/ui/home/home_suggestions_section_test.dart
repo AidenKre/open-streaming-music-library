@@ -8,7 +8,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/repositories/home_suggestions_service.dart';
@@ -20,6 +19,7 @@ import 'package:frontend/ui/home/home_suggestions_controller.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../browse_harness.dart';
+import '../../helpers/fake_home_controls.dart';
 
 TrackUI _track(String uuid) => TrackUI(
   uuidId: uuid,
@@ -34,20 +34,6 @@ TrackUI _track(String uuid) => TrackUI(
   hasAlbumArt: false,
 );
 
-class _FakeHome extends ChangeNotifier implements HomeControls {
-  @override
-  BrowseFilters get filters =>
-      const BrowseFilters(policy: OfflineFilterPolicy.manual);
-  @override
-  void setDownloaded(bool value) {}
-  @override
-  HomeRecentsState get recents => const HomeRecentsEmpty(filtered: false);
-  @override
-  void retryRecents() {}
-  @override
-  Future<PlaybackOutcome> playTrack(TrackUI track) async => const Accepted(1);
-}
-
 class _FakeSuggestions extends ChangeNotifier
     implements HomeSuggestionsControls {
   final states = <SuggestionRail, SuggestionRailState>{
@@ -55,6 +41,9 @@ class _FakeSuggestions extends ChangeNotifier
     SuggestionRail.moreFromArtists: const SuggestionRailLoading(),
   };
   final played = <String>[];
+
+  /// What [playTrack] answers.
+  PlaybackOutcome playOutcome = const Accepted(1);
   final refreshed = <SuggestionRail>[];
   final retried = <SuggestionRail>[];
   final engagement = <(SuggestionRail, RailEngagement)>[];
@@ -78,7 +67,7 @@ class _FakeSuggestions extends ChangeNotifier
   @override
   Future<PlaybackOutcome> playTrack(TrackUI track) async {
     played.add(track.uuidId);
-    return const Accepted(1);
+    return playOutcome;
   }
 }
 
@@ -119,15 +108,20 @@ void main() {
     await db.close();
   });
 
-  Future<void> pumpHome(WidgetTester tester, {bool settle = true}) async {
+  /// [inScaffold]: inside a Scaffold, as in the shell, so a notice shows.
+  Future<void> pumpHome(
+    WidgetTester tester, {
+    bool settle = true,
+    bool inScaffold = false,
+  }) async {
     tester.view.physicalSize = const Size(800, 2400);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     await tester.pumpWidget(
       harness.wrap(
-        const HomePage(),
+        inScaffold ? const Scaffold(body: HomePage()) : const HomePage(),
         overrides: [
-          homeControlsProvider.overrideWithValue(_FakeHome()),
+          homeControlsProvider.overrideWithValue(FakeHomeControls(const HomeRecentsEmpty(filtered: false))),
           homeSuggestionsControlsProvider.overrideWithValue(fake),
         ],
       ),
@@ -275,6 +269,23 @@ void main() {
       await tester.tap(find.byKey(const ValueKey('track:c')));
       await tester.pump();
       expect(fake.played, ['b', 'c']);
+      await teardownTree(tester);
+    });
+
+    // Owner decision 5 (2026-11-17), APP-OTHER-1 D5: a card tap whose
+    // playback does not start shows the playback message as a notice.
+    testWidgets('a card tap that does not start playback says so', (
+      tester,
+    ) async {
+      fake.playOutcome = const RejectedUnplayableOffline();
+      fake.set(_rd, _ready(['a', 'b']));
+      fake.set(_more, _ready(['c']));
+      await pumpHome(tester, inScaffold: true);
+      expect(find.text('Nothing here plays offline.'), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('track:b')));
+      await tester.pumpAndSettle();
+      expect(fake.played, ['b']);
+      expect(find.text('Nothing here plays offline.'), findsOneWidget);
       await teardownTree(tester);
     });
 

@@ -135,10 +135,13 @@ void main() {
     expect(controlled.gate.state, isA<BindingVerified>());
   }
 
-  Future<void> openRig() async {
+  Future<void> openRig({bool fakeTimeBound = false}) async {
     db = AppDatabase(NativeDatabase.memory());
     await seedTestBinding(db, baseUrl: 'http://s', instanceId: boundInstance);
-    controlled = ControlledGate(db);
+    controlled = ControlledGate(
+      db,
+      timer: fakeTimeBound ? boundOnlyGateTimer : null,
+    );
     server = _Server();
     offline = 0;
     plain = testApiClient('http://s', server)
@@ -639,7 +642,8 @@ void main() {
     testWidgets('$name: the wait for a verdict ends after about 10 s, '
         'nothing sent', (tester) async {
       await tester.runAsync(() async {
-        await openRig();
+        // The gate's wait bound runs on this test's fake time.
+        await openRig(fakeTimeBound: true);
         await verify();
         unawaited(controlled.gate.startConnection('http://s'));
         await pumpEventQueue();

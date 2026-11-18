@@ -11,9 +11,9 @@ enum EditWriteMode {
 }
 
 /// A persistence-neutral, in-memory description of edits to a track's editable
-/// fields. The cross-phase reuse unit: the Get Info form drives it, and later
-/// the outbox flush (slice 6), bulk edit, and Upload confirm-tags consume the
-/// same shape — none of which it knows about.
+/// fields. The cross-phase reuse unit: the Get Info form and the upload
+/// review drive it, and the edit outbox (`EditOutbox`) queues and sends it —
+/// none of which it knows about.
 ///
 /// Crucially it distinguishes **"cleared"** (key present with a `null`/empty
 /// value) from **"untouched"** (key absent) via a presence set, so a flush can
@@ -48,8 +48,8 @@ class MetadataEdit {
     );
   }
 
-  /// Returns a copy with [key] reverted to untouched (e.g. a per-field server
-  /// rejection in slice 6, or the user undoing a change).
+  /// Returns a copy with [key] reverted to untouched (e.g. the user undoing
+  /// a change).
   MetadataEdit clearTouched(String key) {
     if (!touched.contains(key)) return this;
     return MetadataEdit._(

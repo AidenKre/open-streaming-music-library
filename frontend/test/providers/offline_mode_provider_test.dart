@@ -204,6 +204,71 @@ void main() {
     },
   );
 
+  // U22-FE-LIFECYCLE-A-03: a blocked session (a different server, a 401)
+  // enters offline mode without the health poll, in one call.
+  group('enterOffline(poll: false)', () {
+    (ProviderContainer, OfflineModeNotifier) scope(
+        Future<http.Response> Function() answer, void Function() onRequest) {
+      final api = testApiClient(
+        'http://localhost:8000',
+        MockClient((_) async {
+          onRequest();
+          return answer();
+        }),
+      );
+      final container = ProviderContainer(
+        overrides: [apiClientProvider.overrideWithValue(api)],
+      );
+      addTearDown(container.dispose);
+      return (container, container.read(offlineModeProvider.notifier));
+    }
+
+    Future<http.Response> healthy() async =>
+        http.Response('{"message": "Healthy"}', 200);
+
+    testWidgets('from online: offline, and no health poll runs',
+        (tester) async {
+      var requests = 0;
+      final (container, notifier) = scope(healthy, () => requests++);
+      notifier.enterOffline(poll: false);
+      expect(container.read(offlineModeProvider), isTrue);
+      expect(notifier.isPolling, isFalse);
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(requests, 0);
+      expect(container.read(offlineModeProvider), isTrue);
+    });
+
+    testWidgets('already offline with a poll scheduled: the poll is stopped',
+        (tester) async {
+      var requests = 0;
+      final (container, notifier) = scope(healthy, () => requests++);
+      notifier.enterOffline();
+      expect(notifier.isPolling, isTrue);
+      notifier.enterOffline(poll: false);
+      expect(notifier.isPolling, isFalse);
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(requests, 0, reason: 'the scheduled poll never fires');
+      expect(container.read(offlineModeProvider), isTrue);
+    });
+
+    testWidgets('a poll in flight cannot bring the app back online',
+        (tester) async {
+      final release = Completer<void>();
+      var polls = 0;
+      final (container, notifier) = scope(() async {
+        await release.future;
+        return healthy();
+      }, () => polls++);
+      notifier.enterOffline();
+      await _waitFor(tester, () => polls == 1);
+      notifier.enterOffline(poll: false);
+      release.complete();
+      await tester.pump(); // flush the released poll's continuation
+      expect(container.read(offlineModeProvider), isTrue);
+      expect(notifier.isPolling, isFalse);
+    });
+  });
+
   testWidgets('exitOffline cancels the recovery poll timer', (tester) async {
     var requests = 0;
     final api = testApiClient(

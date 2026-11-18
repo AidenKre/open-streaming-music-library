@@ -75,7 +75,11 @@ final class TrackScope extends LibraryScope {
   String toString() => 'TrackScope(${track.uuidId})';
 }
 
-/// An explicit, ordered list of tracks.
+/// An explicit, ordered list of tracks. Equal by uuid and download state per
+/// position. Damage is deliberately not part of the key: marking a download
+/// damaged clears `isDownloaded`, which already makes a new key. Only the
+/// one-track key ([TrackScope]) keeps a damage term, for the track menu's
+/// damaged-copy actions.
 @immutable
 final class TracksScope extends LibraryScope {
   final List<TrackUI> tracks;

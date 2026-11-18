@@ -226,11 +226,13 @@ class IntegrationsController extends ChangeNotifier
     _ref.invalidate(lastfmServiceProvider);
   }
 
-  /// [tooSoon]: this action's own words for the server's too-soon answer.
+  /// [tooSoon]: this action's own words for the server's too-soon answer;
+  /// [unreachable]: for an unreachable server.
   Future<void> _act(
     bool Function(LastfmPageOffer o) allowed,
     Future<void> Function() run, {
     String? tooSoon,
+    String? unreachable,
   }) async {
     final offer = _view.offer;
     if (_disposed || _busy || offer == null || !allowed(offer)) return;
@@ -246,6 +248,7 @@ class IntegrationsController extends ChangeNotifier
         LastfmProblem.differentServer ||
         LastfmProblem.signedOut => _nothingChangedMessage,
         LastfmProblem.tooSoon when tooSoon != null => tooSoon,
+        LastfmProblem.unreachable when unreachable != null => unreachable,
         _ => _words(problem),
       };
     }
@@ -292,8 +295,15 @@ class IntegrationsController extends ChangeNotifier
   );
 
   @override
-  Future<void> disconnect() =>
-      _act((o) => o.canDisconnect, () async => _service.disconnect());
+  Future<void> disconnect() => _act(
+    (o) => o.canDisconnect,
+    () async => _service.disconnect(),
+    // The owner's words (DEV-9-13, 2026-11-14). Not for a timeout: a
+    // disconnect that timed out may have been applied.
+    unreachable:
+        '${lastfmProblemText(LastfmProblem.unreachable)} '
+        '$_nothingChangedMessage',
+  );
 
   Future<void> _link(Future<bool> Function(LastfmLinks l) open) async {
     if (_disposed) return;

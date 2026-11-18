@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -39,7 +40,9 @@ void openAlbumDetail(BuildContext context, AlbumUI album) {
     MaterialPageRoute<void>(
       builder: (_) => Scaffold(
         appBar: AppBar(title: Text(albumDetailTitle(album))),
-        body: TracksPage(artistId: album.artistId, albumId: album.id),
+        body: TracksPage.album(
+          AlbumScope(artistId: album.artistId, albumId: album.id),
+        ),
       ),
     ),
   );

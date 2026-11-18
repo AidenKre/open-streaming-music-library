@@ -212,7 +212,7 @@ def test_a_crash_after_the_journal_clear_before_the_outcome_converges(
     track live: restart requeues it and the worker of the new boot deletes it."""
     import sqlite3
 
-    from app.services import organizer
+    from app.services import file_ops
     from tests.deletion_recovery_helpers import crash_at
 
     uuid_id = add_master(world, "Portishead/Dummy/01 Mysterons.flac")
@@ -227,7 +227,7 @@ def test_a_crash_after_the_journal_clear_before_the_outcome_converges(
 
             patch.setattr(world.db, "_delete_track_in", failing)
         else:
-            patch.setattr(organizer, "move_file", lambda *a, **k: False)
+            patch.setattr(file_ops, "move_file", lambda *a, **k: False)
         with pytest.raises(SimulatedCrash):
             make_executor(world, seam=crash_at("after_journal_clear")).run_one()
     assert journal(world, uuid_id) is None and item(world, op, uuid_id)["status"] == "running"

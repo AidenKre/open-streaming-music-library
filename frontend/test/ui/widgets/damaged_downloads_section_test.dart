@@ -21,26 +21,17 @@ import 'package:frontend/ui/widgets/damaged_downloads_section.dart';
 
 import '../fake_downloads_controls.dart';
 import '../../helpers/no_server_api.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../../helpers/test_offline.dart';
 
 Future<void> _insertTrack(AppDatabase db, String uuid,
-    {String? damagedFilePath, String? filePath}) async {
+    {String? damagedFilePath, String? filePath, bool untitled = false}) async {
   final dto = ClientTrackDto.fromJson({
     'uuid_id': uuid,
     'created_at': 0,
     'last_updated': 0,
     'revision': 1,
     'metadata': {
-      'title': 'Title $uuid',
+      'title': untitled ? null : 'Title $uuid',
       'artist': 'A',
       'codec': 'aac',
       'duration': 1.0,
@@ -95,7 +86,7 @@ void main() {
         databaseProvider.overrideWithValue(db),
         downloadManagerProvider.overrideWithValue(manager),
         downloadsControlsProvider.overrideWithValue(controls),
-        offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+        offlineModeProvider.overrideWith(() => TestOffline(offline)),
         if (serverCheckFailed)
           streamsUnavailableNowProvider.overrideWithValue(true),
       ],
@@ -151,6 +142,67 @@ void main() {
     expect(controls.calls,
         ['redownloadDamaged a,b', 'redownloadDamaged a', 'deleteDamaged b']);
     await flushDispose(tester);
+  });
+
+  // D5 (owner, 2026-11-17): a re-download that could not be queued is told,
+  // in the out-of-date banner's words; a queued one says nothing (each row
+  // shows its progress).
+  // Coordinator round 2: an internal ID is never shown to a person.
+  testWidgets('a damaged track without a title reads "Unknown track", never '
+      'its ID', (tester) async {
+    const id = '3f2c9a00-0000-4000-8000-000000000001';
+    await _insertTrack(db, id, damagedFilePath: '/dl/x', untitled: true);
+    await tester.pumpWidget(wrap());
+    await settle(tester);
+    expect(find.text('Unknown track'), findsOneWidget);
+    expect(find.textContaining(id), findsNothing);
+    await flushDispose(tester);
+  });
+
+  group('D5: a failed re-download says so', () {
+    Future<void> pumpTwo(WidgetTester tester) async {
+      await _insertTrack(db, 'a', damagedFilePath: '/dl/a');
+      await _insertTrack(db, 'b', damagedFilePath: '/dl/b');
+      await tester.pumpWidget(wrap());
+      await settle(tester);
+    }
+
+    testWidgets('Re-download all, none queued', (tester) async {
+      await pumpTwo(tester);
+      controls.damagedFailures = 2;
+      await tester.tap(find.text('Re-download all'));
+      await tester.pump();
+      expect(find.text("Couldn't queue re-download."), findsOneWidget);
+      await flushDispose(tester);
+    });
+
+    testWidgets('Re-download all, some not queued', (tester) async {
+      await pumpTwo(tester);
+      controls.damagedFailures = 1;
+      await tester.tap(find.text('Re-download all'));
+      await tester.pump();
+      expect(find.text("Couldn't queue re-download for 1 of 2 tracks."),
+          findsOneWidget);
+      await flushDispose(tester);
+    });
+
+    testWidgets("a row's Re-download, not queued", (tester) async {
+      await pumpTwo(tester);
+      controls.damagedFailures = 1;
+      await tester.tap(find.byTooltip('Re-download').first);
+      await tester.pump();
+      expect(find.text("Couldn't queue re-download."), findsOneWidget);
+      await flushDispose(tester);
+    });
+
+    testWidgets('queued: no message', (tester) async {
+      await pumpTwo(tester);
+      await tester.tap(find.text('Re-download all'));
+      await tester.pump();
+      expect(find.byType(SnackBar), findsNothing);
+      expect(controls.calls, ['redownloadDamaged a,b']);
+      await flushDispose(tester);
+    });
   });
 
   testWidgets('review: many damaged rows scroll inside the section; the '

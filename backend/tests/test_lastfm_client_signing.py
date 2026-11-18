@@ -237,25 +237,28 @@ def test_now_playing_refuses_fields_it_does_not_send(track):
 
 
 @pytest.mark.parametrize(
-    "call",
+    "call, expected",
     [
-        lambda c: c.scrobble(planted.SESSION_KEY, [{"artist": "A\ud800", "track": "T", "timestamp": 1}]),
-        lambda c: c.scrobble(planted.SESSION_KEY, [{"artist": "A", "track": "T", "album": "\udcff", "timestamp": 1}]),
-        lambda c: c.update_now_playing(planted.SESSION_KEY, {"artist": "A", "track": "T\ud83d"}),
-        lambda c: c.scrobble("sk\ud800", [{"artist": "A", "track": "T", "timestamp": 1}]),
-        lambda c: c.get_session("tok\udcff"),
+        (lambda c: c.scrobble(planted.SESSION_KEY, [{"artist": "A\ud800", "track": "T", "timestamp": 1}]),
+         RowRefused),
+        (lambda c: c.scrobble(planted.SESSION_KEY, [{"artist": "A", "track": "T", "album": "\udcff", "timestamp": 1}]),
+         RowRefused),
+        (lambda c: c.update_now_playing(planted.SESSION_KEY, {"artist": "A", "track": "T\ud83d"}), ValueError),
+        (lambda c: c.scrobble("sk\ud800", [{"artist": "A", "track": "T", "timestamp": 1}]), ValueError),
+        (lambda c: c.get_session("tok\udcff"), ValueError),
     ],
     ids=["artist", "album", "now playing", "session key", "token"],
 )
-def test_a_value_that_is_not_valid_text_is_refused_without_a_request(call):
+def test_a_value_that_is_not_valid_text_is_refused_without_a_request(call, expected):
     fake = FakeLastfm()
 
     with pytest.raises(ValueError) as caught:
         call(_client(fake))
 
     assert fake.requests == []
-    # never a UnicodeError carrying the value; a scrobble row is refused as RowRefused (9-R1-40)
-    assert type(caught.value) in (ValueError, RowRefused)
+    # never a UnicodeError carrying the value; a scrobble row is refused as RowRefused (9-R1-40),
+    # every other value as a plain ValueError
+    assert type(caught.value) is expected
     assert "\ud800" not in str(caught.value) and "\udcff" not in str(caught.value)
     assert caught.value.__context__ is None and caught.value.__cause__ is None
     planted.assert_no_secret(str(caught.value), "the error message")

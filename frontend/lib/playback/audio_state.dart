@@ -148,8 +148,12 @@ class AudioState {
 
 /// SC-27 lifecycle axis: does the playback runtime accept work?
 /// Independent of the desired transport and the processing state.
-///  * [none]: no live session yet (commands still run as before).
-///  * [active]: the session is ready.
-///  * [stopping]: a quiesce closed admission; admitted work is settling.
-///  * [quiesced]: terminal; the instance is discarded by the scope rebuild.
+///  * [none]: no live session yet; no request is held back.
+///  * [active]: the session is ready; no request is held back.
+///  * [stopping]: a quiesce closed admission (requests are dropped);
+///    admitted work is settling.
+///  * [quiesced]: terminal, admission stays closed; the instance is
+///    discarded by the scope rebuild.
+/// The wait for the session-ready signal (startup restore and
+/// network-backed work) is separate from this axis.
 enum PlaybackLifecycle { none, active, stopping, quiesced }

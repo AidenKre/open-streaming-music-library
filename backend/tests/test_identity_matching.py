@@ -16,15 +16,10 @@ import pytest
 from app.database.database import Database
 from app.services import identity_worker
 from tests.identity_worker_fakes import T0, FakeClock, make_worker
-from tests.identity_worker_fixtures import add_track, identity, make_db, set_identity, sql
+from tests.identity_worker_fixtures import add_track, identity, set_identity, sql
 from tests.owned_database import add_test_user
 
 V1 = "matcher-v1"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

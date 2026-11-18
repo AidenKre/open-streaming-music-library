@@ -16,16 +16,7 @@ import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/feature_providers.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../helpers/test_offline.dart';
 
 const _blob = {
   'entities': {},
@@ -46,7 +37,7 @@ ProviderContainer _container({
   );
   final c = ProviderContainer(overrides: [
     apiClientProvider.overrideWithValue(api),
-    offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+    offlineModeProvider.overrideWith(() => TestOffline(offline)),
   ]);
   addTearDown(c.dispose);
   return c;

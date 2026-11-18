@@ -1,16 +1,16 @@
-import 'dart:async';
 import 'dart:math' show min;
 
 import 'package:drift/drift.dart';
 import 'package:flutter/foundation.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/collection_ref.dart';
-import 'package:frontend/models/library_scope.dart';
+import 'package:frontend/models/history_event.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
+import 'package:frontend/repositories/table_watch.dart';
 
 /// The entity kinds a recent can be. Any other `entity_type` in history is
 /// kept in history but never surfaces as a recent.
@@ -49,24 +49,16 @@ final class RecentRef {
 }
 
 /// A recent hydrated for display. [entity] is the track, album or artist
-/// read model (`TrackUI` / `AlbumUI` / `ArtistUI`); [scope] is the matching
-/// `TrackScope` / `AlbumScope` / `ArtistScope`. [downloaded] of [total]
-/// member tracks have a usable download (a track counts as 1 of 1).
+/// read model (`TrackUI` / `AlbumUI` / `ArtistUI`).
 @immutable
 final class ResolvedRecent {
   const ResolvedRecent({
     required this.ref,
     required this.entity,
-    required this.scope,
-    required this.downloaded,
-    required this.total,
   });
 
   final RecentRef ref;
   final Object entity;
-  final LibraryScope scope;
-  final int downloaded;
-  final int total;
 }
 
 class RecentlyPlayedRepository {
@@ -220,12 +212,6 @@ class RecentlyPlayedRepository {
             artistIds,
             downloadedArtOnly: downloadedOnly,
           );
-    final albumCounts = albumIds.isEmpty
-        ? const <int, ({int total, int downloaded})>{}
-        : await _db.getAlbumDownloadCounts(albumIds);
-    final artistCounts = artistIds.isEmpty
-        ? const <int, ({int total, int downloaded})>{}
-        : await _db.getArtistDownloadCounts(artistIds);
 
     final trackByUuid = {for (final t in tracks) t.uuidId: t};
     final albumById = {for (final a in albums) a.id: a};
@@ -237,44 +223,17 @@ class RecentlyPlayedRepository {
         case RecentEntityType.track:
           final t = trackByUuid[r.ref];
           if (t == null) continue;
-          out.add(
-            ResolvedRecent(
-              ref: r,
-              entity: t,
-              scope: TrackScope(t),
-              downloaded: t.isDownloaded ? 1 : 0,
-              total: 1,
-            ),
-          );
+          out.add(ResolvedRecent(ref: r, entity: t));
         case RecentEntityType.album:
           final id = collectionIds[r];
           final a = id == null ? null : albumById[id];
           if (a == null) continue;
-          // No counts entry = no member tracks: a real zero.
-          final c = albumCounts[a.id];
-          out.add(
-            ResolvedRecent(
-              ref: r,
-              entity: a,
-              scope: AlbumScope(artistId: a.artistId, albumId: a.id),
-              downloaded: c?.downloaded ?? 0,
-              total: c?.total ?? 0,
-            ),
-          );
+          out.add(ResolvedRecent(ref: r, entity: a));
         case RecentEntityType.artist:
           final id = collectionIds[r];
           final a = id == null ? null : artistById[id];
           if (a == null) continue;
-          final c = artistCounts[a.id];
-          out.add(
-            ResolvedRecent(
-              ref: r,
-              entity: a,
-              scope: ArtistScope(artistId: a.id),
-              downloaded: c?.downloaded ?? 0,
-              total: c?.total ?? 0,
-            ),
-          );
+          out.add(ResolvedRecent(ref: r, entity: a));
       }
     }
     return out;
@@ -293,7 +252,7 @@ class RecentlyPlayedRepository {
     bool downloadedOnly = false,
   }) {
     var live = refs.toList();
-    return _watch(() async {
+    return watchTables(_db, _readsFrom, () async {
       final binding = await ServerBindingRepository(_db).current();
       final eligible = await _eligibleAmong(live, downloadedOnly);
       final resolved = await _resolve(
@@ -359,68 +318,17 @@ class RecentlyPlayedRepository {
     int limit = 20,
     bool downloadedOnly = false,
   }) {
-    return _watch(() => _read(limit: limit, downloadedOnly: downloadedOnly));
-  }
-
-  /// The single-flight stream behind [watchRecent] and [watchResolved]: runs
-  /// [read] in one transaction on listen and whenever a table in [_readsFrom]
-  /// changes.
-  Stream<List<ResolvedRecent>> _watch(
-    Future<List<ResolvedRecent>> Function() readOnce,
-  ) {
-    late final StreamController<List<ResolvedRecent>> controller;
-    StreamSubscription<Set<TableUpdate>>? updates;
-    var cancelled = false;
-    var dirty = false;
-    var reading = false;
-
-    Future<void> read() async {
-      reading = true;
-      dirty = false;
-      try {
-        final result = await _db.transaction(readOnce);
-        if (!cancelled) controller.add(result);
-      } catch (e, st) {
-        if (!cancelled) controller.addError(e, st);
-      } finally {
-        reading = false;
-      }
-      if (dirty && !cancelled && !controller.isPaused) unawaited(read());
-    }
-
-    void markDirty() {
-      dirty = true;
-      if (!reading && !cancelled && !controller.isPaused) unawaited(read());
-    }
-
-    controller = StreamController<List<ResolvedRecent>>(
-      onListen: () {
-        updates = _db
-            .tableUpdates(TableUpdateQuery.onAllTables(_readsFrom))
-            .listen(
-              (_) => markDirty(),
-              onError: (Object e, StackTrace st) {
-                if (!cancelled) controller.addError(e, st);
-              },
-            );
-        markDirty();
-      },
-      onResume: () {
-        if (dirty && !reading && !cancelled) unawaited(read());
-      },
-      onCancel: () async {
-        cancelled = true;
-        await updates?.cancel();
-        updates = null;
-      },
+    return watchTables(
+      _db,
+      _readsFrom,
+      () => _read(limit: limit, downloadedOnly: downloadedOnly),
     );
-    return controller.stream;
   }
 }
 
 /// The history event kind recents are built from (the eligibility query and
 /// the See all freshness scope both use it).
-const recentsEventKind = 'clicked';
+const recentsEventKind = HistoryKind.clicked;
 
 /// Phase 6 §6: the deduped, eligible recents query. Dedupe ranks clicked
 /// events per `(entity_type, entity_ref)` after the optional snapshot

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -60,6 +62,74 @@ void main() {
       expect(find.text("Couldn't sync your library."), findsOneWidget);
       await t.tap(find.widgetWithText(TextButton, 'Retry'));
       expect(session.calls, ['retrySync']);
+      await teardownTree(t);
+    });
+
+    // Other-issues decision 3 (a): the decided text; Reset… in place of
+    // Retry opens the existing "Reset and disconnect?" sheet. The app never
+    // resets on its own: declining changes nothing.
+    testWidgets('$name: a restored server shows its text and Reset…, which '
+        'opens the reset sheet; Cancel changes nothing', (t) async {
+      session.lossSummaries = const ['2 unsent history events'];
+      await pump(t, LibrarySyncStatus.serverRestored);
+      expect(
+        find.text("The server's library looks restored from an older "
+            "backup. This device can't sync with it until it is reset."),
+        findsOneWidget,
+      );
+      expect(find.text("Couldn't sync your library."), findsNothing);
+      expect(find.widgetWithText(TextButton, 'Retry'), findsNothing);
+      await t.tap(find.widgetWithText(TextButton, 'Reset…'));
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
+      expect(find.text('Reset and disconnect?'), findsOneWidget);
+      expect(find.textContaining('2 unsent history events'), findsOneWidget);
+      await t.tap(find.text('Cancel'));
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
+      expect(find.text('Reset and disconnect?'), findsNothing);
+      expect(session.calls, isEmpty);
+      await teardownTree(t);
+    });
+
+    testWidgets('$name: a restored server: confirming the sheet disconnects',
+        (t) async {
+      await pump(t, LibrarySyncStatus.serverRestored);
+      await t.tap(find.widgetWithText(TextButton, 'Reset…'));
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
+      await t.tap(find.widgetWithText(FilledButton, 'Reset and disconnect'));
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
+      expect(session.calls, ['disconnect']);
+      await teardownTree(t);
+    });
+
+    // Pre-merge review D4-06: a double tap on Reset… opens one sheet.
+    testWidgets('$name: a double tap on Reset… opens one sheet', (t) async {
+      session.lossSummariesGate = Completer<List<String>>();
+      await pump(t, LibrarySyncStatus.serverRestored);
+      await t.tap(find.widgetWithText(TextButton, 'Reset…'));
+      await t.pump();
+      await t.tap(find.widgetWithText(TextButton, 'Reset…'));
+      await t.pump();
+      session.lossSummariesGate!.complete(const []);
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
+      expect(find.text('Reset and disconnect?'), findsOneWidget);
+      await t.tap(find.text('Cancel'));
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
+      expect(find.text('Reset and disconnect?'), findsNothing);
+      // Usable again once the sheet closed.
+      session.lossSummariesGate = null;
+      await t.tap(find.widgetWithText(TextButton, 'Reset…'));
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
+      expect(find.text('Reset and disconnect?'), findsOneWidget);
+      await t.tap(find.text('Cancel'));
+      await t.pump();
+      await t.pump(const Duration(milliseconds: 400));
       await teardownTree(t);
     });
 

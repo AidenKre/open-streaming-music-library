@@ -3,24 +3,13 @@ explicit allow-list of owned ``Database`` methods, and ``current_library``
 returns the master admin's ``Library`` until M.1 adds a principal."""
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 
-from app.database import ANY_OWNER, Database, DatabaseContext
+from app.database import ANY_OWNER, Database
 from app.library import Library, current_library
 from app.models import Track, TrackMetaData
-from tests.owned_database import OwnedTestDatabase, add_test_user
-from tests.schema_fixtures import INIT_SQL
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
+from tests.owned_database import add_test_user
 
 
 def _track(title="Airbag"):

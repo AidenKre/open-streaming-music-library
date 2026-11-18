@@ -117,6 +117,46 @@ class LocalCoverArtStore implements LocalResettable {
     }
   }
 
+  /// Per cover id: the tail of the lookups and removals queued on it.
+  final Map<int, Future<void>> _idTails = {};
+
+  /// Runs [body] after every earlier lookup or removal of [coverArtId].
+  Future<T> _serialized<T>(int coverArtId, Future<T> Function() body) {
+    final release = Completer<void>();
+    final previous = _idTails[coverArtId] ?? Future<void>.value();
+    final mine = release.future;
+    _idTails[coverArtId] = mine;
+    return previous.then((_) async {
+      try {
+        return await body();
+      } finally {
+        release.complete();
+        if (identical(_idTails[coverArtId], mine)) _idTails.remove(coverArtId);
+      }
+    });
+  }
+
+  /// Whether the cover is stored, answered only after a removal of it that
+  /// is under way has finished (see [removeIfUnused]).
+  Future<bool> holds(int coverArtId) =>
+      _serialized(coverArtId, () async => has(coverArtId));
+
+  /// Deletes the stored cover unless [inUse] says something still uses it.
+  /// The question and the delete run as one step against [holds]: a
+  /// download committed meanwhile either counts as a use or, asking after
+  /// the delete, fetches the cover again. True when a file was deleted.
+  Future<bool> removeIfUnused(
+    int coverArtId,
+    Future<bool> Function() inUse,
+  ) =>
+      _serialized(coverArtId, () async {
+        if (await inUse()) return false;
+        final f = fileFor(coverArtId);
+        if (!await f.exists()) return false;
+        await f.delete();
+        return true;
+      });
+
   Future<void> clear() async {
     if (!await _directory.exists()) return;
     await for (final entity in _directory.list()) {

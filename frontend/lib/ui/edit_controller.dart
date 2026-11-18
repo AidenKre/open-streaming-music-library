@@ -1,7 +1,10 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/database/database.dart';
 import 'package:frontend/models/metadata_edit.dart';
+import 'package:frontend/models/pending_edit_display.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
 
 /// Whether a submitted edit is syncing now or will when back online.
@@ -89,4 +92,56 @@ class EditController implements EditControls {
   @override
   Future<void> dismissRejected(String uuidId) =>
       _outbox.dismissRejected(uuidId);
+}
+
+/// One conflicted or rejected edit as the pending-edits sheet shows it.
+class EditIssue {
+  const EditIssue({
+    required this.uuidId,
+    required this.trackName,
+    this.rejectionReason,
+  });
+
+  /// For the sheet's actions only; never shown to a person.
+  final String uuidId;
+
+  /// The name a person reads ([editTrackName]).
+  final String trackName;
+
+  final String? rejectionReason;
+}
+
+/// Conflicted edits for the resolution sheet, each named for a person.
+final conflictedEditIssuesProvider = FutureProvider<List<EditIssue>>(
+  (ref) async => _issuesFor(ref, await ref.watch(conflictedEditsProvider.future)),
+);
+
+/// Rejected edits for the banner sheet, each named for a person.
+final rejectedEditIssuesProvider = FutureProvider<List<EditIssue>>(
+  (ref) async => _issuesFor(ref, await ref.watch(rejectedEditsProvider.future)),
+);
+
+Future<List<EditIssue>> _issuesFor(Ref ref, List<PendingEdit> rows) async {
+  if (rows.isEmpty) return const [];
+  // The names are a courtesy; the rows are the only way to resolve an edit.
+  // A failed track read names them as for a track not on this device (the
+  // edit's original values, else "Unknown track") and never empties the list.
+  var tracks = const <TrackUI>[];
+  try {
+    tracks = await ref
+        .read(browseRepositoryProvider)
+        .getTracksByUuids([for (final row in rows) row.uuidId]);
+  } catch (_) {}
+  final byUuid = {for (final track in tracks) track.uuidId: track};
+  return [
+    for (final row in rows)
+      EditIssue(
+        uuidId: row.uuidId,
+        trackName: editTrackName(
+          track: byUuid[row.uuidId],
+          originalValuesJson: row.originalValuesJson,
+        ),
+        rejectionReason: row.rejectionReason,
+      ),
+  ];
 }

@@ -9,7 +9,9 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/repositories/history_snapshot.dart';
+import 'package:frontend/repositories/recents_snapshot_pager.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/new_activity_notice.dart';
@@ -19,6 +21,7 @@ import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 
+import '../../helpers/fake_recents_pager.dart';
 import '../browse_harness.dart';
 import '../fake_see_all_recents_controls.dart';
 
@@ -326,6 +329,63 @@ void main() {
     await teardownTree(tester);
   });
 
+  // U28-B-10: the same rule through the real controller, whose Refresh first
+  // empties the rows (a spinner) and then loads the new snapshot.
+  testWidgets('a new snapshot starts at the top, through the real '
+      'controller', (tester) async {
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final pager = FakePager();
+    final freshness = FakeFreshness();
+    pager.freshness = freshness;
+    await tester.pumpWidget(
+      harness.wrap(
+        Navigator(
+          onGenerateRoute: (_) => MaterialPageRoute<void>(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: TextButton(
+                  onPressed: () =>
+                      openSeeAllRecents(context, initialDownloaded: false),
+                  child: const Text('open'),
+                ),
+              ),
+            ),
+          ),
+        ),
+        overrides: [
+          recentsSnapshotPagerProvider.overrideWithValue(pager),
+          snapshotFreshnessProvider.overrideWithValue(freshness),
+        ],
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    Future<void> load(int i, String prefix) async {
+      pager.captures[i].done.complete(pager.tokenFor(pager.captures[i]));
+      await tester.pump();
+      pager.pages[i].done
+          .complete(pageOf([for (var n = 0; n < 30; n++) '$prefix$n']));
+      await tester.pumpAndSettle();
+    }
+
+    await load(0, 't');
+    expect(_card('track:t0'), findsOneWidget);
+    await tester.drag(find.byType(Scrollable).last, const Offset(0, -1500));
+    await tester.pumpAndSettle();
+    expect(_card('track:t0'), findsNothing);
+
+    await tester.tap(_refresh);
+    await tester.pump();
+    expect(pager.captures, hasLength(2));
+    await load(1, 'n');
+    expect(tester.getTopLeft(_card('track:n0')).dy, lessThan(400));
+    await teardownTree(tester);
+  });
+
   testWidgets('a live update keeps the scroll position', (tester) async {
     await pumpSeeAll(tester, size: const Size(400, 800));
     fake.show(entities: _tracks(30));
@@ -347,6 +407,24 @@ void main() {
       await tester.tap(_card('track:t0'));
       await tester.pump();
       expect(fake.played, ['t0']);
+      await teardownTree(tester);
+    });
+
+    // Owner decision 5 (2026-11-17), APP-OTHER-1 D5: a track tap whose
+    // playback does not start shows the playback message as a notice.
+    testWidgets('a track tap that does not start playback says so', (
+      tester,
+    ) async {
+      await pumpSeeAll(tester);
+      fake.playOutcome = Failed(StateError('x'));
+      fake.show(entities: _tracks(1));
+      await tester.pump();
+      expect(find.text("Couldn't start playback."), findsNothing);
+      await tester.tap(_card('track:t0'));
+      await tester.pump();
+      await tester.pump();
+      expect(fake.played, ['t0']);
+      expect(find.text("Couldn't start playback."), findsOneWidget);
       await teardownTree(tester);
     });
 

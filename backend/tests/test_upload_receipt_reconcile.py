@@ -273,17 +273,21 @@ def test_a_received_files_quota_row_stays_while_its_item_holds_the_source(world)
 
 def test_a_quota_row_whose_item_no_longer_holds_its_source_is_released(world):
     # 7A.2c review r1 R10: a cancelled item's row goes only once its file is gone.
+    # The reconcile alone: a whole start also runs the janitor, which removes the
+    # expired item's file and releases its row itself.
     _staged(world, 0, state="cancelled", source=False)
     _staged(world, 1, state="validating", source=False)  # the file is gone
-    _staged(world, 2, state="expired")
+    _staged(world, 2, state="expired")  # ended, but its file is still there
     sql(world, "INSERT INTO storage_reservations (owner_id, purpose, subject_ref, bytes, lease_boot_id, "
                "created_at) VALUES (?, 'upload_source', ?, 5, NULL, 1)", (world.owner, uid(77)))
     _staged(world, 3, state="validating")
 
-    with world.start():
-        pass
+    reconcile(world)
 
-    assert reservations(world) == [("upload_source", world.items[3], len(CONTENTS[3]), None)]
+    assert reservations(world) == [
+        ("upload_source", world.items[2], len(CONTENTS[2]), None),
+        ("upload_source", world.items[3], len(CONTENTS[3]), None),
+    ]
 
 
 def test_a_recorded_path_outside_the_uploads_tree_is_never_touched(world, tmp_path):
@@ -374,6 +378,7 @@ def _writable(folder):
     folder.chmod(stat.S_IRWXU)
 
 
+@pytest.mark.requires_chmod_denial
 def test_r1_1_a_leftover_that_cannot_be_removed_stays_recorded_for_the_next_start(world):
     part = died_while_receiving(world, 3, part=b"four", reservation=False)
     sql(world, "UPDATE upload_items SET state = 'cancelled', cancel_requested = 1 WHERE item_uuid = ?",
@@ -393,6 +398,7 @@ def test_r1_1_a_leftover_that_cannot_be_removed_stays_recorded_for_the_next_star
     assert item(world, 3)["part_path"] is None and not part.exists()
 
 
+@pytest.mark.requires_chmod_denial
 def test_r1_1_a_dead_partial_that_cannot_be_removed_fails_the_item_and_stays_recorded(world):
     part = died_while_receiving(world, 1, part=CONTENTS[1][:5])
     folder = item_dir(world, world.items[1])
@@ -413,6 +419,7 @@ def test_r1_1_a_dead_partial_that_cannot_be_removed_fails_the_item_and_stays_rec
     assert item(world, 1)["part_path"] is None and not part.exists()
 
 
+@pytest.mark.requires_chmod_denial
 def test_r1_5_an_unreadable_source_is_not_trusted_and_does_not_stall_the_row(world):
     died_while_receiving(world, 0, part=None, source=CONTENTS[0])
     source = item_dir(world, world.items[0]) / "source"
@@ -427,3 +434,43 @@ def test_r1_5_an_unreadable_source_is_not_trusted_and_does_not_stall_the_row(wor
     )
     assert not source.exists()
     assert reservations(world) == []
+
+
+# ── the reconcile alone (no other start-up step runs) ───────────────────────
+
+def reconcile(server):
+    """``reconcile_upload_receipts`` by itself, as a new boot's first start-up
+    step runs it: the janitor and the reservation reconcile do not run."""
+    from app.database import Database, DatabaseContext
+    from app.services.upload_receipt import reconcile_upload_receipts
+    from tests.schema_fixtures import INIT_SQL
+
+    database = Database(DatabaseContext(database_path=Path(server.db_path), init_sql_path=INIT_SQL))
+    return reconcile_upload_receipts(database, server.root, boot_id="boot-of-this-start")
+
+
+def test_a_dead_transfers_source_that_cannot_be_removed_keeps_the_item_and_its_quota_row(world, monkeypatch):
+    """The part goes, but the fixed-name source, which is not the allocated
+    bytes, cannot be removed: the item is not returned to ``allocated``; it
+    fails with its part path kept, and its ``upload_receive`` row stays."""
+    from app.services.upload_receipt import ReceiptFiles
+
+    part = died_while_receiving(world, 2, part=b"xy", source=b"not the allocated bytes")
+    source = item_dir(world, world.items[2]) / "source"
+    real = ReceiptFiles.remove
+
+    def refuse_source(self, path):
+        if Path(path) == source:
+            raise PermissionError("busy")
+        return real(self, path)
+
+    monkeypatch.setattr(ReceiptFiles, "remove", refuse_source)
+
+    reconcile(world)
+
+    row = item(world, 2)
+    assert (row["state"], row["error_code"], row["part_path"]) == (
+        "failed", "upload_cleanup_failed", str(part),
+    )
+    assert not part.exists() and source.exists()
+    assert reservations(world) == [("upload_receive", world.items[2], len(CONTENTS[2]), DEAD)]

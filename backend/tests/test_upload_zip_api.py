@@ -9,9 +9,10 @@ import zipfile
 import pytest
 
 from app.services import upload_errors
-from app.services.upload_validation import ValidationFailed
+from app.services.upload_validation import ValidationFailed, probe_upload
 from tests.identity_worker_fixtures import make_db, sql
 from tests.test_uploads_api import allocate, batch, item
+from tests.tool_call_capture import tool_call
 from tests.upload_validation_fixtures import FakeProbe, detected, item_row, make_worker, stage_item
 from tests.upload_zip_fixtures import (
     Entry, children_of, files_under, make_expander, stage_zip, tiny_limits, zip_worker,
@@ -24,7 +25,7 @@ class ContentProbe(FakeProbe):
     """Per-file probe stand-in: content starting with b"BAD" is invalid audio."""
 
     def __call__(self, path, **kwargs):
-        self.calls.append({"path": path, **kwargs})
+        self.calls.append({**tool_call(probe_upload, path, **kwargs), "path": path})
         if open(path, "rb").read(3) == b"BAD":
             raise ValidationFailed(upload_errors.upload_invalid_audio())
         return detected()

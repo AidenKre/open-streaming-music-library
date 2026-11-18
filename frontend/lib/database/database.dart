@@ -2,520 +2,25 @@ import 'dart:io';
 
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
+import 'package:drift/isolate.dart' show DriftRemoteException;
+import 'package:flutter/foundation.dart' show protected;
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
-import 'database.steps.dart';
-
+part 'autocomplete_queries.dart';
+part 'browse_queries.dart';
 part 'database.g.dart';
-
-// ── Table definitions ──────────────────────────────────────────────────
-
-@TableIndex(name: 'idx_artists_name_lower', columns: {#nameLower})
-class Artists extends Table {
-  IntColumn get id => integer()();
-  TextColumn get name => text()();
-  TextColumn get nameLower =>
-      text().unique().generatedAs(name.lower(), stored: true)();
-
-  @override
-  Set<Column> get primaryKey => {id};
-}
-
-@TableIndex(name: 'idx_albums_name_lower', columns: {#nameLower})
-@TableIndex(name: 'idx_albums_artist_id', columns: {#artistId})
-@TableIndex.sql(
-  'CREATE UNIQUE INDEX idx_albums_regular '
-  'ON albums (name_lower, artist_id) WHERE is_single_grouping = 0',
-)
-@TableIndex.sql(
-  'CREATE UNIQUE INDEX idx_albums_singles '
-  'ON albums (artist_id, COALESCE(year, -1)) WHERE is_single_grouping = 1',
-)
-class Albums extends Table {
-  IntColumn get id => integer()();
-  TextColumn get name => text().nullable()();
-  TextColumn get nameLower =>
-      text().nullable().generatedAs(name.lower(), stored: true)();
-  IntColumn get artistId => integer().references(Artists, #id)();
-  IntColumn get year => integer().nullable()();
-  BoolColumn get isSingleGrouping =>
-      boolean().withDefault(const Constant(false))();
-
-  @override
-  Set<Column> get primaryKey => {id};
-}
-
-class Tracks extends Table {
-  TextColumn get uuidId => text()();
-  TextColumn get filePath => text().nullable()();
-  IntColumn get createdAt => integer()();
-  IntColumn get lastUpdated => integer()();
-  // Monotonic per-track revision from the server, written on every `/changes`
-  // upsert. The conflict-detection base for edits (Option A). Nullable only
-  // for migration: rows that predate this column read NULL = "unknown base"
-  // until their next upsert. The server never sends null.
-  IntColumn get revision => integer().nullable()();
-  // Bitrate of the file actually stored on disk. Null until a download
-  // completes. May differ from trackmetadata.bitrate_kbps when downloaded at
-  // a lower quality than the server source (e.g. 128 kbps download from a
-  // 320 kbps source) or when bitrate passthrough serves the original.
-  IntColumn get downloadedBitrateKbps => integer().nullable()();
-  IntColumn get fileSizeBytes => integer().nullable()();
-  // The quality preset the user/server selected for this download (e.g.
-  // 'original', '320'). Independent of `downloadedBitrateKbps`, which is the
-  // bitrate actually written to disk. Storing both lets us answer
-  // "is the file at the requested quality?" idempotently even when the
-  // backend served a passthrough that didn't match the requested bitrate.
-  TextColumn get downloadedQuality => text().nullable()();
-  // The server revision the downloaded bytes are current as of. Compared
-  // against the live `revision` to detect a stale download (the track changed
-  // server-side since -- audio, tags or artwork -- but the local file is
-  // untouched). Stamped from the stream response's `X-Track-Revision` header;
-  // older servers don't send it, so the fallback is the local revision read
-  // BEFORE the request (erring early: a harmless false-positive stale beats
-  // recording an old-master file as fresh forever), and 0 when even that is
-  // unknown so any later revision flags it. Null only for files downloaded
-  // before this column existed (never flagged -- nothing to compare to).
-  // Advanced in step with the user's OWN successful edits (see
-  // [AppDatabase.recordOwnEditRevision]): the app shows metadata from this DB,
-  // not the file's tags, so a self-edit doesn't make the copy outdated.
-  IntColumn get downloadedAtRevision => integer().nullable()();
-  // The codec actually written to disk. Read off the stream response's
-  // `X-Audio-Codec` header (the server passes the source through unchanged
-  // when its bitrate is already <= the requested preset, so a non-original
-  // download is NOT always AAC). See `TrackDownloader.resolveDownloadedCodec`
-  // for the fallback used against servers that don't send it.
-  TextColumn get downloadedCodec => text().nullable()();
-  // Re-arms (not a bool) when `revision` climbs again after a dismiss, so a
-  // SECOND server-side change re-surfaces the stale warning even if the
-  // first one was dismissed.
-  IntColumn get staleDismissedAtRevision => integer().nullable()();
-  // The download at this path failed to play although the device can play
-  // audio (damaged; Phase 5 decision 6, marked only with evidence). It is the
-  // path in `file_path`, which is kept with the other download columns, so a
-  // re-download knows the original quality and Delete knows the file. Every
-  // "usable download" rule ([usableDownloadPredicate]) excludes it: online
-  // the track streams, offline it is skipped. The file is never deleted
-  // automatically; a re-download or the user's Delete removes it. Null = not
-  // damaged. (A store from before the 2026-11-09 change may hold a damaged
-  // path with `file_path` cleared; cleanup reads both columns.)
-  TextColumn get damagedFilePath => text().nullable()();
-
-  @override
-  Set<Column> get primaryKey => {uuidId};
-}
-
-@TableIndex(name: 'idx_title', columns: {#title})
-@TableIndex(name: 'idx_artist', columns: {#artist})
-@TableIndex(name: 'idx_album', columns: {#album})
-@TableIndex(name: 'idx_album_artist', columns: {#albumArtist})
-@TableIndex(name: 'idx_tm_artist_id', columns: {#artistId})
-@TableIndex(name: 'idx_tm_album_id', columns: {#albumId})
-@TableIndex(name: 'idx_year', columns: {#year})
-@TableIndex(name: 'idx_date', columns: {#date})
-@TableIndex(name: 'idx_genre', columns: {#genre})
-// NOCASE companion to idx_genre (which is BINARY) so the autocomplete prefix
-// scan `genre LIKE ?` stays index-backed and case-insensitive.
-@TableIndex.sql(
-  'CREATE INDEX idx_genre_nocase ON trackmetadata (genre COLLATE NOCASE)',
-)
-@TableIndex(name: 'idx_track_number', columns: {#trackNumber})
-@TableIndex(name: 'idx_disc_number', columns: {#discNumber})
-@TableIndex(name: 'idx_codec', columns: {#codec})
-@TableIndex(name: 'idx_duration', columns: {#duration})
-@TableIndex(name: 'idx_bitrate_kbps', columns: {#bitrateKbps})
-@TableIndex(name: 'idx_sample_rate_hz', columns: {#sampleRateHz})
-@TableIndex(name: 'idx_channels', columns: {#channels})
-@TableIndex(name: 'idx_has_album_art', columns: {#hasAlbumArt})
-@TableIndex.sql(
-  'CREATE INDEX idx_tm_library_queue_order '
-  'ON trackmetadata (artist, album, disc_number, track_number, uuid_id)',
-)
-@TableIndex.sql(
-  'CREATE INDEX idx_tm_artist_queue_order '
-  'ON trackmetadata (artist_id, album, disc_number, track_number, uuid_id)',
-)
-@TableIndex.sql(
-  'CREATE INDEX idx_tm_album_queue_order '
-  'ON trackmetadata (artist_id, album_id, disc_number, track_number, uuid_id)',
-)
-class Trackmetadata extends Table {
-  TextColumn get uuidId => text().references(Tracks, #uuidId)();
-  TextColumn get title => text().nullable()();
-  TextColumn get artist => text().nullable()();
-  TextColumn get album => text().nullable()();
-  TextColumn get albumArtist => text().nullable()();
-  IntColumn get artistId => integer().nullable().references(Artists, #id)();
-  IntColumn get albumId => integer().nullable().references(Albums, #id)();
-  IntColumn get year => integer().nullable()();
-  TextColumn get date => text().nullable()();
-  TextColumn get genre => text().nullable()();
-  IntColumn get trackNumber => integer().nullable()();
-  IntColumn get discNumber => integer().nullable()();
-  TextColumn get codec => text().nullable()();
-  // Audio properties: null = unknown (the server couldn't determine it); 0
-  // is a real value, never a stand-in for unknown (SC-16l).
-  RealColumn get duration => real().nullable()();
-  RealColumn get bitrateKbps => real().nullable()();
-  IntColumn get sampleRateHz => integer().nullable()();
-  IntColumn get channels => integer().nullable()();
-  BoolColumn get hasAlbumArt => boolean().withDefault(const Constant(false))();
-  IntColumn get coverArtId => integer().nullable()();
-
-  @override
-  Set<Column> get primaryKey => {uuidId};
-}
-
-class QueueSessions extends Table {
-  IntColumn get id => integer().autoIncrement()();
-  BoolColumn get isActive => boolean().withDefault(const Constant(false))();
-  IntColumn get createdAt => integer()();
-  IntColumn get updatedAt => integer()();
-  TextColumn get sourceType => text()(); // library|artist|album|search|single
-  IntColumn get sourceArtistId => integer().nullable()();
-  IntColumn get sourceAlbumId => integer().nullable()();
-  IntColumn get currentItemId => integer().nullable()();
-  IntColumn get resumeMainItemId => integer().nullable()();
-  IntColumn get currentPositionMs => integer().withDefault(const Constant(0))();
-  TextColumn get repeatMode => text().withDefault(const Constant('off'))();
-  BoolColumn get shuffleEnabled =>
-      boolean().withDefault(const Constant(false))();
-}
-
-@TableIndex(
-  name: 'idx_queue_session_items_session_position',
-  columns: {#sessionId, #queueType, #position},
-)
-@TableIndex(
-  name: 'idx_queue_session_items_session_uuid',
-  columns: {#sessionId, #uuidId},
-)
-class QueueSessionItems extends Table {
-  IntColumn get itemId => integer().autoIncrement()();
-  IntColumn get sessionId =>
-      integer().references(QueueSessions, #id, onDelete: KeyAction.cascade)();
-  TextColumn get queueType => text().withDefault(const Constant('main'))();
-  IntColumn get position => integer()();
-  TextColumn get uuidId => text().references(Tracks, #uuidId)();
-
-  @override
-  List<String> get customConstraints => const [
-    'UNIQUE(session_id, queue_type, position)',
-  ];
-}
-
-@TableIndex(
-  name: 'idx_queue_session_play_order_session_position',
-  columns: {#sessionId, #playPosition},
-)
-@TableIndex(
-  name: 'idx_queue_session_play_order_session_item',
-  columns: {#sessionId, #itemId},
-)
-class QueueSessionPlayOrder extends Table {
-  IntColumn get sessionId =>
-      integer().references(QueueSessions, #id, onDelete: KeyAction.cascade)();
-  IntColumn get playPosition => integer()();
-  IntColumn get itemId => integer().references(
-    QueueSessionItems,
-    #itemId,
-    onDelete: KeyAction.cascade,
-  )();
-
-  @override
-  Set<Column> get primaryKey => {sessionId, playPosition};
-
-  @override
-  List<String> get customConstraints => const ['UNIQUE(session_id, item_id)'];
-}
-
-/// Outbox of unflushed track metadata edits, one coalesced row per track.
-class PendingEdits extends Table {
-  TextColumn get uuidId => text()();
-
-  /// The coalesced value-map as JSON: keys present = touched, a `null` value =
-  /// an explicit clear (so "cleared" is distinct from "untouched").
-  TextColumn get valuesJson => text()();
-
-  /// `db_only` or `db_and_master` — monotonically escalates, never downgrades.
-  TextColumn get writeMode => text()();
-
-  /// The track revision captured at the first edit of this batch (Option A
-  /// base). Nullable = "unknown base" → forces the conflict path on flush.
-  IntColumn get baseRevision => integer().nullable()();
-
-  /// `pending` (awaiting flush), `conflicted` (server returned 409), or
-  /// `take_server` (resolution chosen; the authoritative single-track refetch
-  /// hasn't succeeded yet — retried after each sync).
-  TextColumn get status => text().withDefault(const Constant('pending'))();
-
-  /// The server's current revision, recorded on a 409 so a "keep mine"
-  /// resolution can rebase onto it.
-  IntColumn get serverRevision => integer().nullable()();
-
-  /// Snapshot of the track's editable columns captured at the first edit of the
-  /// batch (JSON). Lets "take server"/discard revert the optimistic local write
-  /// without a network round-trip.
-  TextColumn get originalValuesJson => text().nullable()();
-
-  /// Short human-readable reason recorded when a flush is permanently rejected
-  /// (422 / track gone), surfaced in the pending-edits banner until dismissed.
-  TextColumn get rejectionReason => text().nullable()();
-
-  IntColumn get updatedAt => integer()();
-
-  @override
-  Set<Column> get primaryKey => {uuidId};
-}
-
-/// The server this database's catalog belongs to (SC-01). Holds exactly one
-/// row whenever a session URL exists; [id] is pinned to 1 so a second row
-/// can never be inserted.
-class ServerBinding extends Table {
-  // drift_dev reads the CHECK statically; the getter is never invoked.
-  IntColumn get id =>
-      // ignore: recursive_getters
-      integer().withDefault(const Constant(1)).check(id.equals(1))();
-
-  /// The server's persistent instance id. Null = provisional/legacy binding
-  /// (not yet learned from `/app/info`).
-  TextColumn get instanceId => text().nullable()();
-
-  /// Random UUID minted when the row is created.
-  TextColumn get localBindingId => text()();
-  TextColumn get lastBaseUrl => text()();
-
-  /// UTC milliseconds since epoch.
-  IntColumn get boundAt => integer()();
-  BoolColumn get catalogReconciledAtBinding =>
-      boolean().withDefault(const Constant(false))();
-
-  /// The bound user's server id. NULL = unknown user, so the next login
-  /// resets (SC-01 Phase M; unknown is never 0).
-  IntColumn get userId => integer().nullable()();
-
-  @override
-  Set<Column> get primaryKey => {id};
-}
-
-/// Per-stream sync cursors (SC-02), e.g. the catalog `/changes` cursor.
-class SyncCursors extends Table {
-  TextColumn get stream => text()();
-  IntColumn get value => integer()();
-
-  @override
-  Set<Column> get primaryKey => {stream};
-}
-
-@TableIndex(
-  name: 'idx_history_events_pending',
-  columns: {#pendingUpload, #localId},
-)
-@TableIndex.sql(
-  'CREATE INDEX idx_history_events_kind_occurred '
-  'ON history_events (kind, occurred_at DESC, event_uuid DESC)',
-)
-class HistoryEvents extends Table {
-  IntColumn get localId => integer().autoIncrement()();
-  TextColumn get eventUuid => text().unique()();
-  TextColumn get kind => text()();
-  TextColumn get entityType => text()();
-  TextColumn get entityRef => text()();
-  IntColumn get occurredAt => integer()();
-  RealColumn get secondsPlayed => real().nullable()();
-  RealColumn get trackLength => real().nullable()();
-  IntColumn get serverRevision => integer().nullable().unique()();
-  IntColumn get receivedAt => integer().nullable()();
-  BoolColumn get pendingUpload => boolean()();
-}
-
-class LocalCounters extends Table {
-  TextColumn get key => text()();
-  IntColumn get value => integer()();
-
-  @override
-  Set<Column> get primaryKey => {key};
-}
-
-class HistorySyncFailures extends Table {
-  TextColumn get eventUuid => text()();
-  TextColumn get reason => text()();
-  TextColumn get detail => text().nullable()();
-  IntColumn get failedAt => integer()();
-
-  @override
-  Set<Column> get primaryKey => {eventUuid};
-}
-
-class HistoryConflictArchive extends Table {
-  IntColumn get archiveId => integer().autoIncrement()();
-  TextColumn get eventUuid => text()();
-  TextColumn get payloadJson => text()();
-  IntColumn get archivedAt => integer()();
-}
-
-@TableIndex.sql(
-  "CREATE UNIQUE INDEX idx_active_listens_accumulating "
-  "ON active_listens (state) WHERE state = 'accumulating'",
-)
-class ActiveListens extends Table {
-  TextColumn get listenUuid => text()();
-  IntColumn get queueSessionId => integer()();
-  IntColumn get queueItemId => integer()();
-  TextColumn get trackUuid => text()();
-  IntColumn get startedAt => integer()();
-  RealColumn get durationSeconds => real().nullable()();
-  IntColumn get accumulatedMicros => integer()();
-  IntColumn get lastCheckpointAt => integer()();
-  TextColumn get state =>
-      // ignore: recursive_getters
-      text().check(state.isIn(['accumulating', 'finalizing']))();
-  TextColumn get finalPayloadJson => text().nullable()();
-
-  @override
-  Set<Column> get primaryKey => {listenUuid};
-}
-
-/// Client durable-submission rows (SC-14): persisted before sending so a
-/// crash or ambiguous response can be resolved by operation id. A raw-stream
-/// request has no frozen body (NULL `frozen_body_json`).
-@TableIndex(
-  name: 'idx_durable_submissions_unresolved',
-  columns: {#localBindingId, #kind, #state},
-)
-@DataClassName('DurableSubmissionRow')
-class DurableSubmissions extends Table {
-  TextColumn get operationUuid => text()();
-  TextColumn get kind => text()();
-  TextColumn get localBindingId => text()();
-
-  /// NULL for raw-stream requests (nothing to freeze).
-  TextColumn get frozenBodyJson => text().nullable()();
-
-  /// One of the SC-14 states. Raw constraint (not `.check`) so the fresh DDL
-  /// is byte-identical to the migration snapshot's.
-  TextColumn get state => text().customConstraint(
-    "NOT NULL CHECK (state IN ('prepared', 'sent', 'accepted', 'rejected', "
-    "'ambiguous'))",
-  )();
-
-  /// NULL until accepted.
-  TextColumn get receiptJson => text().nullable()();
-
-  /// NULL unless rejected.
-  TextColumn get errorCode => text().nullable()();
-
-  /// UTC milliseconds.
-  IntColumn get createdAt => integer()();
-
-  /// UTC milliseconds.
-  IntColumn get updatedAt => integer()();
-
-  @override
-  List<String> get customConstraints => const ['PRIMARY KEY(operation_uuid)'];
-}
-
-/// Phase 8 owned-file cleanup queue: app-owned local files (downloads) whose
-/// DB reference was dropped, enqueued in the same transaction that dropped it
-/// and deleted later by a worker.
-@DataClassName('OwnedFileCleanupRow')
-class OwnedFileCleanupEntries extends Table {
-  @override
-  String get tableName => 'owned_file_cleanup';
-
-  IntColumn get id => integer().autoIncrement()();
-  TextColumn get path => text()();
-
-  /// Which owned root the file lives under. Only downloads for now. Raw
-  /// constraint (not `.check`) so the fresh DDL is byte-identical to the
-  /// migration snapshot's.
-  TextColumn get rootKind => text().customConstraint(
-    "NOT NULL CHECK (root_kind IN ('downloads'))",
-  )();
-
-  /// Device id of the file; NULL = unknown.
-  IntColumn get dev => integer().nullable()();
-
-  /// Inode of the file; NULL = unknown.
-  IntColumn get ino => integer().nullable()();
-
-  /// Bytes; NULL = unknown (never 0).
-  IntColumn get size => integer().nullable()();
-
-  /// File modification time, UTC microseconds since epoch; NULL = unknown.
-  IntColumn get mtime => integer().nullable()();
-
-  /// The SC-01 binding token captured by the enqueuing task; NULL = no
-  /// binding row existed.
-  TextColumn get localBindingId => text().nullable()();
-  IntColumn get attempts => integer().withDefault(const Constant(0))();
-
-  /// NULL until a delete attempt fails.
-  TextColumn get lastError => text().nullable()();
-
-  /// UTC milliseconds.
-  IntColumn get createdAt => integer()();
-}
-
-/// Local upload transfer intents (Phase 7 spec section 7), one row per
-/// selected file, keyed by the SC-01 `local_binding_id`.
-@TableIndex(
-  name: 'idx_upload_intents_batch',
-  columns: {#localBindingId, #batchUuid, #selectionIndex},
-)
-class UploadIntents extends Table {
-  TextColumn get itemUuid => text()();
-  TextColumn get batchUuid => text()();
-
-  /// The ZIP parent's item UUID for a server-expanded child (its review
-  /// draft and operation ids live here too); NULL for a selected file.
-  TextColumn get parentItemUuid => text().nullable()();
-  IntColumn get selectionIndex => integer()();
-  TextColumn get displayName => text()();
-
-  /// NULL = the source must be reselected.
-  TextColumn get sourceDescriptorJson => text().nullable()();
-
-  /// NULL = unknown (never 0).
-  TextColumn get expectedSha256 => text().nullable()();
-
-  /// NULL = unknown (never 0).
-  IntColumn get expectedLength => integer().nullable()();
-
-  /// State vocabulary is owned by the upload pipeline, so no CHECK here.
-  TextColumn get lastState => text()();
-  TextColumn get lastErrorCode => text().nullable()();
-  TextColumn get lastErrorMessage => text().nullable()();
-
-  /// The current review action's operation id. The allocation's operation
-  /// id is the `batch_uuid` itself (not stored here).
-  TextColumn get operationUuid => text().nullable()();
-
-  /// The local operation id of the current content transfer attempt (SC-14
-  /// PUT identity is item + digest/length); a fresh one per deliberate
-  /// re-send, e.g. after the server returns the item to `allocated`.
-  TextColumn get transferOperationUuid => text().nullable()();
-
-  /// The server review version the draft and operation belong to.
-  IntColumn get reviewGeneration => integer().nullable()();
-  TextColumn get draftJson => text().nullable()();
-  TextColumn get localBindingId => text()();
-
-  /// UTC milliseconds.
-  IntColumn get createdAt => integer()();
-
-  /// UTC milliseconds.
-  IntColumn get updatedAt => integer()();
-
-  @override
-  List<String> get customConstraints => const ['PRIMARY KEY(item_uuid)'];
-}
-
-const _historyContentTriggerV3 = '''
+part 'download_state_queries.dart';
+part 'edit_outbox_queries.dart';
+part 'query_parameters.dart';
+part 'search_index.dart';
+part 'tables.dart';
+part 'track_sql.dart';
+
+const _historyContentTrigger = '''
 CREATE TRIGGER history_content
 AFTER UPDATE OF kind, entity_type, entity_ref, occurred_at, seconds_played, track_length
 ON history_events
@@ -531,7 +36,7 @@ BEGIN
 END
 ''';
 
-const _catalogAttributionTriggersV8 = [
+const _catalogAttributionTriggers = [
   '''
 CREATE TRIGGER catalog_attribution_insert
 AFTER INSERT ON trackmetadata
@@ -565,520 +70,6 @@ END
 ''',
 ];
 
-// ── Column allowlists (mirrors backend database.py) ─────────────────────
-
-const allowedMetadataColumns = {
-  'title',
-  'artist',
-  'album',
-  'album_artist',
-  'year',
-  'date',
-  'genre',
-  'track_number',
-  'disc_number',
-  'codec',
-  'duration',
-  'bitrate_kbps',
-  'sample_rate_hz',
-  'channels',
-  'has_album_art',
-  'cover_art_id',
-};
-
-const allowedTrackColumns = {'uuid_id', 'created_at', 'last_updated'};
-
-// The editable-column set lives in models/editable_fields.dart, derived from
-// the same descriptor list that drives the offline default form schema.
-
-/// FTS-relevant values of one trackmetadata row (see [AppDatabase.readTrackFtsEntry]).
-typedef TrackFtsEntry = ({int rowid, String title, String artist, String album});
-
-const allowedAlbumColumns = {
-  'id',
-  'name',
-  'artist',
-  'artist_id',
-  'year',
-  'is_single_grouping',
-};
-const albumTextColumns = {'name', 'artist'};
-const albumIntegerColumns = {'id', 'artist_id', 'year', 'is_single_grouping'};
-
-const allowedArtistColumns = {'id', 'name'};
-const artistTextColumns = {'name'};
-
-const allowedOperators = {'=', '>=', '<=', '<', '>'};
-
-// ── Parameter classes ───────────────────────────────────────────────────
-
-class SearchParameter {
-  final String column;
-  final String operator;
-  final Object? value;
-
-  SearchParameter({required this.column, required this.operator, this.value}) {
-    if (!allowedOperators.contains(operator)) {
-      throw ArgumentError('operator must be in allowedOperators');
-    }
-    if (!allowedMetadataColumns.contains(column) &&
-        !allowedTrackColumns.contains(column)) {
-      throw ArgumentError(
-        'column must be in allowedMetadataColumns or allowedTrackColumns',
-      );
-    }
-  }
-}
-
-class OrderParameter {
-  final String column;
-  final bool isAscending;
-  final int? nullsAs;
-  final bool caseInsensitive;
-
-  OrderParameter({
-    required this.column,
-    this.isAscending = true,
-    this.nullsAs,
-    this.caseInsensitive = false,
-  }) {
-    if (!allowedMetadataColumns.contains(column) &&
-        !allowedTrackColumns.contains(column)) {
-      throw ArgumentError(
-        'column must be in allowedMetadataColumns or allowedTrackColumns',
-      );
-    }
-  }
-}
-
-class RowFilterParameter {
-  final String column;
-  final Object? value;
-
-  RowFilterParameter({required this.column, this.value}) {
-    if (!allowedMetadataColumns.contains(column) &&
-        !allowedTrackColumns.contains(column)) {
-      throw ArgumentError(
-        'column must be in allowedMetadataColumns or allowedTrackColumns',
-      );
-    }
-  }
-}
-
-class AlbumOrderParameter {
-  final String column;
-  final bool isAscending;
-  final bool nullsLast;
-
-  AlbumOrderParameter({
-    required this.column,
-    this.isAscending = true,
-    this.nullsLast = false,
-  }) {
-    if (!allowedAlbumColumns.contains(column)) {
-      throw ArgumentError('column must be in allowedAlbumColumns');
-    }
-  }
-}
-
-class AlbumRowFilterParameter {
-  final String column;
-  final Object? value;
-
-  AlbumRowFilterParameter({required this.column, this.value}) {
-    if (!allowedAlbumColumns.contains(column)) {
-      throw ArgumentError('column must be in allowedAlbumColumns');
-    }
-  }
-}
-
-class ArtistOrderParameter {
-  final String column;
-  final bool isAscending;
-
-  ArtistOrderParameter({required this.column, this.isAscending = true}) {
-    if (!allowedArtistColumns.contains(column)) {
-      throw ArgumentError('column must be in allowedArtistColumns');
-    }
-  }
-}
-
-class ArtistRowFilterParameter {
-  final String column;
-  final Object? value;
-
-  ArtistRowFilterParameter({required this.column, this.value}) {
-    if (!allowedArtistColumns.contains(column)) {
-      throw ArgumentError('column must be in allowedArtistColumns');
-    }
-  }
-}
-
-// ── Helper functions ────────────────────────────────────────────────────
-
-String aliasMap(String column) {
-  return allowedMetadataColumns.contains(column) ? 'tm' : 't';
-}
-
-/// The one ORDER BY body for track queries (browse windows, uuid lists and
-/// the queue insert), so every list orders a given [OrderParameter] list the
-/// same way. [OrderParameter.nullsAs] sorts NULL as that value (COALESCE);
-/// [OrderParameter.caseInsensitive] compares with `COLLATE NOCASE`.
-String trackOrderClause(List<OrderParameter> orderBy) {
-  return orderBy
-      .map((o) {
-        final column = '${aliasMap(o.column)}."${o.column}"';
-        final key = o.nullsAs == null
-            ? column
-            : 'COALESCE($column, ${o.nullsAs})';
-        final collate = o.caseInsensitive ? ' COLLATE NOCASE' : '';
-        return '$key$collate ${o.isAscending ? 'ASC' : 'DESC'}';
-      })
-      .join(', ');
-}
-
-Variable _variableFrom(Object value) {
-  if (value is String) return Variable.withString(value);
-  if (value is int) return Variable.withInt(value);
-  if (value is double) return Variable.withReal(value);
-  throw ArgumentError('Unsupported variable type: ${value.runtimeType}');
-}
-
-bool _listEquals(List<String> a, List<String> b) {
-  if (a.length != b.length) return false;
-  for (var i = 0; i < a.length; i++) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
-}
-
-// ── Track cursor filter ─────────────────────────────────────────────────
-
-(String, List<Variable>) filterForCursor(
-  List<RowFilterParameter> rowFilters,
-  List<OrderParameter> orderParams,
-) {
-  final columns = rowFilters.map((r) => r.column).toList();
-  final orderColumns = orderParams.map((o) => o.column).toList();
-
-  if (columns.length != columns.toSet().length) {
-    throw ArgumentError('Filtering by row requires all unique columns');
-  }
-  if (!_listEquals(columns, orderColumns)) {
-    throw ArgumentError(
-      'row_filter_parameters columns must match order_parameters columns',
-    );
-  }
-
-  final constraints = <String>[];
-  final values = <Variable>[];
-
-  for (var depth = 0; depth < rowFilters.length; depth++) {
-    final equalityParts = <String>[];
-    final equalityValues = <Variable>[];
-
-    for (var i = 0; i < depth; i++) {
-      final alias = aliasMap(rowFilters[i].column);
-      final col = rowFilters[i].column;
-      final v = rowFilters[i].value;
-      if (v == null) {
-        equalityParts.add('$alias."$col" IS NULL');
-      } else {
-        equalityParts.add('$alias."$col" = ?');
-        equalityValues.add(_variableFrom(v));
-      }
-    }
-
-    final alias = aliasMap(rowFilters[depth].column);
-    final col = rowFilters[depth].column;
-    final cursorValue = rowFilters[depth].value;
-
-    if (cursorValue == null) {
-      if (orderParams[depth].isAscending) {
-        final allParts = [...equalityParts, '$alias."$col" IS NOT NULL'];
-        if (allParts.length == 1) {
-          constraints.add(allParts[0]);
-        } else {
-          constraints.add('(${allParts.join(' AND ')})');
-        }
-        values.addAll(equalityValues);
-      }
-      // DESC with null cursor: skip (nothing is less than NULL)
-      continue;
-    }
-
-    final op = orderParams[depth].isAscending ? '>' : '<';
-    final finalPart = '$alias."$col" $op ?';
-    final allParts = [...equalityParts, finalPart];
-    final allValues = [...equalityValues, _variableFrom(cursorValue)];
-
-    if (allParts.length == 1) {
-      constraints.add(allParts[0]);
-    } else {
-      constraints.add('(${allParts.join(' AND ')})');
-    }
-    values.addAll(allValues);
-  }
-
-  if (constraints.isEmpty) return ('', values);
-  return (constraints.join(' OR '), values);
-}
-
-// ── Album cursor filter ─────────────────────────────────────────────────
-
-/// Maps album column names to table-qualified SQL references.
-/// The get_albums query joins `albums a` with `artists ar`, so "artist"
-/// maps to `ar."name"` (the actual column, not the SELECT alias).
-String _albumColRef(String col) {
-  if (col == 'artist') return 'ar."name"';
-  return 'a."$col"';
-}
-
-(String, List<Variable>) filterForAlbumCursor(
-  List<AlbumRowFilterParameter> rowFilters,
-  List<AlbumOrderParameter> orderParams,
-) {
-  final columns = rowFilters.map((r) => r.column).toList();
-  final orderColumns = orderParams.map((o) => o.column).toList();
-
-  if (columns.length != columns.toSet().length) {
-    throw ArgumentError('Filtering by row requires all unique columns');
-  }
-  if (!_listEquals(columns, orderColumns)) {
-    throw ArgumentError(
-      'row_filter_parameters columns must match order_parameters columns',
-    );
-  }
-
-  final constraints = <String>[];
-  final values = <Variable>[];
-
-  for (var depth = 0; depth < rowFilters.length; depth++) {
-    final equalityParts = <String>[];
-    final equalityValues = <Variable>[];
-
-    for (var i = 0; i < depth; i++) {
-      final col = rowFilters[i].column;
-      final v = rowFilters[i].value;
-      final colRef = _albumColRef(col);
-      final collate = albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
-      final param = albumIntegerColumns.contains(col)
-          ? 'CAST(? AS INTEGER)'
-          : '?';
-      if (v == null) {
-        equalityParts.add('$colRef IS NULL');
-      } else {
-        equalityParts.add('$colRef$collate = $param');
-        equalityValues.add(_variableFrom(v));
-      }
-    }
-
-    final col = rowFilters[depth].column;
-    final cursorValue = rowFilters[depth].value;
-    final nullsLast = orderParams[depth].nullsLast;
-    final colRef = _albumColRef(col);
-    final collate = albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
-    final param = albumIntegerColumns.contains(col)
-        ? 'CAST(? AS INTEGER)'
-        : '?';
-
-    if (cursorValue == null) {
-      if (nullsLast) {
-        // NULLs sort last: nothing comes after NULL
-        continue;
-      } else if (orderParams[depth].isAscending) {
-        // NULLs sort first (default): any non-null comes after NULL
-        final allParts = [...equalityParts, '$colRef IS NOT NULL'];
-        if (allParts.length == 1) {
-          constraints.add(allParts[0]);
-        } else {
-          constraints.add('(${allParts.join(' AND ')})');
-        }
-        values.addAll(equalityValues);
-      }
-      // DESC with null cursor: skip
-      continue;
-    }
-
-    final op = orderParams[depth].isAscending ? '>' : '<';
-    late final String finalPart;
-    late final List<Variable> allValues;
-    if (nullsLast) {
-      // Non-NULL cursor with nullsLast: greater values OR NULLs come after
-      finalPart = '($colRef$collate $op $param OR $colRef IS NULL)';
-      allValues = [...equalityValues, _variableFrom(cursorValue)];
-    } else {
-      finalPart = '$colRef$collate $op $param';
-      allValues = [...equalityValues, _variableFrom(cursorValue)];
-    }
-    final allParts = [...equalityParts, finalPart];
-
-    if (allParts.length == 1) {
-      constraints.add(allParts[0]);
-    } else {
-      constraints.add('(${allParts.join(' AND ')})');
-    }
-    values.addAll(allValues);
-  }
-
-  if (constraints.isEmpty) return ('', values);
-  return (constraints.join(' OR '), values);
-}
-
-// ── Artist cursor filter ────────────────────────────────────────────────
-
-(String, List<Variable>) filterForArtistCursor(
-  List<ArtistRowFilterParameter> rowFilters,
-  List<ArtistOrderParameter> orderParams,
-) {
-  if (rowFilters.isEmpty) return ('', <Variable>[]);
-
-  final columns = rowFilters.map((r) => r.column).toList();
-  final orderColumns = orderParams.map((o) => o.column).toList();
-
-  if (columns.length != columns.toSet().length) {
-    throw ArgumentError('Filtering by row requires all unique columns');
-  }
-  if (!_listEquals(columns, orderColumns)) {
-    throw ArgumentError(
-      'row_filter_parameters columns must match order_parameters columns',
-    );
-  }
-
-  final constraints = <String>[];
-  final values = <Variable>[];
-
-  for (var depth = 0; depth < rowFilters.length; depth++) {
-    final equalityParts = <String>[];
-    final equalityValues = <Variable>[];
-
-    for (var i = 0; i < depth; i++) {
-      final col = rowFilters[i].column;
-      final v = rowFilters[i].value;
-      final collate = artistTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
-      if (v == null) {
-        equalityParts.add('"$col" IS NULL');
-      } else {
-        equalityParts.add('"$col"$collate = ?');
-        equalityValues.add(_variableFrom(v));
-      }
-    }
-
-    final col = rowFilters[depth].column;
-    final cursorValue = rowFilters[depth].value;
-    final collate = artistTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
-
-    if (cursorValue == null) {
-      if (orderParams[depth].isAscending) {
-        final allParts = [...equalityParts, '"$col" IS NOT NULL'];
-        if (allParts.length == 1) {
-          constraints.add(allParts[0]);
-        } else {
-          constraints.add('(${allParts.join(' AND ')})');
-        }
-        values.addAll(equalityValues);
-      }
-      continue;
-    }
-
-    final op = orderParams[depth].isAscending ? '>' : '<';
-    final finalPart = '"$col"$collate $op ?';
-    final allParts = [...equalityParts, finalPart];
-    final allValues = [...equalityValues, _variableFrom(cursorValue)];
-
-    if (allParts.length == 1) {
-      constraints.add(allParts[0]);
-    } else {
-      constraints.add('(${allParts.join(' AND ')})');
-    }
-    values.addAll(allValues);
-  }
-
-  if (constraints.isEmpty) return ('', values);
-  return (constraints.join(' OR '), values);
-}
-
-// ── SELECT columns for track queries ────────────────────────────────────
-
-const trackSelectColumns =
-    'tm.uuid_id, tm.title, tm.artist, tm.album, tm.album_artist, '
-    'tm.artist_id, tm.album_id, '
-    'tm.year, tm.date, tm.genre, tm.track_number, tm.disc_number, '
-    'tm.codec, tm.duration, tm.bitrate_kbps, tm.sample_rate_hz, '
-    'tm.channels, tm.has_album_art, tm.cover_art_id, t.file_path, t.created_at, t.last_updated, '
-    't.revision, '
-    't.downloaded_bitrate_kbps, t.file_size_bytes, t.downloaded_quality, '
-    't.downloaded_at_revision, t.downloaded_codec, t.stale_dismissed_at_revision, '
-    't.damaged_file_path';
-const _selectColumns = trackSelectColumns;
-
-/// SQL test, over a `tracks` row aliased `t`, for a download the app can
-/// use: the file is recorded and not marked damaged (Phase 5 decision 6).
-/// The one definition behind every "is it downloaded?" rule (the Downloaded
-/// filter, counts, stale downloads, playback entries). Must agree with
-/// `TrackUI.isDownloaded`.
-const usableDownloadPredicate =
-    '(t.file_path IS NOT NULL AND t.damaged_file_path IS NULL)';
-
-/// SQL form of the stale-download rule, over a `tracks` row aliased `t`: the
-/// track has a downloaded file, its revision moved past the one the file is
-/// current as of, and the user hasn't dismissed this particular change.
-/// NULL `revision`/`downloaded_at_revision` compare as NULL (= not stale).
-/// Must agree with `TrackUI.isStaleDownload` -- the Dart mirror used on
-/// already-loaded rows; `test/models/ui/track_ui_test.dart` asserts the two
-/// agree over every null/ordering combination.
-const staleDownloadPredicate =
-    '$usableDownloadPredicate '
-    'AND t.revision > t.downloaded_at_revision '
-    'AND (t.stale_dismissed_at_revision IS NULL '
-    'OR t.revision > t.stale_dismissed_at_revision)';
-
-/// SQL `EXISTS` test: some track whose `trackmetadata.[column]` equals
-/// [owner] has a downloaded file. The one definition of "has downloads",
-/// shared by browse and search so the Downloaded filter means the same thing
-/// on every surface.
-String hasDownloadedTrack(String column, String owner) =>
-    'EXISTS (SELECT 1 FROM trackmetadata tm '
-    'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-    'WHERE tm.$column = $owner AND $usableDownloadPredicate)';
-
-/// Scalar subquery picking the cover art for the tracks whose
-/// `trackmetadata.[column]` equals [owner]: the lowest-numbered track with
-/// art. With [downloadedOnly] only downloaded tracks qualify; otherwise the
-/// chosen `cover_art_id` may belong to a streaming-only track and resolving
-/// it needs a network round trip. Shared by browse and search so an artist or
-/// album shows the same cover in both.
-String _coverArtSubquery(
-  String column,
-  String owner, {
-  required bool downloadedOnly,
-}) =>
-    'SELECT tm.cover_art_id FROM trackmetadata tm '
-    '${downloadedOnly ? 'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id ' : ''}'
-    'WHERE tm.$column = $owner '
-    'AND tm.has_album_art = 1 '
-    'AND tm.cover_art_id IS NOT NULL '
-    '${downloadedOnly ? 'AND $usableDownloadPredicate ' : ''}'
-    'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
-    'LIMIT 1';
-
-/// SC-12: the one album display projection (browse, search, by-ID). Rows alias
-/// the album `a` and its artist `ar`. Uses the same cover rule everywhere, so a
-/// result shows the same art as its browse card (and, filtered, art that
-/// resolves offline).
-String _albumProjection({required bool downloadedOnly}) =>
-    'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
-    'a."year", a.is_single_grouping, '
-    '(${_coverArtSubquery('album_id', 'a.id', downloadedOnly: downloadedOnly)}) AS cover_art_id '
-    'FROM albums a '
-    'JOIN artists ar ON a.artist_id = ar.id';
-
-/// SC-12: the one artist display projection. Rows come from `artists`.
-String _artistProjection({required bool downloadedOnly}) =>
-    'SELECT id, name, '
-    '(${_coverArtSubquery('artist_id', 'artists.id', downloadedOnly: downloadedOnly)}) AS cover_art_id '
-    'FROM artists';
-
 /// Nulls every column that marks a track as downloaded. The single shared
 /// definition for every clear path (delete, reset fence, a commit undone by a
 /// reset) so adding a downloaded-state column can't leave a row half-cleared.
@@ -1096,6 +87,9 @@ const clearedDownloadColumns = TracksCompanion(
 
 // ── FTS5 virtual table creation statements ──────────────────────────────
 
+// The search tables are contentless (`content=''`): every insert gives the
+// rowid itself (the trackmetadata rowid, the artist id, the album id).
+// `content_rowid='id'` names no column of theirs; it is kept as written.
 const _ftsStatements = [
   "CREATE VIRTUAL TABLE IF NOT EXISTS fts_tracks USING fts5("
       "title, artist_name, album_name, "
@@ -1108,12 +102,6 @@ const _ftsStatements = [
       "content='', content_rowid='id', tokenize='unicode61')",
 ];
 
-String prepareFtsQuery(String rawQuery) {
-  final terms = rawQuery.trim().split(RegExp(r'\s+'));
-  if (terms.isEmpty || (terms.length == 1 && terms[0].isEmpty)) return '';
-  return terms.map((t) => '"${t.replaceAll('"', '""')}"*').join(' ');
-}
-
 String _quoteSqlIdentifier(String identifier) {
   return '"${identifier.replaceAll('"', '""')}"';
 }
@@ -1123,6 +111,20 @@ String _quoteSqlIdentifier(String identifier) {
 /// Why an outbox edit was rejected because its track was deleted server-side.
 const trackGoneRejectionReason = 'Track no longer exists on the server';
 
+/// The stored states of an unsent metadata edit (`pending_edits.status`; the
+/// table's column default is the same `pending`). See the column's comment
+/// for what each means.
+abstract final class PendingEditStatus {
+  static const pending = 'pending';
+  static const conflicted = 'conflicted';
+  static const rejected = 'rejected';
+  static const takeServer = 'take_server';
+}
+
+/// The app's local database. The tables declare references and cascades
+/// (`references(...)`, `KeyAction.cascade`), but the app never turns on
+/// SQLite's `foreign_keys`, so none of them is enforced: code that deletes
+/// rows removes the child rows itself.
 @DriftDatabase(
   tables: [
     Artists,
@@ -1145,22 +147,37 @@ const trackGoneRejectionReason = 'Track no longer exists on the server';
     OwnedFileCleanupEntries,
   ],
 )
-class AppDatabase extends _$AppDatabase implements LocalResettable {
+class AppDatabase extends _$AppDatabase
+    with
+        _AutocompleteQueries,
+        _DownloadStateQueries,
+        _SearchIndex,
+        _BrowseQueries,
+        // Must follow _SearchIndex: its 'on' clause needs that mixin.
+        _EditOutboxQueries
+    implements LocalResettable {
   AppDatabase(super.e);
 
-  /// Schema history was reset during beta: version 1 is the post-reset
-  /// baseline and there is no upgrade path from the pre-reset versions (an
-  /// old-beta database must go through the local-reset flow once).
+  /// Schema history was reset before the first release (2026-11-17):
+  /// version 1 is the baseline, and a database stamped with any other
+  /// version is refused when it opens (see [upgradeSteps]); nothing upgrades
+  /// a database from before the reset. The next schema change is version 2.
+  ///
+  /// While the schema stays at version 1 and its tables are edited directly,
+  /// export the version-1 snapshot again after every edit
+  /// (`dart run drift_dev schema dump lib/database/database.dart
+  /// drift_schemas/default/`): the first upgrade step is generated against it.
   ///
   /// Migration pattern (every schema change follows it):
   ///
   ///  1. Change the table classes, bump [schemaVersion], then run
   ///     `dart run drift_dev make-migrations`. It exports the frozen snapshot
-  ///     `drift_schemas/default/drift_schema_vN.json`, regenerates
-  ///     `database.steps.dart` and the versioned test schemas under
-  ///     `test/drift/`.
-  ///  2. Add one `fromXToY` step to the [stepByStep] call in [migration].
-  ///     Each step only sees the generated `SchemaY` snapshot, never the
+  ///     `drift_schemas/default/drift_schema_vN.json`, and from the second
+  ///     snapshot on it also writes `database.steps.dart`, the versioned test
+  ///     schemas under `test/drift/` and the generated migration test.
+  ///  2. Make [upgradeSteps] return the generated `stepByStep` (import
+  ///     `database.steps.dart`) with one `fromXToY` step per version. Each
+  ///     step only sees the generated `SchemaY` snapshot, never the
   ///     current Dart tables, so an older upgrader can't be handed a later
   ///     table shape (an unguarded ALTER against the current shape once
   ///     bricked every upgrading install).
@@ -1170,15 +187,17 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   ///  4. The whole upgrade is atomic: [migration] runs every step inside one
   ///     `transaction` that also sets `PRAGMA user_version` to the target, so
   ///     a failing step rolls back all of its DDL/DML and the version
-  ///     advances only with a successful migration (drift itself neither
-  ///     wraps `onUpgrade` nor writes the version until after `beforeOpen`).
+  ///     advances only with a successful migration. The transaction is what
+  ///     makes it atomic: drift does not wrap `onUpgrade` in one, and the
+  ///     generated `stepByStep` writes `user_version` after every step
+  ///     (inside this transaction, so those writes roll back too).
   ///     New steps get this for free; never commit or open a nested
   ///     transaction inside a step.
   ///  5. A `TableMigration` rebuild renumbers trackmetadata's implicit rowid,
   ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
   ///     [rebuildFtsIndexes] afterwards.
   @override
-  int get schemaVersion => 8;
+  int get schemaVersion => 1;
 
   @override
   StreamQueryUpdateRules get streamUpdateRules => StreamQueryUpdateRules([
@@ -1200,8 +219,8 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   MigrationStrategy get migration => MigrationStrategy(
     onCreate: (m) async {
       await m.createAll();
-      await customStatement(_historyContentTriggerV3);
-      for (final stmt in _catalogAttributionTriggersV8) {
+      await customStatement(_historyContentTrigger);
+      for (final stmt in _catalogAttributionTriggers) {
         await customStatement(stmt);
       }
       for (final stmt in _ftsStatements) {
@@ -1209,82 +228,24 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       }
     },
     onUpgrade: (m, from, to) => transaction(() async {
-      await _upgradeSteps(m, from, to);
-      // Committed together with the steps: drift writes the version only
-      // after beforeOpen, outside this transaction, so its later write is a
-      // harmless repeat and a crash in between can't re-run a done upgrade.
+      await upgradeSteps(m, from, to);
+      // Committed together with the steps, so a crash can't leave a half-done
+      // upgrade stamped as done or re-run a finished one. Drift writes the
+      // version again after beforeOpen, outside this transaction: a harmless
+      // repeat. (A generated stepByStep also writes it after each step, inside
+      // this transaction.)
       await customStatement('PRAGMA user_version = $to');
     }),
   );
 
-  /// Every per-version step; run only through [migration]'s transaction.
-  OnUpgrade get _upgradeSteps => stepByStep(
-    from1To2: (m, schema) async {
-      // SC-01 / SC-02: created empty; rows come from the session flow.
-      await m.createTable(schema.serverBinding);
-      await m.createTable(schema.syncCursors);
-      // SC-16l: audio properties become nullable and local zeros (the old
-      // "unknown" stand-in) become NULL. Bitrate was already nullable.
-      final tm = schema.trackmetadata;
-      await m.alterTable(
-        // ignore: experimental_member_use
-        TableMigration(
-          tm,
-          columnTransformer: {
-            tm.duration: const CustomExpression<double>('NULLIF(duration, 0)'),
-            tm.sampleRateHz: const CustomExpression<int>(
-              'NULLIF(sample_rate_hz, 0)',
-            ),
-            tm.channels: const CustomExpression<int>('NULLIF(channels, 0)'),
-          },
-        ),
-      );
-      // The rebuild renumbered trackmetadata rowids (fts_tracks' key), so
-      // re-derive the FTS indexes. The FTS tables live outside drift's
-      // exported schema (onCreate adds them), so ensure they exist first:
-      // a no-op on a real v1 file, required by the generated verifier.
-      for (final stmt in _ftsStatements) {
-        await customStatement(stmt);
-      }
-      await rebuildFtsIndexes();
-    },
-    from2To3: (m, schema) async {
-      await m.createTable(schema.historyEvents);
-      await m.createTable(schema.localCounters);
-      await m.createTable(schema.historySyncFailures);
-      await m.createTable(schema.historyConflictArchive);
-      await m.createTable(schema.activeListens);
-      await m.createIndex(schema.idxHistoryEventsPending);
-      await m.createIndex(schema.idxHistoryEventsKindOccurred);
-      await m.createIndex(schema.idxActiveListensAccumulating);
-      await customStatement(_historyContentTriggerV3);
-    },
-    from3To4: (m, schema) async {
-      // Decision 6: damaged downloads (nullable; existing rows read NULL).
-      await m.addColumn(schema.tracks, schema.tracks.damagedFilePath);
-    },
-    from4To5: (m, schema) async {
-      // SC-01 Phase M: the bound user (NULL = unknown user; existing rows).
-      await m.addColumn(schema.serverBinding, schema.serverBinding.userId);
-    },
-    from5To6: (m, schema) async {
-      // SC-14 durable submissions + Phase 7 upload intents: created empty.
-      await m.createTable(schema.durableSubmissions);
-      await m.createTable(schema.uploadIntents);
-      await m.createIndex(schema.idxDurableSubmissionsUnresolved);
-      await m.createIndex(schema.idxUploadIntentsBatch);
-    },
-    from6To7: (m, schema) async {
-      // Phase 8 owned-file cleanup queue: created empty.
-      await m.createTable(schema.ownedFileCleanup);
-    },
-    from7To8: (m, schema) async {
-      // SC-11: catalog_attribution change counter (insert/update/delete triggers).
-      for (final stmt in _catalogAttributionTriggersV8) {
-        await customStatement(stmt);
-      }
-    },
-  );
+  /// The upgrade from a stored version to [schemaVersion]; run only through
+  /// [migration]'s transaction. Version 1 has no step, so a database stamped
+  /// with any other version is refused before anything is written. A test
+  /// subclass overrides this to supply a fake step.
+  @protected
+  OnUpgrade get upgradeSteps => (m, from, to) async {
+    throw DatabaseVersionRefused(from, to);
+  };
 
   Future<void> resetLocalData() async {
     await transaction(() async {
@@ -1318,82 +279,24 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     });
   }
 
-  Future<void> rebuildFtsIndexes() async {
-    await rebuildParentFtsIndexes();
-
-    await customStatement(
-      "INSERT INTO fts_tracks(fts_tracks) VALUES('delete-all')",
-    );
-    await customStatement(
-      "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
-      "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
-      "FROM trackmetadata",
-    );
-  }
-
-  /// Rebuild only the artist/album FTS indexes — small tables, cheap to
-  /// re-derive. Single-track reconciliation pairs this with a per-row
-  /// [applyTrackFtsDelta] so it never pays the O(library) fts_tracks rebuild.
-  Future<void> rebuildParentFtsIndexes() async {
-    await customStatement(
-      "INSERT INTO fts_artists(fts_artists) VALUES('delete-all')",
-    );
-    await customStatement(
-      "INSERT INTO fts_artists(rowid, name) "
-      "SELECT id, name FROM artists",
-    );
-
-    await customStatement(
-      "INSERT INTO fts_albums(fts_albums) VALUES('delete-all')",
-    );
-    await customStatement(
-      "INSERT INTO fts_albums(rowid, name, artist_name) "
-      "SELECT a.id, COALESCE(a.name, ''), ar.name "
-      "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
-    );
-  }
-
-  /// A track's FTS-relevant values, or null if the row doesn't exist. Capture
-  /// BEFORE a write so [applyTrackFtsDelta] can delete the old contentless
-  /// terms (an FTS5 external-content 'delete' must be given the exact values
-  /// that were indexed).
-  Future<TrackFtsEntry?> readTrackFtsEntry(String uuidId) async {
-    final row = await customSelect(
-      "SELECT rowid AS rid, COALESCE(title, '') AS t, "
-      "COALESCE(artist, '') AS a, COALESCE(album, '') AS al "
-      'FROM trackmetadata WHERE uuid_id = ?',
-      variables: [Variable.withString(uuidId)],
-      readsFrom: {trackmetadata},
-    ).getSingleOrNull();
-    if (row == null) return null;
-    return (
-      rowid: row.read<int>('rid'),
-      title: row.read<String>('t'),
-      artist: row.read<String>('a'),
-      album: row.read<String>('al'),
-    );
-  }
-
-  /// Reconcile one track's `fts_tracks` entry after its row was updated,
-  /// upserted, or deleted: delete [before]'s terms (if the row existed) and
-  /// index the current ones (if it still exists). The shared per-row path
-  /// used by the optimistic edit write and single-track refetch.
-  Future<void> applyTrackFtsDelta(String uuidId, TrackFtsEntry? before) async {
-    final after = await readTrackFtsEntry(uuidId);
-    if (before != null) {
-      await customStatement(
-        "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
-        "VALUES('delete', ?, ?, ?, ?)",
-        [before.rowid, before.title, before.artist, before.album],
-      );
+  /// Deletes this database's file when, and only when, it was refused for
+  /// another schema version ([DatabaseVersionRefused]); the next use opens
+  /// a fresh file at version 1. A file that opens is left alone. Throws
+  /// [UnsupportedError] when the database has no file of its own (an
+  /// in-memory one).
+  Future<void> discardRefusedFile() async {
+    final connection = executor;
+    if (connection is! AppDatabaseConnection) {
+      throw UnsupportedError('this database has no file of its own');
     }
-    if (after != null) {
-      await customStatement(
-        'INSERT INTO fts_tracks(rowid, title, artist_name, album_name) '
-        'VALUES(?, ?, ?, ?)',
-        [after.rowid, after.title, after.artist, after.album],
-      );
+    // Asked again here: only a file this app refuses is ever deleted.
+    try {
+      await customSelect('SELECT 1').get();
+      return;
+    } catch (e) {
+      if (databaseVersionRefusalIn(e) == null) rethrow;
     }
+    await connection.discardFile();
   }
 
   // --- LocalResettable -------------------------------------------------------
@@ -1402,1044 +305,136 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
 
   @override
   Future<void> resetLocalState() => resetLocalData();
-
-  // ── Metadata autocomplete ─────────────────────────────────────────────
-  //
-  // Case-insensitive prefix suggestions drawn from the synced library, for the
-  // Get Info form. Artist / album reuse the entities' `name_lower` indexes;
-  // genre has no entity table so it rides the NOCASE `idx_genre_nocase`.
-
-  /// Suggestions for the `artist` and `album_artist` fields.
-  Future<List<String>> artistSuggestions(String prefix, {int limit = 8}) {
-    return _prefixSuggestions(
-      "SELECT name FROM artists WHERE name_lower LIKE ? ESCAPE '\\' "
-      'ORDER BY name LIMIT ?',
-      column: 'name',
-      pattern: '${_escapeLike(prefix.trim().toLowerCase())}%',
-      rawPrefix: prefix,
-      limit: limit,
-      reads: {artists},
-    );
-  }
-
-  /// Suggestions for the `album` field.
-  Future<List<String>> albumSuggestions(String prefix, {int limit = 8}) {
-    return _prefixSuggestions(
-      'SELECT DISTINCT name FROM albums '
-      "WHERE name IS NOT NULL AND name_lower LIKE ? ESCAPE '\\' "
-      'ORDER BY name LIMIT ?',
-      column: 'name',
-      pattern: '${_escapeLike(prefix.trim().toLowerCase())}%',
-      rawPrefix: prefix,
-      limit: limit,
-      reads: {albums},
-    );
-  }
-
-  /// Suggestions for the `genre` field.
-  Future<List<String>> genreSuggestions(String prefix, {int limit = 8}) {
-    return _prefixSuggestions(
-      'SELECT DISTINCT genre FROM trackmetadata '
-      "WHERE genre IS NOT NULL AND genre LIKE ? ESCAPE '\\' "
-      'ORDER BY genre LIMIT ?',
-      column: 'genre',
-      pattern: '${_escapeLike(prefix.trim())}%',
-      rawPrefix: prefix,
-      limit: limit,
-      reads: {trackmetadata},
-    );
-  }
-
-  Future<List<String>> _prefixSuggestions(
-    String sql, {
-    required String column,
-    required String pattern,
-    required String rawPrefix,
-    required int limit,
-    required Set<ResultSetImplementation<dynamic, dynamic>> reads,
-  }) async {
-    if (rawPrefix.trim().isEmpty) return const [];
-    final rows = await customSelect(
-      sql,
-      variables: [Variable.withString(pattern), Variable.withInt(limit)],
-      readsFrom: reads,
-    ).get();
-    return rows.map((r) => r.read<String>(column)).toList();
-  }
-
-  /// Escapes the LIKE metacharacters in user input so a typed `%` or `_` is a
-  /// literal, not a wildcard (paired with `ESCAPE '\'` in the queries).
-  static String _escapeLike(String s) => s
-      .replaceAll('\\', '\\\\')
-      .replaceAll('%', '\\%')
-      .replaceAll('_', '\\_');
-
-  /// A tombstoned track can never accept its unsent edits: resolve the
-  /// `pending`/`conflicted` ones as rejected (visible in the banner), without
-  /// sending anything. Rows already rejected keep their own reason; `take_server`
-  /// rows are untouched. Run inside the transaction that deletes the tracks.
-  Future<void> rejectUnsentEditsOfDeletedTracks(List<String> uuids) =>
-      (update(pendingEdits)
-            ..where(
-              (t) =>
-                  t.uuidId.isIn(uuids) &
-                  t.status.isIn(const ['pending', 'conflicted']),
-            ))
-          .write(
-        const PendingEditsCompanion(
-          status: Value('rejected'),
-          rejectionReason: Value(trackGoneRejectionReason),
-          serverRevision: Value(null),
-        ),
-      );
-
-  // ── Optimistic edit write (outbox) ────────────────────────────────────
-
-  /// Applies the touched fields of a pending edit to the local denormalized
-  /// `trackmetadata` text + a targeted single-row FTS update, so the edit shows
-  /// immediately. Deliberately does NOT repoint `artist_id`/`album_id` (that is
-  /// the server helper's job) — so after an artist rename the tile shows the new
-  /// text but the track stays under the old artist node until flush+sync.
-  Future<void> applyOptimisticTrackEdit(
-    String uuidId,
-    Map<String, Object?> values,
-  ) async {
-    final cols = values.keys.where(editableMetadataColumns.contains).toList();
-    if (cols.isEmpty) return;
-
-    await transaction(() async {
-      final before = await readTrackFtsEntry(uuidId);
-      if (before == null) return;
-
-      final setSql = cols.map((c) => '"$c" = ?').join(', ');
-      // customUpdate (not customStatement) so drift notifies `trackmetadata`
-      // stream watchers — the reactive browse lists must re-render on the edit.
-      await customUpdate(
-        'UPDATE trackmetadata SET $setSql WHERE uuid_id = ?',
-        variables: [
-          ...cols.map((c) => Variable(values[c])),
-          Variable.withString(uuidId),
-        ],
-        updates: {trackmetadata},
-        updateKind: UpdateKind.update,
-      );
-
-      await applyTrackFtsDelta(uuidId, before);
-    });
-  }
-
-  /// Record the server revision a successful edit produced, so the next edit's
-  /// `base_revision` builds on it instead of the stale pre-flush value (which
-  /// would 409 against this client's own prior edit). Only ever raised, never
-  /// lowered, so a concurrently-synced higher revision is not regressed.
-  Future<void> updateTrackRevision(String uuidId, int revision) async {
-    await customUpdate(
-      'UPDATE tracks SET revision = ? '
-      'WHERE uuid_id = ? AND (revision IS NULL OR revision < ?)',
-      variables: [
-        Variable.withInt(revision),
-        Variable.withString(uuidId),
-        Variable.withInt(revision),
-      ],
-      updates: {tracks},
-      updateKind: UpdateKind.update,
-    );
-  }
-
-  /// Snapshot of a track's editable column values (the pre-edit state), used to
-  /// revert an optimistic edit locally on take-server/discard. Returns an empty
-  /// map if the track row is missing.
-  Future<Map<String, Object?>> readEditableColumns(String uuidId) async {
-    final cols = editableMetadataColumns.toList();
-    final select = cols.map((c) => '"$c"').join(', ');
-    final row = await customSelect(
-      'SELECT $select FROM trackmetadata WHERE uuid_id = ?',
-      variables: [Variable.withString(uuidId)],
-      readsFrom: {trackmetadata},
-    ).getSingleOrNull();
-    if (row == null) return {};
-    return {for (final c in cols) c: row.data[c]};
-  }
-
-  /// The queued write mode (`db_only`/`db_and_master`) for a track's pending
-  /// edit, or null if none is queued. Lets Get Info reflect a queued master
-  /// write when it reopens. Only `pending`/`conflicted` rows are active edits
-  /// whose write mode should inform a new save's default — a `take_server`
-  /// marker's write mode is a leftover from the batch it's discarding, and a
-  /// `rejected` row's edit was already reverted, so neither should leak into
-  /// a fresh save.
-  Future<String?> pendingWriteMode(String uuidId) async {
-    final row = await (select(pendingEdits)
-          ..where((t) => t.uuidId.equals(uuidId))
-          ..where((t) => t.status.isIn(const ['pending', 'conflicted'])))
-        .getSingleOrNull();
-    return row?.writeMode;
-  }
-
-  /// Records the revision the user's OWN successful edit produced (raising
-  /// `revision` exactly like [updateTrackRevision]) and, when the downloaded
-  /// file was current as of [currentAsOf] -- the revision the server held
-  /// immediately before the edit -- advances `downloaded_at_revision` to
-  /// [newRevision] in the same statement. The app displays metadata from this
-  /// DB, not the file's tags, so a self-edit doesn't make the download
-  /// meaningfully outdated; server-originated changes (a conversion, another
-  /// device's edit, new artwork) never pass through here and still flag.
-  /// Likewise, a stale-download warning the user dismissed as of
-  /// [currentAsOf] is carried forward to [newRevision], so their own edit
-  /// doesn't resurrect a warning they already dismissed.
-  /// Pass a null [currentAsOf] to only raise the revision.
-  Future<void> recordOwnEditRevision(
-    String uuidId,
-    int newRevision, {
-    required int? currentAsOf,
-  }) async {
-    // SET expressions all read the pre-update row, so the CASEs see the old
-    // downloaded_at_revision / stale_dismissed_at_revision regardless of
-    // clause order.
-    await customUpdate(
-      'UPDATE tracks SET '
-      'downloaded_at_revision = CASE '
-      'WHEN ?1 IS NOT NULL AND file_path IS NOT NULL '
-      'AND downloaded_at_revision = ?1 AND ?2 > ?1 THEN ?2 '
-      'ELSE downloaded_at_revision END, '
-      'stale_dismissed_at_revision = CASE '
-      'WHEN ?1 IS NOT NULL AND stale_dismissed_at_revision = ?1 '
-      'AND ?2 > ?1 THEN ?2 '
-      'ELSE stale_dismissed_at_revision END, '
-      'revision = CASE WHEN revision IS NULL OR revision < ?2 THEN ?2 '
-      'ELSE revision END '
-      'WHERE uuid_id = ?3',
-      variables: [
-        currentAsOf == null
-            ? const Variable<int>(null)
-            : Variable.withInt(currentAsOf),
-        Variable.withInt(newRevision),
-        Variable.withString(uuidId),
-      ],
-      updates: {tracks},
-      updateKind: UpdateKind.update,
-    );
-  }
-
-  /// Dismisses the stale-download warning for [uuidIds] as of each track's
-  /// CURRENT revision -- stamping `staleDismissedAtRevision` (not a bool) so
-  /// the warning re-arms if the track changes on the server again later.
-  /// Unknown uuids are ignored. One statement, so there's no read-then-write
-  /// window for a concurrent `/changes` upsert to slip a newer revision into
-  /// (which would silently dismiss a change the user never saw).
-  Future<void> dismissStaleDownloads(Iterable<String> uuidIds) async {
-    final ids = uuidIds.toSet().toList(growable: false);
-    if (ids.isEmpty) return;
-    final placeholders = List.filled(ids.length, '?').join(', ');
-    await customUpdate(
-      'UPDATE tracks SET stale_dismissed_at_revision = revision '
-      'WHERE uuid_id IN ($placeholders)',
-      variables: ids.map(Variable.withString).toList(),
-      updates: {tracks},
-      updateKind: UpdateKind.update,
-    );
-  }
-
-  Future<void> dismissStaleDownload(String uuidId) =>
-      dismissStaleDownloads([uuidId]);
-
-  /// Live list of downloaded tracks that are stale ([staleDownloadPredicate])
-  /// -- filtered in SQL so the always-on banner watch doesn't map every
-  /// downloaded track on each emission.
-  Stream<List<QueryRow>> watchStaleDownloads() {
-    return customSelect(
-      'SELECT $_selectColumns '
-      'FROM trackmetadata AS tm '
-      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
-      'WHERE $staleDownloadPredicate '
-      'ORDER BY tm.title COLLATE NOCASE, tm.uuid_id',
-      readsFrom: {trackmetadata, tracks},
-    ).watch();
-  }
-
-  /// Downloads that failed to play although their file exists (decision 6),
-  /// kept for the user to re-download or delete.
-  Stream<List<QueryRow>> watchDamagedDownloads() {
-    return customSelect(
-      'SELECT $_selectColumns '
-      'FROM trackmetadata AS tm '
-      'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
-      'WHERE t.damaged_file_path IS NOT NULL '
-      'ORDER BY tm.title COLLATE NOCASE, tm.uuid_id',
-      readsFrom: {trackmetadata, tracks},
-    ).watch();
-  }
-
-  /// Live counts of outstanding edits for the pending-edits surface.
-  /// `take_server` rows are excluded at the source: they are resolution
-  /// markers awaiting their refetch, not user-visible outbox rows.
-  Stream<({int pending, int conflicted, int rejected})>
-      watchPendingEditCounts() =>
-          _pendingEditCountsQuery().watch().map(_editCounts);
-
-  /// One-shot form of [watchPendingEditCounts] (same definition).
-  Future<({int pending, int conflicted, int rejected})> pendingEditCounts() =>
-      _pendingEditCountsQuery().get().then(_editCounts);
-
-  Selectable<QueryRow> _pendingEditCountsQuery() => customSelect(
-    "SELECT "
-    "SUM(CASE WHEN status = 'conflicted' THEN 1 ELSE 0 END) AS conflicted, "
-    "SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected, "
-    "COUNT(*) AS total FROM pending_edits "
-    "WHERE status IN ('pending', 'conflicted', 'rejected')",
-    readsFrom: {pendingEdits},
-  );
-
-  static ({int pending, int conflicted, int rejected}) _editCounts(
-    List<QueryRow> rows,
-  ) {
-    final row = rows.first;
-    final conflicted = row.readNullable<int>('conflicted') ?? 0;
-    final rejected = row.readNullable<int>('rejected') ?? 0;
-    final total = row.read<int>('total');
-    return (
-      pending: total - conflicted - rejected,
-      conflicted: conflicted,
-      rejected: rejected,
-    );
-  }
-
-  // ── Track queries ─────────────────────────────────────────────────────
-
-  (String, List<Variable>) _buildTrackQuery({
-    List<SearchParameter> searchParams = const [],
-    List<OrderParameter> orderBy = const [],
-    List<RowFilterParameter> cursorFilters = const [],
-    int? artistId,
-    int? albumId,
-    int? limit,
-    bool downloadedOnly = false,
-  }) {
-    if (albumId != null && artistId == null) {
-      throw ArgumentError('Cannot filter by album without artist');
-    }
-
-    final vars = <Variable>[];
-    final whereClauses = <String>[];
-
-    // Search parameters
-    for (final param in searchParams) {
-      final alias = aliasMap(param.column);
-      if (param.value == null) {
-        whereClauses.add('$alias."${param.column}" IS NULL');
-      } else {
-        whereClauses.add('$alias."${param.column}" ${param.operator} ?');
-        vars.add(_variableFrom(param.value!));
-      }
-    }
-
-    // Artist/album ID filters
-    if (artistId != null) {
-      whereClauses.add('tm."artist_id" = ?');
-      vars.add(Variable.withInt(artistId));
-    }
-    if (albumId != null) {
-      whereClauses.add('tm."album_id" = ?');
-      vars.add(Variable.withInt(albumId));
-    }
-
-    if (downloadedOnly) {
-      whereClauses.add(usableDownloadPredicate);
-    }
-
-    // Cursor filter
-    if (cursorFilters.isNotEmpty &&
-        orderBy.any((o) => o.nullsAs != null || o.caseInsensitive)) {
-      // The keyset comparison compares raw columns, which would disagree
-      // with a COALESCE / NOCASE sort key.
-      throw ArgumentError(
-        'cursor paging does not support nullsAs/caseInsensitive order keys',
-      );
-    }
-    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
-      final (cursorClause, cursorVars) = filterForCursor(
-        cursorFilters,
-        orderBy,
-      );
-      if (cursorClause.isNotEmpty) {
-        whereClauses.add('($cursorClause)');
-        vars.addAll(cursorVars);
-      }
-    }
-
-    var sql =
-        'SELECT $_selectColumns '
-        'FROM trackmetadata AS tm '
-        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id';
-
-    if (whereClauses.isNotEmpty) {
-      sql += ' WHERE ${whereClauses.join(' AND ')}';
-    }
-
-    if (orderBy.isNotEmpty) {
-      sql += ' ORDER BY ${trackOrderClause(orderBy)}';
-    }
-
-    if (limit != null) {
-      sql += ' LIMIT ?';
-      vars.add(Variable.withInt(limit));
-    }
-
-    return (sql, vars);
-  }
-
-  Future<List<QueryRow>> getTracks({
-    List<SearchParameter> searchParams = const [],
-    List<OrderParameter> orderBy = const [],
-    List<RowFilterParameter> cursorFilters = const [],
-    int? artistId,
-    int? albumId,
-    int? limit,
-    bool downloadedOnly = false,
-  }) {
-    final (sql, vars) = _buildTrackQuery(
-      searchParams: searchParams,
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      artistId: artistId,
-      albumId: albumId,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {trackmetadata, tracks},
-    ).get();
-  }
-
-  /// Reactive window of the first [limit] tracks in display order. Re-emits on
-  /// any write to the read tables, so edits/sync reflect without a refresh.
-  Stream<List<QueryRow>> watchTracks({
-    List<OrderParameter> orderBy = const [],
-    int? artistId,
-    int? albumId,
-    int? limit,
-    bool downloadedOnly = false,
-  }) {
-    final (sql, vars) = _buildTrackQuery(
-      orderBy: orderBy,
-      artistId: artistId,
-      albumId: albumId,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {trackmetadata, tracks},
-    ).watch();
-  }
-
-  (String, List<Variable>) buildTrackUuidQuery({
-    List<OrderParameter> orderBy = const [],
-    int? artistId,
-    int? albumId,
-  }) {
-    if (albumId != null && artistId == null) {
-      throw ArgumentError('Cannot filter by album without artist');
-    }
-
-    final vars = <Variable>[];
-    final whereClauses = <String>[];
-
-    if (artistId != null) {
-      whereClauses.add('tm."artist_id" = ?');
-      vars.add(Variable.withInt(artistId));
-    }
-    if (albumId != null) {
-      whereClauses.add('tm."album_id" = ?');
-      vars.add(Variable.withInt(albumId));
-    }
-
-    var sql =
-        'SELECT tm.uuid_id '
-        'FROM trackmetadata AS tm '
-        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id';
-
-    if (whereClauses.isNotEmpty) {
-      sql += ' WHERE ${whereClauses.join(' AND ')}';
-    }
-
-    if (orderBy.isNotEmpty) {
-      sql += ' ORDER BY ${trackOrderClause(orderBy)}';
-    }
-
-    return (sql, vars);
-  }
-
-  Future<List<String>> getTrackUuids({
-    List<OrderParameter> orderBy = const [],
-    int? artistId,
-    int? albumId,
-  }) async {
-    final (sql, vars) = buildTrackUuidQuery(
-      orderBy: orderBy,
-      artistId: artistId,
-      albumId: albumId,
-    );
-
-    final rows = await customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {trackmetadata, tracks},
-    ).get();
-    return rows.map((r) => r.read<String>('uuid_id')).toList();
-  }
-
-  Future<List<QueryRow>> getTrackByUuid(String uuid) {
-    return getTracks(
-      searchParams: [
-        SearchParameter(column: 'uuid_id', operator: '=', value: uuid),
-      ],
-      limit: 1,
-    );
-  }
-
-  /// Live form of [getTrackByUuid]: re-emits when the track's rows change
-  /// (e.g. a `/changes` pull lands a not-yet-synced track).
-  Stream<List<QueryRow>> watchTrackByUuid(String uuid) {
-    final (sql, vars) = _buildTrackQuery(
-      searchParams: [
-        SearchParameter(column: 'uuid_id', operator: '=', value: uuid),
-      ],
-      limit: 1,
-    );
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {trackmetadata, tracks},
-    ).watch();
-  }
-
-  /// SC-12 by-ID album resolver: one query over the shared album projection,
-  /// returned in the order of [ids] with missing ids dropped.
-  /// [downloadedArtOnly] picks the cover from usable downloads only (the
-  /// offline local-art variant, the same subquery the Downloaded grids use);
-  /// it does NOT filter membership.
-  Future<List<QueryRow>> getAlbumsByIds(
-    List<int> ids, {
-    bool downloadedArtOnly = false,
-  }) async {
-    if (ids.isEmpty) return [];
-    final placeholders = List.filled(ids.length, '?').join(', ');
-    final rows = await customSelect(
-      '${_albumProjection(downloadedOnly: downloadedArtOnly)} '
-      'WHERE a.id IN ($placeholders)',
-      variables: ids.map(Variable.withInt).toList(),
-      readsFrom: {albums, artists, trackmetadata, tracks},
-    ).get();
-    final byId = {for (final row in rows) row.read<int>('id'): row};
-    return [
-      for (final id in ids)
-        if (byId.containsKey(id)) byId[id]!,
-    ];
-  }
-
-  /// SC-12 by-ID artist resolver; same contract as [getAlbumsByIds].
-  Future<List<QueryRow>> getArtistsByIds(
-    List<int> ids, {
-    bool downloadedArtOnly = false,
-  }) async {
-    if (ids.isEmpty) return [];
-    final placeholders = List.filled(ids.length, '?').join(', ');
-    final rows = await customSelect(
-      '${_artistProjection(downloadedOnly: downloadedArtOnly)} '
-      'WHERE id IN ($placeholders)',
-      variables: ids.map(Variable.withInt).toList(),
-      readsFrom: {artists, trackmetadata, tracks},
-    ).get();
-    final byId = {for (final row in rows) row.read<int>('id'): row};
-    return [
-      for (final id in ids)
-        if (byId.containsKey(id)) byId[id]!,
-    ];
-  }
-
-  Future<List<QueryRow>> getTracksByUuids(List<String> uuids) {
-    if (uuids.isEmpty) return Future.value([]);
-
-    final placeholders = List.filled(uuids.length, '?').join(', ');
-    final vars = uuids.map((u) => Variable.withString(u)).toList();
-
-    final sql =
-        'SELECT $_selectColumns '
-        'FROM trackmetadata AS tm '
-        'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
-        'WHERE tm.uuid_id IN ($placeholders)';
-
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {trackmetadata, tracks},
-    ).get().then((rows) {
-      final rowsByUuid = {
-        for (final row in rows) row.read<String>('uuid_id'): row,
-      };
-      return [
-        for (final uuid in uuids)
-          if (rowsByUuid.containsKey(uuid)) rowsByUuid[uuid]!,
-      ];
-    });
-  }
-
-  Future<
-    Map<
-      String,
-      ({
-        String? filePath,
-        int? downloadedBitrateKbps,
-        int? fileSizeBytes,
-        String? downloadedQuality,
-        int? revision,
-        int? downloadedAtRevision,
-        String? downloadedCodec,
-        int? staleDismissedAtRevision,
-        String? damagedFilePath,
-      })
-    >
-  >
-  getTrackDownloadStates(List<String> uuids) async {
-    if (uuids.isEmpty) return {};
-    final placeholders = List.filled(uuids.length, '?').join(', ');
-    final rows = await customSelect(
-      'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes, '
-      'downloaded_quality, revision, downloaded_at_revision, downloaded_codec, '
-      'stale_dismissed_at_revision, damaged_file_path '
-      'FROM tracks WHERE uuid_id IN ($placeholders)',
-      variables: uuids.map(Variable.withString).toList(),
-      readsFrom: {tracks},
-    ).get();
-    return {
-      for (final r in rows)
-        r.read<String>('uuid_id'): (
-          filePath: r.readNullable<String>('file_path'),
-          downloadedBitrateKbps: r.readNullable<int>('downloaded_bitrate_kbps'),
-          fileSizeBytes: r.readNullable<int>('file_size_bytes'),
-          downloadedQuality: r.readNullable<String>('downloaded_quality'),
-          revision: r.readNullable<int>('revision'),
-          downloadedAtRevision: r.readNullable<int>('downloaded_at_revision'),
-          downloadedCodec: r.readNullable<String>('downloaded_codec'),
-          staleDismissedAtRevision: r.readNullable<int>(
-            'stale_dismissed_at_revision',
-          ),
-          damagedFilePath: r.readNullable<String>('damaged_file_path'),
-        ),
-    };
-  }
-
-  Stream<({int count, int totalBytes})> watchDownloadedStats() {
-    return customSelect(
-      'SELECT COUNT(*) AS c, COALESCE(SUM(t.file_size_bytes), 0) AS total_bytes '
-      'FROM tracks AS t WHERE $usableDownloadPredicate',
-      readsFrom: {tracks},
-    ).watch().map(
-      (rows) => (
-        count: rows.first.read<int>('c'),
-        totalBytes: rows.first.read<int>('total_bytes'),
-      ),
-    );
-  }
-
-  // ── Artist queries ────────────────────────────────────────────────────
-
-  Future<List<QueryRow>> getArtists({
-    List<ArtistOrderParameter> orderBy = const [],
-    List<ArtistRowFilterParameter> cursorFilters = const [],
-    int? limit,
-    int? offset,
-    bool downloadedOnly = false,
-  }) {
-    final (sql, vars) = _buildArtistQuery(
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      limit: limit,
-      offset: offset,
-      downloadedOnly: downloadedOnly,
-    );
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {artists, trackmetadata, tracks},
-    ).get();
-  }
-
-  /// Reactive window of the first [limit] artists in display order. Re-emits on
-  /// any write to the read tables, so edits/sync reflect without a refresh.
-  Stream<List<QueryRow>> watchArtists({
-    List<ArtistOrderParameter> orderBy = const [],
-    int? limit,
-    bool downloadedOnly = false,
-  }) {
-    final (sql, vars) = _buildArtistQuery(
-      orderBy: orderBy,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {artists, trackmetadata, tracks},
-    ).watch();
-  }
-
-  (String, List<Variable>) _buildArtistQuery({
-    List<ArtistOrderParameter> orderBy = const [],
-    List<ArtistRowFilterParameter> cursorFilters = const [],
-    int? limit,
-    int? offset,
-    bool downloadedOnly = false,
-  }) {
-    final vars = <Variable>[];
-
-    var query = _artistProjection(downloadedOnly: downloadedOnly);
-
-    final whereClauses = <String>[];
-
-    if (downloadedOnly) {
-      // Artist appears iff at least one of their tracks is downloaded. EXISTS
-      // short-circuits on first hit, so this is cheaper than a COUNT.
-      whereClauses.add(hasDownloadedTrack('artist_id', 'artists.id'));
-    }
-
-    // Cursor filter
-    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
-      final (cursorClause, cursorVars) = filterForArtistCursor(
-        cursorFilters,
-        orderBy,
-      );
-      if (cursorClause.isNotEmpty) {
-        whereClauses.add(cursorClause);
-        vars.addAll(cursorVars);
-      }
-    }
-
-    if (whereClauses.isNotEmpty) {
-      query += ' WHERE ${whereClauses.join(' AND ')}';
-    }
-
-    // ORDER BY
-    if (orderBy.isNotEmpty) {
-      final orderParts = <String>[];
-      for (final o in orderBy) {
-        final col = o.column;
-        final dir = o.isAscending ? 'ASC' : 'DESC';
-        final collate = artistTextColumns.contains(col)
-            ? ' COLLATE NOCASE'
-            : '';
-        orderParts.add('"$col"$collate $dir');
-      }
-      query += ' ORDER BY ${orderParts.join(', ')}';
-    } else {
-      query += ' ORDER BY name COLLATE NOCASE ASC';
-    }
-
-    if (limit != null) {
-      query += ' LIMIT ?';
-      vars.add(Variable.withInt(limit));
-      if (offset != null) {
-        query += ' OFFSET ?';
-        vars.add(Variable.withInt(offset));
-      }
-    }
-
-    return (query, vars);
-  }
-
-  // ── Download status aggregates ────────────────────────────────────────
-
-  /// For each album id, returns `(total, downloaded)` track counts. An album
-  /// is "fully downloaded" iff `downloaded == total && total > 0`.
-  Future<Map<int, ({int total, int downloaded})>> getAlbumDownloadCounts(
-    Iterable<int> albumIds,
-  ) => _downloadCountsByColumn('album_id', albumIds);
-
-  /// Same as [getAlbumDownloadCounts] but per artist. Used by ArtistCard to
-  /// show a "downloaded" badge when ALL of the artist's tracks are downloaded.
-  Future<Map<int, ({int total, int downloaded})>> getArtistDownloadCounts(
-    Iterable<int> artistIds,
-  ) => _downloadCountsByColumn('artist_id', artistIds);
-
-  /// Download counts for every album in one grouped query. Lets the UI batch
-  /// all visible album cards into a single read instead of one query per card.
-  Future<Map<int, ({int total, int downloaded})>> getAllAlbumDownloadCounts() =>
-      _downloadCountsByColumn('album_id', null);
-
-  /// Download counts for every artist in one grouped query.
-  Future<Map<int, ({int total, int downloaded})>>
-      getAllArtistDownloadCounts() =>
-          _downloadCountsByColumn('artist_id', null);
-
-  /// Grouped (total, downloaded) track counts by [groupColumn]. When [ids] is
-  /// null, counts every (non-null) group; otherwise restricts to [ids].
-  /// [groupColumn] is a hardcoded internal literal ('album_id'/'artist_id') —
-  /// never user input — so interpolating it is safe.
-  Future<Map<int, ({int total, int downloaded})>> _downloadCountsByColumn(
-    String groupColumn,
-    Iterable<int>? ids,
-  ) async {
-    final String whereClause;
-    final List<Variable> variables;
-    if (ids == null) {
-      whereClause = 'WHERE tm.$groupColumn IS NOT NULL ';
-      variables = const [];
-    } else {
-      final list = ids.toSet().toList(growable: false);
-      if (list.isEmpty) return const {};
-      final placeholders = List.filled(list.length, '?').join(', ');
-      whereClause = 'WHERE tm.$groupColumn IN ($placeholders) ';
-      variables = list.map(Variable.withInt).toList();
-    }
-    final rows = await customSelect(
-      'SELECT tm.$groupColumn AS aid, COUNT(*) AS total, '
-      'SUM(CASE WHEN $usableDownloadPredicate THEN 1 ELSE 0 END) AS downloaded '
-      'FROM trackmetadata tm '
-      'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
-      '$whereClause'
-      'GROUP BY tm.$groupColumn',
-      variables: variables,
-      readsFrom: {trackmetadata, tracks},
-    ).get();
-    return {
-      for (final r in rows)
-        r.read<int>('aid'): (
-          total: r.read<int>('total'),
-          downloaded: r.read<int>('downloaded'),
-        ),
-    };
-  }
-
-  // ── Album queries ─────────────────────────────────────────────────────
-
-  (String, List<Variable>) _buildAlbumQuery({
-    int? artistId,
-    List<AlbumOrderParameter> orderBy = const [],
-    List<AlbumRowFilterParameter> cursorFilters = const [],
-    int? limit,
-    bool downloadedOnly = false,
-  }) {
-    final vars = <Variable>[];
-
-    var sql = _albumProjection(downloadedOnly: downloadedOnly);
-
-    final whereClauses = <String>[];
-
-    if (artistId != null) {
-      whereClauses.add('a.artist_id = ?');
-      vars.add(Variable.withInt(artistId));
-    }
-
-    if (downloadedOnly) {
-      whereClauses.add(hasDownloadedTrack('album_id', 'a.id'));
-    }
-
-    // Cursor filter
-    if (cursorFilters.isNotEmpty && orderBy.isNotEmpty) {
-      final (cursorClause, cursorVars) = filterForAlbumCursor(
-        cursorFilters,
-        orderBy,
-      );
-      if (cursorClause.isNotEmpty) {
-        whereClauses.add('($cursorClause)');
-        vars.addAll(cursorVars);
-      }
-    }
-
-    if (whereClauses.isNotEmpty) {
-      sql += ' WHERE ${whereClauses.join(' AND ')}';
-    }
-
-    // ORDER BY
-    if (orderBy.isNotEmpty) {
-      final orderParts = <String>[];
-      for (final o in orderBy) {
-        final col = o.column;
-        final colRef = _albumColRef(col);
-        final dir = o.isAscending ? 'ASC' : 'DESC';
-        final collate = albumTextColumns.contains(col) ? ' COLLATE NOCASE' : '';
-        if (o.nullsLast) {
-          orderParts.add('$colRef IS NULL ASC');
-        }
-        orderParts.add('$colRef$collate $dir');
-      }
-      sql += ' ORDER BY ${orderParts.join(', ')}';
-    }
-
-    if (limit != null) {
-      sql += ' LIMIT ?';
-      vars.add(Variable.withInt(limit));
-    }
-
-    return (sql, vars);
-  }
-
-  Future<List<QueryRow>> getAlbums({
-    int? artistId,
-    List<AlbumOrderParameter> orderBy = const [],
-    List<AlbumRowFilterParameter> cursorFilters = const [],
-    int? limit,
-    bool downloadedOnly = false,
-  }) {
-    final (sql, vars) = _buildAlbumQuery(
-      artistId: artistId,
-      orderBy: orderBy,
-      cursorFilters: cursorFilters,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {albums, artists, trackmetadata, tracks},
-    ).get();
-  }
-
-  /// Reactive window of the first [limit] albums in display order. Re-emits on
-  /// any write to the read tables, so edits/sync reflect without a refresh.
-  Stream<List<QueryRow>> watchAlbums({
-    int? artistId,
-    List<AlbumOrderParameter> orderBy = const [],
-    int? limit,
-    bool downloadedOnly = false,
-  }) {
-    final (sql, vars) = _buildAlbumQuery(
-      artistId: artistId,
-      orderBy: orderBy,
-      limit: limit,
-      downloadedOnly: downloadedOnly,
-    );
-    return customSelect(
-      sql,
-      variables: vars,
-      readsFrom: {albums, artists, trackmetadata, tracks},
-    ).watch();
-  }
-
-  Future<
-    ({List<QueryRow> tracks, List<QueryRow> artists, List<QueryRow> albums})
-  >
-  getSearchResults(
-    String query, {
-    bool searchTracks = true,
-    bool searchArtists = true,
-    bool searchAlbums = true,
-    int limitPerType = 10,
-    bool downloadedOnly = false,
-  }) async {
-    final ftsQuery = prepareFtsQuery(query);
-    if (ftsQuery.isEmpty) {
-      return (
-        tracks: <QueryRow>[],
-        artists: <QueryRow>[],
-        albums: <QueryRow>[],
-      );
-    }
-
-    final resultTracks = <QueryRow>[];
-    final resultArtists = <QueryRow>[];
-    final resultAlbums = <QueryRow>[];
-
-    // When downloadedOnly, the filter is applied INSIDE the FTS query, before
-    // LIMIT — otherwise a downloaded match ranked below limitPerType would be
-    // dropped before we ever see it.
-    final trackDownloadedFilter = downloadedOnly
-        ? ' AND ${hasDownloadedTrack('rowid', 'fts_tracks.rowid')}'
-        : '';
-    final artistDownloadedFilter = downloadedOnly
-        ? ' AND ${hasDownloadedTrack('artist_id', 'fts_artists.rowid')}'
-        : '';
-    final albumDownloadedFilter = downloadedOnly
-        ? ' AND ${hasDownloadedTrack('album_id', 'fts_albums.rowid')}'
-        : '';
-
-    if (searchTracks) {
-      final ftsRows = await customSelect(
-        'SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH ?'
-        '$trackDownloadedFilter ORDER BY rank, rowid LIMIT ?',
-        variables: [
-          Variable.withString(ftsQuery),
-          Variable.withInt(limitPerType),
-        ],
-        readsFrom: {},
-      ).get();
-      if (ftsRows.isNotEmpty) {
-        final trackIds = ftsRows.map((r) => r.read<int>('rowid')).toList();
-        final placeholders = List.filled(trackIds.length, '?').join(', ');
-        final vars = trackIds.map((id) => Variable.withInt(id)).toList();
-        final fullRows = await customSelect(
-          'SELECT $_selectColumns, tm.rowid AS _tm_rowid '
-          'FROM trackmetadata AS tm '
-          'INNER JOIN tracks AS t ON tm.uuid_id = t.uuid_id '
-          'WHERE tm.rowid IN ($placeholders)',
-          variables: vars,
-          readsFrom: {trackmetadata, tracks},
-        ).get();
-        final idOrder = {
-          for (var i = 0; i < trackIds.length; i++) trackIds[i]: i,
-        };
-        final sorted = List<QueryRow>.from(fullRows)
-          ..sort(
-            (a, b) => (idOrder[a.read<int>('_tm_rowid')] ?? 999).compareTo(
-              idOrder[b.read<int>('_tm_rowid')] ?? 999,
-            ),
-          );
-        resultTracks.addAll(sorted);
-      }
-    }
-
-    if (searchArtists) {
-      final ftsRows = await customSelect(
-        'SELECT rowid FROM fts_artists WHERE fts_artists MATCH ?'
-        '$artistDownloadedFilter ORDER BY rank, rowid LIMIT ?',
-        variables: [
-          Variable.withString(ftsQuery),
-          Variable.withInt(limitPerType),
-        ],
-        readsFrom: {},
-      ).get();
-      if (ftsRows.isNotEmpty) {
-        final artistIds = ftsRows.map((r) => r.read<int>('rowid')).toList();
-        resultArtists.addAll(
-          await getArtistsByIds(artistIds, downloadedArtOnly: downloadedOnly),
-        );
-      }
-    }
-
-    if (searchAlbums) {
-      final ftsRows = await customSelect(
-        'SELECT rowid FROM fts_albums WHERE fts_albums MATCH ?'
-        '$albumDownloadedFilter ORDER BY rank, rowid LIMIT ?',
-        variables: [
-          Variable.withString(ftsQuery),
-          Variable.withInt(limitPerType),
-        ],
-        readsFrom: {},
-      ).get();
-      if (ftsRows.isNotEmpty) {
-        final albumIds = ftsRows.map((r) => r.read<int>('rowid')).toList();
-        resultAlbums.addAll(
-          await getAlbumsByIds(albumIds, downloadedArtOnly: downloadedOnly),
-        );
-      }
-    }
-
-    return (tracks: resultTracks, artists: resultArtists, albums: resultAlbums);
-  }
 }
 
 // ── Database factory ────────────────────────────────────────────────────
 
-LazyDatabase openAppDatabase() {
-  return LazyDatabase(() async {
-    final dir = await getApplicationSupportDirectory();
-    final file = File(p.join(dir.path, 'database.db'));
-    return NativeDatabase.createInBackground(file);
-  });
+/// The app's database file: `database.db` in the app's support folder.
+Future<File> appDatabaseFile() async {
+  final dir = await getApplicationSupportDirectory();
+  return File(p.join(dir.path, 'database.db'));
+}
+
+/// The app's database connection: a background isolate on
+/// [appDatabaseFile], opened when first used.
+AppDatabaseConnection openAppDatabase() =>
+    AppDatabaseConnection(appDatabaseFile);
+
+/// The connection to the app's database file, opened when first used. A
+/// file of another schema version is refused when it opens
+/// ([DatabaseVersionRefused]) and every later query fails the same way;
+/// [discardFile] closes the connection and deletes the file and its side
+/// files, and the next use opens a fresh file at the same path.
+class AppDatabaseConnection extends QueryExecutor {
+  AppDatabaseConnection(this._locate, {QueryExecutor Function(File)? open})
+      : _open = open ?? NativeDatabase.createInBackground;
+
+  final Future<File> Function() _locate;
+  final QueryExecutor Function(File) _open;
+  late QueryExecutor _current = _connect();
+
+  QueryExecutor _connect() => LazyDatabase(() async => _open(await _locate()));
+
+  /// Closes the connection and deletes the database file and its side files
+  /// (`-wal`, `-shm`, `-journal`): each only when it is a file, and a link
+  /// is removed as a link, never followed. Nothing else is touched, never a
+  /// folder. Whatever happens, the next use opens a new connection.
+  ///
+  /// Deleting a file the background isolate may not have closed yet is fine
+  /// where a delete only removes the name (Apple, Android, Linux) and with
+  /// the rollback journal this app uses; on Windows the delete can fail, and
+  /// the reset then stops and is finished by the next launch.
+  Future<void> discardFile() async {
+    try {
+      await _current.close();
+      final file = await _locate();
+      for (final suffix in const ['', '-wal', '-shm', '-journal']) {
+        final path = '${file.path}$suffix';
+        switch (FileSystemEntity.typeSync(path, followLinks: false)) {
+          case FileSystemEntityType.file:
+            File(path).deleteSync();
+          case FileSystemEntityType.link:
+            Link(path).deleteSync();
+          default:
+            break; // absent, a folder or anything else: left as it is
+        }
+      }
+    } finally {
+      _current = _connect();
+    }
+  }
+
+  @override
+  SqlDialect get dialect => SqlDialect.sqlite;
+
+  @override
+  Future<bool> ensureOpen(QueryExecutorUser user) => _current.ensureOpen(user);
+
+  @override
+  Future<List<Map<String, Object?>>> runSelect(
+    String statement,
+    List<Object?> args,
+  ) => _current.runSelect(statement, args);
+
+  @override
+  Future<int> runInsert(String statement, List<Object?> args) =>
+      _current.runInsert(statement, args);
+
+  @override
+  Future<int> runUpdate(String statement, List<Object?> args) =>
+      _current.runUpdate(statement, args);
+
+  @override
+  Future<int> runDelete(String statement, List<Object?> args) =>
+      _current.runDelete(statement, args);
+
+  @override
+  Future<void> runCustom(String statement, [List<Object?>? args]) =>
+      _current.runCustom(statement, args);
+
+  @override
+  Future<void> runBatched(BatchedStatements statements) =>
+      _current.runBatched(statements);
+
+  @override
+  TransactionExecutor beginTransaction() => _current.beginTransaction();
+
+  @override
+  QueryExecutor beginExclusive() => _current.beginExclusive();
+
+  @override
+  Future<void> close() => _current.close();
+}
+
+/// The [DatabaseVersionRefused] behind [error], also when it reached this
+/// isolate from the database's background isolate (wrapped in
+/// [DriftRemoteException], once per isolate hop); null for any other error.
+DatabaseVersionRefused? databaseVersionRefusalIn(Object? error) {
+  var cause = error;
+  while (cause is DriftRemoteException) {
+    cause = cause.remoteCause;
+  }
+  return cause is DatabaseVersionRefused ? cause : null;
+}
+
+/// A database stamped with another schema version than this app's: refused
+/// when it opens, before anything is written ([AppDatabase.upgradeSteps]).
+/// Its text names the two versions and nothing else (no path), so a log line
+/// may carry it (pre-merge review D3-01).
+class DatabaseVersionRefused extends UnsupportedError {
+  DatabaseVersionRefused(this.found, this.expected)
+      : super('No upgrade step from database version $found to $expected');
+
+  /// The version the file is stamped with.
+  final int found;
+
+  /// This app's schema version.
+  final int expected;
+
+  @override
+  String toString() =>
+      'DatabaseVersionRefused: found version $found, expected version '
+      '$expected';
 }
 
 // ── DTO → Companion converters ──────────────────────────────────────────

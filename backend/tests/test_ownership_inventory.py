@@ -14,13 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from app.database import ANY_OWNER, DatabaseContext
+from app.database import ANY_OWNER
 from app.database.database import Database
 from app.library import Library
 from app.models import Track, TrackMetaData
 from app.models.history import HistoryEvent
-from tests.owned_database import OwnedTestDatabase
-from tests.schema_fixtures import INIT_SQL
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 
@@ -59,6 +57,8 @@ OWNED = {
     "mark_conversion_job_failed",
     "mark_conversion_job_cancelled",
     "complete_conversion_job",
+    # A same-file conversion whose final swap was refused is taken back.
+    "undo_inplace_conversion",
     # U06-B-06: a same-file conversion whose swap the next start finished or ended.
     "settle_swapped_conversion_job",
     "bump_track_revision",
@@ -99,7 +99,7 @@ OWNED = {
     "cancel_upload_item",
     # 7A.2c: a cancel gives a validated source back.
     "get_upload_item_source_path",
-    "release_cancelled_upload_source",
+    "release_removed_upload_source",
     "retry_upload_item",
     "accept_upload_commit",
     "resolve_upload_duplicate",
@@ -346,11 +346,11 @@ ANY_OWNER_SITES: set[tuple[str, str]] = {
     ("services/conversion.py", "ConversionOrchestrator._run_job"),
     ("services/conversion.py", "ConversionOrchestrator.resume_queued"),
     ("services/conversion.py", "reconcile_conversion_jobs"),
-    ("services/track_editor.py", "reconcile_journal"),
+    ("services/journal_settle.py", "reconcile_journal"),
     # The idle identity worker finishing journal rows kept after a failed mark.
-    ("services/track_editor.py", "finish_kept_journal_rows"),
+    ("services/journal_recovery.py", "finish_kept_journal_rows"),
     # Journal recovery: a master of any owner at new_path is not the row's own copy.
-    ("services/track_editor.py", "_reconcile_relocate"),
+    ("services/journal_recovery.py", "_reconcile_relocate"),
     # Startup settle (sign-off OPEN-6.5-05): another track's master (any owner) is
     # never deleted, adopted or hashed; a leftover becomes a track only at a path
     # no track of any owner uses.
@@ -358,7 +358,7 @@ ANY_OWNER_SITES: set[tuple[str, str]] = {
     ("services/journal_settle.py", "_Row._organizer"),
     # U06-B-06: a same-file conversion's swap never overwrites a file another track
     # (of any owner) names.
-    ("services/track_editor.py", "_reconcile_inplace"),
+    ("services/journal_recovery.py", "_reconcile_inplace"),
     # The startup convert-journal eviction.
     ("main.py", "_interrupted_conversion_uuids"),
     ("services/cover_art_manager.py", "CoverArtManager.backfill_cover_art"),
@@ -377,6 +377,13 @@ ANY_OWNER_SITES: set[tuple[str, str]] = {
     ("services/upload_publish.py", "UploadPublisher._remove_own_final"),
     # 7A.3c: a placed final file is removed only when no track of any owner names it.
     ("services/upload_recovery.py", "_remove_placed_final"),
+    # Pre-merge B1-01: a deletion never moves or unlinks a file that another
+    # track's row (of any owner) names; only the catalog entry goes.
+    ("services/deletion_worker.py", "DeletionExecutor._delete_live"),
+    # Pre-merge B1-01: a tag edit's move and a conversion to another file type
+    # never give a track a path that another track's row (of any owner) names.
+    ("services/master_replace.py", "move_to_new_path"),
+    ("services/conversion.py", "ConversionOrchestrator._named_by_another_track"),
 }
 
 
@@ -386,15 +393,6 @@ def _public_methods() -> set[str]:
         for name, member in inspect.getmembers(Database)
         if not name.startswith("_") and callable(member)
     }
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 def test_every_public_database_method_is_classified():
@@ -485,6 +483,10 @@ def test_an_owned_insert_needs_a_real_owner(db, call, owner):
         lambda db: Database.complete_conversion_job(
             db, 1, "u", "aac", 1.0, 1, 1, owner_id=ANY_OWNER
         ),
+        lambda db: Database.undo_inplace_conversion(
+            db, 1, "u", 1, "x", codec="aac", bitrate_kbps=1.0, sample_rate_hz=1, channels=1,
+            owner_id=ANY_OWNER,
+        ),
         lambda db: Database.settle_swapped_conversion_job(db, 1, "u", owner_id=ANY_OWNER),
         lambda db: Database.bump_track_revision(db, "u", owner_id=ANY_OWNER),
         lambda db: Database.apply_track_metadata_edit(db, "u", {}, 1, owner_id=ANY_OWNER),
@@ -497,7 +499,7 @@ def test_an_owned_insert_needs_a_real_owner(db, call, owner):
             duration=1.0, owner_id=ANY_OWNER,
         ),
     ],
-    ids=["mark_running", "mark_failed", "mark_cancelled", "complete_job", "settle_swap", "bump_revision", "edit",
+    ids=["mark_running", "mark_failed", "mark_cancelled", "complete_job", "undo_swap", "settle_swap", "bump_revision", "edit",
          "update_cover_art", "delete_track", "delete_journal_entry", "set_user_setting",
          "refresh_audio"],
 )
@@ -539,10 +541,11 @@ def test_any_owner_appears_only_at_the_documented_sites():
 
 
 # Routes that may read the raw Database: only server-wide facts.
-# get_app_info: get_server_instance_id. register, login: the users and auth_sessions
-# tables (server-wide, spec §5.2), never owned data. logout, me (M.1b): the
-# caller's own auth_sessions row and users row (server-wide), never owned data.
-DATABASE_ROUTES = {"get_app_info", "register", "login", "logout", "me"}
+# register, login: the users and auth_sessions tables (server-wide, spec §5.2),
+# never owned data. logout, me (M.1b): the caller's own auth_sessions row and
+# users row (server-wide), never owned data. (get_app_info reads the server
+# identity cached at start-up, app.state.server_instance_id.)
+DATABASE_ROUTES = {"register", "login", "logout", "me"}
 
 
 def test_no_route_reaches_the_database_directly(configure_app):

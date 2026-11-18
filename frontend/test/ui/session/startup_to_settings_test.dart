@@ -21,28 +21,16 @@ import 'package:frontend/ui/startup_gate.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../browse_harness.dart';
+import '../../helpers/fake_session_service.dart';
 import '../../helpers/test_credentials.dart';
-
-class _Service extends SessionService {
-  _Service(super.ref);
-  LocalResetException? failure;
-  int resets = 0;
-  @override
-  Future<SessionStart> resumeSavedSession() async =>
-      const SessionStart(SessionStartKind.online);
-  @override
-  Future<LocalResetException?> resetLocalData() async {
-    resets++;
-    return failure;
-  }
-}
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// Real StartupGate -> session host -> AppShell -> top-bar Settings ->
 /// Disconnect (spec §4: not only a globally overridden harness).
 void main() {
   late AppDatabase db;
   late BrowseHarness harness;
-  late _Service service;
+  late FakeSessionService service;
   late Override noSessionApi;
 
   setUp(() async {
@@ -66,12 +54,16 @@ void main() {
         overrides: [
           noSessionApi,
           credentialStoreTestOverride(),
-          sessionServiceProvider.overrideWith((ref) => service = _Service(ref)),
+          sessionServiceProvider.overrideWith((ref) => service =
+              FakeSessionService(
+                  start: const SessionStart(SessionStartKind.online))),
         ],
       ),
     );
     await tester.pumpAndSettle();
     expect(find.byType(AppShell), findsOneWidget);
+    // The mounted session host reaches the model through the controller.
+    expect(service.activations, 1);
   }
 
   Future<void> openSettingsAndConfirmDisconnect(WidgetTester tester) async {
@@ -107,7 +99,7 @@ void main() {
     await pumpLiveApp(tester);
     // A wipe step failed (data left behind); quiesce-only issues are not
     // shown (live gate, 2026-11-07).
-    service.failure = LocalResetException([
+    service.resetFailure = LocalResetException([
       LocalResetFailure(int, StateError('wipe failed'), StackTrace.empty,
           participant: Object()),
     ]);

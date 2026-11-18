@@ -1,12 +1,15 @@
 // What the Uploads page shows (spec §7 para 3), computed from the local
 // upload intents, the running transfers' progress and whether network work
-// is possible. Pure model code: the rules for which action an item offers in
-// which state, and when network actions are off, live here (SC-26).
+// is possible. Pure model code: the row actions (cancel, reselect, retry,
+// archive files) and when network actions are off live here; the review and
+// attention predicates and the shared state sets live in
+// upload_item_rules.dart (SC-26).
+import 'package:frontend/models/byte_text.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/models/server_blocked_reason.dart';
-import 'package:frontend/services/download_manager.dart' show formatBytes;
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart';
 
 const _inProgress = {
@@ -20,18 +23,6 @@ const _inProgress = {
   'cancelling',
 };
 const _done = {'imported', 'duplicate', 'expanded'};
-/// States of an adopted row that read as sent by another device while its
-/// upload's files are seen arriving (besides `receiving`, always).
-const _otherDeviceWaiting = {'on_other_device', 'allocated', 'transferring'};
-/// Failed, refused, or waiting for the user.
-const uploadAttentionStates = {
-  'failed',
-  'rejected',
-  'needs_reselect',
-  'source_changed',
-  'duplicate_conflict',
-  'on_other_device',
-};
 const _cancellable = {
   'allocating',
   'allocated',
@@ -83,40 +74,6 @@ UploadsAvailability uploadsAvailability({
       ? UploadsAvailability.notAdvertised
       : UploadsAvailability.available;
 }
-
-/// The fallback for a `failed` item the server retries (7A.2c), used only
-/// while the server's own per-item `retryable` flag is unknown (SC-22).
-const serverRetryableCodes = {
-  'probe_timeout',
-  'probe_unavailable',
-  'upload_source_missing',
-  'upload_validation_failed',
-  'user_staged_quota_exceeded',
-  'staged_quota_exceeded',
-  'insufficient_storage',
-  'free_space_unknown',
-  'upload_write_failed',
-};
-
-/// The error codes of a `review_ready` item the server will refuse again, so
-/// the user cannot fix it by confirming (7-R1-UI-01): it is shown as not
-/// importable, needs attention, and offers only Cancel.
-const serverRefusedReviewCodes = {'upload_library_links_unsupported'};
-
-/// True for a `review_ready` item carrying a [serverRefusedReviewCodes] code.
-bool isServerRefusedReview(String state, String? errorCode) =>
-    state == 'review_ready' && serverRefusedReviewCodes.contains(errorCode);
-
-/// Whether an item in [state] can be reviewed: ready and not refused, or a
-/// duplicate conflict. One rule for Uploads rows, ZIP children and counts.
-bool offersReview(String state, String? errorCode) =>
-    (state == 'review_ready' && !isServerRefusedReview(state, errorCode)) ||
-    state == 'duplicate_conflict';
-
-/// Whether an item in [state] is failed, refused, or waiting for the user.
-bool needsUserAttention(String state, String? errorCode) =>
-    uploadAttentionStates.contains(state) ||
-    isServerRefusedReview(state, errorCode);
 
 /// One item row.
 class UploadRow {
@@ -232,6 +189,8 @@ class UploadsOverview {
     required this.rows,
     required this.counts,
     required this.limitsText,
+    this.otherDeviceSending = const {},
+    this.transfersPaused = false,
   });
 
   /// [intents] in display order; [progress] = bytes sent per running item.
@@ -273,6 +232,8 @@ class UploadsOverview {
     final maxBytes = limits?.maxFileBytes;
     return UploadsOverview(
       availability: availability,
+      otherDeviceSending: otherDeviceSending,
+      transfersPaused: transfersPaused,
       rows: rows,
       counts: UploadCounts(
         total: top.length,
@@ -305,16 +266,20 @@ class UploadsOverview {
     required Set<String> otherDeviceSending,
   }) {
     final state = i.lastState;
-    // An adopted row whose bytes another device is sending (sign-off
-    // s7-app-texts): the server receiving them, or this device saw its
-    // upload's files arrive lately (UploadArrivals). Without network nothing
-    // is known to move: the row reads as its stored state (Paused).
-    final fromOtherDevice =
-        online &&
-        !i.bytesOnThisDevice &&
-        (state == 'receiving' ||
-            (_otherDeviceWaiting.contains(state) &&
-                otherDeviceSending.contains(i.batchUuid)));
+    // An adopted row whose bytes another device is sending.
+    final fromOtherDevice = sentFromOtherDevice(
+      state,
+      bytesHere: i.bytesOnThisDevice,
+      online: online,
+      batchSending: otherDeviceSending.contains(i.batchUuid),
+    );
+    final texts = uploadItemTexts(
+      state,
+      errorCode: i.lastErrorCode,
+      bytesHere: i.bytesOnThisDevice,
+      paused: !online,
+      fromOtherDevice: fromOtherDevice,
+    );
     // Without network nothing is moving, whatever state was last stored.
     final sending = online && (state == 'transferring' || state == 'receiving');
     final sent = sending ? progressBytes : null;
@@ -334,21 +299,8 @@ class UploadsOverview {
       itemUuid: i.itemUuid,
       batchUuid: i.batchUuid,
       displayName: i.displayName,
-      // Only the row being received is uploading; a waiting one still waits.
-      statusText: fromOtherDevice && state == 'receiving'
-          ? otherDeviceSendingStatus
-          : uploadStatusText(
-              state,
-              errorCode: i.lastErrorCode,
-              paused: !online,
-            ),
-      detailText: fromOtherDevice
-          ? otherDeviceSendingText
-          : uploadDetailText(
-              state,
-              errorCode: i.lastErrorCode,
-              bytesHere: i.bytesOnThisDevice,
-            ),
+      statusText: texts.status,
+      detailText: texts.detail,
       sizeText: switch ((sent, total)) {
         (final s?, final t?) => '${formatBytes(s)} of ${formatBytes(t)}',
         (final s?, null) => '${formatBytes(s)} sent',
@@ -374,6 +326,12 @@ class UploadsOverview {
   }
 
   final UploadsAvailability availability;
+
+  /// The batches another device is sending (the upload manager's).
+  final Set<String> otherDeviceSending;
+
+  /// Nothing can move now although the page is available.
+  final bool transfersPaused;
   final List<UploadRow> rows;
   final UploadCounts counts;
 

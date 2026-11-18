@@ -1,5 +1,6 @@
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/conversion_job.dart';
+import 'package:frontend/models/dto/json_fields.dart';
 
 /// Thin wrapper around the backend's generic `/jobs` resource. Only
 /// `type="conversion"` exists today -- the shape is forward-looking per the
@@ -56,12 +57,14 @@ class JobsApi {
       query: query,
       retry: retry,
     );
-    final data = (json['data'] as List<dynamic>?) ?? const [];
+    // A missing or null data list is an empty page, as before; a malformed
+    // one is a FormatException.
+    final data = json['data'] == null ? const [] : jsonList(json, 'data');
     return JobsPage(
-      jobs: data
-          .map((j) => ConversionJob.fromJson(j as Map<String, dynamic>))
-          .toList(),
-      nextCursor: json['nextCursor'] as int?,
+      jobs: [
+        for (final j in data) ConversionJob.fromJson(jsonObject(j, 'job')),
+      ],
+      nextCursor: jsonIntOrNull(json, 'nextCursor'),
     );
   }
 
@@ -88,7 +91,7 @@ class JobsApi {
   /// 404) -- `deleteJson` defaults to retrying transient failures.
   Future<bool> cancelJob(int jobId) async {
     final json = await _apiClient.deleteJson(['jobs', jobId.toString()]);
-    return json['cancelled'] as bool;
+    return jsonBool(json, 'cancelled');
   }
 }
 

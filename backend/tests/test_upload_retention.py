@@ -9,7 +9,7 @@ batch answers 410 ``upload_batch_expired`` and never re-creates it."""
 import pytest
 
 from app.services.upload_janitor import UploadJanitor
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_validation_fixtures import stage_item
 
@@ -20,11 +20,6 @@ YOUNG = OLD + 1
 ENDED = {"imported": ", result_track_uuid = 't', result_revision = 1",
          "duplicate": ", result_track_uuid = 't', duplicate_kind = 'exact'",
          "expanded": ", kind = 'zip'", "cancelled": "", "expired": ""}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -24,7 +24,9 @@ from app.database.database import UploadItemsInUse
 from app.services.duplicate_detection import TrackRef
 from app.services.path_sanitize import assert_within
 from app.services import upload_commit
-from app.services.upload_receipt import ReceiptFiles, discard_child_files, owner_dir, remove_verified
+from app.services.upload_receipt import (
+    ReceiptFiles, discard_child_files, owner_dir, remove_then_release, remove_verified,
+)
 from app.services.upload_validation import duplicate_report_from_json, validation_token_key
 from app.database.operation_receipts import OperationConflict
 from app.models.api_return_models import UploadLimitsInfo
@@ -115,6 +117,12 @@ def _conflict_matches(library, row: dict) -> list[DuplicateMatchOut] | None:
         return None
 
 
+# A staged match is live only in the states the validation worker compares
+# against; once its upload ended (cancelled, expired, imported, failed...)
+# nothing can be published from it, so it reads like a gone one.
+_LIVE_STAGED_MATCH_STATES = ("review_ready", "committing", "duplicate_conflict")
+
+
 def _build_check(library, report) -> DuplicateCheckOut:
     matches = []
     for m in report.matches:
@@ -124,6 +132,8 @@ def _build_check(library, report) -> DuplicateCheckOut:
             matches.append(_library_track_match(library, m.subject.uuid_id, **base))
         else:
             item = library.get_upload_item(m.subject.item_uuid)
+            if item is not None and item["state"] not in _LIVE_STAGED_MATCH_STATES:
+                item = None
             summary = None
             if item is not None:
                 batch = library.get_upload_batch(item["batch_uuid"])
@@ -300,11 +310,11 @@ def _release_cancelled_source(
         recorded = library.get_upload_item_source_path(item_uuid)
         if recorded is None:
             return False
-        path = Path(recorded)
-        assert_within(path, owner_dir(uploads_root, library.owner_id))
-        if remove_verified(ReceiptFiles(), path):
-            library.release_cancelled_upload_source(
-                item_uuid, source_path=recorded, now=now, from_states=from_states)
+        remove_then_release(
+            ReceiptFiles(), Path(recorded),
+            lambda: library.release_removed_upload_source(
+                item_uuid, source_path=recorded, now=now, from_states=from_states),
+            within=owner_dir(uploads_root, library.owner_id), remove=remove_verified)
     except Exception as exc:
         logger.warning("cancelled upload source not released: %s", type(exc).__name__)
     return True

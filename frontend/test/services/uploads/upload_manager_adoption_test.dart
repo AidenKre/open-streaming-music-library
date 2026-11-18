@@ -21,6 +21,7 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_manager.dart';
 import 'package:frontend/services/uploads/upload_review_transport.dart';
+import 'package:frontend/services/uploads/uploads_overview.dart';
 
 import '../../helpers/fake_uploads_api.dart';
 import '../../helpers/upload_manager_harness.dart';
@@ -364,6 +365,118 @@ void main() {
     expect(after!['last_state'], 'expired');
     expect(after['source_descriptor_json'], before['source_descriptor_json']);
     expect(after['expected_sha256'], before['expected_sha256']);
+  });
+
+  // A7-01 (pre-merge review): a failed or unpacked row of this device follows
+  // what the server says about it when the page opens (DEV-7-23 point 4), so
+  // a retry, cancel or expiry done elsewhere is shown here. A row the server
+  // still calls failed, or one whose file the server is still waiting for,
+  // stays failed with its Retry.
+  group('a failed or unpacked row follows the server on page entry', () {
+    /// This device's file u-2 (batch u-1) ends in [localState]; a failed one
+    /// carries a retryable error code.
+    Future<void> local(String localState) async {
+      await h.verify();
+      await h.manager.addFiles([await h.file('a.flac', 'abc')]);
+      await h.pump();
+      h.api.openPuts.single.complete(state: localState, batchUuid: 'u-1');
+      await h.pump();
+      if (localState == 'failed') {
+        await h.store.update(
+          h.token,
+          ['u-2'],
+          lastErrorCode: const Value('probe_timeout'),
+        );
+      }
+      expect((await row('u-2'))!['last_state'], localState);
+    }
+
+    /// The server lists u-2 in [state].
+    void listed(String state, {Map<String, dynamic>? error}) {
+      h.api.onListBatches = (after) async => UploadBatchPage.fromJson({
+        'batches': [batchJson('u-1')],
+        'next_after': null,
+      });
+      h.api.onListItems = (batch, after) async => UploadItemPage.fromJson({
+        'items': [
+          itemJson('u-2', batchUuid: 'u-1', state: state, error: error),
+        ],
+        'next_after': null,
+      });
+    }
+
+    Future<UploadRow> overviewRow() async => UploadsOverview.of(
+      intents: await h.store.forBinding(h.token),
+      progress: const {},
+      availability: UploadsAvailability.available,
+      retryable: h.manager.retryable.value,
+    ).rows.single;
+
+    for (final state in ['imported', 'duplicate', 'cancelled', 'expired']) {
+      test('a failed row that ended elsewhere ($state) takes that state and '
+          'no longer offers Retry', () async {
+        await local('failed');
+        expect((await overviewRow()).offersRetry, isTrue);
+        listed(state);
+        await enter();
+
+        final after = await row('u-2');
+        expect(after!['last_state'], state);
+        expect(after['last_error_code'], isNull);
+        expect((await overviewRow()).offersRetry, isFalse);
+        expect((await overviewRow()).needsAttention, isFalse);
+      });
+    }
+
+    test('a failed row retried elsewhere and now ready takes the review '
+        'state', () async {
+      await local('failed');
+      listed('review_ready');
+      await enter();
+
+      expect((await row('u-2'))!['last_state'], 'review_ready');
+      expect((await overviewRow()).offersReviewTags, isTrue);
+      expect((await overviewRow()).offersRetry, isFalse);
+    });
+
+    test('a row the server still calls failed stays failed with Retry',
+        () async {
+      await local('failed');
+      listed('failed', error: {
+        'code': 'probe_timeout',
+        'message': 'probe_timeout',
+        'retryable': true,
+      });
+      await enter();
+
+      final after = await row('u-2');
+      expect(after!['last_state'], 'failed');
+      expect(after['last_error_code'], 'probe_timeout');
+      expect((await overviewRow()).offersRetry, isTrue);
+    });
+
+    for (final state in ['allocated', 'receiving']) {
+      test('a failed row whose file the server is still waiting for ($state) '
+          'stays failed with Retry', () async {
+        await local('failed');
+        listed(state);
+        await enter();
+
+        expect((await row('u-2'))!['last_state'], 'failed');
+        expect((await row('u-2'))!['last_error_code'], 'probe_timeout');
+        expect((await overviewRow()).offersRetry, isTrue);
+      });
+    }
+
+    test('an unpacked archive cancelled elsewhere takes the cancelled state',
+        () async {
+      await local('expanded');
+      listed('cancelled');
+      await enter();
+
+      expect((await row('u-2'))!['last_state'], 'cancelled');
+      expect((await overviewRow()).offersChildren, isFalse);
+    });
   });
 
   // 7-R2-02: a sign-out rotates the binding and keeps the rows; a sign-in as

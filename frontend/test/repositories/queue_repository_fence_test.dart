@@ -14,7 +14,7 @@ import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 
 import '../helpers/server_binding.dart';
-import '../ui/browse_harness.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 void main() {
   late AppDatabase db;
@@ -77,6 +77,14 @@ void main() {
     int sessionId,
   ) async {
     final items = await repo.getCanonicalItemIds(sessionId);
+    // A prepared (inactive) session of this repository, for the writers
+    // that act on one (SC-27 prepare / activate / discard).
+    final prepared = await repo.createSessionFromExplicitList(
+      sourceType: 'tracks',
+      trackUuids: ['a', 'b'],
+      activate: false,
+    );
+    final preparedItems = await repo.getCanonicalItemIds(prepared);
     return {
       'createSessionFromQuery': () => repo.createSessionFromQuery(
         sourceType: 'album',
@@ -105,6 +113,11 @@ void main() {
       'removeTrackUuidsFromQueues': () =>
           repo.removeTrackUuidsFromQueues(['b']),
       'deactivateAll': () => repo.deactivateAll(),
+      'activateSession': () => repo.activateSession(prepared),
+      'setPreparedCurrentItem': () =>
+          repo.setPreparedCurrentItem(prepared, preparedItems[1], 1),
+      'discardSession': () => repo.discardSession(prepared),
+      'pruneInactiveSessions': () => repo.pruneInactiveSessions(),
     };
   }
 

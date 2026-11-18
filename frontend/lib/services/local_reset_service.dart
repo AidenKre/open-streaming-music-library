@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/auth_api.dart';
+import 'package:frontend/database/database.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/playback/preview_player.dart';
@@ -20,6 +21,8 @@ import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/history/listen_recorder.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
+import 'package:frontend/services/queue_warm_service.dart';
+import 'package:frontend/services/recap_export_files.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
 import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
@@ -64,8 +67,11 @@ class LocalResetService {
   /// The in-memory session generation (SC-15 step 1), bumped synchronously
   /// when a reset starts. In-memory work started before a reset compares it
   /// to drop its result (durable writes are fenced by the binding row
-  /// instead); the scope rebuild discards everything else. Its first readers
-  /// are the 5A background runners (SingleFlightRunner).
+  /// instead); the scope rebuild discards everything else. Bumped by [reset],
+  /// [signOut] and [completePendingReset]. Its reader today is the
+  /// stream-quality reconcile in `settings_service.dart`
+  /// (`SettingsNotifier._syncQualityFromBackend`), which drops a server
+  /// answer that arrives after a reset or a log-out.
   int get generation => _generation;
   int _generation = 0;
 
@@ -75,9 +81,17 @@ class LocalResetService {
   /// [uncountedLossSummary] (once per call) instead of being dropped, so this
   /// never throws because of a reporter.
   Future<List<String>> pendingLossSummaries() async {
+    final List<LossReporter> reporters;
+    try {
+      reporters = _ref.read(lossReportersProvider);
+    } catch (_) {
+      // Reporters that cannot even be built are unknown too (pre-merge
+      // review D4-06): the sheet still opens, saying so.
+      return const [uncountedLossSummary];
+    }
     final summaries = <String>[];
     var uncounted = false;
-    for (final reporter in _ref.read(lossReportersProvider)) {
+    for (final reporter in reporters) {
       try {
         final summary = await reporter.pendingLossSummary();
         if (summary != null) summaries.add(summary);
@@ -141,7 +155,7 @@ class LocalResetService {
       if (!await prefs.setBool(resetPendingKey, true)) {
         throw StateError('the reset marker could not be saved');
       }
-      await _ref.read(serverBindingRepositoryProvider).fence();
+      await _fence();
     } catch (e) {
       // A wipe would most likely fail too: report and stop. (A saved marker
       // makes the next launch wipe anyway, as the user asked for.)
@@ -152,13 +166,7 @@ class LocalResetService {
     final failures = <LocalResetFailure>[];
 
     // 2. Quiesce.
-    for (final q in _ref.read(localQuiescablesProvider)) {
-      try {
-        await q.quiesce().timeout(quiesceTimeout);
-      } catch (e, st) {
-        failures.add(LocalResetFailure(q.runtimeType, e, st, quiesce: true));
-      }
-    }
+    await _quiesceAll(failures);
 
     // Disconnect also revokes the session (best effort), once the fence held
     // and old-scope work is quiesced, before the wipe deletes the credentials.
@@ -187,13 +195,7 @@ class LocalResetService {
     final revoker = _takeRevoker(verified);
     _generation++;
     final failures = <LocalResetFailure>[];
-    for (final q in _ref.read(localQuiescablesProvider)) {
-      try {
-        await q.quiesce().timeout(quiesceTimeout);
-      } catch (e, st) {
-        failures.add(LocalResetFailure(q.runtimeType, e, st, quiesce: true));
-      }
-    }
+    await _quiesceAll(failures);
     // The kept records are found again by their token after the rotation.
     try {
       final dead = _ref.read(deadSignInRecordsProvider);
@@ -230,30 +232,30 @@ class LocalResetService {
         LocalResetFailure(ServerBindingRepository, e, st),
       );
     }
-    // Closed for good (not just stopped): no recovery edge may restart it
-    // and hand the rotated token to old-scope runners.
-    final gate = _ref.read(serverBindingGateProvider);
-    gate.stop(); // back to idle: a closed gate keeps its last state
-    gate.dispose();
+    closeGateForGood();
     await _revokeWith(revoker);
     try {
       await _ref.read(credentialStoreProvider).delete();
     } catch (e, st) {
       failures.add(LocalResetFailure(CredentialStore, e, st));
     }
-    if (failures.any((f) => !f.quiesce)) {
-      throw LocalResetException(failures);
-    }
+    final result = LocalResetException(failures);
+    if (result.wipeFailed) throw result;
   }
 
   /// Finishes a reset that never completed its wipe (review major 2): the
-  /// app was killed during it, or a wipe step failed. Fence and wipe again;
-  /// nothing runs yet, so there is nothing to quiesce. Clears the marker
-  /// only when the whole wipe succeeds; throws like [reset] otherwise.
+  /// app was killed during it, or a wipe step failed. Fence and wipe again,
+  /// without quiescing: no signed-in work runs yet. The cold-start recovery
+  /// may already run in this scope and is not stopped: its two local members
+  /// are the owned-file cleanup, whose pass is fenced by the binding row, and
+  /// the download reconcile, which only clears file paths of rows the wipe
+  /// deletes. A new recovery member that writes unfenced rows would break
+  /// this. Clears the marker only when the whole wipe succeeds; throws like
+  /// [reset] otherwise.
   Future<void> completePendingReset() async {
     _generation++;
     try {
-      await _ref.read(serverBindingRepositoryProvider).fence();
+      await _fence();
     } catch (e) {
       throw LocalResetAbortedException(e);
     }
@@ -265,12 +267,51 @@ class LocalResetService {
     }
   }
 
+  /// The fence: deletes the binding row. A database of another schema
+  /// version cannot be written, so its file is deleted instead
+  /// ([AppDatabase.discardRefusedFile], after the reset marker was saved)
+  /// and the fence runs on the fresh database that replaces it; the wipe
+  /// then goes on as usual (pre-merge review D3-01).
+  Future<void> _fence() async {
+    final binding = _ref.read(serverBindingRepositoryProvider);
+    try {
+      await binding.fence();
+    } catch (e) {
+      if (databaseVersionRefusalIn(e) == null) rethrow;
+      await _ref.read(databaseProvider).discardRefusedFile();
+      await binding.fence();
+    }
+  }
+
+  /// Closes the scope's binding gate for good (not just stopped): no
+  /// recovery edge may restart it and hand the scope's token to old-scope
+  /// runners. Log-out uses it, and a launch that deleted the stored sign-in
+  /// while the scope still holds it (pre-merge review A5-01).
+  void closeGateForGood() {
+    final gate = _ref.read(serverBindingGateProvider);
+    gate.stop(); // back to idle: a closed gate keeps its last state
+    gate.dispose();
+  }
+
   /// The fence stops local writes; the gate must stop handing out the old
   /// verified token too, or a request started now (an edit flush, a sync)
   /// would still reach the server with what the user was told is lost.
   void _stopGate() {
     if (_ref.exists(serverBindingGateProvider)) {
       _ref.read(serverBindingGateProvider).stop();
+    }
+  }
+
+  /// Stops the [localQuiescablesProvider] participants in list order
+  /// (playback first), each bounded by [quiesceTimeout]. A failure or a
+  /// timeout is recorded, never thrown: stopping never blocks what follows.
+  Future<void> _quiesceAll(List<LocalResetFailure> failures) async {
+    for (final q in _ref.read(localQuiescablesProvider)) {
+      try {
+        await q.quiesce().timeout(quiesceTimeout);
+      } catch (e, st) {
+        failures.add(LocalResetFailure(q.runtimeType, e, st, quiesce: true));
+      }
     }
   }
 
@@ -341,6 +382,21 @@ class LocalResetException implements Exception {
 
   final List<LocalResetFailure> failures;
 
+  /// Every failure is a stopping (quiesce) step: every other step ran (for a
+  /// reset, the wipe; the fence keeps late work out of the new store), so
+  /// nothing was left behind. True for an empty list.
+  bool get quiesceOnly => failures.every((f) => f.quiesce);
+
+  /// A step other than stopping failed, so something may be left behind or
+  /// undone: a wipe step, the fence, the reset marker, a log-out's token
+  /// rotation or credential delete, or a held sign-in that could not be
+  /// saved. Always the opposite of [quiesceOnly].
+  bool get wipeFailed => !quiesceOnly;
+
+  /// The database wipe failed: the old catalog and sync cursors are still on
+  /// the device.
+  bool get databaseKept => failures.any((f) => f.participant is AppDatabase);
+
   @override
   String toString() =>
       'LocalResetException: ${failures.length} subsystem(s) failed to reset '
@@ -363,6 +419,7 @@ class LocalResetAbortedException implements Exception {
 final localQuiescablesProvider = Provider<List<Quiescable>>((ref) {
   return <Quiescable>[
     _PlaybackQuiescable(ref),
+    _QueueWarmQuiescable(ref),
     _ListenQuiescable(ref),
     _PreviewQuiescable(ref),
     _HistoryQuiescable(ref),
@@ -410,6 +467,7 @@ final localResettablesProvider = Provider<List<LocalResettable>>((ref) {
     _OfflineExitResettable(ref),
     ref.read(downloadManagerProvider),
     ref.read(localCoverArtStoreProvider),
+    ref.read(recapExportFilesProvider),
     ref.read(coverArtCacheProvider),
     ref.read(databaseProvider),
     _PrefsClearResettable(ref),
@@ -436,6 +494,25 @@ class _PlaybackQuiescable implements Quiescable {
 
   @override
   Future<void> quiesce() => _ref.read(queuePlayerProvider.notifier).quiesce();
+}
+
+/// The queue warm-up, right after playback (SC-15, other-issues row 71):
+/// cancels its two debounce timers and starts none until the scope is
+/// rebuilt, so no warm-up request leaves during the wipe. Never builds the
+/// service.
+class _QueueWarmQuiescable implements Quiescable {
+  _QueueWarmQuiescable(this._ref);
+  final Ref _ref;
+
+  @override
+  String get quiesceName => 'queue-warm';
+
+  @override
+  Future<void> quiesce() async {
+    if (_ref.exists(queueWarmServiceProvider)) {
+      await _ref.read(queueWarmServiceProvider).quiesce();
+    }
+  }
 }
 
 /// Listen recording, after playback (SC-15): stops taking observations
@@ -472,8 +549,8 @@ class _PreviewQuiescable implements Quiescable {
   }
 }
 
-/// Durable submissions, after history (SC-15): aborts sends in flight and
-/// closes admission. Never builds the helper.
+/// The upload manager, after history (SC-15): ends the transfers in flight,
+/// stops its status poll and closes admission. Never builds the manager.
 class _UploadsQuiescable implements Quiescable {
   _UploadsQuiescable(this._ref);
   final Ref _ref;
@@ -508,6 +585,8 @@ class _OwnedCleanupQuiescable implements Quiescable {
   }
 }
 
+/// Durable submissions, last (SC-15): aborts sends in flight and closes
+/// admission. Never builds the helper.
 class _SubmissionsQuiescable implements Quiescable {
   _SubmissionsQuiescable(this._ref);
   final Ref _ref;

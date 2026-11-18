@@ -11,14 +11,16 @@ started client needs before a test sends requests (for example logging in)
 goes into ``open_app_client``, so every client gets it.
 
 Test databases do not sync to disk (SF-BE-2): every ``sqlite3.connect`` made
-in a test process issues ``PRAGMA synchronous=OFF`` (``_connect_without_sync``
-below). That only decides whether a committed transaction survives an
+in the test process issues ``PRAGMA synchronous=OFF`` (``_connect_without_sync``
+below); a child process a test starts is not covered and keeps SQLite's
+default. That only decides whether a committed transaction survives an
 operating-system crash or power loss. Atomicity, isolation, locking, WAL
-behaviour and what other connections see are unchanged, so no test can observe
-the difference; the product's own setting is untouched. A test about
-durability settings carries ``@pytest.mark.real_sqlite_durability`` and gets
-the unwrapped ``sqlite3.connect`` (``tests/test_sqlite_test_durability.py``
-pins both sides).
+behaviour and what other connections see are unchanged, and the product's own
+setting is untouched; the one product path that reads the setting,
+``Database.make_durable``, skips its full flush of the database file when it is
+off. A test about durability settings carries
+``@pytest.mark.real_sqlite_durability`` and gets the unwrapped
+``sqlite3.connect`` (``tests/test_sqlite_test_durability.py`` pins both sides).
 
 No test reaches a host off this machine (9-R1-02: ``RealNetworkRefused``,
 checked at every test's teardown), and the suite's first ``app.config`` import
@@ -30,6 +32,7 @@ import atexit
 import contextlib
 import functools
 import ipaddress
+import logging
 import os
 import shutil
 import sqlite3
@@ -151,6 +154,44 @@ def _no_refused_network():
     check_no_refused_network()
 
 
+# The loggers whose levels and handlers decide what a later test's caplog sees
+# (operator lines go to "uvicorn.error"). pytest's own capture handlers, which
+# it attaches anew for each phase, are left out of the comparison.
+_GUARDED_LOGGERS = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+def _logging_state() -> dict:
+    state = {}
+    for name in _GUARDED_LOGGERS:
+        logger = logging.getLogger(name)
+        handlers = tuple(h for h in logger.handlers if not type(h).__module__.startswith("_pytest"))
+        state[name or "root"] = (logger.level, handlers, logger.propagate, logger.disabled)
+    state["logging.disable"] = logging.root.manager.disable
+    return state
+
+
+@pytest.fixture(autouse=True)
+def _logging_left_as_found():
+    """Fails a test that leaves a guarded logger with another level, handler
+    list, ``propagate`` or ``disabled`` than it found (after caplog's own
+    restore), and puts the state back so no later test inherits it."""
+    before = _logging_state()
+    yield
+    after = _logging_state()
+    if after == before:
+        return
+    changed = sorted(k for k in before if before[k] != after[k])
+    for name in _GUARDED_LOGGERS:
+        logger = logging.getLogger(name)
+        level, handlers, propagate, disabled = before[name or "root"]
+        own = [h for h in logger.handlers if type(h).__module__.startswith("_pytest")]
+        logger.handlers[:] = [*handlers, *own]
+        logger.propagate, logger.disabled = propagate, disabled
+        logger.setLevel(level)
+    logging.disable(before["logging.disable"])
+    pytest.fail(f"the test left these loggers changed: {', '.join(changed)}", pytrace=False)
+
+
 # 9-R1-03: ``app.config`` builds ``settings = Settings()`` at import, and
 # Settings reads ``.env`` relative to the working directory: pytest launched
 # from a developer's ``backend/`` would load its real ``.env`` (external
@@ -165,6 +206,7 @@ with contextlib.chdir(_IMPORT_CWD):
 import app.services as _services  # noqa: E402  (after the sqlite3 wrapper)
 from app.services import ffmpeg_runner as _ffmpeg_runner  # noqa: E402
 from app.services import transcoder as _transcoder  # noqa: E402
+from tests.database_fixtures import make_db  # noqa: E402
 
 TEST_ADMIN_USERNAME = "admin"
 TEST_ADMIN_PASSWORD = "test-admin-password"
@@ -243,9 +285,10 @@ def configure_app(tmp_path, monkeypatch):
     itself (its patch wins, also when made by an earlier fixture) or passes
     ``real_process_list=True``. The real path stays covered by
     ``test_ffmpeg_runner.py::TestKillOrphanedFfmpeg`` (real processes),
-    ``test_internal_dirs.py`` S7 (start-up sweeps every internal dir),
-    ``test_conversion.py`` (the conversion reconcile's own kill) and
+    ``test_internal_dirs.py`` S7 (start-up sweeps every internal dir) and
     ``test_startup_real_process_sweep.py`` (a real start-up and real listing).
+    ``test_conversion.py`` replaces the conversion reconcile's own call to
+    ``kill_orphaned_ffmpeg`` with a fake, so it covers no real listing.
     """
     # Installed at fixture setup, and only over the real function, so a patch
     # made earlier by another fixture or later in the test body wins.
@@ -338,7 +381,8 @@ def configure_app(tmp_path, monkeypatch):
 def open_app_client(configure_app):
     """Return ``open_app_client(**overrides)``: a context manager yielding a
     started ``TestClient`` on a freshly configured app (same overrides as
-    ``configure_app``). Each call reloads the app.
+    ``configure_app``). Each call imports ``app.main`` afresh (``configure_app``
+    drops the cached module; nothing is reloaded in place).
 
     The client is logged in as the master admin (Phase M.1b): its default
     ``Authorization`` header carries the admin's API token, so every API test
@@ -365,6 +409,13 @@ def app_client(open_app_client):
 
 
 @pytest.fixture
+def db(tmp_path):
+    """A fresh test database under ``tmp_path`` (``tests/database_fixtures.make_db``).
+    A test module that defines its own ``db`` fixture gets that one instead."""
+    return make_db(tmp_path)
+
+
+@pytest.fixture
 def fast_stability_poll(monkeypatch):
     """Review r1 m-R1-51: the import tests write their files before the scan,
     so the real 0.2 s stability poll (two polls per file) only adds wall time.
@@ -375,6 +426,60 @@ def fast_stability_poll(monkeypatch):
     monkeypatch.setattr(file_watcher.wait_until_stable, "__defaults__", (timeout, 0.01))
     # Review r2 m-R2-02: and a 30 ms quiet window instead of 2 s.
     monkeypatch.setattr(file_watcher, "STABILITY_QUIET_WINDOW_S", 0.03)
+
+
+# Other-issues row 62: a test whose fault is a permission that ``chmod`` takes
+# away carries ``requires_chmod_denial``. Where chmod does not deny (the tests
+# run as root, or the file system ignores mode bits) such a test is skipped,
+# never run to a false pass or a false failure. The check is a probe of what
+# chmod does here, not a user-id test.
+CHMOD_SKIP_REASON = "chmod does not deny access here (root, or mode bits not enforced)"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "requires_chmod_denial: the test's fault is a permission chmod takes away; "
+        "skipped where chmod does not deny (tests/conftest.py)",
+    )
+
+
+def probe_chmod_denial() -> bool:
+    """Whether chmod takes access away here: a folder made read-only refuses a
+    new file and a file made unreadable refuses a read. Runs the probe again on
+    every call, in a fresh temporary folder."""
+    with tempfile.TemporaryDirectory(prefix="osml-chmod-probe-") as tmp:
+        folder = os.path.join(tmp, "folder")
+        os.mkdir(folder)
+        probe = os.path.join(folder, "probe")
+        with open(probe, "wb") as f:
+            f.write(b"x")
+        os.chmod(probe, 0)
+        os.chmod(folder, 0o555)
+        try:
+            try:
+                with open(os.path.join(folder, "new"), "wb"):
+                    pass
+                write_refused = False
+            except PermissionError:
+                write_refused = True
+            try:
+                with open(probe, "rb"):
+                    pass
+                read_refused = False
+            except PermissionError:
+                read_refused = True
+            return write_refused and read_refused
+        finally:
+            os.chmod(folder, 0o755)
+            os.chmod(probe, 0o644)
+
+
+@functools.cache
+def chmod_denies() -> bool:
+    """``probe_chmod_denial`` once per test process (the answer is the machine's,
+    the same for every test)."""
+    return probe_chmod_denial()
 
 
 # Phase 6.5 (plan D16): registered markers for process-backed tests. A test
@@ -409,3 +514,5 @@ def pytest_collection_modifyitems(config, items):
         reason = tool_skip_reason(names, shutil.which)
         if reason is not None:
             item.add_marker(pytest.mark.skip(reason=reason))
+        if "requires_chmod_denial" in names and not chmod_denies():
+            item.add_marker(pytest.mark.skip(reason=CHMOD_SKIP_REASON))

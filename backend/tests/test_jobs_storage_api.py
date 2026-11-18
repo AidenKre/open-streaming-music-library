@@ -7,9 +7,9 @@ reservations); unknown free space has its own code, never 0.
 
 from types import SimpleNamespace
 
-from tests.test_jobs_api import (  # noqa: F401  (client, held_client are fixtures)
+from tests.jobs_api_fixtures import _post_job
+from tests.test_jobs_api import (
     _add_track_with_file,
-    _post_job,
     client,
     held_client,
 )

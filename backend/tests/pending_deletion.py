@@ -46,9 +46,9 @@ def mark_pending_deletion(database_path, uuid_id: str) -> None:
         )
         conn.execute(
             "INSERT INTO deletion_journal (owner_id, operation_uuid, uuid_id, original_path, "
-            "quarantine_path, base_revision, src_dev, src_ino, src_size, src_mtime_ns, "
+            "quarantine_path, base_revision, src_dev, src_ino, src_size, "
             "master_missing, stage, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 1, 1, 2, 3, 4, 0, 'intent', 1, 1)",
+            "VALUES (?, ?, ?, ?, ?, 1, 1, 2, 3, 0, 'intent', 1, 1)",
             (owner, operation, uuid_id, str(path),
              f"/quarantine/.deleting/{owner}/{operation}/{uuid_id}"),
         )

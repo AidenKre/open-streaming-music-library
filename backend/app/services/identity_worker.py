@@ -39,7 +39,7 @@ from app.services.duplicate_detection import (
     matcher_version as _matcher_version_of,
 )
 from app.services.fingerprinter import RawFingerprint, classify as classify_print
-from app.services.ffmpeg_runner import FfmpegProcessRegistry
+from app.services.ffmpeg_runner import FfmpegProcessRegistry, ToolOptions
 from app.services.identity_wakeup import IdentityWakeup
 from app.services.worker_thread import WorkerThread
 
@@ -268,17 +268,27 @@ class AudioIdentityWorker(WorkerThread):
 
     def _compute_exact_layer(self, subject: dict, path: str):
         job_id = ("identity", next(self._job_ids))
-        self._current_job = job_id
         try:
-            if self._stop.is_set():  # a stop between the loop check and here must not be lost
-                return ExactUnavailable("failed", REASON_KILLED)
-            return self._compute_exact(
-                Path(path), subject["codec"], registry=self.registry,
-                job_id=job_id, low_priority=True,
-            )
+            return self._process_step(self._exact_job, subject, path, job_id=job_id)
         finally:
-            self._current_job = None
             self.registry.forget(job_id)
+
+    def _exact_job(self, subject: dict, path: str, *, job_id):
+        if self._stop.is_set():  # a stop between the loop check and here must not be lost
+            return ExactUnavailable("failed", REASON_KILLED)
+        return self._compute_exact(Path(path), subject["codec"], options=self._tool_options(job_id))
+
+    def _fingerprint_job(self, subject: dict, path: str, *, job_id):
+        if self._stop.is_set():  # a stop between the loop check and here must not be lost
+            return FingerprintUnavailable(REASON_KILLED)
+        return audio_identity.compute_fingerprint(
+            Path(path), self._fingerprinter, params=self._params,
+            known_duration_s=subject["duration"], options=self._tool_options(job_id),
+        )
+
+    def _tool_options(self, job_id) -> ToolOptions:
+        """Every identity tool run: killable through this worker's registry, low priority."""
+        return ToolOptions(registry=self.registry, job_id=job_id, low_priority=True)
 
     def _exact_values(self, subject: dict, exact, stat1: Optional[_Stat], now: int) -> dict[str, Any]:
         values = identity_to_columns(
@@ -401,18 +411,9 @@ class AudioIdentityWorker(WorkerThread):
         self._stat1 = _stat(path)
         self._stat_known = True
         job_id = ("identity", next(self._job_ids))
-        self._current_job = job_id
         try:
-            if self._stop.is_set():  # a stop between the loop check and here must not be lost
-                result = FingerprintUnavailable(REASON_KILLED)
-            else:
-                result = audio_identity.compute_fingerprint(
-                    Path(path), self._fingerprinter, params=self._params,
-                    known_duration_s=subject["duration"], registry=self.registry,
-                    job_id=job_id, low_priority=True,
-                )
+            result = self._process_step(self._fingerprint_job, subject, path, job_id=job_id)
         finally:
-            self._current_job = None
             self.registry.forget(job_id)
         if isinstance(result, FingerprintUnavailable):
             return self._fingerprint_failure(subject, result.reason, now)

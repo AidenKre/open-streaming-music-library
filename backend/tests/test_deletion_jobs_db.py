@@ -14,26 +14,16 @@ import uuid
 
 import pytest
 
-from app.database import DatabaseContext
 from app.database.operation_receipts import OperationConflict
 from app.library import Library
 from app.models.deletions import DeletionJobRequest
-from tests.owned_database import OwnedTestDatabase, add_test_user
-from tests.schema_fixtures import INIT_SQL
+from tests.owned_database import add_test_user
+from tests.sqlite_helpers import sql_rows
 
 OP = "11111111-1111-4111-8111-111111111111"
 A = "aaaaaaaa-0000-4000-8000-000000000001"
 B = "bbbbbbbb-0000-4000-8000-000000000002"
 C = "cccccccc-0000-4000-8000-000000000003"
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 @pytest.fixture
@@ -54,22 +44,14 @@ def _request(*targets, op=OP):
     })
 
 
-def _rows(db, sql, params=()):
-    conn = sqlite3.connect(db.context.database_path)
-    try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
-
-
 def _job_rows(db):
     return (
-        _rows(db, "SELECT owner_id, operation_uuid, created_at, status FROM deletion_jobs"
+        sql_rows(db, "SELECT owner_id, operation_uuid, created_at, status FROM deletion_jobs"
                   " ORDER BY owner_id"),
-        _rows(db, "SELECT owner_id, operation_uuid, uuid_id, position, base_revision, status,"
+        sql_rows(db, "SELECT owner_id, operation_uuid, uuid_id, position, base_revision, status,"
                   " error_code, tombstone_revision, detail_json, lease_boot_id, cancel_requested"
                   " FROM deletion_job_items ORDER BY owner_id, position"),
-        _rows(db, "SELECT owner_id, operation_uuid, kind, created_at, result_ref"
+        sql_rows(db, "SELECT owner_id, operation_uuid, kind, created_at, result_ref"
                   " FROM operation_receipts ORDER BY owner_id"),
     )
 
@@ -135,7 +117,7 @@ def test_an_operation_uuid_used_for_another_kind_conflicts(db, me):
     with pytest.raises(OperationConflict):
         me.create_deletion_job(_request((A, 1)), now=500)
 
-    assert _rows(db, "SELECT COUNT(*) FROM deletion_jobs") == [(0,)]
+    assert sql_rows(db, "SELECT COUNT(*) FROM deletion_jobs") == [(0,)]
 
 
 def test_another_users_operation_uuid_is_no_handle_on_my_job(db, me, sam):
@@ -166,7 +148,7 @@ def test_a_hundred_targets_are_stored(db, me):
 
     assert me.create_deletion_job(_request(*targets), now=1)
 
-    items = _rows(db, "SELECT uuid_id, position, base_revision FROM deletion_job_items"
+    items = sql_rows(db, "SELECT uuid_id, position, base_revision FROM deletion_job_items"
                       " ORDER BY position")
     assert items == [(u, i, r) for i, (u, r) in enumerate(targets)]
 

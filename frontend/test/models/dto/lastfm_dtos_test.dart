@@ -272,6 +272,29 @@ void main() {
       }
     });
 
+    // Owner's decision 2026-11-17 (guide 6.2, R-332-09): `.` and `..` are
+    // not account names (a profile link would leave the user path).
+    test('"." and ".." are refused as account names; other dotted names '
+        'are kept', () {
+      for (final odd in ['.', '..']) {
+        expect(plausibleLastfmAccountName(odd), isNull, reason: odd);
+        expect(LastfmStatus.fromJson(_status(accountName: odd)).accountName,
+            isNull, reason: odd);
+        expect(
+          LastfmCompleted.fromJson({
+            'connection_id': 'x',
+            'account_name': odd,
+            'state': 'enabled',
+          }),
+          isNull,
+          reason: odd,
+        );
+      }
+      for (final ok in ['...', '.a', 'a.', 'a.b']) {
+        expect(plausibleLastfmAccountName(ok), ok);
+      }
+    });
+
     test('malformed problem rows are skipped; at most 20 are kept', () {
       final s = LastfmStatus.fromJson(_status(recentProblems: [
         _problem(artist: null),

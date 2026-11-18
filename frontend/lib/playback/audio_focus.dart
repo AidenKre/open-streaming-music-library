@@ -37,6 +37,13 @@ abstract interface class FocusRelinquisher {
   Future<void> relinquishFocus();
 }
 
+/// An owner that is told when the output it was asked to give up comes back
+/// unused ([AudioFocus.handBack]): it may play again what its relinquish
+/// paused.
+abstract interface class FocusReturnListener {
+  void onFocusReturned();
+}
+
 /// The owner's command path for session events (SC-27 invariant 5/10).
 abstract interface class AudioFocusOwner {
   /// Pause if playing, remembering to resume when the interruption ends.
@@ -69,10 +76,10 @@ class _Transfer {
 /// transferred, not just requested: [acquire] asks the current holder's owner
 /// to relinquish ([FocusRelinquisher]) and grants the output only once the
 /// holder acknowledged that it is silent, waiting at most [relinquishBound].
-/// No lock is held while waiting: the wait is a revision/identity check after
-/// an await, so the newest request wins (an older pending acquire answers
-/// false at once) and a late acknowledgement changes nothing. A refused or
-/// failed relinquish leaves the output with its holder.
+/// No lock is held while waiting: the wait is an identity check of the
+/// pending transfer after an await, so the newest request wins (an older
+/// pending acquire answers false at once) and a late acknowledgement changes
+/// nothing. A refused or failed relinquish leaves the output with its holder.
 class AudioFocus {
   AudioFocus(this._port, {Timer Function(Duration, void Function())? timer})
       : _timer = timer ?? Timer.new;
@@ -132,7 +139,32 @@ class AudioFocus {
     if (_pending?.to == output) _supersedePending();
     if (_holder != output) return;
     _holder = null;
-    _ownershipRevision++;
+  }
+
+  /// [output] returns the output it took, or was still waiting for, without
+  /// having used it: the other output holds it again as if the transfer had
+  /// never been asked, and its owner is told ([FocusReturnListener]) so that
+  /// it can play again what its relinquish paused (an owner that was not
+  /// playing holds the output afterwards all the same). Nothing happens when
+  /// [output] neither holds nor waits for the output, or is already being
+  /// asked to give it up.
+  void handBack(AudioOutput output) {
+    final other = output == AudioOutput.queue
+        ? AudioOutput.preview
+        : AudioOutput.queue;
+    final pending = _pending;
+    if (pending != null && pending.to == output) {
+      _supersedePending();
+    } else if (pending == null && _holder == output) {
+      _holder = _owners.containsKey(other) ? other : null;
+      _yielded.remove(other);
+    } else {
+      return;
+    }
+    final owner = _owners[other];
+    if (owner is FocusReturnListener) {
+      (owner as FocusReturnListener).onFocusReturned();
+    }
   }
 
   /// Whether [output] gave the output away and has not held it since.
@@ -140,14 +172,8 @@ class AudioFocus {
 
   final Map<AudioOutput, AudioFocusOwner> _owners = {};
   StreamSubscription<AudioSessionEvent>? _subscription;
-  int _ownershipRevision = 0;
-
-  /// Bumped whenever ownership changes.
-  int get ownershipRevision => _ownershipRevision;
-
   void bind(AudioOutput output, AudioFocusOwner owner) {
     _owners[output] = owner;
-    _ownershipRevision++;
     _subscription ??= _port.events.listen(_route);
   }
 
@@ -156,12 +182,10 @@ class AudioFocus {
   void release(AudioOutput output, AudioFocusOwner owner) {
     if (!identical(_owners[output], owner)) return;
     _owners.remove(output);
-    _ownershipRevision++;
     final pending = _pending;
     if (pending != null && pending.to == output) _supersedePending();
     if (_holder == output) {
       _holder = null;
-      _ownershipRevision++;
     }
     if (pending != null && identical(_pending, pending) && pending.from == output) {
       _complete(pending);
@@ -189,7 +213,6 @@ class AudioFocus {
   void _grant(AudioOutput output) {
     _holder = output;
     _yielded.remove(output);
-    _ownershipRevision++;
   }
 
   void _supersedePending() {

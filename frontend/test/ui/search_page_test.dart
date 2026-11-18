@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/database/database.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_providers.dart';
@@ -22,14 +23,17 @@ import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/feed/feed.dart';
+import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/utils/library_search_controller.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/library_card.dart';
 import 'package:frontend/ui/widgets/track_card.dart';
 
 import 'browse_harness.dart';
+import 'fake_library_actions.dart';
 import 'fake_library_search_controls.dart';
 import '../helpers/no_server_api.dart';
+import '../helpers/library_seed.dart' show SeedTrack, markDownloaded, seedLibrary;
 
 void main() {
   late AppDatabase db;
@@ -292,6 +296,30 @@ void main() {
       await teardownTree(tester);
     });
 
+    // Owner decision 5 (2026-11-17), APP-OTHER-1 D5: a song tap whose
+    // playback does not start shows the playback message as a short notice.
+    testWidgets('a song tap that does not start playback says so', (
+      tester,
+    ) async {
+      final actions = FakeLibraryActions()
+        ..playOutcome = Failed(StateError('x'));
+      await tester.pumpWidget(
+        h.wrap(
+          const SearchPage(),
+          overrides: [libraryActionsProvider.overrideWithValue(actions)],
+        ),
+      );
+      await search(tester, 'Blue');
+      expect(find.text("Couldn't start playback."), findsNothing);
+      await tester.tap(find.text('Blue 3'));
+      await tester.pump();
+      await tester.pump();
+      expect(actions.calls.single, startsWith('playFromList '));
+      expect(actions.calls.single, contains('search'));
+      expect(find.text("Couldn't start playback."), findsOneWidget);
+      await teardownTree(tester);
+    });
+
     testWidgets('an artist result opens that artist\'s albums', (tester) async {
       await seedLibrary(libDb, [
         const SeedTrack(
@@ -336,7 +364,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.widgetWithText(AppBar, 'Nebula'), findsOneWidget);
       final page = tester.widget<TracksPage>(find.byType(TracksPage));
-      expect((page.artistId, page.albumId), (60, 60));
+      expect((page.album?.artistId, page.album?.albumId), (60, 60));
       await teardownTree(tester);
     });
 
@@ -440,7 +468,10 @@ void main() {
       await tester.ensureVisible(albumCard(60));
       await tester.tap(albumCard(60));
       await tester.pumpAndSettle();
-      expect(tester.widget<TracksPage>(find.byType(TracksPage)).albumId, 60);
+      expect(
+        tester.widget<TracksPage>(find.byType(TracksPage)).album?.albumId,
+        60,
+      );
       await teardownTree(tester);
     });
 

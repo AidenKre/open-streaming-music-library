@@ -19,8 +19,9 @@ from app.services.track_editor import finish_kept_journal_rows
 from app.services.track_locks import TrackLocks
 from tests.identity_worker_fakes import make_worker
 from tests.identity_worker_fixtures import make_db
-from tests.test_identity_editor import SpyWakeup, _editor, _identity, _tag_write_marked, _world
-from tests.test_track_editor import _lib
+from tests.identity_editor_fixtures import SpyWakeup, _editor, _identity, _world
+from tests.test_identity_editor import _tag_write_marked
+from tests.track_editor_fixtures import _lib
 
 
 def _edit_with_a_failing_mark(monkeypatch, library, db, track, wakeup):
@@ -109,8 +110,8 @@ def test_a_failing_finisher_never_stops_the_worker(tmp_path):
 
 
 def test_a_row_that_keeps_failing_is_logged_once_not_on_every_pass(tmp_path, monkeypatch, caplog):
-    import app.services.track_editor as track_editor_mod
-    from tests.test_track_editor import _add_track, _db
+    import app.services.journal_recovery as journal_recovery
+    from tests.track_editor_fixtures import _add_track, _db
 
     db = _db(tmp_path)
     library = tmp_path / "music"
@@ -120,7 +121,7 @@ def test_a_row_that_keeps_failing_is_logged_once_not_on_every_pass(tmp_path, mon
     def boom(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(track_editor_mod, "_reconcile_one", boom)
+    monkeypatch.setattr(journal_recovery, "reconcile_one", boom)
     caplog.set_level("WARNING", logger="app.services.track_editor")
     reported = set()
 
@@ -135,14 +136,14 @@ def test_a_new_failing_row_that_reuses_a_finished_rows_id_is_logged_again(tmp_pa
     """SQLite hands out a deleted row's id again (no AUTOINCREMENT). A row that
     failed, was logged and was then finished must not silence a later failing row
     that gets the same id, for another track."""
-    import app.services.track_editor as track_editor_mod
-    from tests.test_track_editor import _add_track, _db
+    import app.services.journal_recovery as journal_recovery
+    from tests.track_editor_fixtures import _add_track, _db
 
     db = _db(tmp_path)
     library = tmp_path / "music"
     first = _add_track(db, library / "owner" / "a.m4a", "A", "Art")
     second = _add_track(db, library / "owner" / "b.m4a", "B", "Art")
-    real = track_editor_mod._reconcile_one
+    real = journal_recovery.reconcile_one
     failing = {first.uuid_id}
 
     def flaky(database, entry, *args, **kwargs):
@@ -150,7 +151,7 @@ def test_a_new_failing_row_that_reuses_a_finished_rows_id_is_logged_again(tmp_pa
             raise sqlite3.OperationalError("database is locked")
         return real(database, entry, *args, **kwargs)
 
-    monkeypatch.setattr(track_editor_mod, "_reconcile_one", flaky)
+    monkeypatch.setattr(journal_recovery, "reconcile_one", flaky)
     caplog.set_level("WARNING", logger="app.services.track_editor")
     reported = set()
 

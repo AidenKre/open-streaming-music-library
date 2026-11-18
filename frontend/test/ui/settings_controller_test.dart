@@ -5,24 +5,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/settings_controller.dart';
-
-class _Offline extends OfflineModeNotifier {
-  _Offline(this.initial);
-  final bool initial;
-  @override
-  bool build() {
-    super.build();
-    return initial;
-  }
-  void set(bool value) => state = value;
-}
+import '../helpers/test_offline.dart';
 
 void main() {
-  ({ProviderContainer c, _Offline offline}) scope(bool offline) {
-    late _Offline notifier;
+  ({ProviderContainer c, TestOffline offline}) scope(bool offline) {
+    late TestOffline notifier;
     final c = ProviderContainer(
       overrides: [
-        offlineModeProvider.overrideWith(() => notifier = _Offline(offline)),
+        offlineModeProvider.overrideWith(() => notifier = TestOffline(offline)),
       ],
     );
     addTearDown(c.dispose);

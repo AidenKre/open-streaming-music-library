@@ -15,7 +15,10 @@ from pathlib import Path
 
 import pytest
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
+from app.services.conversion import TRACK_CHANGED_ERROR
+from app.core.media_types import CODEC_TO_EXT
+from app.services import conversion as conversion_module
 from app.database.database import ANY_OWNER, ConversionJobNotRunning, Database
 from app.library import Library
 from app.services.audio_identity import (
@@ -25,32 +28,28 @@ from app.services.audio_identity import (
     ExactUnavailable,
     compute_identity,
 )
-from tests.audio_fixtures import build_identity_fixtures
+from tests.crash import Crash
+from tests.identity_conversion_fixtures import (  # noqa: F401  (fixtures is a fixture)
+    _ComputeSpy,
+    _JobWakeup,
+    _lossless_world,
+    _settled,
+    fixtures,
+)
+from tests.tool_call_capture import tool_call
+from app.services.duplicate_detection import find_duplicates
 from app.services.track_editor import reconcile_journal
 from tests.owned_database import add_test_user
-from tests.test_identity_writers import (  # noqa: F401  (db is a fixture)
-    DIGEST,
+from tests.sqlite_helpers import sql_dicts
+from tests.identity_rows import DIGEST, _identity
+from tests.test_identity_writers import (  # noqa: F401  (connection_depth is a fixture)
     _bare_track,
     _current,
-    _identity,
     _new_track,
-    _sql,
     connection_depth,
-    db,
 )
 
 NEW_DIGEST = "cd" * 32
-
-
-def _settled(db, uuid_id, *, fp_state="current"):
-    """The worker's finished state for a track: every layer current, generation 3."""
-    _sql(db, "UPDATE track_audio_identity SET generation = 3, exact_state = 'current', "
-             "exact_kind = 'pcm_sha256', exact_digest = ?, sample_rate_hz = 44100, channels = 2, "
-             "bits_per_sample = 16, fp_state = ?, fp_algorithm = 'chromaprint-2', "
-             "match_state = 'current', matcher_version = 'm1', priority = 1, attempts = 2, "
-             "next_attempt_at = 99, failure_reason = 'timeout' WHERE uuid_id = ?",
-         (DIGEST, fp_state, uuid_id))
-    return _identity(db, uuid_id)
 
 
 def _track(db):
@@ -133,7 +132,7 @@ def test_no_fingerprinter_stays_unavailable_after_a_conversion(db):
 def _unreadable(db, uuid_id, *, exact_state="failed", fp_state="failed"):
     """What the worker leaves after the exact hash failed for good (DEV-6.5-12): exact
     'failed' with nothing known, and the fingerprint marked failed with it (no fpcalc run)."""
-    _sql(db, "UPDATE track_audio_identity SET generation = 3, exact_state = ?, "
+    sql_dicts(db, "UPDATE track_audio_identity SET generation = 3, exact_state = ?, "
              "exact_kind = NULL, exact_digest = NULL, sample_rate_hz = NULL, channels = NULL, "
              "bits_per_sample = NULL, fp_state = ?, fp_algorithm = 'chromaprint-2', "
              "match_state = 'current', attempts = 4, next_attempt_at = NULL, "
@@ -306,8 +305,10 @@ def test_a_refused_commit_leaves_the_identity_untouched(db):
     assert _identity(db, uuid_id) == before
 
 
-def test_a_commit_without_an_identity_leaves_the_row_alone(db):
-    """The in-place commit runs before ``os.replace``: no identity yet."""
+def test_an_in_place_commit_marks_the_identity_stale_before_the_replace(db):
+    """The in-place commit runs before ``os.replace``: no identity yet. Pre-merge
+    A3-01: the old digest describes audio about to be replaced, so the commit
+    marks the row stale ('conversion': digest cleared, every layer pending)."""
     uuid_id = _track(db)
     before = _settled(db, uuid_id)
     job_id = _running_job(db, uuid_id)
@@ -317,7 +318,10 @@ def test_a_commit_without_an_identity_leaves_the_row_alone(db):
         inplace_journal=("/m/Lucky.flac", "/s/t.m4a"),
     )
 
-    assert _identity(db, uuid_id) == before
+    row = _identity(db, uuid_id)
+    assert (row["generation"], row["exact_state"], row["exact_kind"], row["exact_digest"],
+            row["fp_state"], row["match_state"]) \
+        == (before["generation"] + 1, "pending", None, None, "pending", "pending")
 
 
 # --- SC-16a: the conversion writers open no second connection ------------------------
@@ -358,17 +362,6 @@ def _packet_digest(path):
     ).stdout.strip()
     assert out.startswith("SHA256=")
     return out[len("SHA256="):].lower()
-
-
-class _JobWakeup:
-    """Records, at each notify, the committed generation and the journal rows left."""
-
-    def __init__(self, db, uuid_id):
-        self.db, self.uuid_id, self.seen = db, uuid_id, []
-
-    def notify(self):
-        self.seen.append((_identity(self.db, self.uuid_id)["generation"],
-                          len(self.db.list_journal_entries())))
 
 
 def _conversion_world(tmp_path, codec, target, bitrate):
@@ -423,12 +416,13 @@ def test_an_in_place_conversion_stores_the_identity_after_the_replace_and_signal
     assert db.get_conversion_job(job_id)["status"] == "done"
     assert at_write == [(True, 1)]  # new bytes in place, journal row not yet deleted
     row = _identity(db, track.uuid_id)
+    # Two bumps: the commit's 'conversion' mark (pre-merge A3-01), then the write.
     assert (row["generation"], row["exact_state"], row["exact_kind"]) \
-        == (before["generation"] + 1, "current", "packets_sha256")
+        == (before["generation"] + 2, "current", "packets_sha256")
     assert row["exact_digest"] == _packet_digest(source)
     assert row["fp_state"] == "pending"
     assert db.list_journal_entries() == []
-    assert wakeup.seen == [(before["generation"] + 1, 0)]
+    assert wakeup.seen == [(before["generation"] + 2, 0)]
 
 
 @pytest.mark.requires_ffmpeg
@@ -451,15 +445,52 @@ def test_an_in_place_identity_write_that_fails_keeps_the_job_done_and_recovery_m
     assert source.read_bytes() != original
     assert [e["intent"] for e in db.list_journal_entries()] == ["convert"]
     assert wakeup.seen == []
-    assert _identity(db, track.uuid_id) == before
+    # Pre-merge A3-01: the commit already marked the identity stale ('conversion'),
+    # so the old digest of the replaced audio is not left 'current'.
+    row = _identity(db, track.uuid_id)
+    assert (row["generation"], row["exact_state"], row["exact_kind"], row["exact_digest"],
+            row["fp_state"], row["match_state"]) \
+        == (before["generation"] + 1, "pending", None, None, "pending", "pending")
 
     monkeypatch.undo()
     reconcile_journal(db, tmp_path)
 
     row = _identity(db, track.uuid_id)
     assert (row["generation"], row["exact_state"], row["exact_digest"], row["fp_state"]) \
-        == (before["generation"] + 1, "pending", DIGEST, "pending")
+        == (before["generation"] + 2, "pending", None, "pending")
     assert db.list_journal_entries() == []
+
+
+@pytest.mark.requires_ffmpeg
+def test_an_in_place_conversion_whose_identity_write_fails_is_no_exact_copy_of_the_original(
+    tmp_path, monkeypatch
+):
+    # Pre-merge A3-01: the file now holds other audio; an upload of the original
+    # must not be refused against it, nor the finder call it an exact copy.
+    db, orch, coordinator, track, source, before, wakeup, job_id = _conversion_world(
+        tmp_path, "mp3", "mp3", 128)
+    original = AudioIdentity(
+        exact=ExactAudioHash(before["exact_kind"], before["exact_digest"], before["sample_rate_hz"],
+                             before["channels"], before["bits_per_sample"]),
+        tool_versions=None, computed_at=0)
+
+    def exact_copies():
+        with db._connection() as conn:
+            report = find_duplicates(conn, original, owner_id=db.owner_id)
+            _, refused = Database._exact_library_matches_in(
+                conn, owner_id=db.owner_id, item_uuid="item-1", identity=original, acknowledged={})
+        return [m.subject.uuid_id for m in report.matches if m.kind == "exact"], refused
+
+    assert exact_copies() == ([track.uuid_id], [track.uuid_id])
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "write_conversion_identity", boom)
+    conv._run_submitted(coordinator)
+
+    assert db.get_conversion_job(job_id)["status"] == "done"
+    assert exact_copies() == ([], [])
 
 
 @pytest.mark.requires_ffmpeg
@@ -476,11 +507,11 @@ def test_a_crash_between_the_replace_and_the_identity_write_converges_through_re
         reconcile_journal(db, tmp_path)
         snap.update(row=_identity(db, track.uuid_id), journal=db.list_journal_entries(),
                     replaced=source.read_bytes() != original)
-        raise conv._HardCrash()
+        raise Crash()
 
     monkeypatch.setattr(db, "write_conversion_identity", crash)
 
-    with pytest.raises(conv._HardCrash):
+    with pytest.raises(Crash):
         conv._run_submitted(coordinator)
 
     assert snap["replaced"] is True
@@ -488,7 +519,7 @@ def test_a_crash_between_the_replace_and_the_identity_write_converges_through_re
     row = snap["row"]
     assert (row["generation"], row["exact_state"], row["exact_digest"], row["fp_state"],
             row["match_state"], row["priority"]) \
-        == (before["generation"] + 1, "pending", DIGEST, "pending", "pending", 0)
+        == (before["generation"] + 2, "pending", None, "pending", "pending", 0)
 
 
 @pytest.mark.requires_ffmpeg
@@ -503,18 +534,20 @@ def test_a_crash_after_the_relocating_commit_converges_through_recovery(tmp_path
         snap["committed"] = _identity(db, track.uuid_id)
         reconcile_journal(db, tmp_path)
         snap["recovered"] = _identity(db, track.uuid_id)
-        raise conv._HardCrash()
+        raise Crash()
 
     monkeypatch.setattr(db, "complete_conversion_job", commit_then_crash)
 
-    with pytest.raises(conv._HardCrash):
+    with pytest.raises(Crash):
         conv._run_submitted(coordinator)
 
     committed, recovered = snap["committed"], snap["recovered"]
     assert (committed["generation"], committed["exact_state"]) \
         == (before["generation"] + 1, "current")
+    # Pre-merge A3-01: recovery's 'conversion' mark clears the digest (unknown until
+    # the worker hashes the master again), never a digest it cannot vouch for.
     assert (recovered["generation"], recovered["exact_state"], recovered["exact_digest"]) \
-        == (before["generation"] + 2, "pending", committed["exact_digest"])
+        == (before["generation"] + 2, "pending", None)
     assert wakeup.seen == []
 
 
@@ -538,54 +571,6 @@ def _pcm_digest(path):
     ).stdout.strip()
     assert out.startswith("SHA256=")
     return out[len("SHA256="):].lower()
-
-
-@pytest.fixture(scope="module")
-def fixtures(tmp_path_factory):
-    if shutil.which("ffmpeg") is None:
-        pytest.skip("ffmpeg not available")
-    return build_identity_fixtures(tmp_path_factory.mktemp("conversion-fixtures"))
-
-
-class _ComputeSpy:
-    """Wraps the real identity computer; records (file name, codec hint, kwargs) and can
-    rewrite the result for the converted temp (the test seam for a mismatch)."""
-
-    def __init__(self, rewrite_temp=None):
-        self.calls, self.rewrite_temp = [], rewrite_temp
-
-    def __call__(self, path, codec_hint, **kwargs):
-        self.calls.append((Path(path).name, codec_hint, kwargs))
-        identity = compute_identity(path, codec_hint, **kwargs)
-        if self.rewrite_temp is not None and ".tagged." in Path(path).name:
-            identity = self.rewrite_temp(identity)
-        return identity
-
-    def computed_source(self):
-        return [c for c in self.calls if ".tagged." not in c[0]]
-
-
-def _lossless_world(tmp_path, fixture, target, *, stored=None):
-    """A track whose master is a copy of ``fixture``; its identity row carries a
-    current fingerprint and either the given stored exact layer or a stale pending one."""
-    db, orch, coordinator = conv._make_orchestrator(tmp_path)
-    source = conv._root(tmp_path) / f"song{fixture.path.suffix}"
-    shutil.copyfile(fixture.path, source)
-    track = conv._add_track(db, source, codec=fixture.codec_hint)
-    _settled(db, track.uuid_id)
-    if stored is None:  # stale digest from an older generation: must not be trusted
-        _sql(db, "UPDATE track_audio_identity SET exact_state = 'pending' WHERE uuid_id = ?",
-             (track.uuid_id,))
-    else:
-        _sql(db, "UPDATE track_audio_identity SET exact_digest = ? WHERE uuid_id = ?",
-             (stored, track.uuid_id))
-    before = _identity(db, track.uuid_id)
-    spy = _ComputeSpy()
-    orch.compute_identity = spy
-    wakeup = _JobWakeup(db, track.uuid_id)
-    orch.identity_signal = wakeup
-    job_id = orch.enqueue(conv._lib(orch), track.uuid_id, target, None, track.revision)
-    return db, orch, coordinator, track, source, before, spy, wakeup, job_id
 
 
 LOSSLESS_CASES = [
@@ -613,7 +598,7 @@ def test_a_lossless_conversion_passes_and_keeps_the_digest_and_fingerprint(
     job = db.get_conversion_job(job_id)
     assert (job["status"], job["error_text"]) == ("done", None)
     master = Path(db.get_track_by_uuid(track.uuid_id).file_path)
-    assert master.suffix == f".{conv.CODEC_TO_EXT[target]}"
+    assert master.suffix == f".{CODEC_TO_EXT[target]}"
     row = _identity(db, track.uuid_id)
     assert (row["generation"], row["exact_state"], row["exact_kind"], row["exact_digest"]) \
         == (before["generation"] + 1, "current", "pcm_sha256", expected)
@@ -696,20 +681,20 @@ def test_a_source_change_during_the_job_is_a_track_change_not_a_mismatch(
     db, orch, coordinator, track, source, before, spy, wakeup, job_id = _lossless_world(
         tmp_path, fixture, "alac", stored=_pcm_digest(fixture.path))
     spy.rewrite_temp = _mismatched
-    real_transcode = conv.conversion_module.transcode
+    real_transcode = conversion_module.transcode
 
     def transcode_then_rewrite(*args, **kwargs):
         result = real_transcode(*args, **kwargs)
-        _sql(db, "UPDATE track_audio_identity SET generation = generation + 1 WHERE uuid_id = ?",
+        sql_dicts(db, "UPDATE track_audio_identity SET generation = generation + 1 WHERE uuid_id = ?",
              (track.uuid_id,))
         return result
 
-    monkeypatch.setattr(conv.conversion_module, "transcode", transcode_then_rewrite)
+    monkeypatch.setattr(conversion_module, "transcode", transcode_then_rewrite)
 
     conv._run_submitted(coordinator)
 
     job = db.get_conversion_job(job_id)
-    assert (job["status"], job["error_text"]) == ("failed", conv.TRACK_CHANGED_ERROR)
+    assert (job["status"], job["error_text"]) == ("failed", TRACK_CHANGED_ERROR)
     assert db.get_track_by_uuid(track.uuid_id).revision == track.revision
 
 
@@ -736,7 +721,7 @@ def _run_case(tmp_path, fixture, target, bitrate=None, spy=None):
     shutil.copyfile(fixture.path, source)
     track = conv._add_track(db, source, codec=fixture.codec_hint)
     _settled(db, track.uuid_id)
-    _sql(db, "UPDATE track_audio_identity SET exact_state = 'pending' WHERE uuid_id = ?",
+    sql_dicts(db, "UPDATE track_audio_identity SET exact_state = 'pending' WHERE uuid_id = ?",
          (track.uuid_id,))  # the source digest is computed, never the stale stored one
     before = _identity(db, track.uuid_id)
     spy = spy or _ComputeSpy()
@@ -764,8 +749,11 @@ def test_a_conversion_the_check_does_not_apply_to_skips_with_a_log(
     assert _skip_logged(caplog, reason)
     assert spy.computed_source() == []  # no source hash when the check cannot apply
     row = _identity(db, track.uuid_id)
+    # AAC -> ALAC stays an .m4a: an in-place conversion, whose commit also marks the
+    # identity stale before the write (pre-merge A3-01), so two bumps.
+    bumps = 2 if name == "aac256.m4a" else 1
     assert (row["generation"], row["exact_state"], row["fp_state"]) \
-        == (before["generation"] + 1, "current", "pending")
+        == (before["generation"] + bumps, "current", "pending")
 
 
 @pytest.mark.requires_ffmpeg
@@ -856,7 +844,7 @@ def test_a_source_hash_that_cannot_run_lets_the_job_proceed(tmp_path, fixtures, 
     class SourceFails(_ComputeSpy):
         def __call__(self, path, codec_hint, **kwargs):
             if ".tagged." not in Path(path).name:
-                self.calls.append((Path(path).name, codec_hint, kwargs))
+                self.calls.append((Path(path).name, codec_hint, tool_call(compute_identity, path, codec_hint, **kwargs)))
                 return AudioIdentity(exact=ExactUnavailable("failed", "timeout"),
                                      tool_versions=None, computed_at=1)
             return super().__call__(path, codec_hint, **kwargs)
@@ -917,7 +905,7 @@ def test_a_converted_file_that_cannot_be_read_back_fails_and_keeps_the_original(
 
     job = db.get_conversion_job(job_id)
     assert job["status"] == "failed"
-    assert job["error_text"] == conv.conversion_module.AUDIO_UNREADABLE_ERROR
+    assert job["error_text"] == conversion_module.AUDIO_UNREADABLE_ERROR
     conv._assert_track_untouched(db, track, source, original)
     assert not source.with_suffix(".m4a").exists()
     assert db.list_journal_entries() == []
@@ -938,7 +926,7 @@ def test_a_source_change_after_the_check_and_before_the_commit_is_a_track_change
 
     @contextlib.contextmanager
     def bump_then_lock(key):
-        _sql(db, "UPDATE track_audio_identity SET generation = generation + 1 WHERE uuid_id = ?",
+        sql_dicts(db, "UPDATE track_audio_identity SET generation = generation + 1 WHERE uuid_id = ?",
              (track.uuid_id,))
         with real_lock(key):
             yield
@@ -948,7 +936,7 @@ def test_a_source_change_after_the_check_and_before_the_commit_is_a_track_change
     conv._run_submitted(coordinator)
 
     job = db.get_conversion_job(job_id)
-    assert (job["status"], job["error_text"]) == ("failed", conv.TRACK_CHANGED_ERROR)
+    assert (job["status"], job["error_text"]) == ("failed", TRACK_CHANGED_ERROR)
     conv._assert_track_untouched(db, track, source, original)
     assert db.list_journal_entries() == []
 
@@ -957,7 +945,7 @@ def test_a_conversion_write_forgets_the_old_files_stat_snapshot(db):
     """Review F5: the stat snapshot described the old master; unknown is NULL."""
     uuid_id = _track(db)
     _settled(db, uuid_id)
-    _sql(db, "UPDATE track_audio_identity SET stat_size = 10, stat_mtime_ns = 20, "
+    sql_dicts(db, "UPDATE track_audio_identity SET stat_size = 10, stat_mtime_ns = 20, "
              "stat_inode = 30 WHERE uuid_id = ?", (uuid_id,))
 
     _write(db, uuid_id, _aac(), audio_unchanged=False)

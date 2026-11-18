@@ -4,7 +4,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/providers.dart';
-import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 
 @immutable
 class UploadDiagnostics {

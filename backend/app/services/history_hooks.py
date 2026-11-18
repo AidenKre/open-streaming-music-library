@@ -4,7 +4,8 @@
 with ONLY the newly inserted rows (never exact duplicates). Each hook runs in
 its own SAVEPOINT: a raising hook rolls back only its own writes, a
 `history_hook_failures` row is recorded, and the history batch still commits.
-No subscriber exists in Phase 5 (Phase 9D adds the scrobble outbox).
+The one subscriber is the Last.fm scrobble outbox (`lastfm_outbox.py`),
+registered at start unless Last.fm is off, and removed at shutdown.
 """
 
 import sqlite3

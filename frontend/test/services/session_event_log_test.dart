@@ -10,6 +10,7 @@ import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/session_event_log.dart';
 import 'package:frontend/services/session_service.dart';
 import 'package:path/path.dart' as p;
+import '../helpers/chmod_denial.dart';
 
 void main() {
   late Directory dir;
@@ -167,7 +168,7 @@ void main() {
     // file holds nothing that names a user, so it is left, and later
     // events are still written.
     test('a delete that fails is ignored, and later events are written',
-        () async {
+        skip: skipUnlessChmodDenies, () async {
       final l = log();
       await l.append('before');
       await Process.run('chmod', ['555', dir.path]);

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/models/conversion_job.dart';
+import 'package:frontend/models/track_names.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/ui/convert_flow.dart';
@@ -115,14 +116,17 @@ class _ConversionTileState extends ConsumerState<_ConversionTile> {
     final job = widget.job;
     final colors = Theme.of(context).colorScheme;
     final trackAsync = ref.watch(_trackByUuidProvider(job.uuidId));
-    final title = trackAsync.value?.title ?? job.uuidId;
+    // Never the internal ID (owner, 2026-11-17).
+    final title = trackAsync.value?.title ?? unknownTrackName;
     final targetLabel = job.targetCodec.toUpperCase() +
         (job.targetBitrate != null ? ' • ${job.targetBitrate} kbps' : '');
 
     final status = job.status;
-    final subtitle = status is ConversionFailed
-        ? 'Failed: ${status.message}'
-        : 'Convert to $targetLabel';
+    final subtitle = switch (status) {
+      ConversionFailed(:final message) => 'Failed: $message',
+      ConversionDone() => 'Converted to $targetLabel',
+      _ => 'Convert to $targetLabel',
+    };
 
     Widget cancelButton() => IconButton(
           icon: const Icon(Icons.close),

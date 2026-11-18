@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -14,7 +15,8 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from app.core.media_types import is_lossless, is_lossy
 from app.services.ffmpeg_runner import (
-    FfmpegProcessRegistry,
+    NO_OPTIONS,
+    ToolOptions,
     run_capture,
     scaled_timeout,
 )
@@ -91,14 +93,14 @@ def _positive_int(value: Any) -> Optional[int]:
     return n if n > 0 else None
 
 
-def _probe(path: Path, input_format: Optional[str] = None, **run_kwargs: Any) -> tuple[Optional[int], Optional[int], Optional[int]]:
+def _probe(path: Path, options: ToolOptions) -> tuple[Optional[int], Optional[int], Optional[int]]:
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "a:0",
         "-show_entries", "stream=sample_rate,channels,bits_per_raw_sample,bits_per_sample",
-        "-of", "json", *ffmpeg_input_args(input_format), str(path),
+        "-of", "json", *ffmpeg_input_args(options.input_format), str(path),
     ]
     result = run_capture(
-        cmd, timeout_s=PROBE_TIMEOUT_S, max_stdout_bytes=PROBE_MAX_STDOUT_BYTES, **run_kwargs
+        cmd, timeout_s=PROBE_TIMEOUT_S, max_stdout_bytes=PROBE_MAX_STDOUT_BYTES, options=options
     )
     if result.returncode != 0:
         raise CaptureFailed(reason_for_exit(result.returncode), result.returncode)
@@ -113,14 +115,14 @@ def _probe(path: Path, input_format: Optional[str] = None, **run_kwargs: Any) ->
     return _positive_int(stream.get("sample_rate")), _positive_int(stream.get("channels")), bits
 
 
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
 def compute_exact(
     path: Path,
     codec_hint: Optional[str],
     *,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
-    low_priority: bool = False,
-    input_format: Optional[str] = None,
+    options: ToolOptions = NO_OPTIONS,
 ) -> ExactAudioHash | ExactUnavailable:
     """SHA-256 of the decoded audio (spec §3), or why that is unavailable.
 
@@ -150,27 +152,28 @@ def compute_exact(
     try:
         if not path.is_file():
             raise CaptureFailed(REASON_MASTER_MISSING)
-        run_kwargs: dict[str, Any] = {
-            "registry": registry, "job_id": job_id, "low_priority": low_priority,
-        }
-        rate, channels, bits = _probe(path, input_format, **run_kwargs)
+        rate, channels, bits = _probe(path, options)
         if kind == KIND_PACKETS:
             bits = None
         elif rate is None or channels is None:
             raise CaptureFailed(REASON_PROBE_ERROR)
         result = run_capture(
-            ["ffmpeg", "-v", "error", *ffmpeg_input_args(input_format), "-i", str(path), "-map", "0:a:0",
-             "-c:a", ffmpeg_codec, "-f", "hash", "-hash", "sha256", "-"],
+            ["ffmpeg", "-v", "error", *ffmpeg_input_args(options.input_format), "-i", str(path),
+             "-map", "0:a:0", "-c:a", ffmpeg_codec, "-f", "hash", "-hash", "sha256", "-"],
             timeout_s=scaled_timeout(path),
             max_stdout_bytes=HASH_MAX_STDOUT_BYTES,
-            **run_kwargs,
+            options=options,
         )
         if result.returncode != 0:
             raise CaptureFailed(reason_for_exit(result.returncode), result.returncode)
         match = _SHA256_RE.fullmatch(result.stdout.decode("ascii", errors="replace").strip())
         if match is None:
             raise CaptureFailed(REASON_OUTPUT_ERROR, result.returncode)
-        return ExactAudioHash(kind, match.group(1).lower(), rate, channels, bits)
+        digest = match.group(1).lower()
+        if digest == _EMPTY_SHA256:
+            # No audio: nothing to hash, never an identity.
+            raise CaptureFailed(REASON_DECODE_ERROR, result.returncode)
+        return ExactAudioHash(kind, digest, rate, channels, bits)
     except Exception as e:
         reason, error_type, returncode = reason_for_capture_exception(e)
     logger.warning(
@@ -183,9 +186,7 @@ def compute_exact(
 def check_strict_decode(
     path: Path,
     *,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
-    low_priority: bool = False,
+    options: ToolOptions = NO_OPTIONS,
     audio_end: Optional[int] = None,
 ) -> Optional[str]:
     """Decode the first audio stream once in strict mode, before a lossless
@@ -223,7 +224,7 @@ def check_strict_decode(
              "-f", "null", "-"],
             timeout_s=scaled_timeout(path),
             max_stdout_bytes=max_stdout,
-            registry=registry, job_id=job_id, low_priority=low_priority,
+            options=options,
         )
         if result.returncode == 0:
             if audio_end is not None:
@@ -378,6 +379,34 @@ def _zero_padding_size(f: Any, end: int) -> Optional[int]:
     return run if run <= TRAILING_PADDING_MAX_BYTES else None
 
 
+def _strip_trailers(path: Path) -> Optional[tuple[int, int]]:
+    """``(end, last_zero_run)`` for :func:`audio_end_without_trailer`:
+    ``last_zero_run`` is the length of the zero run when the last round that
+    removed bytes was a zero-padding strip, else 0. None as that function."""
+    last_zero_run = 0
+    try:
+        with path.open("rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            end = size
+            for _ in range(_TRAILER_MAX_ROUNDS):
+                strip = _id3v1_size(f, end) or _apev2_size(f, end)
+                zero_run = 0
+                if strip is None:
+                    strip = _zero_padding_size(f, end)
+                    if strip is None:
+                        return None
+                    zero_run = strip
+                if strip == 0:
+                    break
+                end -= strip
+                last_zero_run = zero_run
+                if end <= 0:
+                    return None
+    except OSError:
+        return None
+    return (end, last_zero_run) if end < size else None
+
+
 def audio_end_without_trailer(path: Path) -> Optional[int]:
     """Byte length of ``path`` without the trailers it recognises, or None
     when none is recognised, nothing would be left, or the file cannot be read.
@@ -393,33 +422,28 @@ def audio_end_without_trailer(path: Path) -> Optional[int]:
     length field), Enhanced TAG, and ID3v2 at the end (non-standard for FLAC).
     Reads only the tail in bounded chunks. Never raises.
     """
-    try:
-        with path.open("rb") as f:
-            size = os.fstat(f.fileno()).st_size
-            end = size
-            for _ in range(_TRAILER_MAX_ROUNDS):
-                strip = _id3v1_size(f, end) or _apev2_size(f, end)
-                if strip is None:
-                    strip = _zero_padding_size(f, end)
-                    if strip is None:
-                        return None
-                if strip == 0:
-                    break
-                end -= strip
-                if end <= 0:
-                    return None
-    except OSError:
-        return None
-    return end if end < size else None
+    stripped = _strip_trailers(path)
+    return None if stripped is None else stripped[0]
+
+
+def audio_end_candidates(path: Path) -> tuple[int, ...]:
+    """Candidate audio ends for a strict-decode retry: ``()`` when
+    :func:`audio_end_without_trailer` is None, else its value followed by up to
+    two larger ends. A healthy last frame can end with a CRC byte 0x00 (or two),
+    which reads like zero padding and is stripped with it; so when the last
+    stripped trailer was a zero run, ``end + 1`` and ``end + 2`` (never more
+    than the zeros stripped) are tried too."""
+    stripped = _strip_trailers(path)
+    if stripped is None:
+        return ()
+    end, zero_run = stripped
+    return tuple(range(end, end + min(2, zero_run) + 1))
 
 
 def measure_decoded_duration(
     path: Path,
     *,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
-    low_priority: bool = False,
-    input_format: Optional[str] = None,
+    options: ToolOptions = NO_OPTIONS,
 ) -> Optional[float]:
     """Measure a file's decoded full-track duration in seconds by decoding it once
     (spec 4.1). Used only when the tool and the track's stored duration are unknown
@@ -428,10 +452,10 @@ def measure_decoded_duration(
     errors for a failed run."""
     result = run_capture(
         ["ffmpeg", "-v", "error", "-nostdin", "-progress", "pipe:1", "-nostats",
-         *ffmpeg_input_args(input_format), "-i", str(path), "-map", "0:a:0", "-f", "null", "-"],
+         *ffmpeg_input_args(options.input_format), "-i", str(path), "-map", "0:a:0", "-f", "null", "-"],
         timeout_s=scaled_timeout(path),
         max_stdout_bytes=DECODE_PROGRESS_MAX_STDOUT_BYTES,
-        registry=registry, job_id=job_id, low_priority=low_priority,
+        options=options,
     )
     if result.returncode != 0:
         raise CaptureFailed(reason_for_exit(result.returncode), result.returncode)
@@ -464,10 +488,7 @@ def compute_fingerprint(
     *,
     params: "MatcherParams",
     known_duration_s: Optional[float] = None,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Any = None,
-    low_priority: bool = False,
-    input_format: Optional[str] = None,
+    options: ToolOptions = NO_OPTIONS,
 ) -> FingerprintIdentity | FingerprintUnavailable:
     """Fingerprint one file and classify it. Never raises; an unexpected
     exception becomes REASON_INTERNAL_ERROR (type logged, never message/path)."""
@@ -481,12 +502,7 @@ def compute_fingerprint(
     )
 
     try:
-        # Only an upload names its demuxer; library calls are made as ever.
-        forced = {} if input_format is None else {"input_format": input_format}
-        raw = fingerprinter.fingerprint(
-            path, max_seconds=FINGERPRINT_SECONDS, registry=registry, job_id=job_id,
-            low_priority=low_priority, **forced,
-        )
+        raw = fingerprinter.fingerprint(path, max_seconds=FINGERPRINT_SECONDS, options=options)
         if isinstance(raw, FingerprintFailure):
             if raw.reason == REASON_EMPTY_FINGERPRINT:
                 return FingerprintIdentity(FP_TOO_SHORT, fingerprinter.name, fingerprinter.algorithm, None, ())
@@ -506,10 +522,7 @@ def compute_fingerprint(
             # source differences of about a second or less (~8 items) are
             # absorbed by the +-fp_max_offset search.
             try:
-                measured = measure_decoded_duration(
-                    path, registry=registry, job_id=job_id, low_priority=low_priority,
-                    **forced,
-                )
+                measured = measure_decoded_duration(path, options=options)
             except Exception as e:
                 reason, error_type, _ = reason_for_capture_exception(e)
                 logger.warning("decoded duration failed: reason=%s error=%s", reason, error_type)
@@ -567,20 +580,20 @@ def split_tool_versions(versions: Optional[str]) -> tuple[Optional[str], Optiona
     return head, (tail if sep else None)
 
 
-def tool_versions(*, fingerprinter: Any = None, **run_kwargs: Any) -> Optional[str]:
+def tool_versions(*, fingerprinter: Any = None, options: ToolOptions = NO_OPTIONS) -> Optional[str]:
     """``"ffmpeg <ver>"`` from ``ffmpeg -version``, or None; with a
     fingerprinter ``"; <name> <tool_version>"`` is appended (e.g.
     ``"ffmpeg 8.1; fpcalc 1.6.2"``). The ffmpeg part is cached for the process
     on success; a failure (missing tool, non-zero exit, odd output) is None
     overall (a missing tool is not a version change) and not cached. Never
     raises."""
-    ffmpeg = _ffmpeg_version(**run_kwargs)
+    ffmpeg = _ffmpeg_version(options)
     if ffmpeg is None or fingerprinter is None:
         return ffmpeg
     return f"{ffmpeg}; {fingerprinter.name} {fingerprinter.tool_version}"
 
 
-def _ffmpeg_version(**run_kwargs: Any) -> Optional[str]:
+def _ffmpeg_version(options: ToolOptions = NO_OPTIONS) -> Optional[str]:
     global _tool_versions_cache
     if _tool_versions_cache is not None:
         return _tool_versions_cache
@@ -589,7 +602,7 @@ def _ffmpeg_version(**run_kwargs: Any) -> Optional[str]:
             ["ffmpeg", "-version"],
             timeout_s=_TOOL_VERSIONS_TIMEOUT_S,
             max_stdout_bytes=_TOOL_VERSIONS_MAX_STDOUT_BYTES,
-            **run_kwargs,
+            options=options,
         )
         if result.returncode != 0:
             return None
@@ -627,19 +640,14 @@ def compute_identity(
     fingerprinter: Optional["Fingerprinter"] = None,
     known_duration_s: Optional[float] = None,
     params: Optional["MatcherParams"] = None,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
-    low_priority: bool = False,
-    input_format: Optional[str] = None,
+    options: ToolOptions = NO_OPTIONS,
 ) -> AudioIdentity:
     """The audio identity of ``path``: the exact layer and, when a
     fingerprinter is given, the fingerprint layer (without one the fingerprint
     is None, i.e. not computed). Shared by the worker, the organizer and
-    Phase 7, minus storage. Never raises."""
-    kwargs = {"registry": registry, "job_id": job_id, "low_priority": low_priority}
-    # An upload names its demuxer; library calls are unchanged.
-    forced = {} if input_format is None else {"input_format": input_format}
-    exact = compute_exact(path, codec_hint, **kwargs, **forced)
+    Phase 7, minus storage. Never raises. ``options`` reach every tool run (an
+    upload's names its demuxer; a library file's names none)."""
+    exact = compute_exact(path, codec_hint, options=options)
     fingerprint = None
     if fingerprinter is not None:
         if params is None:
@@ -649,12 +657,11 @@ def compute_identity(
 
             params = MatcherParams.from_settings(settings)
         fingerprint = compute_fingerprint(
-            path, fingerprinter, params=params, known_duration_s=known_duration_s,
-            **kwargs, **forced,
+            path, fingerprinter, params=params, known_duration_s=known_duration_s, options=options,
         )
     return AudioIdentity(
         exact=exact,
-        tool_versions=tool_versions(fingerprinter=fingerprinter, **kwargs),
+        tool_versions=tool_versions(fingerprinter=fingerprinter, options=options),
         computed_at=int(time.time()),
         fingerprint=fingerprint,
     )

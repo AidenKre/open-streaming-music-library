@@ -10,6 +10,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -18,6 +19,13 @@ import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/edit_sync_mutex.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/server_binding_gate.dart';
+
+/// The stored batch of an unsent edit: the touched fields and their values
+/// (a null value is an explicit clear).
+extension on PendingEdit {
+  Map<String, Object?> get storedValues =>
+      (jsonDecode(valuesJson) as Map).cast<String, Object?>();
+}
 
 EditWriteMode _parseMode(String wire) =>
     wire == 'db_and_master' ? EditWriteMode.dbAndMaster : EditWriteMode.dbOnly;
@@ -164,7 +172,7 @@ class EditOutbox implements LossReporter {
       // coalesce onto it and clear the conflict as a side effect of
       // re-escalating write mode (e.g. reopening Get Info on a conflicted
       // db_and_master track and saving with no field changes).
-      if (edit.isEmpty && existing?.status == 'conflicted') return;
+      if (edit.isEmpty && existing?.status == PendingEditStatus.conflicted) return;
 
       // Snapshot the pre-edit state on the first edit of a batch — before the
       // optimistic write mutates the columns — and preserve it across
@@ -174,7 +182,7 @@ class EditOutbox implements LossReporter {
       // them here would poison a later revert. A rejected row is the
       // opposite: it was already reverted locally (and a `/changes` pull may
       // have landed since), so the current columns are the true "before".
-      final original = existing != null && existing.status != 'rejected'
+      final original = existing != null && existing.status != PendingEditStatus.rejected
           ? existing.originalValuesJson ??
               jsonEncode(await db.readEditableColumns(uuidId))
           : jsonEncode(await db.readEditableColumns(uuidId));
@@ -193,17 +201,16 @@ class EditOutbox implements LossReporter {
       // is fine: this batch's own flush bumps the revision, so the next
       // `/changes` pull re-sends the full row anyway.
       if (existing != null &&
-          existing.status != 'take_server' &&
-          existing.status != 'rejected') {
-        final prev =
-            (jsonDecode(existing.valuesJson) as Map).cast<String, Object?>();
+          existing.status != PendingEditStatus.takeServer &&
+          existing.status != PendingEditStatus.rejected) {
+        final prev = existing.storedValues;
         values = {...prev, ...values}; // latest value per touched key wins
         mode = _escalate(_parseMode(existing.writeMode), writeMode);
         // Re-editing a conflicted row rebases onto the server's revision so the
         // next flush builds on server truth instead of 409-ing again on the
         // stale base; otherwise keep the batch's first base.
         base =
-            (existing.status == 'conflicted' && existing.serverRevision != null)
+            (existing.status == PendingEditStatus.conflicted && existing.serverRevision != null)
                 ? existing.serverRevision
                 : existing.baseRevision;
       }
@@ -214,7 +221,7 @@ class EditOutbox implements LossReporter {
               valuesJson: Value(jsonEncode(values)),
               writeMode: Value(mode.wire),
               baseRevision: Value(base),
-              status: const Value('pending'),
+              status: const Value(PendingEditStatus.pending),
               serverRevision: const Value(null),
               originalValuesJson: Value(original),
               updatedAt: Value(DateTime.now().millisecondsSinceEpoch),
@@ -263,7 +270,7 @@ class EditOutbox implements LossReporter {
       rows = await binding.runFenced(
           bindingToken,
           () => (db.select(db.pendingEdits)
-                ..where((t) => t.status.equals('pending')))
+                ..where((t) => t.status.equals(PendingEditStatus.pending)))
               .get());
     } on BindingFencedException {
       return true;
@@ -301,7 +308,7 @@ class EditOutbox implements LossReporter {
     // Re-checked per row, right before its request: a fence may land while
     // other rows are in flight.
     if ((await binding.current())?.localBindingId != bindingToken) return;
-    final values = (jsonDecode(row.valuesJson) as Map).cast<String, dynamic>();
+    final values = row.storedValues;
     final body = <String, dynamic>{
       ...values,
       'base_revision': row.baseRevision,
@@ -348,7 +355,7 @@ class EditOutbox implements LossReporter {
             () => (db.update(db.pendingEdits)
                   ..where((t) => t.uuidId.equals(row.uuidId)))
                 .write(PendingEditsCompanion(
-              status: const Value('conflicted'),
+              status: const Value(PendingEditStatus.conflicted),
               serverRevision: Value(_serverRevisionFrom(e)),
             )),
           );
@@ -396,26 +403,14 @@ class EditOutbox implements LossReporter {
     } catch (_) {
       return false;
     }
-    final edited = (jsonDecode(row.valuesJson) as Map).cast<String, Object?>();
+    final edited = row.storedValues;
     // An empty batch (the "re-tag master from current DB values" flow with no
     // field edits) has no field to verify equality against, so it can never
     // be soundly self-resolved — always fall through to the conflict path.
     if (edited.isEmpty) return false;
-    final m = dto.metadata;
-    final server = <String, Object?>{
-      'title': m.title,
-      'artist': m.artist,
-      'album': m.album,
-      'album_artist': m.albumArtist,
-      'year': m.year,
-      'date': m.date,
-      'genre': m.genre,
-      'track_number': m.trackNumber,
-      'disc_number': m.discNumber,
-    };
     for (final entry in edited.entries) {
-      if (!server.containsKey(entry.key)) return false;
-      final serverValue = server[entry.key];
+      if (!editableMetadataColumns.contains(entry.key)) return false;
+      final serverValue = dto.metadata.editableValue(entry.key);
       final editedValue = entry.value;
       // The server NFC-normalizes string fields before storing; compare
       // normalized so a decomposed-vs-composed Unicode value that was
@@ -485,7 +480,7 @@ class EditOutbox implements LossReporter {
     final snapshotJson = row.originalValuesJson;
     if (snapshotJson == null) return;
     final snapshot = (jsonDecode(snapshotJson) as Map).cast<String, Object?>();
-    final edited = (jsonDecode(row.valuesJson) as Map).cast<String, Object?>();
+    final edited = row.storedValues;
     final current = await db.readEditableColumns(row.uuidId);
     if (current.isEmpty) return; // track row already gone locally
     final revert = <String, Object?>{
@@ -504,13 +499,13 @@ class EditOutbox implements LossReporter {
     final rebased = await mutex.run(() => binding.runFenced(token, () async {
       final row = await (db.select(db.pendingEdits)
             ..where((t) => t.uuidId.equals(uuidId))
-            ..where((t) => t.status.equals('conflicted')))
+            ..where((t) => t.status.equals(PendingEditStatus.conflicted)))
           .getSingleOrNull();
       if (row == null) return false;
       await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
           .write(PendingEditsCompanion(
         baseRevision: Value(row.serverRevision),
-        status: const Value('pending'),
+        status: const Value(PendingEditStatus.pending),
         serverRevision: const Value(null),
       ));
       return true;
@@ -543,9 +538,9 @@ class EditOutbox implements LossReporter {
         token,
         () => (db.update(db.pendingEdits)
               ..where((t) => t.uuidId.equals(uuidId))
-              ..where((t) => t.status.isIn(const ['conflicted', 'take_server'])))
+              ..where((t) => t.status.isIn(const [PendingEditStatus.conflicted, PendingEditStatus.takeServer])))
             .write(const PendingEditsCompanion(
-          status: Value('take_server'),
+          status: Value(PendingEditStatus.takeServer),
           serverRevision: Value(null),
         )),
       ),
@@ -580,7 +575,7 @@ class EditOutbox implements LossReporter {
           token,
           () => (db.delete(db.pendingEdits)
                 ..where((t) => t.uuidId.equals(uuidId))
-                ..where((t) => t.status.equals('take_server')))
+                ..where((t) => t.status.equals(PendingEditStatus.takeServer)))
               .go(),
         ),
       );
@@ -594,7 +589,7 @@ class EditOutbox implements LossReporter {
   /// section (refreshTrack re-takes the shared guards itself).
   Future<void> retryTakeServerResolutions() async {
     final rows = await (db.select(db.pendingEdits)
-          ..where((t) => t.status.equals('take_server')))
+          ..where((t) => t.status.equals(PendingEditStatus.takeServer)))
         .get();
     if (rows.isEmpty) return;
     // Defer the (small, cheap, but still redundant N times) parent-FTS
@@ -612,7 +607,7 @@ class EditOutbox implements LossReporter {
   Future<void> _markRejected(String uuidId, String reason) async {
     await (db.update(db.pendingEdits)..where((t) => t.uuidId.equals(uuidId)))
         .write(PendingEditsCompanion(
-      status: const Value('rejected'),
+      status: const Value(PendingEditStatus.rejected),
       rejectionReason: Value(reason),
       serverRevision: const Value(null),
     ));
@@ -639,7 +634,7 @@ class EditOutbox implements LossReporter {
         token,
         () => (db.delete(db.pendingEdits)
               ..where((t) => t.uuidId.equals(uuidId))
-              ..where((t) => t.status.equals('rejected')))
+              ..where((t) => t.status.equals(PendingEditStatus.rejected)))
             .go(),
       ),
     );
@@ -647,13 +642,13 @@ class EditOutbox implements LossReporter {
 
   Stream<List<PendingEdit>> watchConflicts() {
     return (db.select(db.pendingEdits)
-          ..where((t) => t.status.equals('conflicted')))
+          ..where((t) => t.status.equals(PendingEditStatus.conflicted)))
         .watch();
   }
 
   Stream<List<PendingEdit>> watchRejected() {
     return (db.select(db.pendingEdits)
-          ..where((t) => t.status.equals('rejected')))
+          ..where((t) => t.status.equals(PendingEditStatus.rejected)))
         .watch();
   }
 

@@ -53,6 +53,17 @@ _CRASH_SCRIPT = textwrap.dedent(
 )
 
 
+def test_the_schema_version_is_1_and_init_sql_stamps_it():
+    """The version is fixed at 1 until the first upgrade step is written.
+    Whoever writes it raises ``LATEST_SCHEMA_VERSION`` and the pragma together
+    and updates this test; the oldest version the server upgrades from stays 1."""
+    assert Database.LATEST_SCHEMA_VERSION == 1
+    assert Database.MINIMUM_SCHEMA_VERSION == 1
+    statements = [line.strip() for line in INIT_SQL.read_text().splitlines() if line.strip()]
+    assert statements[-2:] == ["PRAGMA user_version = 1;", "COMMIT;"]
+    assert INIT_SQL.read_text().count("PRAGMA user_version") == 1
+
+
 def _schema_objects(path: Path) -> list:
     conn = sqlite3.connect(path)
     try:

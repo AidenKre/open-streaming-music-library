@@ -300,6 +300,29 @@ void main() {
     await teardownTree(tester);
   });
 
+  // Refactor APP-UPLOAD, section 6 #4 (owner 2026-11-17): Cancel waits for a
+  // review submit like Confirm and Skip, and shows it: the button is off.
+  testWidgets('while a submit is being sent, Cancel this item is off; it is '
+      'on again when the submit ended', (tester) async {
+    fake.show(fakeReviewView('a'));
+    fake.busy = true;
+    await pump(tester);
+    ButtonStyleButton cancel() => tester.widget<ButtonStyleButton>(
+        find.ancestor(
+            of: find.text('Cancel this item'),
+            matching: find.bySubtype<ButtonStyleButton>()));
+    expect(cancel().onPressed, isNull);
+    await tester.tap(find.text('Cancel this item'));
+    await tester.pump();
+    expect(fake.calls, isNot(contains('cancel')));
+
+    fake.busy = false;
+    fake.changed();
+    await tester.pump();
+    expect(cancel().onPressed, isNotNull);
+    await teardownTree(tester);
+  });
+
   testWidgets('an item being imported offers no action', (tester) async {
     fake.show(fakeReviewView('a', state: 'committing'));
     await pump(tester);

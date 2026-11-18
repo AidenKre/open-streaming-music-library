@@ -1,5 +1,5 @@
 import 'dart:developer' as developer;
-import 'dart:math' show min;
+import 'dart:math' show Random, min;
 import 'package:drift/drift.dart';
 
 import 'package:frontend/database/database.dart';
@@ -9,6 +9,20 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 abstract final class QueueItemTypes {
   static const main = 'main';
   static const manual = 'manual';
+}
+
+/// A request has nothing to queue: no track to queue, or its current track
+/// is not among them (playback ends RejectedEmpty). Any other error while
+/// preparing is a failure (section 6 #6).
+class NothingToQueue extends StateError {
+  NothingToQueue(super.message);
+}
+
+/// The prepared session, or the target recorded in it, is gone (a catalog
+/// sync removed it, or it was discarded): the request re-resolves, then
+/// ends RejectedEmpty. Any other error while activating is a failure.
+class PreparedSessionGone extends StateError {
+  PreparedSessionGone(super.message);
 }
 
 /// Direction in the effective queue order.
@@ -43,6 +57,18 @@ class QueuePlaybackEntry {
     this.downloadedCodec,
     this.sourceCodec,
   });
+
+  /// The same entry without its download ([filePath] null): every other
+  /// field, the codecs included, is copied. A copy, not a re-read.
+  QueuePlaybackEntry withoutDownload() => QueuePlaybackEntry(
+        itemId: itemId,
+        queueType: queueType,
+        canonicalPosition: canonicalPosition,
+        playPosition: playPosition,
+        uuidId: uuidId,
+        downloadedCodec: downloadedCodec,
+        sourceCodec: sourceCodec,
+      );
 }
 
 /// Columns of a [QueuePlaybackEntry] row (aliases `po`, `qsi`, `t`). The
@@ -54,6 +80,26 @@ const _playbackEntryColumns =
     't.downloaded_codec, '
     '(SELECT tm.codec FROM trackmetadata AS tm '
     'WHERE tm.uuid_id = qsi.uuid_id) AS source_codec';
+
+/// The play order joined to its items, as every entry query starts; each
+/// query then joins `tracks` (inner: an entry whose track row is gone is
+/// not returned).
+const _playOrderJoin = 'FROM queue_session_play_order AS po '
+    'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id ';
+
+/// A [QueuePlaybackEntry] query up to its WHERE: light (no trackmetadata
+/// join; only the source codec is read from it, by a subquery).
+const _playbackEntrySelect = 'SELECT $_playbackEntryColumns '
+    '$_playOrderJoin'
+    'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id ';
+
+/// A [QueueTrackEntry] query up to its WHERE.
+const _trackEntrySelect =
+    'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
+    'po.play_position, qsi.uuid_id, $trackSelectColumns '
+    '$_playOrderJoin'
+    'INNER JOIN trackmetadata AS tm ON qsi.uuid_id = tm.uuid_id '
+    'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id ';
 
 class QueueTrackEntry extends QueuePlaybackEntry {
   final TrackUI track;
@@ -109,13 +155,27 @@ class QueueTrackRemovalResult {
 class QueueRepository {
   final AppDatabase _db;
   final ServerBindingRepository _binding;
+
+  /// What a new sticky-shuffle queue draws from (SC-27: injected, so tests
+  /// can seed it; the scope passes `queueRandomProvider`).
+  final Random _random;
   String? _token;
   bool _closed = false;
 
   QueueRepository(
     this._db, {
     ServerBindingRepository? binding,
-  }) : _binding = binding ?? ServerBindingRepository(_db);
+    Random? random,
+  }) : _binding = binding ?? ServerBindingRepository(_db),
+       _random = random ?? Random();
+
+  /// The tables a [_trackEntrySelect] query reads (for its watchers).
+  Set<TableInfo> get _trackEntryTables => {
+        _db.queueSessionPlayOrder,
+        _db.queueSessionItems,
+        _db.trackmetadata,
+        _db.tracks,
+      };
 
   /// Its session scope is gone: every later write is refused, so a lane step
   /// that outlives a reset can't pin the NEXT session's token.
@@ -172,13 +232,7 @@ class QueueRepository {
       );
       await _db.customStatement(sql, args);
 
-      final count = await _countItems(sessionId);
-      if (count == 0) {
-        await (_db.delete(
-          _db.queueSessions,
-        )..where((s) => s.id.equals(sessionId))).go();
-        throw StateError('Cannot create a queue session with no tracks');
-      }
+      await _requireItems(sessionId);
 
       await _seedPlayOrderFromCanonical(sessionId);
 
@@ -194,27 +248,12 @@ class QueueRepository {
             ],
           )
           .getSingleOrNull();
-      final currentItemId = currentRow?.read<int>('item_id');
-      if (currentItemId == null) {
-        throw StateError('Current track was not inserted into the queue');
-      }
-
-      await _setCurrentItem(sessionId, currentItemId);
-      if (shuffleEnabled) {
-        final futureMainIds = await getFutureMainItemIds(
-          sessionId,
-          currentItemId: currentItemId,
-          usePlayOrder: false,
-        );
-        futureMainIds.shuffle();
-        await _rebuildFutureSuffix(
-          sessionId,
-          currentItemId: currentItemId,
-          mainFutureItemIds: futureMainIds,
-        );
-      }
-      if (!activate) _prepared[sessionId] = null;
-      return sessionId;
+      return _finishCreatedSession(
+        sessionId,
+        currentRow?.read<int>('item_id'),
+        shuffleFuture: shuffleEnabled,
+        activate: activate,
+      );
     });
   }
 
@@ -264,13 +303,7 @@ class QueueRepository {
         }
       });
 
-      final count = await _countItems(sessionId);
-      if (count == 0) {
-        await (_db.delete(
-          _db.queueSessions,
-        )..where((s) => s.id.equals(sessionId))).go();
-        throw StateError('Cannot create a queue session with no tracks');
-      }
+      final count = await _requireItems(sessionId);
 
       if (playOrder != null) {
         final itemIdByPosition = {
@@ -283,9 +316,13 @@ class QueueRepository {
         };
         final orderedItemIds = [for (final i in playOrder) itemIdByPosition[i]!];
         await _replacePlayOrder(sessionId, orderedItemIds);
-        await _setCurrentItem(sessionId, orderedItemIds.first);
-        if (!activate) _prepared[sessionId] = null;
-        return sessionId;
+        // The order is given: never reshuffled.
+        return _finishCreatedSession(
+          sessionId,
+          orderedItemIds.first,
+          shuffleFuture: false,
+          activate: activate,
+        );
       }
 
       await _seedPlayOrderFromCanonical(sessionId);
@@ -303,28 +340,58 @@ class QueueRepository {
             ],
           )
           .getSingleOrNull();
-      final currentItemId = currentRow?.read<int>('item_id');
-      if (currentItemId == null) {
-        throw StateError('Current track was not inserted into the queue');
-      }
-
-      await _setCurrentItem(sessionId, currentItemId);
-      if (shuffleEnabled) {
-        final futureMainIds = await getFutureMainItemIds(
-          sessionId,
-          currentItemId: currentItemId,
-          usePlayOrder: false,
-        );
-        futureMainIds.shuffle();
-        await _rebuildFutureSuffix(
-          sessionId,
-          currentItemId: currentItemId,
-          mainFutureItemIds: futureMainIds,
-        );
-      }
-      if (!activate) _prepared[sessionId] = null;
-      return sessionId;
+      return _finishCreatedSession(
+        sessionId,
+        currentRow?.read<int>('item_id'),
+        shuffleFuture: shuffleEnabled,
+        activate: activate,
+      );
     });
+  }
+
+  /// The emptiness check both creation paths share: a session with no
+  /// items is deleted and refused. Returns the item count.
+  Future<int> _requireItems(int sessionId) async {
+    final count = await _countItems(sessionId);
+    if (count == 0) {
+      await (_db.delete(
+        _db.queueSessions,
+      )..where((s) => s.id.equals(sessionId))).go();
+      throw NothingToQueue('Cannot create a queue session with no tracks');
+    }
+    return count;
+  }
+
+  /// The ending both creation paths share: [currentItemId] becomes current
+  /// (null: the current track was not inserted, refused); with
+  /// [shuffleFuture] the main items after it are shuffled (sticky shuffle);
+  /// a session created inactive is registered as prepared.
+  Future<int> _finishCreatedSession(
+    int sessionId,
+    int? currentItemId, {
+    required bool shuffleFuture,
+    required bool activate,
+  }) async {
+    if (currentItemId == null) {
+      throw NothingToQueue('Current track was not inserted into the queue');
+    }
+
+    await _setCurrentItem(sessionId, currentItemId);
+    if (shuffleFuture) {
+      final futureMainIds = await getFutureMainItemIds(
+        sessionId,
+        currentItemId: currentItemId,
+        usePlayOrder: false,
+      );
+      futureMainIds.shuffle(_random);
+      await _rebuildFutureSuffix(
+        sessionId,
+        currentItemId: currentItemId,
+        mainFutureItemIds: futureMainIds,
+      );
+    }
+    if (!activate) _prepared[sessionId] = null;
+    return sessionId;
   }
 
   Future<QueueSession?> getActiveSession() {
@@ -452,10 +519,7 @@ class QueueRepository {
     ];
 
     var sql =
-        'SELECT $_playbackEntryColumns '
-        'FROM queue_session_play_order AS po '
-        'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
-        'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+        '$_playbackEntrySelect'
         'WHERE po.session_id = ? AND po.play_position >= ? '
         'ORDER BY po.play_position ASC';
 
@@ -478,10 +542,7 @@ class QueueRepository {
     final placeholders = List.filled(ids.length, '?').join(', ');
     final rows = await _db
         .customSelect(
-          'SELECT $_playbackEntryColumns '
-          'FROM queue_session_play_order AS po '
-          'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
-          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+          '$_playbackEntrySelect'
           'WHERE po.session_id = ? AND po.item_id IN ($placeholders)',
           variables: [
             Variable.withInt(sessionId),
@@ -529,10 +590,7 @@ class QueueRepository {
   ) async {
     final row = await _db
         .customSelect(
-          'SELECT $_playbackEntryColumns '
-          'FROM queue_session_play_order AS po '
-          'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
-          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+          '$_playbackEntrySelect'
           'WHERE po.session_id = ? AND po.item_id = ? '
           'LIMIT 1',
           variables: [Variable.withInt(sessionId), Variable.withInt(itemId)],
@@ -540,32 +598,6 @@ class QueueRepository {
         .getSingleOrNull();
 
     return row == null ? null : _playbackEntryFromRow(row);
-  }
-
-  Future<Map<int, int>> getPlayPositionsForItemIds(
-    int sessionId,
-    Iterable<int> itemIds,
-  ) async {
-    final ids = itemIds.toSet().toList(growable: false);
-    if (ids.isEmpty) return const {};
-
-    final placeholders = List.filled(ids.length, '?').join(', ');
-    final rows = await _db
-        .customSelect(
-          'SELECT item_id, play_position '
-          'FROM queue_session_play_order '
-          'WHERE session_id = ? AND item_id IN ($placeholders)',
-          variables: [
-            Variable.withInt(sessionId),
-            ...ids.map(Variable.withInt),
-          ],
-        )
-        .get();
-
-    return {
-      for (final row in rows)
-        row.read<int>('item_id'): row.read<int>('play_position'),
-    };
   }
 
   Future<List<int>> getCanonicalItemIds(int sessionId) async {
@@ -642,21 +674,11 @@ class QueueRepository {
   Future<QueueTrackEntry?> getTrackForItem(int sessionId, int itemId) async {
     final rows = await _db
         .customSelect(
-          'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id, $trackSelectColumns '
-          'FROM queue_session_play_order AS po '
-          'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
-          'INNER JOIN trackmetadata AS tm ON qsi.uuid_id = tm.uuid_id '
-          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+          '$_trackEntrySelect'
           'WHERE po.session_id = ? AND po.item_id = ? '
           'LIMIT 1',
           variables: [Variable.withInt(sessionId), Variable.withInt(itemId)],
-          readsFrom: {
-            _db.queueSessionPlayOrder,
-            _db.queueSessionItems,
-            _db.trackmetadata,
-            _db.tracks,
-          },
+          readsFrom: _trackEntryTables,
         )
         .get();
 
@@ -669,21 +691,11 @@ class QueueRepository {
   ) async {
     final rows = await _db
         .customSelect(
-          'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id, $trackSelectColumns '
-          'FROM queue_session_play_order AS po '
-          'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
-          'INNER JOIN trackmetadata AS tm ON qsi.uuid_id = tm.uuid_id '
-          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+          '$_trackEntrySelect'
           'WHERE po.session_id = ? '
           'ORDER BY po.play_position ASC',
           variables: [Variable.withInt(sessionId)],
-          readsFrom: {
-            _db.queueSessionPlayOrder,
-            _db.queueSessionItems,
-            _db.trackmetadata,
-            _db.tracks,
-          },
+          readsFrom: _trackEntryTables,
         )
         .get();
 
@@ -699,12 +711,7 @@ class QueueRepository {
 
     final rows = await _db
         .customSelect(
-          'SELECT po.item_id, qsi.queue_type, qsi.position AS canonical_position, '
-          'po.play_position, qsi.uuid_id, $trackSelectColumns '
-          'FROM queue_session_play_order AS po '
-          'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
-          'INNER JOIN trackmetadata AS tm ON qsi.uuid_id = tm.uuid_id '
-          'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+          '$_trackEntrySelect'
           'WHERE po.session_id = ? AND po.play_position >= ? '
           'ORDER BY po.play_position ASC '
           'LIMIT ?',
@@ -713,12 +720,7 @@ class QueueRepository {
             Variable.withInt(startPlayPosition),
             Variable.withInt(limit),
           ],
-          readsFrom: {
-            _db.queueSessionPlayOrder,
-            _db.queueSessionItems,
-            _db.trackmetadata,
-            _db.tracks,
-          },
+          readsFrom: _trackEntryTables,
         )
         .get();
 
@@ -1057,14 +1059,21 @@ class QueueRepository {
     );
   }
 
+  /// Runs [body], whose queue writes go through this repository, as one
+  /// fenced transaction: all of them or none, and no reader outside it sees
+  /// a state in between (Drift runs outside statements after it). The
+  /// writers it calls keep their own fence check (a nested transaction).
+  Future<T> writeAtomically<T>(Future<T> Function() body) => _fenced(body);
+
   Future<void> deactivateAll() => _fenced(_deactivateAll);
 
   /// Makes a prepared (inactive) session the active one (SC-27): in one
   /// fenced transaction the others are deactivated and it is activated. A
-  /// session that no longer exists changes nothing and throws. A session
-  /// prepared by this instance is activated conditionally: its current item
-  /// must still be queued with its track, else (catalog sync removed it)
-  /// nothing changes and it throws. Other sessions (the previous one being
+  /// session that no longer exists changes nothing and throws
+  /// [PreparedSessionGone]. A session prepared by this instance is activated
+  /// conditionally: its current item must still be queued with its track,
+  /// else (catalog sync removed it) nothing changes and it throws
+  /// [PreparedSessionGone]. Other sessions (the previous one being
   /// reactivated) activate unconditionally.
   Future<void> activateSession(int sessionId) => _fenced(() async {
         await _db.transaction(() async {
@@ -1072,12 +1081,12 @@ class QueueRepository {
                 ..where((s) => s.id.equals(sessionId)))
               .getSingleOrNull();
           if (session == null) {
-            throw StateError('Prepared session $sessionId is gone');
+            throw PreparedSessionGone('Prepared session $sessionId is gone');
           }
           if (_prepared.containsKey(sessionId) &&
               !await _currentItemIsQueued(sessionId, session.currentItemId,
                   _prepared[sessionId])) {
-            throw StateError(
+            throw PreparedSessionGone(
                 'Prepared session $sessionId lost its current item');
           }
           await _deactivateAll();
@@ -1113,9 +1122,10 @@ class QueueRepository {
 
   /// Records the landing target resolved for a prepared session as its
   /// current item, before activation, with the play position it was resolved
-  /// at (activation is stale if the item has since moved). Throws a
-  /// [StateError] (changing nothing) if the session is not one this instance
-  /// prepared, or the item no longer belongs to it.
+  /// at (activation is stale if the item has since moved). Changing
+  /// nothing, it throws [PreparedSessionGone] if the item no longer belongs
+  /// to the session, and a plain [StateError] if the session is not one this
+  /// instance prepared (an internal error).
   Future<void> setPreparedCurrentItem(
           int sessionId, int itemId, int expectedPlayPosition) =>
       _fenced(() => _db.transaction(() async {
@@ -1128,7 +1138,8 @@ class QueueRepository {
               throw StateError('Session $sessionId is not a prepared session');
             }
             if (row == null) {
-              throw StateError('Item $itemId is not in session $sessionId');
+              throw PreparedSessionGone(
+                  'Item $itemId is not in session $sessionId');
             }
             await _setCurrentItem(sessionId, itemId);
             _prepared[sessionId] = expectedPlayPosition;

@@ -1,4 +1,4 @@
-"""The one background worker thread lifecycle (review r1 7-R1-06).
+"""The one background worker thread lifecycle.
 
 A worker is one daemon thread that runs ``run_step`` over and over until it is
 stopped. This module owns everything around the step; a subclass owns only
@@ -26,7 +26,8 @@ Wake-up and stop
 
 A stop during a process step
   A step that runs an external process wraps it in ``_process_step(fn, ...,
-  job_id)``, which publishes the job id. ``request_stop`` then sets
+  job_id=...)``, which publishes the job id and passes it on to ``fn`` as the
+  keyword ``job_id``. ``request_stop`` then sets
   ``_stop_hit_step`` (the step's result is not to be trusted) and, when a
   ``kill_registry`` was given, calls ``kill_registry.kill(job_id)``.
 
@@ -129,11 +130,12 @@ class WorkerThread:
         self.request_stop()
         return self.join(self.join_timeout_s if timeout is _DEFAULT else timeout)
 
-    def _process_step(self, fn, *args, **kwargs):
-        """Run one process step with its job id published, so a stop can kill it."""
-        self._current_job = kwargs.get("job_id") or args[-1]
+    def _process_step(self, fn, *args, job_id, **kwargs):
+        """Run one process step with its job id published, so a stop can kill it.
+        ``fn`` gets the job id as the keyword ``job_id``."""
+        self._current_job = job_id
         try:
-            return fn(*args, **kwargs)
+            return fn(*args, job_id=job_id, **kwargs)
         finally:
             self._current_job = None
 

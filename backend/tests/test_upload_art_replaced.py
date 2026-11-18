@@ -8,7 +8,7 @@ from io import BytesIO
 
 import pytest
 
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import journal
 from tests.upload_recovery_fixtures import World, art_ids
 from tests.upload_validation_fixtures import item_row
@@ -29,11 +29,6 @@ def _halves(direction: str) -> bytes:
 
 
 FIRST, SECOND = _halves("top"), _halves("left")
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

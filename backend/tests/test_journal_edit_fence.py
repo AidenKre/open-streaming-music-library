@@ -30,8 +30,8 @@ from app.services.track_editor import (
     reconcile_journal,
 )
 from app.services.track_locks import TrackLocks
-from tests.test_identity_editor import _editor, _identity, _world
-from tests.test_track_editor import _add_track, _lib, _make_audio
+from tests.identity_editor_fixtures import _editor, _world
+from tests.track_editor_fixtures import _add_track, _lib, _make_audio
 
 pytestmark = pytest.mark.requires_ffmpeg
 

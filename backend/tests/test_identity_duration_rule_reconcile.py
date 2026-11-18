@@ -13,7 +13,7 @@ unknown under the new rule is not re-queued at every start.
 import pytest
 
 from app.services.identity_worker import reconcile_audio_identity
-from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, sql
 
 TOOLS = "ffmpeg 9.0.2; fpcalc 1.6.2"
 ALG = "chromaprint-2"
@@ -23,11 +23,6 @@ GAVE_UP = {**EXACT_CURRENT, "fp_state": "failed", "fp_algorithm": ALG, "attempts
            "failure_reason": "duration_unknown"}
 MID_LADDER = {**EXACT_CURRENT, "fp_state": "pending", "fp_algorithm": ALG, "attempts": 2,
               "next_attempt_at": 9_999_999_999, "failure_reason": "duration_unknown"}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def _reconcile(db, *, present=True):

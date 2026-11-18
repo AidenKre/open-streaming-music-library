@@ -6,14 +6,12 @@ The post-commit wake-up signal, the two transaction primitives
 """
 
 import contextlib
-import sqlite3
 import threading
 import uuid
 from pathlib import Path
 
 import pytest
 
-from app.database import DatabaseContext
 from app.database.database import Database
 from app.library import Library
 from app.models.track import Track
@@ -25,43 +23,17 @@ from app.services.audio_identity import (
     ExactUnavailable,
 )
 from app.services.identity_wakeup import IdentityWakeup
-from tests.owned_database import OwnedTestDatabase
-from tests.schema_fixtures import INIT_SQL
-
-DIGEST = "ab" * 32
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
-
-
-def _sql(db, query, params=()):
-    conn = sqlite3.connect(db.context.database_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = [dict(r) for r in conn.execute(query, params)]
-        conn.commit()
-        return rows
-    finally:
-        conn.close()
+from tests.identity_rows import DIGEST, _identity
+from tests.sqlite_helpers import sql_dicts
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 
 
 def _bare_track(db, owner_id=None) -> str:
     """A tracks row with no identity row (plain SQL, no writer involved)."""
     uuid_id = str(uuid.uuid4())
-    _sql(db, "INSERT INTO tracks (uuid_id, file_path, owner_id) VALUES (?, ?, ?)",
-         (uuid_id, f"/m/{uuid_id}.flac", owner_id or db.owner_id))
+    sql_dicts(db, f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, owner_id) VALUES (?, {PATH_MARKS}, ?)",
+         (uuid_id, *path_values(f"/m/{uuid_id}.flac"), owner_id or db.owner_id))
     return uuid_id
-
-
-def _identity(db, uuid_id):
-    rows = _sql(db, "SELECT * FROM track_audio_identity WHERE uuid_id = ?", (uuid_id,))
-    return rows[0] if rows else None
 
 
 def _current(tool="ffmpeg 9.0.2", computed_at=1_700_000_000):
@@ -175,7 +147,7 @@ def test_no_identity_writes_a_pending_row(db):
 def test_a_second_insert_bumps_the_generation_and_replaces_the_values(db):
     uuid_id = _bare_track(db)
     _insert(db, uuid_id, None)
-    _sql(db, "UPDATE track_audio_identity SET priority = 1, attempts = 2, "
+    sql_dicts(db, "UPDATE track_audio_identity SET priority = 1, attempts = 2, "
              "next_attempt_at = 99, match_state = 'current' WHERE uuid_id = ?", (uuid_id,))
     _insert(db, uuid_id, _current())
 
@@ -233,16 +205,19 @@ def test_the_owners_library_passes_the_fingerprinter_flag(db):
 def test_a_failure_before_commit_leaves_neither_the_track_nor_its_identity(db, monkeypatch):
     """Exit proof: identity and track commit together or not at all."""
     real = Database._insert_audio_identity_in
+    crashed = []
 
-    def insert_then_crash(conn, uuid_id, identity, *, fingerprinter_present):
-        real(conn, uuid_id, identity, fingerprinter_present=fingerprinter_present)
+    def insert_then_crash(conn, uuid_id, identity, *, fingerprinter_present, stat=None):
+        real(conn, uuid_id, identity, fingerprinter_present=fingerprinter_present, stat=stat)
+        crashed.append(uuid_id)
         raise RuntimeError("crash before commit")
 
     monkeypatch.setattr(Database, "_insert_audio_identity_in", staticmethod(insert_then_crash))
     track = _new_track(identity=_current())
 
     assert db.add_track(track) is False
-    assert _sql(db, "SELECT uuid_id FROM tracks WHERE uuid_id = ?", (track.uuid_id,)) == []
+    assert crashed == [track.uuid_id]  # the identity row was written, then the injected crash
+    assert sql_dicts(db, "SELECT uuid_id FROM tracks WHERE uuid_id = ?", (track.uuid_id,)) == []
     assert _identity(db, track.uuid_id) is None
 
 
@@ -275,7 +250,7 @@ def _settled_row(db, fp_state="current", owner_id=None):
     """A track whose identity the worker has fully computed and matched."""
     uuid_id = _bare_track(db, owner_id)
     _insert(db, uuid_id, _current())
-    _sql(db, "UPDATE track_audio_identity SET fp_state = ?, fp_algorithm = 'chromaprint-2', "
+    sql_dicts(db, "UPDATE track_audio_identity SET fp_state = ?, fp_algorithm = 'chromaprint-2', "
              "match_state = 'current', matcher_version = 'm1', priority = 1, attempts = 2, "
              "next_attempt_at = 99, failure_reason = 'decode_error', generation = 7 "
              "WHERE uuid_id = ?", (fp_state, uuid_id))
@@ -310,7 +285,10 @@ def test_a_conversion_or_settle_marks_every_layer_pending(db, reason, fp_before)
     assert _mark(db, uuid_id, reason) is True
 
     row = _identity(db, uuid_id)
-    assert {k: row[k] for k in (*STALE, *KEPT, "fp_state")} == {**STALE, **KEPT, "fp_state": "pending"}
+    # Pre-merge A3-01: the audio changed, so the old digest is dropped (unknown
+    # until recomputed), never left to match as an exact copy.
+    assert {k: row[k] for k in (*STALE, *KEPT, "fp_state")} == {
+        **STALE, **KEPT, "exact_kind": None, "exact_digest": None, "fp_state": "pending"}
 
 
 @pytest.mark.parametrize("reason", ["tag_write", "conversion", "settle"])

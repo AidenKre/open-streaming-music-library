@@ -34,11 +34,20 @@ import '../repositories/listening_stats_workbook.dart';
 
 const _eps = 1e-6;
 
-/// Runs [after] once, right after the [at]-th SELECT has returned.
+/// The snapshot capture's SELECT, found by its SQL text (the boundary and
+/// the counters in one statement), not by counting statements (F903-O-13).
+bool _isCaptureSelect(String statement) =>
+    statement.contains('MAX(local_id)') && statement.contains('local_counters');
+
+class _InjectedFailure implements Exception {
+  const _InjectedFailure();
+}
+
+/// Runs [afterCapture] once, right after the next capture SELECT has
+/// returned; fails every SELECT that [failWhen] matches.
 class _AfterSelect extends QueryInterceptor {
-  int selects = 0;
-  int? at;
-  void Function()? after;
+  void Function()? afterCapture;
+  bool Function(String statement)? failWhen;
 
   @override
   Future<List<Map<String, Object?>>> runSelect(
@@ -46,9 +55,13 @@ class _AfterSelect extends QueryInterceptor {
     String statement,
     List<Object?> args,
   ) async {
+    if (failWhen?.call(statement) ?? false) throw const _InjectedFailure();
     final rows = await super.runSelect(executor, statement, args);
-    selects++;
-    if (selects == at) after?.call();
+    if (_isCaptureSelect(statement)) {
+      final after = afterCapture;
+      afterCapture = null;
+      after?.call();
+    }
     return rows;
   }
 }
@@ -124,8 +137,7 @@ void main() {
   /// statement outside any transaction (the interceptor runs inside one).
   void writeAfterCapture() {
     final reached = Completer<void>();
-    interceptor.at = interceptor.selects + 1;
-    interceptor.after = reached.complete;
+    interceptor.afterCapture = reached.complete;
     writing = reached.future.then((_) => write());
   }
 
@@ -184,6 +196,33 @@ void main() {
     );
     expect(after.totals.listeningSeconds,
         isNot(closeTo(seven.listeningSeconds, _eps)));
+  });
+
+  // F903-O-10: a statement failing inside the statistics load (every read
+  // made under the token fails) ends the snapshot with that error; the
+  // sibling reads of Future.wait leave no unhandled error behind, and the
+  // database answers the next snapshot.
+  test('statistics: a failing read under the token is a clean error',
+      () async {
+    final service = ListeningStatsService(repo, snapshots);
+    final unhandled = <Object>[];
+    Object? thrown;
+    await runZonedGuarded(() async {
+      interceptor.failWhen = (statement) =>
+          statement.contains('history_events') && !_isCaptureSelect(statement);
+      try {
+        await service.snapshot(seven.range);
+      } catch (e) {
+        thrown = e;
+      }
+      await pumpEventQueue();
+    }, (e, _) => unhandled.add(e));
+    interceptor.failWhen = null;
+    expect(thrown, isA<_InjectedFailure>());
+    expect(unhandled, isEmpty);
+    final snap = await service.snapshot(seven.range);
+    expect(snap.stats.totals.listeningSeconds,
+        closeTo(seven.listeningSeconds, _eps));
   });
 
   test('annual recap: recap, years and token from one snapshot', () async {

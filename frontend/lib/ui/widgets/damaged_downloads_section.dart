@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/models/track_names.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/services/damaged_downloads_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/downloads_controller.dart';
+import 'package:frontend/ui/library_actions.dart' show redownloadResultMessage;
 
 /// The Downloaded page's damaged downloads (Phase 5 decision 6): files that
 /// exist but failed to play. Until the user acts, those tracks stream online
@@ -51,7 +53,7 @@ class DamagedDownloadsSection extends ConsumerWidget {
               child: TextButton(
                 onPressed: offline || redownloadable.isEmpty
                     ? null
-                    : () => controls.redownloadDamaged(redownloadable),
+                    : () => _redownload(context, controls, redownloadable),
                 child: const Text('Re-download all'),
               ),
             ),
@@ -70,7 +72,7 @@ class DamagedDownloadsSection extends ConsumerWidget {
                   redownloading: downloads.isPending(track.uuidId),
                   onRedownload: offline
                       ? null
-                      : () => controls.redownloadDamaged([track]),
+                      : () => _redownload(context, controls, [track]),
                   onDelete: () => controls.deleteDamaged(track.uuidId),
                 );
               },
@@ -82,7 +84,22 @@ class DamagedDownloadsSection extends ConsumerWidget {
   }
 }
 
-@visibleForTesting
+/// Re-download through the controller; says so only when some could not be
+/// queued (a queued row shows its own progress).
+Future<void> _redownload(
+  BuildContext context,
+  DownloadsControls controls,
+  List<TrackUI> tracks,
+) async {
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  final message = redownloadResultMessage(
+    await controls.redownloadDamaged(tracks),
+  );
+  if (message != null) {
+    messenger?.showSnackBar(SnackBar(content: Text(message)));
+  }
+}
+
 String damagedDownloadsLabel(int count) => count == 1
     ? '1 download couldn’t be played (the file looks damaged)'
     : '$count downloads couldn’t be played (the files look damaged)';
@@ -104,7 +121,7 @@ class _DamagedRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return ListTile(
       dense: true,
-      title: Text(track.title ?? track.uuidId,
+      title: Text(trackTitleOrUnknown(track.title),
           maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle:
           Text(track.subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),

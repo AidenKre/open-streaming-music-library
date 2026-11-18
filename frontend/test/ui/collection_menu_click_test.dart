@@ -23,6 +23,7 @@ import '../helpers/no_server_api.dart';
 import '../helpers/server_binding.dart';
 import 'browse_harness.dart';
 import 'collection_playback_harness.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 void main() {
   late AppDatabase db;

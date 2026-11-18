@@ -14,27 +14,8 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/clock.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
-
-/// The local states an upload intent's `last_state` holds besides the
-/// server's own item states.
-abstract final class UploadIntentState {
-  static const allocating = 'allocating';
-  static const allocated = 'allocated';
-  static const transferring = 'transferring';
-  static const sourceChanged = 'source_changed';
-  static const needsReselect = 'needs_reselect';
-  static const rejected = 'rejected';
-  static const cancelling = 'cancelling';
-  static const reviewSubmitted = 'review_submitted';
-
-  /// An adopted item that still needs its bytes: they are on the device it
-  /// was picked on, never sent from here (7-R1-22). Cancel only.
-  static const onOtherDevice = 'on_other_device';
-
-  /// The server states in which an item still needs its bytes.
-  static const awaitingBytes = {allocated, transferring};
-}
 
 class NewUploadIntent {
   const NewUploadIntent({
@@ -212,10 +193,7 @@ class UploadIntentStore {
         continue;
       }
       // Finished work elsewhere has nothing left to do here.
-      if (i.parentItemUuid == null &&
-          const {'imported', 'duplicate', 'cancelled', 'expired'}.contains(
-            i.rawState,
-          )) {
+      if (i.parentItemUuid == null && endedStates.contains(i.rawState)) {
         continue;
       }
       known.add(i.itemUuid);
@@ -266,31 +244,37 @@ class UploadIntentStore {
       });
 
   /// The one mirror rule for a fresh server read (7-R1-21): a row still
-  /// `review_ready`, `duplicate_conflict` or `on_other_device` locally takes
+  /// `review_ready`, `duplicate_conflict`, `on_other_device`, `failed` or
+  /// `expanded` locally takes
   /// the state and error code of an item the server now reports differently.
   /// A read that agrees never touches the row; submitted or committing rows
   /// are never written, and an `on_other_device` row is not flipped back by a
   /// read that still waits for bytes (allocated, receiving, transferring).
   /// Over a reviewable row only an ended state (imported, duplicate,
   /// cancelled, expired) is mirrored, never one reviewable state over the
-  /// other (reads are not ordered against local writes).
+  /// other (reads are not ordered against local writes). A `failed` row
+  /// takes any other state that does not wait for bytes (a retry, cancel or
+  /// expiry done elsewhere), never one that does: this device writes
+  /// `failed` over a refused send the server still waits for. An unpacked
+  /// archive (`expanded`) takes only an ended state.
   Future<void> mirrorReviewStates(
     String bindingToken,
     List<UploadItem> items,
   ) async {
     for (final item in items) {
-      final ended = const {
-        'imported',
-        'duplicate',
-        'cancelled',
-        'expired',
+      final ended = endedStates.contains(item.rawState);
+      final waitsForBytes = const {
+        'allocated',
+        'receiving',
+        'transferring',
       }.contains(item.rawState);
       final from = {
-        if (ended) ...['review_ready', 'duplicate_conflict'],
-        if (!const {'allocated', 'receiving', 'transferring'}.contains(
-          item.rawState,
-        ))
+        if (ended) ...reviewableStates,
+        if (ended) ServerItemState.expanded,
+        if (!waitsForBytes) ...{
           UploadIntentState.onOtherDevice,
+          ServerItemState.failed,
+        },
       }.difference({item.rawState});
       if (from.isEmpty) continue;
       await update(

@@ -119,11 +119,11 @@ def test_corrupt_file_is_failed_with_a_path_free_reason(fixtures, results):
 
 
 def test_low_priority_with_a_registry_gives_the_same_digest(fixtures, results):
-    from app.services.ffmpeg_runner import FfmpegProcessRegistry
+    from app.services.ffmpeg_runner import FfmpegProcessRegistry, ToolOptions
 
     fx = fixtures["flac24.flac"]
-    again = compute_exact(fx.path, fx.codec_hint, registry=FfmpegProcessRegistry(),
-                          job_id="identity", low_priority=True)
+    again = compute_exact(fx.path, fx.codec_hint, options=ToolOptions(
+        registry=FfmpegProcessRegistry(), job_id="identity", low_priority=True))
     assert again == results["flac24.flac"]
 
 

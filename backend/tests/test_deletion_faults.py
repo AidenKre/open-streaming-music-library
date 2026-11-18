@@ -54,6 +54,7 @@ def _quarantine(world, op, uuid_id):
 # ── the rename fails ───────────────────────────────────────────────────────
 
 
+@pytest.mark.requires_chmod_denial
 def test_a_refused_rename_leaves_the_catalog_and_the_master_intact(world):
     uuid_id = add_master(world, "A/Album/a.flac")
     master = path_of(world, uuid_id)
@@ -92,6 +93,7 @@ def test_an_occupied_quarantine_path_is_never_overwritten(world):
     assert journal(world, uuid_id) is None and live(world, uuid_id)
 
 
+@pytest.mark.requires_chmod_denial
 def test_a_failed_rename_with_an_original_that_changed_keeps_the_journal(world):
     uuid_id = add_master(world, "A/Album/a.flac")
     master = path_of(world, uuid_id)
@@ -208,6 +210,7 @@ def test_a_quarantine_file_that_changed_is_never_restored(world):
     assert journal(world, uuid_id) is not None and not live(world, uuid_id)
 
 
+@pytest.mark.requires_chmod_denial
 def test_a_restore_that_fails_keeps_the_journal(world):
     uuid_id = add_master(world, "A/Album/a.flac")
     master = path_of(world, uuid_id)

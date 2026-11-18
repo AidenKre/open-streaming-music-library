@@ -11,6 +11,7 @@ import 'package:frontend/ui/browse_filter_controller.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/repositories/history_snapshot.dart';
 import 'package:frontend/ui/feed/feed.dart';
+import 'package:frontend/ui/snapshot_paging_controller.dart';
 
 /// See all's input and presentation state (Phase 6 §3 See all, §7; SC-09,
 /// SC-10, SC-26).
@@ -64,7 +65,8 @@ final seeAllRecentsControllerFactoryProvider = Provider<SeeAllRecentsFactory>(
           SeeAllRecentsController(ref, initialDownloaded: initialDownloaded),
 );
 
-class SeeAllRecentsController extends ChangeNotifier
+class SeeAllRecentsController
+    extends SnapshotPagingController<ResolvedRecent, RecentRef>
     implements SeeAllRecentsControls {
   static const _pageSize = 50;
 
@@ -83,22 +85,9 @@ class SeeAllRecentsController extends ChangeNotifier
     recentsSnapshotPagerProvider,
   );
   StreamSubscription<List<ResolvedRecent>>? _watch;
-  StreamSubscription<SnapshotStaleness>? _freshness;
 
-  /// Bumped by every new snapshot and by dispose; stale continuations return.
-  int _generation = 0;
-  bool _disposed = false;
-
-  HistorySnapshotToken? _token;
   List<ResolvedRecent>? _rows;
   List<FeedEntity>? _entities;
-  RecentRef? _cursor;
-  bool _hasMore = false;
-  bool _failed = false;
-  bool _inFlight = false;
-  bool _expired = false;
-  SnapshotStaleness _notice = SnapshotStaleness.fresh;
-  void Function()? _retry;
 
   @override
   BrowseFilters get filters => _filters.filters;
@@ -110,109 +99,47 @@ class SeeAllRecentsController extends ChangeNotifier
   List<FeedEntity>? get entities => _entities;
 
   @override
-  bool get hasMore => _hasMore;
-
-  @override
-  bool get failed => _failed;
-
-  @override
-  SnapshotStaleness get notice => _notice;
-
-  @override
-  int get snapshotEpoch => _generation;
-
-  @override
   Future<PlaybackOutcome> playTrack(TrackUI track) =>
       _ref.read(libraryActionsProvider).playRecentTrack(track);
 
   @override
-  void refresh() {
-    if (_disposed) return;
-    final generation = ++_generation;
-    _cancelLive();
-    _token = null;
+  Future<SnapshotPageResult<ResolvedRecent, RecentRef>> fetchPage(
+    HistorySnapshotToken token,
+    RecentRef? after,
+  ) => _pager.page(token, after, _pageSize);
+
+  @override
+  Future<
+    (HistorySnapshotToken, SnapshotPageResult<ResolvedRecent, RecentRef>?)
+  >
+  captureSnapshot() async =>
+      (await _pager.capture(downloadedOnly: filters.downloaded), null);
+
+  @override
+  Stream<SnapshotStaleness> watchFreshness(HistorySnapshotToken token) =>
+      _pager.watchFreshness(token);
+
+  @override
+  void onPage(
+    List<ResolvedRecent> rows,
+    int generation,
+    HistorySnapshotToken token,
+  ) {
+    _rows = [...?_rows, ...rows];
+    _entities = _toEntities(_rows!);
+    _watchLoaded(generation, token);
+  }
+
+  @override
+  void onExpired() {
+    _rows ??= const [];
+    _entities ??= const [];
+  }
+
+  @override
+  void resetRows() {
     _rows = null;
     _entities = null;
-    _cursor = null;
-    _hasMore = false;
-    _failed = false;
-    _expired = false;
-    _notice = SnapshotStaleness.fresh;
-    _retry = null;
-    notifyListeners();
-    _capture(generation);
-  }
-
-  @override
-  void loadMore() {
-    final token = _token;
-    if (token == null || !_hasMore || _inFlight || _failed) return;
-    _loadPage(_generation, token, _cursor);
-  }
-
-  @override
-  void retry() {
-    final again = _retry;
-    if (!_failed || again == null) return;
-    _failed = false;
-    _retry = null;
-    notifyListeners();
-    again();
-  }
-
-  void _capture(int generation) {
-    _inFlight = true;
-    _pager
-        .capture(downloadedOnly: filters.downloaded)
-        .then(
-          (token) {
-            if (_stale(generation)) return;
-            _token = token;
-            _freshness = _pager
-                .watchFreshness(token)
-                .listen(
-                  (value) => _onFreshness(generation, value),
-                  // A failed freshness check leaves the notice as it was.
-                  onError: (Object _) {},
-                );
-            _loadPage(generation, token, null);
-          },
-          onError: (Object _) {
-            if (_stale(generation)) return;
-            _fail(() => _capture(generation));
-          },
-        );
-  }
-
-  void _loadPage(int generation, HistorySnapshotToken token, RecentRef? after) {
-    _inFlight = true;
-    _pager
-        .page(token, after, _pageSize)
-        .then(
-          (result) {
-            if (_stale(generation)) return;
-            _inFlight = false;
-            switch (result) {
-              case SnapshotPage(:final items, :final nextCursor, :final hasMore):
-                _rows = [...?_rows, ...items];
-                _entities = _toEntities(_rows!);
-                _cursor = nextCursor;
-                _hasMore = hasMore;
-                _watchLoaded(generation, token);
-              case SnapshotExpired():
-                _rows ??= const [];
-                _entities ??= const [];
-                _hasMore = false;
-                _expired = true;
-                _notice = SnapshotStaleness.historyChanged;
-            }
-            notifyListeners();
-          },
-          onError: (Object _) {
-            if (_stale(generation)) return;
-            _fail(() => _loadPage(generation, token, after));
-          },
-        );
   }
 
   void _watchLoaded(int generation, HistorySnapshotToken token) {
@@ -221,7 +148,7 @@ class SeeAllRecentsController extends ChangeNotifier
     final refs = [for (final r in _rows!) r.ref];
     sub = _pager.watchLoaded(token, refs).listen((rows) {
       // Emissions of a replaced watch are ignored even if they arrive.
-      if (_stale(generation) || !identical(_watch, sub)) return;
+      if (isStale(generation) || !identical(_watch, sub)) return;
       _rows = rows;
       _entities = _toEntities(rows);
       notifyListeners();
@@ -229,40 +156,19 @@ class SeeAllRecentsController extends ChangeNotifier
     _watch = sub;
   }
 
-  void _onFreshness(int generation, SnapshotStaleness value) {
-    if (_stale(generation) || _expired || value == _notice) return;
-    _notice = value;
-    notifyListeners();
-  }
-
-  void _fail(void Function() again) {
-    _inFlight = false;
-    _failed = true;
-    _retry = again;
-    notifyListeners();
-  }
-
   List<FeedEntity> _toEntities(List<ResolvedRecent> rows) => [
     for (final r in rows) ?feedEntityOf(r.entity),
   ];
 
-  bool _stale(int generation) => _disposed || generation != _generation;
-
-  void _cancelLive() {
+  @override
+  void cancelLoaded() {
     _watch?.cancel();
-    _freshness?.cancel();
     _watch = null;
-    _freshness = null;
   }
 
   @override
-  void dispose() {
-    if (_disposed) return;
-    _disposed = true;
-    _generation++;
-    _cancelLive();
+  void onDispose() {
     _filters.removeListener(refresh);
     _filters.dispose();
-    super.dispose();
   }
 }

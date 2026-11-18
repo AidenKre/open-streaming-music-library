@@ -15,7 +15,8 @@ from fastapi.testclient import TestClient
 from app.services import identity_worker as identity_worker_mod
 from app.services import upload_commit as upload_commit_mod
 from app.services import upload_validation as upload_validation_mod
-from tests.test_identity_worker_app import FakeWorker, _lock_is_held
+from tests.test_identity_worker_app import FakeWorker
+from tests.worker_app_fixtures import _lock_is_held
 from tests.test_upload_commit_app import FakeCommit
 from tests.test_upload_validation_app import FakeValidation
 

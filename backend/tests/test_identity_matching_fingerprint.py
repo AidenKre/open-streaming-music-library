@@ -16,7 +16,7 @@ from app.services.duplicate_detection import MatcherParams
 from app.services.fingerprinter import pack_fingerprint
 from tests.fingerprint_fixtures import ALGO, BASE, noisy, pin_matcher_settings, random_print
 from tests.identity_worker_fakes import bytes_digest, make_worker
-from tests.identity_worker_fixtures import add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import add_track, identity, sql
 from tests.owned_database import add_test_user
 
 V1 = "matcher-v1"
@@ -26,11 +26,6 @@ V1 = "matcher-v1"
 def _explicit_matcher_settings(monkeypatch):
     # U09-B-06: these tests prove matching at stated settings, not at the defaults.
     pin_matcher_settings(monkeypatch)
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

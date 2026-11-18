@@ -9,9 +9,6 @@ but no longer against free space, because the filesystem's free count already
 excludes those bytes.
 """
 
-import sqlite3
-from types import SimpleNamespace
-
 import pytest
 
 from app.services.storage_ledger import (
@@ -23,7 +20,7 @@ from app.services.storage_ledger import (
     StorageLedger,
     register_purpose,
 )
-from tests.test_storage_ledger import FakeDisk, _rows, db, library_dir  # noqa: F401  (fixtures)
+from tests.test_storage_ledger import FakeDisk, _rows, library_dir  # noqa: F401  (fixtures)
 
 BOOT = "boot-current"
 QUOTA = StagedQuota(user_bytes=1000, total_bytes=1000)

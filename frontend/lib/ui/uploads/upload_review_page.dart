@@ -1,8 +1,11 @@
 // The review page (spec §7 para 4; SC-26: a view). It renders the review
 // controller's state and sends every input to it or to the preview
 // controller.
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/ui/feed/new_activity_notice.dart';
@@ -12,7 +15,7 @@ import 'package:frontend/ui/uploads/upload_duplicate_banner.dart';
 import 'package:frontend/ui/uploads/upload_review_controller.dart';
 import 'package:frontend/ui/widgets/metadata_form.dart';
 import 'package:frontend/services/uploads/upload_review_rules.dart'
-    show ReviewItemView;
+    show ReviewItemView, previewPlaying;
 
 class UploadReviewPage extends ConsumerStatefulWidget {
   const UploadReviewPage({super.key, required this.batchUuid, this.startAt});
@@ -114,7 +117,15 @@ class _UploadReviewPageState extends ConsumerState<UploadReviewPage> {
   @override
   Widget build(BuildContext context) {
     final preview = ref.watch(previewPlayerProvider);
-    return _scaffold(preview);
+    // The preview is closed when the person leaves, not when the page is
+    // gone: while the page animates out, a preview that was still loading
+    // would go on to sound, and one that sounds would keep sounding.
+    return PopScope(
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) unawaited(ref.read(previewControlsProvider).close());
+      },
+      child: _scaffold(preview),
+    );
   }
 
   Widget _scaffold(PreviewState preview) => Scaffold(
@@ -251,7 +262,9 @@ class _UploadReviewPageState extends ConsumerState<UploadReviewPage> {
                 child: const Text('Confirm and import'),
               ),
               TextButton(
-                onPressed: view.canCancel ? _controls.cancelItem : null,
+                onPressed: view.canCancel && !_controls.busy
+                    ? _controls.cancelItem
+                    : null,
                 child: const Text('Cancel this item'),
               ),
             ],
@@ -297,8 +310,7 @@ class _UploadReviewPageState extends ConsumerState<UploadReviewPage> {
     final duplicates = view.duplicates;
     final controls = ref.read(previewControlsProvider);
     final stagedPlaying =
-        preview.source == StagedUploadPreview(view.itemUuid) &&
-        previewIsActive(preview.status);
+        previewPlaying(preview, StagedUploadPreview(view.itemUuid));
     return [
       if (duplicates.coverage != null) Text(duplicates.coverage!),
       for (final note in duplicates.notes) Text(note),
@@ -342,7 +354,7 @@ class _UploadReviewPageState extends ConsumerState<UploadReviewPage> {
       edit: _controls.edit,
       onChanged: _controls.editChanged,
       suggestionsFor: _controls.suggestions,
-      autocompleteKeys: const {'artist', 'album_artist', 'album', 'genre'},
+      autocompleteKeys: suggestedEditableFields,
     );
   }
 

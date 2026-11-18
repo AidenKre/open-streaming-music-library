@@ -8,6 +8,9 @@ import 'package:frontend/ui/library_actions.dart';
 class FakeLibraryActions implements LibraryActionControls {
   final calls = <String>[];
 
+  /// What [playFromList] and [playQuery] (the row taps) answer.
+  PlaybackOutcome playOutcome = const Accepted(1);
+
   static String describe(LibraryScope scope) => switch (scope) {
     AlbumScope(:final artistId, :final albumId) => 'album($artistId,$albumId)',
     ArtistScope(:final artistId) => 'artist($artistId)',
@@ -49,7 +52,7 @@ class FakeLibraryActions implements LibraryActionControls {
     calls.add(
       'playFromList ${tracks.map((t) => t.uuidId).join(',')} @$startIndex $source',
     );
-    return const Accepted(1);
+    return playOutcome;
   }
 
   @override
@@ -62,7 +65,7 @@ class FakeLibraryActions implements LibraryActionControls {
       'playQuery ${track.uuidId} ${album == null ? 'library' : describe(album)}'
       ' downloadedOnly=$downloadedOnly',
     );
-    return const Accepted(1);
+    return playOutcome;
   }
 
   @override

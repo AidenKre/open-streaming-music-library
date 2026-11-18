@@ -76,7 +76,7 @@ class _CreateAccountPageState extends ConsumerState<CreateAccountPage> {
                   controller: _password,
                   decoration: const InputDecoration(
                     labelText: 'Password',
-                    helperText: 'At least 8 characters.',
+                    helperText: 'At least $minPasswordLength characters.',
                     border: OutlineInputBorder(),
                   ),
                   obscureText: true,

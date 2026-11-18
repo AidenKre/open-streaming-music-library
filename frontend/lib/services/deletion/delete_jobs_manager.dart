@@ -26,6 +26,8 @@ import 'package:frontend/services/deletion/delete_job.dart';
 import 'package:frontend/services/deletion/deletion_preview.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
+import 'package:frontend/services/operations/gate_wait.dart';
+import 'package:frontend/services/operations/submission_failure_rules.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 
 
@@ -142,8 +144,9 @@ class DeleteJobsManager {
   Future<void> _submitChain = Future.value();
   bool _syncNeeded = false;
   int _requestsInFlight = 0;
-  Completer<void> _gateWaitSignal = Completer<void>();
-  bool _waitingForGate = false;
+
+  /// A pass's wait for the server check; [quiesce] ends it.
+  late final _gateWait = GateWait(gate: _gate, closing: _closing.future);
 
   /// The jobs this scope knows, by operation UUID.
   ValueListenable<Map<String, DeleteJob>> get jobs => _jobs;
@@ -239,11 +242,63 @@ class DeleteJobsManager {
     );
   }
 
-  /// Tracks a job known from the receipt list until it is finished.
+  /// Tracks a job known from the receipt list until it is finished. A job
+  /// already known is read once more, so a finished one shows what the
+  /// server says now (its storage clean-up may have finished since).
   void follow(String operationUuid) {
     if (_closed) return;
-    if (!_jobs.value.containsKey(operationUuid)) _followed.add(operationUuid);
+    _followed.add(operationUuid);
     request('follow', bypassBackoff: true);
+  }
+
+  /// Statuses of a job the server has finished (`GET /tracks/deletions`).
+  static const _finishedStatuses = {'succeeded', 'partial', 'failed'};
+
+  /// Reads the server's whole job list and loads every job not finished
+  /// there (pending, running, or a status this app does not know) that
+  /// [jobs] does not hold yet: a deletion accepted before a relaunch, or
+  /// started on another device. The server lists a track until its deletion
+  /// runs, so only this list says it is on its way out. True when the list
+  /// and each such job were read; a read the binding does not allow now
+  /// fails at once (false). Sends nothing that changes the server.
+  Future<bool> loadUnfinished() async {
+    if (_closed) return false;
+    final token = (await _binding.current())?.localBindingId;
+    if (token == null) return false;
+    try {
+      final unfinished = <String>[];
+      final seen = <String>{};
+      String? after;
+      do {
+        final page = await _api.listJobs(
+          after: after,
+          limit: 100, // the server's largest page
+          abortTrigger: _closing.future,
+          waitForBinding: false,
+        );
+        for (final j in page.jobs) {
+          if (!_finishedStatuses.contains(j.status)) {
+            unfinished.add(j.operationUuid);
+          }
+        }
+        after = page.nextAfter;
+        if (after != null && !seen.add(after)) return false;
+      } while (after != null);
+      for (final op in unfinished) {
+        if (_jobs.value.containsKey(op)) continue;
+        final dto = await _api.getJob(op, abortTrigger: _closing.future);
+        await _applyServerJob(token, dto, [
+          for (final i in dto.items)
+            DeletionTargetDto(uuidId: i.uuidId, baseRevision: i.baseRevision),
+        ]);
+      }
+      // Polled to their end like this app's own jobs.
+      if (_closed) return false;
+      if (unfinished.isNotEmpty) request('unfinished');
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Requests a pass for [reason] (recovery edges bypass a pending backoff).
@@ -255,11 +310,11 @@ class DeleteJobsManager {
   ///
   /// While a request waits for the server's answer, [idle] yields one event
   /// turn instead: a slow answer must not hold its callers.
-  Future<void> idle() => _waitingForGate
+  Future<void> idle() => _gateWait.waiting
       ? Future.value()
       : _requestsInFlight > 0
       ? Future<void>.delayed(Duration.zero)
-      : Future.any([_runner.whenIdle(), _gateWaitSignal.future]);
+      : Future.any([_runner.whenIdle(), _gateWait.nextWaitBegins]);
 
   bool get isClosed => _closed;
 
@@ -372,7 +427,7 @@ class DeleteJobsManager {
       return const PassFailed(BackoffReason.capabilityMissing);
     }
     try {
-      final token = await _verifiedToken();
+      final token = await _gateWait.token();
       if (token == null) return const PassDone();
       var retry = false;
       final handled = <String>{};
@@ -398,7 +453,7 @@ class DeleteJobsManager {
         final SubmissionOutcome outcome;
         try {
           outcome = await _sendOne(op);
-        } on _StatusQueryFailed catch (e) {
+        } on StatusQueryFailed catch (e) {
           throw e.cause;
         }
         switch (outcome) {
@@ -439,8 +494,8 @@ class DeleteJobsManager {
               ),
             );
           case SubmissionAmbiguous(:final cause):
-            final parked = _isUnauthorized(
-              cause is _StatusQueryFailed ? cause.cause : cause,
+            final parked = isUnauthorized(
+              cause is StatusQueryFailed ? cause.cause : cause,
             );
             await _apply(token, () {
               final j = _jobs.value[op];
@@ -506,17 +561,18 @@ class DeleteJobsManager {
     _putJob(job);
   });
 
-  /// Polls every accepted or running job (and every followed one not yet
-  /// known), except those the submission step just answered.
+  /// Polls every accepted or running job, except those the submission step
+  /// just answered, and reads every followed one once.
   Future<_PollOutcome> _poll(String token, {required Set<String> skip}) async {
     final ops = <String>[
       for (final j in _jobs.value.values)
         if (j.phase == DeleteJobPhase.accepted ||
             j.phase == DeleteJobPhase.running)
           if (!skip.contains(j.operationUuid)) j.operationUuid,
-      for (final op in _followed)
-        if (!_jobs.value.containsKey(op)) op,
     ];
+    for (final op in _followed) {
+      if (!ops.contains(op)) ops.add(op);
+    }
     var failed = false;
     for (final op in ops) {
       final DeletionJobDto dto;
@@ -525,11 +581,10 @@ class DeleteJobsManager {
         dto = await _api.getJob(op, abortTrigger: _closing.future);
       } on ApiException catch (e) {
         if (e.statusCode == 401) return _PollOutcome.parked;
-        if (e.statusCode == 404 &&
-            e.errorCode == 'deletion_job_not_found' &&
-            !_jobs.value.containsKey(op)) {
+        if (e.statusCode == 404 && e.errorCode == 'deletion_job_not_found') {
+          // A followed job is read once, found or not.
           _followed.remove(op);
-          continue;
+          if (!_jobs.value.containsKey(op)) continue;
         }
         failed = true;
         continue;
@@ -599,56 +654,42 @@ class DeleteJobsManager {
         if (e.statusCode == 404 && e.errorCode == 'deletion_job_not_found') {
           return const StatusAbsent();
         }
-        throw _StatusQueryFailed(e);
+        throw StatusQueryFailed(e);
       } catch (e) {
         if (e is ServerInstanceChangedException ||
             e is LibraryToolsRequestAborted) {
           rethrow;
         }
-        throw _StatusQueryFailed(e);
+        throw StatusQueryFailed(e);
       }
     },
     onFailure: (e) => switch (e) {
       // A failed status query never settles the operation as refused.
-      _StatusQueryFailed(:final cause) =>
+      StatusQueryFailed(:final cause) =>
         _commonFailure(cause) ??
             SubmissionAmbiguousAs(
               cause is ApiException && cause.statusCode == 401
                   ? cause.errorCode ?? 'http_401'
                   : 'status_unavailable',
             ),
-      _ => _commonFailure(e) ?? _refusal(e),
+      // A refused deletion is final whatever `retryable` says.
+      _ => _commonFailure(e) ?? refusalIsFinal(e),
     },
   );
-
-  /// The verified binding token; null when [quiesce] began while waiting.
-  Future<String?> _verifiedToken() async {
-    if (_gate.state is! BindingVerified) {
-      _waitingForGate = true;
-      _gateWaitSignal.complete();
-      _gateWaitSignal = Completer<void>();
-    }
-    final verified = _gate.awaitVerified()..ignore();
-    try {
-      return await Future.any<String?>([
-        verified,
-        _closing.future.then((_) => null),
-      ]);
-    } finally {
-      _waitingForGate = false;
-    }
-  }
 
   void _putJob(DeleteJob job) {
     if (_closed) return;
     _jobs.value = Map.unmodifiable({..._jobs.value, job.operationUuid: job});
   }
 
-  /// A write to [jobs] from a pass: a no-op once the binding changed.
-  Future<void> _apply(String token, void Function() write) =>
-      _binding.runFenced(token, () async {
-        if (!_closed) write();
-      });
+  /// A write to [jobs] from a pass: a no-op once the binding changed. The
+  /// binding is checked in its fence (a transaction) and the write follows
+  /// it: a listener of [jobs] that reads the database (Manage library reads
+  /// the titles) must not run inside a transaction that closes under it.
+  Future<void> _apply(String token, void Function() write) async {
+    await _binding.runFenced(token, () async {});
+    if (!_closed) write();
+  }
 
   static List<DeletionTargetDto> _targetsOf(String? frozenBodyJson) {
     if (frozenBodyJson == null) return const [];
@@ -684,9 +725,6 @@ class DeleteJobsManager {
     createdAt: dto.createdAt,
   );
 
-  static bool _isUnauthorized(Object cause) =>
-      cause is ApiException && cause.statusCode == 401;
-
   static SubmissionFailureDisposition? _commonFailure(Object e) => switch (e) {
     // TokenWithheldException: nothing was sent, the row stays as it was and
     // the pass's retry sends it later (sign-off OPEN-M-11).
@@ -695,22 +733,6 @@ class DeleteJobsManager {
     TokenWithheldException() => const LeaveSubmissionUntouched(),
     _ => null,
   };
-
-  /// A refusal (4xx except 401/408/429) is final whatever `retryable` says.
-  static SubmissionFailureDisposition? _refusal(Object e) =>
-      e is ApiException &&
-          e.statusCode >= 400 &&
-          e.statusCode <= 499 &&
-          !const {401, 408, 429}.contains(e.statusCode)
-      ? SubmissionTerminal(e.errorCode ?? 'http_${e.statusCode}')
-      : null;
-
-}
-
-/// A failed status query, so the failure hook can tell it from a failed send.
-class _StatusQueryFailed implements Exception {
-  const _StatusQueryFailed(this.cause);
-  final Object cause;
 }
 
 enum _PollOutcome { done, more, parked }

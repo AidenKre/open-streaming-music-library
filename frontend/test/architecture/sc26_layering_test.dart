@@ -18,6 +18,7 @@ void main() {
       'trackSyncProvider.notifier',
       'conversionJobsProvider.notifier',
     ];
+    _expectNamedThingsExist(forbidden);
     final offenders = [
       for (final file in _dartFiles('lib/ui'))
         for (final pattern in forbidden)
@@ -27,56 +28,66 @@ void main() {
     expect(offenders, isEmpty);
   });
 
+  // U34-A-07: every import and export form (package or relative, single or
+  // double quotes), through the same directive parser as the view checks.
+  // Pre-merge review D5-06: every file under lib/ outside lib/ui/ is model
+  // code, found on disk (a new folder is scanned without being listed);
+  // only the deliberate exceptions are named.
   test('model code never imports ui/', () {
     final offenders = [
-      for (final dir in [
-        'lib/api',
-        'lib/database',
-        'lib/models',
-        'lib/playback',
-        'lib/providers',
-        'lib/repositories',
-        'lib/services',
-      ])
-        for (final file in _dartFiles(dir))
-          if (file.readAsStringSync().contains("import 'package:frontend/ui/"))
-            file.path,
+      for (final file in _modelFiles())
+        if (!_mayImportUi.containsKey(_libPath(file)))
+          for (final target
+              in _targets(_libPath(file), file.readAsStringSync()))
+            if (target.startsWith('ui/')) '${file.path}: $target',
     ];
     expect(offenders, isEmpty);
   });
 
-  // Phase M §7.1 / M-U18: the session screens are views over SessionControls.
-  // They import no model layer (no services, API, repositories or database),
-  // so they can neither authenticate nor read credentials themselves.
-  test('the session screens import no model code', () {
-    const views = [
-      'lib/ui/server_address_page.dart',
-      'lib/ui/login_page.dart',
-      'lib/ui/create_account_page.dart',
-    ];
-    const modelImports = [
-      "import 'package:frontend/services/",
-      "import 'package:frontend/api/",
-      "import 'package:frontend/repositories/",
-      "import 'package:frontend/database/",
-    ];
-    final offenders = [
-      for (final path in views)
-        for (final pattern in modelImports)
-          if (File(path).readAsStringSync().contains(pattern)) '$path: $pattern',
-    ];
-    expect(offenders, isEmpty);
+  test('the ui/ import exceptions exist and still import ui/', () {
+    for (final path in _mayImportUi.keys) {
+      final file = File('lib/$path');
+      expect(file.existsSync(), isTrue, reason: path);
+      expect(
+        _targets(path, file.readAsStringSync()).any((t) => t.startsWith('ui/')),
+        isTrue,
+        reason: '$path no longer imports ui/: drop it from _mayImportUi',
+      );
+    }
+  });
+
+  test('the model scan reaches every folder under lib/ except ui/', () {
+    final folders = {
+      for (final d in Directory('lib').listSync().whereType<Directory>())
+        d.path.substring('lib/'.length),
+    }..remove('ui');
+    final scanned = {
+      for (final f in _modelFiles()) _libPath(f).split('/').first,
+    };
+    expect(folders, isNotEmpty);
+    // A folder with Dart files in it is scanned (an empty one has nothing
+    // to scan).
+    expect(
+      scanned,
+      containsAll([
+        for (final d in folders)
+          if (_dartFiles('lib/$d').isNotEmpty) d,
+      ]),
+    );
+    expect(scanned, isNot(contains('ui')));
   });
 
   test('the session controller does no I/O of its own', () {
     final source = File('lib/ui/session_controller.dart').readAsStringSync();
-    for (final forbidden in [
+    const names = [
       'AuthApi(',
       'credentialStoreProvider',
       'sharedPreferencesProvider',
       'apiClientProvider',
       'serverBindingRepositoryProvider',
-    ]) {
+    ];
+    _expectNamedThingsExist(names);
+    for (final forbidden in names) {
       expect(source.contains(forbidden), isFalse, reason: forbidden);
     }
   });
@@ -118,6 +129,49 @@ List<String> _targets(String path, String source) {
 
 String _libPath(File f) => f.path.substring('lib/'.length);
 
+/// Every Dart file under lib/ that is not under lib/ui/: the model side.
+Iterable<File> _modelFiles() =>
+    _dartFiles('lib').where((f) => !_libPath(f).startsWith('ui/'));
+
+/// Model-side files that may import ui/, with the reason. Each must exist
+/// and still import ui/ (tested), so the list cannot go stale.
+const _mayImportUi = {
+  'main.dart': 'the composition root: it starts the app with its root views',
+};
+
+/// The things a "never names X" check lists still exist in lib/ (a renamed
+/// one would let the check pass without checking anything): a provider is
+/// still declared, `Type(` and `Type.member` still name a class (and its
+/// member). Import strings are not names and are not checked.
+void _expectNamedThingsExist(List<String> patterns) {
+  final sources = [for (final f in _dartFiles('lib')) f.readAsStringSync()];
+  for (final pattern in patterns) {
+    if (pattern.startsWith('import ')) continue;
+    final name = pattern.replaceAll(RegExp(r'(\.notifier|\()$'), '');
+    if (name.endsWith('Provider')) {
+      expect(_declaredInLib(name), isTrue, reason: pattern);
+      continue;
+    }
+    final parts = name.split('.');
+    final type = RegExp('\\bclass ${parts.first}\\b');
+    final member = parts.length > 1 ? RegExp('\\b${parts[1]}\\(') : null;
+    expect(
+      sources.any((s) =>
+          type.hasMatch(s) && (member == null || member.hasMatch(s))),
+      isTrue,
+      reason: pattern,
+    );
+  }
+}
+
+/// Whether a top-level `final` or `const` named [name] is declared in lib/.
+bool _declaredInLib(String name) {
+  final declaration =
+      RegExp('^(?:final|const)\\b[^=;]*\\b$name\\s*=', multiLine: true);
+  return _dartFiles('lib')
+      .any((f) => declaration.hasMatch(f.readAsStringSync()));
+}
+
 /// The model's command side: its services, I/O providers and the scope's
 /// rebuild hook. A view never names them (SC-26 review greps, Phase M).
 const _modelCommandProviders = [
@@ -145,9 +199,11 @@ const _modelCommandFiles = [
   'repositories/server_binding_repository.dart',
 ];
 
-/// Existing views that import the database library only for a row type
-/// they observe through a `watch*` stream (allowed by SC-26).
-const _databaseTypeImports = {'widgets/pending_edits_banner.dart'};
+/// Views that may import the database library only for a row type they
+/// observe through a `watch*` stream (allowed by SC-26). None today: the
+/// pending-edits banner observes its controller's view type since
+/// APP-OTHER-1 D4.
+const _databaseTypeImports = <String>{};
 
 void _boundaryTests() {
   test('the directive parser sees relative, double-quoted and export forms',
@@ -164,6 +220,24 @@ import 'dart:io';
       'api/auth_api.dart',
       'ui/session_controller.dart',
     ]);
+  });
+
+  // U34-A-07: a renamed provider or file would silently void a check that
+  // names it, so every name on the lists must still exist.
+  test('every provider and file the checks name still exists', () {
+    final missingProviders = [
+      for (final name in _modelCommandProviders)
+        if (!_declaredInLib(name)) name,
+    ];
+    expect(missingProviders, isEmpty);
+    final missingFiles = [
+      for (final path in [
+        ..._modelCommandFiles,
+        for (final view in _databaseTypeImports) 'ui/$view',
+      ])
+        if (!File('lib/$path').existsSync()) path,
+    ];
+    expect(missingFiles, isEmpty);
   });
 
   test('every view is found, and the controllers are not views', () {
@@ -250,6 +324,13 @@ import 'dart:io';
       'uploadsOverviewProvider',
       'uploadOtherDeviceSendingProvider',
     ];
+    // U34-A-07: a stale name on either list would void its check.
+    for (final path in valueTypes) {
+      expect(File('lib/$path').existsSync(), isTrue, reason: path);
+    }
+    for (final name in modelProviders) {
+      expect(_declaredInLib(name), isTrue, reason: name);
+    }
     final offenders = [
       for (final file in views) ...[
         for (final target
@@ -269,14 +350,16 @@ import 'dart:io';
   test('the uploads controller does no I/O of its own', () {
     final source =
         File('lib/ui/uploads/uploads_controller.dart').readAsStringSync();
-    for (final forbidden in [
+    const names = [
       "import 'dart:io'",
       'uploadsApiProvider',
       'apiClientProvider',
       'databaseProvider',
       'uploadIntentStoreProvider',
       'FileUploadSource.open',
-    ]) {
+    ];
+    _expectNamedThingsExist(names);
+    for (final forbidden in names) {
       expect(source.contains(forbidden), isFalse, reason: forbidden);
     }
   });
@@ -287,7 +370,7 @@ import 'dart:io';
   test('the review controller does no I/O of its own', () {
     final source = File('lib/ui/uploads/upload_review_controller.dart')
         .readAsStringSync();
-    for (final forbidden in [
+    const names = [
       "import 'dart:io'",
       'uploadsApiProvider',
       'apiClientProvider',
@@ -297,7 +380,9 @@ import 'dart:io';
       'browseRepositoryProvider',
       'trackSyncProvider',
       'editOutboxProvider',
-    ]) {
+    ];
+    _expectNamedThingsExist(names);
+    for (final forbidden in names) {
       expect(source.contains(forbidden), isFalse, reason: forbidden);
     }
     expect(

@@ -1,31 +1,10 @@
 """SC-22 errors of the upload API. The one home for upload API errors."""
 
-from fastapi import HTTPException
-
-from app.core.api_errors import api_error
+from app.core.api_errors import ApiError
 
 
-class UploadError(Exception):
-    def __init__(self, status, code, message, *, retryable, headers=None, **extra):
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
-        self.retryable = retryable
-        self.headers = headers
-        self.extra = extra
-
-    def to_http(self) -> HTTPException:
-        exc = api_error(
-            self.status,
-            self.code,
-            self.message,
-            retryable=self.retryable,
-            **self.extra,
-        )
-        if self.headers:
-            exc.headers = dict(self.headers)
-        return exc
+class UploadError(ApiError):
+    """An error of the upload API."""
 
 
 def upload_item_not_cancellable(state: str) -> UploadError:

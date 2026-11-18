@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.services.upload_validation import reconcile_upload_validation
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_validation_fixtures import FakeProbe, item_row
 from tests.upload_zip_fixtures import (
     CallbackFiles, Entry, children_of, files_under, make_expander, make_ledger, stage_zip, zip_worker,
@@ -19,11 +19,6 @@ from tests.upload_zip_fixtures import (
 ONE, TWO = "disc1/one.flac", "disc1/two.flac"
 DATA = {ONE: bytes(range(60)), TWO: bytes(range(60))[::-1]}
 BOOT2 = "boot-2"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

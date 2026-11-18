@@ -10,7 +10,7 @@ from app.models.duplicates import (
     PairStatusOut,
 )
 from app.services.deletion_errors import pair_not_found
-from app.services.deletion_worker import master_exists_in_root
+from app.services.master_paths import master_exists_in_root
 from app.services.duplicate_detection import BAND_RANK
 
 _BAND_OF_RANK = {rank: band for band, rank in BAND_RANK.items()}

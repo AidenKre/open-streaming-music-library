@@ -14,7 +14,7 @@ import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/ui/annual_recap_export_image.dart';
 
-import 'annual_recap_page_test.dart' show prior, recapOf, track;
+import '../helpers/recap_page_fixtures.dart' show prior, recapOf, track;
 import 'browse_harness.dart' show teardownTree;
 
 /// Width and height from a PNG's IHDR chunk.
@@ -223,7 +223,9 @@ void main() {
       expect(inImage(find.text('9')), findsOneWidget);
       expect(inImage(find.text('7')), findsOneWidget);
       expect(inImage(find.text('11')), findsOneWidget);
-      expect(inImage(find.textContaining('Unavailable')), findsOneWidget);
+      // Decision 6, row 1 (owner, 2026-11-17).
+      expect(inImage(find.text('Deleted or unknown tracks')), findsOneWidget);
+      expect(inImage(find.textContaining('Unavailable')), findsNothing);
       expect(inImage(find.text('1 min')), findsOneWidget);
       expect(inImage(find.textContaining('Busiest month')), findsOneWidget);
       expect(inImage(find.text('March')), findsOneWidget);

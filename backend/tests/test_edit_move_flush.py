@@ -20,13 +20,13 @@ from pathlib import Path
 
 import pytest
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
 from app.services.track_edit import WriteMode
 from app.services.track_editor import reconcile_journal
-from tests.test_identity_editor import _editor, _world
-from tests.test_track_editor import _add_track, _db, _lib
+from tests.identity_editor_fixtures import _editor, _world
+from tests.track_editor_fixtures import _add_track, _db, _lib
 
-_WRITER_MODULES = ("app.services.organizer", "app.services.track_editor", "app.services.conversion")
+_WRITER_MODULES = ("app.services.file_ops", "app.services.track_editor", "app.services.conversion")
 
 
 def _spy(monkeypatch, tmp_path, probe):

@@ -12,6 +12,7 @@ key counts written out below, not from the classifier.
 """
 
 from dataclasses import replace
+from itertools import count
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,7 +24,7 @@ from app.services.duplicate_detection import MatcherParams, classifier_version, 
 from app.services.fingerprinter import pack_fingerprint
 from app.services.identity_worker import reconcile_audio_identity
 from tests.identity_worker_fakes import FakeFingerprinter
-from tests.identity_worker_fixtures import add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import add_track, identity, sql
 
 ALGO = "chromaprint-2"
 SETTING = "fingerprint_classifier_version"
@@ -38,13 +39,11 @@ SHORT = tuple(i << 18 for i in range(130))
 BASE = MatcherParams.from_settings(Settings(_env_file=None))  # min_items 120, min_diversity 0.15
 
 
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
+_NUMBERS = count()  # one path per track
 
 
 def printed(db, items, state, *, algorithm=ALGO, match_state="current", owner_id=None):
-    uuid_id = add_track(db, "/m/x.flac", owner_id=owner_id, identity={
+    uuid_id = add_track(db, f"/m/{next(_NUMBERS)}.flac", owner_id=owner_id, identity={
         "exact_state": "current", "exact_kind": KIND_PCM, "exact_digest": "ab" * 32,
         "sample_rate_hz": 44100, "channels": 2, "fp_state": state, "fp_algorithm": algorithm,
         "match_state": match_state})

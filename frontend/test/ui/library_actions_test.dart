@@ -24,6 +24,8 @@ import 'package:frontend/ui/library_actions.dart';
 import 'browse_harness.dart';
 import '../helpers/no_server_api.dart';
 import '../helpers/server_binding.dart';
+import '../helpers/library_seed.dart' show SeedTrack, markDownloaded, seedLibrary;
+import '../helpers/test_offline.dart';
 
 /// Records the manager calls instead of downloading.
 class _RecordingDownloads extends DownloadManager {

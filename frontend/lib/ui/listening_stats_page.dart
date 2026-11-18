@@ -51,6 +51,8 @@ import 'package:frontend/ui/listening_stats/listening_stats_format.dart';
 import 'package:frontend/ui/listening_stats/stats_ranked_card.dart';
 import 'package:frontend/ui/listening_stats/top_lists.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
+import 'package:frontend/ui/widgets/playback_notice.dart';
 
 /// A page reached from Listening stats (9C.1 registers "Year in music").
 @immutable
@@ -162,7 +164,7 @@ class _ListeningStatsPageState extends ConsumerState<ListeningStatsPage> {
                 padding: const EdgeInsets.only(top: 12),
                 child: NewActivityNotice(
                   message: _controls.notice == SnapshotStaleness.historyChanged
-                      ? 'Listening history changed'
+                      ? 'This page is out of date.'
                       : 'New listening activity',
                   actionLabel: 'Refresh',
                   onRefresh: _controls.refresh,
@@ -183,7 +185,11 @@ class _ListeningStatsPageState extends ConsumerState<ListeningStatsPage> {
                 padding: EdgeInsets.symmetric(vertical: 48),
                 child: Center(child: CircularProgressIndicator()),
               ),
-              StatsFailed() => _Failed(onRetry: _controls.retry),
+              StatsFailed() => LoadFailureNotice(
+                message: 'Couldn’t load listening stats.',
+                onRetry: _controls.retry,
+                padForChrome: false,
+              ),
               StatsReady(
                 :final stats,
                 :final hasHistory,
@@ -195,26 +201,14 @@ class _ListeningStatsPageState extends ConsumerState<ListeningStatsPage> {
                   pendingListens: pendingListens,
                   topLists: _controls.topLists,
                   token: _controls.token,
-                  onPlayTrack: _controls.playTrack,
+                  onPlayTrack: (t) =>
+                      showPlaybackOutcome(context, _controls.playTrack(t)),
                 ),
             },
           ],
         );
       },
     ),
-  );
-}
-
-class _Failed extends StatelessWidget {
-  const _Failed({required this.onRetry});
-  final VoidCallback onRetry;
-
-  @override
-  Widget build(BuildContext context) => Column(
-    children: [
-      const Text('Couldn’t load listening stats.'),
-      TextButton(onPressed: onRetry, child: const Text('Retry')),
-    ],
   );
 }
 
@@ -300,7 +294,7 @@ class _Content extends ConsumerWidget {
               'Unavailable history: ${formatListeningTime(u.listeningSeconds)}, '
               '${u.qualifiedPlays} qualified '
               '${u.qualifiedPlays == 1 ? 'play' : 'plays'} '
-              '(deleted or unresolved tracks; included in the totals above).',
+              '(deleted or unknown tracks; included in the totals above).',
               style: theme.textTheme.bodySmall,
             ),
           ),

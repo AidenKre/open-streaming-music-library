@@ -9,13 +9,12 @@
   server_instance_id}`` for the caller.
 """
 
-import sqlite3
-
 import pytest
 
 from app.library import Library
-from app.models import Track, TrackMetaData
+from tests.auth_helpers import flac_track
 from tests.conftest import bearer, log_in
+from tests.sqlite_helpers import sql_rows
 
 PASSWORD = "correct horse battery"
 
@@ -24,27 +23,6 @@ def _register(client, username):
     response = client.post("/auth/register", json={"username": username, "password": PASSWORD})
     assert response.status_code == 201, response.text
     return response.json()
-
-
-def _rows(client, statement, params=()):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        return conn.execute(statement, params).fetchall()
-    finally:
-        conn.close()
-
-
-def _track(source, title):
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes(b"not really flac")
-    return Track(
-        file_path=source,
-        metadata=TrackMetaData(
-            title=title, artist="Radiohead", album="OK Computer", codec="flac",
-            duration=1.0, bitrate_kbps=900.0, sample_rate_hz=44100, channels=2,
-            track_number=1, disc_number=1,
-        ),
-    )
 
 
 def _error(response):
@@ -69,7 +47,7 @@ def test_logout_revokes_the_api_token_on_the_next_request(app_client):
     app_client.post("/auth/logout", headers=bearer(sam["token"]))
 
     assert _error(app_client.get("/tracks", headers=bearer(sam["token"]))) == (401, "invalid_token")
-    [(revoked_at,)] = _rows(
+    [(revoked_at,)] = sql_rows(
         app_client, "SELECT revoked_at FROM auth_sessions WHERE user_id = ?", (sam["user"]["id"],)
     )
     assert revoked_at is not None
@@ -79,7 +57,7 @@ def test_logout_revokes_the_media_token_too(app_client, tmp_path):
     db = app_client.app.state.database
     sam = _register(app_client, "Sam")
     folder = db.get_user(sam["user"]["id"])["library_folder"]
-    track = _track(tmp_path / "music" / folder / "Lucky.flac", "Lucky")
+    track = flac_track(tmp_path / "music" / folder / "Lucky.flac", "Lucky")
     assert Library(db, sam["user"]["id"]).add_track(track)
     stream = f"/tracks/{track.uuid_id}/stream"
     params = {"quality": "original", "access_token": sam["media_token"]}
@@ -106,12 +84,12 @@ def test_logout_leaves_the_users_other_sessions_and_other_users_alone(app_client
 def test_a_repeated_logout_is_refused_as_a_dead_token_and_changes_nothing(app_client):
     sam = _register(app_client, "Sam")
     app_client.post("/auth/logout", headers=bearer(sam["token"]))
-    before = _rows(app_client, "SELECT * FROM auth_sessions ORDER BY token_hash")
+    before = sql_rows(app_client, "SELECT * FROM auth_sessions ORDER BY token_hash")
 
     response = app_client.post("/auth/logout", headers=bearer(sam["token"]))
 
     assert _error(response) == (401, "invalid_token")
-    assert _rows(app_client, "SELECT * FROM auth_sessions ORDER BY token_hash") == before
+    assert sql_rows(app_client, "SELECT * FROM auth_sessions ORDER BY token_hash") == before
 
 
 def test_logout_without_a_token_is_auth_required(app_client):

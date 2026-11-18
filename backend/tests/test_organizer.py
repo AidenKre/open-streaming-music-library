@@ -1010,12 +1010,387 @@ class TestCaseVariantRowsAreEachCompared:
         from app.models import Track
         from app.services.import_outcome import ImportOutcome
         from tests.name_clash_rig import META, Rig, identity_of
+        from tests.track_paths import allow_two_tracks_on_one_path
 
         rig = Rig(tmp_path, monkeypatch)
         rig.seed_track("Song.flac", b"one|t")
-        # Its case twin: only the row (a case-insensitive disk cannot hold both files).
+        # Its case twin: only the row (a case-insensitive disk cannot hold both files),
+        # and only without the unique index, which now refuses the twin on any disk.
+        allow_two_tracks_on_one_path(rig.db)
         assert rig.db.add_track(Track(file_path=rig.folder / "song.flac", metadata=META,
                                       audio_identity=identity_of("two")))
         incoming = rig.source("b", "song.flac", b"two|retagged")
 
         assert rig.organize(incoming) is ImportOutcome.DUPLICATE
+
+
+class TestAHashFailureOnATakenNameIsRetried:
+    """Owner's decision 2026-11-17 (review #4 of U05-B-01): when the audio of
+    the file already under a taken name cannot be read now (the decoder cannot
+    run, a time-out, a kill, an unexpected error, an I/O error), the import is
+    an environmental failure retried later: nothing is placed, no numbered name
+    is taken, the source stays. Only a file the identity code classes as
+    unreadable for good (identity_reasons.is_content_failure, an unsupported
+    codec, ffprobe refusing it) still lets the bytes decide."""
+
+    OUTSIDE = ["tool_missing", "timeout", "killed", "internal_error", None]
+
+    @pytest.fixture
+    def rig(self, tmp_path, monkeypatch):
+        from tests.name_clash_rig import Rig
+
+        return Rig(tmp_path, monkeypatch)
+
+    def _untracked(self, rig, name, content):
+        rig.folder.mkdir(parents=True, exist_ok=True)
+        path = rig.folder / name
+        path.write_bytes(content)
+        return path
+
+    @pytest.mark.parametrize("reason", OUTSIDE)
+    def test_an_outside_failure_is_retried_later_and_nothing_is_placed(self, rig, reason):
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked")
+        rig.failures[existing] = reason
+        incoming = rig.source("b", "song.flac", b"two|t")
+
+        outcome = rig.organize(incoming)
+
+        assert outcome is ImportOutcome.TOOL_UNAVAILABLE and outcome.environmental
+        assert rig.names() == ["song.flac"]
+        assert incoming.read_bytes() == b"two|t"
+        assert rig.track_names() == []
+
+    def test_a_compute_that_raises_is_retried_later(self, rig):
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked")
+        rig.failures[existing] = RuntimeError("boom")
+        incoming = rig.source("b", "song.flac", b"one|retagged")
+
+        assert rig.organize(incoming) is ImportOutcome.TOOL_UNAVAILABLE
+        assert rig.names() == ["song.flac"] and incoming.exists()
+
+    def test_a_probe_that_cannot_run_now_is_retried_later(self, rig):
+        from app.services.import_outcome import ImportOutcome
+        from app.services.metadata import ProbeUnavailable
+        from tests.name_clash_rig import META
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked")
+        incoming = rig.source("b", "song.flac", b"one|retagged")
+
+        def probe(file_path):
+            if Path(file_path) == existing:
+                raise ProbeUnavailable("ffprobe timed out")
+            return META
+
+        with (
+            patch("app.services.organizer.get_track_metadata", side_effect=probe),
+            patch("app.services.organizer.extract_cover_art_bytes", return_value=None),
+        ):
+            assert rig.organizer.organize(incoming) is ImportOutcome.TOOL_UNAVAILABLE
+
+        assert rig.names() == ["song.flac"] and incoming.exists()
+
+    @pytest.mark.requires_chmod_denial
+    def test_a_file_that_cannot_be_read_now_is_retried_later(self, rig):
+        """No hash on either side, and the library file cannot be opened now:
+        the bytes cannot answer, so the import waits."""
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"unavailable|x")
+        incoming = rig.source("b", "song.flac", b"unavailable|y")
+        existing.chmod(0)
+        try:
+            assert rig.organize(incoming) is ImportOutcome.TOOL_UNAVAILABLE
+        finally:
+            existing.chmod(0o644)
+
+        assert rig.names() == ["song.flac"] and incoming.exists()
+
+    @pytest.mark.parametrize("audio,expected", [("one", "duplicate"), ("two", "imported")])
+    def test_the_retry_decides_once_the_cause_is_gone(self, rig, audio, expected):
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked")
+        rig.failures[existing] = "timeout"
+        incoming = rig.source("b", "song.flac", f"{audio}|retagged".encode())
+        assert rig.organize(incoming) is ImportOutcome.TOOL_UNAVAILABLE
+
+        del rig.failures[existing]  # the decoder answers again
+        outcome = rig.organize(incoming)
+
+        assert outcome is ImportOutcome(expected)
+        if expected == "duplicate":
+            assert rig.names() == ["song.flac"] and incoming.exists()
+        else:
+            assert rig.names() == ["song (2).flac", "song.flac"] and not incoming.exists()
+
+    @pytest.mark.parametrize("reason", ["decode_error", "probe_error", "output_error"])
+    def test_a_file_unreadable_for_good_lets_the_bytes_decide(self, rig, reason):
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"one|damaged")
+        rig.failures[existing] = reason
+        incoming = rig.source("b", "song.flac", b"one|other bytes")
+
+        assert rig.organize(incoming) is ImportOutcome.IMPORTED
+
+        assert rig.names() == ["song (2).flac", "song.flac"]
+
+    def test_a_library_file_ffprobe_refuses_lets_the_bytes_decide(self, rig):
+        from app.services.import_outcome import ImportOutcome
+        from tests.name_clash_rig import META
+
+        existing = self._untracked(rig, "song.flac", b"one|not audio any more")
+        incoming = rig.source("b", "song.flac", b"one|tags")
+
+        with (
+            patch("app.services.organizer.get_track_metadata",
+                  side_effect=lambda file_path: None if Path(file_path) == existing else META),
+            patch("app.services.organizer.extract_cover_art_bytes", return_value=None),
+        ):
+            assert rig.organizer.organize(incoming) is ImportOutcome.IMPORTED
+
+        assert rig.names() == ["song (2).flac", "song.flac"]
+
+    def test_a_track_whose_file_is_gone_does_not_block_the_name_for_ever(self, rig):
+        from app.models import Track
+        from app.services.import_outcome import ImportOutcome
+        from tests.name_clash_rig import META
+
+        assert rig.db.add_track(Track(file_path=rig.folder / "song.flac", metadata=META))
+        incoming = rig.source("b", "song.flac", b"two|t")
+
+        assert rig.organize(incoming) is ImportOutcome.IMPORTED
+
+        assert rig.names() == ["song (2).flac"]
+
+    def test_art_created_for_a_deferred_import_is_released(self, tmp_path):
+        from app.services.audio_identity import AudioIdentity, ExactUnavailable
+        from app.services.import_outcome import ImportOutcome
+        from tests.name_clash_rig import identity_of
+
+        released = []
+        taken = tmp_path / "music" / "Artist" / "Album" / "song.flac"
+        taken.parent.mkdir(parents=True)
+        taken.write_bytes(b"one|untracked")
+
+        def compute(path, codec):
+            if Path(path) == taken:
+                return AudioIdentity(exact=ExactUnavailable("failed", "timeout"),
+                                     tool_versions=None, computed_at=1)
+            return identity_of("two")
+
+        org = organizer.Organizer(organizer.OrganizerContext(
+            music_library_dir=tmp_path / "music", should_organize_files=True,
+            should_copy_files=False, add_to_database=lambda track: True,
+            add_cover_art=lambda image: CoverArtAddResult(cover_art_id=5, was_created=True),
+            release_cover_art=lambda art_id: released.append(art_id) or True,
+            compute_identity=compute))
+        source = tmp_path / "import" / "song.flac"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"two|t")
+        meta = TrackMetaData(title="Song", artist="Artist", album="Album", codec="flac",
+                             duration=1.0, has_album_art=True)
+
+        with (
+            patch("app.services.organizer.get_track_metadata", return_value=meta),
+            patch("app.services.organizer.extract_cover_art_bytes", return_value=b"art"),
+        ):
+            assert org.organize(source) is ImportOutcome.TOOL_UNAVAILABLE
+
+        assert released == [5] and source.exists()
+        assert sorted(p.name for p in taken.parent.iterdir()) == ["song.flac"]
+
+    def test_a_stop_during_the_existing_files_decode_is_stopped(self, tmp_path):
+        from app.services.import_outcome import ImportOutcome
+        from tests.name_clash_rig import identity_of
+
+        taken = tmp_path / "music" / "Artist" / "Album" / "song.flac"
+        taken.parent.mkdir(parents=True)
+        taken.write_bytes(b"one|untracked")
+        asked = []
+
+        def stopping():
+            asked.append(1)
+            return len(asked) > 1  # the incoming hash runs; the stop comes before the second
+
+        org = organizer.Organizer(organizer.OrganizerContext(
+            music_library_dir=tmp_path / "music", should_organize_files=True,
+            should_copy_files=False, add_to_database=lambda track: True,
+            compute_identity=lambda path, codec: identity_of("two"), should_stop=stopping))
+        source = tmp_path / "import" / "song.flac"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"two|t")
+        meta = TrackMetaData(title="Song", artist="Artist", album="Album", codec="flac", duration=1.0)
+
+        with patch("app.services.organizer.get_track_metadata", return_value=meta):
+            assert org.organize(source) is ImportOutcome.STOPPED
+
+        assert source.exists()
+        assert sorted(p.name for p in taken.parent.iterdir()) == ["song.flac"]
+
+
+class TestAHashFailureOnATakenNameReviewR1:
+    """Review r1 of the hash-failure rule (bugs-BE-A-review-hash-retry.md)."""
+
+    @pytest.fixture
+    def rig(self, tmp_path, monkeypatch):
+        from tests.name_clash_rig import Rig
+
+        return Rig(tmp_path, monkeypatch)
+
+    def _untracked(self, rig, name, content):
+        rig.folder.mkdir(parents=True, exist_ok=True)
+        path = rig.folder / name
+        path.write_bytes(content)
+        return path
+
+    @pytest.mark.requires_chmod_denial
+    def test_a_library_file_that_cannot_be_opened_now_is_retried_not_numbered(self, rig):
+        """ffprobe answers a file it cannot open (EACCES, EIO) with the same exit
+        as a refusal, so "no metadata" alone is not proof the file is unreadable
+        for good: a file that cannot be opened now waits."""
+        from app.services.import_outcome import ImportOutcome
+        from tests.name_clash_rig import META
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked, other size")
+        incoming = rig.source("b", "song.flac", b"one|tags")
+        existing.chmod(0)
+        try:
+            with (
+                patch("app.services.organizer.get_track_metadata",
+                      side_effect=lambda file_path: None if Path(file_path) == existing else META),
+                patch("app.services.organizer.extract_cover_art_bytes", return_value=None),
+            ):
+                outcome = rig.organizer.organize(incoming)
+        finally:
+            existing.chmod(0o644)
+
+        assert outcome is ImportOutcome.TOOL_UNAVAILABLE
+        assert rig.names() == ["song.flac"] and incoming.exists()
+
+    def test_a_certain_duplicate_answers_even_when_another_copy_cannot_be_read_now(self, rig):
+        from app.services.import_outcome import ImportOutcome
+
+        unreadable = self._untracked(rig, "song.flac", b"x|untracked")
+        rig.failures[unreadable] = "timeout"
+        rig.seed_track("song (2).flac", b"one|t")
+        incoming = rig.source("b", "song.flac", b"one|retagged")
+
+        assert rig.organize(incoming) is ImportOutcome.DUPLICATE
+
+    @pytest.mark.parametrize("failure", [("unsupported", None), "master_missing"])
+    def test_an_unsupported_or_missing_master_lets_the_bytes_decide(self, rig, failure):
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked")
+        rig.failures[existing] = failure
+        incoming = rig.source("b", "song.flac", b"one|other bytes")
+
+        assert rig.organize(incoming) is ImportOutcome.IMPORTED
+
+        assert rig.names() == ["song (2).flac", "song.flac"]
+
+    def test_a_probe_killed_by_the_shutdown_reads_as_stopped(self, tmp_path):
+        from app.services.import_outcome import ImportOutcome
+        from app.services.metadata import ProbeUnavailable
+        from tests.name_clash_rig import identity_of
+
+        taken = tmp_path / "music" / "Artist" / "Album" / "song.flac"
+        taken.parent.mkdir(parents=True)
+        taken.write_bytes(b"one|untracked")
+        asked = []
+
+        def stopping():
+            asked.append(1)
+            return len(asked) > 1  # the incoming hash runs; the stop comes after it
+
+        meta = TrackMetaData(title="Song", artist="Artist", album="Album", codec="flac", duration=1.0)
+
+        def probe(file_path):
+            if Path(file_path) == taken:
+                raise ProbeUnavailable("ffprobe was killed")
+            return meta
+
+        org = organizer.Organizer(organizer.OrganizerContext(
+            music_library_dir=tmp_path / "music", should_organize_files=True,
+            should_copy_files=False, add_to_database=lambda track: True,
+            compute_identity=lambda path, codec: identity_of("two"), should_stop=stopping))
+        source = tmp_path / "import" / "song.flac"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"two|t")
+
+        with patch("app.services.organizer.get_track_metadata", side_effect=probe):
+            assert org.organize(source) is ImportOutcome.STOPPED
+
+        assert source.exists()
+
+    def test_a_library_name_that_cannot_be_examined_now_is_retried(self, rig, monkeypatch):
+        import pathlib
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked")
+        incoming = rig.source("b", "song.flac", b"two|t")
+        real_is_file = pathlib.Path.is_file
+
+        def is_file(self, *args, **kwargs):
+            if self == existing:
+                raise PermissionError(13, "Permission denied")
+            return real_is_file(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "is_file", is_file)
+
+        assert rig.organize(incoming) is ImportOutcome.TOOL_UNAVAILABLE
+        assert incoming.exists()
+
+    @pytest.mark.requires_chmod_denial
+    def test_a_decode_error_on_a_file_that_cannot_be_opened_now_still_waits(self, rig):
+        """ffmpeg reports an unopenable file as a decode error (a content
+        reason): the readable-now check runs before the bytes decide."""
+        from app.services.import_outcome import ImportOutcome
+
+        existing = self._untracked(rig, "song.flac", b"one|untracked, other size")
+        rig.failures[existing] = "decode_error"
+        incoming = rig.source("b", "song.flac", b"one|tags")
+        existing.chmod(0)
+        try:
+            outcome = rig.organize(incoming)
+        finally:
+            existing.chmod(0o644)
+
+        assert outcome is ImportOutcome.TOOL_UNAVAILABLE
+        assert rig.names() == ["song.flac"] and incoming.exists()
+
+
+@pytest.mark.requires_ffmpeg
+def test_a_shutdown_also_ends_the_cover_extraction_of_an_import(tmp_path):
+    # Pre-merge review of A3-04 (R-01): the import's probes run registered in the
+    # organizer's probe registry so a shutdown ends them; the cover extraction
+    # must be one of them, not wait out its own bound.
+    import subprocess
+
+    from app.services.ffmpeg_runner import FfmpegProcessRegistry
+
+    song = tmp_path / "song.m4a"
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-f", "lavfi", "-i", "testsrc=size=64x64:rate=1:duration=1",
+         "-map", "0:a", "-map", "1:v", "-c:a", "aac", "-c:v", "mjpeg", "-frames:v", "1",
+         "-disposition:v", "attached_pic", "-f", "mp4", str(song)],
+        check=True)
+    registry = FfmpegProcessRegistry()
+    registry.close()  # shutting down: every run registered from now on is killed
+    add_cover_art = Mock()
+    ctx = organizer.OrganizerContext(
+        music_library_dir=tmp_path / "music", should_organize_files=True, should_copy_files=False,
+        add_to_database=lambda x: True, add_cover_art=add_cover_art, probe_registry=registry)
+
+    meta = TrackMetaData(title="T", artist="A", codec="aac", has_album_art=True)
+    _, result, art = organizer.Organizer(ctx)._register_cover_art(song, meta)
+
+    assert (result, art) == (None, None)
+    add_cover_art.assert_not_called()

@@ -16,7 +16,9 @@ const fakeLastfmUrl =
     'https://www.last.fm/api/auth/?api_key=$fakeLastfmKey&token=$fakeLastfmToken';
 const fakeConnectionId = 'c0ffee00-0000-4000-8000-000000000001';
 
-/// A status body as the 9D.1d server sends it.
+/// A status body as the 9D.1d server sends it. [counts] null sends no
+/// numbers (each count unknown); the other optional fields are sent as given
+/// (R-332-12).
 LastfmStatus lastfmStatus({
   String service = 'running',
   String state = 'enabled',
@@ -24,16 +26,26 @@ LastfmStatus lastfmStatus({
   String? account = 'listener_01',
   String? connectionId = fakeConnectionId,
   String? appName,
+  int? approvalExpiresAt,
+  Object? counts = const {
+    'pending': 0,
+    'sent': 0,
+    'ignored': 0,
+    'failed': 0,
+    'dropped': 0,
+  },
+  List<Object?> recentProblems = const [],
+  int? lastSuccessAt,
 }) => LastfmStatus.fromJson({
   'service': service,
   'state': state,
   'needs_reconnect': needsReconnect,
   'account_name': account,
   'connection_id': connectionId,
-  'approval_expires_at': null,
-  'counts': {'pending': 0, 'sent': 0, 'ignored': 0, 'failed': 0, 'dropped': 0},
-  'recent_problems': [],
-  'last_success_at': null,
+  'approval_expires_at': approvalExpiresAt,
+  'counts': counts,
+  'recent_problems': recentProblems,
+  'last_success_at': lastSuccessAt,
   // Omitted when null: a server without LASTFM_APP_NAME support (DEV-9-06).
   'app_name': ?appName,
 });

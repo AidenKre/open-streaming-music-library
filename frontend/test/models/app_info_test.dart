@@ -162,4 +162,33 @@ void main() {
       expect(isLosslessCodec(null), isNull);
     });
   });
+
+  group('isDownloadedAudioUnchanged', () {
+    bool same(String? oldCodec, String? codec, double? oldKbps, double? kbps) =>
+        isDownloadedAudioUnchanged(
+          downloadedCodec: oldCodec,
+          codec: codec,
+          downloadedBitrateKbps: oldKbps,
+          bitrateKbps: kbps,
+        );
+
+    test('a lossless codec matches whatever the bitrates; a lossy one within '
+        '1 kbps', () {
+      expect(same('FLAC', 'flac', 600, 950), isTrue);
+      expect(same('flac', 'flac', null, null), isTrue);
+      expect(same('mp3', 'mp3', 319, 319.9), isTrue);
+      expect(same('mp3', 'mp3', 318, 319.5), isFalse);
+      expect(same('mp3', 'aac', 320, 320), isFalse);
+    });
+
+    test('a missing codec, or a missing bitrate of a codec not known as '
+        'lossless, never matches', () {
+      expect(same(null, 'flac', 900, 900), isFalse);
+      expect(same('flac', null, 900, 900), isFalse);
+      expect(same('mp3', 'mp3', null, 320), isFalse);
+      expect(same('weird', 'weird', 320, 320), isTrue,
+          reason: 'same codec, bitrates within 1 kbps');
+      expect(same('weird', 'weird', null, 320), isFalse);
+    });
+  });
 }

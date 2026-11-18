@@ -17,18 +17,14 @@ from pathlib import Path
 import pytest
 
 from app.services import organizer, upload_placement
-from tests.identity_worker_fixtures import make_db, sql
+from tests.crash import Crash
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import accept, journal, library_root, make_commit_worker, ready_item
 from tests.upload_publish_fixtures import make_publisher, prepared_commit
 from tests.upload_validation_fixtures import item_row
 
 _real_link = os.link
 _Usage = namedtuple("_Usage", "total used free")
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -521,9 +517,6 @@ def test_a_tampered_work_path_outside_the_owners_stage_is_never_trusted(db, musi
 def test_a_retry_removes_its_own_half_copy_and_imports(db, music, monkeypatch):
     commit = _accepted(db, music)
     _refuse(monkeypatch, errno.EXDEV)
-
-    class Crash(BaseException):
-        pass
 
     def seam(name):
         if name == "mid_copy":

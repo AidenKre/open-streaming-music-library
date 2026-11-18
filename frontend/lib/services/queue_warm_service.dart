@@ -38,6 +38,10 @@ class QueueWarmService {
   // succession.
   final Map<String, Set<String>> _pendingWarmUuids = {};
 
+  /// Set by [quiesce] (a reset or log-out, SC-15): no timer starts and no
+  /// request is sent after it. Terminal: the scope is rebuilt afterwards.
+  bool _quiesced = false;
+
   QueueWarmService({
     required QueueRepository queueRepo,
     required ApiClient apiClient,
@@ -51,6 +55,7 @@ class QueueWarmService {
     required int currentPlayPosition,
     required String quality,
   }) {
+    if (_quiesced) return;
     _queueWarmTimer?.cancel();
     _queueWarmTimer = Timer(_debounce, () {
       unawaited(
@@ -79,6 +84,8 @@ class QueueWarmService {
         limit: _maxTrackUuids,
       );
       if (entries.isEmpty) return;
+      // A reset's quiet step landed during the queue read: send nothing.
+      if (_quiesced) return;
 
       final trackUuids = entries.map((e) => e.uuidId).toList(growable: false);
       await _apiClient.postJson(
@@ -106,7 +113,7 @@ class QueueWarmService {
   /// Debounced — rapid calls within the window accumulate (per quality) so no
   /// earlier batch is dropped.
   void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {
-    if (trackUuids.isEmpty) return;
+    if (_quiesced || trackUuids.isEmpty) return;
     _pendingWarmUuids.putIfAbsent(quality, () => <String>{}).addAll(trackUuids);
     _uuidsWarmTimer?.cancel();
     _uuidsWarmTimer = Timer(_debounce, _flushWarmUuids);
@@ -140,7 +147,8 @@ class QueueWarmService {
           'session_id': null,
           'current_index': 0,
           // Warm the whole batch, not just the server's default look-ahead
-          // window — every queued download should be pre-transcoded.
+          // window. The batch is capped at [_maxTrackUuids]: queued
+          // downloads beyond the first 50 are not warmed by this request.
           'count': capped.length,
           'quality': quality,
           'track_uuids': capped,
@@ -153,6 +161,17 @@ class QueueWarmService {
     } on TokenWithheldException {
       developer.log('queue warm (uuids) skipped: the server is not verified', name: 'QueueWarm');
     }
+  }
+
+  /// The reset's quiet step (SC-15, after playback): cancels both pending
+  /// warm-ups and stops for good, so no warm-up request leaves during or
+  /// after the wipe. A request already handed to the client is not awaited
+  /// (it is advisory, and its token is the old scope's).
+  Future<void> quiesce() async {
+    _quiesced = true;
+    _queueWarmTimer?.cancel();
+    _uuidsWarmTimer?.cancel();
+    _pendingWarmUuids.clear();
   }
 
   void dispose() {

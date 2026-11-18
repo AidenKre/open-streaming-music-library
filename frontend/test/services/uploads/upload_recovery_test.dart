@@ -16,6 +16,7 @@ import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_manager.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 

@@ -1,8 +1,11 @@
-// U15-FE-DB-B-03: after a catalog sync the search indexes are rebuilt from
-// the tables. The rebuild empties fts_tracks and fills it again; run as
-// separate statements, a search issued in between found nothing. It runs in
-// one transaction now, so a reader sees the old index or the new one, never
-// an empty one.
+// U15-FE-DB-B-03: a search issued while a sync updates fts_tracks must see
+// the old entries or the new ones, never neither. The sync used to rebuild
+// the whole index after every sync (empty it, fill it again); it now updates
+// each page's entries (delete the old ones, index the current ones) in the
+// transaction that saves the page (PM-APP-SEARCH). Either way the step that
+// writes the current entries comes after the old ones are gone: a search
+// started just before it, from outside the transaction, must still find the
+// track.
 import 'dart:async';
 import 'dart:convert';
 
@@ -43,9 +46,9 @@ Map<String, Object?> _upsert(String uuid, int revision) => {
   },
 };
 
-/// The real database; right after the rebuild empties fts_tracks it starts a
-/// search from outside any transaction (the root zone), like a search page
-/// would, and keeps its result.
+/// The real database; just before the statement that writes the current
+/// entries into fts_tracks, it starts a search from outside any transaction
+/// (the root zone), like a search page would, and keeps its result.
 class _ProbingDb extends AppDatabase {
   _ProbingDb() : super(NativeDatabase.memory());
 
@@ -54,16 +57,16 @@ class _ProbingDb extends AppDatabase {
 
   @override
   Future<void> customStatement(String statement, [List<dynamic>? args]) async {
-    await super.customStatement(statement, args);
     if (probing &&
         searchDuringRebuild == null &&
-        statement.contains("fts_tracks(fts_tracks) VALUES('delete-all')")) {
+        statement.startsWith('INSERT INTO fts_tracks(rowid')) {
       searchDuringRebuild = Zone.root.run(
         () => customSelect(
           "SELECT count(*) AS n FROM fts_tracks WHERE fts_tracks MATCH 'u1'",
         ).getSingle().then((r) => r.read<int>('n')),
       );
     }
+    await super.customStatement(statement, args);
   }
 }
 
@@ -98,12 +101,11 @@ void main() {
       db: db,
       api: TracksApi(api: api),
       queueRepository: QueueRepository(db),
-      prefs: await SharedPreferences.getInstance(),
       bindingToken: token,
     );
   }
 
-  test('a search during the index rebuild still finds an indexed track',
+  test('a search during the index update still finds an indexed track',
       () async {
     pages[0] = {
       'changes': [_upsert('u1', 1)],
@@ -112,24 +114,25 @@ void main() {
     };
     await (await service()).syncChanges();
 
+    // u1 comes again: its old entry is deleted before the new one is written.
     pages[1] = {
-      'changes': [_upsert('u2', 2)],
+      'changes': [_upsert('u1', 2), _upsert('u2', 3)],
       'nextCursor': null,
-      'latestRevision': 2,
+      'latestRevision': 3,
     };
     db.probing = true;
     await (await service()).syncChanges();
 
     expect(db.searchDuringRebuild, isNotNull,
-        reason: 'the rebuild ran and the probe searched');
+        reason: 'the index update ran and the probe searched');
     expect(await db.searchDuringRebuild, 1,
-        reason: 'a search saw the emptied index mid-rebuild');
+        reason: 'a search saw the index without u1 mid-update');
   });
 
-  // Phase 8 adds a rebuild after a failed page (pages that committed changed
-  // the tables): it runs in one transaction too.
-  test('a search during the rebuild after a failed page still finds a track',
-      () async {
+  // A sync that fails after a committed page: that page's index update ran
+  // in the page's transaction too.
+  test('a search during the index update of a sync that then fails still '
+      'finds a track', () async {
     pages[0] = {
       'changes': [_upsert('u1', 1)],
       'nextCursor': null,
@@ -139,16 +142,16 @@ void main() {
 
     // One page commits, the next request fails.
     pages[1] = {
-      'changes': [_upsert('u2', 2)],
-      'nextCursor': 2,
-      'latestRevision': 3,
+      'changes': [_upsert('u1', 2), _upsert('u2', 3)],
+      'nextCursor': 3,
+      'latestRevision': 4,
     };
     db.probing = true;
     await expectLater((await service()).syncChanges(), throwsA(anything));
 
     expect(db.searchDuringRebuild, isNotNull,
-        reason: 'the rebuild after the failed page ran and the probe searched');
+        reason: 'the committed page updated the index and the probe searched');
     expect(await db.searchDuringRebuild, 1,
-        reason: 'a search saw the emptied index mid-rebuild');
+        reason: 'a search saw the index without u1 mid-update');
   });
 }

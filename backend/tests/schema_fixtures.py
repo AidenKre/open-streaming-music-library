@@ -1,65 +1,67 @@
-"""Real previous-version backend databases.
+"""Shared database helpers for the schema tests.
 
-``fixtures/schema_v<N>.sql`` is the frozen ``init.sql`` of schema version N:
-v9 (``main`` @ 3ee4c9e, the last pre-Phase-5 schema), v11 (PR 5A.0,
-``phase-5a0`` @ 747fa35, before the history tables), v12 (``main`` @
-a516b17, the last pre-multi-user schema), v13 (``roadmap-integration`` @
-92adfe0, Phase M's fresh schema, the last before Phase 6.5) and v14
-(``roadmap-integration`` @ 2e4e4a4, Phase 6.5's audio identity, the last
-before Phase 7), v15 (``phase-8-integration`` @ d785b9e, Phase 7's upload
-tables, the last before Phase 8) and v16 (``phase-9-integration`` @ 0c9f5d6,
-Phase 8's deletion tables, the last before Phase 9D.1b's Last.fm tables).
-The server refuses v9-v12 and upgrades v13 to v16; the tests build them with
-plain SQL and open them through the production ``Database.initialize()``.
-
-Each fixture is byte-identical to ``backend/app/database/init.sql`` at its
-commit. To re-freeze v15 or v16 (for example after Phase 7 or Phase 8 edits
-its objects in place), run from the repository root, naming the last commit
-whose ``init.sql`` still ends with ``PRAGMA user_version = <N>``:
-
-    git show <commit>:backend/app/database/init.sql > backend/tests/fixtures/schema_v<N>.sql
-
-v16 was produced by exactly this with <commit> = 0c9f5d69a67c5013620c5280c2b57b8d6f20ea14.
+``fixtures/schema_v17.sql`` is the one frozen schema: ``init.sql`` as it was
+at the last commit before the schema version was reset to 1
+(``PRAGMA user_version = 17``), byte for byte. ``make_pre_reset_database``
+builds a real database from it, so the tests can show that the server refuses
+a file from before the reset. It is history: never edit it or freeze it again.
 """
 
 import sqlite3
 from pathlib import Path
 
-from app.database.database import DatabaseContext
+from app.database.database import Database, DatabaseContext
 from tests.owned_database import OwnedTestDatabase
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 
 FIXTURES = Path(__file__).parent / "fixtures"
-LEGACY_VERSIONS = (9, 11, 12, 13, 14, 15, 16)
 INIT_SQL = Path(__file__).parent.parent / "app" / "database" / "init.sql"
+PRE_RESET_VERSION = 17
+# Versions the server and the admin tool must refuse: 0 (tables, but no
+# version stamp), the version after the latest, and the last one before the reset.
+REFUSED_VERSIONS = (0, Database.LATEST_SCHEMA_VERSION + 1, PRE_RESET_VERSION)
 
 
-def make_legacy_database(path: Path, version: int) -> None:
-    """An empty database at a frozen schema ``version`` (9, 11 to 16).
-    From v11 on it carries a server instance id, as those versions shipped."""
-    if version not in LEGACY_VERSIONS:
-        raise ValueError(f"no frozen schema for version {version}")
+def make_pre_reset_database(path: Path) -> None:
+    """A real version-17 database as a server from before the reset left it:
+    the frozen schema, an instance id and two users' libraries."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
-        conn.executescript((FIXTURES / f"schema_v{version}.sql").read_text())
+        conn.executescript((FIXTURES / "schema_v17.sql").read_text())
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('server_instance_id', 'inst-v17')"
+        )
+        seed_two_user_library(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def make_database_at(path: Path, version: int) -> None:
+    """A database stamped ``version``. Version 17 is the real thing
+    (``make_pre_reset_database``). Any other version is today's tables under
+    that stamp, written by plain ``sqlite3``: a rollback-journal file with no
+    ``-wal`` or ``-shm`` next to it."""
+    if version == PRE_RESET_VERSION:
+        make_pre_reset_database(path)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(INIT_SQL.read_text())
         conn.execute(f"PRAGMA user_version = {version}")
-        if version >= 11:
-            conn.execute(
-                "INSERT INTO app_settings (key, value) "
-                "VALUES ('server_instance_id', ?)",
-                (f"inst-v{version}",),
-            )
         conn.commit()
     finally:
         conn.close()
 
 
 def seed_two_user_library(conn: sqlite3.Connection) -> None:
-    """A Phase M library as a running server leaves it, in plain SQL valid on
-    v13 and later: two users with tracks, metadata, FTS rows, an edited-away
-    FTS entry, a tombstone, a journal row, conversion jobs (one deleted, so
-    ``sqlite_sequence`` runs ahead of the highest id), history and settings.
-    The caller commits."""
+    """A library as a running server leaves it, in plain SQL (valid on today's
+    schema and on the frozen version 17): two users with tracks, metadata,
+    FTS rows, an edited-away FTS entry, a tombstone, a journal row, conversion
+    jobs (one deleted, so ``sqlite_sequence`` runs ahead of the highest id),
+    history and settings. The caller commits."""
     conn.execute("PRAGMA foreign_keys=ON")
     for uid, name in ((1, "sam"), (2, "alex")):
         conn.execute(
@@ -89,11 +91,15 @@ def seed_two_user_library(conn: sqlite3.Connection) -> None:
         (22, "u-alex-2", 2, "Idioteque", 8),
         (23, "u-alex-3", 2, "Gone", 9),
     ]
+    # The frozen version 17 stores the path alone, today's schema its folded form with it.
+    folded = "file_path_fold" in {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
+    path_columns, path_marks = (PATH_COLUMNS, PATH_MARKS) if folded else ("file_path", "?")
     for track_id, uuid, owner, title, revision in tracks:
+        path = f"/music/{owner}/{uuid}.flac"
         conn.execute(
-            "INSERT INTO tracks (id, uuid_id, file_path, created_at, last_updated, "
-            "revision, owner_id) VALUES (?, ?, ?, 100, 200, ?, ?)",
-            (track_id, uuid, f"/music/{owner}/{uuid}.flac", revision, owner),
+            f"INSERT INTO tracks (id, uuid_id, {path_columns}, created_at, last_updated, "
+            f"revision, owner_id) VALUES (?, ?, {path_marks}, 100, 200, ?, ?)",
+            (track_id, uuid, *(path_values(path) if folded else (path,)), revision, owner),
         )
         conn.execute(
             "INSERT INTO trackmetadata (track_id, uuid_id, title, artist, album, "
@@ -132,41 +138,18 @@ def seed_two_user_library(conn: sqlite3.Connection) -> None:
     )
 
 
-def insert_v9_track(
-    conn: sqlite3.Connection,
-    *,
-    track_id: int,
-    uuid_id: str,
-    artist_id: int,
-    album_id: int,
-    title: str = "t",
-    revision: int = 1,
-    duration=180.0,
-    sample_rate_hz=44100,
-    channels=2,
-    bitrate_kbps=320.0,
-) -> None:
-    conn.execute(
-        "INSERT INTO tracks (id, uuid_id, file_path, revision) VALUES (?, ?, ?, ?)",
-        (track_id, uuid_id, f"/music/{uuid_id}.flac", revision),
-    )
-    conn.execute(
-        "INSERT INTO trackmetadata (track_id, uuid_id, title, artist, album, "
-        "artist_id, album_id, codec, duration, bitrate_kbps, sample_rate_hz, "
-        "channels, has_album_art) VALUES (?, ?, ?, 'Artist', 'Album', ?, ?, "
-        "'flac', ?, ?, ?, ?, 0)",
-        (
-            track_id,
-            uuid_id,
-            title,
-            artist_id,
-            album_id,
-            duration,
-            bitrate_kbps,
-            sample_rate_hz,
-            channels,
-        ),
-    )
+def make_two_user_database(path: Path) -> None:
+    """A database created fresh by production initialization, with no test
+    owner, holding ``seed_two_user_library`` (users 1 and 2)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = Database(DatabaseContext(database_path=path, init_sql_path=INIT_SQL))
+    assert db.initialize() is True
+    conn = sqlite3.connect(path)
+    try:
+        seed_two_user_library(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def open_database(path: Path) -> OwnedTestDatabase:

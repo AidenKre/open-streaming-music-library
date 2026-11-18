@@ -350,6 +350,23 @@ void main() {
       expect(snapshots.pageReads, hasLength(1));
     });
 
+    // Owner's answer to worklist question 4 (a), 2026-11-17: both "See all"
+    // pages start watching before their first page loads.
+    test('the watch starts before the first page loads: a new listen during '
+        'the first load is noticed', () async {
+      expect(c.cards, isNull);
+      final w = freshness.watches.single;
+      expect(identical(w.token, token), isTrue);
+      expect(w.kinds, {'play'});
+      w.emit(SnapshotStaleness.newActivity);
+      await settle();
+      expect(c.notice, SnapshotStaleness.newActivity);
+      await answer(page(tracks(1, 3)));
+      expect(c.cards, hasLength(3));
+      expect(c.notice, SnapshotStaleness.newActivity);
+      expect(freshness.watches, hasLength(1));
+    });
+
     test('a history change reported by the watch shows the notice; Refresh '
         'cancels the watch', () async {
       await answer(page(tracks(1, 3)));
@@ -401,6 +418,32 @@ void main() {
       expect(c.cards!.map((x) => x.unavailable), [true, false]);
       expect(c.cards!.first.rank, 1);
       expect(c.cards!.first.listeningSeconds, 1999);
+    });
+
+    // O-332-11: a failing watch is not an error of the page: it is
+    // swallowed and the numbers already shown stay.
+    test('a failing watch is swallowed; the shown cards and numbers stay',
+        () async {
+      await answer(page(tracks(1, 2)));
+      final w = repo.currentWatches.single;
+      w.emit(CurrentStatsEntities(
+        tracks: {'t-002': track('t-002')},
+        artists: const {},
+        albums: const {},
+      ));
+      await settle();
+      final shown = [
+        for (final x in c.cards!)
+          (x.rank, x.listeningSeconds, x.qualifiedPlays, x.unavailable),
+      ];
+      w.fail(StateError('read failed'));
+      await settle();
+      expect(c.failed, isFalse);
+      expect([
+        for (final x in c.cards!)
+          (x.rank, x.listeningSeconds, x.qualifiedPlays, x.unavailable),
+      ], shown);
+      expect(shown.map((x) => x.$4), [true, false]);
     });
 
     test('a further page re-watches every loaded id; the old watch is '

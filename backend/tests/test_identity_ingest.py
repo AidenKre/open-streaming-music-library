@@ -28,6 +28,7 @@ from app.services.import_outcome import ImportOutcome
 from app.services.pipeline import make_pipeline
 from tests.owned_database import OwnedTestDatabase
 from tests.schema_fixtures import INIT_SQL
+from tests.tool_call_capture import tool_call
 
 IDENTITY = AudioIdentity(
     exact=ExactAudioHash(KIND_PCM, "cd" * 32, 44100, 2, 16),
@@ -236,7 +237,7 @@ def test_ffmpeg_missing_or_timing_out_still_imports_with_the_exact_layer_pending
     db, _, tmp = env
     source = _flac(tmp / "import" / "lucky.flac")
 
-    with patch("app.services.audio_identity.run_capture", side_effect=failure):
+    with patch("app.services.audio_identity.run_capture", autospec=True, side_effect=failure):
         assert _pipeline(env).organize(source) is ImportOutcome.IMPORTED
 
     [track] = db.get_tracks()
@@ -255,10 +256,11 @@ def test_the_ingest_hash_runs_under_the_pipelines_registry(env):
     real = audio_identity.run_capture
 
     def spy(cmd, **kwargs):
-        seen.append((kwargs.get("registry"), kwargs.get("job_id")))
+        call = tool_call(real, cmd, **kwargs)
+        seen.append((call["registry"], call["job_id"]))
         return real(cmd, **kwargs)
 
-    with patch("app.services.audio_identity.run_capture", side_effect=spy):
+    with patch("app.services.audio_identity.run_capture", autospec=True, side_effect=spy):
         assert _pipeline(env, identity_registry=registry).organize(source) is ImportOutcome.IMPORTED
 
     assert seen and all(r is registry and job is not None for r, job in seen)
@@ -271,7 +273,7 @@ def test_the_hash_is_skipped_when_the_pipeline_is_stopping(env):
     stop.set()
     source = _source(tmp)
 
-    with patch("app.services.audio_identity.compute_exact") as compute:
+    with patch("app.services.audio_identity.compute_exact", autospec=True) as compute:
         assert _organize(_pipeline(env, stop_event=stop), source) is ImportOutcome.IMPORTED
 
     compute.assert_not_called()
@@ -291,12 +293,16 @@ def test_a_failing_commit_never_signals(env, monkeypatch):
     db, _, tmp = env
     wakeup = SpyWakeup(db.context.database_path)
 
-    def crash(conn, uuid_id, identity, *, fingerprinter_present):
+    crashed = []
+
+    def crash(conn, uuid_id, identity, *, fingerprinter_present, stat=None):
+        crashed.append(uuid_id)
         raise sqlite3.OperationalError("disk I/O error")
 
     monkeypatch.setattr(Database, "_insert_audio_identity_in", staticmethod(crash))
     outcome = _organize(_pipeline(env, identity_signal=wakeup), _source(tmp))
 
+    assert len(crashed) == 1  # the injected failure is the one that stopped the commit
     assert outcome is ImportOutcome.DATABASE_ERROR
     assert wakeup.seen == []
     assert db.get_tracks() == [] and _row(db) == []

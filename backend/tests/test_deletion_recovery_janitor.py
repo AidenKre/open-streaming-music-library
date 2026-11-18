@@ -22,15 +22,12 @@ import os
 
 import pytest
 
-from app.services.deletion_recovery import DeletionJanitor
-from app.services.deletion_worker import DeletionExecutor
 from app.services.upload_publish import SimulatedCrash
 from tests.deletion_recovery_helpers import (
-    NEW_BOOT,
     crash_at,
     crashed_at,
     disk,
-    restarted_db,
+    janitor,
 )
 from tests.deletion_world import (
     add_art,
@@ -49,23 +46,6 @@ from tests.deletion_world import (
 @pytest.fixture
 def world(tmp_path):
     return build_world(tmp_path)
-
-
-def janitor(world, seam=None):
-    """The janitor of a restarted process: its own connection and boot id."""
-    database = restarted_db(world)
-    executor = DeletionExecutor(
-        database,
-        music_library_dir=world.music,
-        track_locks=world.locks,
-        cover_art=world.cover_art,
-        cache=world.cache,
-        default_cache=world.default_cache,
-        boot_id=NEW_BOOT,
-        lock_timeout_s=0,
-        seam=seam,
-    )
-    return DeletionJanitor(database, executor=executor, music_library_dir=world.music)
 
 
 def quarantine_of(world, uuid_id):
@@ -190,6 +170,7 @@ def test_a_different_file_in_quarantine_is_kept(world):
     assert_kept(world, uuid_id, op, before)
 
 
+@pytest.mark.requires_chmod_denial
 def test_an_unreadable_quarantine_identity_is_kept(world):
     uuid_id, rev, op = crashed_at(world, "after_commit")
     folder = os.path.dirname(quarantine_of(world, uuid_id))

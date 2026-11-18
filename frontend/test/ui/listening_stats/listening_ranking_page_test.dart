@@ -4,7 +4,7 @@
 // its own snapshot token.
 //
 //  * States: loading, a page (more to come), the last page, expired
-//    (loaded cards kept, "Listening history changed — Refresh", never an
+//    (loaded cards kept, "This page is out of date. — Refresh", never an
 //    empty-ranking message), failed (Retry; never an empty list), the
 //    settled empty ranking, new listening activity.
 //  * Ranks and numbers per card; same-title tracks are two cards (uuid).
@@ -14,6 +14,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/listening_stats.dart';
+import 'package:frontend/models/ui/artist_ui.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/repositories/history_snapshot.dart';
 import 'package:frontend/ui/listening_stats/listening_ranking_controller.dart';
 import 'package:frontend/ui/listening_stats/listening_ranking_page.dart';
@@ -147,7 +149,7 @@ void main() {
         cards: trackCards,
         expired: true,
         notice: SnapshotStaleness.historyChanged);
-    expect(find.text('Listening history changed'), findsOneWidget);
+    expect(find.text('This page is out of date.'), findsOneWidget);
     expect(cardOf('track:t-a'), findsOneWidget);
     expect(fake.refreshes, 0);
     await tester.tap(find.widgetWithText(TextButton, 'Refresh'));
@@ -163,7 +165,7 @@ void main() {
         cards: const [],
         expired: true,
         notice: SnapshotStaleness.historyChanged);
-    expect(find.text('Listening history changed'), findsOneWidget);
+    expect(find.text('This page is out of date.'), findsOneWidget);
     expect(find.text(nothingRanked), findsNothing);
     await teardownTree(tester);
   });
@@ -212,6 +214,22 @@ void main() {
     await tester.pumpAndSettle();
     expect(fake.played, ['t-a']);
     expect(h.browse.audio.calls, isEmpty);
+    await teardownTree(tester);
+  });
+
+  // Owner decision 5 (2026-11-17), APP-OTHER-1 D5: a track tap whose
+  // playback does not start shows the playback message as a notice.
+  testWidgets('a track tap that does not start playback says so', (
+    tester,
+  ) async {
+    fake.playOutcome = const RejectedUnplayableOffline();
+    await openPage(tester);
+    await show(tester, cards: trackCards);
+    expect(find.text('Nothing here plays offline.'), findsNothing);
+    await tester.tap(inCard('track:t-a', 'Same'));
+    await tester.pumpAndSettle();
+    expect(fake.played, ['t-a']);
+    expect(find.text('Nothing here plays offline.'), findsOneWidget);
     await teardownTree(tester);
   });
 
@@ -275,5 +293,61 @@ void main() {
       expect(find.text('See all'), findsNothing);
       await teardownTree(tester);
     });
+  });
+
+  // O-332-13: the cell height (statsRankedCardHeight) leaves room for the
+  // rank and numbers lines at large text sizes.
+  for (final scale in [2.0, 3.0]) {
+    testWidgets('a ranked card at text scale $scale fits its cell',
+        (tester) async {
+      tester.view.physicalSize = const Size(1200, 2400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(h.browse.wrap(
+        Builder(
+          builder: (context) => MediaQuery(
+            data: MediaQuery.of(context)
+                .copyWith(textScaler: TextScaler.linear(scale)),
+            child: ListeningRankingPage(
+              kind: StatsRankingKind.tracks,
+              token: token,
+            ),
+          ),
+        ),
+        overrides: overrides(),
+      ));
+      await tester.pump();
+      await show(tester, cards: trackCards);
+      expect(tester.takeException(), isNull);
+      expect(inCard('track:t-b', '#1'), findsOneWidget);
+      expect(inCard('track:t-b', '1 h 1 min · 4 qualified plays'),
+          findsOneWidget);
+      await teardownTree(tester);
+    });
+  }
+
+  // O-332-13: a new snapshot (a refresh) shows the ranking from its top.
+  testWidgets('a new snapshot starts the grid at the top', (tester) async {
+    await openPage(tester);
+    final many = [
+      for (var i = 1; i <= 60; i++)
+        card(ArtistUI(id: i, name: 'Artist $i'), i, 60.0 * (61 - i), 1),
+    ];
+    await show(tester, cards: many);
+    final position = tester
+        .state<ScrollableState>(find.descendant(
+          of: find.byType(CustomScrollView),
+          matching: find.byType(Scrollable),
+        ))
+        .position;
+    position.jumpTo(800);
+    await tester.pump();
+    expect(position.pixels, 800);
+
+    fake.show(cards: many, epoch: 1);
+    await tester.pump();
+    await tester.pump();
+    expect(position.pixels, 0);
+    await teardownTree(tester);
   });
 }

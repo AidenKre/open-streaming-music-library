@@ -9,8 +9,8 @@ import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/ui/utils/library_search_controller.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
-import '../browse_harness.dart';
 
 // Every test runs under `testWidgets` for its fake clock: `tester.pump(d)`
 // advances the debounce timer exactly, with no wall-clock sleeps. Scheduling

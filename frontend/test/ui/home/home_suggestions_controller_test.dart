@@ -17,7 +17,6 @@
 // trivial stand-in selection so expected lists stay readable.
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart' show StateProvider;
 import 'package:flutter_riverpod/misc.dart' show Override;
@@ -37,6 +36,7 @@ import 'package:frontend/ui/home/home_page.dart';
 import 'package:frontend/ui/home/home_suggestions_controller.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../../helpers/fake_home_controls.dart';
 
 TrackUI track(String uuid) => TrackUI(
   uuidId: uuid,
@@ -169,28 +169,6 @@ class _FakeService implements HomeSuggestionsService {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
-class _FakeHomeControls extends ChangeNotifier implements HomeControls {
-  BrowseFilters _filters = const BrowseFilters(policy: OfflineFilterPolicy.manual);
-
-  @override
-  BrowseFilters get filters => _filters;
-
-  @override
-  void setDownloaded(bool value) {
-    _filters = _filters.userSetDownloaded(value);
-    notifyListeners();
-  }
-
-  @override
-  HomeRecentsState get recents => const HomeRecentsEmpty(filtered: false);
-
-  @override
-  void retryRecents() {}
-
-  @override
-  Future<PlaybackOutcome> playTrack(TrackUI track) async => const Accepted(1);
-}
-
 class _RecordingActions implements LibraryActionControls {
   final lists = <(List<String>, int, String)>[];
 
@@ -219,7 +197,7 @@ const _scrolledTouched = RailEngagement(atStart: false, pointerDown: true);
 
 void main() {
   late _FakeService service;
-  late _FakeHomeControls home;
+  late FakeHomeControls home;
   late _RecordingActions actions;
   late StreamController<({int count, int totalBytes})> downloads;
   late ProviderContainer container;
@@ -274,7 +252,7 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     service = _FakeService();
-    home = _FakeHomeControls();
+    home = FakeHomeControls(const HomeRecentsEmpty(filtered: false));
     actions = _RecordingActions();
     downloads = StreamController.broadcast();
     addTearDown(downloads.close);

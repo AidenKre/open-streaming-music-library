@@ -8,20 +8,85 @@
   second process (or a second uvicorn worker) on the same data directory
   refuses to start and logs the lock path.
 - **POSIX hosts only** (Linux, macOS): the instance lock uses `fcntl.flock`.
-- **Fresh schema (Phase M, schema 13).** A database from an older (or newer)
+- **Fresh schema (schema 1).** A database from an older (or newer)
   server is refused at startup and its files are left untouched (the data
   directory and an empty `osml.lock` may be created before the check): back it
-  up, start with a fresh `APP_DATA_DIR`, and re-import your music. An older
-  database stops the server with: "This database predates multi-user support
-  (schema N). Back it up, start with a fresh APP_DATA_DIR, and re-import your
-  music."
+  up, start with a fresh `APP_DATA_DIR`, and re-import your music. Such a
+  database stops the server (and the admin CLI) with: "This database has
+  schema N; this server reads schema 1. Back it up and start with a fresh
+  APP_DATA_DIR."
+
+## Prerequisites
+
+- **[uv](https://docs.astral.sh/uv/).** uv runs the server on Python 3.12
+  (named in `.python-version`); when no Python 3.12 is installed, uv can
+  download one.
+- **`ffmpeg` and `ffprobe`** on `PATH`. Without `ffprobe` no file is imported:
+  each one stays in its import folder and is logged as
+  `import failed: <path> (tool_unavailable)` (an archive as `archive kept:`).
+  `ffmpeg` writes metadata edits into the files, reads embedded cover art,
+  encodes streams at a quality other than `original`, converts a track's file
+  format, and computes the audio hash that finds exact duplicates.
+- **The libarchive library.** The server loads it at startup and does not
+  start without it. macOS ships it as `/usr/lib/libarchive.dylib`, which is
+  found without any setup. On Debian or Ubuntu, `sudo apt install
+  libarchive-dev` installs it. To use another copy, set the environment
+  variable `LIBARCHIVE` to the library file's path.
+- **`fpcalc`** (Chromaprint 1.5 or later), optional. With it on `PATH` (or
+  `FPCALC_PATH` set to the executable), the server fingerprints the tracks,
+  so Possible duplicates in the app also finds copies that were encoded
+  differently. Without it only copies with identical audio are found.
+  `AUDIO_FINGERPRINT_BACKEND=off` switches fingerprinting off even when
+  `fpcalc` is present.
+
+On macOS with Homebrew: `brew install uv ffmpeg chromaprint`. On Debian or
+Ubuntu: `sudo apt install ffmpeg libarchive-dev libchromaprint-tools`, and uv
+from its install page.
 
 ## Setup
 
 Run the server and the admin CLI **from this `backend/` directory**: both read
 `.env` from the working directory, and the default folders below resolve
-against it too. Start the server with
-`uv run uvicorn app.main:app --workers 1`.
+against it too.
+
+1. Install the dependencies: `uv sync`.
+2. Create the master admin's password file outside the clone:
+
+   ```sh
+   mkdir -p ~/.config/osml && chmod 700 ~/.config/osml
+   touch ~/.config/osml/admin-password && chmod 600 ~/.config/osml/admin-password
+   echo "$HOME/.config/osml/admin-password"
+   ```
+
+   Open that file in a text editor and write the password (8 to 1024
+   characters) in it, on one line and nothing else. The `echo` prints the
+   file's full path.
+3. Create `backend/.env` with the master admin (details under "Master admin"
+   below) and `chmod 600 .env`. Use the full path the `echo` printed
+   (`/Users/you/...` on macOS, `/home/you/...` on Linux): `~` is not expanded.
+
+   ```
+   OSML_ADMIN_USERNAME=admin
+   OSML_ADMIN_PASSWORD_FILE=/home/you/.config/osml/admin-password
+   ```
+
+4. Start the server with
+   `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1`.
+
+`--host 0.0.0.0` lets every device on your network reach the server (the app
+on a phone needs that); without it uvicorn listens on `127.0.0.1`, this
+computer only. `--port` chooses the port. Find this computer's network
+address with `ipconfig getifaddr en0` (macOS, Wi-Fi) or `hostname -I`
+(Linux). To check that another device reaches the server, open
+`http://<this computer's address>:8000/` in a browser there: it answers
+`{"message":"Healthy"}`. If it does not, a firewall on this computer may be
+blocking the port. In the app, enter the same address, for example
+`http://192.168.1.20:8000` (see [`../frontend/README.md`](../frontend/README.md)).
+`http://` is not encrypted on the network.
+
+Signup is open by default: anyone who can reach this port can create an
+account in the app. If only you should have one, add
+`OSML_SIGNUP_ENABLED=false` to `.env`.
 
 ### Folders
 
@@ -56,17 +121,35 @@ changing the password re-hashes it and ends the admin's sessions. The server
 warns when `.env` or the password file is group- or world-readable; run
 `chmod 600 .env`.
 
+Keep the password file, and the Last.fm key files below, **outside this
+repository**, for example in `~/.config/osml/` (`chmod 700` the folder,
+`chmod 600` each file). Inside the clone git ignores `.env` and the default
+folders, but not other files you add, so a key file there shows up in
+`git status` and can be committed by mistake. Write each `_FILE` setting as a
+full path: `~` is not expanded, and a relative path is read from the working
+directory. One line break at the end of the file is ignored.
+
 ### Other settings
 
 - `OSML_SIGNUP_ENABLED` (default `true`): whether the app may create accounts.
 - `OSML_MAX_USERS` (default `25`): signup stops at this many users; the admin,
   disabled users and users being deleted count.
-- `DEFAULT_STREAMING_QUALITY` (default `original`): seeds the admin's streaming
+- `OSML_INSECURE_FAST_PASSWORD_HASHING` (default `false`): for the test suite
+  only. `true` hashes passwords with weak, fast settings, so a copied database
+  is far easier to crack, and the server logs a warning at every start. Leave
+  it off on a real server. After turning it off, each password is hashed again
+  with the normal settings at its user's next sign-in (the admin's at the next
+  start).
+- `DEFAULT_STREAMING_QUALITY` (default `original`; or `320`, `256`, `192`,
+  `128`, the AAC bitrate in kbps): seeds the admin's streaming
   quality on the first start. The admin's tracks are pre-encoded at that
   quality as they are imported; with `original` nothing is pre-encoded.
   Other users' tracks are never pre-encoded.
 - `ENABLE_FILE_WATCHER` (default `true`): `false` turns off the import
   watchers, the startup scans and the settle check, so nothing is imported.
+- `LIBRARY_DELETE_ENABLED` (default `false`): `true` lets users delete tracks
+  from the server through the app. While it is off, the server refuses those
+  requests and tells the app that deleting is off.
 
 ## Import folders
 
@@ -74,7 +157,8 @@ Drop supported audio (`.mp3 .wav .flac .m4a`) or archives
 (`.zip .rar .tar .tar.gz`) into `IMPORT_DIR` (the admin) or
 `USER_IMPORT_DIR/<folder>/` (each user). Files directly in `import-users/`,
 folders no user owns, and anything under a folder whose name starts with `.`
-are ignored (logged).
+are ignored (an audio file or archive in one of the first two places is
+logged at INFO level, which the server's default logging does not show).
 
 - **When.** A file is imported once its size and modification time have stayed
   unchanged for 2 s. If a copy pauses for longer, the file may be imported
@@ -82,14 +166,21 @@ are ignored (logged).
   re-reads its duration, bitrate and codec (not after a restart in that
   window).
 - **Archives.** An archive still being copied is kept until it is complete. A
-  finished archive is unpacked once and moved to `.imported/` in its import
-  folder (never deleted); moving it back out imports it again. An archive kept
+  finished archive is unpacked once; files in it that are not audio are
+  ignored. When every audio file in it was imported, the archive is deleted.
+  When a track in it was refused for its own content (a duplicate, a failed
+  audio check), or it holds no audio or audio the server does not import
+  (the last with a warning), it is moved to `.imported/` in its import
+  folder; moving it back out imports it again. An archive kept
   because of a problem outside the file (a missing `ffprobe`, a busy database,
   a failed move) is logged as `archive kept: <path> (<reason>)` and retried at
   the next server start or when it changes. A RAR written without its end
   block (RAR before 3.0, or `-en`) is never imported.
-- **Refused files.** A file that is not audio, a duplicate, or fails the
-  `ffprobe` audio check stays where it is, is logged as
+- **Other files.** A file whose name is neither supported audio nor an
+  archive (a `cover.jpg`, a `.cue`, a `.txt`) is left where it is and not
+  logged, whether it was there at start or arrived later.
+- **Refused files.** A duplicate, or a file that fails the `ffprobe` audio
+  check, stays where it is, is logged as
   `import failed: <path> (<reason>)`, and is retried at the next start.
   The audio check trusts the `.flac` extension: a text file named `.flac`
   passes it and is imported as a track with empty metadata that can't play.
@@ -111,9 +202,10 @@ uv run python -m app.cli users delete NAME
 - `reset-password` asks `New password:` and `Repeat new password:`, applies the
   registration rules and ends the user's sessions.
 - `disable` ends the user's sessions and blocks login; `enable` lifts it.
-- `reset-password`, `disable` and `delete` refuse the master admin
+- `reset-password`, `disable`, `enable` and `delete` refuse the master admin
   (`NAME is the master admin; it is managed through .env`).
-- Every command except `delete` works while the server runs. Every command
+- Every `users` command except `delete` works while the server runs
+  (`lastfm purge`, below, also needs it stopped). Every command
   refuses a database of another schema version and never migrates it.
 - **`delete` only with the server stopped.** It refuses while the server holds
   the lock (`The server is running (it holds <path>); stop it before deleting a
@@ -277,6 +369,8 @@ the session keys can be decrypted.
 
 Run the suite from this folder with `uv run pytest`. The configured default is `-n auto`: one pytest-xdist worker per CPU. Pin a worker count for like-for-like timing comparisons, for example `uv run pytest -n 2`; focused runs of a few files pass `-n 0` (serial).
 
+pytest and pytest-xdist are in the `dev` dependency group, which `uv sync` and `uv run` install by default; `uv sync --no-dev` installs the server without them.
+
 "integration" means a test needs a real external tool or a real child process, and the default command still runs everything. Select by marker:
 
 ```
@@ -284,6 +378,13 @@ uv run pytest -m "not integration"   # unit selection
 uv run pytest -m integration         # real-tool / real-process cases only
 ```
 
-Prerequisites: `ffmpeg`/`ffprobe` and `fpcalc` on PATH. Without them the `requires_*` cases are skipped visibly (the skip reason names the missing tool); they are still selected by `-m integration`.
+Prerequisites: `ffmpeg`/`ffprobe` and `fpcalc` on PATH (see Prerequisites above). Without them the `requires_ffmpeg` and `requires_fpcalc` cases are skipped visibly (the skip reason names the missing tool); they are still selected by `-m integration`. Some tests also start real `sh` (`/bin/sh`) and `sleep` processes; the one test that needs `nice` is skipped without it.
 
-Test databases do not sync to disk: `tests/conftest.py` makes every SQLite connection opened during the tests issue `PRAGMA synchronous=OFF`. That only decides whether a committed transaction survives an operating-system crash or power loss. Atomicity, isolation, locking and WAL behaviour are unchanged, so no test can observe the difference, and the product's own setting is untouched. A test about durability settings must carry `@pytest.mark.real_sqlite_durability`, which gives it the unwrapped `sqlite3.connect`.
+Tests that skip by machine:
+
+- Tests marked `requires_chmod_denial` are skipped where `chmod` does not take access away: when the suite runs as root (the usual case in a container) or on a file system that ignores mode bits.
+- The case-rename tests depend on the temporary folder: some need one that ignores letter case (the macOS default) and the others one that does not (the Linux default), and each kind is skipped on the other. To run the skipped kind, point `--basetemp` at a new folder on a volume of that kind (pytest empties that folder at the start of each run).
+
+Besides pytest's own temporary folders, the suite creates `osml-tests-import-*`, `osml-chmod-probe-*` and `osml-replace-matrix-*` folders in the system temporary folder and removes them again; a run that is killed can leave them behind.
+
+Test databases do not sync to disk: `tests/conftest.py` makes every SQLite connection opened in the test process issue `PRAGMA synchronous=OFF`; a child process a test starts is not covered and keeps SQLite's default. That only decides whether a committed transaction survives an operating-system crash or power loss. Atomicity, isolation, locking and WAL behaviour are unchanged, and the product's own setting is untouched; the one product path that reads the setting, `Database.make_durable`, skips its full flush of the database file when it is off. A test about durability settings must carry `@pytest.mark.real_sqlite_durability`, which gives it the unwrapped `sqlite3.connect`.

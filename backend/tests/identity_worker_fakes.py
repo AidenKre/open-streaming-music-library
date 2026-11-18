@@ -11,7 +11,8 @@ from typing import Any, Callable, Optional
 from app.services.audio_identity import KIND_PCM, ExactAudioHash, ExactUnavailable
 from app.services.identity_worker import AudioIdentityWorker
 from app.services.identity_wakeup import IdentityWakeup
-from app.services.ffmpeg_runner import FfmpegProcessRegistry
+from app.services.ffmpeg_runner import NO_OPTIONS, FfmpegProcessRegistry
+from tests.tool_call_capture import option_fields
 
 T0 = 1_800_000_000
 TOOLS = "ffmpeg 9.0.2"
@@ -47,11 +48,8 @@ class FakeCompute:
         self.raises: list[BaseException] = []
         self.mid: Optional[Callable[[], None]] = None
 
-    def __call__(self, path, codec_hint, *, registry=None, job_id=None, low_priority=False):
-        self.calls.append({
-            "path": str(path), "codec_hint": codec_hint, "registry": registry,
-            "job_id": job_id, "low_priority": low_priority,
-        })
+    def __call__(self, path, codec_hint, *, options=NO_OPTIONS):
+        self.calls.append({"path": str(path), "codec_hint": codec_hint, **option_fields(options)})
         if self.raises:
             raise self.raises.pop(0)
         path = Path(path)
@@ -109,9 +107,8 @@ class FakeFingerprinter:
         self.raises: list[BaseException] = []
         self.mid: Optional[Callable[[], None]] = None
 
-    def fingerprint(self, path, *, max_seconds=120, registry=None, job_id=None, low_priority=False):
-        self.calls.append({"path": str(path), "max_seconds": max_seconds, "registry": registry,
-                           "job_id": job_id, "low_priority": low_priority})
+    def fingerprint(self, path, *, max_seconds=120, options=NO_OPTIONS):
+        self.calls.append({"path": str(path), "max_seconds": max_seconds, **option_fields(options)})
         if self.raises:
             raise self.raises.pop(0)
         if self.mid is not None:

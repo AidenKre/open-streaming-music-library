@@ -336,6 +336,22 @@ void main() {
       expect(c.read(offlineModeProvider), isTrue);
     });
 
+    // U22-FE-LIFECYCLE-A-03: the app is already offline with a health poll
+    // scheduled when the block comes; the block stops that poll too.
+    test('already offline with a health poll scheduled: the block stops it',
+        () async {
+      OfflineModeNotifier.pollInterval = const Duration(hours: 1);
+      await liveOn('inst-1');
+      final offline = c.read(offlineModeProvider.notifier)..enterOffline();
+      expect(offline.isPolling, isTrue);
+      await connectionEdge('inst-2');
+      expect(service().serverBlocked.value,
+          ServerBlockedReason.differentServer);
+      expect(c.read(offlineModeProvider), isTrue);
+      expect(offline.isPolling, isFalse,
+          reason: 'no health poll may bring a blocked app back online');
+    });
+
     test('an offline launch that reconnects to a different server blocks',
         () async {
       await seedTestBinding(db, baseUrl: 'http://s', instanceId: 'inst-1');

@@ -1,6 +1,6 @@
 """Sign-off DEV-7-25 link fallback, Part B: the deletion put-back on a library
 that refuses hard links. ``put_back_file`` places the quarantined file back
-with the shared ``organizer.place_no_replace`` (hard link first, a rename when
+with the shared ``file_ops.place_no_replace`` (hard link first, a rename when
 the filesystem refuses it, never a copy) and never replaces anything at the
 original path. After a rename the restored file is proven by the journaled
 identity (dev, inode, size), else by the quarantine's own identity taken just
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services import deletion_worker, organizer
+from app.services import deletion_worker, file_ops, organizer
 from app.services.deletion_recovery import DeletionJanitor
 from tests.deletion_recovery_helpers import crashed_at, disk, recover
 from tests.deletion_world import (
@@ -222,7 +222,7 @@ def test_a_file_replaced_right_after_the_move_is_put_back_by_rename(world, monke
     master = path_of(world, uuid_id)
     rev = revision(world, uuid_id)
     op = accept_job(world, (uuid_id, rev))
-    real_move = organizer.move_file
+    real_move = file_ops.move_file
 
     def move(source, destination):
         moved = real_move(source, destination)
@@ -232,7 +232,7 @@ def test_a_file_replaced_right_after_the_move_is_put_back_by_rename(world, monke
             os.replace(copy, destination)  # same bytes, another inode
         return moved
 
-    monkeypatch.setattr(organizer, "move_file", move)
+    monkeypatch.setattr(file_ops, "move_file", move)
     _no_links(monkeypatch)
 
     make_executor(world).run_one()
@@ -269,13 +269,13 @@ def test_an_unrecorded_holding_file_is_put_back_by_rename(world, monkeypatch):
 
 def test_the_put_back_uses_the_shared_primitive_without_copies(world, monkeypatch, tmp_path):
     calls = []
-    real = organizer.place_no_replace
+    real = file_ops.place_no_replace
 
     def spy(source, destination, **kwargs):
         calls.append(kwargs.get("allow_copy", True))
         return real(source, destination, **kwargs)
 
-    monkeypatch.setattr(organizer, "place_no_replace", spy)
+    monkeypatch.setattr(file_ops, "place_no_replace", spy)
     q = tmp_path / "q" / "x.flac"
     q.parent.mkdir()
     q.write_bytes(b"x")
@@ -284,7 +284,7 @@ def test_the_put_back_uses_the_shared_primitive_without_copies(world, monkeypatc
     assert deletion_worker.put_back_file(original, q, prove_identity=None) is True
 
     assert calls == [False]
-    assert not hasattr(organizer, "link_no_replace")
+    assert not hasattr(organizer, "link_no_replace") and not hasattr(file_ops, "link_no_replace")
 
 
 def test_without_a_journaled_identity_a_rename_is_proven_by_the_quarantines_own(
@@ -326,7 +326,7 @@ def test_a_put_back_whose_quarantine_vanishes_before_the_rename_keeps_everything
     for folder in (master.parent, master.parent.parent):  # so the put-back makes them
         if folder.exists() and not any(folder.iterdir()):
             folder.rmdir()
-    real = organizer.place_no_replace
+    real = file_ops.place_no_replace
     hooked = []
 
     def place(source, destination, **kwargs):
@@ -339,7 +339,7 @@ def test_a_put_back_whose_quarantine_vanishes_before_the_rename_keeps_everything
 
         return real(source, destination, **{**kwargs, "before_fallback": vanish_then_hook})
 
-    monkeypatch.setattr(organizer, "place_no_replace", place)
+    monkeypatch.setattr(file_ops, "place_no_replace", place)
     before = journal(world, uuid_id)
 
     recover(world)

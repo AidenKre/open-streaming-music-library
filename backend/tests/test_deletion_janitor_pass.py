@@ -13,7 +13,7 @@ import logging
 from fastapi.testclient import TestClient
 
 from app.services.deletion_recovery import DeletionJanitor
-from app.services.deletion_worker import DeletionWorker
+from app.services.deletion_worker import DeletionWorker, RunResult
 
 
 class _Executor:
@@ -21,7 +21,7 @@ class _Executor:
         self.answers = list(answers)
 
     def run_one(self):
-        return self.answers.pop(0) if self.answers else False
+        return self.answers.pop(0) if self.answers else RunResult.IDLE
 
 
 class _Janitor:
@@ -70,7 +70,7 @@ def test_an_idle_worker_runs_a_pass_only_once_one_is_due():
 
 def test_a_busy_worker_runs_targets_before_any_pass():
     janitor, clock = _Janitor(), _Clock()
-    worker = _worker(_Executor([True, True]), janitor, clock)
+    worker = _worker(_Executor([RunResult.DONE, RunResult.DONE]), janitor, clock)
     clock.now += 600
 
     assert worker.process_one() == "done"
@@ -105,7 +105,7 @@ class _Raising:
 # still runs; a fault that never clears does not stop the janitor until restart.
 def test_a_step_that_released_its_item_still_runs_a_due_pass():
     janitor, clock = _Janitor(), _Clock()
-    worker = _worker(_Executor(["released", "released"]), janitor, clock)
+    worker = _worker(_Executor([RunResult.RELEASED, RunResult.RELEASED]), janitor, clock)
 
     assert worker.process_one() == "error"
     assert janitor.passes == 0  # not due yet
@@ -126,7 +126,7 @@ def test_a_step_that_keeps_failing_still_runs_a_due_pass():
 
 
 def test_a_worker_without_a_janitor_behaves_as_before():
-    worker = DeletionWorker(_Executor([True]), idle_poll_s=5)
+    worker = DeletionWorker(_Executor([RunResult.DONE]), idle_poll_s=5)
 
     assert worker.process_one() == "done"
     assert worker.process_one() == "idle"

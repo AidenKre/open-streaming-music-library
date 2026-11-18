@@ -21,7 +21,9 @@ from app.core.media_types import ARCHIVE_EXTENSIONS, AUDIO_EXTENSIONS, OTHER_AUD
 from app.services import upload_errors as errors
 from app.services.path_sanitize import assert_within
 from app.services.storage_ledger import UPLOAD_EXPAND, UPLOAD_SOURCE, InsufficientStorage, StagedQuota
-from app.services.upload_receipt import ReceiptFiles, _item_dir, discard_child_files, owner_dir, remove_verified
+from app.services.upload_receipt import (
+    ReceiptFiles, _item_dir, discard_child_files, owner_dir, remove_then_release, remove_verified,
+)
 from app.services.upload_validation import ValidationFailed, ValidationInterrupted
 
 log = logging.getLogger(__name__)
@@ -274,10 +276,12 @@ class ZipExpander:
             try:  # past the flip nothing may reach the failure handler (it would discard published files)
                 # A child cancelled while it was being staged is not published; its file goes.
                 self._discard_children(owner, [c for c in children if c["item_uuid"] not in published])
-                if remove_verified(self._files, path):
-                    self._database.release_cancelled_upload_source(
+                remove_then_release(  # the path was checked inside the owner's stage above
+                    self._files, path,
+                    lambda: self._database.release_removed_upload_source(
                         parent, owner_id=owner, source_path=str(path),
-                        now=int(self._clock()), from_states=("expanded",))
+                        now=int(self._clock()), from_states=("expanded",)),
+                    remove=remove_verified)
             except Exception as e:
                 log.warning("expanded archive not released: %s", type(e).__name__)
             return "expanded"
@@ -349,11 +353,12 @@ def reconcile_expanded_archives(database, uploads_root) -> int:
     files, released = ReceiptFiles(), 0
     for row in database.list_expanded_upload_archives():
         try:
-            path = Path(row["source_path"])
-            assert_within(path, owner_dir(uploads_root, row["owner_id"]))
-            if remove_verified(files, path) and database.release_cancelled_upload_source(
-                    row["item_uuid"], owner_id=row["owner_id"], source_path=row["source_path"],
-                    now=int(time.time()), from_states=("expanded",)):
+            if remove_then_release(
+                    files, Path(row["source_path"]),
+                    lambda: database.release_removed_upload_source(
+                        row["item_uuid"], owner_id=row["owner_id"], source_path=row["source_path"],
+                        now=int(time.time()), from_states=("expanded",)),
+                    within=owner_dir(uploads_root, row["owner_id"]), remove=remove_verified):
                 released += 1
         except Exception as e:
             log.warning("expanded archive not released: %s", type(e).__name__)

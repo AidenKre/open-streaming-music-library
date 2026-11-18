@@ -9,7 +9,8 @@ import uuid
 
 import pytest
 
-from tests.test_upload_limits import EFFECTIVE_DEFAULTS
+from tests.sqlite_helpers import sql_rows
+from tests.upload_limit_values import EFFECTIVE_DEFAULTS
 
 NOW = 1_700_000_000
 
@@ -32,14 +33,6 @@ def item(n: int, size: int = 10, **overrides) -> dict:
 
 def batch(items, batch_uuid=None, **extra) -> dict:
     return {"batch_uuid": batch_uuid or uid(0, space=2), "items": items, **extra}
-
-
-def rows(client, sql, params=()):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
 
 
 @pytest.fixture
@@ -109,10 +102,10 @@ def test_an_allocation_persists_the_caller_s_rows_and_a_receipt(client):
     assert allocate(client, body).status_code == 201
 
     admin = client.app.state.admin_user_id
-    assert rows(client, "SELECT owner_id, batch_uuid, label, created_at, updated_at FROM upload_batches") == [
+    assert sql_rows(client, "SELECT owner_id, batch_uuid, label, created_at, updated_at FROM upload_batches") == [
         (admin, body["batch_uuid"], None, NOW, NOW)
     ]
-    assert rows(
+    assert sql_rows(
         client,
         "SELECT owner_id, item_uuid, batch_uuid, parent_item_uuid, kind, filename, selection_index, "
         "member_order_key, expected_bytes, expected_sha256, received_bytes, state, review_version, "
@@ -122,7 +115,7 @@ def test_an_allocation_persists_the_caller_s_rows_and_a_receipt(client):
          s["sha256"], 0, "allocated", 0, 0, NOW, NOW, NOW)
         for i, s in enumerate(body["items"])
     ]
-    assert rows(client, "SELECT owner_id, operation_uuid, kind, created_at, result_ref FROM operation_receipts") == [
+    assert sql_rows(client, "SELECT owner_id, operation_uuid, kind, created_at, result_ref FROM operation_receipts") == [
         (admin, body["batch_uuid"], "upload_allocation", NOW, body["batch_uuid"])
     ]
 
@@ -139,7 +132,7 @@ def test_every_uuid_and_digest_spelling_is_stored_canonically(client):
     assert response.status_code == 201, response.text
     assert response.json()["batch"]["batch_uuid"] == uid(0, space=2)
     assert response.json()["items"][0]["item_uuid"] == spec["item_uuid"]
-    assert rows(client, "SELECT batch_uuid, item_uuid, expected_sha256 FROM upload_items") == [
+    assert sql_rows(client, "SELECT batch_uuid, item_uuid, expected_sha256 FROM upload_items") == [
         (uid(0, space=2), spec["item_uuid"], spec["sha256"])
     ]
 
@@ -171,8 +164,8 @@ def test_an_invalid_body_is_a_422_and_allocates_nothing(client, body):
     detail = response.json()["detail"]
     assert isinstance(detail, list) and detail
     assert all("input" not in entry for entry in detail)
-    assert rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
-    assert rows(client, "SELECT count(*) FROM operation_receipts") == [(0,)]
+    assert sql_rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
+    assert sql_rows(client, "SELECT count(*) FROM operation_receipts") == [(0,)]
 
 
 def test_a_malformed_json_body_is_a_422(client):
@@ -188,7 +181,7 @@ def test_a_body_over_256_kib_is_refused_before_validation(client):
 
     assert response.status_code == 413
     assert response.json()["detail"]["error"] == "request_too_large"
-    assert rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
+    assert sql_rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
 
 
 # ── S5: limits are checked before anything is allocated ────────────────────
@@ -213,9 +206,9 @@ def assert_refused(client, response, limit, value):
     assert str(value) in detail["message"]
     root = str(client.app.state.settings.music_library_dir.parent)
     assert root not in response.text
-    assert rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
-    assert rows(client, "SELECT count(*) FROM upload_items") == [(0,)]
-    assert rows(client, "SELECT count(*) FROM operation_receipts") == [(0,)]
+    assert sql_rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
+    assert sql_rows(client, "SELECT count(*) FROM upload_items") == [(0,)]
+    assert sql_rows(client, "SELECT count(*) FROM operation_receipts") == [(0,)]
 
 
 @pytest.mark.parametrize("count", [1, 100])
@@ -224,7 +217,7 @@ def test_one_to_100_files_are_allocated(client, count):
 
     assert response.status_code == 201, response.text
     assert len(response.json()["items"]) == count
-    assert rows(client, "SELECT count(*) FROM upload_items") == [(count,)]
+    assert sql_rows(client, "SELECT count(*) FROM upload_items") == [(count,)]
 
 
 def test_101_files_are_refused_with_the_limit(client):
@@ -279,9 +272,9 @@ def test_a_refused_batch_id_can_still_be_allocated(small):
 
 def snapshot(client):
     return (
-        rows(client, "SELECT * FROM upload_batches ORDER BY owner_id, batch_uuid"),
-        rows(client, "SELECT * FROM upload_items ORDER BY owner_id, item_uuid"),
-        rows(client, "SELECT * FROM operation_receipts ORDER BY owner_id, operation_uuid"),
+        sql_rows(client, "SELECT * FROM upload_batches ORDER BY owner_id, batch_uuid"),
+        sql_rows(client, "SELECT * FROM upload_items ORDER BY owner_id, item_uuid"),
+        sql_rows(client, "SELECT * FROM operation_receipts ORDER BY owner_id, operation_uuid"),
     )
 
 
@@ -379,7 +372,7 @@ def test_a_batch_id_used_by_another_kind_of_operation_is_a_409(client):
 
     assert response.status_code == 409
     assert response.json()["detail"]["error"] == "operation_conflict"
-    assert rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
+    assert sql_rows(client, "SELECT count(*) FROM upload_batches") == [(0,)]
 
 
 def _second_user_client(client):
@@ -408,7 +401,7 @@ def test_another_users_batch_item_and_operation_ids_allocate_fresh_for_me(client
     finally:
         conn.close()
     sams = [
-        rows(client, f"SELECT * FROM {table} WHERE owner_id = ? ORDER BY 2", (sam,))
+        sql_rows(client, f"SELECT * FROM {table} WHERE owner_id = ? ORDER BY 2", (sam,))
         for table in ("upload_batches", "upload_items", "operation_receipts")
     ]
 
@@ -420,11 +413,11 @@ def test_another_users_batch_item_and_operation_ids_allocate_fresh_for_me(client
     assert mine.json()["batch"]["label"] == "Mine"
     assert [i["expected_bytes"] for i in mine.json()["items"]] == [5, 6]
     assert sams == [
-        rows(client, f"SELECT * FROM {table} WHERE owner_id = ? ORDER BY 2", (sam,))
+        sql_rows(client, f"SELECT * FROM {table} WHERE owner_id = ? ORDER BY 2", (sam,))
         for table in ("upload_batches", "upload_items", "operation_receipts")
     ]
     admin = client.app.state.admin_user_id
-    assert rows(client, "SELECT count(*) FROM upload_items WHERE owner_id = ?", (admin,)) == [(3,)]
+    assert sql_rows(client, "SELECT count(*) FROM upload_items WHERE owner_id = ?", (admin,)) == [(3,)]
 
 
 # ── S7: one batch and one item by id; foreign ids look absent ─────────────
@@ -829,7 +822,7 @@ def test_the_items_of_an_unknown_or_foreign_batch_answer_the_same_404(client):
 # ── S10: cancel an unpublished item ────────────────────────────────────────
 
 def item_row(client, item_uuid):
-    [row] = rows(
+    [row] = sql_rows(
         client,
         "SELECT state, updated_at, progress_at, cancel_requested FROM upload_items WHERE item_uuid = ?",
         (item_uuid,),
@@ -956,10 +949,10 @@ def test_a_cancel_bumps_only_the_callers_batch_when_uuids_are_shared(client):
     assert client.delete(f"/tracks/uploads/items/{uid(1)}").status_code == 200
 
     admin = client.app.state.admin_user_id
-    assert rows(client, "SELECT owner_id, batch_uuid, updated_at FROM upload_batches ORDER BY owner_id, batch_uuid") == sorted([
+    assert sql_rows(client, "SELECT owner_id, batch_uuid, updated_at FROM upload_batches ORDER BY owner_id, batch_uuid") == sorted([
         (admin, s_batch, NOW), (admin, a_batch, NOW + 5), (sam, s_batch, NOW), (sam, a_batch, NOW),
     ])
-    assert rows(client, "SELECT owner_id, state FROM upload_items WHERE item_uuid = ? ORDER BY owner_id", (uid(1),)) == sorted([
+    assert sql_rows(client, "SELECT owner_id, state FROM upload_items WHERE item_uuid = ? ORDER BY owner_id", (uid(1),)) == sorted([
         (admin, "cancelled"), (sam, "allocated"),
     ])
 
@@ -994,6 +987,6 @@ def test_a_cancel_bumps_the_callers_batch_when_another_user_has_the_item_uuid_el
     assert client.delete(f"/tracks/uploads/items/{uid(1)}", headers=sam_headers).status_code == 200
 
     admin = client.app.state.admin_user_id
-    assert rows(client, "SELECT owner_id, batch_uuid, updated_at FROM upload_batches ORDER BY owner_id") == sorted([
+    assert sql_rows(client, "SELECT owner_id, batch_uuid, updated_at FROM upload_batches ORDER BY owner_id") == sorted([
         (admin, x_batch, NOW), (sam, y_batch, NOW + 5),
     ])

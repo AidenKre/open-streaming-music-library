@@ -1,3 +1,4 @@
+import 'package:frontend/models/dto/json_fields.dart';
 import 'package:frontend/models/dto/track_metadata_dto.dart';
 
 class ClientTrackDto {
@@ -20,15 +21,16 @@ class ClientTrackDto {
     required this.revision,
   });
 
+  /// Typed reads: a missing or malformed field is a [FormatException].
   factory ClientTrackDto.fromJson(Map<String, dynamic> json) {
     return ClientTrackDto(
-      uuidId: json['uuid_id'] as String,
+      uuidId: jsonString(json, 'uuid_id'),
       metadata: TrackMetadataDto.fromJson(
-        json['metadata'] as Map<String, dynamic>,
+        jsonObject(json['metadata'], 'metadata'),
       ),
-      createdAt: (json['created_at'] as num).toInt(),
-      lastUpdated: (json['last_updated'] as num).toInt(),
-      revision: (json['revision'] as num).toInt(),
+      createdAt: jsonWholeInt(json, 'created_at'),
+      lastUpdated: jsonWholeInt(json, 'last_updated'),
+      revision: jsonWholeInt(json, 'revision'),
     );
   }
 }

@@ -297,7 +297,8 @@ def test_rows_deleted_in_that_order_never_violate_a_foreign_key(conn):
         INSERT INTO user_delete_art_capture VALUES (1, 5);
         INSERT INTO artists (id, name, owner_id) VALUES (1, 'A', 1);
         INSERT INTO albums (id, name, artist_id) VALUES (1, 'B', 1);
-        INSERT INTO tracks (id, uuid_id, file_path, owner_id) VALUES (1, 'u', '/m/sam/a', 1);
+        INSERT INTO tracks (id, uuid_id, file_path, file_path_fold, file_folder_fold, owner_id)
+            VALUES (1, 'u', '/m/sam/a', '/m/sam/a', '/m/sam', 1);
         INSERT INTO trackmetadata (track_id, uuid_id, artist_id, album_id, has_album_art)
             VALUES (1, 'u', 1, 1, 0);
         INSERT INTO track_tombstones VALUES ('v', 0, 1, 1);
@@ -310,7 +311,8 @@ def test_rows_deleted_in_that_order_never_violate_a_foreign_key(conn):
         INSERT INTO track_audio_identity (uuid_id, exact_state, fp_state)
             VALUES ('u', 'pending', 'pending');
         INSERT INTO track_audio_fingerprint VALUES ('u', 'fpcalc', 'chromaprint-2', 1.5, 1, X'00');
-        INSERT INTO tracks (id, uuid_id, file_path, owner_id) VALUES (2, 'w', '/m/sam/b', 1);
+        INSERT INTO tracks (id, uuid_id, file_path, file_path_fold, file_folder_fold, owner_id)
+            VALUES (2, 'w', '/m/sam/b', '/m/sam/b', '/m/sam', 1);
         INSERT INTO track_duplicate_candidates (owner_id, uuid_a, uuid_b, kind, band_rank,
             sort_score, matcher_version, detected_at) VALUES (1, 'u', 'w', 'exact', 0, 1.0, 'm', 0);
         INSERT INTO upload_batches (owner_id, batch_uuid, created_at, updated_at)

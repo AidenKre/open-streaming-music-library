@@ -4,18 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:frontend/playback/audio_focus.dart';
 
-class FakeAudioSessionPort implements AudioSessionPort {
-  final controller = StreamController<AudioSessionEvent>.broadcast();
-  int listens = 0;
-
-  @override
-  Stream<AudioSessionEvent> get events {
-    listens++;
-    return controller.stream;
-  }
-
-  void emit(AudioSessionEvent event) => controller.add(event);
-}
+import '../helpers/fake_audio_focus.dart';
 
 class RecordingOwner implements AudioFocusOwner {
   final calls = <String>[];
@@ -97,14 +86,10 @@ void main() {
     expect(successor.calls, ['noisy']);
   });
 
-  test('ownership changes bump the revision; the owner may play', () async {
-    final before = focus.ownershipRevision;
+  test('the bound owner may play; once released it may not', () async {
     focus.bind(AudioOutput.queue, owner);
-    expect(focus.ownershipRevision, greaterThan(before));
     expect(await focus.beforePlay(AudioOutput.queue), isTrue);
-    final bound = focus.ownershipRevision;
     focus.release(AudioOutput.queue, owner);
-    expect(focus.ownershipRevision, greaterThan(bound));
     expect(await focus.beforePlay(AudioOutput.queue), isFalse,
         reason: 'no owner, no audio');
   });
@@ -180,7 +165,6 @@ void main() {
 
     test('acquiring from a holder waits for its acknowledgement', () async {
       await hold(AudioOutput.queue);
-      final revision = transfer.ownershipRevision;
       bool? granted;
       unawaited(transfer.acquire(AudioOutput.preview).then((g) => granted = g));
       await pumpEventQueue();
@@ -198,7 +182,6 @@ void main() {
       expect(granted, isTrue);
       expect(mayPlay, isTrue);
       expect(transfer.holder, AudioOutput.preview);
-      expect(transfer.ownershipRevision, greaterThan(revision));
       expect(await transfer.beforePlay(AudioOutput.preview), isTrue);
     });
 
@@ -434,6 +417,71 @@ void main() {
     // 7-R1-23: a preview closed (or released) before the library acknowledged
     // leaves the library holding the output; it must not stay yielded, or its
     // automatic continuations never play again.
+    // Pre-merge R2-L-02: an output that was taken, or asked for, and never
+    // used goes back as if the transfer had never been asked.
+    group('handing the output back unused', () {
+      test('the holder hands it back: the other output holds it again, is '
+          'not yielded, and is told once', () async {
+        await hold(AudioOutput.queue);
+        await hold(AudioOutput.preview);
+        final asked = preview.relinquishes;
+        transfer.handBack(AudioOutput.preview);
+        expect(transfer.holder, AudioOutput.queue);
+        expect(transfer.yieldedBy(AudioOutput.queue), isFalse);
+        expect(queue.returns, 1);
+        expect(await transfer.beforePlay(AudioOutput.queue), isTrue);
+        expect(preview.relinquishes, asked,
+            reason: 'the library plays again without asking the preview');
+      });
+
+      test('while its transfer is still pending: the transfer ends refused, '
+          'the holder keeps the output, is not yielded, and is told once',
+          () async {
+        await hold(AudioOutput.queue);
+        bool? granted;
+        unawaited(
+            transfer.acquire(AudioOutput.preview).then((g) => granted = g));
+        await pumpEventQueue();
+        expect(granted, isNull);
+        transfer.handBack(AudioOutput.preview);
+        await pumpEventQueue();
+        expect(granted, isFalse);
+        expect(transfer.holder, AudioOutput.queue);
+        expect(transfer.yieldedBy(AudioOutput.queue), isFalse);
+        expect(queue.returns, 1);
+        expect(timers.active, isEmpty);
+        queue.acknowledge(); // a late acknowledgement changes nothing
+        await pumpEventQueue();
+        expect(transfer.holder, AudioOutput.queue);
+      });
+
+      test('an output that neither holds nor waits hands nothing back',
+          () async {
+        await hold(AudioOutput.queue);
+        transfer.handBack(AudioOutput.preview);
+        expect(transfer.holder, AudioOutput.queue);
+        expect(queue.returns, 0);
+      });
+
+      test('an output that is already being taken back hands nothing back',
+          () async {
+        await hold(AudioOutput.preview);
+        bool? back;
+        unawaited(
+            transfer.beforePlay(AudioOutput.queue).then((g) => back = g));
+        await pumpEventQueue();
+        expect(back, isNull);
+        transfer.handBack(AudioOutput.preview);
+        expect(queue.returns, 0);
+        expect(transfer.holder, AudioOutput.preview,
+            reason: 'the transfer to the library is still waiting');
+        preview.acknowledge();
+        await pumpEventQueue();
+        expect(back, isTrue);
+        expect(transfer.holder, AudioOutput.queue);
+      });
+    });
+
     group('7-R1-23: a superseded transfer leaves its holder not yielded', () {
       test('giving up the pending target while the library still holds',
           () async {
@@ -488,83 +536,4 @@ void main() {
       });
     });
   });
-}
-
-/// A focus owner whose relinquish the test acknowledges.
-class RelinquishingOwner implements AudioFocusOwner, FocusRelinquisher {
-  RelinquishingOwner(this.name);
-  final String name;
-  final calls = <String>[];
-  int relinquishes = 0;
-  Completer<void>? _ack;
-
-  @override
-  Future<void> relinquishFocus() {
-    relinquishes++;
-    return (_ack ??= Completer<void>()).future;
-  }
-
-  void acknowledge() {
-    _ack?.complete();
-    _ack = null;
-  }
-
-  void fail(Object error) {
-    _ack?.completeError(error);
-    _ack = null;
-  }
-
-  @override
-  void onInterruptionBegan() => calls.add('began');
-
-  @override
-  void onInterruptionEnded({required bool shouldResume}) =>
-      calls.add('ended(resume: $shouldResume)');
-
-  @override
-  void onBecameNoisy() => calls.add('noisy');
-}
-
-/// Timers the test fires by hand (no wall clock).
-class FakeTimers {
-  final _timers = <_FakeTimer>[];
-
-  Timer create(Duration duration, void Function() callback) {
-    final timer = _FakeTimer(duration, callback);
-    _timers.add(timer);
-    return timer;
-  }
-
-  List<(Duration, Timer)> get pending =>
-      [for (final t in _timers) if (t.isActive) (t.duration, t)];
-
-  List<Timer> get active => [for (final t in _timers) if (t.isActive) t];
-
-  void fireAll() {
-    for (final t in List.of(_timers)) {
-      t.fire();
-    }
-  }
-}
-
-class _FakeTimer implements Timer {
-  _FakeTimer(this.duration, this._callback);
-  final Duration duration;
-  final void Function() _callback;
-  bool _active = true;
-
-  void fire() {
-    if (!_active) return;
-    _active = false;
-    _callback();
-  }
-
-  @override
-  void cancel() => _active = false;
-
-  @override
-  bool get isActive => _active;
-
-  @override
-  int get tick => 0;
 }

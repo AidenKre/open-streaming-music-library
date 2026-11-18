@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/services/uploads/upload_duplicate_banners.dart';
 import 'package:frontend/services/uploads/upload_review_rules.dart'
-    show ReviewItemView;
+    show ReviewItemView, previewPlaying;
 import 'package:frontend/ui/preview_controller.dart';
 import 'package:frontend/ui/uploads/upload_review_controller.dart';
 
@@ -132,9 +132,7 @@ class DuplicateRowTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final uuid = row.trackUuid;
     final playing =
-        uuid != null &&
-        previewState.source == LibraryTrackPreview(uuid) &&
-        previewIsActive(previewState.status);
+        uuid != null && previewPlaying(previewState, LibraryTrackPreview(uuid));
     return Wrap(
       crossAxisAlignment: WrapCrossAlignment.center,
       spacing: 8,

@@ -1,7 +1,7 @@
 // Phase M §7.2 / SC-27 Phase M amendment (M-U20): the stream URI takes the
 // base URL explicitly; there is no process-wide base URL to read.
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/playback/track_cache_manager.dart';
+import 'package:frontend/playback/stream_uris.dart';
 import 'package:frontend/services/quality_presets.dart';
 
 void main() {

@@ -12,8 +12,7 @@ import pytest
 
 from tests import lastfm_secrets as planted
 from tests.lastfm_fake import failed, ok_now_playing, xml_reply
-from tests.lastfm_sender_rig import connect_user, make_rig, query, session_key_for
-from tests.test_lastfm_now_playing import add_track
+from tests.lastfm_sender_rig import add_track, connect_user, make_rig, query, session_key_for
 
 TITLE = "Zqx-Title-Marker"
 ARTIST = "Zqx-Artist-Marker"

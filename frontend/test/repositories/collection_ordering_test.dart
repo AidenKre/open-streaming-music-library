@@ -7,8 +7,8 @@ import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/collection_ordering.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
-import '../ui/browse_harness.dart';
 import '../helpers/server_binding.dart';
+import '../helpers/library_seed.dart' show SeedTrack, markDownloaded, seedLibrary;
 
 /// Ordering primitives shared by the browse watch queries and the queue
 /// insert (real in-memory SQLite). Expected orders are written out by hand,
@@ -56,13 +56,6 @@ void main() {
       expect(rows.map((r) => r.read<String>('uuid_id')), expected);
     });
 
-    test('getTrackUuids applies the same keys', () async {
-      expect(
-        await db.getTrackUuids(orderBy: order(), artistId: 1, albumId: 1),
-        expected,
-      );
-    });
-
     test('a queue built from the query has the same order', () async {
       final repo = QueueRepository(db);
       final sessionId = await repo.createSessionFromQuery(
@@ -74,16 +67,6 @@ void main() {
       );
       final entries = await repo.getPlaybackEntries(sessionId);
       expect(entries.map((e) => e.uuidId), expected);
-    });
-
-    test('nullsAs/caseInsensitive cannot be combined with a cursor', () {
-      expect(
-        () => db.getTracks(
-          orderBy: [OrderParameter(column: 'disc_number', nullsAs: 0)],
-          cursorFilters: [RowFilterParameter(column: 'disc_number', value: 1)],
-        ),
-        throwsArgumentError,
-      );
     });
   });
 

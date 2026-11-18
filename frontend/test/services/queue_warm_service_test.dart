@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -74,6 +75,10 @@ class _Refuse implements TokenPermit {
   Future<void> verdictSettled() async {}
 }
 
+/// Longer than the service's private 500 ms warm-up debounce, so a pump of
+/// this much fires a pending warm-up (DR-A-04: one value for every wait).
+const _pastDebounce = Duration(milliseconds: 700);
+
 void main() {
   // Sign-off OPEN-M-11: while the server is not verified the token client
   // withholds the warm-up. It is advisory: one log line, no retry, and no
@@ -104,7 +109,7 @@ void main() {
       );
       addTearDown(service.dispose);
       service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
       expect(requests, 0);
     });
 
@@ -116,7 +121,7 @@ void main() {
       );
       addTearDown(service.dispose);
       service.scheduleWarmUuids(['a', 'b'], quality: '256');
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
       expect(requests, 0);
     });
   });
@@ -136,7 +141,7 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
 
     expect(repo.callCount, 1);
     expect(requests, 0);
@@ -144,7 +149,11 @@ void main() {
 
   _fakeTest('U20-FE-QUEUE-B-10: an unexpected error from the request is '
       'logged, not raised', (tester) async {
-    _installMockClient(MockClient((req) async => throw StateError('boom')));
+    var requests = 0;
+    _installMockClient(MockClient((req) async {
+      requests++;
+      throw StateError('boom');
+    }));
     final service = QueueWarmService(
       apiClient: _api,
       queueRepo: _FakeQueueRepo([_entry('a', 0)]),
@@ -152,7 +161,10 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
+
+    // The one request was made and failed; nothing escaped the timer.
+    expect(requests, 1);
   });
 
   _fakeTest('scheduleWarm POSTs to /tracks/warm after the debounce', (tester) async {
@@ -171,7 +183,7 @@ void main() {
 
     service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
 
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
 
     expect(capturedUrl?.path, '/tracks/warm');
     expect(capturedBody?['session_id'], '7');
@@ -197,7 +209,7 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
 
     expect(requests, 0);
   });
@@ -217,7 +229,7 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 1, quality: '192');
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
 
     expect(repo.lastStartPlayPosition, 1);
     expect(capturedBody?['track_uuids'], ['b', 'c']);
@@ -239,7 +251,7 @@ void main() {
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
 
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
     expect(postCount, 1);
   });
 
@@ -254,7 +266,7 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: null, currentPlayPosition: 0, quality: '320');
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
 
     expect(postCount, 0);
     expect(repo.callCount, 0);
@@ -270,7 +282,7 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
     expect(postCount, 0);
   });
 
@@ -287,13 +299,15 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
-    await tester.pump(const Duration(milliseconds: 700));
+    await tester.pump(_pastDebounce);
 
     expect((capturedBody!['track_uuids'] as List).length, 50);
   });
 
   _fakeTest('swallows POST errors so callers never see them', (tester) async {
+    var requests = 0;
     _installMockClient(MockClient((_) async {
+      requests++;
       throw const SocketException('simulated network failure');
     }));
     final service = QueueWarmService(
@@ -303,9 +317,10 @@ void main() {
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
-    // Retries run instantly (delay mocked to no-op via initForTest), then the
-    // NetworkException is caught and swallowed inside the service.
-    await tester.pump(const Duration(milliseconds: 700));
+    // One attempt (the warm does not retry); the NetworkException is caught
+    // and swallowed inside the service (testWidgets fails on an escaped one).
+    await tester.pump(_pastDebounce);
+    expect(requests, 1);
   });
 
   group('scheduleWarmUuids', () {
@@ -323,7 +338,7 @@ void main() {
 
       service.scheduleWarmUuids(['uuid-1', 'uuid-2'], quality: '256');
 
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
 
       expect(capturedUrl?.path, '/tracks/warm');
       // The download-driven path must NOT send a magic string here; the
@@ -350,7 +365,7 @@ void main() {
       final sixtyUuids = List.generate(60, (i) => 'uuid-$i');
       service.scheduleWarmUuids(sixtyUuids, quality: '128');
 
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
 
       expect((capturedBody!['track_uuids'] as List).length, 50);
     });
@@ -371,7 +386,7 @@ void main() {
       service.scheduleWarmUuids(['b'], quality: '128');
       service.scheduleWarmUuids(['c'], quality: '128');
 
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
       expect(postCount, 1);
       // Earlier batches must NOT be dropped — all three uuids are warmed.
       expect(capturedBody?['track_uuids'], ['a', 'b', 'c']);
@@ -390,7 +405,7 @@ void main() {
       service.scheduleWarmUuids(['a', 'b'], quality: '128');
       service.scheduleWarmUuids(['b', 'c'], quality: '128');
 
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
       expect(capturedBody?['track_uuids'], ['a', 'b', 'c']);
     });
 
@@ -407,7 +422,7 @@ void main() {
       service.scheduleWarmUuids(['a'], quality: '128');
       service.scheduleWarmUuids(['b'], quality: '256');
 
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
       expect(captured.length, 2);
       final lo = captured.firstWhere((b) => b['quality'] == '128');
       final hi = captured.firstWhere((b) => b['quality'] == '256');
@@ -416,14 +431,17 @@ void main() {
     });
 
     _fakeTest('swallows POST errors', (tester) async {
+      var requests = 0;
       _installMockClient(MockClient((_) async {
+        requests++;
         throw const SocketException('simulated network failure');
       }));
       final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1'], quality: '128');
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
+      expect(requests, 1);
     });
 
     _fakeTest('does nothing when list is empty', (tester) async {
@@ -436,7 +454,7 @@ void main() {
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids([], quality: '128');
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
       expect(postCount, 0);
     });
 
@@ -451,7 +469,7 @@ void main() {
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1'], quality: '128');
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
 
       // Warm POSTs do NOT opt into retry — a transient 503 surfaces once,
       // is logged and swallowed by the service. The server may still warm
@@ -532,7 +550,7 @@ void main() {
       service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
       service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
 
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
       expect(postCount, 1);
     });
 
@@ -550,7 +568,7 @@ void main() {
       addTearDown(service.dispose);
 
       service.scheduleWarm(sessionId: 42, currentPlayPosition: 0, quality: '320');
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
 
       expect(capturedBody?['session_id'], '42');
     });
@@ -565,11 +583,85 @@ void main() {
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1'], quality: '128');
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(_pastDebounce);
 
       // No retry on the warm path. NetworkException (attemptsMade: 1) is
       // caught and swallowed inside the service's timer callback.
       expect(calls, 1);
     });
   });
+
+  // Other-issues row 71 (SC-15): a reset quiets the warm-up. Both pending
+  // timers are cancelled, a warm already reading the queue sends nothing,
+  // and no later schedule starts a timer (quiesced is terminal: the scope is
+  // rebuilt after the reset).
+  group('quiesce', () {
+    late int requests;
+    setUp(() {
+      requests = 0;
+      _installMockClient(MockClient((req) async {
+        requests++;
+        return http.Response('', 204);
+      }));
+    });
+
+    _fakeTest('cancels both pending warm-ups and starts none afterwards',
+        (tester) async {
+      final service = QueueWarmService(
+        apiClient: _api,
+        queueRepo: _FakeQueueRepo([_entry('a', 0)]),
+      );
+      addTearDown(service.dispose);
+      service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '320');
+      service.scheduleWarmUuids(['dl-1'], quality: '320');
+      await tester.pump(const Duration(milliseconds: 100));
+
+      await service.quiesce();
+      await tester.pump(_pastDebounce);
+      expect(requests, 0);
+
+      service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '320');
+      service.scheduleWarmUuids(['dl-2'], quality: '320');
+      await tester.pump(_pastDebounce);
+      expect(requests, 0);
+    });
+
+    _fakeTest('a warm-up reading the queue when the quiet step lands sends '
+        'nothing', (tester) async {
+      final repo = _GatedQueueRepo([_entry('a', 0)]);
+      final service = QueueWarmService(apiClient: _api, queueRepo: repo);
+      addTearDown(service.dispose);
+      service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '320');
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(repo.reads, 1, reason: 'the timer fired and the read is waiting');
+
+      await service.quiesce();
+      repo.gate.complete();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(requests, 0);
+    });
+  });
+}
+
+/// A queue read that answers only once the test completes [gate].
+class _GatedQueueRepo extends _FakeQueueRepo {
+  _GatedQueueRepo(super.entries);
+
+  final gate = Completer<void>();
+  int reads = 0;
+
+  @override
+  Future<List<QueuePlaybackEntry>> getPlaybackEntries(
+    int sessionId, {
+    int startPlayPosition = 0,
+    int? limit,
+  }) async {
+    reads++;
+    await gate.future;
+    return super.getPlaybackEntries(
+      sessionId,
+      startPlayPosition: startPlayPosition,
+      limit: limit,
+    );
+  }
 }

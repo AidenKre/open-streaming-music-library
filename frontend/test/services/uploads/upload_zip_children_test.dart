@@ -207,4 +207,28 @@ void main() {
     expect(result.valid, 1);
     expect(result.failed, 1);
   });
+
+  // Refactor APP-UPLOAD (sign-off s7-app-texts review-8 #2): a file of an
+  // archive whose received copy the server lost cannot be sent again (the
+  // server refuses to retry a child without its file) and the archive's file
+  // list offers neither Retry nor Cancel, so the text names the one step
+  // that works: adding the archive again. Proposed wording, for the owner.
+  test('a file of the archive the server lost says to add the archive again, '
+      'not to try again', () async {
+    api.onListItems = (batch, after) async => _page([
+      _child('c1', 'failed', error: {
+        'code': 'upload_source_missing',
+        'retryable': true,
+      }),
+    ]);
+    final result = await UploadZipChildren(api).load('b-1', 'zip');
+    expect(result.children.single.statusText, 'Failed');
+    expect(
+      result.children.single.detailText,
+      'The server no longer has this file from the archive. Add the archive '
+      'again to upload it.',
+    );
+    expect(result.children.single.detailText, isNot(contains('Try again')));
+    expect(result.children.single.needsAttention, isTrue);
+  });
 }

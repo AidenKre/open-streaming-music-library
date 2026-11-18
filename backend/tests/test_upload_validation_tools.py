@@ -11,17 +11,11 @@ from app.services.ffmpeg_runner import FfmpegProcessRegistry
 from app.services.fingerprinter import FpcalcFingerprinter, probe_fpcalc_version
 from app.services.job_runtime import CancelTokens
 from app.services.upload_validation import UploadValidationWorker
-from tests.identity_worker_fixtures import make_db
 from tests.upload_validation_fixtures import BOOT, item_row, report_of, stage_item
 
 
 def _ff(*args):
     subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", *args], check=True)
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

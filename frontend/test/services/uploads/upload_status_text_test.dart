@@ -9,7 +9,8 @@ import 'package:frontend/services/uploads/upload_status_text.dart';
 const _states = [
   // local
   'allocating', 'allocated', 'transferring', 'source_changed',
-  'needs_reselect', 'rejected', 'cancelling',
+  'needs_reselect', 'rejected', 'cancelling', 'review_submitted',
+  'on_other_device',
   // server
   'receiving', 'validating', 'review_ready', 'committing', 'imported',
   'duplicate', 'expanded', 'failed', 'duplicate_conflict', 'expired',

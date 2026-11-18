@@ -9,9 +9,7 @@ import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/repositories/history_snapshot.dart';
-
-int utc(int y, [int m = 1, int d = 1, int h = 0]) =>
-    DateTime.utc(y, m, d, h).millisecondsSinceEpoch;
+import '../helpers/listening_stats_builder.dart';
 
 // 2026-03-15T12:00Z.
 final now = utc(2026, 3, 15, 12);
@@ -67,24 +65,17 @@ ListeningStats stats(
 }) {
   final r = range ?? StatsRange.year(year);
   final n = nowMs == 0 ? now : nowMs;
-  return ListeningStats(
+  return listeningStatsOf(
     range: r,
     window: r.resolve(n),
     boundaryLocalId: boundary,
-    totals: ListeningTotals(
-      listeningSeconds: seconds,
-      qualifiedPlays: qualified,
-      uniqueTracks: unique,
-      activeDays: days,
-    ),
-    unavailable: ListeningSubtotal(
-      listeningSeconds: unavailableSeconds,
-      qualifiedPlays: unavailableQualified,
-    ),
-    futureTimestampCount: 0,
-    overlongListenCount: 0,
+    seconds: seconds,
+    qualifiedPlays: qualified,
+    uniqueTracks: unique,
+    activeDays: days,
+    unavailableSeconds: unavailableSeconds,
+    unavailablePlays: unavailableQualified,
     buckets: months(year, monthly),
-    chartCapped: false,
     topTracks: tracks,
     topArtists: artists,
     topAlbums: albums,

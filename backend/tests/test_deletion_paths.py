@@ -21,9 +21,9 @@ from tests.deletion_world import (
     live,
     make_executor,
     revision,
-    sql,
     tombstone,
 )
+from tests.track_paths import set_track_path
 
 
 @pytest.fixture
@@ -44,7 +44,7 @@ def _sha(path):
 
 
 def _point_at(world, uuid_id, path):
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(path), uuid_id))
+    set_track_path(world.db, uuid_id, path)
 
 
 def _disk(world):
@@ -144,3 +144,15 @@ def test_a_symlinked_library_root_is_rejected(world, tmp_path):
     uuid_id = add_master(world, "Radiohead/01 Lucky.flac", create_file=False)
 
     _run_rejected(world, uuid_id, victim)
+
+
+def test_the_quarantine_folders_have_one_spelling(tmp_path):
+    """``.deleting`` under the music folder, and one folder per owner id below
+    it: the worker, recovery and the janitor all ask these two functions."""
+    from app.services.master_paths import quarantine_base, quarantine_dir
+
+    music = tmp_path / "music"
+
+    assert quarantine_base(music) == music / ".deleting"
+    assert quarantine_dir(music, 7) == music / ".deleting" / "7"
+    assert quarantine_dir(str(music), 7) == music / ".deleting" / "7"

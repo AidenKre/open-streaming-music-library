@@ -5,7 +5,7 @@
 //  * cursor semantics are unchanged: advance to the server's validated
 //    nextCursor (even on an empty page), final page -> last entry revision,
 //    empty final page -> unchanged;
-//  * the legacy `lastRevision` pref is moved into the row on first use;
+//  * a leftover pre-SC-02 `lastRevision` pref is ignored;
 //  * best-effort restore detection compares latestRevision with the `after`
 //    the client REQUESTED.
 //  * refetchAndApplyTrack (take-server) is fenced too.
@@ -82,7 +82,6 @@ void main() {
       db: db,
       api: TracksApi(api: api),
       queueRepository: QueueRepository(db),
-      prefs: await SharedPreferences.getInstance(),
       bindingToken: token,
     );
   }
@@ -157,14 +156,18 @@ void main() {
       expect(await cursors.read(SyncStream.catalog), 7);
     });
 
-    test('the legacy lastRevision pref is used once and removed', () async {
-      pages[5] = _page([_upsert('u1', 6)], latest: 6);
+    // Section 6 #2 (owner, 2026-11-17: no data from before Phase M is ever
+    // opened again): the pre-SC-02 `lastRevision` pref is neither read nor
+    // removed; the catalog cursor lives only in `sync_cursors`.
+    test('a leftover lastRevision pref is not read: the sync starts from '
+        'sync_cursors', () async {
+      pages[0] = _page([_upsert('u1', 6)], latest: 6);
       final s = await service(prefs: {'lastRevision': 5});
       await s.syncChanges();
-      expect(requestedAfters, [5]);
+      expect(requestedAfters, [0]);
       expect(await cursors.read(SyncStream.catalog), 6);
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.containsKey('lastRevision'), isFalse);
+      expect(prefs.getInt('lastRevision'), 5);
     });
   });
 
@@ -326,16 +329,6 @@ void main() {
       await expectLater(run, throwsA(isA<BindingFencedException>()));
       expect(await reconciled(), isFalse);
     });
-  });
-
-  // Audit 5A.0(a) #7: moving the legacy watermark is a durable write too.
-  test('the legacy cursor move is fenced by the binding', () async {
-    final sync = await service(prefs: {'lastRevision': 42});
-    await binding.fence();
-    await expectLater(sync.syncChanges(), throwsA(isA<BindingFencedException>()));
-    final rows = await db.customSelect('SELECT * FROM sync_cursors').get();
-    expect(rows, isEmpty);
-    expect((await SharedPreferences.getInstance()).getInt('lastRevision'), 42);
   });
 
   // Audit 5A.0(c) #1 (SC-02): the page and its cursor commit TOGETHER. A

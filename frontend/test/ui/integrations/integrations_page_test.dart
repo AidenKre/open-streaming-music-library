@@ -15,12 +15,12 @@
 // control.
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/models/dto/lastfm_dtos.dart';
 import 'package:frontend/services/lastfm/lastfm_errors.dart';
 import 'package:frontend/ui/integrations/integrations_controller.dart';
 
 import '../browse_harness.dart' show teardownTree;
 import 'fake_integrations_controls.dart';
+import '../../helpers/fake_lastfm_api.dart' show lastfmStatus;
 
 const _stopped = 'Scrobbling is stopped on this server. Ask whoever runs it.';
 const _credit = 'Scrobbling powered by Last.fm';
@@ -347,14 +347,12 @@ void main() {
     // #1: a reconnect waiting for its approval shows Finish and the note.
     testWidgets('a reconnect waiting for its approval offers Finish',
         (tester) async {
-      final fake = FakeIntegrationsControls.known(LastfmStatus.fromJson({
-        'service': 'running',
-        'state': 'enabled',
-        'needs_reconnect': true,
-        'account_name': 'listener_01',
-        'connection_id': 'c-1',
-        'approval_expires_at': 1800000600000,
-      }));
+      final fake = FakeIntegrationsControls.known(lastfmStatus(
+        needsReconnect: true,
+        connectionId: 'c-1',
+        approvalExpiresAt: 1800000600000,
+        counts: null,
+      ));
       await pumpIntegrations(tester, fake);
       expect(find.text(awaitingNote), findsOneWidget);
       expect(find.text('Reconnect'), findsOneWidget);

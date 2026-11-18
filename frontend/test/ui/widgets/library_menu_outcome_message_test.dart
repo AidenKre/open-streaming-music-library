@@ -32,16 +32,8 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 
 import '../browse_harness.dart';
 import '../fake_library_actions.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
+import '../../helpers/test_offline.dart';
 
 /// Answers every queue action with [outcome].
 class _OutcomeActions extends FakeLibraryActions {
@@ -95,7 +87,7 @@ Widget _build(Widget card, FakeLibraryActions? actions,
       artistIsDownloadingProvider.overrideWith((ref, id) => false),
       artistDownloadCountsProvider
           .overrideWith((ref, id) => const AsyncData(counts)),
-      offlineModeProvider.overrideWith(() => _StubOffline(true)),
+      offlineModeProvider.overrideWith(() => TestOffline(true)),
       playbackAvailabilityProvider.overrideWith(
         (ref, scope) => PlaybackAvailability.of(
             offline: true,

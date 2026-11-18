@@ -15,9 +15,9 @@ from app.services.encoded_cache import CACHE_FILE_SUFFIX
 from app.services.encoder_coordinator import EncoderCoordinator
 from tests.conftest import bearer
 from tests.owned_database import add_test_user
+from tests.quality_fixtures import _store_quality
 from tests.test_default_quality import (
     _install_fake_coordinator,
-    _store_quality,
     _stored_quality,
 )
 
@@ -142,7 +142,7 @@ def _add_owned_track(client, tmp_path, library, name):
 
 
 def _drain(client):
-    client.app.state.encoder_coordinator._executor.shutdown(wait=True)
+    client.app.state.encoder_coordinator.drain()
 
 
 def _uuids_in(cache, quality):
@@ -243,6 +243,6 @@ def test_startup_prewarms_only_the_admins_tracks(configure_app, tmp_path, monkey
     )
 
     with TestClient(configure_app().app) as c:
-        c.app.state.encoder_coordinator._executor.shutdown(wait=True)
+        c.app.state.encoder_coordinator.drain()
 
     assert warmed == [(admin_track, "192")]

@@ -1,5 +1,5 @@
 // Fix 9-fix-r4-fe (live defect 9-L-03): the "More from your artists"
-// candidate statement exactly as candidate aa5d50bd shipped it, kept as the
+// candidate statement exactly as it shipped before the rewrite, kept as the
 // reference the rewritten statement must match row for row. It ran one
 // correlated `NOT EXISTS` over history_events per catalog track of a recent
 // artist (history_events has no index on entity_ref, so each one walked the

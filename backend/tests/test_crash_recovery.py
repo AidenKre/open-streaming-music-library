@@ -19,13 +19,10 @@ from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services import metadata as metadata_mod
 from app.services.track_edit import WriteMode
+from tests.crash import Crash
 
 # Registered marker (plan D16): tests/conftest.py skips without ffmpeg/ffprobe.
 requires_ffmpeg = pytest.mark.requires_ffmpeg
-
-
-class _Killed(BaseException):
-    """The process dying: not an Exception, so no handler may swallow it."""
 
 
 def _make_audio(path: Path, codec: str = "aac", **tags) -> None:
@@ -82,14 +79,14 @@ def test_committed_relocate_survives_a_kill_before_the_journal_delete(
         revision = library.get_track_by_uuid(track.uuid_id).revision
 
         def killed(*args, **kwargs):
-            raise _Killed()
+            raise Crash()
 
         with monkeypatch.context() as m:
             m.setattr(Database, "delete_journal_entry", killed)
             # Driven through the app's own editor (what PATCH /tracks calls):
             # a BaseException escaping an HTTP handler tears down the
             # TestClient's event-loop portal, which would hide the restart.
-            with pytest.raises(_Killed):
+            with pytest.raises(Crash):
                 client.app.state.track_editor.apply_edit(
                     library, track.uuid_id, {"artist": "New"}, revision,
                     WriteMode.db_and_master,
@@ -138,11 +135,11 @@ def test_a_second_users_committed_conversion_survives_a_kill_before_the_journal_
         assert submitted == [(job_id,)]
 
         def killed(*args, **kwargs):
-            raise _Killed()
+            raise Crash()
 
         with monkeypatch.context() as m:
             m.setattr(Database, "delete_journal_entry", killed)
-            with pytest.raises(_Killed):
+            with pytest.raises(Crash):
                 orchestrator._run_job(job_id)
 
         (entry,) = library.list_journal_entries()

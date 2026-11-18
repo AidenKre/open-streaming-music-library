@@ -34,9 +34,9 @@ from tests.deletion_world import (
     make_executor,
     path_of,
     revision,
-    sql,
     tombstone,
 )
+from tests.track_paths import allow_two_tracks_on_one_path, set_track_path
 
 
 @pytest.fixture
@@ -261,7 +261,7 @@ def test_a_track_whose_stored_path_is_outside_its_library_is_kept(world, tmp_pat
     uuid_id = add_master(world, "A/x.flac")
     held, data, _ = hold(world, uuid_id)
     outside = tmp_path / "elsewhere" / "x.flac"
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(outside), uuid_id))
+    set_track_path(world.db, uuid_id, outside)
 
     assert startup_pass(world) == 1
     assert held.read_bytes() == data and not outside.exists()
@@ -271,8 +271,9 @@ def test_a_place_another_track_uses_is_kept(world):
     uuid_id = add_master(world, "A/x.flac")
     other = add_master(world, "A/other.flac")
     held, data, _ = hold(world, uuid_id)
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
-        (str(path_of(world, uuid_id)), other))
+    # Two rows naming one file: the state the unique index now refuses.
+    allow_two_tracks_on_one_path(world.db)
+    set_track_path(world.db, other, path_of(world, uuid_id))
 
     assert startup_pass(world) == 1
     assert held.read_bytes() == data and not path_of(world, uuid_id).exists()
@@ -322,13 +323,13 @@ def test_the_put_back_link_is_synced_before_the_holding_name_goes(world, monkeyp
     removal without the link."""
     from pathlib import Path
 
-    from app.services import deletion_worker
+    from app.services import master_paths
 
     uuid_id = add_master(world, "A/x.flac")
     master = path_of(world, uuid_id)
     held, data, ino = hold(world, uuid_id)
     events = []
-    real_sync, real_unlink = deletion_worker.fsync_dir, os.unlink
+    real_sync, real_unlink = master_paths.fsync_dir, os.unlink
 
     def sync(directory):
         events.append(("sync", Path(directory)))
@@ -338,7 +339,7 @@ def test_the_put_back_link_is_synced_before_the_holding_name_goes(world, monkeyp
         events.append(("unlink", Path(path)))
         return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(deletion_worker, "fsync_dir", sync)
+    monkeypatch.setattr(master_paths, "fsync_dir", sync)
     monkeypatch.setattr(os, "unlink", unlink)
 
     assert startup_pass(world) == 0

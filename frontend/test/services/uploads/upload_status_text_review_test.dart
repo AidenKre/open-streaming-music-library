@@ -4,11 +4,12 @@
 // `upload_batch_expired`), and the local `review_submitted` state. One
 // function: plain words, never a code, path, ID or the server's message.
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 
 import '../../helpers/fake_uploads_api.dart';
+import '../../helpers/upload_intent_record.dart';
 import '../../helpers/upload_manager_harness.dart';
 
 final _leak = RegExp(
@@ -148,25 +149,14 @@ void main() {
       'cancel', () {
     final overview = UploadsOverview.of(
       intents: [
-        UploadIntentRecord(
-          itemUuid: 'i',
+        intentRecord(
+          'i',
           batchUuid: 'b',
-          parentItemUuid: null,
-          selectionIndex: 0,
           displayName: 'a.flac',
-          lastState: 'review_submitted',
-          lastErrorCode: null,
-          lastErrorMessage: null,
+          state: 'review_submitted',
           operationUuid: 'op',
-          transferOperationUuid: null,
           reviewGeneration: 1,
-          draftJson: null,
           localBindingId: 'bind',
-          createdAtMs: 0,
-          updatedAtMs: 0,
-          expectedLength: null,
-          expectedSha256: null,
-          descriptor: null,
         ),
       ],
       progress: const {},

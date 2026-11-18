@@ -2,6 +2,7 @@ import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/repositories/browse_repository.dart';
@@ -11,6 +12,7 @@ import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/tracks_page.dart';
 
 import '../browse_harness.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 void main() {
   late AppDatabase db;
@@ -52,7 +54,10 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.widgetWithText(AppBar, 'Ann - Singles'), findsOneWidget);
     final page = tester.widget<TracksPage>(find.byType(TracksPage));
-    expect((page.artistId, page.albumId, page.browseAll), (4, 9, false));
+    expect(
+      (page.album, page.browseAll),
+      (const AlbumScope(artistId: 4, albumId: 9), false),
+    );
     await teardownTree(tester);
   });
 

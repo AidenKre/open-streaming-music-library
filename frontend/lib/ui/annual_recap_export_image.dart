@@ -114,139 +114,142 @@ class RecapExportImage extends StatelessWidget {
               decoration: TextDecoration.none,
             ),
             child: SizedBox.fromSize(
-            key: const ValueKey('recap.export'),
-            size: logicalSize,
-            child: ColoredBox(
-              color: _paper,
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(
-                      height: 56,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          SizedBox(
-                            height: 18,
-                            child: _text(
-                              recap.isYearSoFar
-                                  ? '${recap.year} · Year so far · UTC'
-                                  : '${recap.year} · UTC',
-                              size: 13,
-                              color: _muted,
+              key: const ValueKey('recap.export'),
+              size: logicalSize,
+              child: ColoredBox(
+                color: _paper,
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SizedBox(
+                        height: 56,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            SizedBox(
+                              height: 18,
+                              child: _text(
+                                recap.isYearSoFar
+                                    ? '${recap.year} · Year so far · UTC'
+                                    : '${recap.year} · UTC',
+                                size: 13,
+                                color: _muted,
+                              ),
                             ),
-                          ),
-                          SizedBox(
-                            height: 38,
-                            child: _text(
-                              'Year in music',
-                              size: 30,
-                              weight: FontWeight.w700,
+                            SizedBox(
+                              height: 38,
+                              child: _text(
+                                'Year in music',
+                                size: 30,
+                                weight: FontWeight.w700,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 16),
-                    SizedBox(
-                      height: 112,
-                      child: Wrap(
-                        spacing: 12,
-                        runSpacing: 8,
-                        children: [
-                          _tile(
-                            'Listening time',
-                            formatListeningTime(recap.totals.listeningSeconds),
-                          ),
-                          _tile(
-                            'Qualified plays',
-                            '${recap.totals.qualifiedPlays}',
-                          ),
-                          _tile(
-                            'Unique tracks',
-                            '${recap.totals.uniqueTracks}',
-                          ),
-                          _tile('Active days', '${recap.totals.activeDays}'),
-                          _tile(
-                            'Unavailable history',
-                            formatListeningTime(
-                              recap.unavailable.listeningSeconds,
+                      const SizedBox(height: 16),
+                      SizedBox(
+                        height: 112,
+                        child: Wrap(
+                          spacing: 12,
+                          runSpacing: 8,
+                          children: [
+                            _tile(
+                              'Listening time',
+                              formatListeningTime(
+                                recap.totals.listeningSeconds,
+                              ),
                             ),
-                          ),
-                          if (busiest != null)
-                            _tile('Busiest month', recapMonthName(busiest)),
-                        ],
+                            _tile(
+                              'Qualified plays',
+                              '${recap.totals.qualifiedPlays}',
+                            ),
+                            _tile(
+                              'Unique tracks',
+                              '${recap.totals.uniqueTracks}',
+                            ),
+                            _tile('Active days', '${recap.totals.activeDays}'),
+                            _tile(
+                              'Deleted or unknown tracks',
+                              formatListeningTime(
+                                recap.unavailable.listeningSeconds,
+                              ),
+                            ),
+                            if (busiest != null)
+                              _tile('Busiest month', recapMonthName(busiest)),
+                          ],
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 20),
-                    SizedBox(
-                      height: 212,
-                      child: recap.isEmpty
-                          ? _text(
-                              'No listening in ${recap.year}',
-                              size: 15,
-                              color: _muted,
-                            )
-                          : Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                _list('Top tracks', [
-                                  for (final e in recap.topTracks)
-                                    (
-                                      e.entity.title ?? 'Unknown title',
-                                      e.entity.artist,
-                                    ),
-                                ]),
-                                _list('Top artists', [
-                                  for (final e in recap.topArtists)
-                                    (e.entity.name, null),
-                                ]),
-                                _list('Top albums', [
-                                  for (final e in recap.topAlbums)
-                                    (
-                                      e.entity.name ?? 'Unknown album',
-                                      e.entity.artist,
-                                    ),
-                                ]),
-                              ],
-                            ),
-                    ),
-                    const Spacer(),
-                    SizedBox(
-                      key: const ValueKey('recap.export.footer'),
-                      height: 44,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          SizedBox(
-                            height: 22,
-                            child: _text(
-                              'Generated ${formatUtcInstant(recap.generatedAtUtcMs)}. '
-                              'All times UTC.',
-                              size: 12,
-                              color: _muted,
-                            ),
-                          ),
-                          SizedBox(
-                            height: 22,
-                            child: _text(
-                              'From your listening history on all your devices, '
-                              'as synced to this one.',
-                              size: 12,
-                              color: _muted,
-                            ),
-                          ),
-                        ],
+                      const SizedBox(height: 20),
+                      SizedBox(
+                        height: 212,
+                        child: recap.isEmpty
+                            ? _text(
+                                'No listening in ${recap.year}',
+                                size: 15,
+                                color: _muted,
+                              )
+                            : Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  _list('Top tracks', [
+                                    for (final e in recap.topTracks)
+                                      (
+                                        e.entity.title ?? 'Unknown title',
+                                        e.entity.artist,
+                                      ),
+                                  ]),
+                                  _list('Top artists', [
+                                    for (final e in recap.topArtists)
+                                      (e.entity.name, null),
+                                  ]),
+                                  _list('Top albums', [
+                                    for (final e in recap.topAlbums)
+                                      (
+                                        e.entity.name ?? 'Unknown album',
+                                        e.entity.artist,
+                                      ),
+                                  ]),
+                                ],
+                              ),
                       ),
-                    ),
-                  ],
+                      const Spacer(),
+                      SizedBox(
+                        key: const ValueKey('recap.export.footer'),
+                        height: 44,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            SizedBox(
+                              height: 22,
+                              child: _text(
+                                'Generated ${formatUtcInstant(recap.generatedAtUtcMs)}. '
+                                'All times UTC.',
+                                size: 12,
+                                color: _muted,
+                              ),
+                            ),
+                            SizedBox(
+                              height: 22,
+                              child: _text(
+                                'From your listening history on all your devices, '
+                                'as synced to this one.',
+                                size: 12,
+                                color: _muted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-          ),
-          ),
+            ),
           ),
         ),
       ),

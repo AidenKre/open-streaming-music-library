@@ -60,13 +60,6 @@ class AuthMe {
   final String serverInstanceId;
 }
 
-/// Register, login, logout and me (spec 5.2).
-///
-/// Callers choose the [ApiClient]: register/login and the cancel-time revoke
-/// use the unhooked client (spec 7.2). Every call is a single attempt, and
-/// server errors stay [ApiException]s (SC-22 envelope). Nothing here logs or
-/// echoes a password or token. Logout and me are written against spec 5.2;
-/// the server endpoints land in M.1b.
 /// Revokes the scope client's own session, best effort: a 401 (already
 /// revoked) or any network error is swallowed.
 Future<void> revokeBestEffort(ApiClient api) async {
@@ -75,6 +68,12 @@ Future<void> revokeBestEffort(ApiClient api) async {
   } catch (_) {}
 }
 
+/// Register, login, logout and me (spec 5.2).
+///
+/// Callers choose the [ApiClient]: register/login and the cancel-time revoke
+/// use the unhooked client (spec 7.2). Every call is a single attempt, and
+/// server errors stay [ApiException]s (SC-22 envelope). Nothing here logs or
+/// echoes a password or token.
 class AuthApi {
   AuthApi(ApiClient api) : _api = api;
 

@@ -21,7 +21,7 @@ import sqlite3
 
 import pytest
 
-from app.services import organizer
+from app.services import file_ops
 from app.services.deletion_worker import DeletionWorker
 from tests.deletion_world import (
     BOOT,
@@ -147,7 +147,7 @@ def test_a_failing_outcome_write_of_a_conflict_is_released_then_finished(
 def test_a_failing_outcome_after_a_cleared_rename_journal_is_released(world, monkeypatch):
     uuid_id, op = _job(world)
     master = path_of(world, uuid_id)
-    monkeypatch.setattr(organizer, "move_file", lambda *a, **k: False)
+    monkeypatch.setattr(file_ops, "move_file", lambda *a, **k: False)
     _fail_once(
         monkeypatch, world.db, "finish_deletion_item",
         when=lambda **k: k.get("status") == "failed",
@@ -356,19 +356,34 @@ def test_a_step_that_released_its_item_answers_error_so_the_worker_waits(world, 
     # releases in milliseconds.
     uuid_id, op = _job(world)
     _fail_once(monkeypatch, world.db, "read_deletion_target")
-    worker = DeletionWorker(make_executor(world), idle_poll_s=5)
+    events = []
 
-    assert worker.process_one() == "error"
-    _released(world, op, uuid_id)
-    assert "error" in DeletionWorker.IDLE_OUTCOMES  # the base waits after it
+    class Recording(DeletionWorker):
+        """Writes down each step's outcome and each wait the loop asks for;
+        nothing really waits, and the second wait stops the loop."""
 
-    assert worker.process_one() == "done"
+        def process_one(self):
+            outcome = super().process_one()
+            if outcome == "error":
+                _released(world, op, uuid_id)
+            events.append(outcome)
+            return outcome
+
+        def _wait(self, timeout):
+            events.append(("wait", timeout))
+            if events.count(("wait", timeout)) == 2:
+                self.request_stop()
+
+    Recording(make_executor(world), idle_poll_s=5)._run_loop()
+
+    # The released item waits one poll; the finished target is followed at once.
+    assert events == ["error", ("wait", 5), "done", "idle", ("wait", 5)]
     assert _status(world, op, uuid_id) == ("deleted", None)
 
 
 def test_a_keep_site_release_also_answers_error(world, monkeypatch):
     # In-piece review #1: a designed keep site (here the directory sync after
-    # the move) releases through `_recovery_required`, not an escaping
+    # the move) releases through `_release_held`, not an escaping
     # exception; that requeue must wait a poll too.
     from app.services import deletion_worker
 

@@ -53,12 +53,18 @@ class OfflineModeNotifier extends Notifier<bool> {
 
   /// Enter local-only mode. Called by the [ApiClient] transport-failure hook,
   /// by the download manager on a mid-stream network failure, and by the
-  /// startup gate when a saved server URL is unreachable. No-op if already
-  /// offline. Exit happens only via [_poll] on a passing health check.
-  void enterOffline() {
-    if (state) return;
-    state = true;
-    _scheduleNextPoll();
+  /// startup gate when a saved server URL is unreachable. By default a no-op
+  /// if already offline; exit then happens only via [_poll] on a passing
+  /// health check. With `poll: false` (a blocked session: a different server
+  /// or a 401, used by the two blocked callers in the session service) no
+  /// poll is scheduled, and any scheduled or in-flight poll is stopped even
+  /// when already offline, so no health check can bring the app back online.
+  void enterOffline({bool poll = true}) {
+    if (!state) {
+      state = true;
+      if (poll) _scheduleNextPoll();
+    }
+    if (!poll) cancelOfflinePolling();
   }
 
   /// Leave local-only mode and stop health polling. Unlike the [_poll]-driven

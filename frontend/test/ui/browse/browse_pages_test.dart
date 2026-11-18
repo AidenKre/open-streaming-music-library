@@ -11,6 +11,7 @@ import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/library_card.dart';
 
 import '../browse_harness.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// 4A.4 (phase-4 §4): browse-all routes own ONE back AppBar and reuse the
 /// page bodies in browse-all mode; details never get browse controls.

@@ -11,11 +11,8 @@ import pytest
 from app.core.instance_lock import acquire_instance_lock
 from app.services import user_delete
 from tests.cli_fixtures import cli_settings, run_cli
+from tests.crash import Crash
 from tests.user_delete_world import build_world, dump, exists
-
-
-class Crash(BaseException):
-    pass
 
 
 @pytest.fixture

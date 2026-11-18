@@ -13,7 +13,7 @@ else in place.
 from fastapi.testclient import TestClient
 
 from app.services.conversion import reconcile_conversion_jobs
-from tests.test_track_editor import _db
+from tests.track_editor_fixtures import _db
 
 TEMP_NAMES = (
     "11111111-1111-4111-8111-111111111111.3.convert.flac",

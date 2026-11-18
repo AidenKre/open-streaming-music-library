@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/api/uploads_api.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/services/server_binding_gate.dart';
@@ -232,13 +233,19 @@ class FakeUploadsApi implements UploadsApi {
     return _abortable(Future.sync(() => onListBatches(after)), abortTrigger);
   }
 
+  /// How each `listItems` call asked to wait for the server check, in
+  /// order (the fake itself never waits or refuses).
+  final listItemsWaits = <BindingWait>[];
+
   @override
   Future<UploadItemPage> listItems(
     String batchUuid, {
     String? after,
     int? limit,
     Future<void>? abortTrigger,
+    BindingWait wait = BindingWait.untilVerified,
   }) {
+    listItemsWaits.add(wait);
     _record('listItems $batchUuid');
     return _abortable(Future.sync(() => onListItems(batchUuid, after)), abortTrigger);
   }

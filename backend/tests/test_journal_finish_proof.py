@@ -22,14 +22,12 @@ import logging
 
 import pytest
 
-from app.services.track_editor import (
-    _reconcile_one,
-    finish_kept_journal_rows,
-)
+from app.services.journal_recovery import reconcile_one
+from app.services.track_editor import finish_kept_journal_rows
 from app.services.track_editor import reconcile_journal as _reconcile_journal
 from app.services.track_locks import TrackLocks
 from tests.test_journal_settle import fake_read
-from tests.test_track_editor import _add_track, _db
+from tests.track_editor_fixtures import _add_track, _db
 
 INTENTS = ["relocate", "convert"]
 OPERATOR = "uvicorn.error"
@@ -172,7 +170,7 @@ def test_runtime_recovery_never_deletes_the_staged_copy_of_a_move_that_did_not_l
     [entry] = db.list_journal_entries()
 
     try:
-        _reconcile_one(db, entry, tmp_path, runtime=True)
+        reconcile_one(db, entry, tmp_path)
     except Exception:  # noqa: BLE001 - a kept row may be signalled by raising
         pass
 

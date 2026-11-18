@@ -1,5 +1,21 @@
 import 'package:frontend/database/database.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+
+/// The server answered with a `latestRevision` below the `after` this client
+/// requested: it was restored from an older backup (SC-01 rule 5). Nothing
+/// from that response was applied.
+class ServerRegressedException implements Exception {
+  ServerRegressedException({
+    required this.requestedAfter,
+    required this.latestRevision,
+  });
+  final int requestedAfter;
+  final int latestRevision;
+
+  @override
+  String toString() =>
+      'ServerRegressedException(requested after $requestedAfter, '
+      'server latest $latestRevision)';
+}
 
 /// A server change stream with its own watermark; [name] is the stored
 /// `sync_cursors.stream` key.
@@ -11,9 +27,6 @@ class SyncCursorStore {
   SyncCursorStore(this._db);
 
   final AppDatabase _db;
-
-  /// The SharedPreferences key that held the catalog watermark before SC-02.
-  static const legacyCatalogPrefKey = 'lastRevision';
 
   /// The stream's cursor; 0 when none has been stored.
   Future<int> read(SyncStream stream) async {
@@ -30,25 +43,5 @@ class SyncCursorStore {
         .insertOnConflictUpdate(
           SyncCursorsCompanion.insert(stream: stream.name, value: value),
         );
-  }
-
-  /// One-time move of the legacy catalog watermark into stream `catalog`.
-  /// The row is written durably before the pref is removed; an existing row
-  /// wins (a kill between the two steps leaves both). No pref: no row.
-  /// [transaction] runs the row write (default: a plain Drift transaction;
-  /// sync passes its binding fence).
-  Future<void> migrateLegacyCatalogCursor(
-    SharedPreferences prefs, {
-    Future<void> Function(Future<void> Function() body)? transaction,
-  }) async {
-    final legacy = prefs.getInt(legacyCatalogPrefKey);
-    if (legacy == null) return;
-    await (transaction ?? _db.transaction)(() async {
-      final existing = await (_db.select(_db.syncCursors)
-            ..where((c) => c.stream.equals(SyncStream.catalog.name)))
-          .getSingleOrNull();
-      if (existing == null) await write(SyncStream.catalog, legacy);
-    });
-    await prefs.remove(legacyCatalogPrefKey);
   }
 }

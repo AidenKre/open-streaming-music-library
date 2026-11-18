@@ -1,16 +1,15 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/services/uploads/upload_manager.dart';
+import 'package:frontend/services/uploads/upload_manager.dart'
+    show uploadManagerProvider;
 import 'package:frontend/services/uploads/upload_source_picker.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart';
+import 'package:frontend/services/uploads/upload_types.dart'
+    show LeftOutReason, ReselectOutcome, UploadsUnavailable;
 import 'package:frontend/services/uploads/upload_zip_children.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 import 'package:frontend/services/uploads/uploads_overview_provider.dart';
 import 'package:frontend/services/uploads/uploads_visibility.dart';
-
-/// Where a `Review tags` tap leads: [open] the review page. The page keeps
-/// handling [notAvailableYet] for controllers that cannot open it.
-enum ReviewTagsOutcome { open, notAvailableYet }
 
 /// A message for the user after Add files or a reselect.
 @immutable
@@ -68,14 +67,18 @@ abstract interface class UploadsControls implements Listenable {
   /// Retries a failed item (the server re-checks it or takes its bytes again).
   Future<void> retry(String itemUuid);
 
-  ReviewTagsOutcome reviewTags(String itemUuid);
-
   void dismissNotice();
 
   /// Null until [loadChildren] was called for [parentItemUuid].
   ChildListState? childrenOf(String parentItemUuid);
 
-  Future<void> loadChildren(String batchUuid, String parentItemUuid);
+  /// [quiet]: a list already shown stays on screen while it is read again
+  /// and when that read fails.
+  Future<void> loadChildren(
+    String batchUuid,
+    String parentItemUuid, {
+    bool quiet = false,
+  });
 
   void dispose();
 }
@@ -104,7 +107,8 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
   UploadsNotice? _notice;
   bool _adding = false;
   bool _reselecting = false;
-  bool _retrying = false;
+  /// The items whose Retry is in flight (one at a time per item).
+  final _retrying = <String>{};
   bool _disposed = false;
   final _children = <String, ChildListState>{};
   final _childLoads = <String, int>{};
@@ -114,7 +118,7 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
     debugPrint('Uploads action failed: ${error.runtimeType}');
     _notice = error is UploadsUnavailable
         ? const UploadsNotice("Uploads aren't available right now")
-        : const UploadsNotice('Something went wrong. Try again.');
+        : const UploadsNotice(uploadActionFailedText);
   }
 
   @override
@@ -205,8 +209,7 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
 
   @override
   Future<void> retry(String itemUuid) async {
-    if (_retrying) return;
-    _retrying = true;
+    if (!_retrying.add(itemUuid)) return;
     try {
       final outcome = await _ref.read(uploadManagerProvider).retry(itemUuid);
       final message = retryOutcomeText(outcome);
@@ -214,13 +217,10 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
     } catch (e) {
       _fail(e);
     } finally {
-      _retrying = false;
+      _retrying.remove(itemUuid);
       _notify();
     }
   }
-
-  @override
-  ReviewTagsOutcome reviewTags(String itemUuid) => ReviewTagsOutcome.open;
 
   @override
   void dismissNotice() {
@@ -234,11 +234,19 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
       _children[parentItemUuid];
 
   @override
-  Future<void> loadChildren(String batchUuid, String parentItemUuid) async {
+  Future<void> loadChildren(
+    String batchUuid,
+    String parentItemUuid, {
+    bool quiet = false,
+  }) async {
     final generation = (_childLoads[parentItemUuid] ?? 0) + 1;
     _childLoads[parentItemUuid] = generation;
-    _children[parentItemUuid] = const ChildListLoading();
-    _notify();
+    final shown = _children[parentItemUuid];
+    final keep = quiet && shown is ChildListLoaded;
+    if (!keep) {
+      _children[parentItemUuid] = const ChildListLoading();
+      _notify();
+    }
     ChildListState result;
     try {
       result = ChildListLoaded(
@@ -247,7 +255,7 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
             .load(batchUuid, parentItemUuid),
       );
     } catch (_) {
-      result = const ChildListFailed();
+      result = keep ? shown : const ChildListFailed();
     }
     // A newer request for this archive owns the answer.
     if (_disposed || _childLoads[parentItemUuid] != generation) return;

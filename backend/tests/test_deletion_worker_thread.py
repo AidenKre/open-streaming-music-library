@@ -20,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.services import deletion_worker as deletion_worker_mod
-from app.services.deletion_worker import DeletionWorker
+from app.services.deletion_worker import DeletionWorker, RunResult
 from app.services.worker_thread import PollingWorkerThread
 from tests.deletion_world import accept_job, item
 
@@ -48,7 +48,7 @@ def test_the_worker_is_a_polling_worker_on_the_shared_base():
 
 
 def test_process_one_reports_done_idle_and_error(caplog):
-    executor = _Executor([True, False, RuntimeError("/music/owner/secret.flac")])
+    executor = _Executor([RunResult.DONE, RunResult.IDLE, RuntimeError("/music/owner/secret.flac")])
     worker = DeletionWorker(executor, idle_poll_s=60)
 
     assert worker.process_one() == "done"
@@ -71,9 +71,9 @@ def test_a_started_worker_runs_until_idle_and_stops():
         def run_one(self):
             if self.left:
                 self.left -= 1
-                return True
+                return RunResult.DONE
             ran.set()
-            return False
+            return RunResult.IDLE
 
     worker = DeletionWorker(Executor(), idle_poll_s=60)
     worker.start()

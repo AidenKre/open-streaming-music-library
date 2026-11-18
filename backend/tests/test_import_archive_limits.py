@@ -25,9 +25,9 @@ from app.services.ingestion import Ingestor, IngestorContext
 from app.services.pipeline import make_pipeline
 from app.services.storage_ledger import IMPORT_UNPACK
 from tests.archive_builders import tar_info, write_tar
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
-from tests.test_import_startup import WATCH, _drain_imports, _tone, requires_ffmpeg
+from tests.import_startup_fixtures import WATCH, _drain_imports, _tone, requires_ffmpeg
 from tests.upload_zip_fixtures import Entry, LedgerSpy, build_zip, corrupt_member_data, make_ledger, tiny_limits
 
 OPERATOR = "uvicorn.error"
@@ -42,11 +42,6 @@ def _disk_cost(*sizes):
 
 
 A, B = b"A" * 300, b"B" * 200
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

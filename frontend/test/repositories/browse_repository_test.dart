@@ -3,20 +3,20 @@ import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/repositories/browse_repository.dart';
+import '../helpers/library_fixture.dart';
 
 void main() {
   late AppDatabase db;
   late BrowseRepository repo;
-  late _LibraryFixture fixture;
+  late LibraryFixture fixture;
 
   setUp(() {
     db = AppDatabase(NativeDatabase.memory());
     repo = BrowseRepository(db);
-    fixture = _LibraryFixture(db);
+    fixture = LibraryFixture(db);
   });
 
   tearDown(() async {
@@ -618,6 +618,7 @@ void main() {
           downloadedAtRevision: Value(8),
           downloadedCodec: Value('aac'),
           staleDismissedAtRevision: Value(7),
+          damagedFilePath: Value('/dl/p2.m4a'),
         ),
       );
 
@@ -632,6 +633,7 @@ void main() {
       expect(p2.downloadedAtRevision, 8);
       expect(p2.downloadedCodec, 'aac');
       expect(p2.staleDismissedAtRevision, 7);
+      expect(p2.damagedFilePath, '/dl/p2.m4a');
       expect(p2.title, before[1].title, reason: 'metadata untouched');
     });
 
@@ -671,9 +673,11 @@ void main() {
           downloadedAtRevision: Value(8),
           downloadedCodec: Value('aac'),
           staleDismissedAtRevision: Value(7),
+          damagedFilePath: Value('/dl/p1.m4a'),
         ),
       );
       final before = await loadTracks();
+      expect(before.first.damagedFilePath, '/dl/p1.m4a');
       await (db.update(
         db.tracks,
       )..where((t) => t.uuidId.equals('p1'))).write(clearedDownloadColumns);
@@ -685,8 +689,25 @@ void main() {
       expect(p1.downloadedAtRevision, equals(null));
       expect(p1.downloadedCodec, equals(null));
       expect(p1.staleDismissedAtRevision, equals(null));
+      expect(p1.damagedFilePath, equals(null));
       expect(p1.revision, before.first.revision, reason: 'not a download col');
     });
+    // U29-B-11: a damaged download is read from the row, so a list shows the
+    // track as damaged, not as downloaded.
+    test('a damaged download is read from the row', () async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p2'))).write(
+        const TracksCompanion(
+          filePath: Value('/dl/p2.flac'),
+          damagedFilePath: Value('/dl/p2.flac'),
+        ),
+      );
+      final p2 = (await loadTracks())[1];
+      expect(p2.uuidId, 'p2');
+      expect(p2.damagedFilePath, '/dl/p2.flac');
+      expect(p2.isDownloadDamaged, isTrue);
+      expect(p2.isDownloaded, isFalse);
+    });
+
     test('leaves a row whose track vanished unchanged', () async {
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('p3'))).write(
         const TracksCompanion(filePath: Value('/dl/p3.flac')),
@@ -715,104 +736,3 @@ Future<void> _markDownloaded(AppDatabase db, String uuid) =>
     (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid))).write(
       TracksCompanion(filePath: Value('/dl/$uuid.flac')),
     );
-
-class _LibraryFixture {
-  final AppDatabase db;
-  int _nextArtistId = 1;
-  int _nextAlbumId = 1;
-  final Map<String, int> _artistIds = {};
-  final Map<String, int> _albumIds = {};
-
-  _LibraryFixture(this.db);
-
-  Future<void> insertAlbum({
-    required String artist,
-    required String album,
-    required List<String> uuids,
-    String? trackTitlePrefix,
-  }) async {
-    final artistId = await _ensureArtist(artist);
-    final albumId = await _ensureAlbum(artistId, album);
-    for (var i = 0; i < uuids.length; i++) {
-      await _insertTrack(
-        uuid: uuids[i],
-        artist: artist,
-        artistId: artistId,
-        album: album,
-        albumId: albumId,
-        trackNumber: i + 1,
-        title: trackTitlePrefix != null
-            ? '$trackTitlePrefix ${i + 1}'
-            : 'Track ${uuids[i]}',
-      );
-    }
-  }
-
-  Future<int> _ensureArtist(String name) async {
-    final key = name.toLowerCase();
-    final existing = _artistIds[key];
-    if (existing != null) return existing;
-
-    final id = _nextArtistId++;
-    await db
-        .into(db.artists)
-        .insert(ArtistsCompanion(id: Value(id), name: Value(name)));
-    _artistIds[key] = id;
-    return id;
-  }
-
-  Future<int> _ensureAlbum(int artistId, String name) async {
-    final key = '$artistId:${name.toLowerCase()}';
-    final existing = _albumIds[key];
-    if (existing != null) return existing;
-
-    final id = _nextAlbumId++;
-    await db
-        .into(db.albums)
-        .insert(
-          AlbumsCompanion(
-            id: Value(id),
-            name: Value(name),
-            artistId: Value(artistId),
-            year: const Value(2024),
-            isSingleGrouping: const Value(false),
-          ),
-        );
-    _albumIds[key] = id;
-    return id;
-  }
-
-  Future<void> _insertTrack({
-    required String uuid,
-    required String artist,
-    required int artistId,
-    required String album,
-    required int albumId,
-    required int trackNumber,
-    String? title,
-  }) async {
-    final dto = ClientTrackDto.fromJson({
-      'uuid_id': uuid,
-      'created_at': 1700000000 + trackNumber,
-      'last_updated': 1700000100 + trackNumber,
-      'revision': 1700000000 + trackNumber,
-      'metadata': {
-        'title': title ?? 'Track $uuid',
-        'artist': artist,
-        'album': album,
-        'artist_id': artistId,
-        'album_id': albumId,
-        'track_number': trackNumber,
-        'disc_number': 1,
-        'duration': 180.0,
-        'bitrate_kbps': 320.0,
-        'sample_rate_hz': 44100,
-        'channels': 2,
-        'has_album_art': false,
-      },
-    });
-
-    await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
-    await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
-  }
-}

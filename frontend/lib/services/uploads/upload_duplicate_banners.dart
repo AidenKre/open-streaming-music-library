@@ -267,7 +267,7 @@ String _stagedHeadline(String opening, List<DuplicateRow> rows) {
 
 String? _coverage(DuplicateCheck? check) {
   if (check == null) return 'Not checked for duplicates yet';
-  if (!check.isReadable || check.status != 'complete') {
+  if (!check.ranToCompletion) {
     return "The duplicate check couldn't run for this file";
   }
   if (check.matches.isNotEmpty) return null;
@@ -279,7 +279,7 @@ String? _coverage(DuplicateCheck? check) {
 }
 
 List<String> _notes(DuplicateCheck check) {
-  if (!check.isReadable || check.status != 'complete') return const [];
+  if (!check.ranToCompletion) return const [];
   final fp = check.fingerprint.subjectState;
   return [
     if (fp == 'too_short' || fp == 'low_information')

@@ -22,9 +22,9 @@ from app.services.user_delete import (
     run_user_delete,
 )
 from tests.cli_fixtures import add_user, cli_settings, sql
+from tests.crash import Crash
 from tests.user_delete_world import (
     FTS_TABLES,
-    SAM_TOKENS,
     SERVER_WIDE_TABLES,
     USER_ROWS,
     build_world,
@@ -35,10 +35,6 @@ from tests.user_delete_world import (
     table_names,
     user_rows,
 )
-
-
-class Crash(BaseException):
-    """A simulated kill: not an Exception, so nothing may swallow it."""
 
 
 @pytest.fixture

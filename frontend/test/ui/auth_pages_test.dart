@@ -6,11 +6,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/services/session_service.dart';
 import 'package:frontend/ui/create_account_page.dart';
 import 'package:frontend/ui/login_page.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/startup_gate.dart';
 
+import '../helpers/fake_session_service.dart';
 import 'browse_harness.dart' show teardownTree;
 import 'fake_session_controls.dart';
 
@@ -76,6 +78,42 @@ void main() {
     });
   });
 
+  // Pre-merge review A5-03: the real controller over a sign-in that throws
+  // after the server answered: the button comes back and a sentence shows.
+  for (final register in [false, true]) {
+    testWidgets(
+        'a ${register ? 'register' : 'login'} that throws gives the button '
+        'back and shows a sentence', (tester) async {
+      final service = FakeSessionService()
+        ..signInThrows = StateError('database is locked');
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [sessionServiceProvider.overrideWithValue(service)],
+          child: MaterialApp(
+            home: register ? const CreateAccountPage() : const LoginPage(),
+          ),
+        ),
+      );
+      final prefix = register ? 'createAccount' : 'login';
+      final label = register ? 'Create account' : 'Log in';
+      await tester.enterText(find.byKey(Key('$prefix.username')), 'sam');
+      await tester.enterText(find.byKey(Key('$prefix.password')), '12345678');
+      if (register) {
+        await tester.enterText(
+            find.byKey(const Key('createAccount.confirm')), '12345678');
+      }
+      await tester.tap(find.widgetWithText(FilledButton, label));
+      await tester.pump();
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      final button =
+          tester.widget<FilledButton>(find.widgetWithText(FilledButton, label));
+      expect(button.onPressed, isNotNull, reason: 'the button is usable again');
+      expect(find.text('Could not sign in.'), findsOneWidget);
+      await teardownTree(tester);
+    });
+  }
+
   group('Create account', () {
     testWidgets('sends username, password and confirmation to the controller',
         (tester) async {
@@ -100,6 +138,12 @@ void main() {
             of: find.byKey(Key(key)), matching: find.byType(TextField)));
         expect(field.obscureText, isTrue, reason: key);
       }
+      await teardownTree(tester);
+    });
+
+    testWidgets('the password hint names the minimum length', (tester) async {
+      await pump(tester, SessionPhase.createAccount);
+      expect(find.text('At least 8 characters.'), findsOneWidget);
       await teardownTree(tester);
     });
 

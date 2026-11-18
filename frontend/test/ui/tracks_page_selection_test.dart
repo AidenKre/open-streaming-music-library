@@ -1,10 +1,9 @@
-import 'dart:io';
-
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
@@ -14,6 +13,7 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 import 'browse_harness.dart';
 import 'fake_library_actions.dart';
 import 'fake_track_selection_controls.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// SC-17 selection mode on the Tracks browse body (8-U07 selection, 8-U09).
 void main() {
@@ -165,6 +165,33 @@ void main() {
     });
   });
 
+  // Owner decision 5 (2026-11-17), APP-OTHER-1 D5: a row tap whose playback
+  // does not start shows the playback message as a short notice.
+  group('a row tap that does not start playback says so', () {
+    testWidgets('a browse row', (tester) async {
+      actions.playOutcome = Failed(StateError('x'));
+      await pump(tester, selectionMode: false);
+      expect(find.text("Couldn't start playback."), findsNothing);
+      await tester.tap(find.text('Kept Song'));
+      await tester.pumpAndSettle();
+      expect(actions.calls.single, startsWith('playQuery d1'));
+      expect(find.text("Couldn't start playback."), findsOneWidget);
+      await teardownTree(tester);
+    });
+
+    testWidgets('an in-page search result row', (tester) async {
+      actions.playOutcome = const RejectedUnplayableOffline();
+      await pump(tester, selectionMode: false);
+      await search(tester, 'Remote');
+      expect(find.text('Nothing here plays offline.'), findsNothing);
+      await tester.tap(find.text('Remote Song'));
+      await tester.pumpAndSettle();
+      expect(actions.calls.single, 'playFromList s1 @0 search');
+      expect(find.text('Nothing here plays offline.'), findsOneWidget);
+      await teardownTree(tester);
+    });
+  });
+
   group('the selection survives', () {
     testWidgets('growth of the browse window', (tester) async {
       await seedLibrary(db, [
@@ -308,16 +335,49 @@ void main() {
     });
   }
 
-  test('no deletion wording in the selection mode sources', () {
-    // 8B.1a ships no deletion wording; the Manage library page adds it.
-    for (final path in [
-      'lib/ui/tracks_page.dart',
-      'lib/ui/widgets/track_tile.dart',
-      'lib/ui/selection/track_selection_controller.dart',
-      'lib/models/track_selection.dart',
-    ]) {
-      final source = File(path).readAsStringSync().toLowerCase();
-      expect(source, isNot(contains('delet')), reason: path);
+  // Other-issues row 81 (U29-A-13): what the picker shows, not a search of
+  // source files. Manage library adds deletion around this list; the list
+  // itself (rows, selection, search results) offers no deletion control or
+  // wording.
+  testWidgets('selection mode shows no deletion control or wording', (
+    tester,
+  ) async {
+    void expectNoDeletion(String when) {
+      final texts = [
+        for (final t in tester.widgetList<Text>(find.byType(Text)))
+          (t.data ?? t.textSpan?.toPlainText() ?? '').toLowerCase(),
+        for (final t in tester.widgetList<RichText>(find.byType(RichText)))
+          t.text.toPlainText().toLowerCase(),
+      ];
+      expect(texts.where((t) => t.contains('delet')), isEmpty, reason: when);
+      for (final icon in [
+        Icons.delete,
+        Icons.delete_outline,
+        Icons.delete_forever,
+        Icons.delete_sweep,
+      ]) {
+        expect(find.byIcon(icon), findsNothing, reason: '$when: $icon');
+      }
+      expect(
+        find.byWidgetPredicate(
+          (w) =>
+              w is Tooltip &&
+              (w.message ?? '').toLowerCase().contains('delet'),
+        ),
+        findsNothing,
+        reason: when,
+      );
     }
+
+    await pump(tester);
+    expect(find.byType(Checkbox), findsNWidgets(2));
+    expectNoDeletion('rows');
+    await tester.tap(find.text('Remote Song'));
+    await tester.pumpAndSettle();
+    expectNoDeletion('a row selected');
+    await search(tester, 'Song');
+    expect(find.byType(Checkbox), findsWidgets);
+    expectNoDeletion('search results');
+    await teardownTree(tester);
   });
 }

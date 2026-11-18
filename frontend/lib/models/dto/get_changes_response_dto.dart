@@ -1,4 +1,5 @@
 import 'package:frontend/models/dto/change_entry_dto.dart';
+import 'package:frontend/models/dto/json_fields.dart';
 
 class GetChangesResponseDto {
   final List<ChangeEntryDto> changes;
@@ -22,16 +23,18 @@ class GetChangesResponseDto {
     this.servedBy,
   });
 
+  /// Typed reads: a missing or malformed field is a [FormatException].
   factory GetChangesResponseDto.fromJson(
     Map<String, dynamic> json, {
     String? servedBy,
   }) {
     return GetChangesResponseDto(
-      changes: (json['changes'] as List<dynamic>)
-          .map((e) => ChangeEntryDto.fromJson(e as Map<String, dynamic>))
-          .toList(),
-      nextCursor: (json['nextCursor'] as num?)?.toInt(),
-      latestRevision: (json['latestRevision'] as num).toInt(),
+      changes: [
+        for (final e in jsonList(json, 'changes'))
+          ChangeEntryDto.fromJson(jsonObject(e, 'change')),
+      ],
+      nextCursor: jsonWholeIntOrNull(json, 'nextCursor'),
+      latestRevision: jsonWholeInt(json, 'latestRevision'),
       servedBy: servedBy,
     );
   }

@@ -2,8 +2,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/history_intent.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/playback/playback_requests.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/collection_ordering.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
@@ -16,10 +16,11 @@ import 'package:frontend/services/settings_service.dart';
 /// Stateless and navigation-free (navigation is the view's, via
 /// `library_routes.dart`; busy state belongs to the page controller that
 /// shows it). Each method resolves membership through the model
-/// (`BrowseRepository.getTracksForScope`, passing only the observed offline
-/// state) and submits typed requests to `PlaybackRequests.submit`, whose
-/// outcome it returns. Play and Shuffle replace the queue with an album or
-/// artist; Play Next and Add to Queue enqueue any scope.
+/// (`BrowseRepository.getTracksForScope`, passing only whether streams are
+/// unavailable now: offline, or the server check failed) and submits typed
+/// requests to `PlaybackRequests.submit`, whose outcome it returns. Play and
+/// Shuffle replace the queue with an album or artist; Play Next and Add to
+/// Queue enqueue any scope.
 abstract interface class LibraryActionControls {
   Future<PlaybackOutcome> playNext(LibraryScope scope);
 
@@ -68,9 +69,12 @@ class LibraryActions implements LibraryActionControls {
 
   final Ref _ref;
 
+  // Offline, or the server check failed (sign-off OPEN-M-11): the one rule
+  // every play path reads, so only members that can play now are queued.
   Future<List<TrackUI>> _members(LibraryScope scope) => _ref
       .read(browseRepositoryProvider)
-      .getTracksForScope(scope, offline: _ref.read(offlineModeProvider));
+      .getTracksForScope(scope,
+          offline: _ref.read(streamsUnavailableProvider)());
 
   // Download and Delete act on the whole collection, offline or not: Delete
   // must reach damaged files and fence queued downloads of every member, and
@@ -231,11 +235,23 @@ String downloadFailedMessage(LibraryScope scope) => scope is TrackScope
     ? "Couldn't queue the download."
     : "Couldn't queue the downloads.";
 
-/// Shown when a damaged download's re-download did not go through.
+/// Shown when no re-download could be queued: a damaged or out-of-date
+/// download's re-download, or the library menu's damaged re-download.
 const redownloadFailedMessage = "Couldn't queue re-download.";
 
+/// The message after a damaged or out-of-date re-download: null when every
+/// track was queued, [redownloadFailedMessage] when none was, else how many
+/// of them could not be.
+String? redownloadResultMessage(({int failed, int total}) r) =>
+    r.failed == 0
+        ? null
+        : r.failed == r.total
+            ? redownloadFailedMessage
+            : "Couldn't queue re-download for ${r.failed} of ${r.total} "
+                'tracks.';
+
 /// Shown when a library menu's Delete download(s) did not finish
-/// (U30-A-01). New wording, awaiting the owner.
+/// (U30-A-01).
 String deleteDownloadsFailedMessage(LibraryScope scope) => scope is TrackScope
     ? "Couldn't delete the download."
     : "Couldn't delete the downloads.";

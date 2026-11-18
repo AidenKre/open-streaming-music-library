@@ -1,6 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
-import 'package:frontend/models/dto/get_tracks_response_dto.dart';
 import 'package:frontend/models/dto/track_metadata_dto.dart';
 
 Map<String, dynamic> _fullMetadataJson() => {
@@ -158,44 +157,6 @@ void main() {
       expect(dto.metadata.title, isNull);
       expect(dto.metadata.artist, isNull);
       expect(dto.metadata.duration, 100.0);
-    });
-  });
-
-  group('GetTracksResponseDto.fromJson', () {
-    test('parses a list of tracks and nextCursor', () {
-      final json = {
-        'data': [
-          _trackJson('uuid-1', _fullMetadataJson()),
-          _trackJson('uuid-2', _minimalMetadataJson()),
-        ],
-        'nextCursor': 'some-cursor',
-      };
-
-      final response = GetTracksResponseDto.fromJson(json);
-
-      expect(response.data.length, 2);
-      expect(response.data[0].uuidId, 'uuid-1');
-      expect(response.data[1].uuidId, 'uuid-2');
-      expect(response.nextCursor, 'some-cursor');
-    });
-
-    test('nextCursor is null when absent', () {
-      final json = {
-        'data': [_trackJson('uuid-1', _minimalMetadataJson())],
-        'nextCursor': null,
-      };
-
-      final response = GetTracksResponseDto.fromJson(json);
-
-      expect(response.nextCursor, isNull);
-    });
-
-    test('empty data list is handled', () {
-      final json = {'data': <dynamic>[], 'nextCursor': null};
-
-      final response = GetTracksResponseDto.fromJson(json);
-
-      expect(response.data, isEmpty);
     });
   });
 }

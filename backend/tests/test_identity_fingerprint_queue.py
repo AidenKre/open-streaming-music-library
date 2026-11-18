@@ -17,14 +17,9 @@ settled (current or unsupported) they are the fingerprint layer's. So:
 import pytest
 
 from app.database import ANY_OWNER
-from tests.identity_worker_fixtures import add_journal, add_track, make_db, sql
+from tests.identity_worker_fixtures import add_journal, add_track, sql
 
 NOW = 1_800_000_000
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def _next(db, now=NOW, *, fingerprint=True, skip=None):

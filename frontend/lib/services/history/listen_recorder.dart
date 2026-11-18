@@ -272,7 +272,7 @@ class ListenRecorder {
     if (listen == null) return;
     final play = HistoryEventPayload(
       eventUuid: listen.uuid,
-      kind: 'play',
+      kind: HistoryKind.play,
       entityType: 'track',
       entityRef: occurrence.trackUuid,
       occurredAt: occurrence.startedAtUtcMs,
@@ -342,7 +342,7 @@ class ListenRecorder {
           (draft.accumulatedMicros > 0
               ? HistoryEventPayload(
                   eventUuid: draft.listenUuid,
-                  kind: 'play',
+                  kind: HistoryKind.play,
                   entityType: 'track',
                   entityRef: draft.trackUuid,
                   occurredAt: draft.startedAt,

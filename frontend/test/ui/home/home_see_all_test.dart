@@ -14,7 +14,7 @@ import 'package:frontend/ui/home/home_page.dart';
 
 import '../browse_harness.dart';
 import '../fake_see_all_recents_controls.dart';
-import 'home_recents_section_test.dart' show FakeHomeControls;
+import '../../helpers/fake_home_controls.dart' show FakeHomeControls;
 
 TrackUI _track(String uuid) => TrackUI(
   uuidId: uuid,

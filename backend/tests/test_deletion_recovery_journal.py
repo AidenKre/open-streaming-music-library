@@ -49,6 +49,7 @@ from tests.deletion_world import (
     sql,
     tombstone,
 )
+from tests.track_paths import set_track_path
 
 
 @pytest.fixture
@@ -152,7 +153,7 @@ def test_a_journal_whose_track_has_another_revision_is_kept(world):
 def test_a_journal_whose_track_points_at_another_path_is_kept(world):
     uuid_id, rev, op = crashed_after_journal(world)
     other = world.root(world.owner) / "Elsewhere" / "x.flac"
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(other), uuid_id))
+    set_track_path(world.db, uuid_id, other)
     before, kept = disk(world), journal(world, uuid_id)
 
     recover(world)

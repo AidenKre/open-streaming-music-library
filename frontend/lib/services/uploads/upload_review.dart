@@ -5,6 +5,7 @@ import 'dart:convert';
 
 import 'package:drift/drift.dart' show Value;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/api/uploads_api.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/editable_fields.dart';
@@ -15,8 +16,12 @@ import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/uploads/upload_duplicate_decisions.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
-import 'package:frontend/services/uploads/upload_manager.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
+import 'package:frontend/services/uploads/upload_manager.dart'
+    show UploadManager, uploadIntentStoreProvider, uploadManagerProvider;
 import 'package:frontend/services/uploads/upload_review_transport.dart';
+import 'package:frontend/services/uploads/upload_types.dart'
+    show RetryOutcome, UploadsUnavailable;
 
 /// `{"v":1,"edits":{key: value}}`; a null value is an explicit clear.
 String encodeDraft(MetadataEdit edit) =>
@@ -84,12 +89,19 @@ class UploadReview {
     final result = <UploadItem>[];
     String? cursor;
     do {
-      final page = await _api.listItems(batchUuid, after: cursor);
+      // The review page's read: like the person's own action, it waits for
+      // a server check only within the gate's bound, and fails at once on a
+      // different server, signed out, or offline with the server still
+      // verified (row 72); never without a limit.
+      final page = await _api.listItems(
+        batchUuid,
+        after: cursor,
+        wait: BindingWait.forPendingVerdict,
+      );
       await _intents.adoptListedChildren(token, page.items);
       await _intents.mirrorReviewStates(token, page.items);
       for (final item in page.items) {
-        if (item.rawState == 'review_ready' ||
-            item.rawState == 'duplicate_conflict' ||
+        if (reviewableStates.contains(item.rawState) ||
             keep.contains(item.itemUuid)) {
           result.add(item);
         }

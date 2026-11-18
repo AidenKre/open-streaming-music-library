@@ -28,7 +28,10 @@ from app.services.ffmpeg_runner import (
     CaptureTimeout,
     FfmpegError,
     FfmpegProcessRegistry,
+    ToolOptions,
+    run_capture,
 )
+from tests.tool_call_capture import bound_to, tool_call
 
 DIGEST = "ab" * 32
 
@@ -58,7 +61,7 @@ class FakeRunner:
         self.calls: list[tuple[list[str], dict]] = []
 
     def __call__(self, cmd, **kwargs):
-        self.calls.append((list(cmd), kwargs))
+        self.calls.append((list(cmd), tool_call(run_capture, cmd, **kwargs)))
         if cmd[0] == "ffprobe":
             if self.probe_error is not None:
                 raise self.probe_error
@@ -142,7 +145,7 @@ def test_unknown_codecs_are_unsupported_without_running_anything(runner, audio_f
 def test_process_options_are_forwarded_to_every_call(runner, audio_file):
     fake = runner()
     registry = FfmpegProcessRegistry()
-    compute_exact(audio_file, "flac", registry=registry, job_id="identity", low_priority=True)
+    compute_exact(audio_file, "flac", options=ToolOptions(registry=registry, job_id="identity", low_priority=True))
     assert len(fake.calls) >= 1
     for _cmd, kwargs in fake.calls:
         assert kwargs["registry"] is registry
@@ -348,7 +351,8 @@ SC25_IDENTITY_TABLE_COLUMNS = {
 class TestComputeIdentity:
     def test_wraps_the_exact_layer_with_tool_versions_and_time(self, runner, audio_file, monkeypatch):
         fake = runner()
-        monkeypatch.setattr(audio_identity, "tool_versions", lambda **kwargs: "ffmpeg 9.0.2")
+        monkeypatch.setattr(audio_identity, "tool_versions",
+                            bound_to(audio_identity.tool_versions)(lambda **kwargs: "ffmpeg 9.0.2"))
         monkeypatch.setattr(audio_identity.time, "time", lambda: 1_700_000_000.7)
         identity = compute_identity(audio_file, "flac")
         assert isinstance(identity, AudioIdentity)
@@ -359,9 +363,10 @@ class TestComputeIdentity:
 
     def test_forwards_process_options(self, runner, audio_file, monkeypatch):
         fake = runner()
-        monkeypatch.setattr(audio_identity, "tool_versions", lambda **kwargs: None)
+        monkeypatch.setattr(audio_identity, "tool_versions",
+                            bound_to(audio_identity.tool_versions)(lambda **kwargs: None))
         registry = FfmpegProcessRegistry()
-        compute_identity(audio_file, "mp3", registry=registry, job_id="w", low_priority=True)
+        compute_identity(audio_file, "mp3", options=ToolOptions(registry=registry, job_id="w", low_priority=True))
         assert fake.calls and all(
             kw["registry"] is registry and kw["job_id"] == "w" and kw["low_priority"] is True
             for _cmd, kw in fake.calls
@@ -369,7 +374,8 @@ class TestComputeIdentity:
 
     def test_a_failure_is_still_an_identity_value(self, runner, audio_file, monkeypatch):
         runner(hash_error=FfmpegError("ffmpeg not found"))
-        monkeypatch.setattr(audio_identity, "tool_versions", lambda **kwargs: None)
+        monkeypatch.setattr(audio_identity, "tool_versions",
+                            bound_to(audio_identity.tool_versions)(lambda **kwargs: None))
         identity = compute_identity(audio_file, "flac")
         assert identity.exact == ExactUnavailable(state="failed", reason="tool_missing")
         assert identity.tool_versions is None
@@ -384,6 +390,7 @@ class TestToolVersions:
         calls = []
 
         def fake(cmd, **kwargs):
+            tool_call(run_capture, cmd, **kwargs)
             calls.append(cmd)
             return CaptureResult(0, b"ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers\nbuilt with clang\n", "")
 
@@ -397,6 +404,7 @@ class TestToolVersions:
         answers = [FfmpegError("ffmpeg not found"), CaptureResult(1, b"", "x"), CaptureResult(0, b"garbage", "")]
 
         def fake(cmd, **kwargs):
+            tool_call(run_capture, cmd, **kwargs)
             answer = answers.pop(0)
             if isinstance(answer, BaseException):
                 raise answer
@@ -492,6 +500,45 @@ def test_6_5a2d_a_tool_that_cannot_run_is_tool_missing_not_a_decode_error(runner
     # about the file: the worker must not burn the file's attempts on it.
     failed = CaptureResult(returncode, b"", "nice: ffmpeg: Permission denied")
     runner(**({"probe": failed} if stage == "probe" else {"hash_result": failed}))
-    assert compute_exact(audio_file, "flac", low_priority=True) == ExactUnavailable(
+    assert compute_exact(audio_file, "flac", options=ToolOptions(low_priority=True)) == ExactUnavailable(
         state="failed", reason="tool_missing"
     )
+
+
+# --- pre-merge review A3-03: no audio packets is no identity ------------------------
+
+EMPTY_INPUT_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"  # SHA-256 of b""
+
+
+@pytest.mark.parametrize("codec_hint", ["flac", "aac"])
+def test_audio_with_no_packets_is_failed_not_the_digest_of_nothing(runner, audio_file, codec_hint):
+    # Every such file would otherwise "exactly match" every other one.
+    runner(hash_result=CaptureResult(0, f"SHA256={EMPTY_INPUT_DIGEST}\n".encode(), ""))
+    assert compute_exact(audio_file, codec_hint) == ExactUnavailable(state="failed", reason="decode_error")
+
+
+def _flac_header_only(source: Path, target: Path) -> None:
+    """``source`` cut right after its metadata blocks: a FLAC with an audio
+    stream (STREAMINFO) and not one frame."""
+    data = source.read_bytes()
+    assert data[:4] == b"fLaC"
+    pos, last = 4, False
+    while not last:
+        last = bool(data[pos] & 0x80)
+        pos += 4 + int.from_bytes(data[pos + 1:pos + 4], "big")
+    target.write_bytes(data[:pos])
+
+
+@pytest.mark.requires_ffmpeg
+def test_a_real_flac_without_frames_has_no_exact_identity(tmp_path):
+    from tests.conversion_fixtures import _make_audio
+
+    first, second = tmp_path / "first.flac", tmp_path / "second.flac"
+    _make_audio(first, codec="flac")
+    _make_audio(second, codec="flac", title="another")
+    empty_one, empty_two = tmp_path / "one.flac", tmp_path / "two.flac"
+    _flac_header_only(first, empty_one)
+    _flac_header_only(second, empty_two)
+
+    assert compute_exact(empty_one, "flac") == ExactUnavailable(state="failed", reason="decode_error")
+    assert compute_exact(empty_two, "flac") == ExactUnavailable(state="failed", reason="decode_error")

@@ -1,8 +1,7 @@
-import 'dart:async';
-
 import 'package:drift/drift.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/history_event.dart';
 import 'package:frontend/models/listening_stats.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
@@ -10,6 +9,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
+import 'package:frontend/repositories/table_watch.dart';
 
 /// Phase 9 listening statistics (spec §2, §3): every aggregate of one range
 /// read from local history in SQL, bounded by an insertion boundary.
@@ -42,17 +42,24 @@ class ListeningStatsRepository {
     () => _load(range, boundaryLocalId, capturedNowUtcMs),
   );
 
-  /// Counted listens within the boundary still waiting to upload, whatever
-  /// their date.
-  Future<int> pendingListens(int boundaryLocalId) async {
+  /// Counted listens within the boundary still waiting to upload that
+  /// started in [range]'s counted window at [capturedNowUtcMs]: the ones the
+  /// range's totals include (never a future-dated one).
+  Future<int> pendingListens(
+    StatsRange range,
+    int boundaryLocalId,
+    int capturedNowUtcMs,
+  ) async {
     final row = await _db
         .customSelect(
           'SELECT COUNT(*) AS n FROM history_events '
-          'WHERE $_baseFilter AND pending_upload = 1',
-          variables: [
-            Variable.withInt(boundaryLocalId),
-            Variable.withReal(double.maxFinite),
-          ],
+          'WHERE $_baseFilter AND pending_upload = 1 AND $_inRange',
+          // ?1..?4 of the shared fragments (?5 is not referenced here).
+          variables: _vars(
+            range,
+            boundaryLocalId,
+            capturedNowUtcMs,
+          ).sublist(0, 4),
           readsFrom: {_db.historyEvents},
         )
         .getSingle();
@@ -269,7 +276,7 @@ class ListeningStatsRepository {
     return _db
         .customSelect(
           'SELECT $keyExpr AS k, '
-          'SUM(CAST(ROUND(seconds_played * 1000000) AS INTEGER)) AS micros, '
+          '$_listeningMicros AS micros, '
           'COUNT(CASE WHEN $_qualified THEN 1 END) AS q '
           'FROM history_events '
           'WHERE $_baseFilter AND $_inRange AND k IS NOT NULL '
@@ -299,76 +306,39 @@ class ListeningStatsRepository {
 
   /// The shown [trackUuids], [artistIds] and [albumIds] as they resolve now
   /// through the SC-12 resolvers: emitted on listen and again whenever the
-  /// catalog tables change. Ids that no longer resolve are absent.
+  /// catalog tables change, one read at a time ([watchTables]). Ids that no
+  /// longer resolve are absent.
   Stream<CurrentStatsEntities> watchCurrent({
     List<String> trackUuids = const [],
     List<int> artistIds = const [],
     List<int> albumIds = const [],
   }) {
-    late final StreamController<CurrentStatsEntities> out;
-    StreamSubscription<Set<TableUpdate>>? sub;
-    var closed = false;
-    var dirty = false;
-    var reading = false;
-
-    // One read at a time, in order; changes arriving during a read coalesce
-    // into one further read.
-    Future<void> pump() async {
-      if (reading) return;
-      reading = true;
-      try {
-        while (dirty && !closed) {
-          dirty = false;
-          final current = await _db.transaction(() async {
-            final tracks = trackUuids.isEmpty
-                ? const <TrackUI>[]
-                : await _browse.getTracksByUuids(trackUuids);
-            final artists = artistIds.isEmpty
-                ? const <ArtistUI>[]
-                : await _browse.getArtistsByIds(
-                    artistIds,
-                    downloadedArtOnly: _downloadedArtOnly(),
-                  );
-            final albums = albumIds.isEmpty
-                ? const <AlbumUI>[]
-                : await _browse.getAlbumsByIds(
-                    albumIds,
-                    downloadedArtOnly: _downloadedArtOnly(),
-                  );
-            return CurrentStatsEntities(
-              tracks: {for (final t in tracks) t.uuidId: t},
-              artists: {for (final a in artists) a.id: a},
-              albums: {for (final a in albums) a.id: a},
-            );
-          });
-          if (!closed) out.add(current);
-        }
-      } catch (e, st) {
-        if (!closed) out.addError(e, st);
-      } finally {
-        reading = false;
-      }
-    }
-
-    out = StreamController<CurrentStatsEntities>(
-      onListen: () {
-        // Subscribed before the first read, so a change during it re-reads.
-        sub = _db
-            .tableUpdates(TableUpdateQuery.onAllTables(
-                [_db.trackmetadata, _db.tracks, _db.albums, _db.artists]))
-            .listen((_) {
-          dirty = true;
-          unawaited(pump());
-        });
-        dirty = true;
-        unawaited(pump());
-      },
-      onCancel: () async {
-        closed = true;
-        await sub?.cancel();
+    return watchTables(
+      _db,
+      [_db.trackmetadata, _db.tracks, _db.albums, _db.artists],
+      () async {
+        final tracks = trackUuids.isEmpty
+            ? const <TrackUI>[]
+            : await _browse.getTracksByUuids(trackUuids);
+        final artists = artistIds.isEmpty
+            ? const <ArtistUI>[]
+            : await _browse.getArtistsByIds(
+                artistIds,
+                downloadedArtOnly: _downloadedArtOnly(),
+              );
+        final albums = albumIds.isEmpty
+            ? const <AlbumUI>[]
+            : await _browse.getAlbumsByIds(
+                albumIds,
+                downloadedArtOnly: _downloadedArtOnly(),
+              );
+        return CurrentStatsEntities(
+          tracks: {for (final t in tracks) t.uuidId: t},
+          artists: {for (final a in artists) a.id: a},
+          albums: {for (final a in albums) a.id: a},
+        );
       },
     );
-    return out.stream;
   }
 
   /// One keyset page of the track ranking inside [range]'s window, hydrated
@@ -524,8 +494,8 @@ String _monthKey(int utcMs) {
 
 /// Play events of tracks within the insertion boundary, whatever their
 /// seconds.
-const _playRows =
-    "kind = 'play' AND entity_type = 'track' AND local_id <= ?1";
+const _playRows = "kind = '${HistoryKind.play}' AND entity_type = 'track' "
+    'AND local_id <= ?1';
 
 /// Finalized positive play events of tracks within the insertion boundary,
 /// whose seconds are above zero and at most [maxListenSeconds]. The `?2`
@@ -534,6 +504,11 @@ const _playRows =
 const _baseFilter =
     '$_playRows AND seconds_played > 0 '
     'AND seconds_played <= $maxListenSeconds AND seconds_played <= ?2';
+
+/// Listening time summed as integer microseconds, so equal recorded time
+/// ties exactly whatever the split (the 9A.1a ranking rule).
+const _listeningMicros =
+    'SUM(CAST(ROUND(seconds_played * 1000000) AS INTEGER))';
 
 /// The event started inside the range's counted window.
 const _inRange = '(occurred_at >= ?4 AND occurred_at < ?3)';
@@ -571,6 +546,10 @@ const playRowFilterSql = _baseFilter;
 
 /// [_qualified]: seconds reach min(30, length / 2), else 30.
 const qualifiedPlaySql = _qualified;
+
+/// [_listeningMicros]: listening time summed as integer microseconds, the
+/// first ranking key of statistics and Home suggestions alike.
+const listeningMicrosSql = _listeningMicros;
 
 /// [_resolvable]: the event's track still has `tracks` and `trackmetadata`.
 const resolvableTrackSql = _resolvable;

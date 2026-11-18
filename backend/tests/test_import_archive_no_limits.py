@@ -32,10 +32,10 @@ from app.services.storage_ledger import IMPORT_UNPACK, StorageLedger
 from app.services.upload_validation import ValidationFailed
 from app.services.upload_zip import ArchivePlan, Member, inspect_archive
 from tests.archive_builders import write_rar, write_tar
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_zip_fixtures import Entry, build_zip, patch_eocd_count, tiny_limits
-from tests.test_import_startup import WATCH, _drain_imports
+from tests.import_startup_fixtures import WATCH, _drain_imports
 
 OPERATOR = "uvicorn.error"
 MiB, GiB = 1024**2, 1024**3
@@ -67,11 +67,6 @@ def _sparse_tar(path, name, declared):
         f.write(header)
         f.truncate(len(header) + -(-declared // 512) * 512 + 1024)  # data, then the end marker
     return path
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

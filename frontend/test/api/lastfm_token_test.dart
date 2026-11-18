@@ -6,7 +6,6 @@
 // The user-action wait is the one bound (ServerBindingGate.tokenWaitBound).
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -104,14 +103,6 @@ void main() {
   tearDown(() async {
     gate.dispose();
     await db.close();
-  });
-
-  // One constant (equal const Durations are identical, so the source is
-  // what tells the one bound from a second copy of its value).
-  test('one wait bound for user actions: the gate\'s', () {
-    expect(File('lib/api/gated_send.dart').readAsStringSync(),
-        contains('userActionVerdictWait = ServerBindingGate.tokenWaitBound;'));
-    expect(userActionVerdictWait, ServerBindingGate.tokenWaitBound);
   });
 
   test('status, verified but offline: not verified now (not yet), nothing '

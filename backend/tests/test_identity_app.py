@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from app.services.ffmpeg_runner import CaptureTimeout, FfmpegError
 from app.services.identity_wakeup import IdentityWakeup
-from tests.test_import_startup import WATCH, _drain_imports, _tone
+from tests.import_startup_fixtures import WATCH, _drain_imports, _tone
 
 pytestmark = pytest.mark.usefixtures("fast_stability_poll")
 
@@ -66,7 +66,7 @@ def test_an_archive_that_cannot_be_hashed_is_imported_and_set_aside(configure_ap
     only track imported)."""
     archive = _zip_of_tone(tmp_path / "import" / "album.zip", "Lucky", tmp_path)
 
-    with patch("app.services.audio_identity.run_capture", side_effect=failure):
+    with patch("app.services.audio_identity.run_capture", autospec=True, side_effect=failure):
         with TestClient(configure_app(env=WATCH).app) as c:
             _drain_imports(c)
             rows = _identity_rows(c.app.state.database)

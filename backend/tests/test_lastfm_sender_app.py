@@ -3,59 +3,14 @@ sender only while Last.fm is ``running``, on the holder's own gate and client
 (never a second of either); shutdown stops it before the client closes, and
 the instance lock is kept while it is still alive."""
 
-from concurrent.futures import Future
-
 import pytest
 from fastapi.testclient import TestClient
 
 from app.services import lastfm_sender
 from tests.lastfm_routes import clean_env
 from tests.lastfm_secrets import valid_env
-from tests.test_identity_worker_app import _lock_is_held
-
-
-class FakeSender:
-    instances: list["FakeSender"] = []
-
-    def __init__(self, database, state, *, client, gate, notices, settle_delay_s, **kwargs):
-        self.database, self.state, self.client, self.gate = database, state, client, gate
-        self.settle_delay_s = settle_delay_s
-        self.events: list[str] = []
-        self.done: Future = Future()
-        self.alive = False
-        self.join_ends_thread = True
-        # 9-R1-11: the sender is handed the accounts' Now Playing notices and listens to them.
-        self.notices = notices
-        notices.attach(self.wake)
-        FakeSender.instances.append(self)
-
-    def start(self):
-        self.events.append("start")
-        self.alive = True
-
-    def request_stop(self):
-        self.events.append("request_stop")
-
-    def wake(self):
-        self.events.append("wake")
-
-    def join(self, timeout=None):
-        self.events.append("join while the client is " + ("closed" if self.client._client.is_closed else "open"))
-        if self.join_ends_thread:
-            self.finish()
-        return not self.alive
-
-    def finish(self):
-        self.alive = False
-        if not self.done.done():
-            self.done.set_result(None)
-
-    def stop(self, timeout=None):
-        self.request_stop()
-        return self.join(timeout)
-
-    def is_alive(self):
-        return self.alive
+from tests.lastfm_sender_rig import FakeSender, SENDER_ON
+from tests.worker_app_fixtures import _lock_is_held
 
 
 @pytest.fixture
@@ -64,9 +19,6 @@ def fake_sender(monkeypatch):
     FakeSender.instances = []
     monkeypatch.setattr(lastfm_sender, "ScrobbleSender", FakeSender)
     return FakeSender
-
-
-SENDER_ON = {"ENABLE_LASTFM_SENDER": "true"}
 
 
 def test_a_running_server_starts_one_sender_on_the_holders_gate_and_client(configure_app, fake_sender):
@@ -130,7 +82,7 @@ def test_the_instance_lock_is_kept_while_the_sender_is_still_alive(configure_app
     assert not _lock_is_held(tmp_path / "data")
 
 
-# --- audit points DR-f17e5c12-B-03 and SP-ST-BE-09 ------------------------------------------
+# --- failures and stragglers around the instance lock and the Last.fm client -----------------
 
 
 def test_a_raising_shutdown_step_still_removes_the_history_hook(configure_app, fake_sender, tmp_path):

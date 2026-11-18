@@ -117,8 +117,17 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 
   @override
   Future<AppSettings> build() async {
-    final prefs = await ref.read(sharedPreferencesProvider.future);
-    final local = _read(prefs);
+    final SharedPreferences prefs;
+    final AppSettings local;
+    try {
+      prefs = await ref.read(sharedPreferencesProvider.future);
+      local = _read(prefs);
+    } catch (e) {
+      // The screen shows a fixed sentence (other-issues row 66).
+      developer.log('settings not loaded: ${e.runtimeType}',
+          name: 'SettingsNotifier');
+      rethrow;
+    }
 
     // Publish local prefs immediately so consumers (download default,
     // restored playback quality, settings UI) don't sit on the `original`
@@ -234,9 +243,9 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 
   /// Sends [quality] to the backend so the server warms all tracks at the new
   /// default. On success, persists to SharedPreferences and updates state.
-  /// On PUT failure, updates in-memory state (so the UI reflects the user's
-  /// choice for the session) but does NOT persist — the next online startup
-  /// will resync from the backend, keeping cross-device state consistent.
+  /// On PUT failure, leaves state and prefs unchanged (the old default stays
+  /// the default) and rethrows: a refused default is not shown as the
+  /// default (owner, 2026-11-17, amending D29).
   Future<void> setStreamQualityFull(String quality) async {
     if (!isValidQuality(quality)) {
       throw ArgumentError('invalid stream quality: $quality');
@@ -244,25 +253,29 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 
     // PUT first; only persist on success. A failed PUT must not leave prefs
     // ahead of the backend — that breaks cross-device sync.
-    var backendOk = false;
+    // A reset or a log-out during the PUT must win over its late answer
+    // (pre-merge review A5-04, as the reconcile does).
+    final generation = ref.read(localResetServiceProvider).generation;
     try {
       await ref.read(apiClientProvider).putJson(
         ['settings', 'quality'],
         body: {'quality': quality},
         retry: true,
       );
-      backendOk = true;
     } catch (e) {
       developer.log(
         'Failed to update backend quality: $e',
         name: 'SettingsNotifier',
       );
+      rethrow;
     }
 
-    if (backendOk) {
-      final prefs = await ref.read(sharedPreferencesProvider.future);
-      await prefs.setString(_streamQualityKey, quality);
+    if (!ref.mounted ||
+        ref.read(localResetServiceProvider).generation != generation) {
+      return;
     }
+    final prefs = await ref.read(sharedPreferencesProvider.future);
+    await prefs.setString(_streamQualityKey, quality);
 
     state = AsyncData(
       _current.copyWith(
@@ -307,10 +320,12 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
 final settingsProvider =
     AsyncNotifierProvider<SettingsNotifier, AppSettings>(SettingsNotifier.new);
 
-/// Whether the server-side quality settings (stream/download quality) can be
-/// changed now. They round-trip through the backend, which pre-transcodes;
-/// offline the PUT would retry and fail. The rule lives here (D29); the
-/// Settings rows only show it.
+/// Whether a stream-quality default can be set now: the only quality setting
+/// whose change calls the server (its PUT pre-transcodes); offline the PUT
+/// would retry and fail. Download quality is saved on this device only, and
+/// the session-only stream quality is kept in memory only, so both stay
+/// usable offline. The rule lives here (D29, amended 2026-11-17); the stream
+/// choice sheet only shows it.
 final canChangeServerQualityProvider = Provider<bool>(
   (ref) => !ref.watch(offlineModeProvider),
 );

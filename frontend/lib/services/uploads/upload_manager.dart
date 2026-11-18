@@ -24,57 +24,24 @@ import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/clock.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
+import 'package:frontend/services/operations/gate_wait.dart';
+import 'package:frontend/services/operations/submission_failure_rules.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/uploads/upload_import_sync.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_other_device.dart';
-import 'package:frontend/services/uploads/upload_review.dart' show decodeDraft;
 import 'package:frontend/services/uploads/upload_review_transport.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
-import 'package:frontend/services/uploads/uploads_network_feature.dart';
+import 'package:frontend/services/uploads/upload_types.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
-import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/uploads/uploads_visibility.dart';
 import 'package:uuid/uuid.dart';
 
-/// Uploads can't be added: the server doesn't advertise them, or the
-/// session's binding is gone.
-class UploadsUnavailable implements Exception {
-  const UploadsUnavailable();
-}
-
-/// Why a selected file was left out of the upload.
-enum LeftOutReason { empty, tooLarge, unreadable, changedWhileReading }
-
-class LeftOutFile {
-  const LeftOutFile(this.displayName, this.reason);
-  final String displayName;
-  final LeftOutReason reason;
-}
-
-/// What [UploadManager.reselect] did.
-enum ReselectOutcome { accepted, differentFile, unreadable, notNeeded }
-
-class AddFilesResult {
-  const AddFilesResult({required this.batchUuids, required this.leftOut});
-  final List<String> batchUuids;
-  final List<LeftOutFile> leftOut;
-}
-
-/// What [UploadManager.retry] came to.
-enum RetryOutcome {
-  /// The server took the retry; the item moved on.
-  accepted,
-
-  /// The item is not in a state the server retries; its real state is stored.
-  notRetryable,
-
-  /// The item changed since it was read (review version); its real state is
-  /// stored.
-  changed,
-}
+export 'package:frontend/services/uploads/upload_loss_reporter.dart';
+export 'package:frontend/services/uploads/upload_types.dart';
 
 class UploadManager {
   UploadManager({
@@ -108,7 +75,7 @@ class UploadManager {
        _refreshCapabilities = refreshCapabilities,
        _newUuid = newUuid ?? (() => const Uuid().v4()),
        _timer = timer,
-       _review = review ?? const UnavailableUploadReviewTransport(),
+       _review = review ?? HttpUploadReviewTransport(api),
        _transferBackoff = transferBackoff ?? BackoffSchedule() {
     _runner = SingleFlightRunner(
       name: 'uploads',
@@ -356,9 +323,9 @@ class UploadManager {
     final intent = (await _intents.forBinding(
       token,
     )).where((i) => i.itemUuid == itemUuid).firstOrNull;
-    if (intent == null || _ServerItemState.settled.contains(intent.lastState)) return;
+    if (intent == null || endedStates.contains(intent.lastState)) return;
     if (intent.lastState == UploadIntentState.rejected) {
-      await _setItems(token, [intent], _ServerItemState.cancelled, null);
+      await _setItems(token, [intent], ServerItemState.cancelled, null);
       return;
     }
     _cancelRequested.add(itemUuid);
@@ -444,7 +411,7 @@ class UploadManager {
   /// error, including a changed server, is rethrown with nothing written.
   Future<RetryOutcome> retry(String itemUuid) async {
     if (isClosed || _isOffline()) throw const UploadsUnavailable();
-    if (uploadsFeatureForNetwork(await _feature()) == null) {
+    if (featureForNetwork(await _feature()) == null) {
       throw const UploadsUnavailable();
     }
     final token = (await _binding.current())?.localBindingId;
@@ -537,7 +504,7 @@ class UploadManager {
       [itemUuid],
       lastState: const Value(UploadIntentState.reviewSubmitted),
       lastErrorCode: const Value(null),
-      onlyIfStateIn: const {_ServerItemState.reviewReady, 'duplicate_conflict'},
+      onlyIfStateIn: reviewableStates,
     );
     _runner.request('review', bypassBackoff: true);
   }
@@ -563,9 +530,9 @@ class UploadManager {
 
   /// Completes when no pass is running, or the running one waits for the
   /// binding gate to verify (a wait only the gate or [quiesce] ends).
-  Future<void> idle() => _waitingForGate
+  Future<void> idle() => _gateWait.waiting
       ? Future.value()
-      : Future.any([_runner.whenIdle(), _gateWaitSignal.future]);
+      : Future.any([_runner.whenIdle(), _gateWait.nextWaitBegins]);
 
   Future<void> quiesce() async {
     if (!_closing.isCompleted) _closing.complete();
@@ -580,45 +547,28 @@ class UploadManager {
   }
 
   final _closing = Completer<void>();
-  Completer<void> _gateWaitSignal = Completer<void>();
-  bool _waitingForGate = false;
 
-  /// The verified binding token; null when [quiesce] began while waiting.
-  Future<String?> _verifiedToken() async {
-    if (_gate.state is! BindingVerified) {
-      _waitingForGate = true;
-      _gateWaitSignal.complete();
-      _gateWaitSignal = Completer<void>();
-    }
-    final verified = _gate.awaitVerified()..ignore();
-    try {
-      return await Future.any<String?>([
-        verified,
-        _closing.future.then((_) => null),
-      ]);
-    } finally {
-      _waitingForGate = false;
-    }
-  }
+  /// A pass's wait for the server check; [quiesce] ends it.
+  late final _gateWait = GateWait(gate: _gate, closing: _closing.future);
 
   /// One pass: allocates every batch that still has `allocating` intents.
   Future<PassOutcome> _runPass(Set<String> reasons) async {
     if (_authParked) return _parked();
     if (_isOffline()) return const PassFailed(BackoffReason.offline);
-    var feature = uploadsFeatureForNetwork(await _feature());
+    var feature = featureForNetwork(await _feature());
     if (feature == null && _refreshCapabilities != null) {
       // Online with no live block (a failed /app/info read leaves it cached or
       // absent): re-read once and decide on the fresh answer (7-R1-02).
       try {
         await _refreshCapabilities();
       } catch (_) {}
-      feature = uploadsFeatureForNetwork(await _feature());
+      feature = featureForNetwork(await _feature());
     }
     if (feature == null) {
       return const PassFailed(BackoffReason.capabilityMissing);
     }
     try {
-      final token = await _verifiedToken();
+      final token = await _gateWait.token();
       if (token == null) return const PassDone();
       _instanceChanged = false;
       final batches = <String, List<UploadIntentRecord>>{};
@@ -649,12 +599,12 @@ class UploadManager {
             await _setItems(
               token,
               _cancelling(items),
-              _ServerItemState.cancelled,
+              ServerItemState.cancelled,
               null,
               onlyIfStateIn: const {UploadIntentState.cancelling},
             );
           case SubmissionAmbiguous(:final cause):
-            if (_isUnauthorized(cause)) {
+            if (isUnauthorized(cause)) {
               return _parked();
             }
             transient = true;
@@ -746,7 +696,7 @@ class UploadManager {
                 abortTrigger: _closing.future,
               );
             } catch (e) {
-              throw _StatusQueryFailed(e);
+              throw StatusQueryFailed(e);
             }
             final state = item.rawState;
             // A resolve-duplicate is acted on only by `duplicate`: an item
@@ -759,8 +709,8 @@ class UploadManager {
               return StatusAccepted(item.toJson());
             }
             final pending = resolve
-                ? const {_ServerItemState.reviewReady, 'duplicate_conflict'}
-                : const {_ServerItemState.reviewReady};
+                ? reviewableStates
+                : const {ServerItemState.reviewReady};
             return pending.contains(state) &&
                     item.reviewVersion == intent.reviewGeneration
                 ? const StatusAbsent()
@@ -768,20 +718,18 @@ class UploadManager {
           },
           onFailure: (e) => switch (e) {
             // A failed status query never settles the operation as refused.
-            _StatusQueryFailed(:final cause) =>
+            StatusQueryFailed(:final cause) =>
               _commonFailure(cause) ??
                   SubmissionAmbiguousAs(
                     cause is ApiException && cause.statusCode == 401
                         ? cause.errorCode ?? 'http_401'
                         : 'status_unavailable',
                   ),
-            UploadReviewRouteUnavailable() => const SubmissionAmbiguousAs(
-              'route_unavailable',
-            ),
-            _ => _commonFailure(e) ?? _refusal(e),
+            // A refused review answer is final whatever `retryable` says.
+            _ => _commonFailure(e) ?? refusalIsFinal(e),
           },
         );
-        } on _StatusQueryFailed catch (e) {
+        } on StatusQueryFailed catch (e) {
           throw e.cause;
         }
         switch (outcome) {
@@ -800,7 +748,7 @@ class UploadManager {
             await _intents.update(
               token,
               [intent.itemUuid],
-              lastState: const Value(_ServerItemState.reviewReady),
+              lastState: const Value(ServerItemState.reviewReady),
               lastErrorCode: Value(code),
               onlyIfStateIn: const {UploadIntentState.reviewSubmitted},
             );
@@ -826,8 +774,8 @@ class UploadManager {
               result = failure;
             }
           case SubmissionAmbiguous(:final cause):
-            if (_isUnauthorized(
-              cause is _StatusQueryFailed ? cause.cause : cause,
+            if (isUnauthorized(
+              cause is StatusQueryFailed ? cause.cause : cause,
             )) {
               return const _StepParked();
             }
@@ -839,16 +787,6 @@ class UploadManager {
     }
     return result;
   }
-
-  /// A refusal (4xx except 401/408/429) ends a review action, whatever its
-  /// `retryable` says: the same frozen body would be refused again.
-  static SubmissionFailureDisposition? _refusal(Object e) =>
-      e is ApiException &&
-          e.statusCode >= 400 &&
-          e.statusCode <= 499 &&
-          !const {401, 408, 429}.contains(e.statusCode)
-      ? SubmissionTerminal(e.errorCode ?? 'http_${e.statusCode}')
-      : null;
 
   /// What a failed request means for a pass step: a 401 is a wait for auth,
   /// a transport or API error a retry. Null for anything else (the caller
@@ -863,9 +801,6 @@ class UploadManager {
     TokenWithheldException() => const _StepRetry(),
     _ => null,
   };
-
-  static bool _isUnauthorized(Object cause) =>
-      cause is ApiException && cause.statusCode == 401;
 
   /// The failure hook cases every submission shares: another server answered,
   /// or the manager is closing. The rows stay as they were.
@@ -1085,7 +1020,7 @@ class UploadManager {
           );
         } on ApiException catch (e) {
           if (e.statusCode == 404) {
-            await _setItems(token, [intent], _ServerItemState.cancelled, null);
+            await _setItems(token, [intent], ServerItemState.cancelled, null);
             continue;
           }
           if (e.statusCode != 409 ||
@@ -1206,9 +1141,9 @@ class UploadManager {
   /// What the server says about the item, as a submission status.
   (SubmissionStatus, UploadItem) _statusOf(UploadItem item) {
     final state = item.rawState;
-    final SubmissionStatus status = state == _ServerItemState.allocated
+    final SubmissionStatus status = state == ServerItemState.allocated
         ? const StatusAbsent()
-        : state == _ServerItemState.receiving
+        : state == ServerItemState.receiving
         ? const StatusPending()
         : _ServerItemState.failedForGood.contains(state)
         ? StatusRejected(item.error?.code ?? state)
@@ -1393,13 +1328,13 @@ class UploadManager {
           token,
           [intent.itemUuid],
           lastState: Value(
-            dispatchable ? _ServerItemState.failed : item.rawState,
+            dispatchable ? ServerItemState.failed : item.rawState,
           ),
           lastErrorCode: Value(item?.error?.code ?? code),
           onlyIfStateIn: startable,
         );
       case SubmissionAmbiguous(:final cause):
-        if (_isUnauthorized(cause)) {
+        if (isUnauthorized(cause)) {
           _authParked = true; // a wait for auth, never a failure
           return;
         }
@@ -1415,6 +1350,19 @@ class UploadManager {
             lastState: const Value(UploadIntentState.allocated),
             lastErrorCode: Value(cause.errorCode),
             onlyIfStateIn: startable,
+          );
+        } else if (cause is NetworkException ||
+            (cause is UploadTransferAborted &&
+                _stalled.contains(intent.itemUuid))) {
+          // A cut or stalled send: no byte moves while the backoff runs, so
+          // a row that was sending says it was interrupted (the next send
+          // asks the status first, under the same operation id).
+          await _intents.update(
+            token,
+            [intent.itemUuid],
+            lastState: const Value(UploadIntentState.allocated),
+            lastErrorCode: const Value('upload_interrupted'),
+            onlyIfStateIn: const {UploadIntentState.transferring},
           );
         }
         final delay = _transferBackoff.nextDelay(
@@ -1523,37 +1471,25 @@ class _TransferStop implements Exception {
   final SubmissionFailureDisposition disposition;
 }
 
-/// The server's item states the manager compares against.
-/// A failed review status query, so the failure hook can tell it from a
-/// failed send.
-class _StatusQueryFailed implements Exception {
-  const _StatusQueryFailed(this.cause);
-  final Object cause;
-}
-
+/// The sets of server item states the manager compares against.
 abstract final class _ServerItemState {
-  static const allocated = 'allocated';
-  static const receiving = 'receiving';
-  static const reviewReady = 'review_ready';
-  static const cancelled = 'cancelled';
-  static const failed = 'failed';
-
   /// States a transfer may be started from.
-  static const dispatchable = {allocated, receiving, 'transferring'};
+  static const dispatchable = {
+    ServerItemState.allocated,
+    ServerItemState.receiving,
+    'transferring',
+  };
 
   /// States the server changes on its own (polled). `expanded` is ended
   /// (spec §3): never polled, so a pruned batch cannot stall the poll.
   static const serverDriven = {
-    receiving,
+    ServerItemState.receiving,
     'validating',
     'committing',
   };
 
-  /// Nothing more to cancel.
-  static const settled = {cancelled, 'imported', 'duplicate', 'expired'};
-
   /// The server ended the item without importing it.
-  static const failedForGood = {'failed', cancelled, 'expired'};
+  static const failedForGood = {'failed', ServerItemState.cancelled, 'expired'};
 
   /// States that show a commit was acted on (a resolve-duplicate is acted
   /// on only by `duplicate`).
@@ -1580,93 +1516,6 @@ final class _StepRetry extends _StepResult {
 
 final class _StepParked extends _StepResult {
   const _StepParked();
-}
-
-/// What one sign-in holds in the upload intents that Disconnect or Log out
-/// would drop (DEV-7-22, DEV-8-14); see [UploadLossReporter.counts].
-class UploadLossCounts {
-  const UploadLossCounts({
-    required this.unsent,
-    required this.reviewDrafts,
-    required this.unsentReviews,
-    required this.unsentCancels,
-  });
-
-  /// Files whose bytes the server doesn't have yet (the Disconnect rule).
-  final int unsent;
-
-  /// Reviewable rows with a typed, unconfirmed tag draft.
-  final int reviewDrafts;
-
-  /// Reviews confirmed here that the server hasn't answered.
-  final int unsentReviews;
-
-  /// Cancels the server hasn't answered.
-  final int unsentCancels;
-}
-
-/// The Disconnect confirmation's "unsent uploads" line: the files on this
-/// device (kept ones of an ended sign-in included) whose bytes the server
-/// doesn't have yet. [counts] is the one read of the intents; Log out reuses
-/// it for its extra categories.
-class UploadLossReporter implements LossReporter {
-  UploadLossReporter({
-    required UploadIntentStore intents,
-    required ServerBindingRepository binding,
-  }) : _intents = intents,
-       _binding = binding;
-
-  final UploadIntentStore _intents;
-  final ServerBindingRepository _binding;
-
-  static const _unsent = {
-    UploadIntentState.allocating,
-    UploadIntentState.allocated,
-    _ServerItemState.receiving,
-    UploadIntentState.transferring,
-    UploadIntentState.needsReselect,
-    UploadIntentState.sourceChanged,
-  };
-
-  static const _reviewable = {
-    _ServerItemState.reviewReady,
-    'duplicate_conflict',
-  };
-
-  /// The counts of every row on this device while a binding exists (rows kept
-  /// by an ended sign-in included), or null with no binding. Throws when the
-  /// binding or its intents cannot be read.
-  Future<UploadLossCounts?> counts() async {
-    final token = (await _binding.current())?.localBindingId;
-    if (token == null) return null;
-    var unsent = 0, drafts = 0, reviews = 0, cancels = 0;
-    for (final i in await _intents.all()) {
-      final state = i.lastState;
-      if (i.bytesOnThisDevice && _unsent.contains(state)) unsent++;
-      if (_reviewable.contains(state) && decodeDraft(i.draftJson).isNotEmpty) {
-        drafts++;
-      }
-      if (state == UploadIntentState.reviewSubmitted) reviews++;
-      if (state == UploadIntentState.cancelling) cancels++;
-    }
-    return UploadLossCounts(
-      unsent: unsent,
-      reviewDrafts: drafts,
-      unsentReviews: reviews,
-      unsentCancels: cancels,
-    );
-  }
-
-  @override
-  Future<String?> pendingLossSummary() async {
-    final c = await counts();
-    final count = c?.unsent ?? 0;
-    return switch (count) {
-      0 => null,
-      1 => '1 upload not yet sent',
-      _ => '$count uploads not yet sent',
-    };
-  }
 }
 
 /// One manager per scope, on the scope's [DurableSubmission]; quiesced when

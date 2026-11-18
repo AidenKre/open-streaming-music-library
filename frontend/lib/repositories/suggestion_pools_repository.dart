@@ -90,7 +90,7 @@ class SuggestionPoolsRepository {
           'tm.title AS title, '
           '($usableDownloadPredicate) AS downloaded '
           'FROM (SELECT entity_ref, '
-          '$_sumMicrosSql AS micros, '
+          '$listeningMicrosSql AS micros, '
           'COUNT(CASE WHEN $qualifiedPlaySql THEN 1 END) AS q, '
           'MAX(CASE WHEN $qualifiedPlaySql THEN occurred_at END) AS last_q '
           'FROM history_events '
@@ -126,10 +126,6 @@ class SuggestionPoolsRepository {
   }
 }
 
-/// Listening time summed as integer microseconds, so equal recorded time
-/// ties exactly whatever the split (the 9A.1a ranking rule).
-const _sumMicrosSql = 'SUM(CAST(ROUND(seconds_played * 1000000) AS INTEGER))';
-
 final int _rediscoverMinAgeMs = rediscoverMinAge.inMilliseconds;
 final int _recentArtistWindowMs = recentArtistWindow.inMilliseconds;
 
@@ -138,7 +134,7 @@ final int _recentArtistWindowMs = recentArtistWindow.inMilliseconds;
 /// start.
 final String _recentArtistsSql =
     'SELECT $currentArtistKeySql AS k, '
-    '$_sumMicrosSql AS micros, '
+    '$listeningMicrosSql AS micros, '
     'COUNT(CASE WHEN $qualifiedPlaySql THEN 1 END) AS q '
     'FROM history_events '
     'WHERE $playRowFilterSql AND occurred_at >= ?4 AND occurred_at < ?3 '

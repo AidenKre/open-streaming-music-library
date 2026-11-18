@@ -15,6 +15,7 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/api/api_client.dart' show NetworkException;
 import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/models/dto/lastfm_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
@@ -27,7 +28,7 @@ import 'package:frontend/ui/integrations/integrations_controller.dart';
 
 import '../../helpers/fake_external_browser.dart';
 import '../../helpers/fake_lastfm_api.dart';
-import '../browse_harness.dart' show TestOffline;
+import '../../helpers/test_offline.dart';
 
 class _Rig {
   _Rig({
@@ -161,21 +162,16 @@ void main() {
 
     test('problem rows carry the model reason; the order is kept', () async {
       final rig = _rig();
-      rig.api.onStatus = () async => LastfmStatus.fromJson({
-        'service': 'running',
-        'state': 'enabled',
-        'needs_reconnect': false,
-        'account_name': 'listener_01',
-        'connection_id': fakeConnectionId,
-        'counts': {'pending': 1, 'sent': 2, 'ignored': 1, 'failed': 0,
+      rig.api.onStatus = () async => lastfmStatus(
+        counts: {'pending': 1, 'sent': 2, 'ignored': 1, 'failed': 0,
             'dropped': 1},
-        'recent_problems': [
+        recentProblems: [
           {'artist': 'Artist B', 'track': 'Track B', 'listened_at': 2000,
               'status': 'dropped', 'code': 'too_old'},
           {'artist': 'Artist A', 'track': 'Track A', 'listened_at': 1000,
               'status': 'ignored', 'code': '1'},
         ],
-      });
+      );
       final c = await rig.start();
       expect(
         c.view.problems.map((p) => (p.artist, p.track, p.listenedAt, p.reason)),
@@ -363,6 +359,41 @@ void main() {
       expect(c.view.status!.state, LastfmAccountState.notConnected);
     });
 
+    // DEV-9-13 (owner 2026-11-14): Disconnect while the server is
+    // unreachable also says that nothing was changed.
+    test('disconnect while the server is unreachable says nothing was '
+        'changed', () async {
+      final rig = _rig(state: 'enabled', needsReconnect: false);
+      final c = await rig.start();
+      rig.api.onDisconnect = () async =>
+          throw NetworkException('refused', attemptsMade: 1);
+      await c.disconnect();
+      expect(c.message, "Can't reach your server right now. Nothing was changed.");
+    });
+
+    test('a disconnect that timed out may have been applied: no "nothing '
+        'was changed"', () async {
+      final rig = _rig(state: 'enabled', needsReconnect: false);
+      final c = await rig.start();
+      rig.api.onDisconnect = () async => throw NetworkException(
+        'slow',
+        cause: TimeoutException('t'),
+        attemptsMade: 1,
+      );
+      await c.disconnect();
+      expect(c.message, lastfmProblemText(LastfmProblem.timedOut));
+    });
+
+    test('finish while the server is unreachable keeps its own words',
+        () async {
+      final rig = _rig(state: 'awaiting_authorization');
+      rig.api.onComplete = () async =>
+          throw NetworkException('refused', attemptsMade: 1);
+      final c = await rig.start();
+      await c.finish();
+      expect(c.message, lastfmProblemText(LastfmProblem.unreachable));
+    });
+
     test('a new action clears the previous message', () async {
       final rig = _rig(state: 'awaiting_authorization');
       rig.api.onComplete = () async => throw lastfmApiError(
@@ -420,14 +451,11 @@ void main() {
     // #1: finishing a reconnect (the server still says `enabled`).
     test('a reconnect waiting for its approval can be finished', () async {
       final rig = _rig(state: 'enabled', needsReconnect: true);
-      rig.api.onStatus = () async => LastfmStatus.fromJson({
-        'service': 'running',
-        'state': 'enabled',
-        'needs_reconnect': true,
-        'account_name': 'listener_01',
-        'connection_id': fakeConnectionId,
-        'approval_expires_at': 1800000600000,
-      });
+      rig.api.onStatus = () async => lastfmStatus(
+        needsReconnect: true,
+        approvalExpiresAt: 1800000600000,
+        counts: null,
+      );
       final c = await rig.start();
       expect(c.view.offer!.canFinish, isTrue);
       await c.finish();

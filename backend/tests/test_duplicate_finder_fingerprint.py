@@ -35,15 +35,10 @@ from app.services.audio_identity import (
 from app.config import Settings
 from app.services.duplicate_detection import DuplicateMatch, MatcherParams, TrackRef, find_duplicates
 from tests.fingerprint_fixtures import ALGO, BASE, EXPLICIT, fp_track, noisy, pin_matcher_settings, random_print
-from tests.identity_worker_fixtures import make_db, sql
 from tests.owned_database import add_test_user
+from tests.pending_deletion import mark_pending_deletion
 
 T = 1_800_000_000
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -310,9 +305,7 @@ def test_exclude_drops_those_tracks(db, conn):
 def test_a_track_the_live_tracks_view_leaves_out_is_never_matched(db, conn):
     hidden = fp_track(db, "hidden")
     shown = fp_track(db, "shown")
-    sql(db, "DROP VIEW live_tracks")
-    sql(db, "CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks "
-            f"WHERE uuid_id <> '{hidden}'")
+    mark_pending_deletion(db.context.database_path, hidden)
 
     assert set(fp_matches(find(db, conn))) == {TrackRef(shown)}
 

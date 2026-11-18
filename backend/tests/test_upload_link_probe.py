@@ -13,13 +13,7 @@ import pytest
 from app.library import library_root
 from app.services import organizer
 from app.services.upload_publish import probe_library_links
-from tests.identity_worker_fixtures import make_db
 from tests.owned_database import add_test_user
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -234,8 +228,7 @@ def test_a_link_refused_for_another_reason_is_not_called_unsupported(db, music, 
     assert all("/" not in line for line in lines)
 
 
-@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
-                    reason="root ignores mode bits, so chmod(0) cannot deny the search (review r3 7-R3-06)")
+@pytest.mark.requires_chmod_denial
 def test_a_twin_that_cannot_be_examined_keeps_its_proof(db, music):
     """In-piece review F2: a library folder the server cannot search proves
     nothing; the scratch (the only proof) stays until the twin is proven gone."""

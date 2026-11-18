@@ -12,15 +12,17 @@ from tests.lastfm_fake import failed, ok_now_playing, ok_scrobbles, scrobble_res
 from tests.lastfm_sender_rig import (
     GAP_S,
     NOW_S,
+    add_track,
     bind,
     connect_user,
     connection,
     make_rig,
+    method,
     queue_row,
     row,
     session_key_for,
+    sk,
 )
-from tests.test_lastfm_now_playing import add_track, method, sk
 
 
 @pytest.fixture

@@ -16,6 +16,7 @@ import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 import '../../helpers/test_credentials.dart';
+import '../../helpers/test_offline.dart';
 
 Map<String, dynamic> _jobJson({
   int jobId = 1,
@@ -134,19 +135,6 @@ class _FakeJobsServer {
   }
 }
 
-class _Offline extends OfflineModeNotifier {
-  _Offline(this.initial);
-  final bool initial;
-
-  @override
-  bool build() {
-    super.build();
-    return initial;
-  }
-
-  void set(bool value) => state = value;
-}
-
 class _CountingSync extends TrackSyncNotifier {
   int syncFreshCalls = 0;
 
@@ -171,7 +159,7 @@ class _Harness {
   final ProviderContainer container;
   final _FakeJobsServer server;
   final _CountingSync sync;
-  final _Offline offline;
+  final TestOffline offline;
   final ApiClient api;
 
   /// debugPrint output captured while the harness is open (the notifier
@@ -214,7 +202,7 @@ _Harness _harness({
   final s = server ?? _FakeJobsServer();
   final api = testApiClient(baseUrl, s.client);
   final sync = _CountingSync();
-  final off = _Offline(offline);
+  final off = TestOffline(offline);
   final container = ProviderContainer(
     overrides: [
       apiClientProvider.overrideWithValue(api),

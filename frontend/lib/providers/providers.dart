@@ -1,3 +1,5 @@
+import 'dart:math' show Random;
+
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
 import 'package:frontend/api/api_client_provider.dart';
@@ -10,7 +12,6 @@ import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/repositories/recently_played_repository.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
-import 'package:frontend/repositories/sync_cursor_store.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/edit_sync_mutex.dart';
@@ -35,9 +36,16 @@ final jobsApiProvider = Provider<JobsApi>(
   (ref) => JobsApi(api: ref.read(apiClientProvider)),
 );
 
+/// The generator every queue shuffle draws from (SC-27: injected, so tests
+/// can seed it).
+final queueRandomProvider = Provider<Random>((ref) => Random());
+
 /// Scope-bound: closed (refusing writes) when its session scope is disposed.
 final queueRepositoryProvider = Provider<QueueRepository>((ref) {
-  final repo = QueueRepository(ref.read(databaseProvider));
+  final repo = QueueRepository(
+    ref.read(databaseProvider),
+    random: ref.read(queueRandomProvider),
+  );
   ref.onDispose(repo.close);
   return repo;
 });
@@ -70,10 +78,6 @@ final boundApiClientProvider = Provider<ApiClient>(
       .withInstanceCheck(ref.read(serverBindingRepositoryProvider).checkServedBy),
 );
 
-final syncCursorStoreProvider = Provider<SyncCursorStore>((ref) {
-  return SyncCursorStore(ref.read(databaseProvider));
-});
-
 class TrackSyncState {
   final bool isSyncing;
   final String? error;
@@ -85,6 +89,12 @@ class TrackSyncState {
   /// The last library sync's failure (null once one succeeds). Untouched by
   /// single-track refreshes, which publish only [error].
   final String? libraryError;
+
+  /// The last library sync failed because the server's library looks
+  /// restored from an older backup (`ServerRegressedException`, SC-01
+  /// rule 5): a Retry cannot help, only a reset. Set and cleared with
+  /// [libraryError].
+  final bool libraryServerRestored;
   final int queueMutationVersion;
   final int downloadMutationVersion;
   final Set<int> affectedQueueSessionIds;
@@ -99,36 +109,13 @@ class TrackSyncState {
     this.error,
     this.librarySyncing = false,
     this.libraryError,
+    this.libraryServerRestored = false,
     this.queueMutationVersion = 0,
     this.downloadMutationVersion = 0,
     this.affectedQueueSessionIds = const {},
     this.deletedTrackUuids = const {},
     this.endedQueueSessionIds = const {},
   });
-
-  TrackSyncState copyWith({
-    bool? isSyncing,
-    String? error,
-    int? queueMutationVersion,
-    int? downloadMutationVersion,
-    Set<int>? affectedQueueSessionIds,
-    Set<String>? deletedTrackUuids,
-    Set<int>? endedQueueSessionIds,
-  }) {
-    return TrackSyncState(
-      isSyncing: isSyncing ?? this.isSyncing,
-      error: error,
-      librarySyncing: librarySyncing,
-      libraryError: libraryError,
-      queueMutationVersion: queueMutationVersion ?? this.queueMutationVersion,
-      downloadMutationVersion:
-          downloadMutationVersion ?? this.downloadMutationVersion,
-      affectedQueueSessionIds:
-          affectedQueueSessionIds ?? this.affectedQueueSessionIds,
-      deletedTrackUuids: deletedTrackUuids ?? this.deletedTrackUuids,
-      endedQueueSessionIds: endedQueueSessionIds ?? this.endedQueueSessionIds,
-    );
-  }
 }
 
 class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
@@ -186,10 +173,15 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
   }
 
   Future<bool> _syncOnce() async {
-    // Flush pending edits, then pull — in one mutex-guarded critical section
-    // so a `/changes` pull can never clobber an unflushed optimistic edit
-    // (the pull does a blind full-row upsert). Flushing first also satisfies
-    // "flush before pull on reconnect" since this runs from the recovery edge.
+    // Flush pending edits, then pull, in one mutex-guarded critical section:
+    // no edit is queued between the two, and every edit the flush delivered
+    // is on the server before the pull's blind full-row upsert reads the
+    // track back. An edit still unsent when the pull runs (the flush stopped
+    // or skipped it, or it is in conflict or rejected) stays in the outbox;
+    // if the pull carries a newer server version of that track, the upsert
+    // replaces the edit's optimistic local values, and the outbox still holds
+    // them to send or resolve later. Flushing first also satisfies "flush
+    // before pull on reconnect" since this runs from the recovery edge.
     final ran = await _runGuarded((service) async {
       final flushed = await ref
           .read(editOutboxProvider)
@@ -287,6 +279,8 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         isSyncing: true,
         librarySyncing: library,
         libraryError: library ? null : current?.libraryError,
+        libraryServerRestored:
+            !library && (current?.libraryServerRestored ?? false),
         queueMutationVersion: current?.queueMutationVersion ?? 0,
         downloadMutationVersion: current?.downloadMutationVersion ?? 0,
       ),
@@ -298,7 +292,6 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         db: ref.read(databaseProvider),
         api: ref.read(tracksApiProvider),
         queueRepository: ref.read(queueRepositoryProvider),
-        prefs: await ref.read(sharedPreferencesProvider.future),
         bindingToken: bindingToken,
         ownedFileCleanup: ref.read(ownedFileCleanupProvider),
       );
@@ -311,6 +304,8 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
           latest,
           result,
           libraryError: library ? null : latest?.libraryError,
+          libraryServerRestored:
+              !library && (latest?.libraryServerRestored ?? false),
         ),
       );
       // D29: retries rows a failed cleanup attempt kept.
@@ -333,6 +328,7 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
             service?.committedChanges ?? const SyncResult(),
             error: current?.error,
             libraryError: current?.libraryError,
+            libraryServerRestored: current?.libraryServerRestored ?? false,
           ),
         );
         return false;
@@ -346,6 +342,11 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
               : (service?.committedChanges ?? const SyncResult()),
           error: e.toString(),
           libraryError: library ? e.toString() : latest?.libraryError,
+          // Decision 3 (a): a restored server is told apart from every other
+          // failure; a Retry cannot help there.
+          libraryServerRestored: library
+              ? e is ServerRegressedException
+              : (latest?.libraryServerRestored ?? false),
         ),
       );
       return false;
@@ -359,12 +360,14 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     SyncResult changes, {
     String? error,
     String? libraryError,
+    bool libraryServerRestored = false,
   }) {
     final queueVersion = latest?.queueMutationVersion ?? 0;
     final downloadVersion = latest?.downloadMutationVersion ?? 0;
     return TrackSyncState(
       error: error,
       libraryError: libraryError,
+      libraryServerRestored: libraryServerRestored,
       queueMutationVersion: changes.affectedQueueSessionIds.isEmpty
           ? queueVersion
           : queueVersion + 1,

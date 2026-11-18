@@ -15,7 +15,9 @@ import 'package:frontend/services/uploads/upload_manager.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 import 'package:frontend/services/uploads/uploads_overview_provider.dart';
 
-import '../../ui/browse_harness.dart' show TestOffline;
+import '../../helpers/upload_intent_record.dart';
+import '../../helpers/fake_session_service.dart';
+import '../../helpers/test_offline.dart';
 
 class _FakeManager implements UploadManager {
   final progressNotifier = ValueNotifier<Map<String, int>>(const {});
@@ -33,33 +35,13 @@ class _FakeManager implements UploadManager {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
-class _FakeSession implements SessionService {
-  final blocked = ValueNotifier(ServerBlockedReason.none);
-  @override
-  ValueListenable<ServerBlockedReason> get serverBlocked => blocked;
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
-
-UploadIntentRecord _intent(String uuid, String state) => UploadIntentRecord(
-  itemUuid: uuid,
+UploadIntentRecord _intent(String uuid, String state) => intentRecord(
+  uuid,
   batchUuid: 'b',
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: '$uuid.flac',
-  lastState: state,
-  lastErrorCode: null,
-  lastErrorMessage: null,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
+  state: state,
   localBindingId: 'bind',
-  createdAtMs: 0,
-  updatedAtMs: 0,
   expectedLength: 1000,
-  expectedSha256: null,
-  descriptor: null,
 );
 
 const _live = AdvertisedFeature(
@@ -70,13 +52,13 @@ const _live = AdvertisedFeature(
 void main() {
   late StreamController<List<UploadIntentRecord>> intents;
   late _FakeManager manager;
-  late _FakeSession session;
+  late FakeSessionService session;
   late TestOffline offline;
 
   setUp(() {
     intents = StreamController<List<UploadIntentRecord>>.broadcast();
     manager = _FakeManager();
-    session = _FakeSession();
+    session = FakeSessionService();
     offline = TestOffline(false);
   });
   tearDown(() => intents.close());

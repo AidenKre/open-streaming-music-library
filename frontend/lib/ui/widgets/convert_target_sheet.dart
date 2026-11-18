@@ -74,7 +74,3 @@ Future<ConvertTargetChoice?> showConvertTargetSheet(
   if (bitrate == null) return null;
   return ConvertTargetChoice(codec: codec, bitrateKbps: bitrate);
 }
-
-extension _FirstOrNull<T> on Iterable<T> {
-  T? get firstOrNull => isEmpty ? null : first;
-}

@@ -398,8 +398,8 @@ class PlaybackRequests {
       try {
         prepared = await prepare(
             state.shuffle.shuffleOn, state.queue.repeatMode.name);
-      } on StateError {
-        return const RejectedEmpty(); // nothing to queue
+      } on NothingToQueue {
+        return const RejectedEmpty(); // any other error is a failure
       }
       final sessionId = prepared;
       if (!player.isCurrentRequest(revision)) {
@@ -421,7 +421,7 @@ class PlaybackRequests {
         try {
           await _queue.setPreparedCurrentItem(
               sessionId, target.entry.itemId, target.entry.playPosition);
-        } on StateError {
+        } on PreparedSessionGone {
           continue; // the target is gone: re-resolve
         }
         final result = await player.activatePreparedSession(sessionId, target,

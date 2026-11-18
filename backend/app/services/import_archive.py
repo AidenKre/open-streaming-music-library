@@ -19,6 +19,7 @@ import gzip
 import os
 import re
 import shutil
+import stat
 import tarfile
 import threading
 import uuid
@@ -395,6 +396,15 @@ class ArchiveStopped(Exception):
     """The server is stopping; the unpack was abandoned."""
 
 
+class ArchiveChanged(Exception):
+    """The file that was opened is not the file that was looked at first (its
+    name, or a folder on the way, now leads elsewhere): nothing was read from it."""
+
+
+def _open_no_follow(path, flags):
+    return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+
+
 @dataclass(frozen=True)
 class Unpacked:
     folder: Path
@@ -456,35 +466,49 @@ class ArchiveUnpacker:
         return None
 
     @contextmanager
-    def unpack(self, archive, workspace_dir: Path, *, should_stop):
+    def unpack(self, archive, workspace_dir: Path, *, should_stop, expected=None):
         limits = self._limits()
         identity = file_identity(archive)
         code = self._known(archive, identity, limits)
         if code is not None:
             raise ArchiveRefused(code, remembered=True)
         with _unpack_slot(should_stop):  # the import of the members runs outside it
-            folder, files, other_audio = self._unpack(archive, identity, limits, workspace_dir, should_stop)
+            folder, files, other_audio = self._unpack(
+                archive, identity, limits, workspace_dir, should_stop,
+                expected if expected is not None else identity,
+            )
         try:
             self._refused.pop(archive, None)
             yield Unpacked(folder, files, other_audio)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
-    def _unpack(self, archive, identity, limits, workspace_dir, should_stop):
+    def _unpack(self, archive, identity, limits, workspace_dir, should_stop, expected):
         """Inspect, reserve, copy: ``(folder, files, other_audio)``. The
         reservation covers the copy only and is released when it ends: once
         the bytes are on disk the free space shows them, so holding it through
         the import would count them twice. On failure the folder is removed
         first, so the release never frees bytes still on disk."""
         try:
-            # Opened once: the copy reads the very file that was inspected.
-            source = open(archive, "rb", buffering=0)
+            # Opened once: the copy reads the very file that was inspected. It
+            # is opened without following a link, and it must be the file that
+            # was looked at first.
+            source = open(archive, "rb", buffering=0, opener=_open_no_follow)
         except OSError as exc:
+            if exc.errno == errno.ELOOP:  # a link put at the name after the look
+                raise ArchiveChanged() from None
             # Environmental: tried again later, not remembered.
             if is_transient_read_error(exc):
                 raise ArchiveWriteFailed("read_failed") from None
             raise self._refuse(archive, identity, limits, "invalid") from None
         with source:
+            st = os.fstat(source.fileno())
+            if (
+                expected is None
+                or not stat.S_ISREG(st.st_mode)
+                or (st.st_dev, st.st_ino) != tuple(expected[:2])
+            ):
+                raise ArchiveChanged()
             try:
                 plan = inspect(source, limits, should_stop=should_stop)
             except ValidationFailed as exc:

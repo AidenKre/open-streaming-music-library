@@ -19,8 +19,6 @@ import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/dto/client_track_dto.dart';
-import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/playback/queue_player.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
@@ -30,10 +28,12 @@ import 'package:frontend/playback/audio_focus.dart';
 import 'package:frontend/playback/just_audio_engine.dart';
 import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_engine.dart';
+import 'package:frontend/playback/queue_window.dart';
 
-import 'audio_focus_test.dart' show FakeAudioSessionPort;
-import 'audio_focus_test.dart' show FakeTimers, RelinquishingOwner;
-import 'preview_player_test.dart' show FakePreviewEngine;
+import '../helpers/fake_audio_focus.dart' show FakeAudioSessionPort;
+import '../helpers/fake_audio_focus.dart' show FakeTimers, RelinquishingOwner;
+import '../helpers/fake_preview_engine.dart' show FakePreviewEngine;
+import '../helpers/fake_playback_engine.dart';
 import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/services/history/click_recorder.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
@@ -49,6 +49,7 @@ import 'package:frontend/services/download/download_status_reader.dart';
 import 'package:frontend/services/download/download_reconciliation_service.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/session_readiness.dart';
+import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/preview_controller.dart';
@@ -66,11 +67,13 @@ import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/playback/source_failure_classifier.dart';
 import 'package:frontend/playback/queue_warm_listener.dart';
 import '../helpers/no_server_api.dart';
+import '../helpers/test_offline.dart';
+import '../helpers/library_fixture.dart';
 
 void main() {
   late AppDatabase db;
   late _ObservedStartupRepository repo;
-  late _LibraryFixture fixture;
+  late LibraryFixture fixture;
   ProviderContainer? container;
   late FakePlaybackEngine fakePlayer;
   late RecordingAudioServiceBridge bridge;
@@ -109,7 +112,7 @@ void main() {
     await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     existingFiles.clear();
     repo = _ObservedStartupRepository(db);
-    fixture = _LibraryFixture(db);
+    fixture = LibraryFixture(db);
     fakePlayer = FakePlaybackEngine();
     bridge = RecordingAudioServiceBridge();
     sessionPort = FakeAudioSessionPort();
@@ -119,6 +122,7 @@ void main() {
     trackStatuses.clear();
     probeGate = null;
     classifyGate = null;
+    fileGate = null;
     downloadStatusController = StreamController<int>.broadcast();
   });
 
@@ -139,6 +143,7 @@ void main() {
     Clock? clock,
     bool observers = true,
     bool controllableQuality = false,
+    QualityChangeKind qualityChangeKind = QualityChangeKind.full,
     bool failingReconcile = false,
     _ScriptedSync? sync,
     Random? random,
@@ -166,14 +171,14 @@ void main() {
         if (controllableQuality) ...[
           streamQualityProvider.overrideWith((ref) => ref.watch(_testQuality)),
           streamQualityChangeKindProvider
-              .overrideWith((ref) => QualityChangeKind.full),
+              .overrideWith((ref) => qualityChangeKind),
         ],
         downloadReconciliationServiceProvider.overrideWith((ref) =>
             failingReconcile
                 ? _FailingReconcile(db)
                 : DownloadReconciliationService(
               db: db,
-              statusReader: DownloadStatusReader(db: db),
+              statusReader: DownloadStatusReader(),
               fileExists: (path) async => existingFiles.contains(path),
             )),
         sourceFailureClassifierProvider.overrideWith((ref) =>
@@ -201,7 +206,7 @@ void main() {
         downloadStatusVersionProvider.overrideWith(
           (ref) => downloadStatusController.stream,
         ),
-        if (offline) offlineModeProvider.overrideWith(() => _OfflineOn()),
+        if (offline) offlineModeProvider.overrideWith(() => TestOffline(true)),
       ],
     );
     // Hold a long-lived listener on the audio notifier so its in-build
@@ -254,6 +259,54 @@ void main() {
       await pumpEventQueue();
       expect(fakePlayer.currentItemId, entries.first.itemId);
       expect(events, isEmpty, reason: 'structural seeding never emits a natural transition');
+    });
+
+    // Pre-merge D5-03 / A6-08 and A6-07: two more ways the fake now behaves
+    // like `JustAudioEngine`.
+    test('the player fake rejects a seed whose current item is missing, '
+        'before anything changes, like the production adapter', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'test', trackUuids: ['a', 'b'],
+      );
+      final entries = await repo.getPlaybackEntries(sessionId, startPlayPosition: 0, limit: 2);
+      addTearDown(fakePlayer.dispose);
+      await expectLater(
+          fakePlayer.setSeed([entries.first], currentItemId: entries.last.itemId),
+          throwsStateError);
+      expect(fakePlayer.seedCalls, isEmpty);
+      expect(fakePlayer.playlistRevision, 0);
+      expect(fakePlayer.currentItemId, isNull);
+      expect(fakePlayer.queueLength, 0);
+    });
+
+    test('the player fake reports a pause and a stop inside the call, once '
+        'per change, like the production adapter', () async {
+      await fixture.insertSingles(['a']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'test', trackUuids: ['a'],
+      );
+      final entries = await repo.getPlaybackEntries(sessionId, startPlayPosition: 0, limit: 1);
+      final reports = <EngineTransportState>[];
+      final sub = fakePlayer.transportStateStream.listen(reports.add);
+      addTearDown(sub.cancel);
+      await fakePlayer.setSeed(entries,
+          currentItemId: entries.single.itemId, autoPlay: true);
+      fakePlayer.emitSettledTransport();
+      await fakePlayer.pause();
+      await fakePlayer.pause(); // nothing changed: no second report
+      await fakePlayer.play(); // (the fake leaves the play report to the test)
+      await fakePlayer.pause(); // a pause after a play reports again
+      await fakePlayer.stop();
+      await pumpEventQueue();
+      expect(reports, const [
+        EngineTransportState(true, EngineProcessingState.ready),
+        EngineTransportState(false, EngineProcessingState.ready),
+        EngineTransportState(false, EngineProcessingState.ready),
+        EngineTransportState(false, EngineProcessingState.idle),
+      ]);
+      fakePlayer.dispose();
+      await fakePlayer.pause(); // after dispose: no report, no error
     });
 
     Future<ProviderContainer> start(List<String> uuids) async {
@@ -948,11 +1001,11 @@ void main() {
     // Decision 1 (user, 2026-11-07; 5B.0d M2): offline, a failed stream is
     // treated like an unavailable item and playback moves on to the next
     // downloaded one. Online behaviour is unchanged.
-    Future<(ProviderContainer, _MutableOffline)> streamingOnline() async {
+    Future<(ProviderContainer, TestOffline)> streamingOnline() async {
       await fixture.insertSingles(['a', 'b', 'c']);
       await markDownloaded('c', '/dl/c');
       existingFiles.add('/dl/c');
-      final offline = _MutableOffline();
+      final offline = TestOffline(false);
       final c = createContainer(offlineNotifier: () => offline);
       issues = [];
       c.read(playbackIssueBusProvider).issues.listen(issues.add);
@@ -1207,7 +1260,10 @@ void main() {
     });
   });
 
-  group('5B.0d audit (a) round 2', () {
+  // Was "5B.0d audit (a) round 2".
+  group(
+      'failure recovery: a rebased target and a remembered stream fallback',
+      () {
     test("a rebase's failed load is attributed to the rebased target",
         () async {
       final uuids = List.generate(120, (i) => 'u$i');
@@ -1264,7 +1320,10 @@ void main() {
     });
   });
 
-  group('5B.0d audit (a) round 3', () {
+  // Was "5B.0d audit (a) round 3".
+  group(
+      'a confirmed missing file: catalog clean-up and the stream fallback',
+      () {
     test('a confirmed missing file is cleared from the catalog', () async {
       await fixture.insertSingles(['a', 'b']);
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
@@ -1311,7 +1370,8 @@ void main() {
     });
   });
 
-  group('5B.0d audit (a) round 4 minors', () {
+  // Was "5B.0d audit (a) round 4 minors".
+  group('recovery after a failed reconcile or a stale unavailable advance', () {
     test('a failed catalog reconcile does not stop the recovery', () async {
       await fixture.insertSingles(['a', 'b']);
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
@@ -1347,7 +1407,8 @@ void main() {
     });
   });
 
-  group('5B.0d audit (b) minors', () {
+  // Was "5B.0d audit (b) minors".
+  group('the OS duration and the quiesced state', () {
     test('the OS shows the measured duration when the catalog lacks it',
         () async {
       await fixture.insertSingles(['a']);
@@ -1630,7 +1691,8 @@ void main() {
     });
   });
 
-  group('live gate: missing downloads confirmed by the resolver (D32)', () {
+  // Was "live gate: missing downloads confirmed by the resolver (D32)".
+  group('missing downloads confirmed by the resolver', () {
     test('an offline tap on a download whose file is gone is rejected and '
         'reconciles the catalog', () async {
       await fixture.insertSingles(['a', 'b']);
@@ -1665,8 +1727,8 @@ void main() {
     });
   });
 
-  group('branch audit (5B.0b F4): the scope, not the player, owns the engine '
-      'and window', () {
+  // Was "branch audit (5B.0b F4): the scope, not the player, owns the engine and window".
+  group('the scope, not the player, owns the engine and window', () {
     test('a rebuilt player gets a live engine and window', () async {
       await fixture.insertSingles(['a']);
       final c = createContainer();
@@ -1699,8 +1761,8 @@ void main() {
     });
   });
 
-  group('branch audit (5B.0d m1): the OS playback state is not republished '
-      'on every position tick', () {
+  // Was "branch audit (5B.0d m1): the OS playback state is not republished on every position tick".
+  group('the OS playback state is not republished on every position tick', () {
     test('ticks at real-time pace publish nothing; a seek or a pause does',
         () async {
       await fixture.insertSingles(['a']);
@@ -1728,7 +1790,8 @@ void main() {
     });
   });
 
-  group('branch audit (5B.0d m4): removeFromQueue is commit-last', () {
+  // Was "branch audit (5B.0d m4): removeFromQueue is commit-last".
+  group('removeFromQueue is commit-last', () {
     test('a failed metadata read after a removal leaves the window shifted',
         () async {
       await fixture.insertSingles(['a', 'b', 'c', 'd']);
@@ -1747,7 +1810,8 @@ void main() {
     });
   });
 
-  group('branch audit (5B.0a): characterization gaps', () {
+  // Was "branch audit (5B.0a): characterization gaps".
+  group('quality changes and a sync that empties the queue', () {
     test('a full quality change rebuilds every source at the position then '
         '(M1)', () async {
       await fixture.insertSingles(['a', 'b']);
@@ -1761,6 +1825,25 @@ void main() {
       c.read(_testQuality.notifier).set('low');
       await pumpEventQueue();
       expect(fakePlayer.rebuilds, [('all', 'low', const Duration(seconds: 30), current)]);
+    });
+
+    test('a "this session only" quality change rebuilds only the current '
+        'source, at the position then', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final c = createContainer(
+          controllableQuality: true,
+          qualityChangeKind: QualityChangeKind.temporary);
+      c.read(queuePlayerProvider.notifier);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'), sourceType: 'test');
+      await pumpEventQueue();
+      fakePlayer.emitPosition(const Duration(seconds: 30));
+      await pumpEventQueue();
+      final current = c.read(queuePlayerProvider).queue.currentItemId;
+      c.read(_testQuality.notifier).set('low');
+      await pumpEventQueue();
+      expect(fakePlayer.rebuilds,
+          [('current', 'low', const Duration(seconds: 30), current)]);
+      expect(fakePlayer.lastStreamQuality, 'low');
     });
 
     test('a sync that empties the queue stops audio, and the engine\'s late '
@@ -1787,7 +1870,8 @@ void main() {
     });
   });
 
-  group('branch audit (5B.0a M2): a sync reaches the player', () {
+  // Was "branch audit (5B.0a M2): a sync reaches the player".
+  group('a sync reaches the player', () {
     test('a newer queue mutation version reconciles the affected session; '
         'a stale or equal one does nothing', () async {
       await fixture.insertSingles(['a', 'b']);
@@ -1813,7 +1897,10 @@ void main() {
     });
   });
 
-  group('PR 5B audit (c)', () {
+  // Was "PR 5B audit (c)".
+  group(
+      'stale and superseded activations; an engine restored after a failed seed',
+      () {
     Future<(ProviderContainer, QueuePlayer, int)> playingAB() async {
       await fixture.insertSingles(['a', 'b', 'c']);
       final c = createContainer();
@@ -1895,7 +1982,7 @@ void main() {
         await pumpEventQueue();
         final before = c.read(queuePlayerProvider);
         expect(before.playback.position, const Duration(seconds: 42));
-        fakePlayer.setLoopModeFailures = 1;
+        fakePlayer.seedFailuresAfterReplacing = 1;
         await c.read(playbackRequestsProvider)
             .submit(const PlayList(['c'], 0, ListSource('s')));
         final seed = fakePlayer.seedCalls.last;
@@ -1906,7 +1993,8 @@ void main() {
     }
   });
 
-  group('PR 5B audit (a)', () {
+  // Was "PR 5B audit (a)".
+  group('failed activations and the order of Enqueues and taps', () {
     test('a failed activation leaves the current queue, status and audio '
         'untouched', () async {
       await fixture.insertSingles(['a', 'b', 'c']);
@@ -1937,7 +2025,7 @@ void main() {
       await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
           sourceType: 'test');
       final before = c.read(queuePlayerProvider);
-      fakePlayer.setLoopModeFailures = 1;
+      fakePlayer.seedFailuresAfterReplacing = 1;
       final outcome = await c.read(playbackRequestsProvider)
           .submit(const PlayList(['c'], 0, ListSource('s')));
       expect(outcome, isA<Failed>());
@@ -1982,7 +2070,7 @@ void main() {
       await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
           sourceType: 'test');
       final before = c.read(queuePlayerProvider);
-      fakePlayer.setLoopModeFailures = 1;
+      fakePlayer.seedFailuresAfterReplacing = 1;
       repo.failActivationOf = before.queue.sessionId;
       final outcome = await c.read(playbackRequestsProvider)
           .submit(const PlayList(['c'], 0, ListSource('s')));
@@ -2044,7 +2132,10 @@ void main() {
     });
   });
 
-  group('5B.1 audit (a)', () {
+  // Was "5B.1 audit (a)".
+  group(
+      'no-session Enqueues, the startup prune, a failed first start and a superseded request',
+      () {
     test('a no-session Enqueue never supersedes a newer tap', () async {
       await fixture.insertSingles(['a', 'b', 'x']);
       final c = createContainer();
@@ -2128,7 +2219,10 @@ void main() {
     });
   });
 
-  group('5B.0d audit (c) test gaps', () {
+  // Was "5B.0d audit (c) test gaps".
+  group(
+      'stale chunks, an all-gone queue, queue warm, the OS now-playing and the cursor throttle',
+      () {
     test('a same-session chunk that a lane edit made stale is not applied',
         () async {
       final uuids = List.generate(100, (i) => 'w$i');
@@ -2232,7 +2326,10 @@ void main() {
     });
   });
 
-  group('5B.0d audit (a) minors', () {
+  // Was "5B.0d audit (a) minors".
+  group(
+      'native looping, late load failures, failure runs, the OS now-playing, startup restore and quality rebuilds',
+      () {
     test('a queue edit decides native looping from the new total', () async {
       final uuids = List.generate(30, (i) => 'q$i');
       await fixture.insertSingles([...uuids, ...List.generate(30, (i) => 'r$i')]);
@@ -3503,7 +3600,7 @@ void main() {
       positionMs: 1000,
     );
     final readiness = SessionReadiness();
-    final offline = _MutableOffline();
+    final offline = TestOffline(false);
     final c = createContainer(readiness: readiness, offlineNotifier: () => offline);
     c.read(queuePlayerProvider);
     await pumpEventQueue(times: 50);
@@ -4118,6 +4215,7 @@ void main() {
         // Tell the fake to treat the next file→null transition on the
         // current item as an offline rescue.
         fakePlayer.offlineForRefresh = true;
+        final plays = fakePlayer.playCalls;
         await markDeleted('a', '/dl/a');
         downloadStatusController.add(1);
         await Future<void>.delayed(Duration.zero);
@@ -4130,6 +4228,80 @@ void main() {
           reason: 'refresh should report a flipping file → stream',
         );
         expect(c.read(currentTrackProvider)?.uuidId, 'c');
+        expect(fakePlayer.playCalls, plays + 1,
+            reason: 'it was playing: the next downloaded track plays');
+        expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      },
+    );
+
+    // Pre-merge A6-01: the rule of sign-off DEV-8-09 (paused lands paused)
+    // also holds when the current track's download goes away offline.
+    test(
+      'paused: when the current download is deleted offline, the next '
+      'downloaded track becomes current and stays paused',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('c', '/dl/c');
+
+        final c = createContainer(offline: true);
+        final notifier = c.read(queuePlayerProvider.notifier);
+        await playFromTrackList(c, const ['a', 'b', 'c'],
+            await fixture.track('a'), sourceType: 'search');
+        await pumpEventQueue();
+        await notifier.pause();
+        await pumpEventQueue();
+        expect(c.read(audioPlayWhenReadyProvider), isFalse);
+
+        downloadStatusController.add(0);
+        await pumpEventQueue();
+        fakePlayer.offlineForRefresh = true;
+        final plays = fakePlayer.playCalls;
+        await markDeleted('a', '/dl/a');
+        downloadStatusController.add(1);
+        await pumpEventQueue();
+
+        expect(fakePlayer.rescuedItemIds, hasLength(1),
+            reason: 'the engine handed the missing current file to the core');
+        expect(c.read(currentTrackProvider)?.uuidId, 'c');
+        expect(fakePlayer.playCalls, plays,
+            reason: 'a paused player never starts by itself');
+        expect(fakePlayer.wantsPlaying, isFalse);
+        expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      },
+    );
+
+    // Pre-merge A6-01, review R1: only the rescue of the current item keeps
+    // a pause. A natural advance onto a track that is not downloaded plays
+    // on, even when the engine reports "not playing" for that track (its
+    // stream cannot load) before the core has moved past it.
+    test(
+      'playing: a natural advance onto a track that is not downloaded plays '
+      'the next downloaded one, whatever the engine reports meanwhile',
+      () async {
+        await fixture.insertSingles(['a', 'b', 'c']);
+        await markDownloaded('a', '/dl/a');
+        await markDownloaded('c', '/dl/c');
+
+        final c = createContainer(offline: true);
+        await playFromTrackList(c, const ['a', 'b', 'c'],
+            await fixture.track('a'), sourceType: 'search');
+        await pumpEventQueue();
+        final b = (await repo.getPlaybackEntries(
+                c.read(queuePlayerProvider).queue.sessionId!))
+            .firstWhere((e) => e.uuidId == 'b');
+        final plays = fakePlayer.playCalls;
+
+        fakePlayer.emitUnavailableAdvance(
+            UnavailableAdvance(itemId: b.itemId, playPosition: b.playPosition));
+        fakePlayer.emitPlayerState(
+            const EngineTransportState(false, EngineProcessingState.completed));
+        await pumpEventQueue();
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'c');
+        expect(fakePlayer.playCalls, plays + 1,
+            reason: 'the person was listening: playback goes on');
+        expect(fakePlayer.wantsPlaying, isTrue);
       },
     );
 
@@ -4342,16 +4514,21 @@ void main() {
   // reconciles the current track (SC-27)." No playback-core change: the
   // tombstone's queue edit and the sync state reach the player as in the
   // app (`SyncService._deleteTracks` → `TrackSyncState` → reconcile).
-  group('8B.2b: a sync tombstone of queued tracks', () {
-    Future<void> tombstone(List<String> uuids) async {
-      // What `SyncService._deleteTracks` does, in its order.
-      await repo.removeTrackUuidsFromQueues(uuids);
-      for (final u in uuids) {
-        await db.customStatement(
-            'DELETE FROM trackmetadata WHERE uuid_id = ?', [u]);
-        await db.customStatement('DELETE FROM tracks WHERE uuid_id = ?', [u]);
-      }
+  /// What `SyncService._deleteTracks` does to the database for a tombstone,
+  /// in its order (the sync state it publishes is up to the caller).
+  Future<QueueTrackRemovalResult> deleteTracksAsSync(
+      List<String> uuids) async {
+    final removal = await repo.removeTrackUuidsFromQueues(uuids);
+    for (final u in uuids) {
+      await db.customStatement(
+          'DELETE FROM trackmetadata WHERE uuid_id = ?', [u]);
+      await db.customStatement('DELETE FROM tracks WHERE uuid_id = ?', [u]);
     }
+    return removal;
+  }
+
+  group('8B.2b: a sync tombstone of queued tracks', () {
+    Future<void> tombstone(List<String> uuids) => deleteTracksAsSync(uuids);
 
     test('the playing downloaded track and a future entry: both leave the '
         'queue, the player lands on a survivor, and no seed names the '
@@ -4430,20 +4607,15 @@ void main() {
   // sync removes the playing track, playback lands on the next survivor in
   // play order; only repeat-all wraps; at the end otherwise it stops there
   // (no restart from the first track, no autoplay).
-  group('U20-B-01: where playback lands after a sync removes the playing '
-      'track', () {
+  // Was "U20-B-01: where playback lands after a sync removes the playing track".
+  group('where playback lands after a sync removes the playing track', () {
     var version = 0;
     setUp(() => version = 0);
 
     /// The tombstone as `SyncService._deleteTracks` applies it, and the sync
     /// state it publishes.
     Future<void> tombstone(_ScriptedSync sync, List<String> uuids) async {
-      final removal = await repo.removeTrackUuidsFromQueues(uuids);
-      for (final u in uuids) {
-        await db.customStatement(
-            'DELETE FROM trackmetadata WHERE uuid_id = ?', [u]);
-        await db.customStatement('DELETE FROM tracks WHERE uuid_id = ?', [u]);
-      }
+      final removal = await deleteTracksAsSync(uuids);
       version++;
       sync.push(TrackSyncState(
         queueMutationVersion: version,
@@ -5066,8 +5238,8 @@ void main() {
     });
   });
 
-  group('Sign-off DEV-6-01 (owner, 2026-11-17): shuffle off restores the '
-      'whole original order, on every queue', () {
+  // Was "Sign-off DEV-6-01 (owner, 2026-11-17): shuffle off restores the whole original order, on every queue".
+  group('shuffle off restores the whole original order, on every queue', () {
     // Replaces the 6A.1b group "shuffle toggles keep the played prefix".
     const canonical = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 
@@ -5247,8 +5419,8 @@ void main() {
   // canonical rewrite of its own. The tests that built a "kept shuffled
   // prefix" by turning shuffle off (a state the toggle no longer makes)
   // were removed with that machinery; the rest are kept or rewritten here.
-  group('Repeat-all and repeat-one with the shuffle toggle (DEV-6-01; was '
-      '6-R1-01)', () {
+  // Was "Repeat-all and repeat-one with the shuffle toggle (DEV-6-01; was 6-R1-01)".
+  group('repeat-all and repeat-one with the shuffle toggle', () {
     const canonical = ['a', 'b', 'c', 'd', 'e'];
 
     /// A shuffled collection queue under repeat-all, at its first track.
@@ -5335,9 +5507,41 @@ void main() {
       await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // one
       await c.read(queuePlayerProvider.notifier).toggleShuffle(); // off
       expect(await orderOf(c), canonical);
+      fakePlayer.emitPosition(const Duration(seconds: 30));
+      await pumpEventQueue();
+      final plays = fakePlayer.playCalls;
+      final seeks = fakePlayer.seekedItems.length;
+      final seeds = fakePlayer.seedCalls.length;
       await skip(c, 1);
       expect(current(c), shuffled.last);
       expect(await orderOf(c), canonical);
+      expect(fakePlayer.position, Duration.zero,
+          reason: 'the current track restarts from its start');
+      expect(fakePlayer.playCalls, plays + 1, reason: 'and plays');
+      expect((fakePlayer.seekedItems.length, fakePlayer.seedCalls.length),
+          (seeks, seeds), reason: 'no other item is loaded or sought');
+    });
+
+    test('repeat-one: Previous restarts the current track and changes no '
+        'order', () async {
+      final (c, shuffled) = await shuffledRepeatAll();
+      await skip(c, 2);
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // one
+      final order = await orderOf(c);
+      fakePlayer.emitPosition(const Duration(seconds: 2)); // within 3 s
+      await pumpEventQueue();
+      final plays = fakePlayer.playCalls;
+      final seeks = fakePlayer.seekedItems.length;
+      final seeds = fakePlayer.seedCalls.length;
+      await c.read(queuePlayerProvider.notifier).skipPrevious();
+      await pumpEventQueue();
+      expect(current(c), shuffled[2]);
+      expect(await orderOf(c), order);
+      expect(fakePlayer.position, Duration.zero,
+          reason: 'the current track restarts from its start');
+      expect(fakePlayer.playCalls, plays + 1, reason: 'and plays');
+      expect((fakePlayer.seekedItems.length, fakePlayer.seedCalls.length),
+          (seeks, seeds), reason: 'no other item is loaded or sought');
     });
 
     /// Quit and relaunch: a new player and engine over the same database.
@@ -5524,8 +5728,8 @@ void main() {
     });
   });
 
-  group('Sign-off OPEN-6-04 (owner, 2026-11-17): a track added after the '
-      'queue has ended', () {
+  // Was "Sign-off OPEN-6-04 (owner, 2026-11-17): a track added after the queue has ended".
+  group('a track added after the queue has ended', () {
     String? current(ProviderContainer c) =>
         c.read(currentTrackProvider)?.uuidId;
 
@@ -5714,6 +5918,10 @@ void main() {
           EngineTransportState(true, EngineProcessingState.ready));
       await pumpEventQueue();
       final plays = fakePlayer.playCalls;
+      // Read before the edit is held: the held edit's transaction makes
+      // outside reads wait until it commits (section 6 #1).
+      final y = await fixture.track('y');
+      final z = await fixture.track('z');
       // Near c's end two adds are in the lane; c ends while the first one
       // edits the queue, before the end's own task runs.
       final gate = Completer<void>();
@@ -5721,9 +5929,9 @@ void main() {
         repo.afterReplacePlayOrder = null;
         await gate.future;
       };
-      final first = addToQueue(c, [await fixture.track('y')]);
+      final first = addToQueue(c, [y]);
       await pumpEventQueue();
-      final second = addToQueue(c, [await fixture.track('z')]);
+      final second = addToQueue(c, [z]);
       await pumpEventQueue();
       fakePlayer.emitPlayerState(
           EngineTransportState(false, EngineProcessingState.completed));
@@ -5840,8 +6048,8 @@ void main() {
     });
   });
 
-  group('6-R3-01: an end masked by a pending native insert is a real end',
-      () {
+  // Was "6-R3-01: an end masked by a pending native insert is a real end".
+  group('an end masked by a pending native insert is a real end', () {
     String? current(ProviderContainer c) =>
         c.read(currentTrackProvider)?.uuidId;
 
@@ -6307,8 +6515,31 @@ void main() {
       return null;
     }
 
-    test('a preview acquire pauses the library and is granted only once the '
-        'engine reports it is not playing', () async {
+    // Pre-merge A6-07: the real order. `JustAudioEngine.pause` reports "not
+    // playing" inside the call, before the hand-over starts waiting for it;
+    // the fake now does the same.
+    test('a preview acquire pauses the library and is granted on the '
+        'engine\'s own pause report, without waiting out the bound',
+        () async {
+      final c = createContainer(focus: focus);
+      await libraryHolds(c);
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(fakePlayer.pauseCalls, 1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      expect(granted, isTrue,
+          reason: 'the pause itself reported; nothing later is needed');
+      expect(timers.active, isEmpty, reason: 'the 3 s bound never ran out');
+      expect(focus.holder, AudioOutput.preview);
+    });
+
+    // Was "a preview acquire pauses the library and is granted only once the
+    // engine reports it is not playing": that order (a pause whose report
+    // comes later) is not one today's engine produces. Kept for the wait
+    // itself: an engine that reports late still holds the grant.
+    test('an engine whose pause report comes late: the preview is granted '
+        'only once it reports it is not playing', () async {
+      fakePlayer = _LateReportEngine();
       final c = createContainer(focus: focus);
       await libraryHolds(c);
       bool? granted;
@@ -6316,6 +6547,29 @@ void main() {
       expect(fakePlayer.pauseCalls, 1);
       expect(c.read(audioPlayWhenReadyProvider), isFalse);
       expect(granted, isNull, reason: 'the engine still reports playing');
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      expect(granted, isTrue);
+      expect(focus.holder, AudioOutput.preview);
+    });
+
+    test('a hand-over whose lane step fails (its cursor save) is published '
+        'as a task failure, '
+        'and the preview still gets the output once the engine stops',
+        () async {
+      final c = createContainer(focus: focus);
+      final issues = <PlaybackIssue>[];
+      final sub = c.read(playbackIssueBusProvider).issues.listen(issues.add);
+      addTearDown(sub.cancel);
+      await libraryHolds(c);
+      repo.cursorSaveError = StateError('db gone'); // the pause's cursor save
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(fakePlayer.pauseCalls, 1);
+      final failures = issues.whereType<PlaybackTaskFailed>().toList();
+      expect(failures.map((f) => f.task), ['relinquish']);
+      expect(failures.single.error, isA<StateError>());
       fakePlayer.emitPlayerState(
           const EngineTransportState(false, EngineProcessingState.ready));
       await pumpEventQueue();
@@ -6392,6 +6646,175 @@ void main() {
       expect(focus.holder, AudioOutput.preview);
     });
 
+    // Pre-merge R2-L-02: the output handed back unused (a preview that
+    // never sounded was paused or closed).
+    group('the output comes back unused', () {
+      test('after the hand-over: the library plays again what the hand-over '
+          'paused, without a new seed or seek', () async {
+        final c = createContainer(focus: focus);
+        await libraryHolds(c);
+        bool? granted;
+        await acquirePreview((g) => granted = g);
+        expect(granted, isTrue);
+        expect(c.read(audioPlayWhenReadyProvider), isFalse);
+        final plays = fakePlayer.playCalls;
+        final seeds = fakePlayer.seedCalls.length;
+        focus.handBack(AudioOutput.preview);
+        await pumpEventQueue();
+        expect(fakePlayer.playCalls, plays + 1);
+        expect(c.read(audioPlayWhenReadyProvider), isTrue);
+        expect(focus.holder, AudioOutput.queue);
+        expect(fakePlayer.seedCalls, hasLength(seeds));
+        expect(fakePlayer.seekedItems, isEmpty);
+      });
+
+      test('while the hand-over waits behind a busy lane: the library is '
+          'never paused and nothing is played twice', () async {
+        final c = createContainer(focus: focus);
+        await libraryHolds(c);
+        final gate = Completer<void>();
+        fakePlayer.beforeSeed = (_) => gate.future; // the lane is busy
+        unawaited(playFromTrackList(c, const ['a', 'b'],
+            await fixture.track('a'), sourceType: 'search'));
+        await pumpEventQueue();
+        bool? granted;
+        await acquirePreview((g) => granted = g);
+        expect(granted, isNull);
+        final plays = fakePlayer.playCalls;
+        focus.handBack(AudioOutput.preview);
+        await pumpEventQueue();
+        expect(granted, isFalse);
+        gate.complete();
+        fakePlayer.beforeSeed = null;
+        await pumpEventQueue();
+        expect(fakePlayer.pauseCalls, 0);
+        expect(fakePlayer.playCalls, plays + 1,
+            reason: 'only the play of the queue that was being started');
+        expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      });
+
+      test('after the library paused but before it acknowledged: it plays '
+          'again', () async {
+        fakePlayer = _LateReportEngine();
+        final c = createContainer(focus: focus);
+        await libraryHolds(c);
+        bool? granted;
+        await acquirePreview((g) => granted = g);
+        expect(fakePlayer.pauseCalls, 1);
+        expect(granted, isNull);
+        final plays = fakePlayer.playCalls;
+        focus.handBack(AudioOutput.preview);
+        await pumpEventQueue();
+        expect(granted, isFalse);
+        expect(fakePlayer.playCalls, plays + 1);
+        expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      });
+
+      // Re-check finding R1: while the hand-over is still pending the
+      // library hears an unplug or an interruption too; whatever the preview
+      // does afterwards, the music must not start by itself.
+      for (final (what, event) in <(String, AudioSessionEvent)>[
+        ('headphones were unplugged', const AudioBecameNoisy()),
+        ('an OS interruption began',
+            const AudioInterruptionBegan(AudioInterruptionKind.pause)),
+      ]) {
+        test('$what while the hand-over was pending: the library does not '
+            'play again when the output comes back', () async {
+          fakePlayer = _LateReportEngine();
+          final c = createContainer(focus: focus);
+          await libraryHolds(c);
+          bool? granted;
+          await acquirePreview((g) => granted = g);
+          expect(fakePlayer.pauseCalls, 1);
+          expect(granted, isNull, reason: 'precondition: still pending');
+          sessionPort.emit(event);
+          await pumpEventQueue();
+          final plays = fakePlayer.playCalls;
+          focus.handBack(AudioOutput.preview);
+          await pumpEventQueue();
+          expect(fakePlayer.playCalls, plays);
+          expect(c.read(audioPlayWhenReadyProvider), isFalse);
+        });
+      }
+
+      // Pre-merge R3-L-01: the leave path must not touch a player that is
+      // already gone (a page left while the session scope is torn down).
+      test('the output comes back as the player is disposed: nothing is '
+          'played and no error is raised', () async {
+        // A bus the container does not close, so that a failure reported
+        // after the dispose is still seen.
+        final bus = PlaybackIssueBus();
+        addTearDown(bus.dispose);
+        final issues = <PlaybackIssue>[];
+        final sub = bus.issues.listen(issues.add);
+        addTearDown(sub.cancel);
+        final c = createContainer(focus: focus, extraOverrides: [
+          playbackIssueBusProvider.overrideWithValue(bus),
+        ]);
+        await libraryHolds(c);
+        bool? granted;
+        await acquirePreview((g) => granted = g);
+        expect(granted, isTrue);
+        final plays = fakePlayer.playCalls;
+        final errors = <Object>[];
+        await runZonedGuarded(() async {
+          focus.handBack(AudioOutput.preview);
+          c.dispose();
+          container = null;
+          await pumpEventQueue();
+        }, (error, _) => errors.add(error));
+        expect(errors, isEmpty);
+        expect(issues.whereType<PlaybackTaskFailed>().map((f) => f.task),
+            isEmpty, reason: 'the disposed player was not touched');
+        expect(fakePlayer.playCalls, plays);
+      });
+
+      test('a library that was paused before the hand-over stays paused',
+          () async {
+        final c = createContainer(focus: focus);
+        final notifier = await libraryHolds(c);
+        await notifier.pause();
+        await pumpEventQueue();
+        bool? granted;
+        await acquirePreview((g) => granted = g);
+        expect(granted, isTrue);
+        final plays = fakePlayer.playCalls;
+        focus.handBack(AudioOutput.preview);
+        await pumpEventQueue();
+        expect(fakePlayer.playCalls, plays);
+        expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      });
+
+      test('a library the person paused after the hand-over stays paused',
+          () async {
+        final c = createContainer(focus: focus);
+        final notifier = await libraryHolds(c);
+        bool? granted;
+        await acquirePreview((g) => granted = g);
+        expect(granted, isTrue);
+        await notifier.pause();
+        final plays = fakePlayer.playCalls;
+        focus.handBack(AudioOutput.preview);
+        await pumpEventQueue();
+        expect(fakePlayer.playCalls, plays);
+        expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      });
+
+      test('a library stopped after the hand-over stays stopped', () async {
+        final c = createContainer(focus: focus);
+        final notifier = await libraryHolds(c);
+        bool? granted;
+        await acquirePreview((g) => granted = g);
+        expect(granted, isTrue);
+        await notifier.stop();
+        final plays = fakePlayer.playCalls;
+        focus.handBack(AudioOutput.preview);
+        await pumpEventQueue();
+        expect(fakePlayer.playCalls, plays);
+        expect(c.read(queuePlayerProvider).queue.sessionId, isNull);
+      });
+    });
+
     test('R1-02: a transfer refused at the bound does not pause the library '
         'later', () async {
       final c = createContainer(focus: focus);
@@ -6459,8 +6882,14 @@ void main() {
       _expectNoOverlap(output);
     });
 
-    test('7-R1-23: preview closed before the library acknowledged: after the '
-        'user resumes, the next natural end still plays on', () async {
+    // The order 7-R1-23 was first written for: the library's pause ran, and
+    // the preview closed before the acknowledgement. With today's engine that
+    // window is the pause's cursor save (the pause itself reports at once);
+    // an engine that reports late stands in for it here.
+    test('7-R1-23: preview closed after the library paused but before it '
+        'acknowledged: after the user resumes, the next natural end still '
+        'plays on', () async {
+      fakePlayer = _LateReportEngine();
       final c = createContainer(focus: focus);
       final notifier = await libraryHolds(c, uuids: const ['a', 'b', 'c']);
       bool? granted;
@@ -6488,10 +6917,54 @@ void main() {
       expect(c.read(audioPlayWhenReadyProvider), isTrue);
       expect(focus.holder, AudioOutput.queue);
     });
+
+    // Changed with the fake's pause report (pre-merge A6-07). It used to
+    // pause, leave the engine "still playing", then close the preview: with
+    // a pause reported inside the call the hand-over is already granted by
+    // then. The preview can still close before the acknowledgement while the
+    // library's lane is busy, so the pause has not run yet; that is the
+    // order here. The rule it guards is the same: a transfer that was
+    // superseded gave nothing away.
+    test('7-R1-23: preview closed before the library acknowledged (its lane '
+        'was still busy): the library is not paused, and the next natural '
+        'end still plays on', () async {
+      final c = createContainer(focus: focus);
+      await libraryHolds(c, uuids: const ['a', 'b', 'c']);
+      final gate = Completer<void>();
+      fakePlayer.beforeSeed = (_) => gate.future; // the lane is busy
+      unawaited(playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('a'), sourceType: 'search'));
+      await pumpEventQueue();
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(granted, isNull, reason: 'the pause waits behind the lane');
+      focus.giveUp(AudioOutput.preview); // preview closed before the ack
+      await pumpEventQueue();
+      expect(granted, isFalse);
+      expect(focus.holder, AudioOutput.queue);
+      gate.complete();
+      fakePlayer.beforeSeed = null;
+      await pumpEventQueue();
+      expect(fakePlayer.pauseCalls, 0,
+          reason: 'the library gave nothing away: it keeps playing');
+
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      final plays = fakePlayer.playCalls;
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.completed));
+      await pumpEventQueue();
+
+      expect(fakePlayer.playCalls, greaterThan(plays),
+          reason: 'the library still holds the output: its advance plays');
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      expect(focus.holder, AudioOutput.queue);
+    });
   });
 
-  group('7B.2a exit proof: preview and the library never overlap (7-U10, '
-      '7-L06)', () {
+  // Was "7B.2a exit proof: preview and the library never overlap (7-U10, 7-L06)".
+  group('preview and the library never overlap', () {
     late AudioFocus focus;
     late List<String> output;
     late _GatedPlugin plugin;
@@ -6595,6 +7068,109 @@ void main() {
       expect(c.read(audioPlayWhenReadyProvider), isFalse);
       expect(focus.holder, AudioOutput.preview);
       _expectNoOverlap(output);
+    });
+
+    // Pre-merge R2-L-02 (live case R5: Play preview, Pause 20 ms later).
+    group('a preview that never sounded gives the music back', () {
+      List<String> library() =>
+          [for (final e in output) if (e.startsWith('library')) e];
+
+      /// Music plays; a preview is started and still loads (the library has
+      /// already handed the output over).
+      Future<ProviderContainer> previewLoading() async {
+        final c = await libraryPlaying();
+        unawaited(c.read(previewControlsProvider).playStaged('i1'));
+        await pumpEventQueue();
+        expect(library(), ['library on', 'library off']);
+        expect(c.read(previewPlayerProvider).status, PreviewStatus.loading);
+        return c;
+      }
+
+      void expectMusicPlaysOn(ProviderContainer c) {
+        expect(library(), ['library on', 'library off', 'library on']);
+        expect(output, isNot(contains('preview on')));
+        expect(c.read(audioPlayWhenReadyProvider), isTrue);
+        expect(focus.holder, AudioOutput.queue);
+        expect(c.read(currentTrackProvider)?.uuidId, 'a');
+        expect(plugin.loadCalls, 1, reason: 'the same track, never reloaded');
+        verifyNever(() => plugin.seek(any(), index: any(named: 'index')));
+        _expectNoOverlap(output);
+      }
+
+      test('paused while it still loads: the music plays on, same track and '
+          'position; Resume then pauses the music and plays the preview',
+          () async {
+        final c = await previewLoading();
+        await c.read(previewControlsProvider).pause();
+        await pumpEventQueue();
+        expectMusicPlaysOn(c);
+        expect(c.read(previewPlayerProvider).status, PreviewStatus.paused);
+        previews.last.finishLoad(null); // the late load never sounds
+        await pumpEventQueue();
+        expectMusicPlaysOn(c);
+
+        unawaited(c.read(previewControlsProvider).resume());
+        await pumpEventQueue();
+        previews.last.finishLoad(null);
+        await pumpEventQueue();
+        expect(library().last, 'library off');
+        expect(output.last, 'preview on');
+        expect(c.read(previewPlayerProvider).status, PreviewStatus.playing);
+        _expectNoOverlap(output);
+      });
+
+      test('closed while it still loads: the music plays on', () async {
+        final c = await previewLoading();
+        await c.read(previewControlsProvider).close();
+        await pumpEventQueue();
+        expectMusicPlaysOn(c);
+        expect(c.read(previewPlayerProvider).status, PreviewStatus.idle);
+      });
+
+      // Review finding 1: an unplug or an OS interruption reaches only the
+      // preview while it holds the output; a later close must not start the
+      // music (from the speaker, or during a call).
+      for (final (what, event) in <(String, AudioSessionEvent)>[
+        ('headphones were unplugged', const AudioBecameNoisy()),
+        ('an OS interruption began',
+            const AudioInterruptionBegan(AudioInterruptionKind.pause)),
+      ]) {
+        test('$what while it loaded: closing it afterwards does not start '
+            'the music', () async {
+          final c = await previewLoading();
+          sessionPort.emit(event);
+          await pumpEventQueue();
+          expect(c.read(previewPlayerProvider).status, PreviewStatus.paused);
+          await c.read(previewControlsProvider).close();
+          await pumpEventQueue();
+          expect(library(), ['library on', 'library off']);
+          expect(c.read(audioPlayWhenReadyProvider), isFalse);
+        });
+      }
+
+      test('music that was paused before the preview stays paused',
+          () async {
+        final c = await libraryPlaying();
+        await c.read(queuePlayerProvider.notifier).pause();
+        await pumpEventQueue();
+        unawaited(c.read(previewControlsProvider).playStaged('i1'));
+        await pumpEventQueue();
+        await c.read(previewControlsProvider).pause();
+        await pumpEventQueue();
+        expect(library().where((e) => e == 'library on'), hasLength(1));
+        expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      });
+
+      test('music the person paused while the preview loaded stays paused',
+          () async {
+        final c = await previewLoading();
+        await c.read(queuePlayerProvider.notifier).pause();
+        await pumpEventQueue();
+        await c.read(previewControlsProvider).pause();
+        await pumpEventQueue();
+        expect(library().where((e) => e == 'library on'), hasLength(1));
+        expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      });
     });
 
     test('closing preview leaves the library paused', () async {
@@ -7250,8 +7826,8 @@ void main() {
   // "any library resume/play ... first stops preview"); the engine's play()
   // takes the output back through beforePlay. The yield guard on reseeds is
   // for automatic plays only.
-  group('7-R1-24: a user resume of an untrusted engine while preview holds',
-      () {
+  // Was "7-R1-24: a user resume of an untrusted engine while preview holds".
+  group('a user resume of an untrusted engine while preview holds', () {
     late FakeTimers timers;
     late AudioFocus focus;
     late RelinquishingOwner preview;
@@ -7525,7 +8101,10 @@ void main() {
   });
 
   // 7P.1 in-piece review round 1 (`7P.1-review.md`).
-  group('7P.1 review r1', () {
+  // Was "7P.1 review r1".
+  group(
+      'an untrusted engine: rebuilds onto settled items, failed pauses and reseeds',
+      () {
     Future<QueuePlayer> started(ProviderContainer c) async {
       await fixture.insertSingles(['a', 'b', 'c']);
       await playFromTrackList(c, ['a', 'b', 'c'], await fixture.track('a'),
@@ -7734,7 +8313,8 @@ void main() {
   // Sign-off OPEN-M-11 step D, review r1 F3/F5: while the server check failed
   // a stream behaves like a non-downloaded item offline, and the gate's
   // verdicts reach the engine through the queue player's lane.
-  group('OPEN-M-11 step D: media token', () {
+  // Was "OPEN-M-11 step D: media token".
+  group('media tokens: unavailable streams and gate verdicts in the lane', () {
     test('streams unavailable (the check failed): a request for a track '
         'that is not downloaded is refused like offline', () async {
       await fixture.insertSingles(['a', 'b']);
@@ -7759,7 +8339,7 @@ void main() {
         'check releases what is ahead, a different server stops a streamed '
         'current item and releases everything', () async {
       await fixture.insertSingles(['a', 'b']);
-      final engine = _TokenAwareEngine();
+      final engine = TokenAwareFakeEngine();
       fakePlayer = engine;
       final gate = _StatesGate();
       addTearDown(gate.close);
@@ -7795,8 +8375,10 @@ void main() {
     });
   });
 
-  group('U17-FE-PB-CORE-B-01: a queue edit does not overwrite engine reports '
-      'that arrive while it reads', () {
+  // Was "U17-FE-PB-CORE-B-01: a queue edit does not overwrite engine reports that arrive while it reads".
+  group(
+      'a queue edit does not overwrite engine reports that arrive while it reads',
+      () {
     test('an engine report during the edit\'s queue read is kept: playing, '
         'not loading', () async {
       await fixture.insertSingles(['a', 'b', 'c', 'd']);
@@ -7883,7 +8465,8 @@ void main() {
     });
   });
 
-  group('U17-FE-PB-CORE-B-02: Stop keeps the volume', () {
+  // Was "U17-FE-PB-CORE-B-02: Stop keeps the volume".
+  group('Stop keeps the volume', () {
     test('after Stop the shown volume is the one the engine still uses',
         () async {
       await fixture.insertSingles(['a', 'b']);
@@ -7906,8 +8489,8 @@ void main() {
     });
   });
 
-  group('U17-FE-PB-CORE-B-04: a failure classified after the listener moved '
-      'on writes nothing', () {
+  // Was "U17-FE-PB-CORE-B-04: a failure classified after the listener moved on writes nothing".
+  group('a failure classified after the listener moved on writes nothing', () {
     Future<String?> damagedPathOf(String uuid) async =>
         (await (db.select(db.tracks)..where((t) => t.uuidId.equals(uuid)))
                 .getSingle())
@@ -8030,6 +8613,364 @@ void main() {
       expect(await damagedPathOf('a'), '/dl/a');
     });
   });
+
+  // Was "section 6 #1 (U20-FE-QUEUE-A-01): Play next and Add to queue write the new order in one transaction".
+  group(
+      'Play next and Add to queue write the new order in one transaction',
+      () {
+    Future<(ProviderContainer, int)> playingABC() async {
+      await fixture.insertSingles(['a', 'b', 'c', 'x', 'y']);
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b', 'c'], await fixture.track('a'),
+          sourceType: 'test');
+      await pumpEventQueue();
+      return (c, c.read(queuePlayerProvider).queue.sessionId!);
+    }
+
+    Future<List<String>> order(int sessionId) async =>
+        [for (final r in await _orderRows(db, sessionId)) r.$3];
+
+    for (final (position, expected) in [
+      (EnqueuePosition.next, ['a', 'x', 'y', 'b', 'c']),
+      (EnqueuePosition.end, ['a', 'x', 'y', 'b', 'c']),
+    ]) {
+      test('${position.name}: a failed order rewrite leaves the queue as it '
+          'was (no tracks stranded at the end)', () async {
+        final (c, sessionId) = await playingABC();
+        repo.replacePlayOrderError = StateError('disk full');
+        final outcome = await c
+            .read(playbackRequestsProvider)
+            .submit(Enqueue(const ['x', 'y'], position));
+        expect(outcome, isA<Failed>());
+        expect(await order(sessionId), ['a', 'b', 'c']);
+        expect((await db.select(db.queueSessionItems).get())
+            .where((i) => i.sessionId == sessionId)
+            .map((i) => i.uuidId), unorderedEquals(['a', 'b', 'c']),
+            reason: 'the added items are rolled back with the order');
+        // The queue still works as before.
+        expect(await c.read(playbackRequestsProvider)
+            .submit(Enqueue(const ['x', 'y'], position)), isA<Accepted>());
+        expect(await order(sessionId), expected);
+      });
+
+      test('${position.name}: a reader outside the edit never sees the added '
+          'tracks appended but not yet ordered', () async {
+        final (c, sessionId) = await playingABC();
+        final held = Completer<void>();
+        final entered = Completer<void>();
+        repo.beforeReplacePlayOrder = (_) async {
+          repo.beforeReplacePlayOrder = null;
+          entered.complete();
+          await held.future;
+        };
+        final outcome = c
+            .read(playbackRequestsProvider)
+            .submit(Enqueue(const ['x', 'y'], position));
+        await entered.future; // the items are written; the order is not yet
+        final outside = order(sessionId);
+        await pumpEventQueue();
+        held.complete();
+        expect(await outcome, isA<Accepted>());
+        expect(await outside, expected,
+            reason: 'the outside read sees the queue before or after the '
+                'edit, never in between');
+        expect(await order(sessionId), expected);
+      });
+    }
+  });
+
+  // Pre-merge A6-06: like Play next and Add to queue above (decision 1 of
+  // 2026-11-17), the shuffle toggle writes its flag and its order together.
+  group('Shuffle on/off writes the flag and the play order in one transaction',
+      () {
+    const album = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+
+    Future<(ProviderContainer, int)> playingAlbumAtD() async {
+      await fixture.insertAlbum(artist: 'Artist', album: 'Album', uuids: album);
+      final c = createContainer(random: Random(1));
+      await playFromQueue(c, track: await fixture.track('d'),
+          sourceType: 'album',
+          artistId: 1,
+          albumId: 1,
+          orderParams: [OrderParameter(column: 'track_number')]);
+      await pumpEventQueue();
+      return (c, c.read(queuePlayerProvider).queue.sessionId!);
+    }
+
+    Future<List<String>> order(int sessionId) async =>
+        [for (final r in await _orderRows(db, sessionId)) r.$3];
+
+    Future<bool> storedFlag(int sessionId) async =>
+        (await repo.getSessionSnapshot(sessionId))!.session.shuffleEnabled;
+
+    test('on: a failed order rewrite leaves the stored flag off, with the '
+        'unshuffled order', () async {
+      final (c, sessionId) = await playingAlbumAtD();
+      repo.replacePlayOrderError = StateError('disk full');
+      await expectLater(
+          c.read(queuePlayerProvider.notifier).toggleShuffle(),
+          throwsStateError);
+      expect(await order(sessionId), album);
+      expect(await storedFlag(sessionId), isFalse,
+          reason: 'the flag is rolled back with the order');
+      expect(c.read(queuePlayerProvider).shuffle.shuffleOn, isFalse);
+      // The toggle still works afterwards.
+      await c.read(queuePlayerProvider.notifier).toggleShuffle();
+      expect(await storedFlag(sessionId), isTrue);
+      expect(c.read(queuePlayerProvider).shuffle.shuffleOn, isTrue);
+    });
+
+    test('off: a failed order rewrite leaves the stored flag on, with the '
+        'shuffled order', () async {
+      final (c, sessionId) = await playingAlbumAtD();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.toggleShuffle(); // on
+      final shuffled = await order(sessionId);
+      expect(shuffled, isNot(album), reason: 'seeded: really shuffled');
+      repo.replacePlayOrderError = StateError('disk full');
+      await expectLater(notifier.toggleShuffle(), throwsStateError);
+      expect(await order(sessionId), shuffled);
+      expect(await storedFlag(sessionId), isTrue,
+          reason: 'the flag is rolled back with the order');
+      expect(c.read(queuePlayerProvider).shuffle.shuffleOn, isTrue);
+      await notifier.toggleShuffle(); // off works afterwards
+      expect(await storedFlag(sessionId), isFalse);
+      expect(await order(sessionId), album);
+    });
+  });
+
+  // Was "U17-FE-PB-CORE-B-01: a position report during a stop is ignored".
+  group('a position report during a stop is ignored', () {
+    test('while Stop is still finishing, a position report does not move '
+        'the stopping track', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final c = createContainer();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      fakePlayer.emitPosition(const Duration(seconds: 10));
+      await pumpEventQueue();
+      final gate = repo.deactivateGate = Completer<void>();
+      final stopping = notifier.stop();
+      await repo.deactivateEntered.future; // the engine is stopped
+      fakePlayer.emitPosition(const Duration(seconds: 42));
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'a',
+          reason: 'precondition: the track is still shown');
+      expect(c.read(queuePlayerProvider).playback.position,
+          const Duration(seconds: 10));
+      repo.deactivateGate = null;
+      gate.complete();
+      await stopping;
+      expect(c.read(queuePlayerProvider).playback.position, Duration.zero);
+    });
+
+    test('after a quiesce a position report changes nothing', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final c = createContainer();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      await notifier.quiesce();
+      final before = c.read(queuePlayerProvider);
+      fakePlayer.emitPosition(const Duration(seconds: 42));
+      await pumpEventQueue();
+      expect(identical(c.read(queuePlayerProvider), before), isTrue,
+          reason: 'no state is published after the quiesce');
+    });
+  });
+
+  // Was "U17-FE-PB-CORE-B-04: a volume set while the player closes writes nothing afterwards".
+  group('a volume set while the player closes writes nothing afterwards', () {
+    Future<double?> savedVolume() async =>
+        (await SharedPreferences.getInstance()).getDouble('audioVolume');
+
+    test('closed by a reset while the engine applied it: no state, no saved '
+        'preference after the close', () async {
+      await fixture.insertSingles(['a']);
+      final c = createContainer();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await pumpEventQueue();
+      final gate = fakePlayer.setVolumeGate = Completer<void>();
+      final setting = notifier.setVolume(0.3);
+      await notifier.quiesce(); // the reset closes the player ...
+      (await SharedPreferences.getInstance()).clear(); // ... and wipes prefs
+      gate.complete();
+      await setting;
+      expect(await savedVolume(), isNull,
+          reason: 'the next user does not inherit this volume');
+      expect(c.read(queuePlayerProvider).playback.volume, isNot(0.3));
+    });
+
+    test('its scope disposed while the engine applied it: completes without '
+        'an error and saves nothing', () async {
+      await fixture.insertSingles(['a']);
+      final c = createContainer();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await pumpEventQueue();
+      final gate = fakePlayer.setVolumeGate = Completer<void>();
+      final setting = notifier.setVolume(0.3);
+      c.dispose();
+      container = null;
+      gate.complete();
+      await expectLater(setting, completes);
+      expect(await savedVolume(), isNull);
+    });
+
+    test('an open player still applies and saves it (control)', () async {
+      final c = createContainer();
+      await pumpEventQueue();
+      await c.read(queuePlayerProvider.notifier).setVolume(0.3);
+      expect(c.read(queuePlayerProvider).playback.volume, 0.3);
+      expect(await savedVolume(), 0.3);
+    });
+  });
+
+  // Was "section 6 #6 (U17-FE-PB-CORE-B-06): an internal error while preparing playback is a failure".
+  group('an internal error while preparing playback is a failure', () {
+    Future<(ProviderContainer, AudioState)> playingAB() async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      await pumpEventQueue();
+      return (c, c.read(queuePlayerProvider));
+    }
+
+    Future<void> expectUntouched(ProviderContainer c, AudioState before) async {
+      final after = c.read(queuePlayerProvider);
+      expect(after.queue.sessionId, before.queue.sessionId);
+      expect(after.playback.currentTrack?.uuidId, 'a');
+      expect((await repo.getActiveSession())?.id, before.queue.sessionId);
+      expect((await db.select(db.queueSessions).get()).map((s) => s.id),
+          [before.queue.sessionId], reason: 'no prepared session is left');
+    }
+
+    test('an internal error creating the session is Failed, not "nothing to '
+        'play"', () async {
+      final (c, before) = await playingAB();
+      repo.createSessionError = StateError('db gone');
+      final outcome = await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['c'], 0, ListSource('s')));
+      expect(outcome, isA<Failed>());
+      await expectUntouched(c, before);
+    });
+
+    test('an internal error recording the prepared target is Failed, not '
+        're-resolved into "nothing to play"', () async {
+      final (c, before) = await playingAB();
+      repo.setPreparedCurrentItemError = StateError('db gone');
+      final outcome = await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['c'], 0, ListSource('s')));
+      expect(outcome, isA<Failed>());
+      await expectUntouched(c, before);
+    });
+
+    test('an internal error activating the prepared session is Failed, not '
+        'stale', () async {
+      final (c, before) = await playingAB();
+      repo.beforeActivation = (id) async {
+        repo.beforeActivation = null;
+        repo.failActivationOf = id; // the prepared one: StateError('db gone')
+      };
+      final seeds = fakePlayer.seedCalls.length;
+      final outcome = await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['c'], 0, ListSource('s')));
+      expect(outcome, isA<Failed>());
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      await expectUntouched(c, before);
+    });
+
+    test('a target removed by a sync between resolving and recording it is '
+        're-resolved to its successor, not a failure', () async {
+      final (c, _) = await playingAB();
+      await fixture.insertSingles(['d']);
+      repo.beforeSetPreparedCurrentItem = (sessionId) async {
+        repo.beforeSetPreparedCurrentItem = null;
+        await repo.removeTrackUuidsFromQueues(const ['c']); // a catalog sync
+      };
+      final outcome = await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['c', 'd'], 0, ListSource('s')));
+      expect(outcome, isA<Accepted>());
+      expect(c.read(currentTrackProvider)?.uuidId, 'd');
+    });
+
+    test('a real "nothing to queue" is still RejectedEmpty: no track left, or '
+        'the tapped track not among them', () async {
+      final (c, before) = await playingAB();
+      final requests = c.read(playbackRequestsProvider);
+      expect(
+          await requests.submit(const PlayQuery(
+              source: BrowseSource('library'),
+              currentUuid: 'c',
+              downloadedOnly: true)),
+          isA<RejectedEmpty>(),
+          reason: 'nothing downloaded');
+      await markDownloaded('b', '/dl/b');
+      expect(
+          await requests.submit(const PlayQuery(
+              source: BrowseSource('library'),
+              currentUuid: 'c',
+              downloadedOnly: true)),
+          isA<RejectedEmpty>(),
+          reason: 'the tapped track is not downloaded');
+      await expectUntouched(c, before);
+    });
+
+    // The nine pages that show a failed row tap's message
+    // (showPlaybackOutcome: Tracks twice, Search, Home recents and
+    // suggestions, See all, statistics, ranking, Downloaded) all start it
+    // through LibraryActions.playFromList or playQuery and show
+    // playbackOutcomeMessage of the outcome unchanged.
+    group('the row-tap pages\' message', () {
+      for (final (name, error) in [
+        ('creating', 'create'),
+        ('recording the target', 'target'),
+      ]) {
+        test('an internal error while $name: "Couldn\'t start playback." for '
+            'a list tap and a browse tap', () async {
+          final (c, _) = await playingAB();
+          final actions = c.read(libraryActionsProvider);
+          final track = await fixture.track('c');
+          void arm() => error == 'create'
+              ? repo.createSessionError = StateError('db gone')
+              : repo.setPreparedCurrentItemError = StateError('db gone');
+          arm();
+          expect(
+              playbackOutcomeMessage(
+                  await actions.playFromList([track], 0, source: 'search')),
+              "Couldn't start playback.");
+          if (error == 'target') {
+            arm();
+            expect(
+                playbackOutcomeMessage(
+                    await actions.playQuery(track, downloadedOnly: false)),
+                "Couldn't start playback.");
+          }
+        });
+      }
+
+      test('nothing to play keeps its text for a browse tap', () async {
+        final (c, _) = await playingAB();
+        final outcome = await c
+            .read(libraryActionsProvider)
+            .playQuery(await fixture.track('c'), downloadedOnly: true);
+        expect(playbackOutcomeMessage(outcome),
+            'Nothing to play here right now.');
+      });
+    });
+  });
+}
+
+/// An engine whose pause is not reported inside the call (today's
+/// `JustAudioEngine` reports it there): the report comes when the test
+/// emits it.
+class _LateReportEngine extends FakePlaybackEngine {
+  @override
+  Future<void> pause() async {
+    pauseCalls++;
+    wantsPlaying = false;
+  }
 }
 
 class _LoggingPreviewEngine extends FakePreviewEngine {
@@ -8236,8 +9177,20 @@ class _ObservedStartupRepository extends QueueRepository {
   /// after the wrap's order write).
   Future<void> Function(int sessionId)? afterReplacePlayOrder;
 
+  /// Runs before every play-order rewrite (it may hold it).
+  Future<void> Function(int sessionId)? beforeReplacePlayOrder;
+
+  /// When set, the next play-order rewrite fails with it (one shot).
+  Object? replacePlayOrderError;
+
   @override
   Future<void> replacePlayOrder(int sessionId, List<int> itemIds) async {
+    await beforeReplacePlayOrder?.call(sessionId);
+    final error = replacePlayOrderError;
+    if (error != null) {
+      replacePlayOrderError = null;
+      throw error;
+    }
     await super.replacePlayOrder(sessionId, itemIds);
     await afterReplacePlayOrder?.call(sessionId);
   }
@@ -8254,6 +9207,25 @@ class _ObservedStartupRepository extends QueueRepository {
       throw StateError('db gone');
     }
     return super.activateSession(sessionId);
+  }
+
+  /// When set, the next recording of a prepared target fails with it.
+  Object? setPreparedCurrentItemError;
+
+  /// Runs before every recording of a prepared target (one shot by the
+  /// test that sets it).
+  Future<void> Function(int sessionId)? beforeSetPreparedCurrentItem;
+
+  @override
+  Future<void> setPreparedCurrentItem(
+      int sessionId, int itemId, int expectedPlayPosition) async {
+    await beforeSetPreparedCurrentItem?.call(sessionId);
+    final error = setPreparedCurrentItemError;
+    if (error != null) {
+      setPreparedCurrentItemError = null;
+      return Future.error(error);
+    }
+    return super.setPreparedCurrentItem(sessionId, itemId, expectedPlayPosition);
   }
 
   Completer<void>? trackReadGate;
@@ -8320,7 +9292,7 @@ class _ObservedStartupRepository extends QueueRepository {
   Future<List<QueuePlaybackEntry>> getPlaybackEntries(int sessionId,
       {int startPlayPosition = 0, int? limit}) async {
     final gate = hydrationGate;
-    if (gate != null && limit == 50) {
+    if (gate != null && limit == QueueWindow.hydrationChunk) {
       if (!hydrationEntered.isCompleted) hydrationEntered.complete();
       await gate.future;
     }
@@ -8339,12 +9311,21 @@ class _ObservedStartupRepository extends QueueRepository {
     return super.deactivateAll();
   }
 
+  /// When set, the next cursor save fails with it (a database write that
+  /// fails).
+  Object? cursorSaveError;
+
   @override
   Future<void> updatePlaybackCursor({
     required int sessionId,
     required int currentItemId,
     required int positionMs,
   }) {
+    final error = cursorSaveError;
+    if (error != null) {
+      cursorSaveError = null;
+      return Future.error(error);
+    }
     cursorSaves.add(positionMs);
     return super.updatePlaybackCursor(
       sessionId: sessionId,
@@ -8451,628 +9432,6 @@ class _RecordingRandom implements Random {
   }
 }
 
-class FakePlaybackEngine
-    implements PlaybackEngine {
-  final _playerStateController = StreamController<EngineTransportState>.broadcast();
-  final _positionController = StreamController<Duration>.broadcast();
-  final _currentItemIdController = StreamController<int?>.broadcast();
-  final _unavailableAdvanceController =
-      StreamController<UnavailableAdvance>.broadcast();
-
-  List<QueuePlaybackEntry> _loadedEntries = const [];
-  int? _currentLocalIndex;
-  int? _committedCurrentItemId;
-  Duration _position = Duration.zero;
-  bool _disposed = false;
-  bool get isDisposed => _disposed;
-  Completer<void>? addEntriesEntered;
-  Completer<void>? addEntriesRelease;
-
-  final List<SeedCall> seedCalls = [];
-
-  /// Runs at the start of every seed, before the fake commits or plays.
-  Future<void> Function(int? sessionId)? beforeSeed;
-  final List<List<QueuePlaybackEntry>> addedBatches = [];
-  final List<List<QueuePlaybackEntry>> replacedFutureBatches = [];
-  final List<List<QueuePlaybackEntry>> rebuildCalls = [];
-  final List<int> removedItems = [];
-  final List<int> seekedItems = [];
-  final List<PlaybackTransitionCause> seekCauses = [];
-  int playCalls = 0;
-  int pauseCalls = 0;
-  int stopCalls = 0;
-
-  /// The desired transport as `JustAudioEngine` keeps it: a play stays
-  /// issued across a seed without autoplay (just_audio keeps `playing`
-  /// across a playlist replacement); only a pause or a stop clears it.
-  bool wantsPlaying = false;
-
-  /// What the adapter reports once a seeded load settles.
-  void emitSettledTransport() => emitPlayerState(
-      EngineTransportState(wantsPlaying, EngineProcessingState.ready));
-  EngineLoopMode? lastLoopMode;
-  double? lastVolume;
-  String? lastStreamQuality;
-
-  @override
-  void setStreamQuality(String quality) {
-    lastStreamQuality = quality;
-  }
-
-  @override
-  Future<void> rebuildCurrentSource(String quality, Duration seekTo) async =>
-      rebuilds.add(('current', quality, seekTo, _committedCurrentItemId));
-
-  @override
-  Future<void> rebuildAllSources(String quality, Duration seekTo) async =>
-      rebuilds.add(('all', quality, seekTo, _committedCurrentItemId));
-
-  final rebuilds = <(String, String, Duration, int?)>[];
-
-  @override
-  Future<void> setSeed(
-    List<QueuePlaybackEntry> entries, {
-    required int currentItemId,
-    int? sessionId,
-    PlaybackTransitionCause cause = PlaybackTransitionCause.queueReplacement,
-    Duration initialPosition = Duration.zero,
-    bool autoPlay = false,
-    bool shuffleEnabled = false,
-    PlaybackSourceKind? currentSourceKind,
-  }) async {
-    await beforeSeed?.call(sessionId);
-    playlistRevision++; // like the engine: every seed is a new revision
-    seedRevision = playlistRevision;
-    _loadedEntries = _sorted(entries);
-    _currentLocalIndex = _loadedEntries.indexWhere(
-      (entry) => entry.itemId == currentItemId,
-    );
-    _committedCurrentItemId = currentItemId;
-    _position = initialPosition;
-    seedCalls.add(
-      SeedCall(
-        entries: List<QueuePlaybackEntry>.from(_loadedEntries),
-        currentItemId: currentItemId,
-        sessionId: sessionId,
-        cause: cause,
-        initialPosition: initialPosition,
-        autoPlay: autoPlay,
-        shuffleEnabled: shuffleEnabled,
-        currentSourceKind: currentSourceKind,
-      ),
-    );
-    _appliedKinds
-      ..clear()
-      ..addAll({if (currentSourceKind != null) currentItemId: currentSourceKind});
-    // Like production's structural mutation: commit identity silently.
-    if (autoPlay) {
-      playCalls++;
-      wantsPlaying = true;
-    }
-  }
-
-  @override
-  Future<void> addEntries(List<QueuePlaybackEntry> entries) async {
-    final release = addEntriesRelease;
-    if (release != null) {
-      final entered = addEntriesEntered;
-      addEntriesEntered = null;
-      if (entered != null && !entered.isCompleted) entered.complete();
-      await release.future;
-      addEntriesRelease = null;
-    }
-    final additions = entries
-        .where((entry) => !hasItem(entry.itemId))
-        .toList(growable: false);
-    if (additions.isEmpty) return;
-
-    playlistRevision++;
-    addedBatches.add(additions);
-    _beginHeldEdit();
-    for (final entry in _sorted(additions)) {
-      final insertionIndex = _insertionIndexFor(entry.playPosition);
-      if (_currentLocalIndex != null && insertionIndex <= _currentLocalIndex!) {
-        _currentLocalIndex = _currentLocalIndex! + 1;
-      }
-      _loadedEntries = List<QueuePlaybackEntry>.from(_loadedEntries)
-        ..insert(insertionIndex, entry);
-    }
-  }
-
-  @override
-  void replaceLoadedEntriesMetadata(List<QueuePlaybackEntry> updatedEntries) {
-    final byItemId = {for (final entry in updatedEntries) entry.itemId: entry};
-    _loadedEntries = _loadedEntries
-        .map((entry) => byItemId[entry.itemId] ?? entry)
-        .toList(growable: false);
-  }
-
-  /// Set by the test harness so the fake can decide, on a per-itemId basis,
-  /// whether the simulated local file is currently considered present. The
-  /// production controller goes through dart:io File.existsSync() — in tests
-  /// we steer it through the same external set the QueueRepository fixture
-  /// uses to decide playability.
-  bool Function(QueuePlaybackEntry entry) sourceAvailability = (entry) =>
-      entry.filePath != null && entry.filePath!.isNotEmpty;
-
-  bool offlineForRefresh = false;
-
-  final List<RefreshedSource> refreshedSources = [];
-  final List<int> rescuedItemIds = [];
-
-  @override
-  Future<void> refreshLoadedSourcesForAvailabilityChanges(
-    List<QueuePlaybackEntry> updatedEntries,
-  ) async {
-    final byItemId = {for (final entry in updatedEntries) entry.itemId: entry};
-    final nextEntries = <QueuePlaybackEntry>[];
-    int? rescueItemId;
-    int? rescuePlayPosition;
-    for (final oldEntry in _loadedEntries) {
-      final newEntry = byItemId[oldEntry.itemId] ?? oldEntry;
-      nextEntries.add(newEntry);
-      final oldHadFile = sourceAvailability(oldEntry);
-      final newHasFile = sourceAvailability(newEntry);
-      if (oldHadFile == newHasFile && oldEntry.filePath == newEntry.filePath) {
-        continue;
-      }
-      refreshedSources.add(
-        RefreshedSource(
-          itemId: newEntry.itemId,
-          oldHadFile: oldHadFile,
-          newHasFile: newHasFile,
-          entry: newEntry,
-        ),
-      );
-      if (newEntry.itemId == _committedCurrentItemId &&
-          oldHadFile &&
-          !newHasFile &&
-          offlineForRefresh) {
-        rescueItemId = newEntry.itemId;
-        rescuePlayPosition = newEntry.playPosition;
-      }
-    }
-    _loadedEntries = nextEntries;
-    if (rescueItemId != null && rescuePlayPosition != null) {
-      rescuedItemIds.add(rescueItemId);
-      _unavailableAdvanceController.add(
-        UnavailableAdvance(
-          itemId: rescueItemId,
-          playPosition: rescuePlayPosition,
-        ),
-      );
-    }
-  }
-
-  @override
-  Future<void> replaceFutureEntries({
-    required int currentItemId,
-    required List<QueuePlaybackEntry> entries,
-  }) async {
-    final error = replaceFutureEntriesError;
-    if (error != null) {
-      replaceFutureEntriesError = null;
-      throw error;
-    }
-    final currentIndex = _loadedEntries.indexWhere(
-      (entry) => entry.itemId == currentItemId,
-    );
-    if (currentIndex < 0) {
-      throw StateError('Current item $currentItemId is not loaded');
-    }
-
-    playlistRevision++;
-    replacedFutureBatches.add(List<QueuePlaybackEntry>.from(entries));
-    _beginHeldEdit();
-    _loadedEntries = List<QueuePlaybackEntry>.from(
-      _loadedEntries.take(currentIndex + 1),
-    );
-    for (final entry in _sorted(entries)) {
-      final insertionIndex = _insertionIndexFor(entry.playPosition);
-      _loadedEntries = List<QueuePlaybackEntry>.from(_loadedEntries)
-        ..insert(insertionIndex, entry);
-    }
-  }
-
-  @override
-  Future<void> rebuildAroundCurrent({
-    required int currentItemId,
-    required List<QueuePlaybackEntry> entries,
-  }) async {
-    final sorted = _sorted(entries);
-    final nextIndex = sorted.indexWhere(
-      (entry) => entry.itemId == currentItemId,
-    );
-    if (nextIndex < 0) {
-      throw StateError('Current item $currentItemId is not in rebuilt queue');
-    }
-
-    playlistRevision++;
-    rebuildCalls.add(List<QueuePlaybackEntry>.from(sorted));
-    _loadedEntries = sorted;
-    _currentLocalIndex = nextIndex;
-    _committedCurrentItemId = currentItemId;
-    duringRebuild?.call();
-  }
-
-  /// Runs inside every rebuild (a plugin reporting states while its native
-  /// playlist is edited, e.g. completed → buffering → completed again).
-  void Function()? duringRebuild;
-
-  /// Review 6-R3-01, like the real engine: an insert (`addEntries`,
-  /// `replaceFutureEntries`) updates the issued playlist ([loadedItemIds])
-  /// at once but applies natively later. With [holdNextEdit] set, the next
-  /// such insert stays pending until [settleEdit]. A completion reported
-  /// through [completeNatively] while it is pending is masked as buffering;
-  /// at the settle the engine re-reports completed with the ended item still
-  /// current (darwin stays completed after an insert).
-  bool holdNextEdit = false;
-  bool _editPending = false;
-  bool _completedWhilePending = false;
-  bool get editPending => _editPending;
-
-  void _beginHeldEdit() {
-    if (!holdNextEdit) return;
-    holdNextEdit = false;
-    _editPending = true;
-  }
-
-  /// The plugin reaches the end of its native playlist.
-  void completeNatively() {
-    if (_editPending) {
-      _completedWhilePending = true;
-      emitPlayerState(
-          EngineTransportState(true, EngineProcessingState.buffering));
-    } else {
-      emitPlayerState(
-          EngineTransportState(false, EngineProcessingState.completed));
-    }
-  }
-
-  /// The pending insert has applied natively.
-  void settleEdit() {
-    _editPending = false;
-    if (!_completedWhilePending) return;
-    _completedWhilePending = false;
-    emitPlayerState(
-        EngineTransportState(false, EngineProcessingState.completed));
-  }
-
-  @override
-  Future<void> removeItem(int itemId) async {
-    final index = _loadedEntries.indexWhere((entry) => entry.itemId == itemId);
-    if (index < 0) return;
-    playlistRevision++;
-    removedItems.add(itemId);
-    _loadedEntries = List<QueuePlaybackEntry>.from(_loadedEntries)
-      ..removeAt(index);
-    if (_currentLocalIndex != null && index < _currentLocalIndex!) {
-      _currentLocalIndex = _currentLocalIndex! - 1;
-    }
-  }
-
-  @override
-  Future<void> seekToItem(
-    int itemId, {
-    Duration position = Duration.zero,
-    PlaybackTransitionCause cause = PlaybackTransitionCause.userSkip,
-  }) async {
-    final index = _loadedEntries.indexWhere((entry) => entry.itemId == itemId);
-    if (index < 0) {
-      throw StateError('Item $itemId is not loaded');
-    }
-    seekedItems.add(itemId);
-    seekCauses.add(cause);
-    _currentLocalIndex = index;
-    // Like the engine: an item change is emitted only when it changes.
-    final changed = _committedCurrentItemId != itemId;
-    _committedCurrentItemId = itemId;
-    _position = position;
-    if (changed) _currentItemIdController.add(itemId);
-  }
-
-  int? get currentIndex => _currentLocalIndex;
-
-  @override
-  int? get currentItemId => _committedCurrentItemId;
-
-  String? get currentUuid {
-    if (_currentLocalIndex == null ||
-        _currentLocalIndex! < 0 ||
-        _currentLocalIndex! >= _loadedEntries.length) {
-      return null;
-    }
-    return _loadedEntries[_currentLocalIndex!].uuidId;
-  }
-
-  @override
-  Duration get position => _position;
-
-  @override
-  int playlistRevision = 0;
-
-  /// 7P.1: the playlist revision of the latest seed (what a typed command
-  /// failure of the current playlist carries).
-  int seedRevision = 0;
-
-  final _loadEventsController = StreamController<EngineLoadEvent>.broadcast();
-
-  @override
-  Stream<EngineLoadEvent> get loadEvents => _loadEventsController.stream;
-
-  void emitLoadEvent(EngineLoadEvent event) => _loadEventsController.add(event);
-
-  final _sourceFailuresController =
-      StreamController<EngineSourceFailure>.broadcast();
-
-  @override
-  Stream<EngineSourceFailure> get sourceFailures =>
-      _sourceFailuresController.stream;
-
-  /// A raw failure of [itemId] (default: the current item) as the real
-  /// engine reports it.
-  void emitSourceFailure(
-      {int? itemId, int? sourceId, bool uncertain = false, int code = 0}) {
-    final item = itemId ?? _committedCurrentItemId;
-    final entry = _loadedEntries.where((e) => e.itemId == item).firstOrNull;
-    _sourceFailuresController.add(EngineSourceFailure(
-      playlistRevision: playlistRevision,
-      source: uncertain || entry == null
-          ? null
-          : EngineSourceIdentity(
-              // Like the engine: a source keeps its id across reports.
-              sourceId: sourceId ?? entry.itemId + _failureSourceIds,
-              sessionId: null,
-              itemId: entry.itemId,
-              trackUuid: entry.uuidId,
-              // Like the engine: what the loaded source plays (7P.2: the
-              // kind the core applied wins over the recorded download).
-              localPath: (entry.filePath?.isEmpty ?? true) ||
-                      _appliedKinds[entry.itemId] == PlaybackSourceKind.remote
-                  ? null
-                  : entry.filePath),
-      uncertain: uncertain,
-      errorCode: code,
-    ));
-  }
-
-  static const _failureSourceIds = 1000;
-
-  final _commandFailuresController =
-      StreamController<EngineCommandFailure>.broadcast();
-
-  @override
-  Stream<EngineCommandFailure> get commandFailures =>
-      _commandFailuresController.stream;
-
-  /// 7P.1 (m5): native application of issued work; a test holds or fails
-  /// it with [appliedGate].
-  Completer<bool>? appliedGate;
-
-  @override
-  Future<bool> whenApplied() => appliedGate?.future ?? Future.value(true);
-
-  /// 7P.1: a typed native command failure as the real engine reports it.
-  void emitCommandFailure(EngineCommandFailure failure) =>
-      _commandFailuresController.add(failure);
-
-  @override
-  final int runtimeId = 1;
-
-  @override
-  Stream<PlaybackObservation> get observations =>
-      _observationsController.stream;
-
-  @override
-  int get queueLength => _loadedEntries.length;
-
-  @override
-  List<int> get loadedItemIds =>
-      _loadedEntries.map((entry) => entry.itemId).toList(growable: false);
-
-  @override
-  bool hasItem(int itemId) =>
-      _loadedEntries.any((entry) => entry.itemId == itemId);
-
-  /// 7P.2: kinds a seed applied over the recorded download (by item).
-  final Map<int, PlaybackSourceKind> _appliedKinds = {};
-
-  @override
-  PlaybackSourceKind? sourceKindOf(int itemId) {
-    final entry =
-        _loadedEntries.where((e) => e.itemId == itemId).firstOrNull;
-    if (entry == null) return null;
-    return _appliedKinds[itemId] ??
-        (sourceAvailability(entry)
-            ? PlaybackSourceKind.local
-            : PlaybackSourceKind.remote);
-  }
-
-  @override
-  Future<void> play() async {
-    playCalls++;
-    wantsPlaying = true;
-  }
-
-  @override
-  Future<void> pause() async {
-    pauseCalls++;
-    wantsPlaying = false;
-  }
-
-  @override
-  Future<void> seek(Duration position) async {
-    _position = position;
-    _positionController.add(position);
-  }
-
-  @override
-  Future<void> setVolume(double volume) async {
-    lastVolume = volume;
-  }
-
-  @override
-  Future<void> stop() async {
-    stopCalls++;
-    wantsPlaying = false;
-  }
-
-  int setLoopModeFailures = 0;
-
-  @override
-  Future<void> setLoopMode(EngineLoopMode mode) async {
-    if (setLoopModeFailures > 0) {
-      setLoopModeFailures--;
-      throw StateError('engine refused the loop mode');
-    }
-    lastLoopMode = mode;
-  }
-
-  @override
-  Stream<EngineTransportState> get transportStateStream =>
-      _playerStateController.stream;
-
-  @override
-  Stream<Duration> get positionStream => _positionController.stream;
-
-
-  @override
-  Stream<int?> get currentItemIdStream => _currentItemIdController.stream;
-
-  @override
-  Stream<UnavailableAdvance> get unavailableAdvanceStream =>
-      _unavailableAdvanceController.stream;
-
-  void emitPlayerState(EngineTransportState state) {
-    _playerStateController.add(state);
-  }
-
-  List<int> get loadedPlayPositions =>
-      _loadedEntries.map((entry) => entry.playPosition).toList();
-
-  Object? replaceFutureEntriesError;
-
-  /// The engine moved to [itemId] but its item-change event has not been
-  /// processed yet (it is still in flight).
-  void commitSilently(int itemId) {
-    _committedCurrentItemId = itemId;
-    _currentLocalIndex = _loadedEntries.indexWhere((e) => e.itemId == itemId);
-  }
-
-  void emitPosition(Duration position) {
-    _position = position;
-    _positionController.add(position);
-  }
-
-  void emitDuration(Duration? duration) {
-    emitObservation(duration: duration);
-  }
-
-  final _observationsController =
-      StreamController<PlaybackObservation>.broadcast();
-  int _observationSequence = 0;
-
-  /// A settled playing+ready observation of the current item.
-  void emitPlayingObservation() => emitObservation(playing: true);
-
-  /// A settled observation of [itemId] (default: the committed current item).
-  void emitObservation(
-      {int? itemId, Duration? duration, bool uncertain = false, bool playing = false}) {
-    final item = itemId ?? _committedCurrentItemId;
-    final entry = _loadedEntries.where((e) => e.itemId == item).firstOrNull;
-    _observationsController.add(PlaybackObservation(
-      runtimeId: runtimeId,
-      sequence: ++_observationSequence,
-      playlistRevision: playlistRevision,
-      source: entry == null
-          ? null
-          : EngineSourceIdentity(
-              sourceId: entry.itemId,
-              sessionId: null,
-              itemId: entry.itemId,
-              trackUuid: entry.uuidId),
-      position: _position,
-      duration: duration,
-      playing: playing,
-      processingState: EngineProcessingState.ready,
-      transitionCause: null,
-      rate: 1.0,
-      uncertain: uncertain,
-    ));
-  }
-
-  void emitUnavailableAdvance(UnavailableAdvance event) {
-    _unavailableAdvanceController.add(event);
-  }
-
-  @override
-  void dispose() {
-    if (_disposed) return;
-    _disposed = true;
-    _playerStateController.close();
-    _positionController.close();
-    _observationsController.close();
-    _sourceFailuresController.close();
-    _commandFailuresController.close();
-    _loadEventsController.close();
-    _currentItemIdController.close();
-    _unavailableAdvanceController.close();
-  }
-
-  static List<QueuePlaybackEntry> _sorted(List<QueuePlaybackEntry> entries) {
-    final sorted = List<QueuePlaybackEntry>.from(entries);
-    sorted.sort((a, b) => a.playPosition.compareTo(b.playPosition));
-    return sorted;
-  }
-
-  int _insertionIndexFor(int playPosition) {
-    for (var i = 0; i < _loadedEntries.length; i++) {
-      if (_loadedEntries[i].playPosition > playPosition) {
-        return i;
-      }
-    }
-    return _loadedEntries.length;
-  }
-}
-
-class RefreshedSource {
-  final int itemId;
-  final bool oldHadFile;
-  final bool newHasFile;
-  final QueuePlaybackEntry? entry;
-
-  const RefreshedSource({
-    required this.itemId,
-    required this.oldHadFile,
-    required this.newHasFile,
-    this.entry,
-  });
-}
-
-class SeedCall {
-  final List<QueuePlaybackEntry> entries;
-  final int currentItemId;
-  final int? sessionId;
-  final PlaybackTransitionCause cause;
-  final Duration initialPosition;
-  final bool autoPlay;
-  final bool shuffleEnabled;
-
-  /// 7P.2: the kind the core asked the engine to apply to the current item.
-  final PlaybackSourceKind? currentSourceKind;
-
-  const SeedCall({
-    required this.entries,
-    required this.currentItemId,
-    required this.sessionId,
-    required this.cause,
-    required this.initialPosition,
-    required this.autoPlay,
-    required this.shuffleEnabled,
-    this.currentSourceKind,
-  });
-}
-
 class RecordingAudioServiceBridge extends AudioServiceBridge {
   final List<MediaItem?> mediaItemEvents = [];
   final List<PlaybackState> playbackStateEvents = [];
@@ -9087,140 +9446,6 @@ class RecordingAudioServiceBridge extends AudioServiceBridge {
   Future<void> disposeBridge() async {
     await _mediaSub.cancel();
     await _playbackSub.cancel();
-  }
-}
-
-class _MutableOffline extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-  void set(bool value) => state = value;
-}
-
-class _OfflineOn extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return true;
-  }
-}
-
-class _LibraryFixture {
-  final AppDatabase db;
-  int _nextArtistId = 1;
-  int _nextAlbumId = 1;
-  final Map<String, int> _artistIds = {};
-  final Map<String, int> _albumIds = {};
-
-  _LibraryFixture(this.db);
-
-  Future<void> insertAlbum({
-    required String artist,
-    required String album,
-    required List<String> uuids,
-  }) async {
-    final artistId = await _ensureArtist(artist);
-    final albumId = await _ensureAlbum(artistId, album);
-    for (var i = 0; i < uuids.length; i++) {
-      await _insertTrack(
-        uuid: uuids[i],
-        artist: artist,
-        artistId: artistId,
-        album: album,
-        albumId: albumId,
-        trackNumber: i + 1,
-      );
-    }
-  }
-
-  Future<void> insertSingles(List<String> uuids) async {
-    for (var i = 0; i < uuids.length; i++) {
-      final artistName = 'Artist ${i + 1}';
-      final artistId = await _ensureArtist(artistName);
-      final albumId = await _ensureAlbum(artistId, 'Singles ${i + 1}');
-      await _insertTrack(
-        uuid: uuids[i],
-        artist: artistName,
-        artistId: artistId,
-        album: 'Singles ${i + 1}',
-        albumId: albumId,
-        trackNumber: 1,
-      );
-    }
-  }
-
-  Future<TrackUI> track(String uuid) async {
-    final rows = await db.getTrackByUuid(uuid);
-    return TrackUI.fromQueryRow(rows.single);
-  }
-
-  Future<int> _ensureArtist(String name) async {
-    final key = name.toLowerCase();
-    final existing = _artistIds[key];
-    if (existing != null) return existing;
-
-    final id = _nextArtistId++;
-    await db
-        .into(db.artists)
-        .insert(ArtistsCompanion(id: Value(id), name: Value(name)));
-    _artistIds[key] = id;
-    return id;
-  }
-
-  Future<int> _ensureAlbum(int artistId, String name) async {
-    final key = '$artistId:${name.toLowerCase()}';
-    final existing = _albumIds[key];
-    if (existing != null) return existing;
-
-    final id = _nextAlbumId++;
-    await db
-        .into(db.albums)
-        .insert(
-          AlbumsCompanion(
-            id: Value(id),
-            name: Value(name),
-            artistId: Value(artistId),
-            year: const Value(2024),
-            isSingleGrouping: const Value(false),
-          ),
-        );
-    _albumIds[key] = id;
-    return id;
-  }
-
-  Future<void> _insertTrack({
-    required String uuid,
-    required String artist,
-    required int artistId,
-    required String album,
-    required int albumId,
-    required int trackNumber,
-  }) async {
-    final dto = ClientTrackDto.fromJson({
-      'uuid_id': uuid,
-      'created_at': 1700000000 + trackNumber,
-      'last_updated': 1700000100 + trackNumber,
-      'revision': 1700000000 + trackNumber,
-      'metadata': {
-        'title': 'Track $uuid',
-        'artist': artist,
-        'album': album,
-        'artist_id': artistId,
-        'album_id': albumId,
-        'track_number': trackNumber,
-        'disc_number': 1,
-        'duration': 180.0,
-        'bitrate_kbps': 320.0,
-        'sample_rate_hz': 44100,
-        'channels': 2,
-        'has_album_art': false,
-      },
-    });
-
-    await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
-    await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
   }
 }
 
@@ -9285,7 +9510,7 @@ class _TestQuality extends Notifier<String> {
 
 class _FailingReconcile extends DownloadReconciliationService {
   _FailingReconcile(AppDatabase db)
-      : super(db: db, statusReader: DownloadStatusReader(db: db));
+      : super(db: db, statusReader: DownloadStatusReader());
   @override
   Future<bool> reconcileTrack(String trackUuid) async =>
       throw StateError('db locked');
@@ -9391,17 +9616,6 @@ class _ScriptedPlugin extends Mock implements ja.AudioPlayer {
     _index = index;
     _indices.add(index);
   }
-}
-
-/// A fake engine that also takes the gate's media-token work (OPEN-M-11
-/// step D).
-class _TokenAwareEngine extends FakePlaybackEngine implements MediaTokenSources {
-  final tokenCalls = <String>[];
-  @override
-  Future<void> refreshWithheldMediaTokens() async => tokenCalls.add('refresh');
-  @override
-  Future<void> releaseRemoteSources({required bool includeCurrent}) async =>
-      tokenCalls.add(includeCurrent ? 'release everything' : 'release ahead');
 }
 
 /// A gate whose states the test publishes.

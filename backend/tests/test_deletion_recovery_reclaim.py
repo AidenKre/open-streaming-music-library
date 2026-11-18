@@ -17,7 +17,7 @@ States are made by the real executor stopped at its crash seams
 import pytest
 
 from app.services import deletion_recovery
-from app.services.upload_publish import SimulatedCrash
+from tests.deletion_recovery_helpers import NEW_BOOT, run_until_crash
 from tests.deletion_world import (
     BOOT,
     accept_job,
@@ -33,25 +33,10 @@ from tests.deletion_world import (
     tombstone,
 )
 
-NEW_BOOT = "boot-after-restart"
-
 
 @pytest.fixture
 def world(tmp_path):
     return build_world(tmp_path)
-
-
-def crash_at(point):
-    def seam(name):
-        if name == point:
-            raise SimulatedCrash(point)
-
-    return seam
-
-
-def run_until_crash(world, point):
-    with pytest.raises(SimulatedCrash):
-        make_executor(world, seam=crash_at(point)).run_one()
 
 
 def job_status(world, op, owner=None):

@@ -14,6 +14,7 @@ import 'package:frontend/ui/listening_stats_page.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
 
 import '../fake_listening_stats_controls.dart';
+import '../../helpers/listening_stats_builder.dart';
 
 const day = 86400000;
 
@@ -38,22 +39,17 @@ ListeningStats sevenDays({
     earliestListenUtcMs: DateTime.utc(2020).millisecondsSinceEpoch,
   );
   final values = buckets ?? List<double>.filled(plan.spans.length, 0);
-  return ListeningStats(
+  return listeningStatsOf(
     range: range,
     window: window,
     boundaryLocalId: 10,
-    totals: ListeningTotals(
-      listeningSeconds: seconds,
-      qualifiedPlays: plays,
-      uniqueTracks: tracks,
-      activeDays: days,
-    ),
-    unavailable: ListeningSubtotal(
-      listeningSeconds: unavailableSeconds,
-      qualifiedPlays: unavailablePlays,
-    ),
+    seconds: seconds,
+    qualifiedPlays: plays,
+    uniqueTracks: tracks,
+    activeDays: days,
+    unavailableSeconds: unavailableSeconds,
+    unavailablePlays: unavailablePlays,
     futureTimestampCount: future,
-    overlongListenCount: 0,
     buckets: [
       for (var i = 0; i < values.length && i < plan.spans.length; i++)
         ListeningBucket(
@@ -63,9 +59,6 @@ ListeningStats sevenDays({
         ),
     ],
     chartCapped: capped,
-    topTracks: const [],
-    topArtists: const [],
-    topAlbums: const [],
   );
 }
 

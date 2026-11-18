@@ -241,6 +241,39 @@ void main() {
     expect(seen.last.authorization, 'Bearer ${testCredentials.token}');
   });
 
+  // Pre-merge review A5-02 (owner, 2026-11-18): a Wi-Fi sign-in page
+  // answering at the saved address at launch is "can't reach your server":
+  // offline, the sign-in kept, and the page gets no token. Once the real
+  // server answers, the session goes on without a new sign-in.
+  test('a Wi-Fi sign-in page at launch: offline, no token sent to it; the '
+      'real server later: the session continues with the kept sign-in',
+      () async {
+    server = (_) async => http.Response('<html>Wi-Fi: log in</html>', 200,
+        headers: {'content-type': 'text/html'});
+    final c = scope();
+
+    final start = await launch(c);
+    await pumpEventQueue(times: 50); // offline polls run (zero interval)
+    expect(start.kind, SessionStartKind.offline);
+    expect(c.read(offlineModeProvider), isTrue);
+    expect(await store.read(), testCredentials);
+
+    server = _serverWith('inst-A');
+    await pumpEventQueue(times: 50); // the next poll finds the server
+    expect(c.read(offlineModeProvider), isFalse);
+    // The app's networkRecovered edge starts a new verification.
+    unawaited(c.read(serverBindingGateProvider).startConnection('http://s'));
+    await pumpEventQueue(times: 50);
+    expect(c.read(serverBindingGateProvider).state, isA<BindingVerified>());
+    final before = seen.length;
+    await c.read(apiClientProvider).getJson(['tracks']);
+
+    expect(seen.sublist(0, before).where((r) => r.carriesToken), isEmpty,
+        reason: 'nothing before the verification carried the token');
+    expect(seen.last.url.path, '/tracks');
+    expect(seen.last.authorization, 'Bearer ${testCredentials.token}');
+  });
+
   // Review r3 m-R3-01 (spec §7.2 "auth is per call", §7.4): cover art goes
   // through the cache manager, not the token client. It attaches the token
   // only while the gate allows it for the session URL: during the first

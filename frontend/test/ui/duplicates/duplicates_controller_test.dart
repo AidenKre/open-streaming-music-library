@@ -24,12 +24,13 @@ import 'package:frontend/ui/preview_controller.dart';
 
 import '../../helpers/duplicate_fixtures.dart';
 import '../../helpers/fake_library_tools_api.dart';
-import '../browse_harness.dart' show TestOffline;
 import 'duplicates_test_support.dart';
+import '../../helpers/run_once_track_sync.dart';
+import '../../helpers/test_offline.dart';
 
 void main() {
   late FakeLibraryToolsApi api;
-  late DupSync sync;
+  late RunOnceTrackSync sync;
   late TestOffline offline;
   late RecordingPreviewControls preview;
   late ProviderContainer c;
@@ -57,7 +58,7 @@ void main() {
     c = ProviderContainer(
       overrides: [
         libraryToolsApiProvider.overrideWithValue(api),
-        trackSyncProvider.overrideWith(() => sync = DupSync()),
+        trackSyncProvider.overrideWith(() => sync = RunOnceTrackSync()),
         offlineModeProvider.overrideWith(() => offline),
         previewControlsProvider.overrideWithValue(preview),
         libraryToolsFeatureProvider.overrideWith(

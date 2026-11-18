@@ -13,7 +13,7 @@
 // seeds the 9A.1c PerfFixture (seed 20261112; its first <n> events, default
 // all 100,000, over the 10,000-track catalog), prints the plans and the
 // timings, and asserts the budget below on the pools load (median of 3).
-// OSML_PERF_LEGACY=1 also times the statement candidate aa5d50bd shipped,
+// OSML_PERF_LEGACY=1 also times the statement shipped before the rewrite,
 // once (keep <n> small: it is the stall).
 import 'dart:io';
 
@@ -21,8 +21,13 @@ import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/repositories/browse_repository.dart';
+import 'package:frontend/repositories/history_snapshot.dart';
+import 'package:frontend/repositories/recently_played_repository.dart';
+import 'package:frontend/repositories/recents_snapshot_pager.dart';
 import 'package:frontend/repositories/suggestion_pools_repository.dart';
 
+import '../helpers/fake_clock.dart';
 import 'stats_perf_fixture.dart';
 import 'suggestion_pools_legacy.dart';
 
@@ -126,6 +131,61 @@ void main() {
     expect(_correlatedHistoryReads(legacy), isNotEmpty);
   });
 
+  // SP-RS-13: the same guard over the other history readers on Home and
+  // See all: Recently played (live and snapshot pages, first and late
+  // keyset page, both chip states), the "has history" check and the See all
+  // capture, page and freshness watch.
+  test('no Recently played or See all statement reads history_events once '
+      'per candidate (first and late page, has-history check)', () async {
+    final recorder = _Recorder();
+    final db = AppDatabase(NativeDatabase.memory().interceptWith(recorder));
+    addTearDown(db.close);
+    final recents = RecentlyPlayedRepository(db, BrowseRepository(db));
+    final snapshots = HistorySnapshotService(db, clock: FakeClock());
+    final pager =
+        RecentsSnapshotPager(snapshots, recents, SnapshotFreshness(db));
+    final lateRef = RecentRef(
+      type: RecentEntityType.track,
+      ref: 't-late',
+      occurredAt: perfNowMs - 1000,
+      eventUuid: 'e-late',
+    );
+    recorder.on = true;
+    for (final downloadedOnly in [false, true]) {
+      await recents.page(
+          boundaryLocalId: 1000, limit: 20, downloadedOnly: downloadedOnly);
+      await recents.page(
+          boundaryLocalId: 1000,
+          after: lateRef,
+          limit: 20,
+          downloadedOnly: downloadedOnly);
+      await recents.watchRecent(downloadedOnly: downloadedOnly).first;
+      final token = await pager.capture(downloadedOnly: downloadedOnly);
+      await pager.page(token, null, 20);
+      await pager.page(token, lateRef, 20);
+      await pager.watchFreshness(token).first;
+    }
+    await recents.watchHasEligibleHistory().first;
+    recorder.on = false;
+    final reads = {
+      for (final s in recorder.selects)
+        if (s.sql.contains('history_events')) s.sql: s.args,
+    };
+    expect(
+      reads.keys.where((q) => q.contains(
+          '(r.occurred_at, r.event_uuid, r.entity_type, r.entity_ref)')),
+      isNotEmpty,
+      reason: 'a late keyset page is among the checked statements',
+    );
+    expect(reads.keys.where((q) => q.contains('MAX(local_id)')), isNotEmpty,
+        reason: 'the See all capture and freshness reads are checked');
+    for (final e in reads.entries) {
+      final plan = await _plan(db, e.key, e.value);
+      expect(_correlatedHistoryReads(plan), isEmpty,
+          reason: '${e.key}\n  ${_render(plan)}');
+    }
+  });
+
   test('timings at the performance fixture (evidence; budget '
       '$_budgetMs ms)', skip: _evidence ? false :
       'set OSML_PERF_EVIDENCE=1 to measure', () async {
@@ -180,6 +240,18 @@ void main() {
           '${_render(await _plan(db, legacyArtistCandidatesSql,
               [for (final v in legacyVars(boundary, perfNowMs)) v.value]))}');
     }
+    // SP-RS-13: a late Recently played keyset page (print only, no budget).
+    final recents = RecentlyPlayedRepository(db, BrowseRepository(db));
+    final refs =
+        await recents.eligibleRefs(boundaryLocalId: boundary, limit: 500);
+    if (refs.isNotEmpty) {
+      final t = Stopwatch()..start();
+      await recents.page(boundaryLocalId: boundary, after: refs.last, limit: 20);
+      // ignore: avoid_print
+      print('PERF recents late page (after ${refs.length} refs, ms) '
+          '${t.elapsedMilliseconds}');
+    }
+
     expect(ms[1], lessThan(_budgetMs));
   }, timeout: const Timeout(Duration(seconds: 200)));
 }

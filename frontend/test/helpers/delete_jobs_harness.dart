@@ -25,10 +25,13 @@ export 'upload_manager_harness.dart' show ManualTimers, ManualTimer;
 class DeleteJobsHarness {
   DeleteJobsHarness._(this.db, this.binding, this.token, this.gate);
 
+  /// [database]: another database to run over (default: in-memory, in this
+  /// isolate).
   static Future<DeleteJobsHarness> create({
     String instanceId = 'inst-1',
+    AppDatabase? database,
   }) async {
-    final db = AppDatabase(NativeDatabase.memory());
+    final db = database ?? AppDatabase(NativeDatabase.memory());
     final binding = ServerBindingRepository(db);
     final token = await seedTestBinding(db, reconciled: true);
     final gate = ControlledGate(db);

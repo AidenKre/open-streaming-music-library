@@ -73,6 +73,39 @@ LISTED_BODY_IDS = {
     ("POST", "/settings/integrations/lastfm/now-playing", "body"),
 }
 
+# U02-B-06: every route that changes data either carries IDs in its body
+# (LISTED_BODY_IDS, probed below) or is listed here with the reason it has none.
+NO_BODY_IDS = {
+    ("POST", "/auth/register"): "a username and a password",
+    ("POST", "/auth/login"): "a username and a password",
+    ("POST", "/auth/logout"): "no body: ends the caller's own session",
+    ("PUT", "/settings/quality"): "a quality name",
+    ("PATCH", "/tracks/{uuid_id:uuid}"): "tag values, a base revision and a write mode; the track is in the path",
+    ("DELETE", "/jobs/{job_id}"): "no body; the job is in the path",
+    ("POST", "/settings/integrations/lastfm/connect"): "an empty body",
+    ("POST", "/settings/integrations/lastfm/complete"): "an empty body",
+    ("DELETE", "/settings/integrations/lastfm"): "no body: the caller's own connection",
+    ("POST", "/tracks/uploads/items/{item_uuid:uuid}/retry"): "a review version; the item is in the path",
+    ("DELETE", "/tracks/uploads/items/{item_uuid:uuid}"): "no body; the item is in the path",
+    ("PUT", "/tracks/uploads/items/{item_uuid:uuid}/content"): "the file's bytes; the item is in the path",
+}
+CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def changing_routes(routes) -> set[tuple[str, str]]:
+    """(method, path) of every app route that changes data."""
+    return {
+        (method, route.path)
+        for route in routes
+        if isinstance(route, APIRoute)
+        for method in route.methods & CHANGING_METHODS
+    }
+
+
+def unclassified_changing_routes(routes) -> set[tuple[str, str]]:
+    listed = {(method, path) for method, path, _ in LISTED_BODY_IDS}
+    return changing_routes(routes) - listed - set(NO_BODY_IDS)
+
 
 def _is_id_query(name: str) -> bool:
     return name.endswith("_id") or name == "cursor"
@@ -994,6 +1027,26 @@ def test_a_new_id_taking_route_without_a_probe_fails_the_coverage(configure_app)
         ("GET", "/tracks/{uuid_id}/lyrics", "uuid_id"),
         ("GET", "/tracks/{uuid_id}/lyrics", "translation_id"),
     }
+
+
+def test_every_route_that_changes_data_is_classified_for_body_ids(configure_app):
+    app = configure_app().app
+    listed = {(method, path) for method, path, _ in LISTED_BODY_IDS}
+
+    assert unclassified_changing_routes(app.routes) == set()
+    assert listed.isdisjoint(NO_BODY_IDS)
+    assert listed | set(NO_BODY_IDS) <= changing_routes(app.routes)  # no stale entry
+
+
+def test_a_new_changing_route_without_a_classification_fails(configure_app):
+    app = configure_app().app
+
+    def rate(uuid_id: str):
+        return {}
+
+    routes = [*app.routes, APIRoute("/tracks/{uuid_id}/rating", rate, methods=["PUT"])]
+
+    assert unclassified_changing_routes(routes) == {("PUT", "/tracks/{uuid_id}/rating")}
 
 
 # ── the matrix ──────────────────────────────────────────────────────────────

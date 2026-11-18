@@ -16,6 +16,7 @@ import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/feature_providers.dart';
+import 'package:frontend/services/uploads/uploads_overview.dart';
 
 import '../../helpers/fake_uploads_api.dart';
 import '../../helpers/upload_manager_harness.dart';
@@ -150,6 +151,37 @@ void main() {
     final second = calls.lastIndexOf('putContent u-2');
     expect(calls.sublist(calls.indexOf('putContent u-2') + 1, second),
         contains('getItem u-2'));
+  });
+
+  // A7-03 (pre-merge review): while a cut transfer waits out its backoff no
+  // byte moves; the row says it was interrupted and will start again (the
+  // page's existing words for an interrupted upload), not "Uploading".
+  test('a dropped connection leaves the row reading interrupted, not '
+      'uploading, until the resend', () async {
+    await addOne();
+    final op = (await intent())['transfer_operation_uuid'];
+    h.api.openPuts.single.fail(NetworkException('lost', attemptsMade: 1));
+    await h.pump();
+
+    expect((await intent())['last_state'], 'allocated');
+    expect((await intent())['last_error_code'], 'upload_interrupted');
+    final row = UploadsOverview.of(
+      intents: await h.store.forBinding(h.token),
+      progress: h.manager.progress.value,
+      availability: UploadsAvailability.available,
+    ).rows.single;
+    expect(row.statusText, isNot('Uploading'));
+    expect(row.statusText, 'Queued');
+    expect(row.detailText, 'The upload was interrupted. It will start again.');
+    expect(row.sending, isFalse);
+
+    // The resend after the wait asks the status first, same operation id.
+    h.clock.advance(const Duration(minutes: 1));
+    h.timers.fire();
+    await h.pump();
+    expect(puts(), 2);
+    expect((await intent())['transfer_operation_uuid'], op);
+    expect((await intent())['last_state'], 'transferring');
   });
 
   test('another transfer of the item still running on the server (409, '

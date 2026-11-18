@@ -10,20 +10,13 @@ import uuid as uuid_mod
 from pathlib import Path
 from typing import Any, Optional
 
-from app.database import DatabaseContext
-from tests.owned_database import OwnedTestDatabase
-from tests.schema_fixtures import INIT_SQL
+# Re-exported: ``make_db`` lives in ``tests/database_fixtures.py``; the tests
+# that import it from here keep working.
+from tests.database_fixtures import make_db  # noqa: F401
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 
 DIGEST_A = "aa" * 32
 DIGEST_B = "bb" * 32
-
-
-def make_db(tmp_path: Path) -> OwnedTestDatabase:
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 def sql(db, query: str, params: tuple = ()) -> list[dict]:
@@ -53,8 +46,8 @@ def add_track(
     conn = sqlite3.connect(db.context.database_path)
     try:
         track_id = conn.execute(
-            "INSERT INTO tracks (uuid_id, file_path, owner_id) VALUES (?, ?, ?)",
-            (uuid_id, str(file_path), owner),
+            f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, owner_id) VALUES (?, {PATH_MARKS}, ?)",
+            (uuid_id, *path_values(file_path), owner),
         ).lastrowid
         conn.execute(
             "INSERT INTO trackmetadata (track_id, uuid_id, codec, has_album_art) VALUES (?, ?, ?, 0)",

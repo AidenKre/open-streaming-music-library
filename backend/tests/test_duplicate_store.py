@@ -33,20 +33,15 @@ from tests.identity_worker_fixtures import (
     add_journal,
     add_track,
     identity,
-    make_db,
     set_identity,
     sql,
 )
 from tests.owned_database import add_test_user
+from tests.pending_deletion import mark_pending_deletion
 
 NOW = 1_800_000_000
 V1 = "matcher-v1"
 V2 = "matcher-v2"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def hashed(digest=DIGEST_A, state="current", kind=KIND_PCM, rate=44100, channels=2, **extra):
@@ -316,9 +311,7 @@ def test_a_pair_whose_partner_is_not_live_is_kept(db):
     x = track(db, "x")
     y = track(db, "y", digest=DIGEST_B)
     seed_pair(db, x, y)
-    sql(db, "DROP VIEW live_tracks")
-    sql(db, "CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks "
-            f"WHERE uuid_id <> '{y}'")
+    mark_pending_deletion(db.context.database_path, y)
 
     store(db, x, [])
 

@@ -23,7 +23,8 @@ import 'package:frontend/ui/home/home_controller.dart';
 
 import '../../helpers/server_binding.dart';
 import '../../repositories/catalog_seed.dart';
-import '../browse_harness.dart' show TestOffline, markDownloaded;
+import '../../helpers/library_seed.dart' show markDownloaded;
+import '../../helpers/test_offline.dart';
 
 /// `loading` / `failed` / `empty` / `empty filtered` / `ready k1,k2,…`.
 String describe(HomeRecentsState s) => switch (s) {
@@ -57,9 +58,6 @@ ResolvedRecent _recentTrack(String uuid, {int at = 1}) {
       eventUuid: 'ev-$uuid',
     ),
     entity: t,
-    scope: TrackScope(t),
-    downloaded: 0,
-    total: 1,
   );
 }
 
@@ -403,6 +401,46 @@ void main() {
       repo.historyProbes.single.add(false);
       await pumpEventQueue();
       expect(describe(c.recents), 'empty');
+    });
+
+    // Pre-merge A6-02: a failed "is there any history?" check is unknown,
+    // never "no history" (which hides the section).
+    test('chip ON, nothing downloaded: a failed history probe shows failed '
+        'with Retry, not a hidden section', () async {
+      final c = controls();
+      c.setDownloaded(true);
+      repo.latest(limit: 20, downloadedOnly: true).emit(const []);
+      repo.historyProbes.single.addError(StateError('db'));
+      await pumpEventQueue();
+      expect(describe(c.recents), 'failed');
+
+      c.retryRecents();
+      expect(describe(c.recents), 'loading');
+      repo.latest(limit: 20, downloadedOnly: true).emit(const []);
+      repo.historyProbes.last.add(true);
+      await pumpEventQueue();
+      expect(describe(c.recents), 'empty filtered');
+    });
+
+    test('chip ON: a history probe that failed before the empty list '
+        'arrived still shows failed', () async {
+      final c = controls();
+      c.setDownloaded(true);
+      repo.historyProbes.single.addError(StateError('db'));
+      await pumpEventQueue();
+      expect(describe(c.recents), 'loading', reason: 'the list is not in');
+      repo.latest(limit: 20, downloadedOnly: true).emit(const []);
+      expect(describe(c.recents), 'failed');
+    });
+
+    test('chip ON: a failed history probe never hides downloaded recents',
+        () async {
+      final c = controls();
+      c.setDownloaded(true);
+      repo.historyProbes.single.addError(StateError('db'));
+      await pumpEventQueue();
+      repo.latest(limit: 20, downloadedOnly: true).emit([_recentTrack('a')]);
+      expect(describe(c.recents), 'ready track:a');
     });
 
     test('an error shows failed; Retry subscribes again', () async {

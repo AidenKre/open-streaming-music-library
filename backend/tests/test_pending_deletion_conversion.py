@@ -22,7 +22,8 @@ import pytest
 
 from app.services.track_locks import TrackLocks
 from tests.pending_deletion import clear_pending_deletion, mark_pending_deletion
-from tests.test_jobs_api import _add_track_with_file, _hold_worker, _post_job
+from tests.jobs_api_fixtures import _post_job
+from tests.test_jobs_api import _add_track_with_file, _hold_worker
 
 requires_ffmpeg = pytest.mark.requires_ffmpeg
 

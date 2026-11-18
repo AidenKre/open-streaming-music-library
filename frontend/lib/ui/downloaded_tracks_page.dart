@@ -2,13 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
+import 'package:frontend/models/count_text.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/models/byte_text.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/widgets/damaged_downloads_section.dart';
+import 'package:frontend/ui/widgets/playback_notice.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
@@ -58,9 +61,8 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
         final sizeStr = stats.totalBytes > 0
             ? formatBytes(stats.totalBytes)
             : null;
-        final label = sizeStr != null
-            ? '${stats.count} tracks \u2022 $sizeStr'
-            : '${stats.count} tracks';
+        final tracks = countText(stats.count, '1 track', 'tracks');
+        final label = sizeStr != null ? '$tracks \u2022 $sizeStr' : tracks;
         return Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           child: Text(
@@ -119,9 +121,13 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
                       return LibraryTrackTile(
                         track: track,
                         trailing: trailing,
-                        onTap: () => ref
-                            .read(libraryActionsProvider)
-                            .playQuery(track, downloadedOnly: true),
+                        // The page's context, not the list item's.
+                        onTap: () => showPlaybackOutcome(
+                          this.context,
+                          ref
+                              .read(libraryActionsProvider)
+                              .playQuery(track, downloadedOnly: true),
+                        ),
                       );
                     },
                   ),

@@ -23,8 +23,9 @@ import 'package:frontend/services/uploads/upload_review.dart';
 import 'package:frontend/services/uploads/uploads_overview_provider.dart';
 import 'package:frontend/ui/uploads/upload_review_page.dart';
 
-import '../../playback/audio_focus_test.dart' show FakeTimers;
-import '../../playback/preview_player_test.dart' show FakePreviewEngine;
+import '../../helpers/fake_audio_focus.dart' show FakeTimers;
+import '../../helpers/fake_preview_engine.dart' show FakePreviewEngine;
+import '../../helpers/fake_uploads_api.dart' show itemJson;
 import '../browse_harness.dart';
 import '../fake_uploads_controls.dart';
 
@@ -34,20 +35,15 @@ class _NoSession implements AudioSessionPort {
 }
 
 UploadItem _item(String uuid, {int index = 0}) => UploadItem.fromJson({
-  'item_uuid': uuid,
-  'batch_uuid': 'b-1',
-  'parent_item_uuid': null,
-  'filename': '$uuid.flac',
-  'selection_index': index,
-  'member_order_key': '',
-  'state': 'review_ready',
-  'expected_bytes': 3,
-  'expected_sha256': null,
-  'received_bytes': 3,
-  'review_version': 1,
-  'error': null,
-  'created_at': 1,
-  'updated_at': 1,
+  ...itemJson(
+    uuid,
+    filename: '$uuid.flac',
+    selectionIndex: index,
+    state: 'review_ready',
+    expectedBytes: 3,
+    receivedBytes: 3,
+    reviewVersion: 1,
+  ),
   'tag_write_supported': true,
   'result_track_uuid': null,
   'detected_metadata': {

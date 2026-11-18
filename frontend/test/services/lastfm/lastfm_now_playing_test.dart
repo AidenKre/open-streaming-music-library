@@ -26,6 +26,7 @@ import 'package:frontend/services/lastfm/lastfm_now_playing.dart';
 import 'package:frontend/services/lastfm/lastfm_service.dart';
 
 import '../../helpers/fake_lastfm_api.dart';
+import '../../helpers/test_offline.dart';
 
 const _a = 'aaaaaaaa-0000-4000-8000-000000000001';
 const _b = 'bbbbbbbb-0000-4000-8000-000000000002';
@@ -50,16 +51,6 @@ class _Signal extends Notifier<LastfmPlaybackSignal> {
 
 final _signalProvider =
     NotifierProvider<_Signal, LastfmPlaybackSignal>(_Signal.new);
-
-class _Offline extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-
-  void set(bool value) => state = value;
-}
 
 class _Account extends LastfmService {
   _Account(this._initial);
@@ -93,7 +84,7 @@ class _Rig {
     container = ProviderContainer(overrides: [
       lastfmPlaybackSignalProvider
           .overrideWith((ref) => ref.watch(_signalProvider)),
-      offlineModeProvider.overrideWith(_Offline.new),
+      offlineModeProvider.overrideWith(() => TestOffline(false)),
       lastfmServiceProvider.overrideWith(() => _Account(account)),
       ...lastfmOverrides(api),
     ]);
@@ -117,7 +108,7 @@ class _Rig {
       .set(status, item: item, track: track, atStart: atStart);
 
   void offline(bool value) =>
-      (container.read(offlineModeProvider.notifier) as _Offline).set(value);
+      (container.read(offlineModeProvider.notifier) as TestOffline).set(value);
 
   void failAccount() =>
       (container.read(lastfmServiceProvider.notifier) as _Account).fail();
@@ -167,7 +158,7 @@ class _RealSignalRig {
   _RealSignalRig() {
     container = ProviderContainer(overrides: [
       queuePlayerProvider.overrideWith(_Player.new),
-      offlineModeProvider.overrideWith(_Offline.new),
+      offlineModeProvider.overrideWith(() => TestOffline(false)),
       lastfmServiceProvider.overrideWith(() => _Account(_known())),
       ...lastfmOverrides(api),
     ]);
@@ -177,9 +168,12 @@ class _RealSignalRig {
   final api = FakeLastfmApi();
   late final ProviderContainer container;
 
-  void at(int ms, {PlayerStatus status = PlayerStatus.playing}) =>
+  void at(int ms,
+          {PlayerStatus status = PlayerStatus.playing,
+          String track = _a,
+          int item = 1}) =>
       (container.read(queuePlayerProvider.notifier) as _Player)
-          .emit(_a, Duration(milliseconds: ms), status: status);
+          .emit(track, Duration(milliseconds: ms), status: status, item: item);
 
   List<String> get sent =>
       [for (final c in api.calls) if (c.startsWith('nowPlaying')) c];
@@ -498,6 +492,37 @@ void main() {
       rig.at(5000); // a seek to exactly 5 s is not the start
       await t.pump(const Duration(seconds: 6));
       expect(rig.sent, hasLength(2));
+    });
+
+    // O-332-05, F903-O-16: the item and track the notice names come from
+    // the real signal, not an overridden one.
+    testWidgets('track A on one item, then track B on another: two notices, '
+        'A then B', (t) async {
+      final rig = _RealSignalRig();
+      addTearDown(rig.dispose);
+      await t.pump();
+      rig.at(0);
+      await t.pump(const Duration(seconds: 6));
+      expect(rig.sent, ['nowPlaying $_a']);
+      rig.at(0, track: _b, item: 2);
+      await t.pump(const Duration(seconds: 4));
+      expect(rig.sent, hasLength(1), reason: 'B has not played 5 s yet');
+      await t.pump(const Duration(seconds: 2));
+      expect(rig.sent, ['nowPlaying $_a', 'nowPlaying $_b']);
+    });
+
+    testWidgets('the same track moved to another item inside the first 5 s: '
+        'a fresh 5 s dwell', (t) async {
+      final rig = _RealSignalRig();
+      addTearDown(rig.dispose);
+      await t.pump();
+      rig.at(0);
+      await t.pump(const Duration(seconds: 3));
+      rig.at(0, item: 2);
+      await t.pump(const Duration(seconds: 3));
+      expect(rig.sent, isEmpty, reason: '3 s on the new item');
+      await t.pump(const Duration(seconds: 2));
+      expect(rig.sent, ['nowPlaying $_a']);
     });
 
     testWidgets('pause and resume inside the first 5 s: no second notice',

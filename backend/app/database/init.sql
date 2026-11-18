@@ -1,5 +1,7 @@
 -- The whole script is one transaction: a crash mid-init leaves no schema.
 -- The user_version below must equal Database.LATEST_SCHEMA_VERSION.
+-- This file is the whole schema (version 1): there is no upgrade step yet,
+-- so a schema change is made here, in place.
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS users (
@@ -23,7 +25,6 @@ CREATE TABLE IF NOT EXISTS user_settings (
     PRIMARY KEY (user_id, key)
 );
 
--- Used from M.1.
 CREATE TABLE IF NOT EXISTS auth_sessions (
     "token_hash" TEXT NOT NULL PRIMARY KEY,
     "media_hash" TEXT NOT NULL UNIQUE,
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
 
--- Used by the offline `users delete` (M.2b) to remember which cover art the
+-- Used by the offline `users delete` to remember which cover art the
 -- deleted user referenced. Deliberately no FK to cover_arts, so a captured id
 -- survives the art row's removal on a resumed delete.
 CREATE TABLE IF NOT EXISTS user_delete_art_capture (
@@ -49,8 +50,6 @@ CREATE TABLE IF NOT EXISTS artists (
     "owner_id" INTEGER NOT NULL REFERENCES users("id"),
     UNIQUE ("owner_id", "name_lower")
 );
-
-CREATE INDEX IF NOT EXISTS idx_artists_name_lower ON artists("name_lower");
 
 CREATE TABLE IF NOT EXISTS albums (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,6 +74,13 @@ CREATE TABLE IF NOT EXISTS tracks (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
     "uuid_id" TEXT UNIQUE NOT NULL,
     "file_path" TEXT NOT NULL,
+    -- file_path in canonical caseless form (database.track_path_values: NFD,
+    -- casefold, NFD), written by the same statement as every write of
+    -- file_path. Two spellings a caseless disk reads as one name have one
+    -- folded form.
+    "file_path_fold" TEXT NOT NULL,
+    -- The folder of file_path in the same form, written by the same statement.
+    "file_folder_fold" TEXT NOT NULL,
     "created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
     "last_updated" INTEGER NOT NULL DEFAULT (unixepoch()),
     -- Monotonic sync watermark, assigned from revision_counter on add/update.
@@ -82,8 +88,15 @@ CREATE TABLE IF NOT EXISTS tracks (
     "owner_id" INTEGER NOT NULL REFERENCES users("id")
 );
 
-CREATE INDEX IF NOT EXISTS idx_tracks_revision ON tracks("revision");
 CREATE INDEX IF NOT EXISTS idx_tracks_owner_revision ON tracks("owner_id", "revision");
+-- No two tracks name one file (stored paths are absolute and lie in their
+-- owner's library folder, so this holds across owners), and "is this path
+-- taken" (Database.track_path_in_use) is one probe of this index.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_file_path_fold ON tracks("file_path_fold");
+-- The tracks directly in one folder (Database.track_identities_in_folder, the
+-- import's name choice) are one probe of this index: only those rows are read,
+-- not the folders below it.
+CREATE INDEX IF NOT EXISTS idx_tracks_file_folder_fold ON tracks("file_folder_fold");
 
 CREATE TABLE IF NOT EXISTS cover_arts (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,12 +187,6 @@ CREATE TABLE IF NOT EXISTS track_tombstones (
     "owner_id"   INTEGER NOT NULL REFERENCES users("id")
 );
 
-CREATE INDEX IF NOT EXISTS idx_track_tombstones_deleted_at
-    ON track_tombstones("deleted_at");
-
-CREATE INDEX IF NOT EXISTS idx_track_tombstones_revision
-    ON track_tombstones("revision");
-
 CREATE INDEX IF NOT EXISTS idx_track_tombstones_owner_revision
     ON track_tombstones("owner_id", "revision");
 
@@ -197,7 +204,7 @@ INSERT OR IGNORE INTO revision_counter ("id", "value") VALUES (0, 0);
 -- destructive filesystem step (a relocate move, or an in-place tag overwrite)
 -- so a crash in the move<->commit window is finished or reverted by an
 -- idempotent reconcile pass at startup. `intent` dispatches the recovery;
--- Phase 2 adds an "intent='convert'" branch on this same table.
+-- master-type conversion uses an "intent='convert'" row in this same table.
 CREATE TABLE IF NOT EXISTS edit_journal (
     "id"         INTEGER PRIMARY KEY,
     "intent"     TEXT NOT NULL,
@@ -209,7 +216,7 @@ CREATE TABLE IF NOT EXISTS edit_journal (
     "owner_id"   INTEGER NOT NULL REFERENCES users("id")
 );
 
--- Durable master-type conversion jobs (Phase 2). `status` is one of
+-- Durable master-type conversion jobs. `status` is one of
 -- queued/running/done/failed/cancelled; the actual FS/DB commit for a
 -- conversion is guarded by an "intent='convert'" edit_journal row, not this
 -- table -- this table is job lifecycle/visibility, not crash-safety.
@@ -257,7 +264,7 @@ CREATE TABLE IF NOT EXISTS history_hook_failures (
     "created_at" INTEGER NOT NULL
 );
 
--- Audio identity (Phase 6.5): one row per track; see the 6.5 spec section 6.1.
+-- Audio identity: one row per track.
 CREATE TABLE IF NOT EXISTS track_audio_identity (
   uuid_id         TEXT PRIMARY KEY REFERENCES tracks(uuid_id) ON DELETE CASCADE,
   generation      INTEGER NOT NULL DEFAULT 0,
@@ -297,7 +304,7 @@ CREATE INDEX IF NOT EXISTS idx_taf_duration ON track_audio_fingerprint(duration_
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_uuid_owner ON tracks(uuid_id, owner_id);
 
 -- band_rank: 0 exact / 1 strong / 2 possible. sort_score is 1.0 for exact and never NULL (keyset-safe).
--- The composite FKs back the per-owner rule (SC-28): both partners are that owner's tracks.
+-- The composite FKs back the per-owner rule: both partners are that owner's tracks.
 CREATE TABLE IF NOT EXISTS track_duplicate_candidates (
   owner_id   INTEGER NOT NULL REFERENCES users(id),
   uuid_a     TEXT NOT NULL,
@@ -315,10 +322,10 @@ CREATE TABLE IF NOT EXISTS track_duplicate_candidates (
   FOREIGN KEY (uuid_b, owner_id) REFERENCES tracks(uuid_id, owner_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_tdc_b    ON track_duplicate_candidates(uuid_b);
--- idx_tdc_list serves Phase 8's per-owner keyset list.
+-- idx_tdc_list serves the per-owner keyset list of possible duplicates.
 CREATE INDEX IF NOT EXISTS idx_tdc_list ON track_duplicate_candidates(owner_id, status, band_rank, sort_score DESC, uuid_a, uuid_b);
 
--- Phase 7 (v15) upload tables. Client uuids are unique per owner only (decision O2);
+-- Upload tables. Client uuids are unique per owner only;
 -- a batch's status is derived from its items, never stored.
 CREATE TABLE IF NOT EXISTS upload_batches (
   owner_id   INTEGER NOT NULL REFERENCES users(id),
@@ -330,7 +337,7 @@ CREATE TABLE IF NOT EXISTS upload_batches (
 );
 CREATE INDEX IF NOT EXISTS idx_upload_batches_list ON upload_batches(owner_id, created_at, batch_uuid);
 
--- upload_items: one row per client file or ZIP member (spec §3 states). ZIP children name
+-- upload_items: one row per client file or ZIP member. ZIP children name
 -- their member and never nest; terminal receipts carry the track.
 CREATE TABLE IF NOT EXISTS upload_items (
   owner_id             INTEGER NOT NULL REFERENCES users(id),
@@ -387,7 +394,7 @@ CREATE INDEX IF NOT EXISTS idx_upload_items_state ON upload_items(state, updated
 -- idx_upload_items_result serves the acknowledgement rule.
 CREATE INDEX IF NOT EXISTS idx_upload_items_result ON upload_items(owner_id, result_track_uuid) WHERE result_track_uuid IS NOT NULL;
 
--- upload_item_audio_identity: the SC-25 serializer's columns (IDENTITY_COLUMNS + FINGERPRINT_COLUMNS
+-- upload_item_audio_identity: the audio-identity serializer's columns (IDENTITY_COLUMNS + FINGERPRINT_COLUMNS
 -- in services/audio_identity.py) plus fp_failure_reason. A test fails if the columns diverge from
 -- the serializer. The writer sets fp_state 'unavailable'/'failed' itself when there is no print.
 -- A staged identity is always computed, never pending.
@@ -414,9 +421,9 @@ CREATE TABLE IF NOT EXISTS upload_item_audio_identity (
   CHECK (fp_state NOT IN ('current','low_information') OR (fp_data IS NOT NULL AND fp_duration_s IS NOT NULL AND fp_backend IS NOT NULL AND fp_algorithm IS NOT NULL))
 );
 
--- operation_receipts: SC-16c. Canonical request hash; a replay returns result_ref; the same uuid with a
+-- operation_receipts: one row per idempotent operation. Canonical request hash; a replay returns result_ref; the same uuid with a
 -- different hash is 409 operation_conflict. Keyed (owner_id, operation_uuid) so another user's uuid is
--- invisible (O2). kind is an open set (Phase 8/9D add kinds). Never pruned in Phases 7-9.
+-- invisible. kind is an open set (each kind of operation adds its own). Never pruned.
 CREATE TABLE IF NOT EXISTS operation_receipts (
   owner_id       INTEGER NOT NULL REFERENCES users(id),
   operation_uuid TEXT NOT NULL,
@@ -427,8 +434,8 @@ CREATE TABLE IF NOT EXISTS operation_receipts (
   PRIMARY KEY (owner_id, operation_uuid)
 );
 
--- storage_reservations: SC-16g ledger table. owner_id is SC-16g's owner_ref (Phase M note); subject_ref
--- names the job or item holding the bytes. AUTOINCREMENT so a released id is never reused. Logic arrives in 7A.2a.
+-- storage_reservations: the storage ledger, one row per reservation of bytes by one owner; subject_ref
+-- names the job or item holding the bytes. AUTOINCREMENT so a released id is never reused. Logic: app/services/storage_ledger.py.
 -- The index leads with owner_id because subject_ref (an item uuid) is unique only per owner.
 CREATE TABLE IF NOT EXISTS storage_reservations (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -441,8 +448,8 @@ CREATE TABLE IF NOT EXISTS storage_reservations (
 );
 CREATE INDEX IF NOT EXISTS idx_storage_reservations_owner ON storage_reservations(owner_id, purpose, subject_ref);
 
--- upload_item_acknowledgements: the frozen acknowledgements of an accepted commit (spec 3). Kept as long
--- as the item, because a later item's commit guard reads them (spec 6 step 3; the symmetric rule uses
+-- upload_item_acknowledgements: the frozen acknowledgements of an accepted commit. Kept as long
+-- as the item, because a later item's commit guard reads them (the symmetric rule uses
 -- the subject index).
 CREATE TABLE IF NOT EXISTS upload_item_acknowledgements (
   owner_id     INTEGER NOT NULL REFERENCES users(id),
@@ -454,10 +461,10 @@ CREATE TABLE IF NOT EXISTS upload_item_acknowledgements (
 );
 CREATE INDEX IF NOT EXISTS idx_upload_acks_subject ON upload_item_acknowledgements(owner_id, subject_kind, subject_ref);
 
--- upload_commit_journal: the spec 6 publication journal, keyed by (owner_id, operation_uuid); it needs its
--- receipt. The identity columns are the SC-25 serializer's (IDENTITY_COLUMNS + FINGERPRINT_COLUMNS), NULL
+-- upload_commit_journal: the upload commit's publication journal, keyed by (owner_id, operation_uuid); it needs its
+-- receipt. The identity columns are the audio-identity serializer's (IDENTITY_COLUMNS + FINGERPRINT_COLUMNS), NULL
 -- until prepared; a NULL fp_state means the print is recomputed. cover_art_id has no FK: shared art may be
--- released and recovery re-resolves it (SC-16h). The item FK has no cascade, so an item cannot vanish
+-- released and recovery re-resolves it. The item FK has no cascade, so an item cannot vanish
 -- under its recovery record.
 CREATE TABLE IF NOT EXISTS upload_commit_journal (
   owner_id                INTEGER NOT NULL REFERENCES users(id),
@@ -499,7 +506,7 @@ CREATE TABLE IF NOT EXISTS upload_commit_journal (
 );
 CREATE INDEX IF NOT EXISTS idx_upload_journal_item ON upload_commit_journal(owner_id, item_uuid);
 
--- Phase 8 (v16) deletion tables: keyed (owner_id, operation_uuid) like their
+-- Deletion tables: keyed (owner_id, operation_uuid) like their
 -- receipt. The aggregate job outcome is derived from the items; status here is
 -- only the job lifecycle ('accepted' until every item is terminal, then
 -- 'completed'). Receipts and jobs are never pruned.
@@ -513,7 +520,7 @@ CREATE TABLE IF NOT EXISTS deletion_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_deletion_jobs_list ON deletion_jobs(owner_id, created_at, operation_uuid);
 -- Items: one row per target in request order (position); status is the per-target
--- outcome (SC-16d claim columns lease_boot_id/cancel_requested). No cascade: a job
+-- outcome; lease_boot_id/cancel_requested are the claim columns. No cascade: a job
 -- cannot be deleted under its items, nor an item under its journal row.
 CREATE TABLE IF NOT EXISTS deletion_job_items (
   owner_id           INTEGER NOT NULL REFERENCES users(id),
@@ -533,11 +540,13 @@ CREATE TABLE IF NOT EXISTS deletion_job_items (
   CHECK (status <> 'failed' OR error_code IS NOT NULL),
   CHECK (status NOT IN ('deleted','already_deleted') OR tombstone_revision IS NOT NULL)
 );
--- Journal: the spec section 5 step 2 file journal; its existence is the
+-- Items are never pruned: the worker's idle poll (claim_next_deletion_item) reads only the pending ones through this.
+CREATE INDEX IF NOT EXISTS idx_deletion_job_items_pending ON deletion_job_items(owner_id, operation_uuid, position) WHERE status = 'pending';
+-- Journal: the deletion's file journal; its existence is the
 -- pending-deletion marker read by live_tracks. It outlives the track row until
 -- storage cleanup, so it has no FK to tracks. Identity (dev, ino, size) and the
 -- quarantine path are required unless the master was already missing; cover_art_id
--- has no FK (shared art may be released, SC-16h).
+-- has no FK (shared art may be released).
 CREATE TABLE IF NOT EXISTS deletion_journal (
   owner_id        INTEGER NOT NULL REFERENCES users(id),
   operation_uuid  TEXT NOT NULL,
@@ -548,8 +557,6 @@ CREATE TABLE IF NOT EXISTS deletion_journal (
   src_dev         INTEGER,
   src_ino         INTEGER,
   src_size        INTEGER,
-  src_mtime_ns    INTEGER,
-  exact_digest    TEXT,
   cover_art_id    INTEGER,
   master_missing  INTEGER NOT NULL CHECK (master_missing IN (0,1)),
   stage           TEXT NOT NULL CHECK (stage IN ('intent','moved','committed')),
@@ -574,11 +581,11 @@ WHEN NEW.owner_id IS NOT OLD.owner_id OR NEW.uuid_id IS NOT OLD.uuid_id
 BEGIN
   SELECT RAISE(ABORT, 'deletion_journal owner and track never change');
 END;
--- One liveness definition (SC-25): the finder, the candidate refresh and Phase 8's list join through this view; the pending-deletion marker is a deletion_journal row (Phase 8), and no consumer writes its own predicate.
+-- One liveness definition: the duplicate finder, the candidate refresh and the possible-duplicates list join through this view; the pending-deletion marker is a deletion_journal row, and no consumer writes its own predicate.
 CREATE VIEW IF NOT EXISTS live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks
   WHERE NOT EXISTS (SELECT 1 FROM deletion_journal d WHERE d.uuid_id = tracks.uuid_id);
 
--- Phase 9D.1b (v17), spec §7.3: one Last.fm connection per user; secrets are Fernet ciphertext, never plaintext.
+-- One Last.fm connection per user; secrets are Fernet ciphertext, never plaintext.
 CREATE TABLE IF NOT EXISTS lastfm_connections (
   owner_id                 INTEGER NOT NULL UNIQUE REFERENCES users(id),
   connection_id            TEXT,
@@ -596,7 +603,7 @@ CREATE TABLE IF NOT EXISTS lastfm_connections (
   CHECK (opted_in = 0 OR session_key_enc IS NOT NULL)
 );
 
--- Phase 9D.1b (v17), spec §7.3: the scrobble outbox. The frozen payload is exactly what is sent; there is no link to the track. The second index serves the sender's due scan.
+-- The scrobble outbox. The frozen payload is exactly what is sent; there is no link to the track. The second index serves the sender's due scan.
 CREATE TABLE IF NOT EXISTS scrobble_outbox (
   event_uuid    TEXT NOT NULL PRIMARY KEY,
   owner_id      INTEGER NOT NULL REFERENCES users(id),
@@ -615,5 +622,5 @@ CREATE TABLE IF NOT EXISTS scrobble_outbox (
 CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_owner ON scrobble_outbox(owner_id, status, listened_at_s);
 CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_due ON scrobble_outbox(owner_id, created_at, listened_at_s) WHERE status = 'pending';
 
-PRAGMA user_version = 17;
+PRAGMA user_version = 1;
 COMMIT;

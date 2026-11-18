@@ -26,7 +26,7 @@ from fastapi.testclient import TestClient
 from app.database.database import Database
 from app.library import Library
 from tests.owned_database import add_test_user
-from tests.test_import_startup import WATCH, _drain_imports, _tone, requires_ffmpeg
+from tests.import_startup_fixtures import WATCH, _drain_imports, _tone, requires_ffmpeg
 
 
 import pytest

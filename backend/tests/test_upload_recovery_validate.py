@@ -19,19 +19,15 @@ import pytest
 
 from app.services import audio_identity, upload_recovery
 from app.services.audio_identity import ExactUnavailable
+from app.services.ffmpeg_runner import ToolOptions
 from app.services.upload_publish import SimulatedCrash
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import (
     FakeExact, accept, journal, make_commit_worker, ready_item, reservations,
 )
 from tests.upload_publish_fixtures import RecordingSeam, track_row
 from tests.upload_recovery_fixtures import World
 from tests.upload_validation_fixtures import item_row
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -241,8 +237,9 @@ def _real_commit(world, tmp_path, point, real_flac):
     staged = ready_item(world.db, world.music / ".uploads", content=content)
     commit = accept(world.db, staged)
     seam = RecordingSeam(crash_at=point)
-    def real_exact(path, codec_hint, *, input_format=None, **_process_kwargs):
-        return audio_identity.compute_exact(path, codec_hint, input_format=input_format)
+    def real_exact(path, codec_hint, *, options):
+        # The commit worker's fake registry cannot hold a real process: the format only.
+        return audio_identity.compute_exact(path, codec_hint, options=ToolOptions(input_format=options.input_format))
 
     worker = make_commit_worker(world.db, world.music, exact=real_exact,
                                 after_prepared=world.publisher(seam), seam=seam)
@@ -297,7 +294,7 @@ def test_a_damaged_real_flac_fails_safely_and_keeps_the_good_source(world, tmp_p
     target = Path(row["work_path"] if point == "before_link" else row["final_path"])
     target.write_bytes(_damaged(target.read_bytes(), damage))
 
-    found = audio_identity.compute_exact(target, "flac", input_format="flac")
+    found = audio_identity.compute_exact(target, "flac", options=ToolOptions(input_format="flac"))
     if reason is None:
         assert isinstance(found, audio_identity.ExactAudioHash)
         assert found.digest != row["exact_digest"]
@@ -460,9 +457,8 @@ def test_a_database_error_while_checking_is_left_for_the_next_start(world, monke
 
 
 @pytest.mark.requires_ffmpeg
-@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
-                    reason="root ignores mode bits, so chmod(0) cannot deny the read (review r3 7-R3-06)")
 @pytest.mark.parametrize("point", ["before_link", "after_work_unlink"])
+@pytest.mark.requires_chmod_denial
 def test_a_placed_file_the_server_cannot_read_is_unknown_not_damaged(world, tmp_path, real_flac, point, caplog):
     """In-piece review F1: the decoder reports an unreadable file (EACCES) as a
     decode error; recovery reads the file itself first, so a file it cannot

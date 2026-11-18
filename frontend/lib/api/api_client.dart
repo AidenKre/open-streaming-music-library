@@ -93,6 +93,11 @@ class ApiException implements Exception {
   String toString() => 'ApiException($statusCode): $message';
 }
 
+/// How [ApiException.message] starts for a 2xx answer whose body is not
+/// JSON at all; [ApiClient.healthCheck] reports it as
+/// [HealthResult.bodyNotJson].
+const _malformedJson = 'Malformed JSON response: ';
+
 /// Thrown when the retry helper exhausts attempts on a transport-level error
 /// (socket dropped, DNS failure, timeout, low-level http.ClientException).
 ///
@@ -127,8 +132,10 @@ typedef DelayFn = Future<void> Function(Duration);
 /// the server answered with a non-2xx (e.g. 500) or an unexpected body — the
 /// server is up but misbehaving, so the user should see an inline error
 /// rather than enter offline mode. At app launch only, an HTTP 5xx or 429
-/// answer is treated like `unreachable` (sign-off OPEN-A-04, 2026-11-17); see
-/// [HealthResult.statusCode] and `SessionService.resumeSavedSession`.
+/// answer, or a 2xx answer that is not JSON (a web page in front of the
+/// server), is treated like `unreachable` (sign-off OPEN-A-04, 2026-11-17;
+/// pre-merge review A5-02); see [HealthResult.statusCode] and
+/// `SessionService.resumeSavedSession`.
 enum HealthStatus { ok, serverError, unreachable }
 
 class HealthResult {
@@ -136,10 +143,19 @@ class HealthResult {
   final String? message;
 
   /// The status of an `ApiException` answer: the HTTP status of a non-2xx
-  /// answer, and 200 for a 2xx body that is not valid JSON. Null for a
-  /// well-formed JSON 2xx that is not OSML's, and for transport failures.
+  /// answer, and the 2xx status of a body that is not valid JSON or not a
+  /// JSON object. Null for a well-formed JSON object that is not OSML's, and
+  /// for transport failures.
   final int? statusCode;
-  const HealthResult(this.status, [this.message, this.statusCode]);
+
+  /// The answer was 2xx and its body is not JSON at all (a web page).
+  final bool bodyNotJson;
+  const HealthResult(
+    this.status, [
+    this.message,
+    this.statusCode,
+    this.bodyNotJson = false,
+  ]);
   bool get isOk => status == HealthStatus.ok;
 }
 
@@ -377,7 +393,6 @@ class ApiClient {
         explicit: policy,
         retry: retry,
         triggerOfflineHook: triggerOfflineHook,
-        defaultRetry: true,
       ),
     );
   }
@@ -403,7 +418,6 @@ class ApiClient {
         explicit: policy,
         retry: true,
         triggerOfflineHook: true,
-        defaultRetry: true,
       ),
     );
   }
@@ -430,7 +444,6 @@ class ApiClient {
         explicit: policy,
         retry: retry,
         triggerOfflineHook: true,
-        defaultRetry: false,
       ),
     );
   }
@@ -458,7 +471,6 @@ class ApiClient {
         explicit: policy,
         retry: retry,
         triggerOfflineHook: true,
-        defaultRetry: false,
       ),
     );
   }
@@ -485,7 +497,6 @@ class ApiClient {
         explicit: policy,
         retry: retry,
         triggerOfflineHook: true,
-        defaultRetry: true,
       ),
     );
   }
@@ -512,7 +523,6 @@ class ApiClient {
         explicit: policy,
         retry: retry,
         triggerOfflineHook: true,
-        defaultRetry: false,
       ),
     );
   }
@@ -523,7 +533,7 @@ class ApiClient {
   /// on exhaustion. Cover-art tiles are high-volume (one fetch per album/
   /// artist tile) and a single failing thumbnail should not darken the
   /// whole app — those callers should pass `retry: false` and
-  /// `triggerOfflineHook: false` (or `policy: RetryPolicy.coverArt`).
+  /// `triggerOfflineHook: false`.
   Future<Uint8List> getBytes(
     List<String> pathSegments, {
     Map<String, String>? query,
@@ -552,7 +562,6 @@ class ApiClient {
         explicit: policy,
         retry: retry,
         triggerOfflineHook: triggerOfflineHook,
-        defaultRetry: true,
       ),
     );
   }
@@ -560,14 +569,14 @@ class ApiClient {
   /// Resolves the effective policy from the legacy `retry` / `triggerOfflineHook`
   /// booleans and an optional explicit [explicit] override. When [explicit] is
   /// provided it wins outright; otherwise we pick `standard` vs `noRetry`
-  /// based on the verb's default and apply the offline-hook opt-out via
-  /// `copyWith` so callers keep getting the well-known constants without
-  /// the boolean fork bleeding throughout the request methods.
+  /// from [retry] (each verb sets its own default for it) and apply the
+  /// offline-hook opt-out via `copyWith` so callers keep getting the
+  /// well-known constants without the boolean fork bleeding throughout the
+  /// request methods.
   RetryPolicy _resolvePolicy({
     required RetryPolicy? explicit,
     required bool retry,
     required bool triggerOfflineHook,
-    required bool defaultRetry,
   }) {
     if (explicit != null) {
       return triggerOfflineHook
@@ -893,7 +902,7 @@ class ApiClient {
         // help, so surface as an ApiException — caller decides what to do.
         throw ApiException(
           response.statusCode,
-          'Malformed JSON response: ${e.message}',
+          '$_malformedJson${e.message}',
         );
       } on TypeError catch (e) {
         // jsonDecode produced something other than Map<String, dynamic>
@@ -927,6 +936,7 @@ class ApiClient {
         HealthStatus.serverError,
         'Server error: ${e.statusCode}',
         e.statusCode,
+        _isSuccess(e.statusCode) && e.message.startsWith(_malformedJson),
       );
     } on NetworkException catch (e) {
       return HealthResult(HealthStatus.unreachable, 'Could not reach server: ${e.message}');
@@ -1013,45 +1023,13 @@ class ApiClient {
         _log('$label HTTP ${status.statusCode} — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
-      } on SocketException catch (e) {
+      } catch (e) {
+        final kind = _transportFailureKind(e);
+        if (kind == null) rethrow;
         lastNetworkCause = e;
         if (attemptNumber >= maxAttempts) break;
         final delay = _delayForRetry(attemptNumber, const {}, policy);
-        _log('$label socket error — retrying in ${delay.inMilliseconds}ms');
-        await _delay(delay);
-        continue;
-      } on OSError catch (e) {
-        // dart:io can throw a bare OSError (not wrapped in SocketException)
-        // when a connection is reset during connect -- e.g. a proxy or
-        // restarting server accepting and immediately dropping it.
-        lastNetworkCause = e;
-        if (attemptNumber >= maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {}, policy);
-        _log('$label OS error — retrying in ${delay.inMilliseconds}ms');
-        await _delay(delay);
-        continue;
-      } on TimeoutException catch (e) {
-        lastNetworkCause = e;
-        if (attemptNumber >= maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {}, policy);
-        _log('$label timeout — retrying in ${delay.inMilliseconds}ms');
-        await _delay(delay);
-        continue;
-      } on http.ClientException catch (e) {
-        lastNetworkCause = e;
-        if (attemptNumber >= maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {}, policy);
-        _log('$label client error — retrying in ${delay.inMilliseconds}ms');
-        await _delay(delay);
-        continue;
-      } on ArgumentError catch (e) {
-        // Typically thrown by http when baseUrl is empty/malformed and the
-        // resulting Uri has no scheme/host. Treat as a transport-level error
-        // so callers see a typed NetworkException rather than a raw throw.
-        lastNetworkCause = e;
-        if (attemptNumber >= maxAttempts) break;
-        final delay = _delayForRetry(attemptNumber, const {}, policy);
-        _log('$label argument error — retrying in ${delay.inMilliseconds}ms');
+        _log('$label $kind — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
       }
@@ -1063,6 +1041,27 @@ class ApiClient {
       cause: lastNetworkCause,
       attemptsMade: maxAttempts,
     );
+  }
+
+  /// The log name of a transport-level failure the request loop retries, or
+  /// null for anything else (which propagates unchanged):
+  ///   - SocketException
+  ///   - a bare OSError: dart:io can throw one (not wrapped in
+  ///     SocketException) when a connection is reset during connect, e.g. a
+  ///     proxy or restarting server accepting and immediately dropping it
+  ///   - TimeoutException (the per-attempt timeout)
+  ///   - http.ClientException
+  ///   - ArgumentError: typically thrown by http when baseUrl is
+  ///     empty/malformed and the resulting Uri has no scheme/host; treated as
+  ///     a transport-level error so callers see a typed NetworkException
+  ///     rather than a raw throw
+  static String? _transportFailureKind(Object e) {
+    if (e is SocketException) return 'socket error';
+    if (e is OSError) return 'OS error';
+    if (e is TimeoutException) return 'timeout';
+    if (e is http.ClientException) return 'client error';
+    if (e is ArgumentError) return 'argument error';
+    return null;
   }
 
   /// Returns the wait time before the next attempt. If the response carried

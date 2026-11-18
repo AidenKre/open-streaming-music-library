@@ -7,8 +7,9 @@ one test user on ``initialize()`` and passes that user's id to every
 owner-requiring method the caller did not give an owner. An explicit
 ``owner_id`` always wins, so multi-user tests can use the same instance.
 
-Production code never uses this class. ``OWNER_METHODS`` grows as later
-pieces make more methods owner-scoped.
+Production code never uses this class. ``OWNER_METHODS`` names the methods
+it fills in an owner for; a method missing from it needs an explicit
+``owner_id`` from the test.
 """
 
 import functools
@@ -18,7 +19,10 @@ from app.database.database import Database
 
 TEST_OWNER_USERNAME = "owner"
 
-# Every Database method that requires ``owner_id``.
+# The owner-requiring Database methods that direct-database tests call without
+# an owner: not every method that requires ``owner_id`` (most are called with
+# an explicit one). Each is one of ``app.library.OWNED_METHODS``, the methods a
+# Library binds to its owner (tests/test_owned_database.py checks it).
 OWNER_METHODS: tuple[str, ...] = (
     "add_track",
     "insert_conversion_job",
@@ -48,6 +52,7 @@ OWNER_METHODS: tuple[str, ...] = (
     "settle_swapped_conversion_job",
     "bump_track_revision",
     "complete_conversion_job",
+    "undo_inplace_conversion",
     "list_journal_entries",
     "has_journal_entry_for_uuid",
     "delete_journal_entry",

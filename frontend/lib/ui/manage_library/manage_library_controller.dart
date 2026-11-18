@@ -7,6 +7,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/api/library_tools_api.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -18,6 +19,7 @@ import 'package:frontend/services/deletion/deletion_preview.dart';
 import 'package:frontend/services/deletion/deletion_text.dart';
 import 'package:frontend/models/id_hints.dart';
 import 'package:frontend/services/feature_providers.dart';
+import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/services/deletion/server_delete_availability.dart';
 import 'package:frontend/ui/manage_library/deletion_review_controller.dart';
 import 'package:frontend/ui/selection/track_selection_controller.dart';
@@ -136,6 +138,10 @@ abstract interface class ManageLibraryControls implements Listenable {
 
   ReceiptsLoad get receiptsLoad;
 
+  /// What Deletion history says while [receiptsLoad] is
+  /// [ReceiptsLoad.needsConnection]: why nothing can be read now.
+  String get receiptsUnreachableText;
+
   /// Receipts loaded so far, in the server's keyset order.
   List<ReceiptView> get receipts;
 
@@ -175,11 +181,16 @@ class ManageLibraryController extends ChangeNotifier
     _manager.jobs.addListener(_onJobs);
     _subs.add(_ref.container.listen(libraryToolsFeatureProvider, (_, _) => _poke()));
     _subs.add(_ref.container.listen(offlineModeProvider, (prev, next) {
+      if (next == true) _receiptsRefusal = null;
       _poke();
       if (next == false && _receiptsLoad == ReceiptsLoad.needsConnection) {
         unawaited(retryReceipts());
       }
     }));
+    _subs.add(_ref.container.listen(
+      libraryToolsServerBlockedProvider,
+      (_, _) => _poke(),
+    ));
     _onSelection();
     _onJobs();
   }
@@ -204,6 +215,9 @@ class ManageLibraryController extends ChangeNotifier
   ReceiptsLoad _receiptsLoad = ReceiptsLoad.idle;
   List<ReceiptView> _receipts = const [];
   String? _nextAfter;
+
+  /// Why the last receipts read was refused; cleared when a load starts.
+  BindingRefusal? _receiptsRefusal;
 
   /// The last receipts request, for [retryReceipts].
   String? _lastAfter;
@@ -232,6 +246,14 @@ class ManageLibraryController extends ChangeNotifier
 
   @override
   ReceiptsLoad get receiptsLoad => _receiptsLoad;
+
+  @override
+  String get receiptsUnreachableText => deletionHistoryUnreachableText(
+    libraryToolsUnreachable(
+      blocked: _ref.read(libraryToolsServerBlockedProvider),
+      refusal: _receiptsRefusal,
+    ),
+  );
 
   @override
   List<ReceiptView> get receipts => _receipts;
@@ -401,6 +423,7 @@ class ManageLibraryController extends ChangeNotifier
     if (_disposed || _receiptsLoad == ReceiptsLoad.loading) return;
     _lastAfter = after;
     _lastAppend = append;
+    _receiptsRefusal = null;
     // Offline nothing can be asked: say so at once (as the preview does).
     if (_ref.read(offlineModeProvider)) {
       _receiptsLoad = ReceiptsLoad.needsConnection;
@@ -426,10 +449,11 @@ class ManageLibraryController extends ChangeNotifier
       _receipts = append ? [..._receipts, ...fresh] : fresh;
       _nextAfter = page.nextAfter;
       _receiptsLoad = ReceiptsLoad.loaded;
-    } on LibraryToolsNotConnected {
+    } on LibraryToolsNotConnected catch (e) {
       if (_disposed) return;
+      _receiptsRefusal = e.reason;
       _receiptsLoad = ReceiptsLoad.needsConnection;
-      _reloadWhenVerified();
+      _reload.arm();
     } catch (_) {
       if (_disposed) return;
       _receiptsLoad = ReceiptsLoad.failed;
@@ -437,23 +461,16 @@ class ManageLibraryController extends ChangeNotifier
     notifyListeners();
   }
 
-  bool _awaitingVerified = false;
-
   /// A read that failed fast as not connected repeats by itself once the
-  /// binding verifies (one pending wait; no polling).
-  void _reloadWhenVerified() {
-    if (_awaitingVerified) return;
-    _awaitingVerified = true;
-    _ref.read(libraryToolsApiProvider).whenVerified().then(
-      (_) {
-        _awaitingVerified = false;
-        if (_disposed || _receiptsLoad != ReceiptsLoad.needsConnection) return;
-        unawaited(retryReceipts());
-      },
-      onError: (Object _) {
-        _awaitingVerified = false;
-      },
-    );
+  /// binding verifies.
+  late final _reload = ReloadWhenVerified(
+    whenVerified: () => _ref.read(libraryToolsApiProvider).whenVerified(),
+    onVerified: _onVerified,
+  );
+
+  void _onVerified() {
+    if (_disposed || _receiptsLoad != ReceiptsLoad.needsConnection) return;
+    unawaited(retryReceipts());
   }
 
   @override

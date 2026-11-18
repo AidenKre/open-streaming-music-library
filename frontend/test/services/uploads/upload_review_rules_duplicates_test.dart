@@ -16,26 +16,14 @@ import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/upload_review_rules.dart';
 
 import '../../helpers/duplicate_check_fixtures.dart';
+import '../../helpers/upload_intent_record.dart';
 
-UploadIntentRecord _intent(String state) => UploadIntentRecord(
-  itemUuid: 'i-1',
+UploadIntentRecord _intent(String state) => intentRecord(
+  'i-1',
   batchUuid: 'b-1',
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: 'i-1.flac',
-  lastState: state,
-  lastErrorCode: null,
-  lastErrorMessage: null,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
+  state: state,
   localBindingId: 'bind',
-  createdAtMs: 0,
-  updatedAtMs: 0,
-  expectedLength: null,
-  expectedSha256: null,
-  descriptor: null,
 );
 
 ReviewItemView _view(UploadItem item, {String? state, bool online = true,

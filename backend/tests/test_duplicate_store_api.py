@@ -17,13 +17,9 @@ import pytest
 
 from app.database.database import Database
 from app.library import Library
-from tests.identity_worker_fixtures import DIGEST_A, add_track, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, add_track, sql
 from tests.owned_database import add_test_user
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
+from tests.pending_deletion import mark_pending_deletion
 
 
 def track(db, name, owner_id=None, **identity_values):
@@ -106,9 +102,7 @@ def test_keep_both_skips_other_owners_unknown_and_self(db):
 def test_keep_both_skips_a_partner_that_is_not_live(db):
     new = track(db, "new")
     gone = track(db, "gone")
-    sql(db, "DROP VIEW live_tracks")
-    sql(db, "CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks "
-            f"WHERE uuid_id <> '{gone}'")
+    mark_pending_deletion(db.context.database_path, gone)
 
     seed_dismissed(db, new, [gone])
 
@@ -189,9 +183,7 @@ def test_a_pair_with_a_partner_that_is_not_live_is_not_found(db):
     a = track(db, "a")
     b = track(db, "b")
     seed_open(db, a, b)
-    sql(db, "DROP VIEW live_tracks")
-    sql(db, "CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks "
-            f"WHERE uuid_id <> '{b}'")
+    mark_pending_deletion(db.context.database_path, b)
 
     assert db.set_duplicate_candidate_status(a, b, "dismissed") is False
     assert rows(db)[pair(a, b)]["status"] == "open"
@@ -250,8 +242,6 @@ def test_the_coverage_summary_of_an_empty_library_is_all_zero(db):
 
 def test_the_coverage_summary_ignores_tracks_that_are_not_live(db):
     gone = track(db, "gone", exact_state="failed", exact_digest=None, exact_kind=None)
-    sql(db, "DROP VIEW live_tracks")
-    sql(db, "CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks "
-            f"WHERE uuid_id <> '{gone}'")
+    mark_pending_deletion(db.context.database_path, gone)
 
     assert db.get_identity_coverage_summary()["exact"]["failed"] == 0

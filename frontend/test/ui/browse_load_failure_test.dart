@@ -24,6 +24,7 @@ import 'package:frontend/ui/tracks_page.dart';
 
 import 'browse_harness.dart';
 import 'fake_track_selection_controls.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 const _failed = "Couldn't load your library.";
 

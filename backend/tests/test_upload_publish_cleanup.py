@@ -11,15 +11,9 @@ import os
 import pytest
 
 from app.services.upload_publish import SimulatedCrash
-from tests.identity_worker_fixtures import make_db
 from tests.upload_commit_fixtures import accept, journal, make_commit_worker, ready_item, reservations
 from tests.upload_publish_fixtures import RecordingSeam, make_publisher
 from tests.upload_validation_fixtures import item_row
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -70,6 +64,28 @@ def test_a_source_that_cannot_be_removed_stays_counted(db, music, monkeypatch):
     assert _run(db, music) == "imported"
 
     assert commit["source"].exists()
+    assert item_row(db, commit)["source_path"] == str(commit["source"])
+    assert len(_source_rows(db, commit)) == 1
+
+
+def test_a_source_path_outside_the_owners_stage_is_never_removed(db, music, monkeypatch, tmp_path):
+    """A prepared journal whose source path is not in the owner's stage: the
+    import still lands, the file there is never removed, nothing is released."""
+    from app.services.upload_publish import UploadPublisher
+
+    commit = accept(db, ready_item(db, music / ".uploads"))
+    foreign = tmp_path / "elsewhere.flac"
+    foreign.write_bytes(b"not ours")
+    real = UploadPublisher._remove_source
+
+    def tampered(self, prepared):
+        return real(self, {**dict(prepared), "source_path": str(foreign)})
+
+    monkeypatch.setattr(UploadPublisher, "_remove_source", tampered)
+
+    assert _run(db, music) == "imported"
+
+    assert foreign.read_bytes() == b"not ours"
     assert item_row(db, commit)["source_path"] == str(commit["source"])
     assert len(_source_rows(db, commit)) == 1
 

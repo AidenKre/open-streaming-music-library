@@ -47,6 +47,7 @@ OWNED_METHODS = frozenset(
         "mark_conversion_job_failed",
         "mark_conversion_job_cancelled",
         "complete_conversion_job",
+        "undo_inplace_conversion",
         "settle_swapped_conversion_job",
         "bump_track_revision",
         "refresh_track_audio_properties",
@@ -80,7 +81,7 @@ OWNED_METHODS = frozenset(
         "retry_upload_item",
         "accept_upload_commit",
         "resolve_upload_duplicate",
-        "release_cancelled_upload_source",
+        "release_removed_upload_source",
         # 8A.2b: the deletion preview, jobs and receipts API (spec §4).
         "get_deletion_preview_facts",
         "create_deletion_job",

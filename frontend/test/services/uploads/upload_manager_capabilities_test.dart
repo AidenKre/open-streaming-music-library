@@ -19,6 +19,7 @@ import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/clock.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_manager.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 

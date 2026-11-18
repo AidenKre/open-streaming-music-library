@@ -44,14 +44,22 @@ Future<String> seedTestBinding(
 
 /// A binding gate whose probe the test controls; [respond] completes the
 /// oldest pending probe.
+///
+/// The gate's own timers (a failed check's retry, the wait bound) never fire
+/// by default. [timer] replaces that: [boundOnlyGateTimer] lets the wait
+/// bound run on the test's (fake) time.
 class ControlledGate {
-  ControlledGate(AppDatabase db, {int? signedInUserId = testUserId}) {
+  ControlledGate(
+    AppDatabase db, {
+    int? signedInUserId = testUserId,
+    Timer Function(Duration, void Function())? timer,
+  }) {
     gate = ServerBindingGate(
       repository: ServerBindingRepository(db),
       signedInUserId: signedInUserId,
       probe: _probe,
       backoff: BackoffSchedule(jitter: 0),
-      timer: (d, f) => Timer(const Duration(days: 1), f),
+      timer: timer ?? (d, f) => Timer(const Duration(days: 1), f),
     );
   }
 
@@ -84,6 +92,14 @@ class ControlledGate {
 
   void dispose() => gate.dispose();
 }
+
+/// A gate timer for fake-time tests of the wait bound
+/// ([ServerBindingGate.tokenWaitBound]): the bound runs as asked; every other
+/// gate timer (a failed check's retry) never fires.
+Timer boundOnlyGateTimer(Duration delay, void Function() fire) => Timer(
+  delay == ServerBindingGate.tokenWaitBound ? delay : const Duration(days: 1),
+  fire,
+);
 
 /// Overrides the scope's binding gate with one whose probe answers
 /// [instanceId] immediately. With [startOnRead] it also starts a connection

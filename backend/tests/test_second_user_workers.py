@@ -9,22 +9,9 @@ than that root and workers reading the owner from the row are covered by M.0c
 staging cases for a non-admin owner.
 """
 
-import pytest
-
-from app.database import DatabaseContext
 from app.library import Library
 from app.services.conversion import reconcile_conversion_jobs
-from tests.owned_database import OwnedTestDatabase, add_test_user
-from tests.schema_fixtures import INIT_SQL
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
+from tests.owned_database import add_test_user
 
 
 def test_a_second_users_journal_owned_temp_is_kept_and_their_orphans_swept(db, tmp_path):

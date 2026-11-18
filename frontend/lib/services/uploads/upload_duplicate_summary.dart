@@ -16,7 +16,7 @@ class DuplicateSummary {
         notChecked++;
         continue;
       }
-      if (!check.isReadable || check.status != 'complete') {
+      if (!check.ranToCompletion) {
         failed++;
         continue;
       }
@@ -79,9 +79,7 @@ class DuplicateSummary {
 
     for (final item in items) {
       final check = item.duplicateCheck;
-      if (check == null || !check.isReadable || check.status != 'complete') {
-        continue;
-      }
+      if (check == null || !check.ranToCompletion) continue;
       count(check.exact.libraryPending, (n) => pending = _max(pending, n));
       count(check.exact.libraryFailed, (n) => failed = _max(failed, n));
       final fp = check.fingerprint;

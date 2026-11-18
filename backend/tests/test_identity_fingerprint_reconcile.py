@@ -20,17 +20,12 @@ import pytest
 
 from app.database import ANY_OWNER
 from app.services.identity_worker import reconcile_audio_identity
-from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, sql
 
 TOOLS = "ffmpeg 9.0.2; fpcalc 1.6.2"
 ALG = "chromaprint-2"
 EXACT_CURRENT = {"exact_state": "current", "exact_kind": "pcm_sha256", "exact_digest": DIGEST_A,
                  "match_state": "current", "tool_versions": TOOLS}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

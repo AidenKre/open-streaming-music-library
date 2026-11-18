@@ -13,6 +13,7 @@ from app.services.ffmpeg_runner import (
     CaptureOverflow,
     CaptureTimeout,
     FfmpegError,
+    describe_tool_error,
 )
 
 REASON_MASTER_MISSING = "master_missing"
@@ -57,15 +58,16 @@ def reason_for_exit(returncode: int) -> str:
 def reason_for_capture_exception(e: Exception) -> tuple[str, Optional[str], Optional[int]]:
     """``(reason, error type name or None, returncode or None)`` for an exception
     raised while capturing a tool's output. The type name is given only for
-    exceptions the tool runner or Python raised, never for ``CaptureFailed``."""
+    exceptions the tool runner or Python raised, never for ``CaptureFailed``;
+    a runner error's name carries its category (``FfmpegError (not found)``)."""
     if isinstance(e, CaptureFailed):
         return e.reason, None, e.returncode
     if isinstance(e, CaptureTimeout):
-        return REASON_TIMEOUT, type(e).__name__, None
+        return REASON_TIMEOUT, describe_tool_error(e), None
     if isinstance(e, CaptureOverflow):
-        return REASON_OUTPUT_ERROR, type(e).__name__, None
+        return REASON_OUTPUT_ERROR, describe_tool_error(e), None
     if isinstance(e, FfmpegError):
-        return REASON_TOOL_MISSING, type(e).__name__, None
+        return REASON_TOOL_MISSING, describe_tool_error(e), None
     return REASON_INTERNAL_ERROR, type(e).__name__, None
 
 

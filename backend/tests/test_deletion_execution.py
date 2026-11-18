@@ -18,6 +18,7 @@ import threading
 
 import pytest
 
+from app.services.deletion_worker import RunResult
 from tests.deletion_world import (
     BOOT,
     accept_job,
@@ -35,6 +36,7 @@ from tests.deletion_world import (
     tombstone,
 )
 from tests.pending_deletion import mark_pending_deletion
+from tests.track_paths import set_track_path
 
 UNKNOWN = "eeeeeeee-0000-4000-8000-00000000000e"
 
@@ -52,7 +54,7 @@ def _untouched(world, before_files, uuid_id, rev):
 
 
 def test_nothing_pending_runs_nothing(world):
-    assert make_executor(world).run_one() is False
+    assert make_executor(world).run_one() is RunResult.IDLE
 
 
 # ── the lock (O10) ─────────────────────────────────────────────────────────
@@ -291,7 +293,7 @@ def test_a_non_canonical_stored_path_is_deleted_not_a_conflict(world):
     uuid_id = add_master(world, "Radiohead/OK Computer/01 Lucky.flac")
     root = world.root(world.owner)
     stored = f"{root}/Radiohead//OK Computer/01 Lucky.flac"  # a legacy doubled separator
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (stored, uuid_id))
+    set_track_path(world.db, uuid_id, stored)
     op = accept_job(world, (uuid_id, revision(world, uuid_id)))
 
     drain(make_executor(world))

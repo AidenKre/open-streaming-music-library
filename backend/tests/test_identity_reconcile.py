@@ -14,13 +14,8 @@ import pytest
 
 from app.services.identity_worker import reconcile_audio_identity
 from tests.identity_worker_fakes import TOOLS
-from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, sql
 from tests.owned_database import add_test_user
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -107,9 +102,11 @@ def test_a_missing_master_that_is_back_is_retried(db, music):
         **FAILED, "failure_reason": "master_missing", "tool_versions": TOOLS})
     still_gone = add_track(db, music / "gone.flac", identity={
         **FAILED, "failure_reason": "master_missing", "tool_versions": TOOLS})
-    backing_off = add_track(db, back, identity={
+    for name in ("backing-off.flac", "other.flac"):  # back as well, each its own file
+        (music / name).write_bytes(b"x")
+    backing_off = add_track(db, music / "backing-off.flac", identity={
         "attempts": 2, "next_attempt_at": 9_999_999_999, "failure_reason": "master_missing"})
-    other_failure = add_track(db, back, identity={**FAILED, "tool_versions": TOOLS})
+    other_failure = add_track(db, music / "other.flac", identity={**FAILED, "tool_versions": TOOLS})
 
     _reconcile(db)
 

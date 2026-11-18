@@ -24,7 +24,6 @@ import 'package:frontend/models/history_event.dart';
 import 'package:frontend/repositories/history_repository.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
-import 'package:frontend/services/sync_service.dart' show ServerRegressedException;
 
 import '../helpers/server_binding.dart';
 

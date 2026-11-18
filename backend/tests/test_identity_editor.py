@@ -10,72 +10,19 @@ master leaves identity byte-identical. Every mark signals after its commit.
 
 import os
 import sqlite3
-from pathlib import Path
 
 import pytest
 
 import app.services.track_editor as track_editor_mod
-from app.database.database import Database
 from app.services.track_edit import WriteMode
-from app.services.track_editor import TrackEditor, reconcile_journal
+from app.services.track_editor import reconcile_journal
+from tests.identity_editor_fixtures import DIGEST, SpyWakeup, _editor, _identity, _settle, _world
 from tests.owned_database import add_test_user
-from tests.test_track_editor import _add_track, _db, _lib, _make_audio
-
-DIGEST = "ef" * 32
-
-
-def _identity(db, uuid_id):
-    conn = sqlite3.connect(db.context.database_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute("SELECT * FROM track_audio_identity WHERE uuid_id = ?", (uuid_id,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-
-def _settle(db, uuid_id):
-    """The worker's finished state: every layer current, generation 3."""
-    conn = sqlite3.connect(db.context.database_path)
-    try:
-        conn.execute(
-            "UPDATE track_audio_identity SET exact_state = 'current', exact_kind = 'packets_sha256', "
-            "exact_digest = ?, fp_state = 'current', fp_algorithm = 'chromaprint-2', "
-            "match_state = 'current', matcher_version = 'm1', priority = 1, generation = 3 "
-            "WHERE uuid_id = ?", (DIGEST, uuid_id))
-        conn.commit()
-    finally:
-        conn.close()
-    return _identity(db, uuid_id)
-
+from tests.track_editor_fixtures import _add_track, _db, _lib
 
 def _tag_write_marked(row):
     return (row["generation"], row["exact_state"], row["exact_digest"], row["fp_state"],
             row["match_state"], row["priority"]) == (4, "pending", DIGEST, "current", "pending", 0)
-
-
-class SpyWakeup:
-    """Records the committed generation (seen by a fresh connection) at each notify."""
-
-    def __init__(self, db, uuid_id):
-        self.db, self.uuid_id, self.seen = db, uuid_id, []
-
-    def notify(self):
-        self.seen.append(_identity(self.db, self.uuid_id)["generation"])
-
-
-def _editor(library, wakeup=None):
-    return TrackEditor(library, library / ".staging", identity_signal=wakeup)
-
-
-def _world(tmp_path, name="song.m4a"):
-    library = tmp_path / "music"
-    audio = library / "owner" / "Art" / name
-    _make_audio(audio, title="Old", artist="Art")
-    db = _db(tmp_path)
-    track = _add_track(db, audio, "Old", "Art")
-    before = _settle(db, track.uuid_id)
-    return library, audio, db, track, before
 
 
 # --- the DB spine: master_rewritten ------------------------------------------------
@@ -266,8 +213,11 @@ def _recovery_world(tmp_path):
 
 
 def _conversion_marked(row):
-    return (row["generation"], row["exact_state"], row["exact_digest"], row["fp_state"],
-            row["match_state"], row["priority"]) == (4, "pending", DIGEST, "pending", "pending", 0)
+    # Pre-merge A3-01: a 'conversion' mark means the audio changed, so the old
+    # digest is cleared (unknown until re-hashed); every layer is still pending.
+    return (row["generation"], row["exact_state"], row["exact_kind"], row["exact_digest"],
+            row["fp_state"], row["match_state"], row["priority"]) \
+        == (4, "pending", None, None, "pending", "pending", 0)
 
 
 @pytest.mark.parametrize("temp_left", [True, False])

@@ -20,11 +20,11 @@ import pytest
 
 from app.database import ANY_OWNER
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
 from app.services.track_editor import finish_kept_journal_rows, reconcile_journal
 from app.services.track_locks import TrackLocks
-from tests.test_identity_conversion import _lossless_world, fixtures  # noqa: F401  (fixture)
-from tests.test_track_editor import _add_track, _db
+from tests.identity_conversion_fixtures import _lossless_world, fixtures  # noqa: F401  (fixture)
+from tests.track_editor_fixtures import _add_track, _db
 
 INTENTS = ["relocate", "convert"]
 
@@ -268,8 +268,8 @@ def test_a_master_edit_whose_commit_failed_never_costs_a_file_that_appears_later
     import sqlite3
 
     from app.services.track_edit import WriteMode
-    from tests.test_identity_editor import _editor, _world
-    from tests.test_track_editor import _lib
+    from tests.identity_editor_fixtures import _editor, _world
+    from tests.track_editor_fixtures import _lib
 
     library, audio, db, track, before = _world(tmp_path)
     dest = library / "owner" / "New" / audio.name
@@ -310,8 +310,8 @@ def test_a_later_edit_of_the_same_track_never_consumes_a_kept_rows_temp(
     import sqlite3
 
     from app.services.track_edit import WriteMode
-    from tests.test_identity_editor import _editor, _world
-    from tests.test_track_editor import _lib
+    from tests.identity_editor_fixtures import _editor, _world
+    from tests.track_editor_fixtures import _lib
 
     library, audio, db, track, before = _world(tmp_path)
     blocked = library / "owner" / "New" / audio.name
@@ -569,8 +569,8 @@ def test_a_kept_committed_edit_row_never_deletes_a_master_at_a_unicode_variant(
     import sqlite3
 
     from app.services.track_edit import WriteMode
-    from tests.test_identity_editor import _editor, _world as _editor_world
-    from tests.test_track_editor import _lib
+    from tests.identity_editor_fixtures import _editor, _world as _editor_world
+    from tests.track_editor_fixtures import _lib
 
     library, audio, db, track, before = _editor_world(tmp_path)
     _editor(library).apply_edit(

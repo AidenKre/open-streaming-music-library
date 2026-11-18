@@ -51,7 +51,6 @@ void main() {
       expect(item.filename, 'Song.flac');
       expect(item.selectionIndex, 0);
       expect(item.memberOrderKey, '');
-      expect(item.state, UploadItemState.allocated);
       expect(item.rawState, 'allocated');
       expect(item.expectedBytes, 3);
       expect(item.expectedSha256, _sha);
@@ -97,27 +96,27 @@ void main() {
     });
 
     test('every state of spec §3 parses; an unknown one is kept raw', () {
-      const states = {
-        'allocated': UploadItemState.allocated,
-        'receiving': UploadItemState.receiving,
-        'validating': UploadItemState.validating,
-        'review_ready': UploadItemState.reviewReady,
-        'committing': UploadItemState.committing,
-        'imported': UploadItemState.imported,
-        'duplicate': UploadItemState.duplicate,
-        'expanded': UploadItemState.expanded,
-        'failed': UploadItemState.failed,
-        'duplicate_conflict': UploadItemState.duplicateConflict,
-        'expired': UploadItemState.expired,
-        'cancelled': UploadItemState.cancelled,
-      };
-      for (final MapEntry(:key, :value) in states.entries) {
-        expect(UploadItem.fromJson({..._itemJson(), 'state': key}).state, value,
-            reason: key);
+      const states = [
+        'allocated',
+        'receiving',
+        'validating',
+        'review_ready',
+        'committing',
+        'imported',
+        'duplicate',
+        'expanded',
+        'failed',
+        'duplicate_conflict',
+        'expired',
+        'cancelled',
+      ];
+      for (final state in states) {
+        expect(UploadItem.fromJson({..._itemJson(), 'state': state}).rawState,
+            state,
+            reason: state);
       }
 
       final future = UploadItem.fromJson({..._itemJson(), 'state': 'paused'});
-      expect(future.state, UploadItemState.unknown);
       expect(future.rawState, 'paused');
       expect(future.toJson()['state'], 'paused');
     });

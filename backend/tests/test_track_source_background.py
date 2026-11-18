@@ -61,10 +61,6 @@ def _recording_coordinator(client, calls) -> EncoderCoordinator:
     return coordinator
 
 
-def _warm_generation(coordinator) -> int:
-    return coordinator._snapshot_default_state()[2]
-
-
 def test_a_queued_prefetch_of_a_live_track_encodes_it(client, tmp_path):
     calls: list[Path] = []
     c = _recording_coordinator(client, calls)
@@ -104,7 +100,7 @@ def test_a_queued_warm_of_a_live_track_encodes_it(client, tmp_path):
     c = _recording_coordinator(client, calls)
     uuid_id, master = _add(client, tmp_path)
 
-    c._warm_one(uuid_id, "192", _warm_generation(c))
+    c._warm_one(uuid_id, "192", c.warm_generation)
 
     assert calls == [master]
 
@@ -115,7 +111,7 @@ def test_a_queued_warm_skips_a_track_pending_deletion(client, tmp_path):
     uuid_id, _ = _add(client, tmp_path)
     mark_pending_deletion(_db_path(client), uuid_id)
 
-    c._warm_one(uuid_id, "192", _warm_generation(c))
+    c._warm_one(uuid_id, "192", c.warm_generation)
 
     assert calls == []
     default = client.app.state.default_cache

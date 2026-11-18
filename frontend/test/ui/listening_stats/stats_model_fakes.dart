@@ -10,6 +10,7 @@ import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/repositories/history_snapshot.dart';
 import 'package:frontend/repositories/listening_stats_repository.dart';
+import '../../helpers/listening_stats_builder.dart';
 
 HistorySnapshotToken tokenFor(
   StatsRange range, {
@@ -30,24 +31,11 @@ ListeningStats statsFor(
   double seconds = 0,
   int now = 1800000000000,
   int boundary = 42,
-}) => ListeningStats(
+}) => listeningStatsOf(
   range: range,
   window: range.resolve(now),
   boundaryLocalId: boundary,
-  totals: ListeningTotals(
-    listeningSeconds: seconds,
-    qualifiedPlays: 0,
-    uniqueTracks: 0,
-    activeDays: 0,
-  ),
-  unavailable: const ListeningSubtotal(listeningSeconds: 0, qualifiedPlays: 0),
-  futureTimestampCount: 0,
-  overlongListenCount: 0,
-  buckets: const [],
-  chartCapped: false,
-  topTracks: const [],
-  topArtists: const [],
-  topAlbums: const [],
+  seconds: seconds,
 );
 
 class CaptureCall {
@@ -212,9 +200,17 @@ class FakeStatsRepository implements ListeningStatsRepository {
   int pendingResult = 0;
   final pendingBoundaries = <int>[];
 
+  /// The range and captured now each [pendingListens] call was asked for.
+  final pendingWindows = <(StatsRange, int)>[];
+
   @override
-  Future<int> pendingListens(int boundaryLocalId) {
+  Future<int> pendingListens(
+    StatsRange range,
+    int boundaryLocalId,
+    int capturedNowUtcMs,
+  ) {
     pendingBoundaries.add(boundaryLocalId);
+    pendingWindows.add((range, capturedNowUtcMs));
     return Future.value(pendingResult);
   }
 

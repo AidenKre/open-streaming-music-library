@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import threading
@@ -14,9 +15,11 @@ from app.services.ffmpeg_runner import (
     FfmpegError,
     FfmpegProcessRegistry,
     kill_orphaned_ffmpeg,
+    ToolOptions,
     run_ffmpeg,
     scaled_timeout,
 )
+from tests.process_state import pid_alive
 
 
 def _fake_popen_factory(
@@ -86,23 +89,27 @@ class TestRunFfmpeg:
             with pytest.raises(FfmpegError):
                 run_ffmpeg(["ffmpeg", "-i", "src"], output, timeout=5)
 
-    def test_run_ffmpeg__timeout__kills_process_reaps_and_raises(self, tmp_path):
+    def test_run_ffmpeg__timeout__kills_process_group_reaps_and_raises(self, tmp_path):
+        # BE-TOOLS (A.7): the whole group (pgid == pid), no longer the leader only.
         output = tmp_path / "out.m4a"
         output.write_bytes(b"partial")  # simulate a partial write mid-encode
         fake = _fake_popen_factory(
             communicate_effect=subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5)
         )
-        killed_flag = {}
+        reaped = {}
 
-        class KillTrackingFakePopen(fake):
-            def kill(self):
-                killed_flag["killed"] = True
-                super().kill()
+        class ReapTrackingFakePopen(fake):
+            def communicate(self, timeout=None):
+                result = super().communicate(timeout=timeout)
+                reaped["after_kill"] = killpg.call_count == 1
+                return result
 
-        with patch("app.services.ffmpeg_runner.subprocess.Popen", KillTrackingFakePopen):
+        with patch("app.services.ffmpeg_runner.os.killpg") as killpg, \
+                patch("app.services.ffmpeg_runner.subprocess.Popen", ReapTrackingFakePopen):
             with pytest.raises(FfmpegError):
                 run_ffmpeg(["ffmpeg", "-i", "src"], output, timeout=5)
-        assert killed_flag.get("killed") is True
+        killpg.assert_called_once_with(4242, signal.SIGKILL)
+        assert reaped["after_kill"] is True
         assert not output.exists()
 
     def test_run_ffmpeg__registry_and_job_id__registered_during_run_discarded_after(
@@ -121,10 +128,17 @@ class TestRunFfmpeg:
                 return super().communicate(timeout=timeout)
 
         with patch("app.services.ffmpeg_runner.subprocess.Popen", TrackingFakePopen):
-            run_ffmpeg(["ffmpeg", "-i", "src"], output, timeout=5, registry=registry, job_id="job-1")
+            run_ffmpeg(["ffmpeg", "-i", "src"], output, timeout=5,
+                options=ToolOptions(registry=registry, job_id="job-1"))
 
         assert seen_during_run["registered"] is True
         assert "job-1" not in registry._procs
+
+    def test_run_ffmpeg__low_priority__refused_never_ignored(self, tmp_path):
+        with patch("app.services.ffmpeg_runner.subprocess.Popen") as popen:
+            with pytest.raises(ValueError):
+                run_ffmpeg(["ffmpeg"], tmp_path / "out", timeout=5, options=ToolOptions(low_priority=True))
+        popen.assert_not_called()
 
     def test_run_ffmpeg__no_registry_or_job_id__behaves_as_before(self, tmp_path):
         output = tmp_path / "out.m4a"
@@ -245,7 +259,7 @@ class TestFfmpegProcessRegistryRealProcesses:
 
         def run():
             try:
-                run_ffmpeg(_SLEEP, output, timeout=60, registry=registry, job_id="job-1")
+                run_ffmpeg(_SLEEP, output, timeout=60, options=ToolOptions(registry=registry, job_id="job-1"))
                 outcome["result"] = "returned"
             except BaseException as e:  # noqa: BLE001 - recorded for the assert
                 outcome["result"] = e
@@ -272,7 +286,7 @@ class TestFfmpegProcessRegistryRealProcesses:
         started = time.monotonic()
 
         with pytest.raises(FfmpegError):
-            run_ffmpeg(_SLEEP, tmp_path / "out.bin", timeout=60, registry=registry, job_id="job-1")
+            run_ffmpeg(_SLEEP, tmp_path / "out.bin", timeout=60, options=ToolOptions(registry=registry, job_id="job-1"))
 
         assert time.monotonic() - started < 5
         assert "job-1" not in registry._procs
@@ -285,7 +299,7 @@ class TestFfmpegProcessRegistryRealProcesses:
 
         run_ffmpeg(
             ["sh", "-c", f"printf data > '{output}'"], output, timeout=10,
-            registry=registry, job_id="job-1",
+            options=ToolOptions(registry=registry, job_id="job-1"),
         )
 
         assert output.read_bytes() == b"data"
@@ -314,13 +328,165 @@ class TestFfmpegProcessRegistryRealProcesses:
 
         with patch("app.services.ffmpeg_runner.subprocess.Popen", RaisingPopen):
             with pytest.raises(exc_type):
-                run_ffmpeg(_SLEEP, output, timeout=60, registry=registry, job_id="job-1")
+                run_ffmpeg(_SLEEP, output, timeout=60, options=ToolOptions(registry=registry, job_id="job-1"))
 
         (proc,) = spawned
         assert proc.returncode is not None  # reaped, not leaked
         assert proc.returncode == -signal.SIGKILL
         assert "job-1" not in registry._procs
         assert not output.exists()
+
+
+# ── BE-TOOLS (A.7, approved): every way run_ffmpeg ends a process ends its group ──
+
+
+def _wait_gone(pid: int, deadline_s: float = 5.0) -> bool:
+    """True once ``pid`` no longer runs: gone, or a zombie nobody reaps (an
+    orphan is reaped by init asynchronously where there is one, so this
+    observes with a deadline; it asserts no timing)."""
+    return _wait_for(lambda: not pid_alive(pid), deadline_s)
+
+
+class _ToolWithChild:
+    """A fake tool: ``sh`` starts a child (``sleep``) in its own process group,
+    writes the child's pid to a file, then sleeps itself. ``child_keeps_stderr``
+    leaves the child holding the stderr pipe run_ffmpeg reads."""
+
+    def __init__(self, tmp_path: Path, *, child_keeps_stderr: bool = False):
+        self.pid_file = tmp_path / "child.pid"
+        redirect = "</dev/null >/dev/null" + ("" if child_keeps_stderr else " 2>/dev/null")
+        script = tmp_path / "tool.sh"
+        script.write_text(
+            f"sleep 300 {redirect} &\n"
+            f'echo $! > "$1.part" && mv "$1.part" "$1"\n'
+            "exec sleep 300\n"
+        )
+        self.cmd = ["sh", str(script), str(self.pid_file)]
+
+    def ready(self) -> bool:
+        return self.pid_file.exists()
+
+    def child_pid(self) -> int:
+        return int(self.pid_file.read_text())
+
+    def cleanup(self, *, seen_gone: bool = False) -> None:
+        # A pid already seen gone may belong to another process by now: never signal it.
+        if self.pid_file.exists() and not seen_gone:
+            try:
+                os.kill(self.child_pid(), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def _popen_failing_once_ready(tool: _ToolWithChild, error: BaseException, spawned: list):
+    """A real Popen whose first bounded ``communicate`` raises ``error`` once
+    the tool's child exists: a time-out (or another failure while reading the
+    output) at a known moment, without waiting on the clock."""
+
+    class FailingOnce(subprocess.Popen):
+        failed = False
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            spawned.append(self)
+
+        def communicate(self, *args, **kwargs):
+            if not FailingOnce.failed:
+                FailingOnce.failed = True
+                assert _wait_for(tool.ready), "the fake tool never started its child"
+                raise error
+            return super().communicate(*args, **kwargs)
+
+    return FailingOnce
+
+
+@pytest.mark.integration
+class TestRunFfmpegEndsTheWholeGroup:
+    def _run(self, tmp_path, tool, error):
+        spawned: list[subprocess.Popen] = []
+        output = tmp_path / "out.bin"
+        outcome = {}
+
+        def run():
+            try:
+                with patch("app.services.ffmpeg_runner.subprocess.Popen",
+                           _popen_failing_once_ready(tool, error, spawned)):
+                    run_ffmpeg(tool.cmd, output, timeout=60)
+                outcome["result"] = "returned"
+            except BaseException as e:  # noqa: BLE001 - recorded for the assert
+                outcome["result"] = e
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        child_gone = False
+        try:
+            worker.join(timeout=10)
+            returned = not worker.is_alive()
+            child = tool.child_pid() if tool.ready() else None
+            child_gone = child is not None and _wait_gone(child)
+        finally:
+            tool.cleanup(seen_gone=child_gone)
+            worker.join(timeout=10)
+        return outcome.get("result"), spawned, returned, child_gone
+
+    def test_a_time_out_kills_the_tool_and_the_child_it_started(self, tmp_path):
+        tool = _ToolWithChild(tmp_path)
+
+        result, [proc], returned, child_gone = self._run(
+            tmp_path, tool, subprocess.TimeoutExpired(cmd="tool", timeout=60))
+
+        assert returned
+        assert isinstance(result, FfmpegError)
+        assert proc.returncode == -signal.SIGKILL
+        assert child_gone, "the tool's child outlived the time-out"
+
+    def test_a_time_out_returns_even_when_the_child_holds_the_output_pipe(self, tmp_path):
+        tool = _ToolWithChild(tmp_path, child_keeps_stderr=True)
+
+        result, [proc], returned, child_gone = self._run(
+            tmp_path, tool, subprocess.TimeoutExpired(cmd="tool", timeout=60))
+
+        assert returned, "run_ffmpeg waited on the child after the time-out"
+        assert isinstance(result, FfmpegError)
+        assert child_gone
+
+    @pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt])
+    def test_a_failure_while_reading_the_output_kills_the_child_too(self, tmp_path, exc_type):
+        tool = _ToolWithChild(tmp_path)
+
+        result, [proc], returned, child_gone = self._run(tmp_path, tool, exc_type("interrupted"))
+
+        assert returned
+        assert isinstance(result, exc_type)
+        assert proc.returncode == -signal.SIGKILL
+        assert child_gone, "the tool's child outlived the failure"
+
+    def test_a_stop_through_the_registry_kills_the_child_too(self, tmp_path):
+        """Already true before BE-TOOLS (the registry kills the group); kept as a guard."""
+        tool = _ToolWithChild(tmp_path)
+        registry = FfmpegProcessRegistry()
+        outcome = {}
+
+        def run():
+            try:
+                run_ffmpeg(tool.cmd, tmp_path / "out.bin", timeout=60,
+                    options=ToolOptions(registry=registry, job_id="job-1"))
+            except BaseException as e:  # noqa: BLE001 - recorded for the assert
+                outcome["result"] = e
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        child_gone = False
+        try:
+            assert _wait_for(tool.ready)
+            assert registry.kill("job-1") is True
+            worker.join(timeout=10)
+            assert not worker.is_alive()
+            assert isinstance(outcome["result"], FfmpegError)
+            child_gone = _wait_gone(tool.child_pid())
+            assert child_gone
+        finally:
+            tool.cleanup(seen_gone=child_gone)
 
 
 class TestScaledTimeout:

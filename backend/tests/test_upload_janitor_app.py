@@ -7,36 +7,24 @@ stopped at shutdown. Expiry and retention come from configuration."""
 import sqlite3
 import threading
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.services.upload_janitor import UploadJanitorThread
-from tests.test_identity_worker_app import _lock_is_held
+from tests.recovery_steps import capture_steps, named
+from tests.worker_app_fixtures import _lock_is_held
 
 DAY = 86_400
 
 
-def _capture_steps(main, monkeypatch):
-    captured = []
-    real = main.run_startup_recovery
-
-    def capture(steps):
-        captured.append(list(steps))
-        return real(steps)
-
-    monkeypatch.setattr(main, "run_startup_recovery", capture)
-    return captured
-
-
 def test_the_janitor_is_the_last_non_fatal_startup_step(configure_app, monkeypatch):
     main = configure_app()
-    captured = _capture_steps(main, monkeypatch)
+    captured = capture_steps(main, monkeypatch)
 
     with TestClient(main.app):
         pass
 
     [steps] = captured
-    names = [(s.name, s.fatal) for s in steps]
+    names = named(steps)
     # 8A.3d: the deletion janitor follows it (SC-16e janitors).
     assert names[-3:] == [
         ("storage reservations", False), ("upload janitor", False), ("deletion janitor", False),

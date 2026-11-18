@@ -1,4 +1,4 @@
-"""Account service: register (and later login). No FastAPI imports."""
+"""Account service: register and login. No FastAPI imports."""
 
 import time
 from dataclasses import dataclass
@@ -83,8 +83,27 @@ def register(database, settings, username: str, password: str) -> AuthResult:
     )
 
 
+def _after_a_concurrent_rehash(database, settings, user: dict, password: str, session: dict) -> bool:
+    """The session insert was refused: another sign-in may have stored its own
+    rehash of this same password between our verify and our insert (whether or
+    not we could rehash). Only when the stored hash changed to one at today's
+    parameters, verify once more against it and start the session on it; a
+    password reset (another password) still refuses."""
+    current = database.get_user(user["id"])
+    return (
+        current is not None
+        and current["password_hash"] != user["password_hash"]
+        and not needs_rehash(settings, current["password_hash"])
+        and verify_password(settings, current["password_hash"], password)
+        and database.start_login_session(
+            user_id=user["id"], verified_hash=current["password_hash"], new_hash=None, **session
+        )
+    )
+
+
 def login(database, settings, username: str, password: str) -> AuthResult:
-    """Exactly one argon2 verify on every path, so timing tells nothing."""
+    """Exactly one argon2 verify on every path, so timing tells nothing; a
+    second one only when another sign-in changed the stored hash meanwhile."""
     user = None
     if is_valid_username(username):
         user = database.get_user_by_username_key(username_key(username))
@@ -101,14 +120,12 @@ def login(database, settings, username: str, password: str) -> AuthResult:
         except AuthBusy:
             pass  # rehash on a later login
     tokens = new_session_tokens()
+    session = dict(
+        token_hash=tokens.token_hash, media_hash=tokens.media_hash, created_at=int(time.time())
+    )
     if not database.start_login_session(
-        user_id=user["id"],
-        verified_hash=user["password_hash"],
-        new_hash=new_hash,
-        token_hash=tokens.token_hash,
-        media_hash=tokens.media_hash,
-        created_at=int(time.time()),
-    ):
+        user_id=user["id"], verified_hash=user["password_hash"], new_hash=new_hash, **session
+    ) and not _after_a_concurrent_rehash(database, settings, user, password, session):
         raise InvalidCredentials("invalid credentials")
     return AuthResult(
         tokens=tokens, user=account_user(user), folder_choice=None

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/history_event.dart';
 import 'package:frontend/models/listening_stats.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
@@ -12,6 +13,7 @@ import 'package:frontend/repositories/listening_rank_pagers.dart';
 import 'package:frontend/repositories/listening_stats_repository.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/listening_stats/stats_ranked_card.dart';
+import 'package:frontend/ui/snapshot_paging_controller.dart';
 
 /// Which statistics ranking a "See all" page shows.
 enum StatsRankingKind { tracks, artists, albums }
@@ -73,26 +75,27 @@ final listeningRankingControllerFactoryProvider =
           (kind, token) => ListeningRankingController(ref, kind, token),
     );
 
-/// One page of a ranking, whatever its kind; null when the snapshot expired.
-typedef _Page = ({List<RankedEntry<Object>> entries, Object? next});
+/// One page of a ranking, whatever its kind.
+typedef _PageResult = SnapshotPageResult<RankedEntry<Object>, Object>;
 
-typedef _PageFetch =
-    Future<_Page?> Function(HistorySnapshotToken token, Object? after);
+/// A ranking's two reads: a page of a snapshot, and a new snapshot of the
+/// range with its first page (one transaction).
+typedef _Fetchers = ({
+  Future<_PageResult> Function(HistorySnapshotToken token, Object? after) page,
+  Future<(HistorySnapshotToken, _PageResult)> Function() first,
+});
 
-/// A new snapshot of the range and its first page.
-typedef _FirstFetch = Future<(HistorySnapshotToken, _Page?)> Function();
-
-_Page? _toPage<E extends Object, K extends Object>(
+_PageResult _toPage<E extends Object, K extends Object>(
   SnapshotPageResult<RankedPageEntry<E, K>, RankCursor<K>> result,
 ) => switch (result) {
-  SnapshotPage(:final items, :final nextCursor) => (
-    entries: <RankedEntry<Object>>[for (final i in items) i.entry],
-    next: nextCursor,
+  SnapshotPage(:final items, :final nextCursor) => SnapshotPage(
+    <RankedEntry<Object>>[for (final i in items) i.entry],
+    nextCursor,
   ),
-  SnapshotExpired() => null,
+  SnapshotExpired() => const SnapshotExpired(),
 };
 
-(_PageFetch, _FirstFetch) _fetcher<E extends Object, K extends Object>(
+_Fetchers _fetcher<E extends Object, K extends Object>(
   SnapshotPager<RankedPageEntry<E, K>, RankCursor<K>> pager,
   StatsRange range,
   Future<
@@ -104,20 +107,20 @@ _Page? _toPage<E extends Object, K extends Object>(
   Function(StatsRange range, int limit)
   first,
 ) => (
-  (token, after) async => _toPage(
+  page: (token, after) async => _toPage(
     await pager.page(token, after as RankCursor<K>?, rankingPageSize),
   ),
-  () async {
+  first: () async {
     final (token, result) = await first(range, rankingPageSize);
     return (token, _toPage(result));
   },
 );
 
-class ListeningRankingController extends ChangeNotifier
+class ListeningRankingController
+    extends SnapshotPagingController<RankedEntry<Object>, Object>
     implements ListeningRankingControls {
   ListeningRankingController(this._ref, this.kind, HistorySnapshotToken token)
-    : _token = token,
-      range = token.filterKey as StatsRange,
+    : range = token.filterKey as StatsRange,
       _fetchers = switch (kind) {
         StatsRankingKind.tracks => _fetcher(
           _ref.read(topTracksPagerProvider),
@@ -135,12 +138,11 @@ class ListeningRankingController extends ChangeNotifier
           _ref.read(topAlbumsPagerProvider).first,
         ),
       } {
-    _loadPage(_generation, token, null);
+    startOn(token);
   }
 
   final Ref _ref;
-  final (_PageFetch, _FirstFetch) _fetchers;
-  _PageFetch get _fetch => _fetchers.$1;
+  final _Fetchers _fetchers;
 
   @override
   final StatsRankingKind kind;
@@ -149,13 +151,7 @@ class ListeningRankingController extends ChangeNotifier
   final StatsRange range;
 
   StreamSubscription<CurrentStatsEntities>? _watch;
-  StreamSubscription<SnapshotStaleness>? _freshness;
 
-  /// Bumped by every new snapshot and by dispose; stale continuations return.
-  int _generation = 0;
-  bool _disposed = false;
-
-  HistorySnapshotToken _token;
   final List<RankedEntry<Object>> _entries = [];
   List<StatsRankedCard>? _cards;
 
@@ -163,118 +159,53 @@ class ListeningRankingController extends ChangeNotifier
   /// later entries are not yet known, so they stay available.
   CurrentStatsEntities? _current;
   int _known = 0;
-  Object? _cursor;
-  bool _hasMore = false;
-  bool _failed = false;
-  bool _inFlight = false;
-  bool _expired = false;
-  SnapshotStaleness _notice = SnapshotStaleness.fresh;
-  void Function()? _retry;
 
   @override
   List<StatsRankedCard>? get cards => _cards;
-
-  @override
-  bool get hasMore => _hasMore;
-
-  @override
-  bool get failed => _failed;
-
-  @override
-  bool get expired => _expired;
-
-  @override
-  SnapshotStaleness get notice => _notice;
-
-  @override
-  int get snapshotEpoch => _generation;
 
   @override
   Future<PlaybackOutcome> playTrack(TrackUI track) =>
       _ref.read(libraryActionsProvider).playStatsTrack(track);
 
   @override
-  void loadMore() {
-    if (!_hasMore || _inFlight || _failed || _expired || _disposed) return;
-    _loadPage(_generation, _token, _cursor);
+  Future<SnapshotPageResult<RankedEntry<Object>, Object>> fetchPage(
+    HistorySnapshotToken token,
+    Object? after,
+  ) => _fetchers.page(token, after);
+
+  @override
+  Future<
+    (HistorySnapshotToken, SnapshotPageResult<RankedEntry<Object>, Object>?)
+  >
+  captureSnapshot() => _fetchers.first();
+
+  @override
+  Stream<SnapshotStaleness> watchFreshness(HistorySnapshotToken token) => _ref
+      .read(snapshotFreshnessProvider)
+      .watch(token, kinds: const {HistoryKind.play});
+
+  @override
+  void onPage(
+    List<RankedEntry<Object>> rows,
+    int generation,
+    HistorySnapshotToken token,
+  ) {
+    _entries.addAll(rows);
+    _rebuild();
+    _watchLoaded();
   }
 
   @override
-  void retry() {
-    final again = _retry;
-    if (_disposed || !_failed || again == null) return;
-    _failed = false;
-    _retry = null;
-    notifyListeners();
-    again();
+  void onExpired() {
+    _cards ??= const [];
   }
 
   @override
-  void refresh() {
-    if (_disposed) return;
-    final generation = ++_generation;
-    _cancelLive();
+  void resetRows() {
     _entries.clear();
     _cards = null;
     _current = null;
     _known = 0;
-    _cursor = null;
-    _hasMore = false;
-    _failed = false;
-    _expired = false;
-    _inFlight = false;
-    _notice = SnapshotStaleness.fresh;
-    _retry = null;
-    notifyListeners();
-    _capture(generation);
-  }
-
-  void _capture(int generation) {
-    _inFlight = true;
-    _fetchers.$2().then(
-      (first) {
-        if (_stale(generation)) return;
-        _token = first.$1;
-        _show(generation, first.$1, first.$2);
-      },
-      onError: (Object _) {
-        if (_stale(generation)) return;
-        _fail(() => _capture(generation));
-      },
-    );
-  }
-
-  void _loadPage(int generation, HistorySnapshotToken token, Object? after) {
-    _inFlight = true;
-    _fetch(token, after).then(
-      (page) {
-        if (_stale(generation)) return;
-        _show(generation, token, page);
-      },
-      onError: (Object _) {
-        if (_stale(generation)) return;
-        _fail(() => _loadPage(generation, token, after));
-      },
-    );
-  }
-
-  /// Takes a fetched page (null: the snapshot expired).
-  void _show(int generation, HistorySnapshotToken token, _Page? page) {
-    _inFlight = false;
-    if (page == null) {
-      _cards ??= const [];
-      _hasMore = false;
-      _expired = true;
-      _notice = SnapshotStaleness.historyChanged;
-    } else {
-      _entries.addAll(page.entries);
-      _cursor = page.next;
-      _hasMore = page.next != null;
-      _rebuild();
-      _startFreshness(generation, token);
-      _watchLoaded();
-    }
-    notifyListeners();
   }
 
   void _rebuild() {
@@ -285,24 +216,12 @@ class ListeningRankingController extends ChangeNotifier
     ];
   }
 
-  void _startFreshness(int generation, HistorySnapshotToken token) {
-    if (_freshness != null) return;
-    _freshness = _ref
-        .read(snapshotFreshnessProvider)
-        .watch(token, kinds: const {'play'})
-        .listen((value) {
-          if (_stale(generation) || _expired || value == _notice) return;
-          _notice = value;
-          notifyListeners();
-        }, onError: (Object _) {});
-  }
-
   void _watchLoaded() {
     _watch?.cancel();
     _watch = null;
     if (_entries.isEmpty) return;
     final ids = [for (final e in _entries) e.entity];
-    // `_watchLoaded` and `_cancelLive` cancel the previous watch before it
+    // `_watchLoaded` and `cancelLoaded` cancel the previous watch before it
     // is replaced, and a cancelled subscription delivers nothing
     // (DR-332-STATS-B-01): no staleness check is needed in the listener.
     _watch = _ref
@@ -320,28 +239,9 @@ class ListeningRankingController extends ChangeNotifier
         }, onError: (Object _) {});
   }
 
-  void _fail(void Function() again) {
-    _inFlight = false;
-    _failed = true;
-    _retry = again;
-    notifyListeners();
-  }
-
-  bool _stale(int generation) => _disposed || generation != _generation;
-
-  void _cancelLive() {
-    _watch?.cancel();
-    _freshness?.cancel();
-    _watch = null;
-    _freshness = null;
-  }
-
   @override
-  void dispose() {
-    if (_disposed) return;
-    _disposed = true;
-    _generation++;
-    _cancelLive();
-    super.dispose();
+  void cancelLoaded() {
+    _watch?.cancel();
+    _watch = null;
   }
 }

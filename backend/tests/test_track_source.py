@@ -16,9 +16,9 @@ import pytest
 
 from app.models import Track, TrackMetaData
 from app.services import track_source
-from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator
 from tests.pending_deletion import mark_pending_deletion
+from tests.sqlite_helpers import sql_rows
 
 UNKNOWN = "00000000-0000-4000-8000-000000000000"
 
@@ -278,31 +278,21 @@ def test_an_ordinary_stream_reads_one_row_and_serves_the_master(client, tmp_path
 # ── One retry on a path change or a replaced master (SC-16i, 8-D08) ─────────
 
 
-def _sql(client, statement, params=()):
-    conn = sqlite3.connect(_db_path(client))
-    try:
-        rows = conn.execute(statement, params).fetchall()
-        conn.commit()
-        return rows
-    finally:
-        conn.close()
-
-
 def _revision(client, uuid_id) -> int:
-    return _sql(client, "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,))[0][0]
+    return sql_rows(client, "SELECT revision FROM tracks WHERE uuid_id = ?", (uuid_id,))[0][0]
 
 
 def _commit_row(client, uuid_id, *, file_path=None, codec=None) -> int:
     """Commit a new row revision (optionally a new path / codec), as the
     in-place writers do *before* they touch the file. Returns the revision."""
-    _sql(
+    sql_rows(
         client,
         "UPDATE tracks SET revision = (SELECT MAX(revision) FROM tracks) + 1, "
         "file_path = COALESCE(?, file_path) WHERE uuid_id = ?",
         (None if file_path is None else str(file_path), uuid_id),
     )
     if codec is not None:
-        _sql(client, "UPDATE trackmetadata SET codec = ? WHERE uuid_id = ?", (codec, uuid_id))
+        sql_rows(client, "UPDATE trackmetadata SET codec = ? WHERE uuid_id = ?", (codec, uuid_id))
     return _revision(client, uuid_id)
 
 

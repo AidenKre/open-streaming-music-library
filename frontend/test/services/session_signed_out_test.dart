@@ -141,6 +141,19 @@ void main() {
           reason: 'a healthy server must not flip a signed-out app online');
     });
 
+    // U22-FE-LIFECYCLE-A-03: the app is already offline with a health poll
+    // scheduled when the 401 comes; the 401 stops that poll too.
+    test('already offline with a health poll scheduled: the 401 stops it',
+        () async {
+      OfflineModeNotifier.pollInterval = const Duration(hours: 1);
+      final offline = c.read(offlineModeProvider.notifier)..enterOffline();
+      expect(offline.isPolling, isTrue);
+      service().onUnauthorized();
+      expect(c.read(offlineModeProvider), isTrue);
+      expect(offline.isPolling, isFalse,
+          reason: 'no health poll may bring a signed-out app back online');
+    });
+
     test('a healthy health poll does not bring a signed-out app online',
         () async {
       service().onUnauthorized();
@@ -218,6 +231,18 @@ void main() {
     test('the 401 closes the gate', () {
       service().onUnauthorized();
       expect(gate.closes, 1);
+    });
+
+    test('a second 401 does not close the gate again', () {
+      service().onUnauthorized();
+      service().onUnauthorized();
+      expect(gate.closes, 1);
+    });
+
+    test('a disposed scope no longer watches the gate', () async {
+      await publish(verified); // the launch's own wait for a verdict ends
+      c.dispose();
+      expect(gate.script.hasListener, isFalse);
     });
 
     test('BindingVerified does not clear signedOut', () async {

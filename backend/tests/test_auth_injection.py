@@ -3,11 +3,10 @@ passwords on register and login are rejected or stored and looked up
 literally, never interpolated into SQL.
 """
 
-import sqlite3
-
 import pytest
 
 from tests.conftest import TEST_ADMIN_PASSWORD
+from tests.sqlite_helpers import sql_rows
 
 PASSWORD = "a long enough password"
 
@@ -29,11 +28,7 @@ HOSTILE_USERNAMES = [
 
 
 def _users(client):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        return [r[0] for r in conn.execute("SELECT username FROM users ORDER BY id")]
-    finally:
-        conn.close()
+    return [r[0] for r in sql_rows(client, "SELECT username FROM users ORDER BY id")]
 
 
 @pytest.fixture

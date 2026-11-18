@@ -6,10 +6,14 @@ transcoder had no timeout at all, so a hung ffmpeg wedged a transcode
 forever, and it discarded stderr). Fixes here land for every caller.
 
 Runs via ``Popen`` (not the simpler blocking ``subprocess.run``) so a caller
-that passes ``registry``/``job_id`` can cancel a running invocation from
-another thread — this is what Phase 2's conversion cancellation is built on.
-Every other caller (the tag writer, the streaming transcoder) omits those
-two arguments and sees identical externally-observable behavior to before.
+whose ``ToolOptions`` name a ``registry`` and a ``job_id`` can cancel a running
+invocation from another thread — this is what Phase 2's conversion
+cancellation is built on. Every other caller (the tag writer, the streaming
+transcoder) passes no options and sees identical externally-observable
+behavior to before.
+
+The per-run options travel as one frozen ``ToolOptions`` value, from the code
+that starts the work down to the runner: never as loose keywords.
 
 ``run_capture`` is the sibling for commands whose stdout IS the result
 (``-f hash -``, ``fpcalc -json``): bounded stdout capture, a hard timeout and
@@ -36,11 +40,49 @@ TOOL_CANNOT_RUN_EXITS = frozenset({126, 127})
 
 class FfmpegError(Exception):
     """ffmpeg failed: missing binary, non-zero exit, timeout, or empty output.
-    ``stderr`` carries the captured diagnostics (may be empty)."""
+    ``stderr`` carries the captured diagnostics (may be empty). The message
+    and ``stderr`` can name files and tags: they are for the caller, never
+    for a log line. ``category`` says what happened without either, for logs:
+    "not found", "could not start", "timed out", "killed", "exit <code>",
+    "no output", "too much output" (None when the raiser gave none)."""
 
-    def __init__(self, message: str, stderr: str = ""):
+    category: Optional[str] = None
+
+    def __init__(self, message: str, stderr: str = "", *, category: Optional[str] = None):
         self.stderr = stderr
+        if category is not None:
+            self.category = category
         super().__init__(message)
+
+
+NOT_FOUND = "not found"
+COULD_NOT_START = "could not start"
+TIMED_OUT = "timed out"
+KILLED = "killed"
+NO_OUTPUT = "no output"
+TOO_MUCH_OUTPUT = "too much output"
+
+
+def _exit_category(returncode: int) -> str:
+    return KILLED if returncode < 0 else f"exit {returncode}"
+
+
+def describe_tool_error(error: BaseException) -> str:
+    """For a log line: the error's type, with the runner's category when it
+    has one (``"FfmpegError (exit 1)"``). Never a path or tool output."""
+    category = getattr(error, "category", None) if isinstance(error, FfmpegError) else None
+    name = type(error).__name__
+    return f"{name} ({category})" if category else name
+
+
+def _kill_whole_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the process group of a run that ended abnormally: the tool and
+    any process it started. Signalled even when the leader has already exited
+    and been reaped: the group id cannot be reused while a member exists."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _kill_group(proc: subprocess.Popen) -> bool:
@@ -123,6 +165,30 @@ class FfmpegProcessRegistry:
     @staticmethod
     def _kill_locked(proc: subprocess.Popen) -> bool:
         return _kill_group(proc)
+
+
+@dataclass(frozen=True)
+class ToolOptions:
+    """The per-run options of a tool run, passed as one value from the code
+    that starts the work down to the runner (no loose keywords).
+
+    The runners read ``registry`` and ``job_id`` (both given: the process is
+    registered so ``registry.kill(job_id)`` ends it) and ``low_priority``
+    (``run_capture`` only). The command builders read ``input_format`` (the
+    demuxer forced for staged upload bytes: ``media_input.ffmpeg_input_args``
+    and ``fpcalc_input_args``); the runners never add it to a command.
+
+    Phase 10 (P1) adds the tool's thread count here, as one more field read
+    by the command builders.
+    """
+
+    registry: Optional[FfmpegProcessRegistry] = None
+    job_id: Optional[Any] = None
+    low_priority: bool = False
+    input_format: Optional[str] = None
+
+
+NO_OPTIONS = ToolOptions()
 
 
 def kill_orphaned_ffmpeg(work_dir: Path) -> list[int]:
@@ -210,8 +276,8 @@ def run_ffmpeg(
     cmd: list[str],
     output_path: Path,
     timeout: float,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
+    *,
+    options: ToolOptions = NO_OPTIONS,
 ) -> None:
     """Run an ffmpeg command that produces ``output_path``.
 
@@ -219,11 +285,15 @@ def run_ffmpeg(
     failure the partial output is removed and ``FfmpegError`` is raised with
     stderr attached. The caller owns semantic verification (e.g. re-probing).
 
-    When both ``registry`` and ``job_id`` are given, the process is
-    registered for the duration of the call so ``registry.kill(job_id)`` from
-    another thread can interrupt it — a killed process surfaces as a non-zero
-    exit here, same code path as any other ffmpeg failure.
+    When ``options`` name both a ``registry`` and a ``job_id``, the process
+    is registered for the duration of the call so ``registry.kill(job_id)``
+    from another thread can interrupt it — a killed process surfaces as a
+    non-zero exit here, same code path as any other ffmpeg failure. It runs at
+    normal priority: ``low_priority`` is refused (``ValueError``), never ignored.
     """
+    if options.low_priority:
+        raise ValueError("run_ffmpeg does not run at low priority")
+    registry, job_id = options.registry, options.job_id
     try:
         # start_new_session=True makes this process its own process-group
         # leader, so a cancel can kill the whole group, not just ffmpeg
@@ -235,9 +305,9 @@ def run_ffmpeg(
             start_new_session=True,
         )
     except FileNotFoundError as e:
-        raise FfmpegError("ffmpeg not found") from e
+        raise FfmpegError("ffmpeg not found", category=NOT_FOUND) from e
     except OSError as e:
-        raise FfmpegError(f"ffmpeg failed: {e}") from e
+        raise FfmpegError(f"ffmpeg failed: {e}", category=COULD_NOT_START) from e
 
     if registry is not None and job_id is not None:
         registry.register(job_id, proc)
@@ -247,13 +317,15 @@ def run_ffmpeg(
         except subprocess.TimeoutExpired as e:
             # Popen.communicate(timeout=...), unlike subprocess.run, does NOT
             # kill the child on timeout -- that must be done explicitly, or
-            # the process leaks and the temp file may still be mid-write.
-            proc.kill()
+            # the process leaks and the temp file may still be mid-write. The
+            # whole group: a process the tool started would outlive the
+            # leader and hold the stderr pipe open.
+            _kill_whole_group(proc)
             proc.communicate()
             output_path.unlink(missing_ok=True)
-            raise FfmpegError(f"ffmpeg failed: {e}") from e
+            raise FfmpegError(f"ffmpeg failed: {e}", category=TIMED_OUT) from e
         except BaseException:
-            proc.kill()
+            _kill_whole_group(proc)
             proc.wait()
             output_path.unlink(missing_ok=True)
             raise
@@ -264,7 +336,8 @@ def run_ffmpeg(
     if proc.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
         output_path.unlink(missing_ok=True)
         stderr = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
-        raise FfmpegError(f"ffmpeg exited {proc.returncode}: {stderr}", stderr)
+        category = _exit_category(proc.returncode) if proc.returncode != 0 else NO_OUTPUT
+        raise FfmpegError(f"ffmpeg exited {proc.returncode}: {stderr}", stderr, category=category)
 
 
 @dataclass(frozen=True)
@@ -280,9 +353,13 @@ class CaptureResult:
 class CaptureTimeout(FfmpegError):
     """``run_capture``: the process outlived ``timeout_s`` and was killed."""
 
+    category = TIMED_OUT
+
 
 class CaptureOverflow(FfmpegError):
     """``run_capture``: stdout exceeded ``max_stdout_bytes``; the process was killed."""
+
+    category = TOO_MUCH_OUTPUT
 
 
 _STDERR_KEEP_BYTES = 64 * 1024
@@ -308,10 +385,8 @@ def run_capture(
     cmd: list[str],
     *,
     timeout_s: float,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
     max_stdout_bytes: int,
-    low_priority: bool = False,
+    options: ToolOptions = NO_OPTIONS,
 ) -> CaptureResult:
     """Run ``cmd`` and capture its stdout (bounded) and stderr (first 64 KiB).
 
@@ -322,20 +397,22 @@ def run_capture(
     group is SIGKILLed and reaped and both pipes are closed. A non-zero or
     signal exit is RETURNED in ``CaptureResult.returncode``, not raised.
 
-    ``registry``/``job_id`` behave as in ``run_ffmpeg``: ``registry.kill`` from
-    another thread kills the group and the run returns with ``-SIGKILL``.
+    ``options.registry``/``options.job_id`` behave as in ``run_ffmpeg``:
+    ``registry.kill`` from another thread kills the group and the run returns
+    with ``-SIGKILL``.
 
-    ``low_priority`` prefixes the command with ``nice -n 10`` (and ``ionice
-    -c3`` on Linux) when those tools exist. The target tool is resolved first,
-    so a missing tool is reported as "not found" rather than as ``nice``
-    exiting 127.
+    ``options.low_priority`` prefixes the command with ``nice -n 10`` (and
+    ``ionice -c3`` on Linux) when those tools exist. The target tool is
+    resolved first, so a missing tool is reported as "not found" rather than
+    as ``nice`` exiting 127.
     """
+    registry, job_id = options.registry, options.job_id
     argv = cmd
-    if low_priority:
+    if options.low_priority:
         prefix = _low_priority_prefix()
         if prefix:
             if shutil.which(cmd[0]) is None:
-                raise FfmpegError(f"{os.path.basename(cmd[0])} not found")
+                raise FfmpegError(f"{os.path.basename(cmd[0])} not found", category=NOT_FOUND)
             argv = prefix + cmd
     try:
         proc = subprocess.Popen(
@@ -346,9 +423,12 @@ def run_capture(
             start_new_session=True,
         )
     except FileNotFoundError as e:
-        raise FfmpegError(f"{os.path.basename(cmd[0])} not found") from e
+        raise FfmpegError(f"{os.path.basename(cmd[0])} not found", category=NOT_FOUND) from e
     except OSError as e:
-        raise FfmpegError(f"{os.path.basename(cmd[0])} failed to start: {e.strerror or type(e).__name__}") from e
+        raise FfmpegError(
+            f"{os.path.basename(cmd[0])} failed to start: {e.strerror or type(e).__name__}",
+            category=COULD_NOT_START,
+        ) from e
 
     deadline = time.monotonic() + timeout_s
     use_registry = registry is not None and job_id is not None
@@ -400,13 +480,8 @@ def run_capture(
     finally:
         try:
             if not finished:
-                # Abnormal exit: also kill any grandchild still holding the
-                # group (even if the leader already exited and was reaped;
-                # the pgid cannot be reused while a member exists).
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                # Abnormal exit: also kill any grandchild still holding the group.
+                _kill_whole_group(proc)
             _kill_group(proc)
             proc.wait()
         finally:

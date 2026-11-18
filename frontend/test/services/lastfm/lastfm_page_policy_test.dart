@@ -143,14 +143,14 @@ void main() {
       bool available = true,
       bool online = true,
     }) => LastfmPageOffer.of(
-      status: LastfmStatus.fromJson({
-        'service': service,
-        'state': state,
-        'needs_reconnect': needsReconnect,
-        'account_name': 'listener_01',
-        'connection_id': 'c-1',
-        'approval_expires_at': 1800000600000,
-      }),
+      status: lastfmStatus(
+        service: service,
+        state: state,
+        needsReconnect: needsReconnect,
+        connectionId: 'c-1',
+        approvalExpiresAt: 1800000600000,
+        counts: null,
+      ),
       available: available,
       online: online,
     );

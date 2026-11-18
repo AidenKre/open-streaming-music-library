@@ -36,22 +36,29 @@ class LastfmKnown extends LastfmAccount {
 /// action that reached the API; that is how Now Playing learns of changes
 /// made on the Integrations page.
 class LastfmService extends AsyncNotifier<LastfmAccount> {
+  // "Read again when the connection is verified": a failed status read
+  // ([build] or [_reread]) arms [_armReread]; a new build, a successful read
+  // and disposal disarm it ([_disarm]). [_builds] tells a superseded build
+  // from the current one, so only the current one arms or re-reads.
   StreamSubscription<void>? _rearm;
   int _builds = 0;
+
+  void _disarm() {
+    _rearm?.cancel();
+    _rearm = null;
+  }
 
   /// After a failed status read: one re-read on the next verified edge.
   /// At most one is armed; a successful read leaves none.
   void _armReread(LastfmApi api, Object error) {
-    _rearm?.cancel();
+    _disarm();
     _rearm = api.verifiedAgain.listen((_) {
-      _rearm?.cancel();
-      _rearm = null;
+      _disarm();
       if (ref.mounted) ref.invalidateSelf();
     });
     // The verified edge may have passed before the listener existed.
     if (error is BindingNotVerified && api.isVerifiedNow) {
-      _rearm?.cancel();
-      _rearm = null;
+      _disarm();
       // After the failed read has been delivered, not instead of it.
       final builds = _builds;
       Future.microtask(() {
@@ -62,12 +69,8 @@ class LastfmService extends AsyncNotifier<LastfmAccount> {
 
   @override
   Future<LastfmAccount> build() async {
-    ref.onDispose(() {
-      _rearm?.cancel();
-      _rearm = null;
-    });
-    _rearm?.cancel();
-    _rearm = null;
+    ref.onDispose(_disarm);
+    _disarm();
     final mine = ++_builds;
     final advertised = await ref.watch(integrationsFeatureProvider.future);
     final lastfm = advertised?.block.lastfm;
@@ -106,8 +109,7 @@ class LastfmService extends AsyncNotifier<LastfmAccount> {
     try {
       final status = await api.status();
       if (!ref.mounted) return null;
-      _rearm?.cancel();
-      _rearm = null;
+      _disarm();
       state = AsyncData(LastfmKnown(status: status, available: available));
       return status;
     } on Object catch (e, st) {
@@ -119,8 +121,13 @@ class LastfmService extends AsyncNotifier<LastfmAccount> {
   }
 
   /// Runs [call], then re-reads the status; the call's own result or error
-  /// is what the caller sees.
-  Future<T> _act<T>(Future<T> Function(LastfmApi api) call) async {
+  /// is what the caller sees. On an error, [recover] may answer from the
+  /// re-read status instead (null when the read failed or the scope is gone);
+  /// when it returns null, the error stands.
+  Future<T> _act<T>(
+    Future<T> Function(LastfmApi api) call, {
+    T? Function(Object error, LastfmStatus? status)? recover,
+  }) async {
     final available = await _precondition();
     if (!ref.mounted) throw const LastfmException(LastfmProblem.failed);
     final api = ref.read(lastfmApiProvider);
@@ -128,7 +135,9 @@ class LastfmService extends AsyncNotifier<LastfmAccount> {
     try {
       result = await call(api);
     } on Object catch (e) {
-      if (ref.mounted) await _reread(api, available);
+      final status = ref.mounted ? await _reread(api, available) : null;
+      final recovered = recover?.call(e, status);
+      if (recovered != null) return recovered;
       throw LastfmException.from(e);
     }
     if (ref.mounted) await _reread(api, available);
@@ -144,32 +153,32 @@ class LastfmService extends AsyncNotifier<LastfmAccount> {
   /// `complete`. After a 410, and only then, the status re-read decides:
   /// a connected account with `needs_reconnect == false` is success.
   Future<LastfmCompleted> finish() async {
-    final available = await _precondition();
-    if (!ref.mounted) throw const LastfmException(LastfmProblem.failed);
-    final api = ref.read(lastfmApiProvider);
-    final LastfmCompleted? done;
-    try {
-      done = await api.complete();
-    } on Object catch (e) {
-      final status = ref.mounted ? await _reread(api, available) : null;
-      if (e is ApiException &&
-          e.statusCode == 410 &&
-          status != null &&
-          status.isConnected &&
-          status.needsReconnect == false &&
-          status.connectionId != null &&
-          status.accountName != null) {
-        return LastfmCompleted(
-          connectionId: status.connectionId!,
-          accountName: status.accountName!,
-          state: status.state,
-        );
-      }
-      throw LastfmException.from(e);
-    }
-    if (ref.mounted) await _reread(api, available);
+    final done = await _act(
+      (api) => api.complete(),
+      recover: _completedAfter410,
+    );
     if (done == null) throw const LastfmException(LastfmProblem.badAnswer);
     return done;
+  }
+
+  static LastfmCompleted? _completedAfter410(
+    Object error,
+    LastfmStatus? status,
+  ) {
+    if (error is ApiException &&
+        error.statusCode == 410 &&
+        status != null &&
+        status.isConnected &&
+        status.needsReconnect == false &&
+        status.connectionId != null &&
+        status.accountName != null) {
+      return LastfmCompleted(
+        connectionId: status.connectionId!,
+        accountName: status.accountName!,
+        state: status.state,
+      );
+    }
+    return null;
   }
 
   Future<void> enable(String connectionId) =>

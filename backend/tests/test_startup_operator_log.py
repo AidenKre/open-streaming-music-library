@@ -19,7 +19,7 @@ from app.database.database import Database, DatabaseContext
 from app.services.fingerprinter import detect_fingerprinter
 from app.services.identity_worker import reconcile_audio_identity
 from tests.identity_worker_fixtures import add_track, make_db
-from tests.schema_fixtures import INIT_SQL, make_legacy_database
+from tests.schema_fixtures import INIT_SQL
 
 OPERATOR = "uvicorn.error"
 
@@ -35,16 +35,8 @@ def _database(path: Path) -> Database:
 # --- the schema upgrade -----------------------------------------------------------------------------
 
 
-def test_the_schema_upgrade_is_logged_with_both_versions(tmp_path, caplog):
-    path = tmp_path / "Private Library" / "osml.db"
-    make_legacy_database(path, 13)
-
-    with caplog.at_level(logging.INFO, logger=OPERATOR):
-        _database(path).initialize()
-
-    [line] = [m for m in _operator_lines(caplog) if "schema" in m]
-    assert "13" in line and str(Database.LATEST_SCHEMA_VERSION) in line
-    assert str(tmp_path) not in line and "Private Library" not in line
+# The upgrade line itself ("database schema upgraded from N to M", once, no path) is
+# tested with a fake step in test_schema_steps.py: today the server has no step to run.
 
 
 def test_no_upgrade_line_for_a_new_or_current_database(tmp_path, caplog):

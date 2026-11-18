@@ -38,8 +38,8 @@ import '../../helpers/server_binding.dart';
 import '../../repositories/catalog_seed.dart';
 import '../../repositories/history_snapshot_fixtures.dart'
     show pulledPage, serverEvent;
-import '../browse_harness.dart' show TestOffline;
 import '../fake_library_actions.dart';
+import '../../helpers/test_offline.dart';
 
 String keyOf(FeedEntity e) => (e.key as ValueKey<String>).value;
 

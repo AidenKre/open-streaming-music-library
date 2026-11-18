@@ -222,6 +222,7 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
     calls: list[int] = []
     first_in, second_in, release = threading.Event(), threading.Event(), threading.Event()
     attempted = threading.Event()
+    entered: list[int] = []
 
     class _SlowMembership(set):
         def __contains__(self, item):
@@ -239,6 +240,7 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
             self._real = real
 
         def __enter__(self):
+            entered.append(1)
             if first_in.is_set():
                 attempted.set()  # the second submitter is now trying to enter
             self._real.acquire()
@@ -253,7 +255,8 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
     assert first_in.wait(5)
     t2 = threading.Thread(target=watcher._submit_new, args=(path,))
     t2.start()
-    attempted.wait(1)  # unset only if the product stopped taking the lock at all
+    # Unset only if the product stopped taking the lock at all.
+    assert attempted.wait(5)
     # Without the lock the second thread reaches the membership check within
     # microseconds of attempting; with it, it stays blocked for this window.
     second_in.wait(0.1)
@@ -262,6 +265,7 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
         t.join(5)
     _settle(watcher)
 
+    assert len(entered) == 2  # both submitters went through the lock
     assert on_file.calls == [path]
 
 

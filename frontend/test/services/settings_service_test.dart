@@ -275,7 +275,9 @@ void main() {
   });
 
   group('setStreamQualityFull backend-first persistence', () {
-    test('PUT failure: in-memory state updates, prefs NOT written', () async {
+    // D7 (owner, 2026-11-17): a refused default is not shown as the default.
+    test('PUT failure: the old default stays, prefs NOT written, the call '
+        'throws', () async {
       // Pref starts at 256; user picks 128 but the backend PUT fails.
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
@@ -298,11 +300,16 @@ void main() {
       addTearDown(container.dispose);
 
       await container.read(settingsProvider.future);
-      await container.read(settingsProvider.notifier).setStreamQualityFull('128');
+      await expectLater(
+        container.read(settingsProvider.notifier).setStreamQualityFull('128'),
+        throwsA(anything),
+      );
 
-      // In-memory: user's choice is visible (UI feedback) ...
-      expect(container.read(settingsProvider).value!.streamQuality, '128');
-      // ... but the pref is unchanged (still the pre-call value).
+      // In memory: the old default, not the refused one ...
+      expect(container.read(settingsProvider).value!.streamQuality, '256');
+      expect(container.read(settingsProvider).value!.persistedStreamQuality,
+          '256');
+      // ... and the pref is unchanged (still the pre-call value).
       expect(prefs.getString('settings.streamQuality'), '256');
     });
 
@@ -626,6 +633,42 @@ void main() {
         await notifier.debugBackendSyncDone;
         expect(prefs.getString('settings.streamQuality'), isNull,
             reason: "the old server's quality must not survive the reset");
+      });
+
+      // Pre-merge review A5-04: the same rule for "Set as default": its PUT
+      // answered after a reset (Disconnect wiped the prefs) writes nothing.
+      test('a Set as default answered after a reset writes nothing', () async {
+        final putCompleter = Completer<http.Response>();
+        api = testApiClient(
+          'http://localhost:8000',
+          MockClient((req) async {
+            if (req.method == 'PUT') return putCompleter.future;
+            return getCompleter.future;
+          }),
+        );
+        final prefs = await SharedPreferences.getInstance();
+        late _Resets resets;
+        final container = await _containerWith(prefs, extra: [
+          localResetServiceProvider.overrideWith((ref) => resets = _Resets(ref)),
+        ]);
+        addTearDown(container.dispose);
+        container.read(localResetServiceProvider);
+        await container.read(settingsProvider.future);
+        final notifier = container.read(settingsProvider.notifier);
+        final before = container.read(settingsProvider).value!;
+        final set = notifier.setStreamQualityFull('128');
+        await pumpEventQueue(); // the PUT is in flight
+
+        resets.gen++; // a reset starts and wipes the prefs
+        await prefs.clear();
+        putCompleter.complete(http.Response('{}', 200));
+        await set;
+        expect(prefs.getString('settings.streamQuality'), isNull,
+            reason: "the old server's quality must not survive the reset");
+        expect(container.read(settingsProvider).value!.persistedStreamQuality,
+            before.persistedStreamQuality);
+        getCompleter.complete(qualityResponse(originalQuality));
+        await notifier.debugBackendSyncDone;
       });
 
       test('when the notifier is gone', () async {

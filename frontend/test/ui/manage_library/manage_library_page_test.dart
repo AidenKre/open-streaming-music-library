@@ -14,6 +14,7 @@ import 'package:frontend/ui/manage_library/manage_library_page.dart';
 
 import '../browse_harness.dart';
 import 'fake_manage_library_controls.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 const _banner = Key('manage-library-banner');
 const _panel = Key('selected-panel');

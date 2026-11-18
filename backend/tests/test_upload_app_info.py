@@ -2,7 +2,7 @@
 ``uploads: {version: 1, limits: {...}}`` feature block whose limits are the
 effective values the server enforces, never the raw settings."""
 
-from tests.test_upload_limits import EFFECTIVE_DEFAULTS
+from tests.upload_limit_values import EFFECTIVE_DEFAULTS
 
 
 def _uploads(open_app_client, **env):

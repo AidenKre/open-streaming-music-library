@@ -5,15 +5,16 @@ import os
 import time
 from pathlib import Path
 
+from app.core.upload_states import SOURCE_GIVEN_BACK_STATES
 from app.services import upload_recovery
-from app.services.path_sanitize import assert_within
 from app.services.worker_thread import WorkerThread
-from app.services.upload_receipt import ReceiptFiles, _item_dir, _safe_uuid, owner_dir, remove_verified
+from app.services.upload_receipt import (
+    ReceiptFiles, _item_dir, _safe_uuid, owner_dir, remove_then_release, remove_verified,
+)
 
 log = logging.getLogger(__name__)
 
 DAY = 86_400
-_SOURCE_STATES = ("cancelled", "expired", "imported", "duplicate")
 
 
 class UploadJanitor:
@@ -61,7 +62,7 @@ class UploadJanitor:
 
     def _remove_ended_stages(self, now: int) -> None:
         rows = [r for r in self._database.list_ended_upload_items()
-                if r["state"] in _SOURCE_STATES and (r["source_path"] or r["part_path"])]
+                if r["state"] in SOURCE_GIVEN_BACK_STATES and (r["source_path"] or r["part_path"])]
         self._each(rows, lambda row: self._remove_ended_stage(row, now))
 
     def _remove_ended_stage(self, row: dict, now: int) -> None:
@@ -74,11 +75,9 @@ class UploadJanitor:
                                   (row["source_path"], self._release_source)):
             if not recorded:
                 continue
-            try:
-                path = Path(recorded)
-                assert_within(path, stage)  # not ours: never removed, left recorded
-                if remove_verified(files, path):
-                    release(row, now)
+            try:  # outside the stage: not ours, never removed, left recorded
+                remove_then_release(files, Path(recorded), lambda: release(row, now),
+                                    within=stage, remove=remove_verified)
             except Exception as e:
                 failure = failure or e
         if failure is not None:
@@ -88,7 +87,7 @@ class UploadJanitor:
         self._database.clear_upload_part(owner_id=row["owner_id"], item_uuid=row["item_uuid"])
 
     def _release_source(self, row: dict, now: int) -> None:
-        self._database.release_cancelled_upload_source(
+        self._database.release_removed_upload_source(
             row["item_uuid"], owner_id=row["owner_id"], source_path=row["source_path"], now=now,
             from_states=(row["state"],))
 

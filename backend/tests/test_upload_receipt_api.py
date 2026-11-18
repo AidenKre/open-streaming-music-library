@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.sqlite_helpers import sql_rows
 from tests.upload_stream import put
 
 NOW = 1_700_000_000
@@ -50,16 +51,8 @@ def allocate(client, *contents, headers=None, batch=None, space=7):
     return batch, [i["item_uuid"] for i in items]
 
 
-def rows(client, sql, params=()):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
-
-
 def item(client, item_uuid):
-    [row] = rows(
+    [row] = sql_rows(
         client,
         "SELECT state, received_bytes, received_sha256, part_path, source_path, lease_boot_id, "
         "cancel_requested, error_code, error_retryable FROM upload_items WHERE item_uuid = ?",
@@ -71,7 +64,7 @@ def item(client, item_uuid):
 
 
 def reservations(client):
-    return rows(
+    return sql_rows(
         client,
         "SELECT owner_id, purpose, subject_ref, bytes, lease_boot_id FROM storage_reservations ORDER BY id",
     )
@@ -449,7 +442,7 @@ def _staged_row(client, owner_id, nbytes, subject="elsewhere"):
 
 
 def test_a_full_personal_staged_quota_is_a_retryable_413_before_reading(client):
-    from tests.test_upload_limits import EFFECTIVE_DEFAULTS
+    from tests.upload_limit_values import EFFECTIVE_DEFAULTS
 
     _batch, [it] = allocate(client, DATA)
     owner = client.app.state.admin_user_id
@@ -471,7 +464,7 @@ def test_a_full_personal_staged_quota_is_a_retryable_413_before_reading(client):
 
 
 def test_a_full_server_wide_staged_quota_is_a_retryable_413_before_reading(client):
-    from tests.test_upload_limits import EFFECTIVE_DEFAULTS
+    from tests.upload_limit_values import EFFECTIVE_DEFAULTS
 
     sam, _sam_headers = _second_user(client)
     _batch, [it] = allocate(client, DATA)
@@ -846,11 +839,9 @@ def test_progress_is_persisted_at_most_once_per_interval_and_shows_in_the_status
     assert seen[1]["state"] == "receiving"
     assert 8 < seen[1]["received_bytes"] <= 16
     assert results[0].status == 200
-    [(progress_at,)] = rows(client, "SELECT progress_at FROM upload_items WHERE item_uuid = ?", (it,))
+    [(progress_at,)] = sql_rows(client, "SELECT progress_at FROM upload_items WHERE item_uuid = ?", (it,))
     # Row time = the request's wall clock plus the monotonic time elapsed.
     assert progress_at == NOW + 1
-
-
 
 
 # ── S9: DELETE while receiving ──────────────────────────────────────────────
@@ -980,8 +971,6 @@ def test_a_cancelled_transfer_is_seen_by_its_own_progress_write_too(client):
     _assert_cancelled_put(client, it, results[0], slots)
 
 
-
-
 # ── S10: the idle timeout ──────────────────────────────────────────────────
 
 class FakeIdle:
@@ -1074,12 +1063,12 @@ def test_a_user_with_a_transfer_running_waits_while_another_user_may_send(client
 def _received(client, contents=DATA):
     _batch, [it] = allocate(client, contents)
     assert put(client, it, [contents]).status == 200
-    [snap] = rows(client, "SELECT * FROM upload_items WHERE item_uuid = ?", (it,))
+    [snap] = sql_rows(client, "SELECT * FROM upload_items WHERE item_uuid = ?", (it,))
     return it, snap
 
 
 def _unchanged(client, it, snap):
-    [now] = rows(client, "SELECT * FROM upload_items WHERE item_uuid = ?", (it,))
+    [now] = sql_rows(client, "SELECT * FROM upload_items WHERE item_uuid = ?", (it,))
     assert now == snap
     owner = client.app.state.admin_user_id
     assert reservations(client) == [(owner, "upload_source", it, len(DATA), None)]
@@ -1359,7 +1348,7 @@ def test_r1_6_the_items_path_is_resolved_off_the_event_loop(client, monkeypatch)
 
 
 def test_r1_7_a_full_server_wide_quota_tells_nobody_the_other_users_totals(client):
-    from tests.test_upload_limits import EFFECTIVE_DEFAULTS
+    from tests.upload_limit_values import EFFECTIVE_DEFAULTS
 
     sam, _sam_headers = _second_user(client)
     _batch, [it] = allocate(client, DATA)
@@ -1371,3 +1360,64 @@ def test_r1_7_a_full_server_wide_quota_tells_nobody_the_other_users_totals(clien
     detail = sent.json()["detail"]
     assert "available" not in detail and "limit" not in detail
     assert not any(ch.isdigit() for ch in detail["message"])
+
+
+# ── pre-merge A4-06: the final write after the part became `source` ─────────
+
+def _completion_fails_after_the_rename(client, monkeypatch, on_complete):
+    """Replaces the database's ``complete_upload_receipt`` with ``on_complete``,
+    called once the part was renamed to the staged source (checked on disk).
+    Returns (slot spy, ledger spy, what the call saw)."""
+    db = client.app.state.database
+    seen = []
+
+    def complete(item_uuid, **kwargs):
+        seen.append(Path(kwargs["source_path"]).is_file() and not Path(kwargs["part_path"]).exists())
+        return on_complete(item_uuid)
+
+    monkeypatch.setattr(db, "complete_upload_receipt", complete)
+    slots = spy_slots(client)
+    rt = runtime(client)
+    rt.ledger = ledger = _RacingLedger(rt.ledger, lambda: None)
+    return slots, ledger, seen
+
+
+def test_a_failed_completion_write_removes_the_source_and_returns_the_item(client, monkeypatch):
+    _batch, [it] = allocate(client, DATA)
+
+    def fails(_item_uuid):
+        raise sqlite3.OperationalError("database is locked")
+
+    slots, ledger, seen = _completion_fails_after_the_rename(client, monkeypatch, fails)
+
+    with pytest.raises(sqlite3.OperationalError):  # the error middleware re-raises after its 500
+        put(client, it, [DATA])
+
+    assert seen == [True], "the write failed after the rename, with the source on disk"
+    assert item_error(client, it) == ("allocated", "upload_interrupted", 1)
+    row = item(client, it)
+    assert (row["received_bytes"], row["source_path"], row["part_path"], row["lease_boot_id"]) == (
+        0, None, None, None,
+    )
+    assert files_under_uploads(client) == []
+    assert [r for r in reservations(client) if r[1] in ("upload_receive", "upload_source")] == []
+    assert reservations(client) == []
+    assert slots.calls == [[True]]
+    assert len(ledger.released) == 1
+    assert_released(client, it)
+
+
+def test_a_completion_refused_because_the_item_was_cancelled_removes_the_source(client, monkeypatch):
+    _batch, [it] = allocate(client, DATA)
+
+    def cancelled_meanwhile(item_uuid):
+        _force_state(client, item_uuid, "cancelled", cancel_requested=1)
+        return False
+
+    slots, ledger, seen = _completion_fails_after_the_rename(client, monkeypatch, cancelled_meanwhile)
+
+    sent = put(client, it, [DATA])
+
+    assert seen == [True]
+    assert len(ledger.released) == 1
+    _assert_cancelled_put(client, it, sent, slots)

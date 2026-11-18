@@ -57,6 +57,24 @@ void main() {
     });
   });
 
+  // U21-FE-SESSION-B-09: damage flips isDownloaded off, so a list key needs
+  // no damage term; only the one-track key keeps it (the track menu offers
+  // the damaged copy's actions from a TrackScope).
+  test('a damaged download: TrackScope tells it from no download, TracksScope '
+      'does not', () {
+    final downloaded = _track('u1', filePath: '/f');
+    final damaged = downloaded.copyWith(damagedFilePath: '/f');
+    final none = _track('u1');
+    expect(damaged.isDownloaded, isFalse);
+    // Marking the download damaged makes a new key for both scopes.
+    expect(TrackScope(damaged) == TrackScope(downloaded), isFalse);
+    expect(TracksScope([damaged]) == TracksScope([downloaded]), isFalse);
+    // Damaged and never downloaded: one-track keys differ, list keys agree.
+    expect(TrackScope(damaged) == TrackScope(none), isFalse);
+    expect(TracksScope([damaged]), TracksScope([none]));
+    expect(TracksScope([damaged]).hashCode, TracksScope([none]).hashCode);
+  });
+
   test('TracksScope with a repeated uuid is equal by position', () {
     final a = TracksScope([_track('u1'), _track('u1')]);
     expect(a, TracksScope([_track('u1'), _track('u1')]));

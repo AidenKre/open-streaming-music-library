@@ -10,16 +10,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/app_info_service.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../helpers/test_offline.dart';
 
 Map<String, dynamic> _appInfoJson(List<String> fieldKeys) => {
       'entities': {
@@ -38,7 +29,7 @@ ApiClient api = testApiClient('', MockClient((_) async => throw StateError('unse
 ProviderContainer _container({required bool offline}) {
   final c = ProviderContainer(overrides: [
     apiClientProvider.overrideWithValue(api),
-    offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+    offlineModeProvider.overrideWith(() => TestOffline(offline)),
   ]);
   addTearDown(c.dispose);
   return c;

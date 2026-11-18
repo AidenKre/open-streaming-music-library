@@ -2,7 +2,7 @@
 <!-- Android 12+: allowBackup is ignored for device-to-device transfer, so
      exclude all app data from cloud backup and device transfer. The sign-in
      (secure-storage prefs, or the owner-only fallback file) must never reach
-     another device (Phase M spec 7.1). -->
+     another device. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" />

@@ -1,3 +1,6 @@
+import 'dart:convert';
+
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -162,5 +165,34 @@ void main() {
     expect(frozen.finalPayload?.eventUuid, good);
     // The unreadable rows are kept, not deleted.
     expect(await db.select(db.activeListens).get(), hasLength(4));
+  });
+
+  // B.13 (U26-A-01): the drafts read their stored payload with the one
+  // strict reader the transport uses, so a payload missing a key is
+  // unreadable (it was read with the measure as unknown) and skipped like
+  // the others; the app always writes every key.
+  test('a stored payload missing a key is unreadable and skipped', () async {
+    const good = '88888888-8888-4888-8888-888888888888';
+    const missingKey = '99999999-9999-4999-8999-999999999999';
+    for (final uuid in [good, missingKey]) {
+      await repo.checkpointDraft(token, _draft(uuid));
+      await repo.freezeDraft(token, uuid, _play(uuid));
+    }
+    final stored = (await (db.select(db.activeListens)
+              ..where((l) => l.listenUuid.equals(missingKey)))
+            .getSingle())
+        .finalPayloadJson!;
+    final withoutMeasure = (jsonDecode(stored) as Map<String, Object?>)
+      ..remove('track_length');
+    await (db.update(db.activeListens)
+          ..where((l) => l.listenUuid.equals(missingKey)))
+        .write(ActiveListensCompanion(
+      finalPayloadJson: Value(jsonEncode(withoutMeasure)),
+    ));
+
+    final drafts = await repo.drafts();
+
+    expect([for (final d in drafts) d.listenUuid], [good]);
+    expect(await db.select(db.activeListens).get(), hasLength(2));
   });
 }

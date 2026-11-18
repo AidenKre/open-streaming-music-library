@@ -568,8 +568,8 @@ class TestRangeParsing:
     def _parser(self):
         # Re-import each call so a hot reload during a different test doesn't
         # leak a stale parser reference.
-        from app.main import _parse_byte_range
-        return _parse_byte_range
+        from app.core.byte_range import parse_byte_range
+        return parse_byte_range
 
     def test_explicit_range_returns_inclusive_window(self):
         assert self._parser()("bytes=0-99", file_size=1000) == (0, 99)
@@ -727,7 +727,7 @@ class TestWarmEndpoint:
         assert data["accepted"] is True
         assert data["prefetch_queued"] == 2
 
-        coordinator._executor.shutdown(wait=True)
+        coordinator.drain()
 
         assert client.app.state.encoded_cache.has(track1.uuid_id, "192")
         assert client.app.state.encoded_cache.has(track2.uuid_id, "192")
@@ -787,7 +787,7 @@ class TestWarmEndpoint:
         data = r.json()
         assert data["prefetch_queued"] == 0
         assert data["prefetch_skipped"] == 1
-        coordinator._executor.shutdown(wait=True)
+        coordinator.drain()
         assert encoded["calls"] == 0
 
     def test_warm__already_cached__counted_as_skipped(self, client, tmp_path):
@@ -806,7 +806,7 @@ class TestWarmEndpoint:
         r = client.post("/tracks/warm", json=body)
         assert r.status_code == 200
         assert r.json()["prefetch_queued"] == 1
-        coordinator._executor.shutdown(wait=True)
+        coordinator.drain()
 
         # Second warm sees a cache hit — must NOT be counted as queued work.
         r = client.post("/tracks/warm", json=body)
@@ -842,7 +842,7 @@ class TestWarmEndpoint:
             "track_uuids": [track.uuid_id],
         })
         assert r.status_code == 200
-        coordinator._executor.shutdown(wait=True)
+        coordinator.drain()
         assert encoded["calls"] == 1
 
         with client.stream(
@@ -874,7 +874,7 @@ class TestWarmEndpoint:
             "track_uuids": [track1.uuid_id, track2.uuid_id, track3.uuid_id],
         })
         assert r.status_code == 200
-        coordinator._executor.shutdown(wait=True)
+        coordinator.drain()
 
         # track1 should NOT be prefetched (before current_index).
         assert not client.app.state.encoded_cache.has(track1.uuid_id, "192")
@@ -902,7 +902,7 @@ class TestWarmEndpoint:
             "track_uuids": [track1.uuid_id, track2.uuid_id, track3.uuid_id],
         })
         assert r.status_code == 200
-        coordinator._executor.shutdown(wait=True)
+        coordinator.drain()
 
         assert client.app.state.encoded_cache.has(track1.uuid_id, "192")
         assert not client.app.state.encoded_cache.has(track2.uuid_id, "192")
@@ -930,7 +930,7 @@ class TestWarmEndpoint:
             "track_uuids": [track1.uuid_id, track2.uuid_id, track3.uuid_id],
         })
         assert r.status_code == 200
-        coordinator._executor.shutdown(wait=True)
+        coordinator.drain()
 
         assert client.app.state.encoded_cache.has(track1.uuid_id, "192")
         assert client.app.state.encoded_cache.has(track2.uuid_id, "192")

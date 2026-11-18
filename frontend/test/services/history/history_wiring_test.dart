@@ -33,6 +33,7 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../helpers/server_binding.dart';
+import '../../helpers/test_offline.dart';
 
 class _RecordingRunner extends SingleFlightRunner {
   _RecordingRunner()
@@ -50,17 +51,6 @@ class _RecordingRunner extends SingleFlightRunner {
   Future<void> quiesce() async => quiesced++;
 }
 
-class _Offline extends OfflineModeNotifier {
-  _Offline(this.initial);
-  final bool initial;
-  @override
-  bool build() {
-    super.build();
-    return initial;
-  }
-  void set(bool v) => state = v;
-}
-
 class _InsertTriggers extends HistorySyncTriggers {
   _InsertTriggers() : super(request: (_) {});
   var inserts = 0;
@@ -76,7 +66,9 @@ HistoryEventPayload _event(String uuid) => HistoryEventPayload(
   occurredAt: 1000,
 );
 
-ApiClient api = testApiClient('', MockClient((_) async => throw StateError('no client installed')));
+/// The scope's API client: reset in setUp to one that fails every request;
+/// a test that needs answers installs its own (U26-B-07).
+late ApiClient api;
 
 void main() {
   late AppDatabase db;
@@ -84,12 +76,14 @@ void main() {
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    api = testApiClient(
+        '', MockClient((_) async => throw StateError('no client installed')));
     db = AppDatabase(NativeDatabase.memory());
     token = await seedTestBinding(db);
   });
   tearDown(() => db.close());
 
-  ProviderContainer scope({SingleFlightRunner? runner, _Offline? offline}) {
+  ProviderContainer scope({SingleFlightRunner? runner, TestOffline? offline}) {
     final c = ProviderContainer(
       overrides: [
         apiClientProvider.overrideWithValue(api),
@@ -129,9 +123,10 @@ void main() {
     final runner = _RecordingRunner();
     final c = scope(runner: runner);
     final participants = c.read(localQuiescablesProvider);
+    // Only this participant's place; the full list is pinned once, in
+    // local_reset_service_test.dart.
     expect(participants.map((p) => p.quiesceName),
-        ['playback', 'listens', 'preview', 'history', 'uploads', 'delete-jobs',
-          'owned-file-cleanup', 'submissions']);
+        containsAllInOrder(['playback', 'listens', 'history']));
     final history = participants.singleWhere((p) => p.quiesceName == 'history');
     await history.quiesce();
     expect(runner.quiesced, 0, reason: 'nothing built: nothing to stop (branch audit 5A N1)');
@@ -163,7 +158,7 @@ void main() {
   });
 
   test('offline mode suspends and resumes the foreground poll', () async {
-    final offline = _Offline(false);
+    final offline = TestOffline(false);
     final c = scope(runner: _RecordingRunner(), offline: offline);
     c.read(offlineModeProvider);
     final triggers = c.read(historySyncTriggersProvider);

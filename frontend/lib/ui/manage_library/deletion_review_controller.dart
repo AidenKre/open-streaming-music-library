@@ -12,7 +12,6 @@ import 'package:frontend/services/deletion/delete_jobs_manager.dart';
 import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
 import 'package:frontend/services/deletion/deletion_preview.dart';
 import 'package:frontend/services/deletion/deletion_text.dart';
-import 'package:frontend/services/deletion/server_delete_availability.dart';
 import 'package:frontend/services/deletion/sync_touch.dart';
 import 'package:frontend/ui/selection/track_selection_controller.dart';
 
@@ -57,6 +56,10 @@ abstract interface class DeletionReviewControls implements Listenable {
   /// The operation of the last confirmed deletion.
   String? get submittedOperation;
 
+  /// The selection emptied without a deletion handed over: there is
+  /// nothing left to review, and the review sheet closes.
+  bool get nothingToReview;
+
   /// Asks the server about the current selection (1-100 tracks).
   Future<void> requestPreview();
 
@@ -66,9 +69,6 @@ abstract interface class DeletionReviewControls implements Listenable {
 
   /// Removes [uuid] from the selection and previews the rest again.
   Future<void> removeTarget(String uuid);
-
-  /// The typed count matches the preview's count (N > 1).
-  bool typedCountAccepted(String typed);
 
   /// Submits exactly [shown], the preview the confirmation displayed, with
   /// [confirmedCount]. Sends nothing unless [shown] is still the preview of
@@ -126,6 +126,12 @@ class DeletionReviewController extends ChangeNotifier
 
   @override
   String? get submittedOperation => _submittedOperation;
+
+  @override
+  bool get nothingToReview =>
+      _selection.count == 0 &&
+      _stage != ReviewStage.submitting &&
+      _stage != ReviewStage.submitted;
 
   List<DeletionCandidate> get _candidates => [
     for (final e in _selection.selection.entries)
@@ -255,12 +261,6 @@ class DeletionReviewController extends ChangeNotifier
     if (_disposed) return;
     _selection.deselect(uuid);
     if (_selection.count > 0) await requestPreview();
-  }
-
-  @override
-  bool typedCountAccepted(String typed) {
-    final p = _preview;
-    return p != null && typedCountMatches(typed, p.count);
   }
 
   @override

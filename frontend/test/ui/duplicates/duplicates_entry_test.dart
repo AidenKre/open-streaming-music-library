@@ -35,8 +35,8 @@ import 'package:frontend/ui/settings/settings_registry.dart';
 
 import '../../helpers/duplicate_fixtures.dart';
 import '../../helpers/fake_library_tools_api.dart';
-import '../../playback/audio_focus_test.dart' show FakeTimers;
-import '../../playback/preview_player_test.dart' show FakePreviewEngine;
+import '../../helpers/fake_audio_focus.dart' show RelinquishingOwner, FakeTimers;
+import '../../helpers/fake_preview_engine.dart' show FakePreviewEngine;
 import '../browse_harness.dart';
 import '../fake_session_controls.dart';
 import 'fake_duplicates_controls.dart';
@@ -216,6 +216,42 @@ void main() {
       expect(h.audio.calls, isEmpty);
       expect(h.audio.intents, isEmpty);
       expect(touched, isEmpty);
+      await teardownTree(tester);
+    });
+
+    // Pre-merge R3-L-01: this page closes the preview at the pop (the upload
+    // review page did not). Pinned here for the audition that still loads.
+    testWidgets('leaving the page while an audition still loads gives the '
+        'output back at the pop, before the page is gone', (tester) async {
+      final library = RelinquishingOwner('queue');
+      focus.bind(AudioOutput.queue, library);
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+      await openPage(tester);
+      await tester.tap(find.byKey(const Key('play-a1')));
+      await tester.pump();
+      await tester.runAsync(() => pumpEventQueue());
+      await tester.pump();
+      expect(library.relinquishes, 1);
+      library.acknowledge();
+      await tester.pump();
+      await tester.runAsync(() => pumpEventQueue());
+      await tester.pump();
+      expect(focus.holder, AudioOutput.preview);
+      expect(engines.single.loads, hasLength(1));
+
+      await tester.pageBack();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(find.byType(DuplicatesPage), findsOneWidget,
+          reason: 'precondition: the page is still animating out');
+      expect(focus.holder, AudioOutput.queue);
+      expect(library.returns, 1);
+      expect(engines.single.disposed, isTrue);
+      await tester.pumpAndSettle();
+      await tester.runAsync(() => pumpEventQueue());
+      expect(tester.takeException(), isNull);
+      expect(engines.single.plays, 0);
+      expect(library.returns, 1);
       await teardownTree(tester);
     });
 

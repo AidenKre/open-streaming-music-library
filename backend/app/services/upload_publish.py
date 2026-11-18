@@ -19,7 +19,7 @@ from app.services.audio_identity import identity_from_columns
 from app.services.media_input import item_demuxer
 from app.services.path_sanitize import assert_within
 from app.services.upload_errors import commit_disk_full, upload_commit_failed
-from app.services.upload_receipt import ReceiptFiles, owner_dir, remove_verified
+from app.services.upload_receipt import ReceiptFiles, owner_dir, remove_then_release, remove_verified
 
 log = logging.getLogger(__name__)
 
@@ -152,14 +152,14 @@ class UploadPublisher:
         owner = prepared["owner_id"]
         try:
             source = Path(prepared["source_path"])
-            assert_within(source, owner_dir(self._uploads_root, owner))
-            removed = remove_verified(ReceiptFiles(), source)
-            self._at("after_source_removed")
-            if removed:
-                self._database.release_cancelled_upload_source(
+            released = remove_then_release(
+                ReceiptFiles(), source,
+                lambda: self._database.release_removed_upload_source(
                     prepared["item_uuid"], owner_id=owner, source_path=str(source),
-                    now=int(self._clock()), from_states=("imported",))
-            else:
+                    now=int(self._clock()), from_states=("imported",)),
+                within=owner_dir(self._uploads_root, owner), remove=remove_verified,
+                between=lambda: self._at("after_source_removed"))
+            if released is None:  # the file is still there
                 log.warning("imported source not removed")
         except Exception as e:
             log.warning("imported source cleanup incomplete: %s", type(e).__name__)

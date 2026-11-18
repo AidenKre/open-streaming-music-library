@@ -21,16 +21,7 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import '../helpers/server_binding.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._v);
-  final bool _v;
-  @override
-  bool build() {
-    super.build();
-    return _v;
-  }
-}
+import '../helpers/test_offline.dart';
 
 /// Counts calls to the (small, cheap, but redundant-when-batched)
 /// parent-FTS rebuild so a test can assert it runs once per batch, not
@@ -124,7 +115,7 @@ ProviderContainer _container(
     else
       autoVerifiedGateOverride(),
     tracksApiProvider.overrideWithValue(TracksApi(api: api)),
-    offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+    offlineModeProvider.overrideWith(() => TestOffline(offline)),
   ]);
   addTearDown(c.dispose);
   return c;
@@ -275,36 +266,49 @@ void main() {
   });
 
   // Phase M §7.7 (M-U24): "Edit outbox: already rethrows; unchanged." A 401
-  // fails no edit: the row stays pending (not rejected) and
-  // goes out at the next same-user login.
-  test('flush 401 keeps the row pending, not rejected', () async {
+  // fails no edit: the rows stay pending (not rejected) and go out at the
+  // next same-user login. The 401 hook closes the gate synchronously (here:
+  // the handler does what the session's hook does), so the flush STOPS at the
+  // first 401: the second row is not sent (other-issues row 76: with one row
+  // the test could not tell "stopped" from "skipped"). The flush itself
+  // returns normally.
+  test('flush 401 keeps every row pending, not rejected, and sends no '
+      'further row', () async {
     final db = await _boundDb();
     addTearDown(db.close);
     await _seedTrack(db, revision: 5);
-    final outbox = _container(
+    await _seedTrack(db, uuid: 'u2', revision: 5);
+    late final ProviderContainer container;
+    container = _container(
       db,
-      onPatch: (_) async => http.Response(
-        '{"detail":{"code":"invalid_token","message":"Sign in again."}}',
-        401,
-        headers: {'content-type': 'application/json'},
-      ),
-    ).read(editOutboxProvider);
-
-    await outbox.enqueue(
-      uuidId: 'u1',
-      edit: const MetadataEdit.empty().set('title', 'A'),
-      writeMode: EditWriteMode.dbOnly,
-      baseRevision: 5,
+      onPatch: (_) async {
+        container.read(serverBindingGateProvider).closeSignedOut();
+        return http.Response(
+          '{"detail":{"code":"invalid_token","message":"Sign in again."}}',
+          401,
+          headers: {'content-type': 'application/json'},
+        );
+      },
     );
-    try {
-      await outbox.flush();
-    } catch (_) {
-      // a rethrown 401 is the outbox's "retry later"
-    }
+    final outbox = container.read(editOutboxProvider);
 
-    final row = await db.select(db.pendingEdits).getSingle();
-    expect(row.status, 'pending');
-    expect(row.rejectionReason, isNull);
+    for (final uuid in ['u1', 'u2']) {
+      await outbox.enqueue(
+        uuidId: uuid,
+        edit: const MetadataEdit.empty().set('title', 'A'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+    }
+    await outbox.flush();
+
+    expect(_patchCalls, hasLength(1));
+    final rows = await db.select(db.pendingEdits).get();
+    expect(rows.map((r) => r.uuidId), unorderedEquals(['u1', 'u2']));
+    for (final row in rows) {
+      expect(row.status, 'pending');
+      expect(row.rejectionReason, isNull);
+    }
   });
 
   test('keep-mine rebases onto the server revision and re-flushes', () async {

@@ -1168,7 +1168,7 @@ class TestGetTracksCount:
             assert database.add_track(track=track, timeout=1)
 
         for i in range(5):
-            track = create_track(tmp_path / f"track_{i}.mp3", f"title_{i}", "artist_2")
+            track = create_track(tmp_path / f"other_{i}.mp3", f"title_{i}", "artist_2")
             assert database.add_track(track=track, timeout=1)
 
         expected_count = 5

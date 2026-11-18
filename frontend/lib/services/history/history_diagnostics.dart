@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/models/history_event.dart';
+import 'package:frontend/models/pending_edit_display.dart' show editTrackName;
 import 'package:frontend/repositories/history_repository.dart';
 import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/providers/providers.dart';
@@ -27,6 +28,7 @@ class HistoryDiagnostics {
     this.conflicts = const [],
     this.frozenListens = 0,
     this.listenError,
+    this.trackNames = const {},
   });
 
   /// Unsent events still eligible for upload.
@@ -46,6 +48,11 @@ class HistoryDiagnostics {
 
   /// The last listen recording failure this run (§7 "visible error").
   final String? listenError;
+
+  /// The name a person reads for each conflict's track, by the event's
+  /// track reference (pre-merge review A5-06). A reference missing here is
+  /// shown as `unknownTrackName`, never as the reference itself.
+  final Map<String, String> trackNames;
 }
 
 /// The live history diagnostics: the store's counts plus the sync status,
@@ -71,6 +78,23 @@ final historyDiagnosticsProvider = StreamProvider<HistoryDiagnostics>((ref) {
       final local = await repository.localPayload(server.payload.eventUuid);
       if (local != null) conflicts.add((local: local, server: server));
     }
+    // Each conflict's track as a person knows it, never its reference.
+    final trackNames = <String, String>{};
+    for (final pair in conflicts) {
+      for (final reference in {
+        pair.local.entityRef,
+        pair.server.payload.entityRef,
+      }) {
+        if (trackNames.containsKey(reference)) continue;
+        try {
+          trackNames[reference] = editTrackName(
+            track: await ref.read(browseRepositoryProvider).getTrack(reference),
+          );
+        } catch (_) {
+          // Unknown: the card shows Unknown track.
+        }
+      }
+    }
     if (closed || sequence != publishSequence) return;
     controller.add(
       HistoryDiagnostics(
@@ -82,6 +106,7 @@ final historyDiagnosticsProvider = StreamProvider<HistoryDiagnostics>((ref) {
         conflicts: conflicts,
         frozenListens: frozenListens,
         listenError: listenError.value,
+        trackNames: trackNames,
       ),
     );
   }

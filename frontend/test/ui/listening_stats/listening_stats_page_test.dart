@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/listening_stats.dart';
 import 'package:frontend/ui/listening_stats/listening_stats_controller.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 
 import '../browse_harness.dart' show teardownTree;
 import 'stats_page_harness.dart';
@@ -45,7 +46,9 @@ void main() {
     for (final label in ['7 days', '30 days', 'This year', 'All time']) {
       expect(find.widgetWithText(ChoiceChip, label), findsOneWidget);
     }
-    expect(_chip(tester, '30 days').selected, isTrue);
+    // The page opens on 7 days (sign-off DEV-9-15 item 9).
+    expect(_chip(tester, '7 days').selected, isTrue);
+    expect(_chip(tester, '30 days').selected, isFalse);
     expect(find.text(_emptyCopy), findsNothing);
     expect(find.text(_errorCopy), findsNothing);
     await teardownTree(tester);
@@ -123,6 +126,20 @@ void main() {
       await tester.tap(find.widgetWithText(ChoiceChip, '30 days'));
       await tester.pump();
       expect(h.fake.rangeTaps, [StatsRange.last30Days]);
+      await teardownTree(tester);
+    });
+
+    // Part B's shared notice sits inside the page's list, which already
+    // ends above the shell's bottom chrome: the notice adds no second gap.
+    testWidgets('a failed load inside the shell: the bottom chrome gap is '
+        'added once, by the page', (tester) async {
+      const inset = 150.0;
+      await h.open(tester, bottomInset: inset);
+      await h.show(tester, const StatsFailed(), range: StatsRange.thisUtcYear);
+      final notice = tester.getRect(find.byType(LoadFailureNotice));
+      final retry = tester.getRect(_retry);
+      expect(notice.bottom - retry.bottom, 32,
+          reason: "only the notice's own padding below Retry");
       await teardownTree(tester);
     });
 

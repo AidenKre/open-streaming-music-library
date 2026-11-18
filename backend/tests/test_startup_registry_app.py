@@ -19,6 +19,7 @@ from app.database import DatabaseContext
 from app.database.database import Database
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from tests.identity_worker_fixtures import add_track
+from tests.recovery_steps import capture_steps
 from tests.schema_fixtures import INIT_SQL
 
 
@@ -200,14 +201,8 @@ def test_every_recovery_step_runs_twice_with_the_same_result(configure_app, monk
     for path in stale_encodes:
         path.write_bytes(b"encode of the pre-conversion bytes")
 
-    captured = []
-    real_run = getattr(main, "run_startup_recovery", None)
-
-    def capture(steps):
-        captured.append(list(steps))
-        return real_run(steps)
-
-    monkeypatch.setattr(main, "run_startup_recovery", capture, raising=False)
+    real_run = main.run_startup_recovery
+    captured = capture_steps(main, monkeypatch)
 
     with TestClient(main.app):
         pass

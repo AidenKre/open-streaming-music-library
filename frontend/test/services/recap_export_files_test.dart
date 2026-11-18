@@ -10,11 +10,13 @@ import 'dart:typed_data';
 import 'dart:ui' show Rect;
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/recap_export_files.dart';
 import 'package:frontend/services/recap_export_platform.dart';
 import 'package:path/path.dart' as p;
 
 import '../helpers/fake_recap_export_platform.dart';
+import '../helpers/chmod_denial.dart';
 
 void main() {
   late Directory root;
@@ -134,7 +136,7 @@ void main() {
     });
 
     test('a temporary file that cannot be written fails before the panel '
-        'opens', () async {
+        'opens', skip: skipUnlessChmodDenies, () async {
       Process.runSync('chmod', ['555', tempRoot.path]);
       platform.nextSaveLocation = () => p.join(dest.path, name);
 
@@ -170,7 +172,8 @@ void main() {
     });
 
     test('a temporary file that cannot be removed is logged without its '
-        'path and removed by the next export', () async {
+        'path and removed by the next export',
+        skip: skipUnlessChmodDenies, () async {
       final owned = p.join(tempRoot.path, RecapExportFiles.folderName);
       platform.nextSaveLocation = () => p.join(dest.path, name);
       platform.whilePanelOpen = () async {
@@ -199,7 +202,8 @@ void main() {
     // read-only while the panel is open.
     for (final existing in [false, true]) {
       test('when the move fails the bytes are written in place '
-          '(${existing ? 'confirmed replace' : 'new file'})', () async {
+          '(${existing ? 'confirmed replace' : 'new file'})',
+          skip: skipUnlessChmodDenies, () async {
         final target = File(p.join(dest.path, name));
         if (existing) target.writeAsStringSync('old');
         platform.nextSaveLocation = () => target.path;
@@ -356,7 +360,7 @@ void main() {
     });
 
     test('a temporary file that cannot be written fails before the sheet '
-        'opens', () async {
+        'opens', skip: skipUnlessChmodDenies, () async {
       Process.runSync('chmod', ['555', tempRoot.path]);
 
       expect(await share(), RecapShareOutcome.failed);
@@ -416,6 +420,143 @@ void main() {
       expect(File(shared).existsSync(), isFalse);
       expect(File(target).readAsBytesSync(), png);
       expect(tempFiles(), isEmpty);
+    });
+  });
+
+  // Pre-merge review C2-03: a local reset (Disconnect, a user switch)
+  // removes the owned folder, so the previous person's shared recap does not
+  // stay on the device until the next export. Only that folder; never what a
+  // link points to.
+  group('a local reset', () {
+    String owned() => p.join(tempRoot.path, RecapExportFiles.folderName);
+    Future<RecapShareOutcome> share() =>
+        files.share(png, suggestedName: name, type: RecapExportType.png);
+
+    test('is a file-deleting wipe step', () {
+      expect(files.resetPriority, ResetPriority.deleteFiles);
+    });
+
+    test('removes a held share and left-over exports', () async {
+      expect(await share(), RecapShareOutcome.shared);
+      final held = platform.shareRequests.single.$1;
+      expect(File(held).existsSync(), isTrue);
+      final leftover = Directory(p.join(owned(), 'export-crashed'))
+        ..createSync(recursive: true);
+      File(p.join(leftover.path, name)).writeAsBytesSync(png);
+
+      await files.resetLocalState();
+
+      expect(tempFiles(), isEmpty);
+      expect(Directory(owned()).existsSync(), isFalse);
+      // Nothing else under the temporary directory is touched.
+      expect(tempRoot.existsSync(), isTrue);
+    });
+
+    test('is a no-op without the folder, and can run again', () async {
+      final other = File(p.join(tempRoot.path, 'not-ours.txt'))
+        ..writeAsStringSync('keep');
+      await files.resetLocalState();
+      await files.resetLocalState();
+      expect(other.readAsStringSync(), 'keep');
+    });
+
+    test('an owned folder that is a link: the link goes, never what it '
+        'points to', () async {
+      final elsewhere = Directory(p.join(root.path, 'elsewhere'))..createSync();
+      final precious = File(p.join(elsewhere.path, 'precious.txt'))
+        ..writeAsStringSync('keep');
+      Link(owned()).createSync(elsewhere.path);
+
+      await files.resetLocalState();
+
+      expect(precious.readAsStringSync(), 'keep');
+      expect(FileSystemEntity.typeSync(owned(), followLinks: false),
+          FileSystemEntityType.notFound);
+    });
+
+    // Pre-merge review r1 R-1: a folder that cannot be removed is logged and
+    // left for the next export's sweep; it never fails the reset (which
+    // would keep the reset marker and refuse every connect).
+    test('a folder that cannot be removed is logged, not a reset failure',
+        skip: skipUnlessChmodDenies, () async {
+      final leftover = Directory(p.join(owned(), 'export-crashed'))
+        ..createSync(recursive: true);
+      File(p.join(leftover.path, name)).writeAsBytesSync(png);
+      Process.runSync('chmod', ['555', leftover.path]);
+
+      await files.resetLocalState();
+
+      expect(logs, isNotEmpty);
+      for (final line in logs) {
+        expect(line, isNot(contains(root.path)));
+      }
+      Process.runSync('chmod', ['755', leftover.path]);
+    });
+
+    test('a later share after the reset still works', () async {
+      expect(await share(), RecapShareOutcome.shared);
+      await files.resetLocalState();
+      expect(await share(), RecapShareOutcome.shared);
+      expect(File(platform.shareRequests.last.$1).existsSync(), isTrue);
+    });
+  });
+
+  // Other-issues row 75: a failed save or share writes one log line with the
+  // step and the error's type, never its message or a path.
+  group('failures are logged with the step and the error type only', () {
+    void expectOneLine(String step, String type, List<String> secrets) {
+      expect(logs, hasLength(1), reason: '$logs');
+      final line = logs.single;
+      expect(line, contains(step));
+      expect(line, contains(type));
+      for (final secret in [root.path, ...secrets]) {
+        expect(line, isNot(contains(secret)));
+      }
+    }
+
+    test('the save panel', () async {
+      platform.panelError = StateError('panel broke at /secret/place');
+      expect(await save(), RecapSaveOutcome.failed);
+      expectOneLine('recap save: the save panel failed', 'StateError',
+          ['panel broke', '/secret/place']);
+    });
+
+    test('placing the file', () async {
+      final target = p.join(dest.path, 'missing-folder', name);
+      platform.nextSaveLocation = () => target;
+      expect(await save(), RecapSaveOutcome.failed);
+      expectOneLine('recap save: placing the file failed', 'Exception',
+          ['missing-folder', name]);
+    });
+
+    test('the temporary file cannot be written', () async {
+      expect(
+        await files.save(png,
+            suggestedName: p.join('no-such-folder', name),
+            type: RecapExportType.png),
+        RecapSaveOutcome.failed,
+      );
+      expect(platform.saveRequests, isEmpty);
+      expectOneLine('recap save: writing the temporary file failed',
+          'Exception', ['no-such-folder', name]);
+    });
+
+    test('the export folder cannot be prepared',
+        skip: skipUnlessChmodDenies, () async {
+      Process.runSync('chmod', ['555', tempRoot.path]);
+      expect(await save(), RecapSaveOutcome.failed);
+      expectOneLine('recap save: preparing the export failed', 'Exception',
+          [RecapExportFiles.folderName]);
+    });
+
+    test('the share sheet', () async {
+      platform.shareError = StateError('sheet broke at /secret/place');
+      expect(
+        await files.share(png, suggestedName: name, type: RecapExportType.png),
+        RecapShareOutcome.failed,
+      );
+      expectOneLine('recap share failed', 'StateError',
+          ['sheet broke', '/secret/place']);
     });
   });
 }

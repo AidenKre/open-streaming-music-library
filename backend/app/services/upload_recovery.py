@@ -10,10 +10,11 @@ from pathlib import Path
 from app.core.operator_log import operator_logger
 from app.database.database import ANY_OWNER
 from app.services import audio_identity, metadata, organizer, upload_placement
+from app.services.ffmpeg_runner import ToolOptions
 from app.services.identity_reasons import is_content_failure, is_stored_data_failure
 from app.services.media_input import item_demuxer
 from app.services.path_sanitize import assert_within
-from app.services.upload_receipt import ReceiptFiles, owner_dir, remove_verified
+from app.services.upload_receipt import ReceiptFiles, owner_dir, remove_then_release, remove_verified
 
 log = logging.getLogger(__name__)
 
@@ -136,14 +137,13 @@ def _release_source(database, row: dict, stage: Path, files, clock) -> bool:
     if recorded is None or recorded != row["source_path"] or item is None \
             or item["state"] != "imported":
         return True  # not ours any more
-    source = Path(recorded)
-    assert_within(source, stage)
-    if not remove_verified(files, source):
-        return False
-    database.release_cancelled_upload_source(
-        row["item_uuid"], owner_id=owner, source_path=recorded, now=int(clock()),
-        from_states=("imported",))
-    return True
+    released = remove_then_release(
+        files, Path(recorded),
+        lambda: database.release_removed_upload_source(
+            row["item_uuid"], owner_id=owner, source_path=recorded, now=int(clock()),
+            from_states=("imported",)),
+        within=stage, remove=remove_verified)
+    return released is not None  # None: the file is still there
 
 
 def _remove_placed_final(database, row: dict, root: Path, files) -> bool:
@@ -215,8 +215,7 @@ def _digest_verdict(compute_exact, path, codec, expected, demuxer) -> tuple[bool
     compare with the stored exact hash: ``(verdict, reason)`` as in ``_valid``.
     ``unsupported`` (answered from the codec hint alone) and a content failure
     are False; any other failure is unknown (None) with its reason."""
-    forced = {} if demuxer is None else {"input_format": demuxer}
-    computed = compute_exact(path, codec, low_priority=True, **forced)
+    computed = compute_exact(path, codec, options=ToolOptions(low_priority=True, input_format=demuxer))
     if isinstance(computed, audio_identity.ExactUnavailable):
         if computed.state == "unsupported" or is_content_failure(computed.reason):
             return False, None

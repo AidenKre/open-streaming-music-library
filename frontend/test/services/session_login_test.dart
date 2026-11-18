@@ -12,6 +12,7 @@
 //     - different instance: the different-server sheet, same rules.
 //  4. an interrupted switch is finished by resetPending at the next launch:
 //     server-address screen, then Log in.
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -97,6 +98,32 @@ class _FailingFence extends ServerBindingRepository {
   _FailingFence(super.db);
   @override
   Future<void> fence() async => throw StateError('disk I/O error');
+}
+
+/// The binding-row read fails (an I/O error, a locked database), but only
+/// once the server has answered the sign-in: the session is issued.
+class _FailingReadAfterAuth extends ServerBindingRepository {
+  _FailingReadAfterAuth(super.db);
+  @override
+  Future<ServerBindingRecord?> current() async {
+    if (_events.any((e) => e.startsWith('POST /auth/'))) {
+      throw StateError('database is locked');
+    }
+    return super.current();
+  }
+}
+
+/// The binding-row read meets a database of another schema version, once
+/// the server has answered the sign-in.
+class _RefusedAfterAuth extends ServerBindingRepository {
+  _RefusedAfterAuth(super.db);
+  @override
+  Future<ServerBindingRecord?> current() async {
+    if (_events.any((e) => e.startsWith('POST /auth/'))) {
+      throw DatabaseVersionRefused(8, 1);
+    }
+    return super.current();
+  }
 }
 
 class _FailingDbWipe extends AppDatabase {
@@ -506,6 +533,73 @@ void main() {
           hasLength(1));
     });
 
+    // A confirmed sign-in is no longer held: the scope rebuild that follows
+    // every finished reset must not revoke the session it just saved.
+    test('a scope rebuilt after a confirmed switch does not revoke the saved '
+        'sign-in', () async {
+      await seedAlice();
+      final c = scope();
+      final service = c.read(sessionServiceProvider);
+      await service.login('bob', 'pw-bob-123');
+      expect(await service.confirmPendingSignIn(), isNull);
+      c.dispose();
+      await pumpEventQueue();
+      expect(_events.where((e) => e == 'POST /auth/logout [Bearer tok-bob]'),
+          isEmpty);
+      expect(await store.read(),
+          isA<Credentials>().having((x) => x.username, 'username', 'bob'));
+    });
+
+    // The service itself does not stop two sign-ins at once (the controller
+    // does): the second one to be held revokes the first, never drops it.
+    test('a second held sign-in revokes the first, never drops it', () async {
+      await seedAlice();
+      final answers = [Completer<void>(), Completer<void>()];
+      var n = 0;
+      final t = MockClient((req) async {
+        final auth = req.headers['Authorization'];
+        _events.add('${req.method} ${req.url.path}'
+            '${auth == null ? '' : ' [$auth]'}');
+        if (req.url.path == '/auth/login') {
+          final i = n++;
+          await answers[i].future;
+          return http.Response(
+            jsonEncode({
+              'token': 'tok-$i',
+              'media_token': 'med-$i',
+              'server_instance_id': 'inst-1',
+              'user': {
+                'id': 8,
+                'username': 'bob',
+                'is_admin': false,
+                'is_master_admin': false,
+              },
+            }),
+            200,
+          );
+        }
+        if (req.url.path == '/auth/logout') return http.Response('', 204);
+        return http.Response('{"message":"Healthy"}', 200);
+      });
+      final c = scope(unauthenticated: (url) => testApiClient(url, t));
+      final service = c.read(sessionServiceProvider);
+      final first = service.login('bob', 'pw-bob-123');
+      final second = service.login('bob', 'pw-bob-123');
+      await pumpEventQueue();
+      expect(n, 2, reason: 'both logins are waiting for their answer');
+      answers[0].complete();
+      expect(await first, isA<SignInNeedsUserSwitch>());
+      answers[1].complete();
+      expect(await second, isA<SignInNeedsUserSwitch>());
+      await service.cancelPendingSignIn();
+      expect(
+          _events.where((e) => e.startsWith('POST /auth/logout')),
+          unorderedEquals([
+            'POST /auth/logout [Bearer tok-0]',
+            'POST /auth/logout [Bearer tok-1]',
+          ]));
+    });
+
     test('a connect while a sign-in is held revokes it once', () async {
       await seedAlice();
       final c = scope();
@@ -621,6 +715,48 @@ void main() {
       expect(rebuilds, 0);
       expect(_events, contains('POST /auth/logout [Bearer tok-alice]'));
     });
+
+    // Pre-merge review A5-03: an exception after authentication (the
+    // binding-row read) ends the attempt: the issued session is revoked, the
+    // sign-in fails with a sentence, nothing is stored or bound.
+    for (final register in [false, true]) {
+      test('a binding read that throws after ${register ? 'register' : 'login'}'
+          ' revokes the issued session and fails the sign-in', () async {
+        final c = scope(repository: _FailingReadAfterAuth(db));
+        final service = c.read(sessionServiceProvider);
+        final outcome = register
+            ? await service.register('alice', 'pw-alice-1')
+            : await service.login('alice', 'pw-alice-1');
+        expect(outcome, isA<SignInFailed>());
+        expect(
+            _events.where((e) => e == 'POST /auth/logout [Bearer tok-alice]'),
+            hasLength(1));
+        expect(await store.read(), isNull);
+        expect(await repo().current(), isNull);
+        expect(rebuilds, 0);
+      });
+
+      // Pre-merge review D3-01 (owner, 2026-11-18): a database of another
+      // schema version, met at the binding-row read, is the refusal the
+      // controller shows its own screen for: the issued session is revoked
+      // first, then the refusal reaches the caller (not a sign-in sentence).
+      test('a database of another version found after '
+          '${register ? 'register' : 'login'}: the issued session is revoked '
+          'and the refusal reaches the caller', () async {
+        final c = scope(repository: _RefusedAfterAuth(db));
+        final service = c.read(sessionServiceProvider);
+        final attempt = register
+            ? service.register('alice', 'pw-alice-1')
+            : service.login('alice', 'pw-alice-1');
+        await expectLater(
+            attempt, throwsA(isA<DatabaseVersionRefused>()));
+        expect(
+            _events.where((e) => e == 'POST /auth/logout [Bearer tok-alice]'),
+            hasLength(1));
+        expect(await store.read(), isNull);
+        expect(rebuilds, 0);
+      });
+    }
 
     test('a second login while a switch is held revokes the first one',
         () async {

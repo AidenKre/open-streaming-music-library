@@ -18,7 +18,9 @@ from app.services.cover_art_manager import CoverArtAddResult
 from app.services.storage_ledger import StagedQuota, StorageLedger
 from app.services.upload_commit import UploadCommitWorker
 from app.services.upload_validation import staged_identity_columns
-from app.services.audio_identity import AudioIdentity
+from app.services.audio_identity import AudioIdentity, compute_exact
+from app.services.metadata import write_metadata_tags
+from tests.tool_call_capture import option_fields, tool_call
 from tests.identity_worker_fixtures import sql
 from tests.upload_validation_fixtures import BOOT, FakeProbe, FakeRegistry, detected, exact_for, stage_item  # noqa: F401  (re-exported)
 
@@ -55,7 +57,8 @@ class FakeExact:
         self.result: Any = None
 
     def __call__(self, path, codec_hint, **kwargs):
-        self.calls.append({"path": Path(path), "codec_hint": codec_hint, **kwargs})
+        options = tool_call(compute_exact, path, codec_hint, **kwargs)["options"]
+        self.calls.append({"path": Path(path), "codec_hint": codec_hint, **option_fields(options)})
         if isinstance(self.result, BaseException):
             raise self.result
         if self.result is not None:
@@ -71,8 +74,10 @@ class FakeTagWriter:
         self.extra = extra
         self.raises: Optional[BaseException] = None
 
-    def __call__(self, source, dest, tags, registry=None, job_id=None, **kwargs):
-        self.calls.append({"source": Path(source), "dest": Path(dest), "tags": dict(tags)})
+    def __call__(self, source, dest, tags, **kwargs):
+        options = tool_call(write_metadata_tags, source, dest, tags, **kwargs)["options"]
+        self.calls.append({"source": Path(source), "dest": Path(dest), "tags": dict(tags),
+                           **option_fields(options)})
         if self.raises is not None:
             raise self.raises
         Path(dest).write_bytes(Path(source).read_bytes() + self.extra)

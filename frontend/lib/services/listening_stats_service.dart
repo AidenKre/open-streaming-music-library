@@ -37,7 +37,11 @@ class ListeningStatsService {
       (token) => Future.wait<Object>([
         _stats.load(range, token.boundaryLocalId, token.capturedNowUtcMs),
         _stats.hasListens(token.boundaryLocalId),
-        _stats.pendingListens(token.boundaryLocalId),
+        _stats.pendingListens(
+          range,
+          token.boundaryLocalId,
+          token.capturedNowUtcMs,
+        ),
       ], eagerError: true),
     );
     return StatsSnapshot(

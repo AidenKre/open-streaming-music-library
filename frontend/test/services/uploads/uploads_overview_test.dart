@@ -9,6 +9,8 @@ import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 
+import '../../helpers/upload_intent_record.dart';
+
 const _mb = 1024 * 1024;
 
 UploadIntentRecord _intent(
@@ -20,25 +22,16 @@ UploadIntentRecord _intent(
   String name = 'song.flac',
   String batch = 'b-1',
   String? sha256,
-}) => UploadIntentRecord(
-  itemUuid: uuid,
+}) => intentRecord(
+  uuid,
   batchUuid: batch,
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: name,
-  lastState: state,
+  state: state,
   lastErrorCode: code,
   lastErrorMessage: message,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
   localBindingId: 'bind-1',
-  createdAtMs: 0,
-  updatedAtMs: 0,
   expectedLength: length,
   expectedSha256: sha256,
-  descriptor: null,
 );
 
 UploadRow _row(
@@ -58,7 +51,8 @@ const _allStates = [
   'allocating', 'allocated', 'transferring', 'receiving', 'validating',
   'review_ready', 'committing', 'imported', 'duplicate', 'expanded',
   'failed', 'duplicate_conflict', 'expired', 'cancelled', 'cancelling',
-  'source_changed', 'needs_reselect', 'rejected', 'teleporting',
+  'source_changed', 'needs_reselect', 'rejected', 'on_other_device',
+  'review_submitted', 'teleporting',
 ];
 
 void main() {
@@ -133,7 +127,7 @@ void main() {
       const cancellable = {
         'allocating', 'allocated', 'transferring', 'receiving',
         'validating', 'review_ready', 'failed', 'duplicate_conflict',
-        'source_changed', 'needs_reselect', 'rejected',
+        'source_changed', 'needs_reselect', 'rejected', 'on_other_device',
       };
       for (final s in _allStates) {
         expect(_row(s).canCancel, cancellable.contains(s), reason: s);
@@ -165,7 +159,7 @@ void main() {
     test('needs attention: failed, refused, or waiting for the user', () {
       const attention = {
         'failed', 'rejected', 'needs_reselect', 'source_changed',
-        'duplicate_conflict',
+        'duplicate_conflict', 'on_other_device',
       };
       for (final s in _allStates) {
         expect(_row(s).needsAttention, attention.contains(s), reason: s);
@@ -431,11 +425,12 @@ void main() {
       final c = overview.counts;
       expect(c.total, _allStates.length);
       // allocating allocated transferring receiving validating committing
-      // cancelling
-      expect(c.inProgress, 7);
+      // cancelling review_submitted
+      expect(c.inProgress, 8);
       expect(c.readyForReview, 1);
       // failed duplicate_conflict source_changed needs_reselect rejected
-      expect(c.needsAttention, 5);
+      // on_other_device
+      expect(c.needsAttention, 6);
       // imported duplicate expanded
       expect(c.done, 3);
       expect(c.cancelled, 1);

@@ -6,7 +6,6 @@ user: {id, username, is_admin, is_master_admin}}``. The body is read through
 the SC-22 envelope and never echo the password.
 """
 
-import hashlib
 import sqlite3
 
 import anyio
@@ -14,26 +13,14 @@ import pytest
 from argon2 import PasswordHasher
 
 from app.auth.sessions import lookup_session
+from tests.auth_helpers import sha256_hex
+from tests.sqlite_helpers import sql_dicts
 
 PASSWORD = "a long enough password"
 
 
-def _sha256(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def _rows(client, statement, params=()):
-    path = client.app.state.database.context.database_path
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    try:
-        return [dict(r) for r in conn.execute(statement, params)]
-    finally:
-        conn.close()
-
-
 def _users(client):
-    return _rows(client, "SELECT * FROM users ORDER BY id")
+    return sql_dicts(client, "SELECT * FROM users ORDER BY id")
 
 
 def _register(client, username="Sam", password=PASSWORD, **kwargs):
@@ -80,14 +67,14 @@ def test_the_returned_tokens_are_a_live_session_stored_only_as_hashes(client):
     body = _register(client).json()
 
     # The fixture's own admin login (M.1b) is the only other session row.
-    sessions = _rows(
+    sessions = sql_dicts(
         client,
         "SELECT token_hash, media_hash, user_id, revoked_at FROM auth_sessions WHERE user_id != ?",
         (client.app.state.admin_user_id,),
     )
     assert sessions == [{
-        "token_hash": _sha256(body["token"]),
-        "media_hash": _sha256(body["media_token"]),
+        "token_hash": sha256_hex(body["token"]),
+        "media_hash": sha256_hex(body["media_token"]),
         "user_id": body["user"]["id"],
         "revoked_at": None,
     }]
@@ -174,7 +161,7 @@ def _assert_refused(client, response, status, code):
     assert isinstance(detail["message"], str) and detail["message"]
     assert len(_users(client)) == 1  # only the admin
     # Only the fixture's own admin login (M.1b) holds a session.
-    assert [row["user_id"] for row in _rows(client, "SELECT * FROM auth_sessions")] == [
+    assert [row["user_id"] for row in sql_dicts(client, "SELECT * FROM auth_sessions")] == [
         client.app.state.admin_user_id
     ]
 

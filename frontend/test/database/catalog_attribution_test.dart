@@ -40,14 +40,7 @@ import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/sync_service.dart';
 
 import '../helpers/server_binding.dart';
-
-class _Online extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
+import '../helpers/test_offline.dart';
 
 /// Server-side metadata of one track. Absent keys are sent as null.
 Map<String, Object?> _meta({
@@ -153,7 +146,6 @@ void main() {
     db: db,
     api: TracksApi(api: api),
     queueRepository: QueueRepository(db),
-    prefs: await SharedPreferences.getInstance(),
     bindingToken: token,
   );
 
@@ -175,7 +167,7 @@ void main() {
       databaseProvider.overrideWithValue(db),
       autoVerifiedGateOverride(),
       tracksApiProvider.overrideWithValue(TracksApi(api: api)),
-      offlineModeProvider.overrideWith(_Online.new),
+      offlineModeProvider.overrideWith(() => TestOffline(false)),
     ]);
     addTearDown(c.dispose);
     return c.read(editOutboxProvider);

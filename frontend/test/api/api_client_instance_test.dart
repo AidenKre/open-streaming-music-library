@@ -10,23 +10,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
-/// An inner transport that records whether anyone closed it.
-class _SpyInner extends http.BaseClient {
-  _SpyInner(this._handler);
-  final Future<http.StreamedResponse> Function(http.BaseRequest) _handler;
-  bool closed = false;
-  int sends = 0;
-
-  @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) {
-    sends++;
-    if (closed) throw StateError('inner client used after close');
-    return _handler(request);
-  }
-
-  @override
-  void close() => closed = true;
-}
+import '../helpers/spy_inner_client.dart';
 
 http.Client _down() =>
     MockClient((_) async => throw const SocketException('down'));
@@ -84,9 +68,7 @@ void main() {
 
   test('dispose leaves the shared inner client open for newer clients',
       () async {
-    final inner = _SpyInner(
-      (_) async => http.StreamedResponse(Stream.value('{}'.codeUnits), 200),
-    );
+    final inner = SpyInnerClient();
     final old = ApiClient('http://a', inner);
     final current = ApiClient('http://b', inner);
 
@@ -94,7 +76,7 @@ void main() {
 
     expect(inner.closed, isFalse);
     expect(await current.getJson(['tracks']), isEmpty);
-    expect(inner.sends, 1);
+    expect(inner.requests, hasLength(1));
   });
 
   test('an instance keeps its own base URL', () async {

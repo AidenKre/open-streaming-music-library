@@ -22,6 +22,7 @@ import 'package:frontend/services/recap_export_service.dart';
 
 import '../helpers/fake_clock.dart';
 import '../repositories/listening_stats_workbook.dart';
+import '../helpers/listening_stats_builder.dart';
 
 const _dir = 'test/fixtures/annual_recap';
 
@@ -159,22 +160,14 @@ void main() {
       () {
     final range = StatsRange.year(2025);
     final now = DateTime.utc(2026, 3, 15, 12).millisecondsSinceEpoch;
-    final stats = ListeningStats(
+    final stats = listeningStatsOf(
       range: range,
       window: range.resolve(now),
       boundaryLocalId: 7,
-      totals: const ListeningTotals(
-        listeningSeconds: 40,
-        qualifiedPlays: 1,
-        uniqueTracks: 1,
-        activeDays: 1,
-      ),
-      unavailable: const ListeningSubtotal(
-        listeningSeconds: 0,
-        qualifiedPlays: 0,
-      ),
-      futureTimestampCount: 0,
-      overlongListenCount: 0,
+      seconds: 40,
+      qualifiedPlays: 1,
+      uniqueTracks: 1,
+      activeDays: 1,
       buckets: [
         ListeningBucket(
           startUtcMs: DateTime.utc(2025).millisecondsSinceEpoch,
@@ -182,7 +175,6 @@ void main() {
           listeningSeconds: 40,
         ),
       ],
-      chartCapped: false,
       topTracks: const [
         RankedEntry(
           entity: TrackUI(

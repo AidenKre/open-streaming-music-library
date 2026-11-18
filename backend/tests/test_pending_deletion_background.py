@@ -17,13 +17,12 @@ import pytest
 from app.services.track_editor import finish_kept_journal_rows
 from app.services.track_locks import TrackLocks
 from tests.pending_deletion import clear_pending_deletion, mark_pending_deletion
-from tests.test_identity_editor import SpyWakeup, _identity
+from tests.identity_editor_fixtures import SpyWakeup, _identity, _world as _editor_world
 from tests.test_identity_journal_finisher import _edit_with_a_failing_mark
-from tests.test_identity_editor import _world as _editor_world
 from tests.test_identity_settle import WHOLE, _duration
 from tests.test_identity_settle import _world as _settle_world
 from app.services.settle_check import DEFER, make_settle_refresh
-from tests.test_track_editor import _lib
+from tests.track_editor_fixtures import _lib
 
 
 def _revision(db, uuid_id):

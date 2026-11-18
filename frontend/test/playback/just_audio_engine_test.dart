@@ -8,8 +8,6 @@ import 'package:frontend/api/token_permit.dart';
 import 'package:frontend/playback/just_audio_engine.dart';
 import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_engine.dart';
-import 'package:frontend/playback/playback_target_resolver.dart'
-    show PlaybackSourceKind;
 import 'package:frontend/repositories/queue_repository.dart';
 
 class MockAudioPlayer extends Mock implements ja.AudioPlayer {}

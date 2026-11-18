@@ -17,17 +17,8 @@ from app.database import DatabaseContext
 from app.database.database import Database
 from app.services.conversion import reconcile_conversion_jobs
 from app.services.storage_ledger import CONVERSION, InsufficientStorage, StorageLedger
-from tests.owned_database import OwnedTestDatabase
+from tests.recovery_steps import capture_steps, named
 from tests.schema_fixtures import INIT_SQL
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 def _ledger(db, tmp_path, boot_id, free=1000):
@@ -112,23 +103,11 @@ def test_a_conversion_killed_mid_run_converges_after_restart(db, tmp_path):
 # --- wired into startup -----------------------------------------------------------------
 
 
-def _capture_steps(main, monkeypatch):
-    captured = []
-    real_run = main.run_startup_recovery
-
-    def capture(steps):
-        captured.append(list(steps))
-        return real_run(steps)
-
-    monkeypatch.setattr(main, "run_startup_recovery", capture)
-    return captured
-
-
 def test_the_reservation_reconcile_is_a_non_fatal_step_after_the_identity_reconcile(
     configure_app, monkeypatch
 ):
     main = configure_app()
-    captured = _capture_steps(main, monkeypatch)
+    captured = capture_steps(main, monkeypatch)
 
     with TestClient(main.app):
         state = main.app.state
@@ -137,24 +116,14 @@ def test_the_reservation_reconcile_is_a_non_fatal_step_after_the_identity_reconc
         assert state.storage_ledger._floor == state.settings.storage_free_space_floor_bytes
 
     [steps] = captured
-    assert [(s.name, s.fatal) for s in steps] == [
-        ("edit journal", True),
-        ("conversion jobs", True),
-        ("audio identity", True),
-        # 7A.3c: the upload commit journal, before job reclaim (SC-16e).
-        ("upload commit journal", False),
-        # 8A.3d: the deletion journal, right after the upload one (SC-16e).
-        ("deletion journal", False),
-        # 7A.2b: receipts settle or release their rows before this reconcile runs.
-        ("upload receipts", False),
-        # 7A.2c: dead validation leases are re-queued (job reclaim, SC-16e).
-        ("upload validation", False),
-        # 8A.3d: deletion job reclaim, after the upload one.
-        ("deletion jobs", False),
-        ("storage reservations", False),
-        # 7A.3c: the upload janitor (SC-16e janitors), then 8A.3d's.
-        ("upload janitor", False),
-        ("deletion janitor", False),
+    names = named(steps)
+    # The full order: tests/test_startup_recovery_order.py. Here, the
+    # reservation step's place: non-fatal, after the identity reconcile and
+    # job reclaim, before the janitors.
+    at = names.index(("storage reservations", False))
+    assert names.index(("audio identity", True)) < at
+    assert names[at - 1 : at + 2] == [
+        ("deletion jobs", False), ("storage reservations", False), ("upload janitor", False),
     ]
 
 
@@ -171,7 +140,7 @@ def test_startup_releases_a_dead_boots_reservation_and_a_second_run_changes_noth
         disk_usage=lambda _p: SimpleNamespace(free=10**12),
     ).reserve(owner_id=owner, purpose=CONVERSION, nbytes=10**9, subject_ref="1")
     assert len(_rows(db_path)) == 1
-    captured = _capture_steps(main, monkeypatch)
+    captured = capture_steps(main, monkeypatch)
 
     with TestClient(main.app):
         assert _rows(db_path) == []

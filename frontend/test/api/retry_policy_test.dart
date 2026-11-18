@@ -24,12 +24,6 @@ void main() {
       expect(p.perAttemptTimeout, const Duration(seconds: 10));
     });
 
-    test('RetryPolicy.coverArt is single-attempt AND opts out of offline hook', () {
-      const p = RetryPolicy.coverArt;
-      expect(p.maxAttempts, 1);
-      expect(p.triggerOfflineHook, isFalse);
-    });
-
     test('assertion: maxAttempts must be >= 1', () {
       expect(() => RetryPolicy(maxAttempts: 0), throwsA(isA<AssertionError>()));
     });

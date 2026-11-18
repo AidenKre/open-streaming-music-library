@@ -13,6 +13,7 @@ import 'package:frontend/ui/home/home_page.dart';
 import '../../helpers/server_binding.dart';
 import '../../repositories/catalog_seed.dart';
 import '../browse_harness.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// The first recents query fails; every later one reads the database.
 class _FailFirstRecents extends RecentlyPlayedRepository {

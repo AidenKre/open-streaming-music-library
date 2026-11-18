@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -14,16 +16,7 @@ import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/ui/edit_controller.dart';
 import '../helpers/server_binding.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._v);
-  final bool _v;
-  @override
-  bool build() {
-    super.build();
-    return _v;
-  }
-}
+import '../helpers/test_offline.dart';
 
 const _track = TrackUI(
   uuidId: 'u1',
@@ -94,7 +87,7 @@ Future<AppDatabase> _pump(
         databaseProvider.overrideWithValue(db),
         appInfoProvider.overrideWith((ref) async => caps ?? defaultAppInfo()),
         // Offline so Save just enqueues (no flush / network) in these tests.
-        offlineModeProvider.overrideWith(() => _StubOffline(true)),
+        offlineModeProvider.overrideWith(() => TestOffline(true)),
       ],
       child: MaterialApp(home: GetInfoPage(track: track)),
     ),
@@ -366,9 +359,158 @@ void main() {
     ]);
     expect(find.text('Saved'), findsOneWidget);
   });
+
+  // D2 (owner, 2026-11-17): Save cannot run twice, a failure is told, and
+  // Cancel keeps a queued file write visible.
+  group('D2: saving', () {
+    /// Get Info over a page of its own, so a second close would show.
+    Future<void> pumpOverAPage(WidgetTester tester, EditControls edits) async {
+      tester.view.physicalSize = const Size(1200, 4000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            appInfoProvider.overrideWith((ref) async => defaultAppInfo()),
+            editControlsProvider.overrideWithValue(edits),
+          ],
+          child: const MaterialApp(home: Scaffold(body: Text('Home'))),
+        ),
+      );
+      final nav = tester.state<NavigatorState>(find.byType(Navigator));
+      unawaited(nav.push(MaterialPageRoute<void>(
+        builder: (_) => const Scaffold(body: Text('Page below')),
+      )));
+      await tester.pumpAndSettle();
+      unawaited(nav.push(MaterialPageRoute<void>(
+        builder: (_) => const GetInfoPage(track: _track),
+      )));
+      await tester.pumpAndSettle();
+    }
+
+    int submits(_FakeEdits edits) =>
+        edits.calls.where((c) => c.startsWith('submit')).length;
+
+    testWidgets(
+        'while saving, Save gives way to a progress indicator; a double tap '
+        'saves once and closes the page once', (tester) async {
+      final gate = Completer<void>();
+      final edits = _FakeEdits(submitGate: gate);
+      await pumpOverAPage(tester, edits);
+      await _enterEditMode(tester);
+      await tester.enterText(find.byKey(const ValueKey('field_title')), 'New');
+
+      await tester.tap(find.widgetWithText(TextButton, 'Save'));
+      await tester.pump();
+      final again = find.widgetWithText(TextButton, 'Save');
+      if (again.evaluate().isNotEmpty) await tester.tap(again);
+      await tester.pump();
+
+      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+      expect(find.widgetWithText(TextButton, 'Save'), findsNothing);
+
+      gate.complete();
+      await tester.pumpAndSettle();
+      expect(submits(edits), 1);
+      expect(find.text('Saved'), findsOneWidget);
+      expect(find.byType(GetInfoPage), findsNothing);
+      expect(find.text('Page below'), findsOneWidget,
+          reason: 'the page underneath is not closed');
+    });
+
+    testWidgets(
+        'a failed save says so; the page stays open and Save works again',
+        (tester) async {
+      final edits = _FakeEdits(failSubmit: true);
+      await pumpOverAPage(tester, edits);
+      await _enterEditMode(tester);
+      await tester.enterText(find.byKey(const ValueKey('field_title')), 'New');
+
+      await tester.tap(find.widgetWithText(TextButton, 'Save'));
+      await tester.pumpAndSettle();
+      expect(find.text("Couldn't save the changes."), findsOneWidget);
+      expect(find.text('Saved'), findsNothing);
+      expect(find.byType(GetInfoPage), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+
+      edits.failSubmit = false;
+      await tester.tap(find.widgetWithText(TextButton, 'Save'));
+      await tester.pumpAndSettle();
+      expect(submits(edits), 2);
+      expect(find.byType(GetInfoPage), findsNothing);
+      expect(find.text('Page below'), findsOneWidget);
+    });
+
+    // Coordinator round 2 (R2): Cancel during a save emptied the edit the
+    // save then submitted, and "Saved" showed with nothing saved.
+    testWidgets(
+        'Cancel is off while a save runs; the save submits what was typed',
+        (tester) async {
+      final plan = Completer<void>();
+      final edits = _FakeEdits(planGate: plan);
+      await pumpOverAPage(tester, edits);
+      await _enterEditMode(tester);
+      await tester.enterText(find.byKey(const ValueKey('field_title')), 'New');
+
+      await tester.tap(find.widgetWithText(TextButton, 'Save'));
+      await tester.pump();
+      final cancel = tester.widget<TextButton>(
+          find.widgetWithText(TextButton, 'Cancel'));
+      expect(cancel.onPressed, isNull, reason: 'Cancel waits for the save');
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pump();
+
+      plan.complete();
+      await tester.pumpAndSettle();
+      expect(edits.submitted, hasLength(1));
+      expect(edits.submitted.single.values, {'title': 'New'});
+      expect(find.text('Saved'), findsOneWidget);
+    });
+
+    testWidgets(
+        'Cancel keeps "Update master file on server" on while a file write '
+        'is queued', (tester) async {
+      await _pump(
+        tester,
+        seed: (db) => db.customStatement(
+          "INSERT INTO pending_edits (uuid_id, values_json, write_mode, "
+          "base_revision, status, server_revision, original_values_json, "
+          "updated_at) VALUES ('u1', '{\"title\":\"Queued\"}', "
+          "'db_and_master', 5, 'pending', NULL, '{\"title\":\"Old Title\"}', 0)",
+        ),
+      );
+      bool switchOn() => tester
+          .widget<SwitchListTile>(find.widgetWithText(
+              SwitchListTile, 'Update master file on server'))
+          .value;
+
+      await _enterEditMode(tester);
+      expect(switchOn(), isTrue);
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pumpAndSettle();
+      await _enterEditMode(tester);
+      expect(switchOn(), isTrue,
+          reason: 'the queued file write is still queued after Cancel');
+    });
+  });
 }
 
 class _FakeEdits implements EditControls {
+  _FakeEdits({this.submitGate, this.planGate, this.failSubmit = false});
+
+  /// When set, planSave waits for it (the outbox read in progress).
+  final Completer<void>? planGate;
+
+  /// The edit each submit received.
+  final submitted = <MetadataEdit>[];
+
+  /// When set, submit waits for it (a save in progress).
+  final Completer<void>? submitGate;
+
+  /// When true, submit throws (a reset, no server binding, a database error).
+  bool failSubmit;
+
   final calls = <String>[];
   @override
   Future<bool> hasPendingMasterWrite(String uuidId) async {
@@ -386,6 +528,8 @@ class _FakeEdits implements EditControls {
     EditWriteMode mode,
   ) async {
     calls.add('plan ${track.uuidId} ${mode.wire}');
+    final gate = planGate;
+    if (gate != null) await gate.future;
     return EditSavePlan.ready;
   }
 
@@ -396,6 +540,10 @@ class _FakeEdits implements EditControls {
     EditWriteMode mode,
   ) async {
     calls.add('submit ${track.uuidId} ${mode.wire}');
+    submitted.add(edit);
+    final gate = submitGate;
+    if (gate != null) await gate.future;
+    if (failSubmit) throw StateError('save failed');
     return EditSubmitted.online;
   }
 

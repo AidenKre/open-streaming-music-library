@@ -19,6 +19,7 @@ import 'package:frontend/repositories/suggestion_pools_repository.dart';
 
 import '../helpers/fake_clock.dart';
 import 'catalog_seed.dart';
+import 'suggestion_fixture.dart';
 
 /// Returns [pools] and records what it was asked for.
 class _RecordingPools implements SuggestionPoolsRepository {
@@ -301,5 +302,45 @@ void main() {
       );
       expect(seen.last, SnapshotStaleness.historyChanged);
     });
+  });
+
+  // U28-A-09: the fixture's cases (expected values written by
+  // make_suggestions.py, never computed here) through the real pools, the
+  // real snapshot capture and the service's hydration, as Home reads them.
+  group('the suggestion fixture through the real pools and service', () {
+    final fixture = SuggestionFixture.load();
+    for (final c in fixture.cases) {
+      test(c.name, () async {
+        final db = AppDatabase(NativeDatabase.memory());
+        addTearDown(db.close);
+        await fixture.seed(db);
+        // History as of the fixture's boundary (it lists one later event to
+        // test the pools' boundary; a capture's boundary is the newest row).
+        await db.customStatement(
+            'DELETE FROM history_events WHERE local_id > ?',
+            [fixture.boundary]);
+        final service = HomeSuggestionsService(
+          snapshots: HistorySnapshotService(db,
+              clock: FakeClock(startUtcMs: fixture.capturedNowMs)),
+          freshness: SnapshotFreshness(db),
+          pools: SuggestionPoolsRepository(db),
+          browse: BrowseRepository(db),
+        );
+        final snapshot = await service.capture();
+        expect(snapshot.token.boundaryLocalId, fixture.boundary);
+        final view = await service.resolve(
+          snapshot,
+          currentUuid: c.currentUuid,
+          filter: BrowseFilters(
+            downloaded: c.downloaded,
+            policy: OfflineFilterPolicy.manual,
+          ),
+        );
+        expect(view.rediscover.tracks.map((t) => t.uuidId), c.rediscover);
+        expect(view.moreFromArtists.tracks.map((t) => t.uuidId),
+            c.moreFromArtists);
+        expect(view.complete, isTrue);
+      });
+    }
   });
 }

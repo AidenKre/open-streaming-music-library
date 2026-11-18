@@ -14,15 +14,17 @@ from pathlib import Path
 import pytest
 
 import app.services.conversion as conv_mod
-import tests.test_conversion as conv
-from tests.test_identity_writers import _sql
-from tests.test_identity_conversion import (  # noqa: F401  (fixtures is a fixture)
+import tests.conversion_fixtures as conv
+from app.services.conversion import TRACK_CHANGED_ERROR
+from app.services.audio_identity import compute_identity
+from tests.sqlite_helpers import sql_dicts
+from tests.tool_call_capture import tool_call
+from tests.identity_conversion_fixtures import _lossless_world, fixtures  # noqa: F401  (fixture)
+from tests.identity_rows import _identity
+from tests.test_identity_conversion import (
     MISMATCH,
-    _identity,
-    _lossless_world,
     _mismatched,
     _pcm_digest,
-    fixtures,
 )
 
 STALE = "f" * 64
@@ -95,7 +97,7 @@ def test_a_track_change_during_the_re_hash_is_a_track_change_not_absorbed(tmp_pa
         def __call__(self, path, codec_hint, **kwargs):
             identity = real(path, codec_hint, **kwargs)
             if ".tagged." not in Path(path).name:
-                _sql(db, "UPDATE track_audio_identity SET generation = generation + 1 "
+                sql_dicts(db, "UPDATE track_audio_identity SET generation = generation + 1 "
                          "WHERE uuid_id = ?", (track.uuid_id,))
             return identity
 
@@ -105,7 +107,7 @@ def test_a_track_change_during_the_re_hash_is_a_track_change_not_absorbed(tmp_pa
     conv._run_submitted(coordinator)
 
     job = db.get_conversion_job(job_id)
-    assert (job["status"], job["error_text"]) == ("failed", conv.TRACK_CHANGED_ERROR)
+    assert (job["status"], job["error_text"]) == ("failed", TRACK_CHANGED_ERROR)
     conv._assert_track_untouched(db, track, source, original)
     assert db.list_journal_entries() == []
 
@@ -125,7 +127,7 @@ def _failing_source_rehash(spy, reason):
             return real(path, codec_hint, **kwargs)
         # The real source hash used to be computed here and thrown away; the
         # call is still recorded on the spy, nothing hashes the file.
-        spy.calls.append((Path(path).name, codec_hint, kwargs))
+        spy.calls.append((Path(path).name, codec_hint, tool_call(compute_identity, path, codec_hint, **kwargs)))
         return AudioIdentity(exact=ExactUnavailable("failed", reason),
                              tool_versions=None, computed_at=1)
 
@@ -179,7 +181,7 @@ def test_a_killed_re_hash_stops_the_job_and_keeps_the_original(tmp_path, fixture
 
 
 def _stale_parameters(db, uuid_id):
-    _sql(db, "UPDATE track_audio_identity SET exact_digest = ?, sample_rate_hz = 8000 WHERE uuid_id = ?",
+    sql_dicts(db, "UPDATE track_audio_identity SET exact_digest = ?, sample_rate_hz = 8000 WHERE uuid_id = ?",
          (STALE, uuid_id))
 
 
@@ -243,7 +245,7 @@ def test_a_correct_stored_digest_with_wrong_stored_parameters_is_still_marked_st
     fixture = fixtures["flac24.flac"]
     db, orch, coordinator, track, source, before, spy, wakeup, job_id = _lossless_world(
         tmp_path, fixture, "alac", stored=_pcm_digest(fixture.path))
-    _sql(db, "UPDATE track_audio_identity SET sample_rate_hz = 8000 WHERE uuid_id = ?", (track.uuid_id,))
+    sql_dicts(db, "UPDATE track_audio_identity SET sample_rate_hz = 8000 WHERE uuid_id = ?", (track.uuid_id,))
 
     conv._run_submitted(coordinator)
 
@@ -279,3 +281,17 @@ def test_a_real_parameter_change_behind_a_stale_stored_digest_skips_the_check(tm
     assert (job["status"], job["error_text"]) == ("done", None)
     assert len(spy.computed_source()) == 1
     assert any("parameter change" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.requires_ffmpeg
+def test_the_fresh_re_hash_runs_under_the_jobs_registry_and_job_id(tmp_path, fixtures):
+    """BE-TOOLS review r1 #1: a cancel during the re-hash must reach its ffmpeg."""
+    db, orch, coordinator, track, source, before, spy, wakeup, job_id = _lossless_world(
+        tmp_path, fixtures["flac24.flac"], "alac", stored=STALE)
+
+    conv._run_submitted(coordinator)
+
+    assert db.get_conversion_job(job_id)["status"] == "done"
+    [(name, _, call)] = spy.computed_source()  # the stored digest disagreed: one fresh hash
+    assert name == "song.flac"
+    assert (call["registry"], call["job_id"], call["low_priority"]) == (orch._registry, job_id, False)

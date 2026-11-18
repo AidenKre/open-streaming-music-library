@@ -15,7 +15,8 @@ last); the identity mark; the row delete. Anything that raises keeps the row
 (K1/K2) with nothing deleted. A staged copy found under the row's recovered name
 while nothing is at the staged name is the copy an earlier run placed: it counts
 as present, so a rerun never reads recovery's own move as the operation's.
-Runtime recovery (``_reconcile_one(runtime=True)``) does not come here.
+Runtime recovery (``journal_recovery.reconcile_one``) does not come here.
+``reconcile_journal`` is the start-up pass over every row.
 """
 
 import logging
@@ -25,6 +26,8 @@ from typing import Callable, Optional
 
 from app.core.operator_log import operator_logger
 from app.database import ANY_OWNER
+from app.database.database import Database, TrackPathTaken
+from app.services import recovery_audio
 from app.services.organizer import (
     Organizer,
     OrganizerContext,
@@ -44,19 +47,21 @@ from app.services.recovery_audio import (
     AudioReading,
     leftover_verdict,
 )
-from app.services.track_editor import (
+from app.services.journal_recovery import (
     SWAP_LOST_TEXT,
     SWAP_UNPROVEN_TEXT,
     TRACK_CHANGED_TEXT,
-    _end_swap_job,
-    _is_current_master,
-    _is_regular_file,
-    _job_settled_lost,
-    _mark_identity_stale,
-    _replay_staged_copy,
-    _same_bitrate,
+    JournalOwnershipUnproven,
     conversion_job_id_of,
+    end_swap_job,
+    is_current_master,
+    is_regular_file,
+    job_settled_lost,
+    mark_identity_stale,
     reached_durable_point,
+    replay_staged_copy,
+    row_root,
+    same_bitrate,
 )
 
 # U06-B-06: the job of a same-file conversion whose swap this row settles ends
@@ -69,6 +74,41 @@ logger = logging.getLogger(__name__)
 
 class JournalRowKept(Exception):
     """Startup keeps the row (K1/K2); the message is a fixed, path-free reason."""
+
+
+def reconcile_journal(
+    database: Database, music_library_dir: Path, identity_signal=None,
+    *, read_audio=None, cover_art=None,
+) -> None:
+    """Idempotent startup pass that finishes or reverts every outstanding
+    ``edit_journal`` row, closing the move↔commit window. Safe to run on every
+    boot; a clean shutdown leaves no rows. A recovered master write marks the track's
+    audio identity stale and then wakes ``identity_signal`` (anything with notify()).
+    Every row is settled (``journal_settle``); ``read_audio`` reads a file
+    (default ``recovery_audio.read_audio``), ``cover_art`` (a CoverArtManager or
+    None) serves a leftover that becomes a track."""
+    entries = database.list_journal_entries(owner_id=ANY_OWNER)
+    # A row may itself be only in the page cache; flush once before any file moves.
+    if entries and not reached_durable_point(database):
+        operator_logger.warning(
+            "edit journal recovery goes ahead before a database flush (%d entries)",
+            len(entries),
+        )
+    for entry in entries:
+        try:
+            settle_journal_row(
+                database, entry,
+                row_root(database, entry, music_library_dir, check=assert_name_within),
+                identity_signal, read_audio or recovery_audio.read_audio, cover_art,
+            )
+        except Exception as e:  # never let one bad row block startup
+            reason = (
+                str(e) if isinstance(e, (JournalOwnershipUnproven, JournalRowKept))
+                else type(e).__name__
+            )
+            operator_logger.warning(
+                "journal entry %s for track %s kept: %s", entry["id"], entry["uuid_id"], reason
+            )
 
 
 def settle_journal_row(
@@ -84,6 +124,7 @@ def settle_journal_row(
         row.plan_in_place()
         if row.convert and conversion_job_id_of(entry) is not None:
             row.plan_swap_job()
+        row.refuse_redo_over_another_track()
     row.act(identity_signal, cover_art)
 
 
@@ -108,7 +149,7 @@ class _Row:
         self.final: Optional[str] = self.D  # the track's file once settled
         # Anything at the staged name (a dangling link too) means no move consumed it.
         self.t_lex = self.T is not None and os.path.lexists(self.T)
-        self.t_reg = _is_regular_file(self.T)
+        self.t_reg = is_regular_file(self.T)
         self.R = self._recovered_name()
         # The staged copy: at its staged name, or where an earlier run placed it.
         self.S: Optional[Path] = None
@@ -150,8 +191,8 @@ class _Row:
 
     def usable(self, path: Optional[Path], current: Optional[str]) -> bool:
         return (
-            path is not None and _is_regular_file(path) and not self.claimed(path)
-            and not _is_current_master(str(path), current)
+            path is not None and is_regular_file(path) and not self.claimed(path)
+            and not is_current_master(str(path), current)
         )
 
     def read(self, path: Path) -> AudioReading:
@@ -180,7 +221,7 @@ class _Row:
             self._plan_gone([O])
             return
         self.mark = True
-        old_ok = O is not None and (not os.path.lexists(O) or _is_regular_file(O))
+        old_ok = O is not None and (not os.path.lexists(O) or is_regular_file(O))
         if D == str(O) and old_ok:
             if self.S == self.T and self.S is not None:
                 self.redo_in_place = True
@@ -211,13 +252,20 @@ class _Row:
         if self.usable(O, self.final) and str(O) != self.final:
             self.compare.append(O)
 
+    def refuse_redo_over_another_track(self) -> None:
+        """Reads only. The staged copy of an in-place row (an edit's, or a
+        conversion's whose name carries no job) is never put over a path another
+        track names: the row and the copy stay."""
+        if self.redo_in_place and self.claimed(self.O):
+            raise JournalRowKept("another track's file is at the path")
+
     def plan_swap_job(self) -> None:
         """U06-B-06, reads only (plus the job text on a refusal): how the job of a
         same-file conversion whose own swap may have failed ends with this row."""
         O, D = self.O, self.D
         if O is not None and D == str(O) and self.claimed(O):
             # Another track's file is at the path: never written over; the row stays.
-            _end_swap_job(self.db, self.entry, SWAP_UNPROVEN_TEXT)
+            end_swap_job(self.db, self.entry, SWAP_UNPROVEN_TEXT)
             raise JournalRowKept("another track's file is at the path")
         if D is None:
             self.swap_outcome = TRACK_CHANGED_TEXT
@@ -236,13 +284,13 @@ class _Row:
         elif self.adopt_src is not None:
             self.swap_outcome = SWAP_DONE if self.adopt_src in (self.T, self.R) else SWAP_LOST_TEXT
         elif (
-            D == str(O) and self.S is None and not self.t_present and _is_regular_file(O)
+            D == str(O) and self.S is None and not self.t_present and is_regular_file(O)
         ):
             # The staged file is gone: prove the swap before the job may say done.
-            matches = None if _job_settled_lost(self.db, self.entry) else self._committed_columns(O)
+            matches = None if job_settled_lost(self.db, self.entry) else self._committed_columns(O)
             if matches is True:
                 self.swap_outcome = SWAP_DONE
-            elif matches is None and not _job_settled_lost(self.db, self.entry):
+            elif matches is None and not job_settled_lost(self.db, self.entry):
                 # ffprobe refuses the file for good: D9, the columns become unknown.
                 self.refresh_from_old = True
                 self.swap_outcome = SWAP_UNPROVEN_TEXT
@@ -269,7 +317,7 @@ class _Row:
             meta.codec == committed.codec
             and meta.sample_rate_hz == committed.sample_rate_hz
             and meta.channels == committed.channels
-            and _same_bitrate(meta.bitrate_kbps, committed.bitrate_kbps)
+            and same_bitrate(meta.bitrate_kbps, committed.bitrate_kbps)
         )
 
     def plan_relocating(self) -> None:
@@ -350,7 +398,7 @@ class _Row:
     def _regular_at_new(self, adopted_staged: bool) -> bool:
         """P-old needs a regular file at N (lstat; a symlink there proves nothing).
         A staged copy this recovery places at N is one (checked by lstat at T)."""
-        return (adopted_staged and self.final == str(self.N)) or _is_regular_file(self.N)
+        return (adopted_staged and self.final == str(self.N)) or is_regular_file(self.N)
 
     def _settle_new(self, N: Path, current: Optional[str], p_new_own: bool) -> None:
         """N, not the track's file: the operation's own output goes (P-new),
@@ -509,7 +557,7 @@ class _Row:
         # U06-B-06: a job that ends failed is settled before anything changes, so
         # a later failure leaves nothing a rerun could mistake for a done swap.
         if self.swap_outcome not in (None, SWAP_DONE):
-            _end_swap_job(self.db, self.entry, self.swap_outcome)
+            end_swap_job(self.db, self.entry, self.swap_outcome)
         # 2. Leftovers already in the library become tracks first, where they lie.
         for path, reading in self.in_library:
             self._register(organizer, path, reading)
@@ -519,7 +567,7 @@ class _Row:
         if self.redo_in_place:
             self._durable_point()
             self.O.parent.mkdir(parents=True, exist_ok=True)  # the folder may be gone too
-            _replay_staged_copy(self.T, self.O)
+            replay_staged_copy(self.T, self.O)
         if self.adopt_src is not None:
             if self.adopt_src == self.T:
                 self._move(self.T, self.adopt_dest)
@@ -547,7 +595,7 @@ class _Row:
                     self._unreadable_removed()
         for folder in self.prune:
             prune_empty_dirs(folder, self.root)
-        if self.delete_temp and _is_regular_file(self.T):
+        if self.delete_temp and is_regular_file(self.T):
             self.T.unlink(missing_ok=True)
             if self.temp_unreadable:
                 self._unreadable_removed()
@@ -556,14 +604,14 @@ class _Row:
 
         # 6-7. Identity mark, then the row.
         if self.mark:
-            _mark_identity_stale(self.db, self.entry, identity_signal)
+            mark_identity_stale(self.db, self.entry, identity_signal)
         elif self.adopt_src is not None and identity_signal is not None:
             identity_signal.notify()  # the refresh marked it stale ('settle')
         if self.swap_outcome == SWAP_DONE:
             # The bytes changed under the revision the conversion committed:
             # clients must see the change. Then the job is done.
             self.db.bump_track_revision(self.uuid, owner_id=self.owner)
-            _end_swap_job(self.db, self.entry, None)
+            end_swap_job(self.db, self.entry, None)
         self.db.delete_journal_entry(self.entry["id"], owner_id=self.owner)
 
     def _register(self, organizer: Organizer, path: Path, reading: AudioReading) -> None:
@@ -623,10 +671,14 @@ class _Row:
             meta = self.db.get_track_by_uuid(self.uuid, owner_id=self.owner).metadata
             columns = (meta.codec, meta.bitrate_kbps, meta.sample_rate_hz, meta.channels, None)
         codec, bitrate, rate, channels, duration = columns
-        self.db.refresh_track_audio_properties(
-            self.uuid, codec=codec, bitrate_kbps=bitrate, sample_rate_hz=rate,
-            channels=channels, duration=duration, file_path=file_path, owner_id=self.owner,
-        )
+        try:
+            self.db.refresh_track_audio_properties(
+                self.uuid, codec=codec, bitrate_kbps=bitrate, sample_rate_hz=rate,
+                channels=channels, duration=duration, file_path=file_path, owner_id=self.owner,
+            )
+        except TrackPathTaken as e:
+            # The database's own refusal of a path ``claimed`` found free.
+            raise JournalRowKept("another track's file is at the path") from e
         self._durable = False
 
     def _organizer(self, cover_art) -> Organizer:

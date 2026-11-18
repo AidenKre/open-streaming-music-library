@@ -10,7 +10,7 @@ from app.services.deletion_errors import (
     deletion_job_not_found,
     operation_conflict,
 )
-from app.services.deletion_worker import master_exists_in_root
+from app.services.master_paths import master_exists_in_root
 from app.models.deletions import (
     DeletionJobItemOut,
     DeletionJobOut,

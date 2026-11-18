@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/tracks_api.dart';
@@ -21,14 +22,6 @@ Map<String, dynamic> _trackJson(String uuid) => {
   'revision': 1,
   'metadata': _minimalMetadataJson(),
 };
-
-Response _tracksResponse(List<String> uuids, {String? nextCursor}) => Response(
-  jsonEncode({
-    'data': uuids.map(_trackJson).toList(),
-    'nextCursor': nextCursor,
-  }),
-  200,
-);
 
 Response _changesResponse(
   List<String> uuids, {
@@ -214,101 +207,144 @@ void main() {
     });
   });
 
-  group('TracksApi.getTracksPage (browse)', () {
-    late TracksApi api;
-
-    test('getTracksPage returns parsed response', () async {
-      api = _tracksApi(
-        'http://localhost:8000',
-        MockClient(
-          (req) async =>
-              _tracksResponse(['uuid-1', 'uuid-2'], nextCursor: 'c1'),
-        ),
-      );
-
-      final response = await api.getTracksPage();
-
-      expect(response.data.length, 2);
-      expect(response.data[0].uuidId, 'uuid-1');
-      expect(response.data[1].uuidId, 'uuid-2');
-      expect(response.nextCursor, 'c1');
-    });
-
-    test('sends cursor and limit as query params', () async {
-      Uri? captured;
-      api = _tracksApi(
+  // Other-issues row 68 (U16-FE-API-B-11): the request shape of the
+  // single-track read and the metadata edit, before the client's retry arms
+  // are folded into one check.
+  group('TracksApi.getTrack and patchTrack (request shape)', () {
+    test('getTrack is one GET of /tracks/<uuid> with Accept json, '
+        'parsed into the track', () async {
+      final requests = <Request>[];
+      final api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
-          captured = req.url;
-          return _tracksResponse([]);
+          requests.add(req);
+          return Response(jsonEncode(_trackJson('uuid-1')), 200);
         }),
       );
 
-      await api.getTracksPage(cursor: 'my-cursor', limit: 50);
+      final track = await api.getTrack('uuid-1');
 
-      expect(captured?.queryParameters['cursor'], 'my-cursor');
-      expect(captured?.queryParameters['limit'], '50');
+      expect(track.uuidId, 'uuid-1');
+      expect(track.revision, 1);
+      final req = requests.single;
+      expect(req.method, 'GET');
+      expect(req.url.path, '/tracks/uuid-1');
+      expect(req.url.query, isEmpty);
+      expect(req.headers['Accept'], 'application/json');
+      expect(req.body, isEmpty);
     });
 
-    test('sends only limit when no optional params provided', () async {
-      Uri? captured;
+    test('getTrack is a single attempt: a 503 and a transport error are not '
+        'retried', () async {
+      var calls = 0;
+      var api = _tracksApi(
+        'http://localhost:8000',
+        MockClient((req) async {
+          calls++;
+          return Response('busy', 503);
+        }),
+      );
+      await expectLater(
+        api.getTrack('uuid-1'),
+        throwsA(isA<ApiException>().having((e) => e.statusCode, 'status', 503)),
+      );
+      expect(calls, 1);
+
+      calls = 0;
       api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
-          captured = req.url;
-          return _tracksResponse([]);
+          calls++;
+          throw const SocketException('down');
         }),
       );
-
-      await api.getTracksPage();
-
-      expect(captured?.queryParameters['limit'], '500');
-      expect(captured?.queryParameters.containsKey('cursor'), false);
-      expect(captured?.queryParameters.containsKey('artist_id'), false);
-      expect(captured?.queryParameters.containsKey('album_id'), false);
+      await expectLater(api.getTrack('uuid-1'), throwsA(isA<NetworkException>()));
+      expect(calls, 1);
     });
 
-    test('sends artist_id and album_id as query params', () async {
-      Uri? captured;
-      api = _tracksApi(
+    test('getTrack surfaces a 404 as ApiException', () async {
+      final api = _tracksApi(
+        'http://localhost:8000',
+        MockClient((req) async => Response('{"detail":"gone"}', 404)),
+      );
+      await expectLater(
+        api.getTrack('uuid-1'),
+        throwsA(isA<ApiException>().having((e) => e.statusCode, 'status', 404)),
+      );
+    });
+
+    test('patchTrack is a PATCH of /tracks/<uuid> with the body as JSON and '
+        'returns the parsed answer', () async {
+      final requests = <Request>[];
+      final api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
-          captured = req.url;
-          return _tracksResponse([]);
+          requests.add(req);
+          return Response(
+            jsonEncode({
+              'uuid_id': 'uuid-1',
+              'revision': 8,
+              'master_written': false,
+            }),
+            200,
+          );
         }),
       );
+      final body = {
+        'title': 'New',
+        'base_revision': 7,
+        'write_mode': 'database_only',
+      };
 
-      await api.getTracksPage(artistId: 1, albumId: 2);
+      final answer = await api.patchTrack('uuid-1', body);
 
-      expect(captured?.queryParameters['artist_id'], '1');
-      expect(captured?.queryParameters['album_id'], '2');
+      expect(answer, {
+        'uuid_id': 'uuid-1',
+        'revision': 8,
+        'master_written': false,
+      });
+      final req = requests.single;
+      expect(req.method, 'PATCH');
+      expect(req.url.path, '/tracks/uuid-1');
+      expect(req.headers['Accept'], 'application/json');
+      expect(req.headers['Content-Type'], startsWith('application/json'));
+      expect(jsonDecode(req.body), body);
     });
 
-    test('sends artist_id without album_id as query param', () async {
-      Uri? captured;
-      api = _tracksApi(
+    test('patchTrack retries a transport error and a 503, sending the same '
+        'body each time', () async {
+      final bodies = <String>[];
+      final api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
-          captured = req.url;
-          return _tracksResponse([]);
+          bodies.add(req.body);
+          if (bodies.length == 1) throw const SocketException('reset');
+          if (bodies.length == 2) return Response('busy', 503);
+          return Response(jsonEncode({'uuid_id': 'uuid-1', 'revision': 2}), 200);
         }),
       );
 
-      await api.getTracksPage(artistId: 1);
+      final answer = await api.patchTrack('uuid-1', {'title': 'X'});
 
-      expect(captured?.queryParameters['artist_id'], '1');
-      expect(captured?.queryParameters.containsKey('album_id'), false);
+      expect(answer['revision'], 2);
+      expect(bodies, hasLength(3));
+      expect(bodies.toSet(), {jsonEncode({'title': 'X'})});
     });
 
-    test('returns null nextCursor when not present in response', () async {
-      api = _tracksApi(
+    test('patchTrack does not retry a 409 conflict', () async {
+      var calls = 0;
+      final api = _tracksApi(
         'http://localhost:8000',
-        MockClient((req) async => _tracksResponse(['uuid-1'])),
+        MockClient((req) async {
+          calls++;
+          return Response('{"detail":"conflict"}', 409);
+        }),
       );
-
-      final response = await api.getTracksPage();
-
-      expect(response.nextCursor, isNull);
+      await expectLater(
+        api.patchTrack('uuid-1', {'title': 'X'}),
+        throwsA(isA<ApiException>().having((e) => e.statusCode, 'status', 409)),
+      );
+      expect(calls, 1);
     });
   });
 }

@@ -12,6 +12,7 @@ import pytest
 from app.services import audio_identity
 from app.services.audio_identity import ExactUnavailable
 from app.services.fingerprinter import FingerprintFailure, RawFingerprint
+from tests.tool_call_capture import bound_to
 from tests.identity_worker_fakes import (
     T0,
     VARIED_ITEMS,
@@ -21,14 +22,9 @@ from tests.identity_worker_fakes import (
     bytes_digest,
     make_worker,
 )
-from tests.identity_worker_fixtures import add_track, identity, make_db
+from tests.identity_worker_fixtures import add_track, identity
 
 WAITS = (60, 3600, 86400)
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -111,7 +107,8 @@ def test_an_unchanged_missing_master_walks_the_whole_ladder(db, music):
 )
 def test_the_fingerprint_layer_waits_a_minute_an_hour_and_a_day_then_fails(db, music, result, reason, monkeypatch):
     # 6-5-L-03: the decoded duration is unknown too (the file is not real audio).
-    monkeypatch.setattr(audio_identity, "measure_decoded_duration", lambda *a, **k: None)
+    monkeypatch.setattr(audio_identity, "measure_decoded_duration",
+                        bound_to(audio_identity.measure_decoded_duration)(lambda *a, **k: None))
     path = _file(music)
     uuid_id = add_track(db, path, identity={
         "exact_state": "current", "exact_kind": "pcm_sha256", "exact_digest": bytes_digest(path),

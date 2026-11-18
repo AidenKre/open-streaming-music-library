@@ -113,6 +113,8 @@ void main() {
       await complete(0, boundary: 77);
       expect((c.state as StatsReady).pendingListens, 4);
       expect(repo.pendingBoundaries, [77]);
+      // C2-01: counted over the range on screen at the token's now.
+      expect(repo.pendingWindows, [(StatsRange.last7Days, 1800000000000)]);
     });
 
     test('ready without any history says so (the empty state)', () async {

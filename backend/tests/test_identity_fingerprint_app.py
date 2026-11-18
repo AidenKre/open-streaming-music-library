@@ -18,6 +18,7 @@ from app.services import fingerprinter as fingerprinter_mod
 from app.services import identity_worker as identity_worker_mod
 from app.services import pipeline as pipeline_mod
 from tests.identity_worker_fakes import FakeFingerprinter
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 
 WATCH = {"ENABLE_FILE_WATCHER": "true"}
 
@@ -27,7 +28,8 @@ def _add_track(db_path, owner_id, fp_state):
     conn = sqlite3.connect(db_path)
     try:
         track_id = conn.execute(
-            "INSERT INTO tracks (uuid_id, file_path, owner_id) VALUES (?, '/m/x.flac', ?)", (uuid_id, owner_id),
+            f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, owner_id) VALUES (?, {PATH_MARKS}, ?)",
+            (uuid_id, *path_values(f"/m/{uuid_id}.flac"), owner_id),
         ).lastrowid
         conn.execute("INSERT INTO trackmetadata (track_id, uuid_id, codec, has_album_art) VALUES (?, ?, 'flac', 0)",
                      (track_id, uuid_id))

@@ -43,7 +43,7 @@ def _timed(fn) -> float:
 
 def _build(db_path: Path, n: int, items: int, seed: int):
     """Insert n tracks (all identity layers current). Returns (uuids, planted {copy: source})."""
-    from app.database.database import Database, DatabaseContext
+    from app.database.database import Database, DatabaseContext, track_path_values
     from app.services.fingerprinter import pack_fingerprint
 
     Database(DatabaseContext(database_path=db_path, init_sql_path=BACKEND / "app/database/init.sql")).initialize()
@@ -65,8 +65,10 @@ def _build(db_path: Path, n: int, items: int, seed: int):
         step = 5000
         for lo in range(0, n, step):
             rows = range(lo, min(n, lo + step))
-            conn.executemany("INSERT INTO tracks (id, uuid_id, file_path, owner_id) VALUES (?, ?, ?, ?)",
-                             [(i + 1, uuids[i], f"/bench/{i}.flac", owner) for i in rows])
+            conn.executemany(
+                "INSERT INTO tracks (id, uuid_id, file_path, file_path_fold, file_folder_fold, owner_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                [(i + 1, uuids[i], *track_path_values(f"/bench/{i}.flac"), owner) for i in rows])
             conn.executemany("INSERT INTO trackmetadata (track_id, uuid_id, has_album_art) VALUES (?, ?, 0)",
                              [(i + 1, uuids[i]) for i in rows])
             conn.executemany(

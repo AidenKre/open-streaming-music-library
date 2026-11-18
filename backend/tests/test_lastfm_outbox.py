@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from app.services import history_hooks
+from app.services import history_hooks, lastfm_client
 from tests.lastfm_outbox_helpers import (
     add_catalog_track,
     history_uuids,
@@ -36,12 +36,12 @@ from tests.lastfm_routes import (
     BASE,
     admin_id,
     clean_env,
-    execute,
     open_rig,
     second_user,
     seed_connection,
     seed_token,
 )
+from tests.lastfm_sender_rig import execute
 from tests.pending_deletion import mark_pending_deletion
 
 
@@ -86,6 +86,23 @@ def test_a_qualifying_listen_is_queued_with_its_row_and_frozen_payload(open_app_
             "done_at": None,
         }]
         assert hook_failures(rig) == []
+
+
+def test_every_field_the_hook_writes_is_a_field_the_sender_sends(open_app_client, tmp_path):
+    """Other-issues row 84: the payload names the history hook writes (here with
+    every optional one present) are fields the sender's row check accepts, so a
+    renamed or added key cannot leave every queued row refused as invalid_row."""
+    with outbox_rig(open_app_client) as rig:
+        owner = admin_id(rig)
+        _opted_in(rig, owner)
+        track = add_catalog_track(rig, tmp_path / "m", owner, album_artist="Thom Yorke")
+
+        post(rig, [listen(track, rig.wall.ms - 300_000)])
+
+        [row] = outbox(rig)
+    assert set(row["payload"]) == {"artist", "track", "timestamp", "album", "albumArtist", "duration"}
+    assert set(row["payload"]) <= lastfm_client._ROW_FIELDS
+    lastfm_client.check_scrobble_row(row["payload"])  # raises RowRefused on any refused field
 
 
 def test_listened_at_is_the_listen_start_in_whole_unix_seconds(open_app_client, tmp_path):

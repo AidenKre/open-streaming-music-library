@@ -7,12 +7,16 @@
 // Real in-memory SQLite; the expected covers follow from the seed alone.
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/listening_stats.dart';
 import 'package:frontend/repositories/browse_repository.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/listening_stats_repository.dart';
 
+import '../helpers/test_offline.dart';
 import 'catalog_seed.dart';
 
 const _now = 1800000000000;
@@ -90,4 +94,24 @@ void main() {
       expect(current.artists[1]!.coverArtId, art);
     });
   }
+
+  // F903-O-11: the app's provider passes the offline flag itself, read at
+  // each load (no rebuild needed when the connection flips).
+  test('the provider reads the offline flag at each load', () async {
+    final offlineFlag = TestOffline(false);
+    final c = ProviderContainer(overrides: [
+      databaseProvider.overrideWithValue(db),
+      offlineModeProvider.overrideWith(() => offlineFlag),
+    ]);
+    addTearDown(c.dispose);
+    c.read(offlineModeProvider);
+    final r = c.read(listeningStatsRepositoryProvider);
+    var s = await r.load(StatsRange.allTime, 1 << 40, _now);
+    expect(s.topAlbums.single.entity.coverArtId, _remoteArt);
+    expect(s.topArtists.single.entity.coverArtId, _remoteArt);
+    offlineFlag.set(true);
+    s = await r.load(StatsRange.allTime, 1 << 40, _now);
+    expect(s.topAlbums.single.entity.coverArtId, _localArt);
+    expect(s.topArtists.single.entity.coverArtId, _localArt);
+  });
 }

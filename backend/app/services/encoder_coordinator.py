@@ -26,6 +26,7 @@ New encodes always land in the cache that matches the quality:
 """
 
 import enum
+import logging
 import os
 import queue as _queue
 import threading
@@ -57,6 +58,8 @@ from app.services.transcoder import (
     QUALITY_BITRATES_KBPS,
     transcode_to_aac_m4a,
 )
+
+logger = logging.getLogger(__name__)
 
 
 SourceLookup = Callable[[str], Optional[Path]]
@@ -117,9 +120,10 @@ class _PriorityPool:
     Priority 0 (PRIORITY_HIGH)       — prefetch / queue-warm: encode tasks for
                                         tracks the user is about to play
                                         (enqueue_prefetch).
-    Priority 1 (PRIORITY_LOW)        — background quality work: default-cache
-                                        migration and library-wide warming from
-                                        set_default_quality.
+    Priority 1 (PRIORITY_LOW)        — background quality work: removing the
+                                        default cache's files of other
+                                        qualities and library-wide warming
+                                        from set_default_quality.
     Priority 2 (PRIORITY_CONVERSION) — master-type conversion jobs (Phase 2).
                                         Lowest priority: a long-running convert
                                         must never starve streaming encodes.
@@ -153,8 +157,8 @@ class _PriorityPool:
                 return
             try:
                 task.fn(*task.args, **task.kwargs)
-            except Exception:
-                pass
+            except Exception as e:  # the type only: its text may name a file
+                logger.warning("encoder pool task failed: %s", type(e).__name__)
 
     def shutdown(self, wait: bool = True, *, cancel_pending: bool = False) -> None:
         """Stop the worker threads.
@@ -208,6 +212,19 @@ class EncoderCoordinator:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_pending=True)
+
+    def drain(self) -> None:
+        """Run every queued task, then stop the worker threads and wait for
+        them. For tests and tools; the server stops with ``shutdown``, which
+        drops the queued work."""
+        self._executor.shutdown(wait=True)
+
+    @property
+    def warm_generation(self) -> int:
+        """The warm generation: each default-quality change bumps it, and a
+        queued warm task of an older generation does nothing."""
+        with self._key_locks_guard:
+            return self._warm_generation
 
     def submit_conversion(self, fn: Callable, *args: Any, **kwargs: Any) -> None:
         """Schedule work at PRIORITY_CONVERSION on the shared pool. The one
@@ -553,8 +570,9 @@ class EncoderCoordinator:
             self.encode_for_stream(
                 uuid_id, quality, source_bitrate_kbps, owner_id=owner
             )
-        except Exception:
+        except Exception as e:
             # Background prefetches must never propagate.
+            logger.warning("prefetch failed: %s", type(e).__name__)
             return
 
     def _delete_default_cache_files(self, cache: EncodedCache) -> None:
@@ -580,8 +598,8 @@ class EncoderCoordinator:
                     entry.unlink()
                 except OSError:
                     continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("default cache clean-up failed: %s", type(e).__name__)
 
     def _submit_warm_tasks(self, quality: str, generation: int) -> None:
         """Submit one warm task per UUID to the pool (all workers run in parallel)."""

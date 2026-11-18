@@ -15,21 +15,10 @@ import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 
 import '../fake_library_actions.dart';
+import '../../helpers/test_offline.dart';
 
 const _artist = ArtistUI(id: 1, name: 'Test Artist');
 const _artistWithArt = ArtistUI(id: 1, name: 'Test Artist', coverArtId: 3);
-
-/// Forces [offlineModeProvider] to a fixed value without starting the real
-/// health-poll timer.
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
 
 Widget buildCard(
   ArtistUI artist, {
@@ -57,7 +46,7 @@ Widget buildCard(
       artistDownloadCountsProvider.overrideWith(
         (ref, artistId) => AsyncData(effectiveCounts),
       ),
-      offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+      offlineModeProvider.overrideWith(() => TestOffline(offline)),
       // The menu reads availability for its scope from the same counts.
       playbackAvailabilityProvider.overrideWith(
         (ref, scope) => PlaybackAvailability.of(

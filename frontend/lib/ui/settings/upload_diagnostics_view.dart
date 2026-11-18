@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/count_text.dart';
 import 'package:frontend/services/uploads/upload_diagnostics.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/settings/phase5_settings.dart';
@@ -15,18 +16,16 @@ const uploadDiagnosticsRow = DiagnosticsRow(
 Widget _summary(BuildContext context) => const _UploadsRow();
 Widget _detail(BuildContext context) => const _UploadsDetail();
 
-String _count(int n, String one, String many) => n == 1 ? one : '$n $many';
-
 String _summaryText(UploadDiagnostics d) {
   if (d.quarantined > 0) {
-    return _count(
+    return countText(
       d.quarantined,
       '1 upload needs your attention',
       'uploads need your attention',
     );
   }
   if (d.pending > 0) {
-    return _count(
+    return countText(
       d.pending,
       '1 upload waiting to send',
       'uploads waiting to send',

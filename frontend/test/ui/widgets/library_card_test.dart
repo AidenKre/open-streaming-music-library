@@ -10,22 +10,11 @@ import 'package:frontend/ui/widgets/library_action_menu.dart';
 import 'package:frontend/ui/widgets/library_card.dart';
 
 import '../fake_library_actions.dart';
-
-/// Forces [offlineModeProvider] to a fixed value without starting the real
-/// health-poll timer.
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../../helpers/test_offline.dart';
 
 Widget _harness({required Widget child, bool offline = false}) {
   return ProviderScope(
-    overrides: [offlineModeProvider.overrideWith(() => _StubOffline(offline))],
+    overrides: [offlineModeProvider.overrideWith(() => TestOffline(offline))],
     child: MaterialApp(
       home: Scaffold(body: SizedBox(width: 200, height: 280, child: child)),
     ),

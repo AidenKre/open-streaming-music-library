@@ -35,6 +35,7 @@ import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 import '../helpers/test_credentials.dart';
+import '../helpers/test_offline.dart';
 
 /// Stands in for the real flush + `/changes` pull. [bumpRevisionTo] writes a
 /// newer server revision during the "pull", the way a real sync would, so a
@@ -71,17 +72,6 @@ class _StubTrackSync extends TrackSyncNotifier {
       await db!.updateTrackRevision(bumpUuid!, bumpRevisionTo!);
     }
     return result;
-  }
-}
-
-class _Offline extends OfflineModeNotifier {
-  _Offline(this.value);
-  final bool value;
-
-  @override
-  bool build() {
-    super.build();
-    return value;
   }
 }
 
@@ -238,7 +228,7 @@ void main() {
         trackSyncProvider.overrideWith(() => sync ?? _StubTrackSync()),
         appInfoProvider.overrideWith((ref) async => capabilities),
         conversionJobsProvider.overrideWith(() => jobsNotifier),
-        offlineModeProvider.overrideWith(() => _Offline(offline)),
+        offlineModeProvider.overrideWith(() => TestOffline(offline)),
       ],
       child: MaterialApp(
         home: Scaffold(
@@ -626,63 +616,6 @@ void main() {
     });
   });
 
-  group('conversionErrorMessage', () {
-    test('maps each backend error to readable text', () {
-      expect(
-        conversionErrorMessage(_apiError(409, {'error': 'target_exists'})),
-        "A file already exists at the converted file's location.",
-      );
-      expect(
-        conversionErrorMessage(_apiError(409, {'error': 'pending_recovery'})),
-        'The server is still finishing a previous change to this track. '
-        'Try again later.',
-      );
-      expect(conversionErrorMessage(_apiError(404, 'Track not found')),
-          'Track or its file was not found on the server.');
-      expect(conversionErrorMessage(_apiError(507, 'disk')),
-          'Not enough disk space on the server.');
-      expect(conversionErrorMessage(_apiError(422, 'bitrate must be one of 320, 256')),
-          "Can't convert: bitrate must be one of 320, 256");
-      expect(
-        conversionErrorMessage(_apiError(422, [
-          {'loc': ['body'], 'msg': 'Field required', 'type': 'missing'},
-        ])),
-        "Can't convert: Field required",
-      );
-      expect(conversionErrorMessage(ApiException(500, 'Internal Server Error')),
-          'Could not start the conversion.');
-      expect(
-        conversionErrorMessage(NetworkException('down', attemptsMade: 1)),
-        "Couldn't reach the server. Try again.",
-      );
-    });
-  });
-
-  group('canConvertTrack', () {
-    test('requires online, the convert action, and an allowed target', () {
-      expect(
-        canConvertTrack(isOffline: false, appInfo: _capabilities, codec: 'flac'),
-        isTrue,
-      );
-      expect(
-        canConvertTrack(isOffline: true, appInfo: _capabilities, codec: 'flac'),
-        isFalse,
-      );
-      expect(
-        canConvertTrack(
-          isOffline: false,
-          appInfo: AppInfo(conversion: _capabilities.conversion),
-          codec: 'flac',
-        ),
-        isFalse,
-      );
-      expect(
-        canConvertTrack(isOffline: false, appInfo: null, codec: 'flac'),
-        isFalse,
-      );
-    });
-  });
-
   group('TracksPage Convert… entry', () {
     late Directory tempDir;
     late LocalCoverArtStore coverStore;
@@ -727,7 +660,7 @@ void main() {
           trackSyncProvider.overrideWith(() => _StubTrackSync()),
           appInfoProvider.overrideWith((ref) async => capabilities),
           conversionJobsProvider.overrideWith(_RecordingConversionJobs.new),
-          offlineModeProvider.overrideWith(() => _Offline(offline)),
+          offlineModeProvider.overrideWith(() => TestOffline(offline)),
         ],
         child: const MaterialApp(home: Scaffold(body: TracksPage())),
       ));
@@ -825,7 +758,7 @@ void main() {
           trackSyncProvider.overrideWith(() => _StubTrackSync(gate: gate)),
           appInfoProvider.overrideWith((ref) async => _capabilities),
           // The REAL jobs notifier, so the flow ends in an actual POST.
-          offlineModeProvider.overrideWith(() => _Offline(false)),
+          offlineModeProvider.overrideWith(() => TestOffline(false)),
         ],
         child: const MaterialApp(home: Scaffold(body: TracksPage())),
       ));
@@ -919,7 +852,7 @@ void main() {
           trackSyncProvider.overrideWith(() => _StubTrackSync()),
           appInfoProvider.overrideWith((ref) async => _capabilities),
           // The REAL jobs notifier, so the menu goes through DELETE /jobs.
-          offlineModeProvider.overrideWith(() => _Offline(false)),
+          offlineModeProvider.overrideWith(() => TestOffline(false)),
         ],
         child: const MaterialApp(home: Scaffold(body: TracksPage())),
       ));

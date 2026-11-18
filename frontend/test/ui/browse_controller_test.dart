@@ -10,8 +10,12 @@ import 'package:frontend/ui/browse/browse_pages.dart';
 import 'package:frontend/services/session_service.dart';
 import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/models/library_scope.dart';
 
+import '../helpers/fake_session_service.dart';
 import 'browse_harness.dart';
+import 'fake_track_selection_controls.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 class _FakeBrowse implements BrowseControls {
   int refreshes = 0;
@@ -82,7 +86,7 @@ void main() {
     ),
     (
       'album detail',
-      const Scaffold(body: TracksPage(artistId: 1, albumId: 2)),
+      const Scaffold(body: TracksPage.album(AlbumScope(artistId: 1, albumId: 2))),
       0,
     ),
   ]) {
@@ -97,6 +101,26 @@ void main() {
       await teardownTree(tester);
     });
   }
+
+  // Owner's decision 2026-11-17 (section 6 #3, U29-A-10): Manage library's
+  // track picker is a whole-library Tracks list in selection mode, and
+  // opening it starts no library sync (it used to, through the shared
+  // page). Its rows are the live device library, so a sync started
+  // elsewhere still updates them.
+  testWidgets('the Manage library track picker starts no library sync', (
+    tester,
+  ) async {
+    final selection = FakeTrackSelectionControls();
+    addTearDown(selection.dispose);
+    await pump(
+      tester,
+      Scaffold(body: TracksPage(browseAll: true, selection: selection)),
+    );
+    expect(find.text('Song'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 1));
+    expect(browse.refreshes, 0);
+    await teardownTree(tester);
+  });
 
   // 4A.4: the Tracks-tab re-select hook is gone (phase-4 §4); opening the
   // Tracks browse route from Home refreshes instead, and re-tapping the tab
@@ -116,11 +140,11 @@ void main() {
 
   // Audit 4A(b) #4: one model entry for a catalog sync (5A.0 gates it).
   test('refreshLibrary goes through SessionService.syncLibrary', () async {
-    late _CountingService service;
+    late FakeSessionService service;
     final container = ProviderContainer(
       overrides: [
         sessionServiceProvider.overrideWith(
-          (ref) => service = _CountingService(ref),
+          (ref) => service = FakeSessionService(),
         ),
       ],
     );
@@ -139,11 +163,4 @@ void main() {
     await container.read(browseControlsProvider).refreshLibrary();
     expect(sync.syncs, 1);
   });
-}
-
-class _CountingService extends SessionService {
-  _CountingService(super.ref);
-  int syncs = 0;
-  @override
-  Future<void> syncLibrary() async => syncs++;
 }

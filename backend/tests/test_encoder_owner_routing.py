@@ -58,7 +58,7 @@ def _coordinator(
 
 
 def _drain(coordinator):
-    coordinator._executor.shutdown(wait=True)
+    coordinator.drain()
 
 
 class TestWriteRouting:

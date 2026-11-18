@@ -22,6 +22,7 @@ import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
 import '../../helpers/server_binding.dart';
 import '../../helpers/test_credentials.dart';
+import '../../helpers/test_offline.dart';
 
 /// End-to-end across the conversion -> sync -> stale-download seam: the REAL
 /// jobs notifier polls a fake `/jobs`, a Done transition fires the REAL
@@ -123,14 +124,6 @@ class _FakeServer {
   });
 }
 
-class _Online extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
-
 class _FixedSettings extends SettingsNotifier {
   @override
   Future<AppSettings> build() async => const AppSettings(
@@ -170,6 +163,9 @@ Future<void> _insertDownloadedTrack(AppDatabase db) async {
       fileSizeBytes: Value(3 * 1024 * 1024),
     ),
   );
+  // The sync updates the search index per track (PM-APP-SEARCH): index the
+  // seeded row, as every app write path does.
+  await db.rebuildFtsIndexes();
 }
 
 void main() {
@@ -208,7 +204,7 @@ void main() {
           ...signedInOverrides,
           databaseProvider.overrideWithValue(db),
           autoVerifiedGateOverride(),
-          offlineModeProvider.overrideWith(_Online.new),
+          offlineModeProvider.overrideWith(() => TestOffline(false)),
           settingsProvider.overrideWith(_FixedSettings.new),
         ],
         child: const MaterialApp(home: Scaffold(body: StaleDownloadsBanner())),

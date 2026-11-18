@@ -2,6 +2,7 @@ import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -10,8 +11,9 @@ import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/edit_sync_mutex.dart';
 import 'package:frontend/ui/edit_controller.dart';
 
-import '../ui/browse_harness.dart';
 import '../helpers/server_binding.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
+import '../helpers/test_offline.dart';
 
 /// Save rules that lived in GetInfoPage (SC-26: model).
 void main() {
@@ -87,6 +89,24 @@ void main() {
     expect(await outbox().fieldSuggestions('title', 'so'), isEmpty);
   });
 
+  // B.8: the outbox resolves every field the model says offers suggestions.
+  test('every field with suggestions gets them from the library', () async {
+    await db.customStatement(
+        "UPDATE trackmetadata SET album_artist = 'Abba', genre = 'Pop' "
+        "WHERE uuid_id = 'u1'");
+    const prefixes = {
+      'artist': 'ab',
+      'album_artist': 'ab',
+      'album': 'arr',
+      'genre': 'po',
+    };
+    expect(prefixes.keys.toSet(), suggestedEditableFields);
+    for (final key in suggestedEditableFields) {
+      expect(await outbox().fieldSuggestions(key, prefixes[key]!), isNotEmpty,
+          reason: key);
+    }
+  });
+
   test('submit queues the edit and starts a flush', () async {
     final spy = _FlushSpy(c);
     await spy.submit(
@@ -106,7 +126,7 @@ void main() {
       final c2 = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
-          offlineModeProvider.overrideWith(() => _Offline(offline)),
+          offlineModeProvider.overrideWith(() => TestOffline(offline)),
           editOutboxProvider.overrideWith((ref) => _FlushSpy.forRef(ref, db)),
         ],
       );
@@ -132,16 +152,6 @@ const _track = TrackUI(
   channels: 2,
   hasAlbumArt: false,
 );
-
-class _Offline extends OfflineModeNotifier {
-  _Offline(this.value);
-  final bool value;
-  @override
-  bool build() {
-    super.build();
-    return value;
-  }
-}
 
 /// The real outbox with flush() counted (no network).
 class _FlushSpy extends EditOutbox {

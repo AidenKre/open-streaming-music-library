@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/app_info_service.dart';
@@ -25,10 +26,21 @@ class GetInfoPage extends ConsumerStatefulWidget {
   ConsumerState<GetInfoPage> createState() => _GetInfoPageState();
 }
 
+/// Shown when planning or submitting a save fails; the page stays open.
+const _saveFailedMessage = "Couldn't save the changes.";
+
 class _GetInfoPageState extends ConsumerState<GetInfoPage> {
   MetadataEdit _edit = const MetadataEdit.empty();
   bool _editing = false;
   bool _writeToFile = false;
+
+  /// True while [_save] runs; the Save button gives way to a progress
+  /// indicator so a second tap cannot start a second save.
+  bool _saving = false;
+
+  /// True while the master-write confirm dialog is up; the indicator under
+  /// the dialog's barrier holds still meanwhile.
+  bool _confirming = false;
 
   TrackUI get _track => widget.track;
 
@@ -49,71 +61,67 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
     if (pending) setState(() => _writeToFile = true);
   }
 
-  Object? _currentValue(String key) {
-    switch (key) {
-      case 'title':
-        return _track.title;
-      case 'artist':
-        return _track.artist;
-      case 'album':
-        return _track.album;
-      case 'album_artist':
-        return _track.albumArtist;
-      case 'year':
-        return _track.year;
-      case 'date':
-        return _track.date;
-      case 'genre':
-        return _track.genre;
-      case 'track_number':
-        return _track.trackNumber;
-      case 'disc_number':
-        return _track.discNumber;
-      default:
-        return null;
-    }
-  }
-
   Future<List<String>> _suggestions(String key, String query) =>
       ref.read(editControlsProvider).suggestions(key, query);
 
   Future<void> _save() async {
-    if (!_editing) return;
-    final edits = ref.read(editControlsProvider);
-    final mode = _writeToFile
-        ? EditWriteMode.dbAndMaster
-        : EditWriteMode.dbOnly;
-    switch (await edits.planSave(_track, _edit, mode)) {
-      case EditSavePlan.noChanges:
-        _toast('No changes to save');
-        return;
-      case EditSavePlan.confirmMasterWrite:
-        if (!mounted) return;
-        final confirmed = await showMasterWriteConfirmDialog(context);
-        if (!confirmed) return;
-      case EditSavePlan.ready:
-        break;
+    if (!_editing || _saving) return;
+    setState(() => _saving = true);
+    try {
+      final edits = ref.read(editControlsProvider);
+      // What was on screen when Save was tapped: planned and submitted as one.
+      final edit = _edit;
+      final mode = _writeToFile
+          ? EditWriteMode.dbAndMaster
+          : EditWriteMode.dbOnly;
+      switch (await edits.planSave(_track, edit, mode)) {
+        case EditSavePlan.noChanges:
+          _toast('No changes to save');
+          return;
+        case EditSavePlan.confirmMasterWrite:
+          if (!mounted) return;
+          setState(() => _confirming = true);
+          final bool confirmed;
+          try {
+            confirmed = await showMasterWriteConfirmDialog(context);
+          } finally {
+            if (mounted) setState(() => _confirming = false);
+          }
+          if (!confirmed) return;
+        case EditSavePlan.ready:
+          break;
+      }
+      final submitted = await edits.submit(_track, edit, mode);
+      if (!mounted) return;
+      _toast(
+        submitted == EditSubmitted.online
+            ? 'Saved'
+            : 'Saved — will sync when online',
+      );
+      if (Navigator.of(context).canPop()) Navigator.of(context).pop();
+    } catch (_) {
+      _toast(_saveFailedMessage);
+    } finally {
+      if (mounted) setState(() => _saving = false);
     }
-    final submitted = await edits.submit(_track, _edit, mode);
-    if (!mounted) return;
-    _toast(
-      submitted == EditSubmitted.online
-          ? 'Saved'
-          : 'Saved — will sync when online',
-    );
-    if (Navigator.of(context).canPop()) Navigator.of(context).pop();
   }
 
   void _startEditing() {
     setState(() => _editing = true);
   }
 
-  void _cancelEditing() {
+  /// Resets the edit, then re-reads whether a file write is queued: the
+  /// switch stays on while a `db_and_master` edit waits, off otherwise.
+  Future<void> _cancelEditing() async {
     setState(() {
       _editing = false;
       _edit = const MetadataEdit.empty();
-      _writeToFile = false;
     });
+    final pending = await ref
+        .read(editControlsProvider)
+        .hasPendingMasterWrite(_track.uuidId);
+    if (!mounted) return;
+    setState(() => _writeToFile = pending);
   }
 
   void _toast(String message) {
@@ -137,10 +145,26 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
           if (fields.isNotEmpty)
             if (_editing) ...[
               TextButton(
-                onPressed: _cancelEditing,
+                // Off while a save runs: it would empty the edit being saved.
+                onPressed: _saving ? null : _cancelEditing,
                 child: const Text('Cancel'),
               ),
-              TextButton(onPressed: _save, child: const Text('Save')),
+              if (_saving)
+                TickerMode(
+                  enabled: !_confirming,
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16),
+                    child: Center(
+                      child: SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
+                  ),
+                )
+              else
+                TextButton(onPressed: _save, child: const Text('Save')),
             ] else
               TextButton(onPressed: _startEditing, child: const Text('Edit')),
         ],
@@ -164,17 +188,11 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
           if (_editing) ...[
             MetadataForm(
               fields: fields,
-              current: _currentValue,
+              current: _track.editableValue,
               edit: _edit,
               onChanged: (e) => setState(() => _edit = e),
               suggestionsFor: _suggestions,
-              // Keys _suggestions can actually resolve (drift-backed).
-              autocompleteKeys: const {
-                'artist',
-                'album_artist',
-                'album',
-                'genre',
-              },
+              autocompleteKeys: suggestedEditableFields,
             ),
             const SizedBox(height: 8),
             SwitchListTile(
@@ -214,7 +232,7 @@ class _GetInfoPageState extends ConsumerState<GetInfoPage> {
                   ),
                 ),
               ),
-              Expanded(child: Text(_displayValue(_currentValue(field.key)))),
+              Expanded(child: Text(_displayValue(_track.editableValue(field.key)))),
             ],
           ),
         ),

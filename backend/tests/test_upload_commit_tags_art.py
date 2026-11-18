@@ -17,7 +17,7 @@ import subprocess
 import pytest
 
 from app.services.audio_identity import AudioIdentity
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import (
     FakeArt,
     FakeCoverArt,
@@ -31,11 +31,6 @@ from tests.upload_commit_fixtures import (
     sha,
 )
 from tests.upload_validation_fixtures import DEAD_BOOT, detected
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -13,11 +13,12 @@ import uuid as uuid_mod
 from pathlib import Path
 from typing import Any, Optional
 
-from app.services.audio_identity import AudioIdentity, ExactAudioHash, FingerprintIdentity
+from app.services.audio_identity import AudioIdentity, ExactAudioHash, FingerprintIdentity, compute_identity
 from app.services.job_runtime import CancelTokens
 from app.services.storage_ledger import UPLOAD_SOURCE
-from app.services.upload_validation import UploadValidationWorker
+from app.services.upload_validation import UploadValidationWorker, probe_upload
 from tests.identity_worker_fixtures import sql
+from tests.tool_call_capture import option_fields, tool_call
 
 BOOT = "boot-current"
 DEAD_BOOT = "boot-dead"
@@ -96,7 +97,8 @@ class FakeProbe:
         self.mid = None  # runs once inside the probe (a racing request)
 
     def __call__(self, path, **kwargs):
-        self.calls.append({"path": Path(path), **kwargs})
+        options = tool_call(probe_upload, path, **kwargs)["options"]
+        self.calls.append({"path": Path(path), **option_fields(options)})
         if self.mid is not None:
             mid, self.mid = self.mid, None
             mid()
@@ -129,7 +131,8 @@ class FakeCompute:
         self.mid = None
 
     def __call__(self, path, codec_hint, **kwargs):
-        self.calls.append({"path": Path(path), "codec_hint": codec_hint, **kwargs})
+        call = tool_call(compute_identity, path, codec_hint, **kwargs)
+        self.calls.append({**call, "path": Path(path)})
         if self.mid is not None:
             mid, self.mid = self.mid, None
             mid()
@@ -137,7 +140,7 @@ class FakeCompute:
             raise self.raises
         content = Path(path).read_bytes()
         fingerprint = None
-        if kwargs.get("fingerprinter") is not None:
+        if call["fingerprinter"] is not None:
             fingerprint = self.prints.get(content, print_of())
         return AudioIdentity(
             exact=self.exact.get(content, exact_for(content)), tool_versions="ffmpeg 8.1",

@@ -24,6 +24,9 @@ class FakeSeeAllRecentsControls extends ChangeNotifier
 
   final chipTaps = <bool>[];
   final played = <String>[];
+
+  /// What [playTrack] answers.
+  PlaybackOutcome playOutcome = const Accepted(1);
   int loadMores = 0;
   int retries = 0;
   int refreshes = 0;
@@ -82,7 +85,7 @@ class FakeSeeAllRecentsControls extends ChangeNotifier
   @override
   Future<PlaybackOutcome> playTrack(TrackUI track) async {
     played.add(track.uuidId);
-    return const Accepted(1);
+    return playOutcome;
   }
 
   @override

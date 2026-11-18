@@ -7,217 +7,14 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/models/annual_recap.dart';
-import 'package:frontend/models/listening_stats.dart';
-import 'package:frontend/models/ui/album_ui.dart';
-import 'package:frontend/models/ui/artist_ui.dart';
-import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/repositories/history_snapshot.dart';
 import 'package:frontend/ui/annual_recap_controller.dart';
 import 'package:frontend/ui/annual_recap_export_image.dart';
 import 'package:frontend/ui/annual_recap_page.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 
+import '../helpers/recap_page_fixtures.dart';
 import 'browse_harness.dart' show teardownTree;
-
-int utc(int y, [int m = 1, int d = 1, int h = 0]) =>
-    DateTime.utc(y, m, d, h).millisecondsSinceEpoch;
-
-final now = utc(2026, 3, 15, 12);
-
-HistorySnapshotToken tokenAt(int nowMs) => HistorySnapshotToken(
-  boundaryLocalId: 19,
-  historyContentVersion: 0,
-  capturedNowUtcMs: nowMs,
-  filterKey: 'k',
-);
-
-TrackUI track(String uuid, String? title) => TrackUI(
-  uuidId: uuid,
-  createdAt: 0,
-  lastUpdated: 0,
-  title: title,
-  duration: 200,
-  bitrateKbps: null,
-  sampleRateHz: null,
-  channels: null,
-  hasAlbumArt: false,
-);
-
-AnnualRecap recapOf(
-  int year, {
-  double seconds = 0,
-  int qualified = 0,
-  int unique = 0,
-  int days = 0,
-  double unavailable = 0,
-  List<double> monthly = const [],
-  List<RankedEntry<TrackUI>> tracks = const [],
-  List<RankedEntry<ArtistUI>> artists = const [],
-  List<RankedEntry<AlbumUI>> albums = const [],
-}) {
-  final range = StatsRange.year(year);
-  return AnnualRecap.fromStats(
-    ListeningStats(
-      range: range,
-      window: range.resolve(now),
-      boundaryLocalId: 19,
-      totals: ListeningTotals(
-        listeningSeconds: seconds,
-        qualifiedPlays: qualified,
-        uniqueTracks: unique,
-        activeDays: days,
-      ),
-      unavailable: ListeningSubtotal(
-        listeningSeconds: unavailable,
-        qualifiedPlays: 0,
-      ),
-      futureTimestampCount: 0,
-      overlongListenCount: 0,
-      buckets: [
-        for (var i = 0; i < monthly.length; i++)
-          ListeningBucket(
-            startUtcMs: utc(year, i + 1),
-            endUtcMs: utc(year, i + 2),
-            listeningSeconds: monthly[i],
-          ),
-      ],
-      chartCapped: false,
-      topTracks: tracks,
-      topArtists: artists,
-      topAlbums: albums,
-    ),
-    tokenAt(now),
-  );
-}
-
-/// 2025 as in the recap fixture, with 2 h added in March.
-AnnualRecap prior() => recapOf(
-  2025,
-  seconds: 9220.5,
-  qualified: 9,
-  unique: 7,
-  days: 11,
-  unavailable: 100,
-  monthly: [120.5, 0, 7800, 0, 250, 0, 600, 0, 300, 0, 100, 50],
-  tracks: [
-    for (final (u, t, s) in [
-      ('t-a', 'Alpha', 420.5),
-      ('t-c', 'Gamma', 400.0),
-      ('t-b', 'Beta', 300.0),
-      ('t-d', null, 280.0),
-      ('t-e', 'Epsilon', 250.0),
-    ])
-      RankedEntry(entity: track(u, t), listeningSeconds: s, qualifiedPlays: 1),
-  ],
-  artists: const [
-    RankedEntry(
-      entity: ArtistUI(id: 1, name: 'Aria'),
-      listeningSeconds: 720.5,
-      qualifiedPlays: 3,
-    ),
-  ],
-  albums: const [
-    RankedEntry(
-      entity: AlbumUI(id: 10, artistId: 1, name: 'First Light', artist: 'Aria'),
-      listeningSeconds: 720.5,
-      qualifiedPlays: 3,
-    ),
-  ],
-);
-
-class FakeRecapControls extends ChangeNotifier implements AnnualRecapControls {
-  FakeRecapControls({this.year, this.recap, this.years = const []});
-
-  @override
-  int? year;
-  @override
-  List<int> years;
-  @override
-  AnnualRecap? recap;
-  @override
-  bool loading = false;
-  @override
-  bool failed = false;
-
-  final calls = <String>[];
-  bool disposed = false;
-
-  void set({AnnualRecap? recap, bool loading = false, bool failed = false}) {
-    this.recap = recap;
-    this.loading = loading;
-    this.failed = failed;
-    notifyListeners();
-  }
-
-  @override
-  void selectYear(int year) => calls.add('selectYear($year)');
-
-  @override
-  void refresh() => calls.add('refresh');
-
-  @override
-  void retry() => calls.add('retry');
-
-  @override
-  bool canSave = true;
-  @override
-  bool canShare = true;
-  @override
-  bool exporting = false;
-
-  /// What each export intent answers.
-  String? exportAnswer;
-
-  /// Completed when the next export intent arrives.
-  Completer<void>? nextExport;
-
-  void _exported() {
-    final c = nextExport;
-    nextExport = null;
-    if (c != null && !c.isCompleted) c.complete();
-  }
-
-  void setExporting(bool value) {
-    exporting = value;
-    notifyListeners();
-  }
-
-  /// The PNG bytes each image intent received.
-  final pngs = <Uint8List>[];
-
-  @override
-  Future<String?> savePng(Uint8List png) async {
-    calls.add('savePng');
-    pngs.add(png);
-    _exported();
-    return exportAnswer;
-  }
-
-  @override
-  Future<String?> saveJson() async {
-    calls.add('saveJson');
-    _exported();
-    return exportAnswer;
-  }
-
-  @override
-  Future<String?> sharePng(Uint8List png, {Rect? origin}) async {
-    calls.add('sharePng');
-    pngs.add(png);
-    shareOrigins.add(origin);
-    _exported();
-    return exportAnswer;
-  }
-
-  final shareOrigins = <Rect?>[];
-
-  @override
-  void dispose() {
-    disposed = true;
-    super.dispose();
-  }
-}
 
 void main() {
   late FakeRecapControls controls;
@@ -319,6 +116,10 @@ void main() {
     expect(inKey('recap.unique_tracks', '7'), findsOneWidget);
     expect(inKey('recap.active_days', '11'), findsOneWidget);
     expect(inKey('recap.unavailable', '1 min'), findsOneWidget);
+    // Decision 6, row 1 (owner, 2026-11-17).
+    expect(inKey('recap.unavailable', 'Deleted or unknown tracks'),
+        findsOneWidget);
+    expect(find.textContaining('Unavailable history'), findsNothing);
     expect(inKey('recap.busiest_month', 'March'), findsOneWidget);
     // Review F2: the tile's label says "Generated"; the value is the time.
     expect(inKey('recap.generated', '15 Mar 2026, 12:00 UTC'), findsOneWidget);
@@ -390,6 +191,39 @@ void main() {
     await tester.tap(find.byTooltip('Refresh'));
     await tester.pump();
     expect(controls.calls, ['selectYear(2024)', 'refresh']);
+    await teardownTree(tester);
+  });
+
+  // The shared notice sits inside the page's list, which already ends above
+  // the shell's bottom chrome: the notice adds no second gap.
+  testWidgets('a failure inside the shell: the bottom chrome gap is added '
+      'once, by the page', (tester) async {
+    const inset = 150.0;
+    controls = FakeRecapControls(year: 2025, years: [2025]);
+    controls.failed = true;
+    await tester.binding.setSurfaceSize(const Size(800, 3000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          annualRecapControllerFactoryProvider.overrideWithValue(
+            () => controls,
+          ),
+        ],
+        child: const MaterialApp(
+          home: ShellChromeInsets(
+            top: 0,
+            bottom: inset,
+            child: AnnualRecapPage(),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    final notice = tester.getRect(find.byType(LoadFailureNotice));
+    final retry = tester.getRect(find.widgetWithText(TextButton, 'Retry'));
+    expect(notice.bottom - retry.bottom, 32,
+        reason: "only the notice's own padding below Retry");
     await teardownTree(tester);
   });
 

@@ -10,9 +10,8 @@ import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/repositories/home_suggestions_service.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/settings_service.dart';
-import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/home/home_controller.dart';
-import 'package:frontend/ui/home/home_page.dart';
+import 'package:frontend/ui/home/home_sections.dart';
 import 'package:frontend/ui/library_actions.dart';
 
 /// The queue source of a track tapped in a Home suggestion rail.
@@ -110,11 +109,6 @@ class _Rail {
   StreamSubscription<SnapshotStaleness>? subscription;
 }
 
-String _sectionId(SuggestionRail rail) => switch (rail) {
-  SuggestionRail.rediscover => HomeSectionIds.rediscover,
-  SuggestionRail.moreFromArtists => HomeSectionIds.moreFromArtists,
-};
-
 /// Holds one frozen snapshot per rail and decides, from what each rail
 /// reports, when a newer snapshot may replace the picks on screen (Phase 9
 /// §5). No I/O and no selection rules: those are the service's. Every async
@@ -164,7 +158,7 @@ class HomeSuggestionsController extends ChangeNotifier
   HomeSuggestionsService get _service =>
       _ref.read(homeSuggestionsServiceProvider);
 
-  bool _isHidden(SuggestionRail r) => _hidden?.contains(_sectionId(r)) ?? true;
+  bool _isHidden(SuggestionRail r) => _hidden?.contains(homeSectionIdOf(r)) ?? true;
   Iterable<SuggestionRail> get _visibleRails =>
       SuggestionRail.values.where((r) => !_isHidden(r));
 
@@ -236,7 +230,7 @@ class HomeSuggestionsController extends ChangeNotifier
     }
     final unhidden = <SuggestionRail>[];
     for (final r in SuggestionRail.values) {
-      final id = _sectionId(r);
+      final id = homeSectionIdOf(r);
       if (now.contains(id) && !before.contains(id)) {
         final st = _rails[r]!;
         st.generation++;

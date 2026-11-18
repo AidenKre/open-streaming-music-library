@@ -9,6 +9,8 @@ import 'package:frontend/services/uploads/upload_zip_children.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 import 'package:frontend/models/server_blocked_reason.dart';
 import 'package:frontend/ui/session_controller.dart';
+import 'package:frontend/ui/uploads/upload_review_controller.dart';
+import 'package:frontend/ui/uploads/upload_review_page.dart';
 import 'package:frontend/ui/uploads/uploads_controller.dart';
 import 'package:frontend/ui/uploads/uploads_page.dart';
 import 'package:frontend/ui/widgets/offline_banner.dart';
@@ -16,6 +18,7 @@ import 'package:frontend/ui/widgets/server_blocked_banner.dart';
 
 import '../browse_harness.dart';
 import '../fake_session_controls.dart';
+import '../fake_upload_review_controls.dart';
 import '../fake_uploads_controls.dart';
 
 Finder _row(String uuid) => find.byKey(ValueKey('upload-row-$uuid'));
@@ -27,6 +30,7 @@ void main() {
   late BrowseHarness harness;
   late FakeUploadsControls fake;
   late FakeSessionControls session;
+  late FakeUploadReviewControls review;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
@@ -47,12 +51,14 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     fake = FakeUploadsControls(overview: overview);
+    review = FakeUploadReviewControls();
     await tester.pumpWidget(
       harness.wrap(
         const UploadsPage(),
         overrides: [
           uploadsControllerFactoryProvider.overrideWithValue(() => fake),
           sessionControlsProvider.overrideWithValue(session),
+          uploadReviewControllerFactoryProvider.overrideWithValue(() => review),
         ],
       ),
     );
@@ -170,20 +176,11 @@ void main() {
     await tester.tap(_inRow('a', find.byTooltip('Cancel upload')));
     await tester.tap(_inRow('b', find.text('Reselect file')));
     await tester.tap(_inRow('c', find.text('Review tags')));
-    await tester.pump();
-    expect(fake.calls, ['cancel a', 'reselect b', 'reviewTags c']);
-    await teardownTree(tester);
-  });
-
-  testWidgets('Review tags before the review flow exists says so',
-      (tester) async {
-    await pumpPage(
-      tester,
-      fakeUploadsOverview([fakeUploadRow('c', reviewTags: true)]),
-    );
-    await tester.tap(_inRow('c', find.text('Review tags')));
-    await tester.pump();
-    expect(find.text("Reviewing tags isn't available yet"), findsOneWidget);
+    await tester.pumpAndSettle();
+    expect(fake.calls, ['cancel a', 'reselect b']);
+    // Review tags opens the review of the row's batch at that file.
+    expect(find.byType(UploadReviewPage), findsOneWidget);
+    expect(review.calls, contains('start b-1 c'));
     await teardownTree(tester);
   });
 
@@ -482,6 +479,48 @@ void main() {
     await teardownTree(tester);
   });
 
+  // A7-02 (pre-merge review): a file reviewed from the list changes the
+  // list; it is read again when the review closes.
+  testWidgets("returning from a file's review reads the archive's files again",
+      (tester) async {
+    await openZip(tester);
+    fake.setChildren(
+      'zip',
+      ChildListLoaded(
+        zip([
+          const UploadChildRow(
+            itemUuid: 'c1',
+            displayName: 'c1.flac',
+            statusText: 'Ready for review',
+            detailText: null,
+            needsAttention: false,
+            offersReviewTags: true,
+          ),
+          child('c2'),
+        ]),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(
+      find.descendant(
+        of: find.byKey(const ValueKey('upload-child-c1')),
+        matching: find.text('Review tags'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(UploadReviewPage), findsOneWidget);
+    expect(review.calls, contains('start b-1 c1'));
+    expect(fake.calls, ['loadChildren b-1/zip']);
+
+    Navigator.of(tester.element(find.byType(UploadReviewPage))).pop();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(UploadReviewPage), findsNothing);
+    // Quietly: the list stays on screen while it is read (review PMR-04).
+    expect(fake.calls, ['loadChildren b-1/zip', 'loadChildren b-1/zip quiet']);
+    await teardownTree(tester);
+  });
+
   testWidgets('offline, Try again is disabled with the reason', (tester) async {
     await openZip(tester);
     fake.setChildren('zip', const ChildListFailed());
@@ -616,8 +655,11 @@ void main() {
       'cancel a',
       'reselect b',
       'loadChildren b-1/d',
-      'reviewTags c',
     ]);
+    // Review tags opened the review of the row's batch at that file.
+    await tester.pumpAndSettle();
+    expect(find.byType(UploadReviewPage), findsOneWidget);
+    expect(review.calls, contains('start b-1 c'));
     await teardownTree(tester);
   });
 

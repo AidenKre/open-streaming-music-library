@@ -17,7 +17,9 @@ abstract interface class CollectionDetailControls implements Listenable {
   /// or null.
   String? get message;
 
-  /// Whether [retry] would re-run the action [message] explains.
+  /// Whether [retry] would re-run the action [message] explains: only after
+  /// a failure. "Nothing here plays offline." and "Nothing to play here
+  /// right now." would get the same answer again, so they offer no Retry.
   bool get canRetry;
 
   Future<void> play();
@@ -43,6 +45,7 @@ class CollectionDetailController extends ChangeNotifier
   bool _busy = false;
   bool _disposed = false;
   String? _message;
+  bool _failed = false;
   Future<PlaybackOutcome> Function()? _lastAction;
 
   @override
@@ -52,7 +55,7 @@ class CollectionDetailController extends ChangeNotifier
   String? get message => _message;
 
   @override
-  bool get canRetry => _message != null;
+  bool get canRetry => _message != null && _failed;
 
   @override
   Future<void> play() => _run(() => _actions.play(_scope));
@@ -62,7 +65,7 @@ class CollectionDetailController extends ChangeNotifier
 
   @override
   Future<void> retry() {
-    final action = _message == null ? null : _lastAction;
+    final action = canRetry ? _lastAction : null;
     return action == null ? Future.value() : _run(action);
   }
 
@@ -72,16 +75,21 @@ class CollectionDetailController extends ChangeNotifier
     _message = null;
     notifyListeners();
     String? message;
+    var failed = false;
     try {
-      message = messageFor(await action());
+      final outcome = await action();
+      message = messageFor(outcome);
+      failed = outcome is Failed;
     } catch (error, stack) {
       developer.log('Collection playback failed',
           error: error, stackTrace: stack);
       message = messageFor(Failed(error));
+      failed = true;
     } finally {
       _busy = false;
     }
     _message = message;
+    _failed = failed;
     if (message != null) _lastAction = action;
     if (!_disposed) notifyListeners();
   }

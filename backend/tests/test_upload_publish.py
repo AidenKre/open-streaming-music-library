@@ -12,7 +12,7 @@ import pytest
 
 from app.services.audio_identity import AudioIdentity, ExactUnavailable
 from app.services.upload_publish import SEAM_POINTS, SimulatedCrash
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_commit_fixtures import (
     FakeExact,
@@ -34,11 +34,6 @@ from tests.upload_publish_fixtures import (
     track_row,
 )
 from tests.upload_validation_fixtures import exact_for, item_row, print_of
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -1,13 +1,13 @@
 """Phase M.2a (M-U16, spec §6.3 "At signup"): registering creates the user's
 import folder, or adopts a pre-staged one (§4.5), and scans it."""
 
-from tests.test_import_startup import (
+from tests.import_startup_fixtures import (
     WATCH,
     _drain_imports,
-    _titles,
     _tone,
     requires_ffmpeg,
 )
+from tests.test_import_startup import _titles
 
 
 import pytest

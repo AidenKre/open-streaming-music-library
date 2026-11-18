@@ -1,4 +1,3 @@
-import 'package:frontend/services/server_binding_gate.dart';
 // SC-15: reset lifecycle fence -> quiesce -> wipe.
 //  1. Fence (first, awaited): bump the in-memory generation synchronously,
 //     then delete the SC-01 binding row. If the delete fails, ABORT before
@@ -17,6 +16,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/local_resettable.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/server_binding.dart';
@@ -248,6 +248,24 @@ void main() {
           'Some unsent changes could not be counted',
           '1 upload',
         ],
+      );
+    });
+
+    // Pre-merge review D4-06: the reporters that cannot even be built are
+    // unknown too; the sheet still opens, saying so (it never throws).
+    test('reporters that cannot be built are reported as uncounted',
+        () async {
+      final c = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          lossReportersProvider
+              .overrideWith((ref) => throw StateError('db locked')),
+        ],
+      );
+      addTearDown(c.dispose);
+      expect(
+        await c.read(localResetServiceProvider).pendingLossSummaries(),
+        [LocalResetService.uncountedLossSummary],
       );
     });
 

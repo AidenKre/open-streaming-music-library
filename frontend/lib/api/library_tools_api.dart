@@ -8,7 +8,6 @@ import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/models/dto/library_tools_dtos.dart';
 import 'package:frontend/providers/providers.dart';
-import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 
 /// A request's abort trigger fired before it was sent: nothing went out.
@@ -20,7 +19,7 @@ class LibraryToolsRequestAborted implements Exception {
 }
 
 /// `POST /tracks/deletions` was accepted (2xx) but its receipt could not be
-/// read (8-R1-23): the server holds the job; only its body is unknown.
+/// read: the server holds the job; only its body is unknown.
 class DeletionReceiptUnreadable implements Exception {
   const DeletionReceiptUnreadable();
 
@@ -53,63 +52,44 @@ class LibraryToolsApi {
   final ApiClient _api;
   final ServerBindingGate _gate;
 
-  /// Waits for the gate, then runs [send]; an answer from another instance
-  /// is reported to the gate before it is rethrown. [abortTrigger]
-  /// (completing, with or without an error) ends a wait at the gate with
+  /// Waits for the gate without a limit, then runs [send]
+  /// ([sendWhenVerified]); an answer from another instance is reported to
+  /// the gate before it is rethrown. [abortTrigger] (completing, with or
+  /// without an error) ends a wait at the gate with
   /// [LibraryToolsRequestAborted] and sends nothing.
   ///
-  /// A page read that must not wait ([waitForBinding] false) reads a
-  /// withheld token (the token client refused: not verified, or offline) as
-  /// not connected: its page shows the existing "needs a connection" state
-  /// and reloads by itself. Every other call keeps the raw
-  /// [TokenWithheldException] (sign-off OPEN-M-11, E8).
+  /// A page read that must not wait ([waitForBinding] false, U33-B-02)
+  /// fails at once unless the binding is verified now and the token
+  /// client's own rule (URL, online) allows the request: not connected,
+  /// with its reason (Phase 9, 9-R2-04; sign-off OPEN-M-11, E8). It also
+  /// reads a token withheld at the send (the token client refused: not
+  /// verified, or offline) as not connected: its page shows the existing
+  /// "needs a connection" state and reloads by itself. Every other call
+  /// keeps the raw [TokenWithheldException] (sign-off OPEN-M-11, E8).
   Future<T> _gated<T>(
     Future<T> Function() send,
     Future<void>? abortTrigger, {
     bool waitForBinding = true,
-  }) async {
-    // A read that must not wait (U33-B-02): not verified, or not allowed by
-    // the token client's own rule (URL, online), is not connected, with its
-    // reason (Phase 9, 9-R2-04; sign-off OPEN-M-11, E8).
-    if (!waitForBinding) {
-      requireVerifiedNow(_gate, url: Uri.parse(_api.baseUrl));
-    }
-    var aborted = false;
-    final signal = Completer<void>();
-    void fire() {
-      aborted = true;
-      if (!signal.isCompleted) signal.complete();
-    }
-
-    abortTrigger?.then((_) => fire(), onError: (Object _) => fire());
-    if (aborted) throw const LibraryToolsRequestAborted();
-    final verified = _gate.awaitVerified();
-    if (abortTrigger == null) {
-      await verified;
-    } else {
-      await Future.any<Object?>([
-        verified,
-        signal.future.then<Object?>(
-          (_) => throw const LibraryToolsRequestAborted(),
+  }) =>
+      // Future.sync: a base URL that does not parse fails the call's future,
+      // as every other refusal does; it is never thrown at the caller.
+      Future.sync(
+        () => sendWhenVerified(
+          _gate,
+          send,
+          wait: waitForBinding
+              ? BindingWait.untilVerified
+              : BindingWait.failFast,
+          url: waitForBinding ? null : Uri.parse(_api.baseUrl),
+          abortTrigger: abortTrigger,
+          abortError: const LibraryToolsRequestAborted(),
+          withheldAsNotVerified: !waitForBinding,
         ),
-      ]);
-    }
-    final connection = _gate.verifiedConnection;
-    if (aborted) throw const LibraryToolsRequestAborted();
-    try {
-      return await send();
-    } on ServerInstanceChangedException catch (e) {
-      if (connection != null) _gate.reportDifferentInstance(connection, e);
-      rethrow;
-    } on TokenWithheldException {
-      if (!waitForBinding) throw const LibraryToolsNotConnected();
-      rethrow;
-    }
-  }
+      );
 
   /// Completes when the binding is (or becomes) verified; a page that
-  /// failed fast as not connected reloads then (review r1 R7). Errors when
-  /// the gate closes.
+  /// failed fast as not connected reloads then, by itself. Errors when the
+  /// gate closes.
   Future<void> whenVerified() => _gate.awaitVerified().then<void>((_) {});
 
   Map<String, String> _query({String? status, String? after, int? limit}) => {
@@ -143,8 +123,8 @@ class LibraryToolsApi {
         body: jsonDecode(frozenBodyJson) as Map<String, dynamic>,
       );
     } on ApiException catch (e) {
-      // A 2xx whose body is not JSON / not an object: accepted, receipt
-      // unreadable (8-R1-23).
+      // A 2xx whose body is not JSON / not an object: the job was accepted,
+      // only its receipt is unreadable.
       if (e.statusCode >= 200 && e.statusCode < 300) {
         throw const DeletionReceiptUnreadable();
       }

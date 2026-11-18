@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from app.services.ffmpeg_runner import run_ffmpeg
 from app.services.transcoder import (
     SourceAudioParams,
     TranscodeResult,
@@ -13,6 +14,7 @@ from app.services.transcoder import (
     transcode,
     transcode_to_aac_m4a,
 )
+from tests.tool_call_capture import tool_call
 
 
 class _FakeProc:
@@ -268,3 +270,79 @@ class TestProbeAvailableEncoders:
                 args=["ffmpeg"], returncode=1, stdout=b"", stderr=b""
             )
             assert probe_available_encoders() == frozenset()
+
+
+class TestTranscodeFailureLog:
+    """Other-issues row 61: a failed transcode goes through the module's logger
+    with the target codec and the error type only: ffmpeg's text names the
+    source file and its tags, so it stays in TranscodeResult.stderr. A run of
+    failures of one kind (a warm-up failing for every track) warns once; the
+    repeats are at debug level until a transcode succeeds again."""
+
+    LOGGER = "app.services.transcoder"
+
+    @pytest.fixture(autouse=True)
+    def _fresh_failure_memory(self, monkeypatch):
+        import app.services.transcoder as transcoder
+
+        monkeypatch.setattr(transcoder, "_failures_warned", set())
+
+    def _fail(self, monkeypatch, source):
+        import app.services.transcoder as transcoder
+        from app.services.ffmpeg_runner import FfmpegError
+
+        stderr = f"{source}: Invalid data; TITLE=Secret Song"
+
+        def failing_run(cmd, out, **kwargs):
+            tool_call(run_ffmpeg, cmd, out, **kwargs)
+            raise FfmpegError(f"ffmpeg exited 1: {stderr}", stderr)
+
+        monkeypatch.setattr(transcoder, "run_ffmpeg", failing_run)
+        return stderr
+
+    def _succeed(self, monkeypatch):
+        import app.services.transcoder as transcoder
+
+        def succeeding_run(cmd, out, **kwargs):
+            tool_call(run_ffmpeg, cmd, out, **kwargs)
+            Path(out).write_bytes(b"x")
+
+        monkeypatch.setattr(transcoder, "run_ffmpeg", succeeding_run)
+
+    def _lines(self, caplog):
+        return [(r.levelname, r.getMessage()) for r in caplog.records if r.name == self.LOGGER]
+
+    def test_a_failed_transcode_logs_its_codec_and_error_type_only(
+        self, tmp_path, monkeypatch, caplog, capsys
+    ):
+        source = tmp_path / "Artist" / "Secret Song.flac"
+        source.parent.mkdir()
+        source.write_bytes(b"audio")
+        stderr = self._fail(monkeypatch, source)
+
+        with caplog.at_level("DEBUG", logger=self.LOGGER):
+            result = transcode(source, tmp_path / "out.m4a", "aac", 192)
+
+        assert (result.ok, result.stderr) == (False, stderr)
+        assert self._lines(caplog) == [("WARNING", "transcode to aac failed: FfmpegError")]
+        assert capsys.readouterr().out == ""  # no print
+
+    def test_failures_of_one_kind_warn_once_until_a_transcode_succeeds(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        source = tmp_path / "song.flac"
+        source.write_bytes(b"audio")
+
+        with caplog.at_level("DEBUG", logger=self.LOGGER):
+            self._fail(monkeypatch, source)
+            for _ in range(3):
+                transcode(source, tmp_path / "out.m4a", "aac", 192)
+            transcode(source, tmp_path / "out.mp3", "mp3", 192)  # another codec warns
+            self._succeed(monkeypatch)
+            transcode(source, tmp_path / "out.m4a", "aac", 192)
+            self._fail(monkeypatch, source)
+            transcode(source, tmp_path / "out.m4a", "aac", 192)
+
+        assert [level for level, _ in self._lines(caplog)] == [
+            "WARNING", "DEBUG", "DEBUG", "WARNING", "WARNING",
+        ]

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services.deletion_worker import RunResult
 from tests.deletion_world import (
     BOOT,
     accept_job,
@@ -81,7 +82,7 @@ def test_a_one_track_job_deletes_the_master_and_the_catalog_rows(world):
     op = accept_job(world, (uuid_id, rev))
     keep_bytes = path_of(world, keep).read_bytes()
 
-    assert make_executor(world).run_one() is True
+    assert make_executor(world).run_one() is RunResult.DONE
 
     # The master is gone, and so is its quarantine copy and the emptied folders.
     assert not os.path.lexists(master)
@@ -155,12 +156,12 @@ def test_each_boundary_leaves_the_state_recovery_expects(world):
     j = seen["after_journal"]["journal"]
     assert {k: j[k] for k in (
         "owner_id", "operation_uuid", "original_path", "quarantine_path", "base_revision",
-        "src_dev", "src_ino", "src_size", "src_mtime_ns", "cover_art_id", "master_missing", "stage",
+        "src_dev", "src_ino", "src_size", "cover_art_id", "master_missing", "stage",
     )} == {
         "owner_id": world.owner, "operation_uuid": op, "original_path": str(master),
         "quarantine_path": str(quarantine), "base_revision": rev,
         "src_dev": st.st_dev, "src_ino": st.st_ino, "src_size": st.st_size,
-        "src_mtime_ns": st.st_mtime_ns, "cover_art_id": None, "master_missing": 0,
+        "cover_art_id": None, "master_missing": 0,
         "stage": "intent",
     }
     assert seen["after_journal"]["at_original"] and not seen["after_journal"]["at_quarantine"]

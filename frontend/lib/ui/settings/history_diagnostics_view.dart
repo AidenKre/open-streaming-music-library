@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/count_text.dart';
 import 'package:frontend/models/history_event.dart';
+import 'package:frontend/models/track_names.dart';
 import 'package:frontend/services/history/history_diagnostics.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/settings/phase5_settings.dart';
@@ -17,13 +19,11 @@ const historyDiagnosticsRow = DiagnosticsRow(
 Widget _summary(BuildContext context) => const _HistorySyncRow();
 Widget _detail(BuildContext context) => const _HistorySyncDetail();
 
-String _count(int n, String one, String many) => n == 1 ? one : '$n $many';
-
 /// The one-line state, most important first.
 String _summaryText(HistoryDiagnostics d) {
   if (d.serverRegressed) return 'Server history looks restored';
   if (d.conflicts.isNotEmpty) {
-    return _count(
+    return countText(
       d.conflicts.length,
       '1 conflict needs your choice',
       'conflicts need your choice',
@@ -31,10 +31,10 @@ String _summaryText(HistoryDiagnostics d) {
   }
   if (d.waitingForServerSupport) return 'Waiting for server history support';
   if (d.quarantined > 0) {
-    return _count(d.quarantined, '1 event held back', 'events held back');
+    return countText(d.quarantined, '1 event held back', 'events held back');
   }
   if (d.pending > 0) {
-    return _count(
+    return countText(
       d.pending,
       '1 event waiting to upload',
       'events waiting to upload',
@@ -42,7 +42,7 @@ String _summaryText(HistoryDiagnostics d) {
   }
   if (d.lastError != null) return 'Last sync failed';
   if (d.frozenListens > 0) {
-    return _count(d.frozenListens, '1 listen waiting to be saved',
+    return countText(d.frozenListens, '1 listen waiting to be saved',
         'listens waiting to be saved');
   }
   if (d.listenError != null) return 'A listen could not be saved';
@@ -64,19 +64,23 @@ class _HistorySyncRow extends ConsumerWidget {
   }
 }
 
+/// Seconds as written: "100" for a whole number, "30.5" otherwise.
+String _secondsText(double value) => value == value.truncateToDouble()
+    ? value.toInt().toString()
+    : value.toString();
+
 String _seconds(double? value) {
   if (value == null) return 'unknown time played';
-  final text = value == value.truncateToDouble()
-      ? value.toInt().toString()
-      : value.toString();
-  return '$text s played';
+  return '${_secondsText(value)} s played';
 }
 
-String _describe(HistoryEventPayload p) =>
-    '${p.kind} · ${p.entityType} · ${p.entityRef}\n'
+/// Never the track's reference (pre-merge review A5-06): its name from
+/// [names], else [unknownTrackName].
+String _describe(HistoryEventPayload p, Map<String, String> names) =>
+    '${p.kind} · ${p.entityType} · ${names[p.entityRef] ?? unknownTrackName}\n'
     'Occurred: ${DateTime.fromMillisecondsSinceEpoch(p.occurredAt, isUtc: true).toIso8601String()}\n'
     '${_seconds(p.secondsPlayed)} · track length: '
-    '${p.trackLength == null ? 'unknown' : '${p.trackLength} s'}';
+    '${p.trackLength == null ? 'unknown' : '${_secondsText(p.trackLength!)} s'}';
 
 class _HistorySyncDetail extends ConsumerWidget {
   const _HistorySyncDetail();
@@ -95,11 +99,12 @@ class _HistorySyncDetail extends ConsumerWidget {
           const SizedBox(height: 8),
           Text('Waiting to upload: ${d.pending}'),
           Text('Held back: ${d.quarantined}'),
-          if (d.lastError != null) Text('Last error: ${d.lastError}'),
+          // The row's own sentences, never the raw error (A5-06).
+          if (d.lastError != null) const Text('Last sync failed'),
           if (d.frozenListens > 0)
             Text('Listens waiting to be saved: ${d.frozenListens}'),
           if (d.listenError != null)
-            Text('Last listen recording error: ${d.listenError}'),
+            const Text('A listen could not be saved'),
           const Text(
             'Listening time is saved as you play. If the app is closed '
             'unexpectedly, about the last 5 seconds of playback may not be '
@@ -134,8 +139,10 @@ class _HistorySyncDetail extends ConsumerWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('This device: ${_describe(pair.local)}'),
-                    Text('Server: ${_describe(pair.server.payload)}'),
+                    Text('This device: ${_describe(pair.local, d.trackNames)}'),
+                    Text(
+                      'Server: ${_describe(pair.server.payload, d.trackNames)}',
+                    ),
                     const SizedBox(height: 8),
                     FilledButton(
                       onPressed: () =>

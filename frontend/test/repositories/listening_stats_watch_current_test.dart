@@ -89,10 +89,38 @@ void main() {
 
   // DR-332-STATS-B-02: the read pump. A watch cancelled while its read runs
   // emits nothing more (no value, no error); a read that fails reaches the
-  // stream as an error and the next catalog change reads again. (Coalescing
-  // of changes during a read is not pinned here: a writer cannot commit
-  // while the read's transaction is open, so its timing cannot be forced
-  // deterministically from a test.)
+  // stream as an error and the next catalog change reads again. A writer
+  // cannot commit while the read's transaction is open, so changes during a
+  // read are announced with `notifyUpdates`, as a commit would.
+  test('changes that arrive during a read lead to exactly one more read',
+      () async {
+    final events = <Map<String, String?>>[];
+    final first = Completer<void>();
+    final sub = stats.watchCurrent(trackUuids: const ['t-a']).listen((v) {
+      events.add(titles(v));
+      if (!first.isCompleted) first.complete();
+    });
+    addTearDown(sub.cancel);
+    await first.future;
+    reads.pauseNext();
+    await rename('t-a', 'New');
+    await reads.reached.future;
+    for (var i = 0; i < 3; i++) {
+      db.notifyUpdates({TableUpdate.onTable(db.trackmetadata)});
+      await pumpEventQueue();
+    }
+    final selectsBefore = reads.selects;
+    reads.release();
+    await _settle();
+    expect(events, [
+      {'t-a': 'Same'},
+      {'t-a': 'New'},
+      {'t-a': 'New'},
+    ]);
+    expect(reads.selects - selectsBefore, 1,
+        reason: 'the paused read finishes, then one further read');
+  });
+
   test('cancelled during a read: nothing more is emitted', () async {
     final events = <Object>[];
     final first = Completer<void>();
@@ -122,6 +150,59 @@ void main() {
     await expectLater(q.next, throwsA(isA<StateError>()));
     await rename('t-a', 'Second');
     expect(titles(await q.next), {'t-a': 'Second'});
+  });
+
+  // R-332-16: the statistics watch and the Recently played watch share one
+  // helper; these two edge cases follow Recently played's behaviour.
+  test('while paused, changes run no read; resume reads once', () async {
+    final events = <Map<String, String?>>[];
+    final sub = stats
+        .watchCurrent(trackUuids: const ['t-a'])
+        .listen((v) => events.add(titles(v)));
+    addTearDown(sub.cancel);
+    await _settle();
+    expect(events, [
+      {'t-a': 'Same'},
+    ]);
+    final selectsBefore = reads.selects;
+    sub.pause();
+    await rename('t-a', 'One');
+    await rename('t-a', 'Two');
+    await _settle();
+    expect(reads.selects, selectsBefore, reason: 'no read while paused');
+    sub.resume();
+    await _settle();
+    expect(reads.selects - selectsBefore, 1);
+    expect(events, [
+      {'t-a': 'Same'},
+      {'t-a': 'Two'},
+    ]);
+  });
+
+  test('a change during a failed read reads again at once', () async {
+    final events = <Object>[];
+    final first = Completer<void>();
+    final sub = stats.watchCurrent(trackUuids: const ['t-a']).listen(
+      (v) {
+        events.add(titles(v));
+        if (!first.isCompleted) first.complete();
+      },
+      onError: events.add,
+    );
+    addTearDown(sub.cancel);
+    await first.future;
+    reads.pauseNextThenFail();
+    await rename('t-a', 'New');
+    await reads.reached.future;
+    db.notifyUpdates({TableUpdate.onTable(db.trackmetadata)});
+    await pumpEventQueue();
+    reads.release();
+    await _settle();
+    expect(events, [
+      {'t-a': 'Same'},
+      isA<StateError>(),
+      {'t-a': 'New'},
+    ]);
   });
 
   test('a rename updates the shown track in place', () async {
@@ -199,7 +280,13 @@ void main() {
   });
 }
 
-/// The emissions of a watch, read one at a time (no package:async here).
+/// Lets every pending read and emission finish.
+Future<void> _settle() async {
+  for (var i = 0; i < 20; i++) {
+    await pumpEventQueue();
+  }
+}
+
 /// Pauses or fails the next SELECT reaching SQLite.
 class _ReadControl extends QueryInterceptor {
   var _pause = false;
@@ -216,12 +303,24 @@ class _ReadControl extends QueryInterceptor {
   void release() => _release.complete();
   void failNext() => _fail = true;
 
+  /// Pauses the next SELECT; once released, it fails.
+  void pauseNextThenFail() {
+    pauseNext();
+    _failAfterPause = true;
+  }
+
+  var _failAfterPause = false;
+
+  /// SELECTs that reached this interceptor.
+  var selects = 0;
+
   @override
   Future<List<Map<String, Object?>>> runSelect(
     QueryExecutor executor,
     String statement,
     List<Object?> args,
   ) async {
+    selects++;
     if (_fail) {
       _fail = false;
       throw StateError('read failed');
@@ -230,11 +329,16 @@ class _ReadControl extends QueryInterceptor {
       _pause = false;
       reached.complete();
       await _release.future;
+      if (_failAfterPause) {
+        _failAfterPause = false;
+        throw StateError('read failed');
+      }
     }
     return super.runSelect(executor, statement, args);
   }
 }
 
+/// The emissions of a watch, read one at a time (no package:async here).
 class _Emissions {
   _Emissions(Stream<CurrentStatsEntities> stream) {
     _sub = stream.listen((value) {

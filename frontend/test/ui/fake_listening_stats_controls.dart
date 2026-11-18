@@ -10,7 +10,8 @@ import 'package:frontend/ui/listening_stats/stats_ranked_card.dart';
 /// state and reads back every input the view forwarded.
 class FakeListeningStatsControls extends ChangeNotifier
     implements ListeningStatsControls {
-  StatsRange _range = StatsRange.last30Days;
+  // The real controller's opening range (sign-off DEV-9-15 item 9).
+  StatsRange _range = StatsRange.last7Days;
   ListeningStatsState _state = const StatsLoading();
   SnapshotStaleness _notice = SnapshotStaleness.fresh;
 
@@ -22,6 +23,9 @@ class FakeListeningStatsControls extends ChangeNotifier
 
   /// Every track [playTrack] was asked to play, by uuid.
   final played = <String>[];
+
+  /// What [playTrack] answers.
+  PlaybackOutcome playOutcome = const Accepted(1);
   int refreshes = 0;
   int retries = 0;
   bool disposed = false;
@@ -64,7 +68,7 @@ class FakeListeningStatsControls extends ChangeNotifier
   @override
   Future<PlaybackOutcome> playTrack(TrackUI track) async {
     played.add(track.uuidId);
-    return const Accepted(1);
+    return playOutcome;
   }
 
   @override

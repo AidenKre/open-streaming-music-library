@@ -26,6 +26,7 @@ import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 import 'package:http/http.dart' as http;
 
+import '../helpers/fake_uploads_api.dart' show itemJson;
 import '../helpers/memory_upload_source.dart';
 import '../helpers/server_binding.dart';
 import '../helpers/stamped_server.dart';
@@ -38,19 +39,14 @@ const _frozenForAbort =
     '{"batch_uuid":"$_batch","items":[{"item_uuid":"$_item","filename":"a","byte_length":6,"sha256":"$_abcdefSha256"}]}';
 
 Map<String, dynamic> _itemJson({String state = 'allocated'}) => {
-  'item_uuid': _item,
-  'batch_uuid': _batch,
-  'parent_item_uuid': null,
-  'filename': 'Song.flac',
-  'selection_index': 0,
-  'member_order_key': '',
-  'state': state,
-  'expected_bytes': 6,
-  'expected_sha256': _abcdefSha256,
-  'received_bytes': 0,
-  'review_version': 0,
-  'error': null,
-  'created_at': 1,
+  ...itemJson(
+    _item,
+    batchUuid: _batch,
+    filename: 'Song.flac',
+    state: state,
+    expectedBytes: 6,
+    expectedSha256: _abcdefSha256,
+  ),
   'updated_at': 2,
 };
 
@@ -288,7 +284,7 @@ void main() {
       final item = await api.getItem(_item);
       final batch = await api.getBatch(_batch);
 
-      expect(item.state, UploadItemState.validating);
+      expect(item.rawState, 'validating');
       expect(batch.itemCount, 1);
       expect(server.requests.map((r) => '${r.method} ${r.url.path}'), [
         'GET /tracks/uploads/items/$_item',
@@ -340,7 +336,7 @@ void main() {
 
       expect(server.requests.single.method, 'DELETE');
       expect(server.requests.single.url.path, '/tracks/uploads/items/$_item');
-      expect(item.state, UploadItemState.cancelled);
+      expect(item.rawState, 'cancelled');
     });
 
     test('putContent streams the source to the content route', () async {
@@ -360,7 +356,7 @@ void main() {
       expect(request.url.path, '/tracks/uploads/items/$_item/content');
       expect(String.fromCharCodes(request.body), 'abcdef');
       expect(progress.last, 6);
-      expect(item.state, UploadItemState.validating);
+      expect(item.rawState, 'validating');
     });
 
     test('putContent of a changed source never completes the body', () async {

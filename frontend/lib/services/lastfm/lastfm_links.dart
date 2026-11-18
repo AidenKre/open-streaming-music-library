@@ -20,13 +20,10 @@ final Uri lastfmTermsUri = Uri.parse('https://www.last.fm/legal/terms');
 final Uri lastfmPrivacyUri = Uri.parse('https://www.last.fm/legal/privacy');
 
 /// `https://www.last.fm/user/<name>` with the name percent-encoded; null
-/// when the name is not a plausible account name, or is `.` or `..`.
+/// when the name is not a plausible account name (which `.` and `..` are
+/// not).
 Uri? lastfmProfileUri(String accountName) {
-  if (plausibleLastfmAccountName(accountName) == null ||
-      accountName == '.' ||
-      accountName == '..') {
-    return null;
-  }
+  if (plausibleLastfmAccountName(accountName) == null) return null;
   return Uri.parse('https://www.last.fm/user/${Uri.encodeComponent(accountName)}');
 }
 

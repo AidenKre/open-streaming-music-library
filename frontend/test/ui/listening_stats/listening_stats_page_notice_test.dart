@@ -64,7 +64,7 @@ void main() {
       expect(
         find.descendant(
           of: find.byType(NewActivityNotice),
-          matching: find.text('Listening history changed'),
+          matching: find.text('This page is out of date.'),
         ),
         findsOneWidget,
       );

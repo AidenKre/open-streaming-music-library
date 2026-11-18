@@ -153,7 +153,7 @@ def test_a_stop_during_a_process_step_kills_that_step_and_the_step_knows():
     worker = Steps(kill_registry=registry)
 
     def body():
-        seen["killed"] = worker._process_step(process, ("test", 1))
+        seen["killed"] = worker._process_step(process, job_id=("test", 1))
         seen["stop_hit_step"] = worker._stop_hit_step
         return 3600
 

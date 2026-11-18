@@ -1,9 +1,12 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/database/database.dart' show DatabaseVersionRefused;
+import 'package:frontend/services/download/track_downloader.dart'
+    show DownloadsLeftByReset, downloadsLeftByResetMessage;
+import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/services/session_readiness.dart';
@@ -12,96 +15,19 @@ import 'package:frontend/ui/server_address_page.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/startup_gate.dart';
 
+import '../helpers/fake_session_service.dart';
 import 'fake_session_controls.dart';
-
-class _FakeService extends SessionService {
-  _FakeService(super.ref);
-  SessionStart start = const SessionStart(SessionStartKind.serverAddress);
-  String? connectError;
-  bool differentServer = false;
-  List<String> losses = const [];
-  final switchedTo = <String>[];
-  final blocked = ValueNotifier(ServerBlockedReason.none);
-  int blockedResets = 0;
-  @override
-  ValueListenable<ServerBlockedReason> get serverBlocked => blocked;
-  @override
-  Future<LocalResetException?> resetForBlockedServer() async {
-    blockedResets++;
-    await resetGate?.future;
-    return resetFailure;
-  }
-
-  LocalResetException? resetFailure;
-  Completer<void>? resetGate;
-  int resets = 0;
-  int starts = 0;
-  int syncs = 0;
-  int reloads = 0;
-  @override
-  Future<void> syncLibrary() async => syncs++;
-  @override
-  Future<void> reloadSession() async => reloads++;
-  /// When set, the matching call throws it (a storage fault).
-  Object? startError;
-  Object? connectThrows;
-  Object? resetThrows;
-
-  @override
-  Future<SessionStart> resumeSavedSession() async {
-    starts++;
-    if (startError != null) throw startError!;
-    return start;
-  }
-
-  @override
-  Future<ConnectOutcome> connect(String url) async {
-    if (connectThrows != null) throw connectThrows!;
-    if (differentServer) return ConnectDifferentServer(url);
-    final error = connectError;
-    return error == null ? const ConnectSucceeded() : ConnectFailed(error);
-  }
-
-  @override
-  Future<List<String>> pendingLossSummaries() async => losses;
-
-  LogoutLosses logoutLosses = const LogoutLosses(
-    unsentUploads: 0,
-    reviewDrafts: 0,
-    unsentReviews: 0,
-    unsentCancels: 0,
-    unsentDeletions: 0,
-    unconfirmedDeletions: 0,
-  );
-  @override
-  Future<LogoutLosses> pendingLogoutLosses() async => logoutLosses;
-
-  @override
-  Future<LocalResetException?> resetForNewServer(String url) async {
-    switchedTo.add(url);
-    await resetGate?.future;
-    return resetFailure;
-  }
-
-  @override
-  Future<LocalResetException?> resetLocalData() async {
-    resets++;
-    await resetGate?.future;
-    if (resetThrows != null) throw resetThrows!;
-    return resetFailure;
-  }
-}
 
 void main() {
   group('SessionController (presentation state over SessionService)', () {
-    late _FakeService service;
+    late FakeSessionService service;
     late ProviderContainer c;
 
     setUp(() {
       c = ProviderContainer(
         overrides: [
           sessionServiceProvider.overrideWith(
-            (ref) => service = _FakeService(ref),
+            (ref) => service = FakeSessionService(),
           ),
         ],
       );
@@ -342,6 +268,82 @@ void main() {
       });
     });
 
+    // Pre-merge review D3-01 (owner, 2026-11-18): a local database of
+    // another schema version gets its own screen (its sentence and Reset…),
+    // wherever the app meets it: launch, connect, sign-in. Any other fault
+    // keeps its own sentence.
+    group('a database of another version', () {
+      final refusal = DatabaseVersionRefused(8, 1);
+
+      test('at launch: the refusal screen', () async {
+        service.startError = refusal;
+        await session().start();
+        expect(session().phase, SessionPhase.credentialsUnavailable);
+        expect(session().databaseRefused, isTrue);
+      });
+
+      test('any other launch fault is not the refusal', () async {
+        service.startError = StateError('prefs unreadable');
+        await session().start();
+        expect(session().launchFailed, isTrue);
+        expect(session().databaseRefused, isFalse);
+      });
+
+      test('at connect: the refusal screen, not the save-failed sentence',
+          () async {
+        await session().start();
+        service.connectThrows = refusal;
+        await session().connect('http://x');
+        expect(session().phase, SessionPhase.credentialsUnavailable);
+        expect(session().databaseRefused, isTrue);
+        expect(session().connectError, isNull);
+      });
+
+      test('any other connect fault keeps the save-failed sentence', () async {
+        await session().start();
+        service.connectThrows = StateError('database is locked');
+        await session().connect('http://x');
+        expect(session().phase, SessionPhase.serverAddress);
+        expect(session().databaseRefused, isFalse);
+        expect(session().connectError,
+            'This device could not save the server address.');
+      });
+
+      test('at sign-in: the refusal screen, not a sign-in sentence', () async {
+        service.start = const SessionStart(SessionStartKind.logIn,
+            serverUrl: 'http://s');
+        await session().start();
+        service.signInThrows = refusal;
+        await session().login('alice', 'pw-alice-1');
+        expect(session().phase, SessionPhase.credentialsUnavailable);
+        expect(session().databaseRefused, isTrue);
+        expect(session().authError, isNull);
+      });
+
+      test('any other sign-in fault keeps "Could not sign in."', () async {
+        service.start = const SessionStart(SessionStartKind.logIn,
+            serverUrl: 'http://s');
+        await session().start();
+        service.signInThrows = StateError('database is locked');
+        await session().login('alice', 'pw-alice-1');
+        expect(session().phase, SessionPhase.logIn);
+        expect(session().databaseRefused, isFalse);
+        expect(session().authError, 'Could not sign in.');
+      });
+
+      test('Reset… resets like Disconnect', () async {
+        service.startError = refusal;
+        await session().start();
+        await session().disconnect();
+        expect(service.calls, contains('resetLocalData'));
+        expect(session().phase, SessionPhase.resetComplete);
+        await session().acknowledgeReset();
+        expect(session().phase, SessionPhase.serverAddress);
+        expect(session().databaseRefused, isFalse,
+            reason: 'the reset replaced that database');
+      });
+    });
+
     // EX-75c (SC-26): whether the finished reset's dialog is the "sign-in
     // not saved" sentence is the model's rule, read through the controller,
     // so the view imports no service.
@@ -380,6 +382,41 @@ void main() {
           ])),
           isNull,
         );
+      });
+    });
+
+    // Other-issues row 66 and APP-DATA review 2 F4: the "Reset incomplete"
+    // sentence is the model's, read through the controller.
+    group('resetIncompleteMessage', () {
+      Future<String?> after(LocalResetException failure) async {
+        service.resetFailure = failure;
+        await session().disconnect();
+        return session().resetIncompleteMessage;
+      }
+
+      LocalResetFailure downloadsLeft() => LocalResetFailure(
+          DownloadManager, const DownloadsLeftByReset(2), StackTrace.empty);
+
+      test('downloads left outside the folder: the downloads sentence',
+          () async {
+        expect(await after(LocalResetException([downloadsLeft()])),
+            downloadsLeftByResetMessage);
+      });
+
+      test('any other wipe failure: the fixed sentence, without its text',
+          () async {
+        expect(
+          await after(LocalResetException([
+            downloadsLeft(),
+            LocalResetFailure(int, StateError('wipe failed'), StackTrace.empty),
+          ])),
+          'Some local data could not be cleared.',
+        );
+      });
+
+      test('no failure: none', () async {
+        await session().disconnect();
+        expect(session().resetIncompleteMessage, isNull);
       });
     });
 
@@ -542,6 +579,34 @@ void main() {
         await tester.pumpWidget(const SizedBox.shrink());
       });
 
+      // Owner, 2026-11-17: after a launch fault the screen says what "Log
+      // in again" does (it deletes any stored sign-in); the unreadable
+      // sign-in case keeps its own texts.
+      const replaces =
+          'Logging in again replaces any sign-in saved on this device.';
+
+      testWidgets('after a launch fault: says what Log in again does',
+          (tester) async {
+        final fake = FakeSessionControls(
+          phase: SessionPhase.credentialsUnavailable,
+        )..launchFailed = true;
+        await tester.pumpWidget(ProviderScope(
+          overrides: [sessionControlsProvider.overrideWithValue(fake)],
+          child: const MaterialApp(home: StartupGate()),
+        ));
+        await tester.pump();
+        expect(find.text(sessionUnreadable), findsOneWidget);
+        expect(find.text(replaces), findsOneWidget);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+
+      testWidgets('an unreadable stored sign-in: no launch-fault sentence',
+          (tester) async {
+        await pump(tester, SessionPhase.credentialsUnavailable);
+        expect(find.text(replaces), findsNothing);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+
       testWidgets('an unreadable stored sign-in: the sign-in texts as before',
           (tester) async {
         final fake = await pump(tester, SessionPhase.credentialsUnavailable);
@@ -551,6 +616,108 @@ void main() {
         expect(find.text('Try again'), findsOneWidget);
         expect(find.text('Log in again'), findsOneWidget);
         expect(fake.launchFailed, isFalse);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+    });
+
+    // Pre-merge review D3-01 (owner, 2026-11-18): the approved sentence and
+    // Reset…, which opens the existing "Reset and disconnect?" sheet.
+    group('a database of another version', () {
+      const refusedText = "This device's saved app data was made by a "
+          "different version of the app and can't be opened. Resetting "
+          "removes this device's downloads, settings and sign-in. Nothing on "
+          'the server changes.';
+      const sessionUnreadable = "This device's saved session could not be read.";
+      const uncounted = 'Some unsent changes could not be counted';
+
+      Future<FakeSessionControls> refused(WidgetTester tester) async {
+        final fake = FakeSessionControls(
+          phase: SessionPhase.credentialsUnavailable,
+        )
+          ..launchFailed = true
+          ..databaseRefused = true
+          ..lossSummaries = const [uncounted];
+        await tester.pumpWidget(ProviderScope(
+          overrides: [sessionControlsProvider.overrideWithValue(fake)],
+          child: const MaterialApp(home: StartupGate()),
+        ));
+        await tester.pump();
+        return fake;
+      }
+
+      Future<void> openSheet(WidgetTester tester) async {
+        await tester.tap(find.text('Reset…'));
+        await tester.pump();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
+      }
+
+      testWidgets('the approved sentence and Reset…, and nothing else to '
+          'press; nothing runs while it shows', (tester) async {
+        final fake = await refused(tester);
+        expect(find.text(refusedText), findsOneWidget);
+        expect(find.text('Reset…'), findsOneWidget);
+        expect(find.text(sessionUnreadable), findsNothing);
+        expect(find.text('Try again'), findsNothing,
+            reason: 'trying again cannot open this database');
+        expect(find.text('Log in again'), findsNothing);
+        await tester.pump(const Duration(minutes: 5));
+        expect(fake.calls, ['start']);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+
+      testWidgets('Reset… opens "Reset and disconnect?" with the uncounted '
+          'line; confirming resets', (tester) async {
+        final fake = await refused(tester);
+        await openSheet(tester);
+        expect(find.text('Reset and disconnect?'), findsOneWidget);
+        expect(find.textContaining(uncounted), findsOneWidget);
+        await tester.tap(find.text('Reset and disconnect'));
+        await tester.pump();
+        expect(fake.calls, ['start', 'disconnect']);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+
+      testWidgets('Cancel resets nothing; the screen stays', (tester) async {
+        final fake = await refused(tester);
+        await openSheet(tester);
+        await tester.tap(find.text('Cancel'));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
+        expect(fake.calls, ['start']);
+        expect(find.text(refusedText), findsOneWidget);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+
+      testWidgets('a second tap while the losses are read opens one sheet',
+          (tester) async {
+        final fake = await refused(tester);
+        final gate = Completer<List<String>>();
+        fake.lossSummariesGate = gate;
+        await tester.tap(find.text('Reset…'));
+        await tester.tap(find.text('Reset…'));
+        gate.complete(const [uncounted]);
+        await tester.pump();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
+        expect(fake.lossSummaryReads, 1);
+        expect(find.text('Reset and disconnect?'), findsOneWidget);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+
+      testWidgets('a launch fault that is not the refusal never shows its '
+          'sentence', (tester) async {
+        final fake = FakeSessionControls(
+          phase: SessionPhase.credentialsUnavailable,
+        )..launchFailed = true;
+        await tester.pumpWidget(ProviderScope(
+          overrides: [sessionControlsProvider.overrideWithValue(fake)],
+          child: const MaterialApp(home: StartupGate()),
+        ));
+        await tester.pump();
+        expect(find.text(refusedText), findsNothing);
+        expect(find.text('Reset…'), findsNothing);
+        expect(find.text(sessionUnreadable), findsOneWidget);
         await tester.pumpWidget(const SizedBox.shrink());
       });
     });

@@ -36,6 +36,7 @@ from tests.deletion_world import (
     revision,
     sql,
 )
+from tests.track_paths import allow_two_tracks_on_one_path, set_track_path
 
 
 @pytest.fixture
@@ -176,7 +177,9 @@ def test_an_original_path_another_track_names_is_never_restored_to(world):
     uuid_id, rev, op = crashed_at(world, "after_rename")
     master = path_of(world, uuid_id)
     other = add_master(world, "Other/x.flac")
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(master), other))
+    # Two rows naming one file: the state the unique index now refuses.
+    allow_two_tracks_on_one_path(world.db)
+    set_track_path(world.db, other, master)
     before = snapshot(world, uuid_id)
 
     recover(world)
@@ -200,6 +203,7 @@ def test_a_symlinked_folder_on_the_way_back_is_never_followed(world):
 
 
 @pytest.mark.parametrize("where", ["quarantine folder", "original folder"])
+@pytest.mark.requires_chmod_denial
 def test_an_identity_that_cannot_be_read_keeps_the_journal(world, where):
     uuid_id, rev, op = crashed_at(
         world, "after_rename" if where == "quarantine folder" else "after_journal"
@@ -283,6 +287,22 @@ def test_a_symlinked_owner_quarantine_folder_is_never_trusted(world):
     assert not path_of(world, uuid_id).exists()
 
 
+def test_a_symlinked_quarantine_base_folder_is_never_trusted(world):
+    """The same for .deleting itself: the owner's folder below a symbolic
+    link reads as a real folder, so only the check of the base catches it."""
+    uuid_id, rev, op = crashed_at(world, "after_rename")
+    base = world.music / ".deleting"
+    real = world.tmp / "real-quarantine-base"
+    os.rename(base, real)
+    os.symlink(real, base)
+    before = snapshot(world, uuid_id)
+
+    recover(world)
+
+    assert_kept(world, uuid_id, op, before)
+    assert not path_of(world, uuid_id).exists()
+
+
 def test_another_owners_journal_resolves_under_that_owners_root(world):
     mine = add_master(world, "Portishead/Dummy/01 Mysterons.flac")
     mine_before = path_of(world, mine).read_bytes()
@@ -302,7 +322,7 @@ def test_a_journal_whose_track_points_into_another_owners_root_touches_nothing(w
     owner's root): the path is judged under Sam's root and refused."""
     theirs, rev, op = crashed_at(world, "after_rename", owner=world.sam)
     planted = world.root(world.owner) / "Portishead" / "Dummy" / "01 Mysterons.flac"
-    sql(world, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(planted), theirs))
+    set_track_path(world.db, theirs, planted)
     sql(world, "UPDATE deletion_journal SET original_path = ? WHERE uuid_id = ?", (str(planted), theirs))
     before = snapshot(world, theirs)
 
@@ -328,6 +348,7 @@ def test_a_kept_journal_is_resolved_once_the_original_path_is_free_again(world):
     assert item(world, op, uuid_id)["error"] == "recovery_required"  # terminal: never rewritten
 
 
+@pytest.mark.requires_chmod_denial
 def test_an_unreadable_quarantine_beside_an_intact_original_keeps_the_journal(world):
     """Unknown is never "free": with the original intact and the quarantine
     path unreadable, the journal is not cleared (the mutation spot-check that

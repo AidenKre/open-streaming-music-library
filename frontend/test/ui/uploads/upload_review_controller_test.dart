@@ -34,6 +34,8 @@ import 'package:frontend/ui/preview_controller.dart';
 import 'package:frontend/ui/uploads/upload_review_controller.dart';
 
 import '../../helpers/duplicate_check_fixtures.dart';
+import '../../helpers/fake_uploads_api.dart' show itemJson;
+import '../../helpers/upload_intent_record.dart';
 import '../../repositories/catalog_seed.dart';
 import '../fake_uploads_controls.dart';
 
@@ -45,20 +47,15 @@ UploadItem _item(
   String? title,
   String? result,
 }) => UploadItem.fromJson({
-  'item_uuid': uuid,
-  'batch_uuid': 'b-1',
-  'parent_item_uuid': null,
-  'filename': '$uuid.flac',
-  'selection_index': index,
-  'member_order_key': '',
-  'state': state,
-  'expected_bytes': 3,
-  'expected_sha256': null,
-  'received_bytes': 3,
-  'review_version': version,
-  'error': null,
-  'created_at': 1,
-  'updated_at': 1,
+  ...itemJson(
+    uuid,
+    filename: '$uuid.flac',
+    selectionIndex: index,
+    state: state,
+    expectedBytes: 3,
+    receivedBytes: 3,
+    reviewVersion: version,
+  ),
   'tag_write_supported': true,
   'result_track_uuid': result,
   'detected_metadata': {
@@ -68,25 +65,13 @@ UploadItem _item(
 });
 
 UploadIntentRecord _intent(String uuid, String state, {String? code,
-    String batch = 'b-1'}) => UploadIntentRecord(
-  itemUuid: uuid,
+    String batch = 'b-1'}) => intentRecord(
+  uuid,
   batchUuid: batch,
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: '$uuid.flac',
-  lastState: state,
+  state: state,
   lastErrorCode: code,
-  lastErrorMessage: null,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
   localBindingId: 'bind',
-  createdAtMs: 0,
-  updatedAtMs: 0,
-  expectedLength: null,
-  expectedSha256: null,
-  descriptor: null,
 );
 
 TrackUI _track(String uuid) => TrackUI(
@@ -486,6 +471,35 @@ void main() {
       c.dispose();
     });
 
+    // Refactor APP-UPLOAD, section 6 #4 (owner 2026-11-17): Cancel and the
+    // duplicate choice wait for a review submit, like Confirm and Skip.
+    test('while a submit is being sent, Cancel and the duplicate choice do '
+        'nothing; Cancel works again once the submit ended', () async {
+      review.submitGate = Completer<void>();
+      final c = await started();
+      final first = confirmShown(c, writeTags: false);
+      await settle();
+      expect(c.busy, isTrue);
+      expect(c.current!.canCancel, isTrue);
+      expect(c.current!.canDecideDuplicates, isTrue);
+
+      await c.cancelItem();
+      c.chooseDuplicates(DuplicateGroup.library);
+      expect(
+        review.calls.where(
+            (x) => x.startsWith('cancel') || x.startsWith('choose')),
+        isEmpty,
+      );
+      expect(review.chosen, isEmpty);
+
+      review.submitGate!.complete();
+      await first;
+      expect(c.busy, isFalse);
+      await c.cancelItem();
+      expect(review.calls, contains('cancel a'));
+      c.dispose();
+    });
+
     test('offline: Confirm, Skip and Cancel send nothing', () async {
       final c = await started();
       container.read(overview.notifier).state = fakeUploadsOverview(const [],
@@ -521,6 +535,48 @@ void main() {
       final c = await started(at: 'c');
       await c.cancelItem();
       expect(review.calls, contains('cancel c'));
+      c.dispose();
+    });
+  });
+
+  // Refactor APP-UPLOAD (sign-off s7-app-texts, cascade-8 review #1): the
+  // review page reads the same other-device check as the Uploads page.
+  group('another device is sending the upload', () {
+    test('a waiting row reads as being sent while the upload is seen '
+        'arriving, and as not found here once it is not', () async {
+      final c = await started(local: [
+        _intent('a', 'on_other_device'),
+        _intent('b', 'review_ready'),
+        _intent('c', 'review_ready'),
+      ]);
+      container.read(overview.notifier).state =
+          fakeUploadsOverview(const [], otherDeviceSending: {'b-1'});
+      await settle();
+      expect(c.current!.statusText, 'Waiting for the file');
+      expect(c.current!.errorText, 'Another device is sending this upload.');
+
+      container.read(overview.notifier).state = fakeUploadsOverview(const []);
+      await settle();
+      expect(
+        c.current!.errorText,
+        "This device cannot find this file, so it can't send it. Cancel it "
+        'and add it again.',
+      );
+      c.dispose();
+    });
+
+    test('a row being received from another device reads as such; paused '
+        'transfers read Paused, as on the Uploads page', () async {
+      final c = await started(local: [
+        _intent('a', 'receiving'),
+        _intent('b', 'review_ready'),
+        _intent('c', 'review_ready'),
+      ]);
+      expect(c.current!.statusText, 'Uploading from another device');
+      container.read(overview.notifier).state =
+          fakeUploadsOverview(const [], transfersPaused: true);
+      await settle();
+      expect(c.current!.statusText, 'Paused');
       c.dispose();
     });
   });

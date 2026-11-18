@@ -22,6 +22,7 @@ import 'package:frontend/ui/conversion_controller.dart';
 import 'package:frontend/ui/conversions_page.dart';
 
 import 'fake_conversion_controls.dart';
+import '../helpers/test_offline.dart';
 
 class _FixedConversionJobs extends ConversionJobsNotifier {
   _FixedConversionJobs(this._jobs, {this.enqueueError});
@@ -84,14 +85,6 @@ class _StubSync extends TrackSyncNotifier {
     calls++;
     await gate?.future;
     return true;
-  }
-}
-
-class _Online extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
   }
 }
 
@@ -191,7 +184,7 @@ void main() {
         ),
         trackSyncProvider.overrideWith(() => sync ?? _StubSync()),
         appInfoProvider.overrideWith((ref) async => _capabilities),
-        offlineModeProvider.overrideWith(_Online.new),
+        offlineModeProvider.overrideWith(() => TestOffline(false)),
       ],
       child: const MaterialApp(home: ConversionsPage()),
     );
@@ -218,6 +211,32 @@ void main() {
 
     expect(find.text('Active'), findsOneWidget);
     expect(find.text('Finished'), findsOneWidget);
+  });
+
+  // Row 35 (owner, 2026-11-17): a finished job says what it did; a track not
+  // on this device is "Unknown track", never its internal ID.
+  testPage('a finished job reads "Converted to …"; an active one keeps '
+      '"Convert to …"', (tester) async {
+    await _insertTrack(db, 'abc', title: 'Done song');
+    await _insertTrack(db, 'def', title: 'Queued song');
+    await tester.pumpWidget(wrap([
+      _job(jobId: 1, uuidId: 'abc', targetCodec: 'flac', targetBitrate: null,
+          status: 'done'),
+      _job(jobId: 2, uuidId: 'def', status: 'queued'),
+    ]));
+    await tester.pumpAndSettle();
+    expect(find.text('Converted to FLAC'), findsOneWidget);
+    expect(find.text('Convert to AAC • 192 kbps'), findsOneWidget);
+    expect(find.text('Convert to FLAC'), findsNothing);
+  });
+
+  testPage('a track not on this device reads "Unknown track", never its ID',
+      (tester) async {
+    const id = '3f2c9a00-0000-4000-8000-000000000001';
+    await tester.pumpWidget(wrap([_job(uuidId: id, status: 'queued')]));
+    await tester.pumpAndSettle();
+    expect(find.text('Unknown track'), findsOneWidget);
+    expect(find.textContaining(id), findsNothing);
   });
 
   testPage('queued job shows a cancel button that calls cancel', (tester) async {
@@ -443,12 +462,14 @@ void main() {
       (tester) async {
     await tester.pumpWidget(wrap([_job(uuidId: 'later', status: 'done')]));
     await tester.pumpAndSettle();
-    expect(find.text('later'), findsOneWidget, reason: 'uuid until synced');
+    // Row 35: "Unknown track" until synced, never the ID.
+    expect(find.text('Unknown track'), findsOneWidget);
+    expect(find.text('later'), findsNothing);
 
     await _insertTrack(db, 'later', title: 'Arrived Later');
     await tester.pumpAndSettle();
     expect(find.text('Arrived Later'), findsOneWidget);
-    expect(find.text('later'), findsNothing);
+    expect(find.text('Unknown track'), findsNothing);
 
     // A later rename (another /changes upsert) is reflected too.
     await (db.update(db.trackmetadata)

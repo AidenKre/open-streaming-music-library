@@ -96,9 +96,8 @@ class _Files extends StatelessWidget {
   final UploadsControls controls;
   final UploadRow parent;
 
-  void _review(BuildContext context, UploadChildRow child) {
-    if (controls.reviewTags(child.itemUuid) != ReviewTagsOutcome.open) return;
-    Navigator.of(context).push(
+  Future<void> _review(BuildContext context, UploadChildRow child) async {
+    await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => UploadReviewPage(
           batchUuid: parent.batchUuid,
@@ -106,6 +105,10 @@ class _Files extends StatelessWidget {
         ),
       ),
     );
+    // The review may have changed the archive's files: read them again.
+    if (context.mounted) {
+      controls.loadChildren(parent.batchUuid, parent.itemUuid, quiet: true);
+    }
   }
 
   Widget _reviewButton(BuildContext context, UploadChildRow child) {

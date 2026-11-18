@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 
 import '../../helpers/memory_upload_source.dart';
+import '../../helpers/chmod_denial.dart';
 
 // Independent fixtures (computed with Python's hashlib, not with `crypto`).
 const _abcSha256 =
@@ -175,6 +176,23 @@ void main() {
       await file.writeAsBytes('abc'.codeUnits);
       final source = await FileUploadSource.open(file.path);
       await file.delete();
+
+      await expectLater(
+        digestUploadSource(source),
+        throwsA(isA<UploadSourceUnavailable>()),
+      );
+    });
+
+    // Moved here from the deleted reopenUploadSource group (refactor
+    // APP-UPLOAD, B.9): a file the app may no longer read is unavailable
+    // (reselect), never a changed file.
+    test('a file the app may no longer read is unavailable when read',
+        skip: skipUnlessChmodDenies, () async {
+      final file = File('${dir.path}/song.flac');
+      await file.writeAsBytes('abc'.codeUnits);
+      final source = await FileUploadSource.open(file.path);
+      await Process.run('chmod', ['000', file.path]);
+      addTearDown(() => Process.run('chmod', ['600', file.path]));
 
       await expectLater(
         digestUploadSource(source),

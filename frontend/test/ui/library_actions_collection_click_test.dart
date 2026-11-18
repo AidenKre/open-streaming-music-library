@@ -25,11 +25,13 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/clock.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/ui/library_actions.dart';
 
 import '../helpers/fake_clock.dart';
 import '../helpers/server_binding.dart';
-import 'browse_harness.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
+import '../helpers/test_offline.dart';
 
 /// The audio player, faked: an optional current session that accepts
 /// enqueues, and an activation that always succeeds.
@@ -102,6 +104,15 @@ class _FailingBinding extends ServerBindingRepository {
       Future.error(StateError('binding read failed'));
 }
 
+/// A binding gate whose server check failed (sign-off OPEN-M-11: playback
+/// then treats streams like offline).
+class _FailedCheckGate extends Fake implements ServerBindingGate {
+  @override
+  BindingGateState get state => BindingUnverified(StateError('unreachable'));
+  @override
+  bool get lastVerdictFailed => true;
+}
+
 void main() {
   late AppDatabase db;
   late ProviderContainer container;
@@ -131,6 +142,7 @@ void main() {
     CodecSupport codecs = const CodecSupport.unknown(),
     bool failingMembership = false,
     bool failingBinding = false,
+    bool failedServerCheck = false,
   }) async {
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, seed);
@@ -156,6 +168,8 @@ void main() {
       if (failingBinding)
         serverBindingRepositoryProvider
             .overrideWith((ref) => _FailingBinding(db)),
+      if (failedServerCheck)
+        serverBindingGateProvider.overrideWithValue(_FailedCheckGate()),
     ]);
   }
 
@@ -350,6 +364,25 @@ void main() {
       expect(player.activated, hasLength(1));
       expect(await clicks(), [('album', 'srv-1:2')]);
     });
+
+    // Pre-merge A6-05 (sign-off OPEN-M-11: a failed server check plays like
+    // offline): the membership follows the rule every other play path uses.
+    for (final (name, run) in [
+      ('Play', (LibraryActionControls a) => a.play(album)),
+      ('Shuffle', (LibraryActionControls a) => a.shuffle(album)),
+    ]) {
+      test('the server check failed (not offline): album $name queues only '
+          'the downloaded members', () async {
+        await start(reconciled: true, failedServerCheck: true);
+        await download('n2');
+        expect(await run(actions()), isA<Accepted>());
+        final queued = await container
+            .read(queueRepositoryProvider)
+            .getSessionTracksInPlayOrder(player.activated.single);
+        expect(queued.map((t) => t.uuidId), ['n2'],
+            reason: 'n1 is not downloaded: it cannot play now');
+      });
+    }
   });
   // R1-1 (amends DEV-6-02): offline, with a queue already active, Play next /
   // Add to queue on a collection queue only the members this device can play

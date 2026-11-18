@@ -19,18 +19,7 @@ import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 import '../helpers/no_server_api.dart';
-
-/// Pins [offlineModeProvider] to a fixed value without running the real
-/// health-poll timer.
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../helpers/test_offline.dart';
 
 void main() {
   late AppDatabase db;
@@ -57,7 +46,7 @@ void main() {
         databaseProvider.overrideWithValue(db),
         coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         localCoverArtStoreProvider.overrideWithValue(coverStore),
-        offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+        offlineModeProvider.overrideWith(() => TestOffline(offline)),
       ],
       child: MaterialApp(home: child),
     );

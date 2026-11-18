@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/playback/track_cache_manager.dart';
+import 'package:frontend/playback/stream_uris.dart';
 import 'package:frontend/services/quality_presets.dart';
 
 void main() {

@@ -16,7 +16,7 @@ from app.services.audio_identity import FingerprintIdentity
 from app.services.storage_ledger import UPLOAD_SOURCE
 from app.services.upload_errors import probe_timeout, upload_invalid_audio
 from app.services.upload_validation import ValidationFailed, ValidationInterrupted
-from tests.identity_worker_fixtures import add_track, make_db, sql
+from tests.identity_worker_fixtures import add_track, sql
 from tests.upload_validation_fixtures import (
     BOOT,
     FINGERPRINTER,
@@ -31,11 +31,6 @@ from tests.upload_validation_fixtures import (
     source_rows,
     stage_item,
 )
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

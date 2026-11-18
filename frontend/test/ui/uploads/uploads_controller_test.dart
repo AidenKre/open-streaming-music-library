@@ -226,13 +226,6 @@ void main() {
       c.dispose();
     });
 
-    test('Review tags opens the review flow and sends nothing (7B.2c)', () {
-      final c = create();
-      expect(c.reviewTags('i-1'), ReviewTagsOutcome.open);
-      expect(manager.calls, isEmpty);
-      c.dispose();
-    });
-
     test('reselect picks a file and offers it for the item', () async {
       final c = create();
       picker.queue.add(
@@ -432,6 +425,42 @@ void main() {
       await c.loadChildren('b-1', 'zip');
       expect(c.childrenOf('zip'), isA<ChildListLoaded>());
       expect(children.requests, hasLength(2));
+      c.dispose();
+    });
+
+    // Pre-merge review PMR-04: the reload after a file's review keeps the
+    // list on screen while it runs and when it fails.
+    test('a quiet reload keeps the shown list until a new one arrives',
+        () async {
+      final c = create();
+      children.answer.complete(_zip);
+      await c.loadChildren('b-1', 'zip');
+      final shown = c.childrenOf('zip');
+
+      children.answer = Completer();
+      final failing = c.loadChildren('b-1', 'zip', quiet: true);
+      expect(c.childrenOf('zip'), same(shown));
+      children.answer.completeError(Exception('network'));
+      await failing;
+      expect(c.childrenOf('zip'), same(shown));
+
+      final next = _zip;
+      children.answer = Completer()..complete(next);
+      await c.loadChildren('b-1', 'zip', quiet: true);
+      expect(c.childrenOf('zip'), isNot(same(shown)));
+      expect((c.childrenOf('zip')! as ChildListLoaded).children, same(next));
+      expect(children.requests, hasLength(3));
+      c.dispose();
+    });
+
+    test('a quiet reload of a list that never loaded shows its progress',
+        () async {
+      final c = create();
+      final done = c.loadChildren('b-1', 'zip', quiet: true);
+      expect(c.childrenOf('zip'), isA<ChildListLoading>());
+      children.answer.completeError(Exception('network'));
+      await done;
+      expect(c.childrenOf('zip'), isA<ChildListFailed>());
       c.dispose();
     });
 

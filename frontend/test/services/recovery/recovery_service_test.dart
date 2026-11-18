@@ -313,12 +313,10 @@ void main() {
       // `_ReconcileDownloadsRecoverable` already uses for reconcile above —
       // so sync should run there too, not only on `networkRecovered`.
       //
-      // It currently doesn't: `_SyncRecoverable.triggers` is just
-      // `{networkRecovered}`. Until a resync happens to be triggered by some
-      // other page mounting (Artists/Albums/Tracks `initState`), a plain
-      // background-then-foreground cycle leaves stale/orphaned local state
-      // (e.g. an artist card with zero remaining tracks) on screen
-      // indefinitely.
+      // `_SyncRecoverable.triggers` holds both edges. With only
+      // `{networkRecovered}`, a plain background-then-foreground cycle would
+      // leave stale or orphaned local state (an artist card with no tracks
+      // left) on screen until some page happened to start a sync.
       final container = ProviderContainer();
       addTearDown(container.dispose);
 

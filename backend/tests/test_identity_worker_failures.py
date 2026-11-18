@@ -23,12 +23,8 @@ from app.services.identity_worker import (
     TOOL_MISSING_RETRY_S,
 )
 from tests.identity_worker_fakes import T0, FakeClock, FakeCompute, bytes_digest, make_worker
-from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, make_db, sql
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
+from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, sql
+from tests.track_paths import set_track_path
 
 
 @pytest.fixture
@@ -117,8 +113,7 @@ def test_a_missing_master_whose_path_changed_retries_at_once(db, music):
     new = _file(music, "new.flac")
     uuid_id = add_track(db, old)
     compute = FakeCompute()
-    compute.mid = lambda: sql(
-        db, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(new), uuid_id))
+    compute.mid = lambda: set_track_path(db, uuid_id, new)
     worker = make_worker(db, compute=compute)
 
     worker.process_one()

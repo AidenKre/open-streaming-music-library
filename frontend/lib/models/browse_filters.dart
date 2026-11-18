@@ -1,5 +1,15 @@
 import 'package:flutter/foundation.dart';
 
+/// How a surface's Downloaded filter reacts to connectivity (SC-09).
+enum OfflineFilterPolicy {
+  /// Offline switches Downloaded on; reconnecting undoes only that ON.
+  /// Every Phase 3/4 surface.
+  autoApply,
+
+  /// Never touched by connectivity (Phase 6's Home chip and See all).
+  manual,
+}
+
 /// The filter-chip selection for one browse surface (a root browse tab or
 /// Search today, Home in Phase 6). Session-only: the surface's
 /// `BrowseFilterControls` holds it; it is never global or persisted.
@@ -12,16 +22,6 @@ import 'package:flutter/foundation.dart';
 /// but never locks it: the user can switch it off to browse the full library
 /// from local metadata. Reconnecting ([cameOnline]) undoes only an ON that
 /// offline applied and the user left alone.
-/// How a surface's Downloaded filter reacts to connectivity (SC-09).
-enum OfflineFilterPolicy {
-  /// Offline switches Downloaded on; reconnecting undoes only that ON.
-  /// Every Phase 3/4 surface.
-  autoApply,
-
-  /// Never touched by connectivity (Phase 6's Home chip and See all).
-  manual,
-}
-
 @immutable
 class BrowseFilters {
   const BrowseFilters({
@@ -33,10 +33,10 @@ class BrowseFilters {
          'only an ON can have been applied by offline',
        );
 
-  /// Starting selection for a page created while [isOffline].
   /// How connectivity changes affect [downloaded].
   final OfflineFilterPolicy policy;
 
+  /// Starting selection for a page created while [isOffline].
   factory BrowseFilters.initial({
     required bool isOffline,
     OfflineFilterPolicy policy = OfflineFilterPolicy.autoApply,

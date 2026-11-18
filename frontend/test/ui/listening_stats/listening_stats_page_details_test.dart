@@ -134,6 +134,12 @@ void main() {
     expect(texts, contains('30 min'));
     expect(texts, contains('2 qualified plays'));
     expect(texts, contains('included in the totals'));
+    // Decision 6, row 2 (owner, 2026-11-17): "unknown", not "unresolved".
+    expect(
+      texts,
+      contains('(deleted or unknown tracks; included in the totals above).'),
+    );
+    expect(texts, contains('Unavailable history: 30 min'));
     // The overall totals are not reduced by it.
     expect(summaryValue('time', '2 h'), findsOneWidget);
     expect(summaryValue('plays', '9'), findsOneWidget);

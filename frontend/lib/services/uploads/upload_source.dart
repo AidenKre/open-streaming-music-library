@@ -208,62 +208,6 @@ class UploadSourceDescriptor {
   String toString() => 'UploadSourceDescriptor($length bytes)';
 }
 
-/// The result of reopening a persisted source.
-sealed class SourceReopen {
-  const SourceReopen();
-}
-
-/// The file is there with the same length and digest.
-final class SourceReopened extends SourceReopen {
-  const SourceReopened(this.source);
-  final FileUploadSource source;
-}
-
-/// The file is readable but its content differs: `sourceChanged`. The
-/// allocation's digest can never match it; the file must be uploaded anew.
-final class SourceChangedSinceSelection extends SourceReopen {
-  const SourceChangedSinceSelection(this.change);
-  final SourceChange change;
-}
-
-/// The file can't be opened or read (gone, or no longer permitted): show
-/// "Reselect file to retry". Distinct from a changed file.
-final class SourceNeedsReselect extends SourceReopen {
-  const SourceNeedsReselect();
-}
-
-/// Opens [descriptor]'s path again and checks length (stat, cheap) and then
-/// digest (streamed).
-Future<SourceReopen> reopenUploadSource(
-  UploadSourceDescriptor descriptor, {
-  required String displayName,
-}) async {
-  final FileUploadSource source;
-  try {
-    source = await FileUploadSource.open(
-      descriptor.path,
-      displayName: displayName,
-    );
-  } on UploadSourceUnavailable {
-    return const SourceNeedsReselect();
-  }
-  if (source.length != descriptor.length) {
-    return const SourceChangedSinceSelection(SourceChange.length);
-  }
-  final SourceDigest digest;
-  try {
-    digest = await digestUploadSource(source);
-  } on UploadSourceUnavailable {
-    return const SourceNeedsReselect();
-  } on UploadSourceChanged catch (e) {
-    return SourceChangedSinceSelection(e.change);
-  }
-  if (digest.sha256.toLowerCase() != descriptor.sha256.toLowerCase()) {
-    return const SourceChangedSinceSelection(SourceChange.digest);
-  }
-  return SourceReopened(source);
-}
-
 /// The content PUT body for [source]: its bytes, checked against the
 /// allocation's [expectedLength] and [expectedSha256] while they stream.
 ///

@@ -6,6 +6,17 @@ __pycache__/
 pyrightconfig.json
 temp/
 
+# Server data: the default folders when the server runs from backend/
+# (app/config.py), and a database or instance lock anywhere below it
+backend/data/
+backend/music/
+backend/import/
+backend/import-users/
+backend/**/*.db
+backend/**/*.db-wal
+backend/**/*.db-shm
+backend/**/osml.lock
+
 # Flutter/Dart
 frontend/.dart_tool/
 frontend/.packages

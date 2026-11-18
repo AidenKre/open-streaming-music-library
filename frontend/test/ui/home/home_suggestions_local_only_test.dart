@@ -6,15 +6,11 @@
 // The two inputs owned elsewhere are pinned: the current track (a select over
 // QueuePlayer state, SC-27) and the Phase 6 Home chip controller.
 import 'package:drift/native.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/browse_filters.dart';
-import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/audio_providers.dart';
-import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/home_suggestions_service.dart';
 import 'package:frontend/services/settings_service.dart';
@@ -24,24 +20,7 @@ import 'package:frontend/ui/home/home_suggestions_controller.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../repositories/catalog_seed.dart';
-
-class _Chip extends ChangeNotifier implements HomeControls {
-  BrowseFilters _filters = const BrowseFilters(policy: OfflineFilterPolicy.manual);
-  @override
-  BrowseFilters get filters => _filters;
-  @override
-  void setDownloaded(bool value) {
-    _filters = _filters.userSetDownloaded(value);
-    notifyListeners();
-  }
-
-  @override
-  HomeRecentsState get recents => const HomeRecentsEmpty(filtered: false);
-  @override
-  void retryRecents() {}
-  @override
-  Future<PlaybackOutcome> playTrack(TrackUI track) async => const Accepted(1);
-}
+import '../../helpers/fake_home_controls.dart';
 
 void main() {
   test('every suggestion path runs with no HTTP or API client in the graph',
@@ -55,7 +34,7 @@ void main() {
     await seed.track('t2', artistId: 1, title: 'b');
     await seed.click('track', 't1', at: 1, kind: 'play', eventUuid: 'e1');
 
-    final chip = _Chip();
+    final chip = FakeHomeControls(const HomeRecentsEmpty(filtered: false));
     final container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),

@@ -339,6 +339,18 @@ void main() {
       await teardownTree(tester);
     });
 
+    // Refactor APP-DUP (section 6 #11): the controller's reason.
+    testWidgets('needs a connection says the controller\'s reason', (
+      tester,
+    ) async {
+      fake.receiptsLoad = ReceiptsLoad.needsConnection;
+      fake.receiptsUnreachableText = 'Reason words.';
+      await pumpPage(tester);
+      expect(find.text('Reason words.'), findsOne);
+      expect(find.text('Deletion history needs a connection.'), findsNothing);
+      await teardownTree(tester);
+    });
+
     testWidgets('loaded with nothing in it says so; never while loading, '
         'failed or disconnected', (tester) async {
       fake.receiptsLoad = ReceiptsLoad.loaded;

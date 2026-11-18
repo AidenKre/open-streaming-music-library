@@ -11,11 +11,12 @@ from pathlib import Path
 
 import pytest
 
+from app.services import master_replace
 from app.services import metadata as metadata_mod
 from app.services import track_editor as track_editor_mod
 from app.services.track_edit import WriteMode
 from app.services.track_editor import TrackEditor, reconcile_journal
-from tests.test_track_editor import _add_track, _db, _lib, _make_audio
+from tests.track_editor_fixtures import _add_track, _db, _lib, _make_audio
 
 requires_ffmpeg = pytest.mark.requires_ffmpeg
 
@@ -155,7 +156,7 @@ def test_a_forced_case_only_relocate_never_deletes_the_new_master(ci_tmp, monkey
         file_path.replace(destination_path)
         return True
 
-    monkeypatch.setattr(track_editor_mod, "move_file", unchecked_move)
+    monkeypatch.setattr(master_replace, "move_file", unchecked_move)
 
     _edit(db, library, track.uuid_id, {"artist": "Metallica"})
 

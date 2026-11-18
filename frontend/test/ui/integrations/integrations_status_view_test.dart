@@ -16,6 +16,7 @@ import 'package:frontend/ui/integrations/integrations_controller.dart';
 
 import '../browse_harness.dart' show teardownTree;
 import 'fake_integrations_controls.dart';
+import '../../helpers/fake_lastfm_api.dart' show lastfmStatus;
 
 LastfmStatus _status({
   String state = 'enabled',
@@ -28,16 +29,13 @@ LastfmStatus _status({
   },
   String? account = 'listener_01',
   int? lastSuccessAt,
-}) => LastfmStatus.fromJson({
-  'service': 'running',
-  'state': state,
-  'needs_reconnect': false,
-  'account_name': account,
-  'connection_id': 'c-1',
-  'counts': counts,
-  'recent_problems': const [],
-  'last_success_at': lastSuccessAt,
-});
+}) => lastfmStatus(
+  state: state,
+  account: account,
+  connectionId: 'c-1',
+  counts: counts,
+  lastSuccessAt: lastSuccessAt,
+);
 
 String _countText(WidgetTester tester, String kind) {
   final texts = tester

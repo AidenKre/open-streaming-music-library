@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/models/track_names.dart';
+import 'package:frontend/models/byte_text.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/downloads_controller.dart';
@@ -40,7 +42,12 @@ class DownloadingPage extends ConsumerWidget {
               children: [
                 if (active.isNotEmpty) const _SectionHeader('Active'),
                 for (final job in active)
-                  _DownloadTile(job: job, onCancel: null),
+                  _DownloadTile(
+                    job: job,
+                    onCancel: () => ref
+                        .read(downloadsControlsProvider)
+                        .cancelActive(job.uuidId),
+                  ),
                 if (queued.isNotEmpty) const _SectionHeader('Queued'),
                 for (final job in queued)
                   _DownloadTile(
@@ -72,6 +79,11 @@ class _SectionHeader extends StatelessWidget {
   }
 }
 
+/// A failed download's line (other-issues row 66: a fixed sentence, never
+/// the failure's own text, which stays on the job's status). Proposed to the
+/// owner, not yet approved.
+const downloadFailedMessage = "Couldn't download this track.";
+
 class _DownloadTile extends StatelessWidget {
   final DownloadJob job;
   final VoidCallback? onCancel;
@@ -85,7 +97,7 @@ class _DownloadTile extends StatelessWidget {
     final status = job.status;
     final sizePart = status is Completed ? formatBytes(status.sizeBytes) : null;
     final subtitle = status is Failed
-        ? 'Failed: ${status.message}'
+        ? downloadFailedMessage
         : [artistPart, sizePart].where((s) => s != null && s.isNotEmpty).join(' \u2022 ');
 
     // "Original" of a codec this device can't play downloads transcoded.
@@ -93,7 +105,7 @@ class _DownloadTile extends StatelessWidget {
         ? job.quality
         : '${job.quality} (this device can’t play ${job.unsupportedCodec})';
     return ListTile(
-      title: Text(job.title ?? job.uuidId, maxLines: 1, overflow: TextOverflow.ellipsis),
+      title: Text(trackTitleOrUnknown(job.title), maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: subtitle.isEmpty
           ? Text('Quality: $quality')
           : Text(
@@ -102,11 +114,22 @@ class _DownloadTile extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
       trailing: switch (status) {
-        Active(:final progress) => SizedBox(
-            width: 80,
-            child: LinearProgressIndicator(
-              value: progress > 0 ? progress : null,
-            ),
+        Active(:final progress) => Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 80,
+                child: LinearProgressIndicator(
+                  value: progress > 0 ? progress : null,
+                ),
+              ),
+              if (onCancel != null)
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: onCancel,
+                  tooltip: 'Cancel',
+                ),
+            ],
           ),
         Queued() => onCancel != null
             ? IconButton(

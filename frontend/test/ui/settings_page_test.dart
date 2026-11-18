@@ -24,18 +24,7 @@ import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'browse_harness.dart' show teardownTree;
 import 'fake_session_controls.dart';
 import '../helpers/test_credentials.dart';
-
-/// Override that pins [offlineModeProvider] to a fixed value without running
-/// the real health-poll timer.
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../helpers/test_offline.dart';
 
 /// A transport whose delegate each test swaps after the scope exists.
 class _SwapClient extends http.BaseClient {
@@ -60,7 +49,7 @@ Widget _wrap(
       apiClientProvider.overrideWithValue(_api),
       sharedPreferencesProvider.overrideWith((_) async => prefs),
       credentialStoreTestOverride(),
-      offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+      offlineModeProvider.overrideWith(() => TestOffline(offline)),
       if (session != null)
         sessionControlsProvider.overrideWithValue(session)
       else if (onDisconnect != null)
@@ -85,7 +74,7 @@ Widget _wrapNestedSettingsLauncher(
       apiClientProvider.overrideWithValue(_api),
       sharedPreferencesProvider.overrideWith((_) async => prefs),
       credentialStoreTestOverride(),
-      offlineModeProvider.overrideWith(() => _StubOffline(false)),
+      offlineModeProvider.overrideWith(() => TestOffline(false)),
       // One app scope, as in production (no nested override scope).
       sessionControlsProvider.overrideWithValue(
         FakeSessionControls(onDisconnect: onDisconnect),
@@ -142,6 +131,31 @@ void main() {
     // tighten its timeout so tests don't hang on the default MockClient that
     // returns 2xx synchronously (which is fine here, but be defensive).
     SettingsNotifier.backendSyncTimeout = const Duration(milliseconds: 200);
+  });
+
+  // Other-issues row 66: a settings model that cannot load shows a fixed
+  // sentence, never the error's own text.
+  testWidgets("unreadable settings: a fixed sentence, not the error's text",
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    await tester.pumpWidget(ProviderScope(
+      overrides: [
+        apiClientProvider.overrideWithValue(_api),
+        sharedPreferencesProvider.overrideWith((_) async => prefs),
+        credentialStoreTestOverride(),
+        offlineModeProvider.overrideWith(() => TestOffline(false)),
+        settingsProvider.overrideWith(_UnreadableSettings.new),
+      ],
+      child: const MaterialApp(home: SettingsPage()),
+    ));
+    await tester.pump();
+    await tester.pump();
+    expect(find.text("This device's saved settings could not be read."),
+        findsWidgets);
+    expect(find.textContaining('Failed to load settings'), findsNothing);
+    expect(find.textContaining('/private/prefs.json'), findsNothing);
+    await teardownTree(tester);
   });
 
   testWidgets('renders both quality dropdowns with the loaded values', (
@@ -303,6 +317,12 @@ void main() {
     final logOut = tester.getTopLeft(find.text('Log out')).dy;
     final disconnect = tester.getTopLeft(find.text('Disconnect')).dy;
     expect(logOut, lessThan(disconnect), reason: 'Log out comes first');
+    // Row 32 (owner, 2026-11-17): the row's own word, Log out.
+    expect(
+      find.text(
+          'Log out of this account; downloads and library stay on this device'),
+      findsOneWidget,
+    );
     await tester.tap(find.text('Log out'));
     await tester.pumpAndSettle();
     expect(session.calls, ['logout']);
@@ -562,15 +582,17 @@ void main() {
     // the session host (with every session route) goes away with it.
   });
 
+  // D7 (a) (owner, 2026-11-17; amends Phase 4 D29): offline, only "Set as
+  // default" for stream quality is locked: download quality and "This
+  // session only" are stored on this device only.
   group('offline mode', () {
-    testWidgets('stream quality dropdown is disabled while offline', (
+    testWidgets('both quality dropdowns stay usable while offline', (
       tester,
     ) async {
       final prefs = await SharedPreferences.getInstance();
       await tester.pumpWidget(_wrap(prefs, offline: true));
       await tester.pumpAndSettle();
 
-      // Both dropdowns should be present but with onChanged == null.
       final dropdowns = tester
           .widgetList<DropdownButton<String>>(
             find.byType(DropdownButton<String>),
@@ -578,34 +600,82 @@ void main() {
           .toList();
       expect(dropdowns, hasLength(2));
       for (final d in dropdowns) {
-        expect(
-          d.onChanged,
-          isNull,
-          reason: 'dropdown should be disabled while offline',
-        );
+        expect(d.onChanged, isNotNull);
       }
-      // The explanatory tooltip is present.
-      expect(find.byType(Tooltip), findsWidgets);
+      expect(find.byTooltip('Unavailable while offline'), findsNothing);
+    });
+
+    testWidgets('offline: download quality changes and is saved', (
+      tester,
+    ) async {
+      final prefs = await SharedPreferences.getInstance();
+      await tester.pumpWidget(_wrap(prefs, offline: true));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(DropdownButton<String>).last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('128 kbps').last);
+      await tester.pumpAndSettle();
+      expect(prefs.getString('settings.downloadQuality'), '128');
     });
 
     testWidgets(
-      'offline: tapping the dropdown does not open the choice sheet',
+      'offline: the stream sheet offers This session only; Set as default '
+      'is off with its hint',
       (tester) async {
         final prefs = await SharedPreferences.getInstance();
         await tester.pumpWidget(_wrap(prefs, offline: true));
         await tester.pumpAndSettle();
 
-        // Try to open the stream quality dropdown.
         await tester.tap(find.text('Original').first);
         await tester.pumpAndSettle();
+        await tester.tap(find.text('192 kbps').last);
+        await tester.pumpAndSettle();
 
-        // Because onChanged is null the dropdown won't open its menu and the
-        // choice bottom sheet must never appear.
-        expect(find.text('Set as default'), findsNothing);
-        expect(find.text('This session only'), findsNothing);
+        expect(find.byType(BottomSheet), findsOneWidget);
+        final setDefault = tester.widget<FilledButton>(
+          find.widgetWithText(FilledButton, 'Set as default'),
+        );
+        expect(setDefault.onPressed, isNull);
+        expect(find.byTooltip('Unavailable while offline'), findsOneWidget);
+
+        await tester.tap(find.text('This session only'));
+        await tester.pumpAndSettle();
         expect(find.byType(BottomSheet), findsNothing);
+        expect(find.text('192 kbps'), findsOneWidget,
+            reason: 'the session quality is shown');
+        expect(prefs.getString('settings.streamQuality'), isNull);
       },
     );
+  });
+
+  // D7 (owner, 2026-11-17): a refused "Set as default" keeps the old default
+  // on the row and says so.
+  testWidgets('a refused Set as default keeps the old default and says so', (
+    tester,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    _transport.inner = MockClient(
+      (req) async => req.method == 'PUT'
+          ? http.Response('{"detail":"refused"}', 400)
+          : http.Response('{}', 200),
+    );
+    await tester.pumpWidget(_wrap(prefs));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Original').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('320 kbps').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Set as default'));
+    await tester.pumpAndSettle();
+
+    expect(find.text("Couldn't save the default quality. Try again."),
+        findsOneWidget);
+    final stream = tester
+        .widgetList<DropdownButton<String>>(find.byType(DropdownButton<String>))
+        .first;
+    expect(stream.value, 'original');
+    expect(prefs.getString('settings.streamQuality'), isNull);
   });
 
   group('SC-21 registry', () {
@@ -642,7 +712,7 @@ void main() {
         overrides: [
           sharedPreferencesProvider.overrideWith((_) async => prefs),
           credentialStoreTestOverride(),
-          offlineModeProvider.overrideWith(() => _StubOffline(false)),
+          offlineModeProvider.overrideWith(() => TestOffline(false)),
           settingsSectionsProvider.overrideWithValue(const [
             SettingsSection(id: 'a', order: 0, title: 'Shown'),
             SettingsSection(id: 'b', order: 1, title: 'Empty'),
@@ -674,7 +744,7 @@ void main() {
         overrides: [
           sharedPreferencesProvider.overrideWith((_) async => prefs),
           credentialStoreTestOverride(),
-          offlineModeProvider.overrideWith(() => _StubOffline(false)),
+          offlineModeProvider.overrideWith(() => TestOffline(false)),
           settingsControlsProvider.overrideWithValue(fake),
         ],
         child: MaterialApp(
@@ -712,21 +782,20 @@ void main() {
       expect(fake.calls, ['default 320', 'session 192']);
     });
 
-    // D29: the rows follow the controller's computed rule; they no longer
-    // decide the offline rule themselves.
+    // D29, amended by D7 (a): the rows follow the controller's computed
+    // rule; it locks only the sheet's "Set as default".
     for (final (offline, allowed) in [(false, false), (true, true)]) {
       testWidgets(
-          'server quality rows follow canChangeServerQuality '
+          'Set as default follows canChangeServerQuality '
           '(offline: $offline, allowed: $allowed)', (tester) async {
         final prefs = await SharedPreferences.getInstance();
+        final fake = _FakeSettings(canChangeServerQuality: allowed);
         await tester.pumpWidget(ProviderScope(
           overrides: [
             sharedPreferencesProvider.overrideWith((_) async => prefs),
             credentialStoreTestOverride(),
-            offlineModeProvider.overrideWith(() => _StubOffline(offline)),
-            settingsControlsProvider.overrideWithValue(
-              _FakeSettings(canChangeServerQuality: allowed),
-            ),
+            offlineModeProvider.overrideWith(() => TestOffline(offline)),
+            settingsControlsProvider.overrideWithValue(fake),
           ],
           child: MaterialApp(
             theme: ThemeData(splashFactory: NoSplash.splashFactory),
@@ -741,12 +810,24 @@ void main() {
             .toList();
         expect(dropdowns, hasLength(2));
         for (final d in dropdowns) {
-          expect(d.onChanged == null, !allowed);
+          expect(d.onChanged, isNotNull);
         }
+
+        await tester.tap(find.text('Original').first);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('320 kbps').last);
+        await tester.pumpAndSettle();
+        final setDefault = tester.widget<FilledButton>(
+          find.widgetWithText(FilledButton, 'Set as default'),
+        );
+        expect(setDefault.onPressed == null, !allowed);
         expect(
           find.byTooltip('Unavailable while offline'),
-          allowed ? findsNothing : findsNWidgets(2),
+          allowed ? findsNothing : findsOneWidget,
         );
+        await tester.tap(find.text('This session only'));
+        await tester.pumpAndSettle();
+        expect(fake.calls, ['session 320']);
       });
     }
 
@@ -793,4 +874,11 @@ class _FakeSettings implements SettingsControls {
   int opened = 0;
   @override
   void onSettingsOpened() => opened++;
+}
+
+/// A settings model whose load fails, with a detail that must not be shown.
+class _UnreadableSettings extends SettingsNotifier {
+  @override
+  Future<AppSettings> build() async =>
+      throw StateError('cannot read /private/prefs.json');
 }

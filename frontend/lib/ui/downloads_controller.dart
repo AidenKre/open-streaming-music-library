@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart';
@@ -13,6 +15,10 @@ abstract interface class DownloadsControls {
 
   void cancelQueued(String uuidId);
 
+  /// Cancels a download in progress: its row leaves the list as a
+  /// cancelled queued row does, unless it had already finished.
+  void cancelActive(String uuidId);
+
   Future<void> dismissStale(String uuidId);
 
   Future<void> dismissAllStale(Iterable<String> uuidIds);
@@ -20,9 +26,11 @@ abstract interface class DownloadsControls {
   /// Re-download stale copies; how many of [tracks] could not be queued.
   Future<({int failed, int total})> redownloadStale(List<TrackUI> tracks);
 
-  /// Re-download damaged copies at the default download quality; the new
-  /// download replaces the damaged file (decision 6).
-  Future<void> redownloadDamaged(List<TrackUI> tracks);
+  /// Re-download damaged copies at the quality each track was downloaded
+  /// at (the default download quality only when that is unknown); the new
+  /// download replaces the damaged file (decision 6). Returns how many of
+  /// [tracks] could not be queued.
+  Future<({int failed, int total})> redownloadDamaged(List<TrackUI> tracks);
 
   /// Delete a damaged copy (its kept file) for good.
   Future<void> deleteDamaged(String uuidId);
@@ -43,6 +51,10 @@ class DownloadsController implements DownloadsControls {
   @override
   void cancelQueued(String uuidId) =>
       _ref.read(downloadManagerProvider).cancelQueued(uuidId);
+
+  @override
+  void cancelActive(String uuidId) =>
+      unawaited(_ref.read(downloadManagerProvider).cancelActive(uuidId));
 
   @override
   Future<void> dismissStale(String uuidId) =>
@@ -66,12 +78,17 @@ class DownloadsController implements DownloadsControls {
   }
 
   @override
-  Future<void> redownloadDamaged(List<TrackUI> tracks) => _ref
-      .read(downloadManagerProvider)
-      .redownloadDamaged(
-        tracks,
-        fallbackQuality: _ref.read(downloadQualityProvider),
-      );
+  Future<({int failed, int total})> redownloadDamaged(
+    List<TrackUI> tracks,
+  ) async {
+    final failed = await _ref
+        .read(downloadManagerProvider)
+        .redownloadDamaged(
+          tracks,
+          fallbackQuality: _ref.read(downloadQualityProvider),
+        );
+    return (failed: failed, total: tracks.length);
+  }
 
   @override
   Future<void> deleteDamaged(String uuidId) =>

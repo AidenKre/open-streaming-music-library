@@ -15,15 +15,13 @@ Expected values are written out or read with plain SQL.
 """
 
 import json
-import sqlite3
 
 import pytest
 
-from app.database.database import DatabaseContext
 from app.library import Library
 from app.models.deletions import DeletionJobRequest
-from tests.owned_database import OwnedTestDatabase, add_test_user
-from tests.schema_fixtures import INIT_SQL
+from tests.owned_database import add_test_user
+from tests.sqlite_helpers import sql_rows
 
 OP1 = "11111111-1111-4111-8111-111111111111"
 OP2 = "22222222-2222-4222-8222-222222222222"
@@ -32,15 +30,6 @@ A = "aaaaaaaa-0000-4000-8000-000000000001"
 B = "bbbbbbbb-0000-4000-8000-000000000002"
 C = "cccccccc-0000-4000-8000-000000000003"
 BOOT = "boot-1"
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 @pytest.fixture
@@ -57,18 +46,8 @@ def _job(db, owner, op, *targets, now=500):
     assert Library(db, owner).create_deletion_job(request, now=now)
 
 
-def _rows(db, sql, params=()):
-    conn = sqlite3.connect(db.context.database_path)
-    try:
-        rows = conn.execute(sql, params).fetchall()
-        conn.commit()
-        return rows
-    finally:
-        conn.close()
-
-
 def _items(db):
-    return _rows(
+    return sql_rows(
         db,
         "SELECT owner_id, operation_uuid, uuid_id, status, lease_boot_id, error_code,"
         " tombstone_revision, detail_json FROM deletion_job_items"
@@ -114,15 +93,15 @@ def test_a_claim_stamps_running_with_the_boot_id_and_touches_nothing_else(db):
         (db.owner_id, OP1, A, "running", BOOT, None, None, None),
         (db.owner_id, OP1, B, "pending", None, None, None, None),
     ]
-    assert _rows(db, "SELECT status FROM deletion_jobs") == [("accepted",)]
+    assert sql_rows(db, "SELECT status FROM deletion_jobs") == [("accepted",)]
 
 
 def test_a_running_or_terminal_item_is_never_claimed_again(db):
     _job(db, db.owner_id, OP1, (A, 1))
-    _rows(db, "UPDATE deletion_job_items SET status = 'running', lease_boot_id = 'old'")
+    sql_rows(db, "UPDATE deletion_job_items SET status = 'running', lease_boot_id = 'old'")
     assert db.claim_next_deletion_item(boot_id=BOOT) is None
 
-    _rows(db, "UPDATE deletion_job_items SET status = 'conflict', error_code = 'conflict'")
+    sql_rows(db, "UPDATE deletion_job_items SET status = 'conflict', error_code = 'conflict'")
     assert db.claim_next_deletion_item(boot_id=BOOT) is None
 
 
@@ -131,13 +110,13 @@ def test_an_owner_being_deleted_is_skipped_and_keeps_its_items_pending(db, sam_i
     the claim never takes an item of a user whose deletion has begun."""
     _job(db, sam_id, OP1, (A, 1), now=400)
     _job(db, db.owner_id, OP2, (B, 2), now=500)
-    _rows(db, "UPDATE users SET deleting_at = 1 WHERE id = ?", (sam_id,))
+    sql_rows(db, "UPDATE users SET deleting_at = 1 WHERE id = ?", (sam_id,))
 
     first = db.claim_next_deletion_item(boot_id=BOOT)
 
     assert _claimed(first) == (db.owner_id, OP2, B, 2)
     assert db.claim_next_deletion_item(boot_id=BOOT) is None
-    assert _rows(
+    assert sql_rows(
         db, "SELECT status, lease_boot_id FROM deletion_job_items WHERE owner_id = ?", (sam_id,)
     ) == [("pending", None)]
 
@@ -226,10 +205,10 @@ def test_the_job_completes_when_its_last_item_ends(db):
     db.claim_next_deletion_item(boot_id=BOOT)
 
     _finish(db, db.owner_id, OP1, A, status="deleted", tombstone_revision=3)
-    assert _rows(db, "SELECT status FROM deletion_jobs") == [("accepted",)]
+    assert sql_rows(db, "SELECT status FROM deletion_jobs") == [("accepted",)]
 
     _finish(db, db.owner_id, OP1, B, status="conflict", error_code="conflict")
-    assert _rows(db, "SELECT status FROM deletion_jobs") == [("completed",)]
+    assert sql_rows(db, "SELECT status FROM deletion_jobs") == [("completed",)]
 
 
 def test_an_unknown_detail_code_is_refused_before_any_write(db):
@@ -241,3 +220,17 @@ def test_an_unknown_detail_code_is_refused_before_any_write(db):
                 details=("/music/owner/a.flac",))
 
     assert _items(db)[0][3] == "running"
+
+
+# ── the journal listing ────────────────────────────────────────────────────
+
+
+def test_listing_journals_of_an_unknown_stage_is_refused(db):
+    """A misspelt stage would read as "no such journal", and recovery would
+    skip rows it must judge; the listing refuses it instead, even beside a
+    known stage."""
+    for stages in (("done",), ("intent", "commited"), ("",)):
+        with pytest.raises(ValueError) as refused:
+            db.list_deletion_journals(stages=stages)
+
+        assert str(refused.value) == "unknown deletion journal stage"

@@ -24,6 +24,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import '../../helpers/owned_file_cleanup_rows.dart';
 
 Map<String, Object?> _delete(String uuid, int rev) =>
     {'type': 'delete', 'revision': rev, 'uuid_id': uuid, 'track': null};
@@ -31,15 +32,8 @@ Map<String, Object?> _delete(String uuid, int rev) =>
 Map<String, Object?> _page(List<Map<String, Object?>> changes, int latest) =>
     {'changes': changes, 'nextCursor': null, 'latestRevision': latest};
 
-Future<List<Map<String, Object?>>> _cleanupRows(AppDatabase db) async => [
-  for (final r in await db
-      .customSelect(
-        'SELECT path, local_binding_id, attempts FROM owned_file_cleanup '
-        'ORDER BY id',
-      )
-      .get())
-    r.data,
-];
+Future<List<Map<String, Object?>>> _cleanupRows(AppDatabase db) =>
+    ownedFileCleanupRows(db, const ['path', 'local_binding_id', 'attempts']);
 
 void main() {
   late AppDatabase db;
@@ -99,7 +93,6 @@ void main() {
       db: db,
       api: TracksApi(api: api),
       queueRepository: QueueRepository(db),
-      prefs: await SharedPreferences.getInstance(),
       bindingToken: token,
       ownedFileCleanup: cleanup,
     );
@@ -200,6 +193,45 @@ void main() {
       expect(await trackUuids(), isEmpty);
       expect(outside.existsSync(), isTrue);
       expect(await _cleanupRows(db), isEmpty);
+    });
+
+    // A.2 characterization: only the tombstoned track's files are read.
+    test("another track's download and damaged copy are left alone",
+        () async {
+      final f = download('u1.m4a');
+      final other = download('u2.m4a');
+      final otherDamaged = download('u2.damaged.m4a');
+      await insertTrack('u1', filePath: f.path);
+      await insertTrack('u2',
+          filePath: other.path, damagedFilePath: otherDamaged.path);
+      changes = _page([_delete('u1', 2)], 2);
+      await (await service()).syncChanges();
+      expect(await trackUuids(), ['u2']);
+      expect(f.existsSync(), isFalse);
+      expect((other.existsSync(), otherDamaged.existsSync()), (true, true));
+      expect(await _cleanupRows(db), isEmpty);
+    });
+
+    // A.2 characterization: the clean-up refuses a path a track still
+    // names, so only what is enqueued shows that another track's files are
+    // not read. An attempt that cannot resolve the root keeps the rows.
+    test("only the tombstoned track's files are enqueued", () async {
+      final f = download('u1.m4a');
+      final d = download('u1.damaged.m4a');
+      await insertTrack('u1', filePath: f.path, damagedFilePath: d.path);
+      await insertTrack('u2',
+          filePath: download('u2.m4a').path,
+          damagedFilePath: download('u2.damaged.m4a').path);
+      cleanup = OwnedFileCleanup(
+        db: db,
+        documentsDirectory: () async => throw const FileSystemException('no'),
+        locks: OwnedPathLocks(),
+      );
+      changes = _page([_delete('u1', 2)], 2);
+      await (await service()).syncChanges();
+      expect(await trackUuids(), ['u2']);
+      expect([for (final r in await _cleanupRows(db)) r['path']],
+          [f.path, d.path]);
     });
   });
 

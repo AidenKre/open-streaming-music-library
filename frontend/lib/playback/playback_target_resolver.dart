@@ -1,12 +1,13 @@
 import 'dart:io';
 
 import 'package:frontend/playback/local_source_policy.dart';
+import 'package:frontend/playback/playback_engine.dart';
 import 'package:frontend/playback/playback_issue_bus.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 
 export 'package:frontend/playback/playback_issue_bus.dart' show LocalFileMissing, PlaybackIssue;
-
-enum PlaybackSourceKind { local, remote }
+// Its home is the engine interface; re-exported for existing importers.
+export 'package:frontend/playback/playback_engine.dart' show PlaybackSourceKind;
 
 
 class PlaybackTarget {

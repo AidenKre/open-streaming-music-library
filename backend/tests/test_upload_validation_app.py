@@ -16,8 +16,8 @@ from fastapi.testclient import TestClient
 from app.services import identity_worker as identity_worker_mod
 from app.services import upload_validation as upload_validation_mod
 from app.services.upload_validation import UploadValidationWorker, reconcile_upload_validation
-from tests.identity_worker_fixtures import make_db, sql
-from tests.test_identity_worker_app import _lock_is_held
+from tests.recovery_steps import capture_steps, named
+from tests.worker_app_fixtures import _lock_is_held
 from tests.upload_validation_fixtures import (
     BOOT,
     DEAD_BOOT,
@@ -30,11 +30,6 @@ from tests.upload_validation_fixtures import (
 
 WAIT_S = 10  # an upper bound only; every wait ends on an event
 ON = {"ENABLE_UPLOAD_VALIDATION_WORKER": "true"}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -164,19 +159,12 @@ def test_the_enabled_worker_runs_while_the_app_runs_and_stops_with_it(configure_
 
 def test_the_reclaim_step_runs_after_the_receipts_and_before_the_reservations(configure_app, monkeypatch):
     main = configure_app()
-    captured = []
-    real = main.run_startup_recovery
-
-    def capture(steps):
-        captured.append(list(steps))
-        return real(steps)
-
-    monkeypatch.setattr(main, "run_startup_recovery", capture)
+    captured = capture_steps(main, monkeypatch)
     with TestClient(main.app):
         pass
 
     [steps] = captured
-    names = [(s.name, s.fatal) for s in steps]
+    names = named(steps)
     at = names.index(("upload validation", False))
     assert names[at - 1] == ("upload receipts", False)
     # 8A.3d: deletion job reclaim follows it, then the reservations.

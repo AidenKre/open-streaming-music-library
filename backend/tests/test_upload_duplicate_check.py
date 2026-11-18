@@ -16,7 +16,7 @@ from app.config import Settings
 from app.services.audio_identity import ExactAudioHash, FingerprintUnavailable
 from app.services.duplicate_detection import MatcherParams
 from tests.fingerprint_fixtures import fp_track, noisy, pin_matcher_settings, random_print
-from tests.identity_worker_fixtures import add_track, make_db, sql
+from tests.identity_worker_fixtures import add_track, sql
 from tests.owned_database import add_test_user
 from tests.upload_validation_fixtures import (
     BOOT,
@@ -37,11 +37,6 @@ DIGEST = "cd" * 32
 def _explicit_matcher_settings(monkeypatch):
     # U09-B-06: these tests prove matching at stated settings, not at the defaults.
     pin_matcher_settings(monkeypatch)
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

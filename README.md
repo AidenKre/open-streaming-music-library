@@ -1,19 +1,36 @@
-# open-streaming-music-library
+# open-streaming-music-library (OSML)
 
-The goal of this repo is to create a comprehensive solution for anyone to set up a self hosted music streaming service for themself. The backend should be lightweight, running on users old hardware (e.g an old laptop). The backend should be easy to set up, and should not require much hassle. The backend should be easy to configure (and extremely configurable), there should not be much confusion about how to setup the backend to the users liking.
+OSML is a self-hosted music server and an app that plays from it. You run the
+server on a computer of your own, meant to be modest hardware such as an old
+laptop, put your music into its import folder, and listen with the app. The
+aim is that anyone, not only power users, can own and stream their own music
+instead of renting it from a big streaming service.
 
-The frontend should be easy to use, and should be availiable on IOS, Android as well as MacOS, Windows, Linux and ChromeOS. Additionally, it should be accessable via the web. The frontend should mostly act as a music player, but also be able to configure runtime settings for the backend server.
+## What is here
 
-The whole ecosystem should be easy to use for non power users, and also allow for power users to "fine-tune" everything to their liking. However, the priority is the non power users. This is to hopefully let more people enjoy AND own their music, rather than just streaming from a big streaming service.
+- [`backend/`](backend/README.md): the server (Python, FastAPI, SQLite),
+  written for Linux and macOS (POSIX only).
+- [`frontend/`](frontend/README.md): the app (Flutter).
 
-Evidently, this repo is a huge WIP... with lofty goals. As such the scope has been narrowed significantly, and some compromises have been made. We are putting ease of use first.
+## Getting started
 
+1. Set up and start the server: [`backend/README.md`](backend/README.md)
+   (prerequisites, the master admin in `.env`, the start command).
+2. Put music (`.mp3`, `.wav`, `.flac`, `.m4a`, or a `.zip`, `.rar`, `.tar` or
+   `.tar.gz` of them) into the master admin's import folder (`backend/import/`
+   by default). The server imports it on its own and moves each imported file
+   into its library folder (`backend/music/` by default), so put in copies,
+   not your only files.
+3. Build and run the app: [`frontend/README.md`](frontend/README.md). On its
+   first screen, enter the server's address (for example
+   `http://192.168.1.20:8000`) and log in as the master admin.
 
-## Building the app
+## Status
 
-- **Linux:** the app stores your sign-in in the system keyring through `flutter_secure_storage`, so building it needs the libsecret development package (`libsecret-1-dev` on Debian/Ubuntu) and a running Secret Service (for example GNOME Keyring). When no Secret Service is installed at all, the app uses an owner-only file in its app-support folder instead (also when saving to the keyring fails) and says so under Settings → Sync & storage. Any other keyring problem when reading (for example a locked keyring or a timeout) is treated as temporary: the app shows "Your sign-in could not be read." with **Try again** and **Log in again** instead of signing you out.
-- **iOS:** the sign-in goes into the Keychain (`keychain-access-groups` entitlement in `ios/Runner/Runner.entitlements`; iOS builds are team-signed).
-- **macOS:** the project signs ad-hoc and carries no keychain entitlement, so the app stores the sign-in in an owner-only fallback file in its app-support folder (inside the sandbox container) and says so under Settings → Sync & storage.
-  - To turn the macOS Keychain on for a team-signed build, set a development team for the Runner target in Xcode (Signing & Capabilities) and add the entitlement back to both `macos/Runner/DebugProfile.entitlements` and `macos/Runner/Release.entitlements`, for example `<key>keychain-access-groups</key><array><string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string></array>`.
-  - `test/architecture/macos_signing_test.dart` rejects that entitlement while the project has no development team.
-- **Server address:** on Android, iOS and macOS the app accepts an `http://` server address as well as `https://`, and an `http://` connection is not encrypted on the network.
+OSML is built by one person and is early work. One server can have several
+users, each with their own library. Both the server and the app assume a fresh
+install: a database written by an earlier version is refused, on both sides,
+and there is no way to upgrade it yet. The app has been run on macOS only so
+far.
+
+Licence: MIT (see [`LICENSE`](LICENSE)).

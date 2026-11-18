@@ -61,13 +61,21 @@ final phase4SettingsRows = <SettingsRowContribution>[
   ),
 ];
 
-/// Quality changes round-trip through the backend (the PUT pre-transcodes
-/// server-side); offline the PUT would retry and fail, so the dropdowns are
-/// disabled with an explanation. Local settings stay usable offline.
+/// Only setting a stream-quality default calls the backend (the PUT
+/// pre-transcodes server-side); offline the PUT would retry and fail, so the
+/// stream choice sheet's "Set as default" is disabled with an explanation.
+/// Download quality (saved on this device) and the session-only stream
+/// quality (kept in memory) stay usable offline.
 Widget _offlineTooltip({required bool canChange, required Widget child}) {
   if (canChange) return child;
   return Tooltip(message: 'Unavailable while offline', child: child);
 }
+
+/// Shown when the settings model could not load (it reads only this
+/// device's saved preferences). The same sentence as the session's
+/// unreadable-preferences notice; proposed to the owner, not yet approved.
+const settingsUnreadableMessage =
+    "This device's saved settings could not be read.";
 
 /// Shared loading/error presentation for rows backed by the settings model.
 class _SettingsValue extends ConsumerWidget {
@@ -81,9 +89,11 @@ class _SettingsValue extends ConsumerWidget {
         padding: EdgeInsets.all(16),
         child: Center(child: CircularProgressIndicator()),
       ),
-      error: (e, _) => Padding(
-        padding: const EdgeInsets.all(16),
-        child: Text('Failed to load settings: $e'),
+      // Other-issues row 66: a fixed sentence; the settings model logs the
+      // error's type.
+      error: (_, _) => const Padding(
+        padding: EdgeInsets.all(16),
+        child: Text(settingsUnreadableMessage),
       ),
       data: (settings) => builder(context, ref, settings),
     );
@@ -97,28 +107,20 @@ class _StreamQualityRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SettingsValue(
       builder: (context, ref, settings) {
-        final canChange = ref
-            .watch(settingsControlsProvider)
-            .canChangeServerQuality;
         return ListTile(
           title: const Text('Stream quality'),
-          subtitle: _offlineTooltip(
-            canChange: canChange,
-            child: DropdownButton<String>(
-              isExpanded: true,
-              value: settings.streamQuality,
-              items: [
-                for (final q in qualityPresets)
-                  DropdownMenuItem(value: q, child: Text(qualityLabel(q))),
-              ],
-              onChanged: !canChange
-                  ? null
-                  : (value) {
-                      if (value != null && value != settings.streamQuality) {
-                        _showStreamQualityChoiceSheet(context, ref, value);
-                      }
-                    },
-            ),
+          subtitle: DropdownButton<String>(
+            isExpanded: true,
+            value: settings.streamQuality,
+            items: [
+              for (final q in qualityPresets)
+                DropdownMenuItem(value: q, child: Text(qualityLabel(q))),
+            ],
+            onChanged: (value) {
+              if (value != null && value != settings.streamQuality) {
+                _showStreamQualityChoiceSheet(context, ref, value);
+              }
+            },
           ),
         );
       },
@@ -188,14 +190,21 @@ class _StreamQualityRow extends StatelessWidget {
                     },
                     child: const Text('This session only'),
                   ),
-                  FilledButton(
-                    onPressed: () {
-                      Navigator.of(ctx).pop();
-                      ref
-                          .read(settingsControlsProvider)
-                          .setStreamQualityDefault(newQuality);
+                  Consumer(
+                    builder: (ctx, sheetRef, _) {
+                      final canChange = sheetRef
+                          .watch(settingsControlsProvider)
+                          .canChangeServerQuality;
+                      return _offlineTooltip(
+                        canChange: canChange,
+                        child: FilledButton(
+                          onPressed: !canChange
+                              ? null
+                              : () => _setDefault(ctx, sheetRef, newQuality),
+                          child: const Text('Set as default'),
+                        ),
+                      );
                     },
-                    child: const Text('Set as default'),
                   ),
                 ],
               ),
@@ -204,6 +213,25 @@ class _StreamQualityRow extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  /// Pops the sheet, then sets the default; says so when the server did not
+  /// take it (the row keeps the old default).
+  Future<void> _setDefault(
+    BuildContext sheetContext,
+    WidgetRef ref,
+    String quality,
+  ) async {
+    final messenger = ScaffoldMessenger.maybeOf(sheetContext);
+    final controls = ref.read(settingsControlsProvider);
+    Navigator.of(sheetContext).pop();
+    try {
+      await controls.setStreamQualityDefault(quality);
+    } catch (_) {
+      messenger?.showSnackBar(
+        const SnackBar(content: Text(saveDefaultQualityFailedMessage)),
+      );
+    }
   }
 }
 
@@ -214,33 +242,23 @@ class _DownloadQualityRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SettingsValue(
       builder: (context, ref, settings) {
-        final canChange = ref
-            .watch(settingsControlsProvider)
-            .canChangeServerQuality;
         return ListTile(
           title: const Text('Download quality'),
           subtitle: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _offlineTooltip(
-                canChange: canChange,
-                child: DropdownButton<String>(
-                  isExpanded: true,
-                  value: settings.downloadQuality,
-                  items: [
-                    for (final q in qualityPresets)
-                      DropdownMenuItem(value: q, child: Text(qualityLabel(q))),
-                  ],
-                  onChanged: !canChange
-                      ? null
-                      : (value) {
-                          if (value != null) {
-                            ref
-                                .read(settingsControlsProvider)
-                                .setDownloadQuality(value);
-                          }
-                        },
-                ),
+              DropdownButton<String>(
+                isExpanded: true,
+                value: settings.downloadQuality,
+                items: [
+                  for (final q in qualityPresets)
+                    DropdownMenuItem(value: q, child: Text(qualityLabel(q))),
+                ],
+                onChanged: (value) {
+                  if (value != null) {
+                    ref.read(settingsControlsProvider).setDownloadQuality(value);
+                  }
+                },
               ),
               const SizedBox(height: 4),
               const Text(
@@ -302,7 +320,7 @@ class _LogOutRow extends ConsumerWidget {
       leading: const Icon(Icons.person_off_outlined),
       title: const Text('Log out'),
       subtitle: const Text(
-        'Sign out of this account; downloads and library stay on this device',
+        'Log out of this account; downloads and library stay on this device',
       ),
       onTap: () => unawaited(
         logOutAfterWarning(context, ref.read(sessionControlsProvider)),

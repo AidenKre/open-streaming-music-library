@@ -12,6 +12,7 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 
 import '../browse_harness.dart';
 import '../fake_library_actions.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// The page-facing track row: availability, menu, Get info and the
 /// controller come from providers; the page supplies only the tap.

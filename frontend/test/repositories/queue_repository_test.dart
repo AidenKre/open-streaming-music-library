@@ -1,23 +1,27 @@
+import 'dart:math' show Random;
+
 import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/native.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import '../helpers/server_binding.dart';
+import '../helpers/library_fixture.dart';
 
 void main() {
   late AppDatabase db;
   late QueueRepository repo;
-  late _LibraryFixture fixture;
+  late LibraryFixture fixture;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     repo = QueueRepository(db);
-    fixture = _LibraryFixture(db);
+    fixture = LibraryFixture(db);
   });
 
   tearDown(() async {
@@ -1128,7 +1132,7 @@ void main() {
     addTearDown(counted.close);
     await seedTestBinding(counted);
     final countedRepo = QueueRepository(counted);
-    await _LibraryFixture(counted).insertSingles(['a', 'x']);
+    await LibraryFixture(counted).insertSingles(['a', 'x']);
     final sessionId = await countedRepo.createSessionFromExplicitList(
         sourceType: 'search', trackUuids: const ['a']);
     // 2,000 more main items, played in order.
@@ -1162,6 +1166,292 @@ void main() {
     expect(tail.last.uuidId, 'x', reason: 'the queued item follows the '
         'current track');
     expect(tail.last.queueType, 'manual');
+  });
+
+  group('sticky shuffle draws from the injected generator (U20-FE-QUEUE-A-03)',
+      () {
+    const uuids = ['a', 'b', 'c', 'd', 'e', 'f'];
+    // The futures in canonical order, shuffled by a generator with the
+    // same seed: what the repository must produce.
+    List<String> expected(int seed) =>
+        ['a', 'b', ...['c', 'd', 'e', 'f']..shuffle(Random(seed))];
+
+    for (final seed in [1, 7, 42]) {
+      test('seed $seed, both creation paths', () async {
+        await fixture.insertSingles(uuids);
+        final seeded = QueueRepository(db, random: Random(seed));
+        final list = await seeded.createSessionFromExplicitList(
+            sourceType: 's', trackUuids: uuids, currentIndex: 1,
+            shuffleEnabled: true);
+        expect((await _orderRows(db, list)).map((r) => r.$3), expected(seed));
+        final again = QueueRepository(db, random: Random(seed));
+        final query = await again.createSessionFromQuery(
+            sourceType: 'library', currentUuid: 'b', shuffleEnabled: true);
+        expect((await _orderRows(db, query)).map((r) => r.$3), expected(seed));
+      });
+    }
+
+    test('the scope\'s repository uses queueRandomProvider', () async {
+      await fixture.insertSingles(uuids);
+      final c = ProviderContainer(overrides: [
+        databaseProvider.overrideWithValue(db),
+        queueRandomProvider.overrideWithValue(Random(7)),
+      ]);
+      addTearDown(c.dispose);
+      final id = await c.read(queueRepositoryProvider).createSessionFromExplicitList(
+          sourceType: 's', trackUuids: uuids, currentIndex: 1,
+          shuffleEnabled: true);
+      expect((await _orderRows(db, id)).map((r) => r.$3), expected(7));
+    });
+  });
+
+  // Guide 6.4 missing test (U20-FE-QUEUE-A-06): the five position-shift
+  // statements keep every session's positions dense and leave other
+  // sessions alone, with queued items and a shuffled order.
+  test('queue position shifts: two sessions, queued items, a shuffled order',
+      () async {
+    await fixture.insertSingles(['a', 'b', 'c', 'd', 'e', 'w', 'x', 'y', 'z']);
+    final other = await repo.createSessionFromExplicitList(
+        sourceType: 's', trackUuids: const ['a', 'b', 'c']);
+    await repo.prependManualItems(other, const ['y']);
+    final s = await repo.createSessionFromExplicitList(
+        sourceType: 's', trackUuids: const ['a', 'b', 'c', 'd', 'e'],
+        currentIndex: 1, shuffleEnabled: true);
+
+    Future<List<(String, int, String)>> items(int session) async => [
+          for (final r in await db.customSelect(
+                  'SELECT queue_type, position, uuid_id FROM queue_session_items '
+                  'WHERE session_id = ? ORDER BY queue_type, position',
+                  variables: [Variable.withInt(session)]).get())
+            (r.read<String>('queue_type'), r.read<int>('position'),
+                r.read<String>('uuid_id')),
+        ];
+
+    // Dense play positions 0..n-1 over exactly the session's items, and
+    // dense canonical positions per queue type.
+    Future<void> dense(int session, {required String step}) async {
+      final order = await _orderRows(db, session);
+      final its = await items(session);
+      expect(order.map((r) => r.$1), [for (var i = 0; i < its.length; i++) i],
+          reason: '$step: play positions of $session');
+      for (final type in ['main', 'manual']) {
+        final ps = [for (final i in its) if (i.$1 == type) i.$2];
+        expect(ps, [for (var i = 0; i < ps.length; i++) i],
+            reason: '$step: $type positions of $session');
+      }
+      expect(order.map((r) => r.$3).toList()..sort(),
+          its.map((i) => i.$3).toList()..sort(),
+          reason: '$step: the play order holds exactly the items');
+    }
+
+    final otherBefore = await _orderRows(db, other);
+    final otherItemsBefore = await items(other);
+    await dense(s, step: 'start');
+
+    await repo.prependManualItems(s, const ['x', 'y']);
+    await repo.prependManualItems(s, const ['z']);
+    await repo.appendManualItems(s, const ['w']);
+    await dense(s, step: 'queued');
+    expect([for (final i in await items(s)) if (i.$1 == 'manual') i.$3],
+        ['z', 'x', 'y', 'w'], reason: 'Play next goes first, Add to queue last');
+
+    final xItem = (await repo.getSessionTracksInPlayOrder(s))
+        .firstWhere((e) => e.uuidId == 'x');
+    final dItem = (await repo.getSessionTracksInPlayOrder(s))
+        .firstWhere((e) => e.uuidId == 'd');
+    final orderBefore = [for (final r in await _orderRows(db, s)) r.$3];
+    await repo.removeItem(s, xItem.itemId);
+    await repo.removeItem(s, dItem.itemId);
+    await dense(s, step: 'removed');
+    expect([for (final r in await _orderRows(db, s)) r.$3],
+        [for (final u in orderBefore) if (u != 'x' && u != 'd') u],
+        reason: 'the rest keep their relative play order');
+    expect(await _orderRows(db, other), otherBefore,
+        reason: 'the other session is untouched');
+    expect(await items(other), otherItemsBefore);
+
+    await repo.removeTrackUuidsFromQueues(const ['b']);
+    await dense(s, step: 'sync removal');
+    await dense(other, step: 'sync removal');
+    expect([for (final r in await _orderRows(db, other)) r.$3],
+        ['a', 'c', 'y']);
+    expect(await items(other), [('main', 0, 'a'), ('main', 1, 'c'),
+        ('manual', 0, 'y')]);
+    expect([for (final i in await items(s)) if (i.$1 == 'main') i.$3],
+        ['a', 'c', 'e'], reason: 'canonical order kept');
+  });
+
+  group('typed errors (section 6 #6): which refusal is "nothing to queue" '
+      'or "gone", and which is not', () {
+    test('creation: no track, or the current track not among them: '
+        'NothingToQueue', () async {
+      await fixture.insertSingles(['a']);
+      await expectLater(
+          repo.createSessionFromExplicitList(
+              sourceType: 's', trackUuids: const []),
+          throwsA(isA<NothingToQueue>()));
+      await expectLater(
+          repo.createSessionFromQuery(
+              sourceType: 'library', currentUuid: 'missing'),
+          throwsA(isA<NothingToQueue>()));
+    });
+
+    test('a prepared session or its target gone: PreparedSessionGone',
+        () async {
+      await fixture.insertSingles(['a', 'b']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 's', trackUuids: const ['a', 'b'], activate: false);
+      final items = await repo.getCanonicalItemIds(prepared);
+      await repo.removeTrackUuidsFromQueues(const ['a']);
+      await expectLater(repo.setPreparedCurrentItem(prepared, items[0], 0),
+          throwsA(isA<PreparedSessionGone>()), reason: 'the target is gone');
+      await expectLater(repo.activateSession(prepared),
+          throwsA(isA<PreparedSessionGone>()),
+          reason: 'its current item is gone');
+      await repo.discardSession(prepared);
+      await expectLater(repo.activateSession(prepared),
+          throwsA(isA<PreparedSessionGone>()), reason: 'the session is gone');
+    });
+
+    test('a session this repository did not prepare is an internal error, '
+        'not "gone"', () async {
+      await fixture.insertSingles(['a']);
+      final active = await repo.createSessionFromExplicitList(
+          sourceType: 's', trackUuids: const ['a']);
+      final items = await repo.getCanonicalItemIds(active);
+      await expectLater(
+          repo.setPreparedCurrentItem(active, items[0], 0),
+          throwsA(predicate((e) => e is StateError && e is! PreparedSessionGone,
+              'a plain StateError')));
+    });
+  });
+
+  test('withoutDownload copies every field except the download path', () {
+    const entry = QueuePlaybackEntry(
+      itemId: 7,
+      queueType: QueueItemTypes.manual,
+      canonicalPosition: 3,
+      playPosition: 5,
+      uuidId: 'u',
+      filePath: '/dl/u.flac',
+      downloadedCodec: 'flac',
+      sourceCodec: 'alac',
+    );
+    final copy = entry.withoutDownload();
+    expect(copy.filePath, isNull);
+    expect(
+        (copy.itemId, copy.queueType, copy.canonicalPosition,
+            copy.playPosition, copy.uuidId, copy.downloadedCodec,
+            copy.sourceCodec),
+        (7, QueueItemTypes.manual, 3, 5, 'u', 'flac', 'alac'));
+  });
+
+  // Characterization before the two creation paths share their ending
+  // (refactor U20-FE-QUEUE-A-02): the current item, the sticky-shuffle
+  // block and the "prepared" registration behave the same on both.
+  group('the two session-creation paths end the same way', () {
+    const uuids = ['a', 'b', 'c', 'd', 'e', 'f'];
+    final paths = <String,
+        Future<int> Function(QueueRepository r,
+            {required bool shuffle, required bool activate})>{
+      'query': (r, {required shuffle, required activate}) =>
+          r.createSessionFromQuery(
+              sourceType: 'library',
+              currentUuid: 'c',
+              shuffleEnabled: shuffle,
+              activate: activate),
+      'explicit list': (r, {required shuffle, required activate}) =>
+          r.createSessionFromExplicitList(
+              sourceType: 'search',
+              trackUuids: uuids,
+              currentIndex: 2,
+              shuffleEnabled: shuffle,
+              activate: activate),
+    };
+
+    for (final MapEntry(key: name, value: create) in paths.entries) {
+      test('$name: sticky shuffle keeps the played part and the current '
+          'track in place and shuffles only what follows', () async {
+        await fixture.insertSingles(uuids);
+        for (var run = 0; run < 5; run++) {
+          final id = await create(repo, shuffle: true, activate: true);
+          final rows = await _orderRows(db, id);
+          expect(rows.map((r) => r.$1), [0, 1, 2, 3, 4, 5]);
+          expect(rows.take(3).map((r) => r.$3), ['a', 'b', 'c']);
+          expect(rows.skip(3).map((r) => r.$3).toSet(), {'d', 'e', 'f'});
+          final snapshot = (await repo.getSessionSnapshot(id))!;
+          expect(snapshot.currentItem?.uuidId, 'c');
+          expect(snapshot.currentItem?.playPosition, 2);
+          expect(snapshot.session.shuffleEnabled, isTrue);
+          expect(snapshot.session.isActive, isTrue);
+        }
+      });
+
+      test('$name: without shuffle the play order is canonical', () async {
+        await fixture.insertSingles(uuids);
+        final id = await create(repo, shuffle: false, activate: true);
+        expect((await _orderRows(db, id)).map((r) => r.$3), uuids);
+        expect((await repo.getSessionSnapshot(id))!.currentItem?.uuidId, 'c');
+      });
+
+      test('$name: only a session prepared inactive is registered as '
+          'prepared', () async {
+        await fixture.insertSingles(uuids);
+        final prepared = await create(repo, shuffle: false, activate: false);
+        final items = await repo.getCanonicalItemIds(prepared);
+        await repo.setPreparedCurrentItem(prepared, items[4], 4);
+        expect((await repo.getSessionSnapshot(prepared))!.currentItem?.uuidId,
+            'e');
+        expect((await repo.getSessionSnapshot(prepared))!.session.isActive,
+            isFalse);
+        final active = await create(repo, shuffle: false, activate: true);
+        final activeItems = await repo.getCanonicalItemIds(active);
+        await expectLater(
+            repo.setPreparedCurrentItem(active, activeItems[4], 4),
+            throwsStateError);
+        expect((await repo.getSessionSnapshot(active))!.currentItem?.uuidId,
+            'c', reason: 'refused: nothing changed');
+      });
+    }
+
+    test('explicit list with a permutation: only a session prepared '
+        'inactive is registered as prepared', () async {
+      await fixture.insertSingles(uuids);
+      Future<int> create({required bool activate}) =>
+          repo.createSessionFromExplicitList(
+              sourceType: 'album',
+              trackUuids: uuids,
+              playOrder: const [5, 4, 3, 2, 1, 0],
+              shuffleEnabled: true,
+              activate: activate);
+      final prepared = await create(activate: false);
+      final items = await repo.getCanonicalItemIds(prepared);
+      await repo.setPreparedCurrentItem(prepared, items[0], 5);
+      final active = await create(activate: true);
+      final activeItems = await repo.getCanonicalItemIds(active);
+      await expectLater(repo.setPreparedCurrentItem(active, activeItems[0], 5),
+          throwsStateError);
+    });
+
+    test('explicit list: no tracks is refused and leaves no session',
+        () async {
+      await expectLater(
+          repo.createSessionFromExplicitList(
+              sourceType: 'search', trackUuids: const []),
+          throwsStateError);
+      expect(await db.select(db.queueSessions).get(), isEmpty);
+    });
+
+    test('query: a current track that is not in the result is refused and '
+        'leaves no session', () async {
+      await fixture.insertSingles(uuids);
+      await expectLater(
+          repo.createSessionFromQuery(
+              sourceType: 'library', currentUuid: 'missing'),
+          throwsStateError);
+      expect(await db.select(db.queueSessions).get(), isEmpty);
+      expect(await db.select(db.queueSessionItems).get(), isEmpty);
+    });
   });
 }
 
@@ -1226,118 +1516,6 @@ Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
       )
       .getSingle();
   return row.read<int>('c');
-}
-
-class _LibraryFixture {
-  final AppDatabase db;
-  int _nextArtistId = 1;
-  int _nextAlbumId = 1;
-  final Map<String, int> _artistIds = {};
-  final Map<String, int> _albumIds = {};
-
-  _LibraryFixture(this.db);
-
-  Future<void> insertAlbum({
-    required String artist,
-    required String album,
-    required List<String> uuids,
-  }) async {
-    final artistId = await _ensureArtist(artist);
-    final albumId = await _ensureAlbum(artistId, album);
-    for (var i = 0; i < uuids.length; i++) {
-      await _insertTrack(
-        uuid: uuids[i],
-        artist: artist,
-        artistId: artistId,
-        album: album,
-        albumId: albumId,
-        trackNumber: i + 1,
-      );
-    }
-  }
-
-  Future<void> insertSingles(List<String> uuids) async {
-    for (var i = 0; i < uuids.length; i++) {
-      final artistName = 'Artist ${i + 1}';
-      final artistId = await _ensureArtist(artistName);
-      final albumId = await _ensureAlbum(artistId, 'Singles ${i + 1}');
-      await _insertTrack(
-        uuid: uuids[i],
-        artist: artistName,
-        artistId: artistId,
-        album: 'Singles ${i + 1}',
-        albumId: albumId,
-        trackNumber: 1,
-      );
-    }
-  }
-
-  Future<int> _ensureArtist(String name) async {
-    final key = name.toLowerCase();
-    final existing = _artistIds[key];
-    if (existing != null) return existing;
-
-    final id = _nextArtistId++;
-    await db
-        .into(db.artists)
-        .insert(ArtistsCompanion(id: Value(id), name: Value(name)));
-    _artistIds[key] = id;
-    return id;
-  }
-
-  Future<int> _ensureAlbum(int artistId, String name) async {
-    final key = '$artistId:${name.toLowerCase()}';
-    final existing = _albumIds[key];
-    if (existing != null) return existing;
-
-    final id = _nextAlbumId++;
-    await db
-        .into(db.albums)
-        .insert(
-          AlbumsCompanion(
-            id: Value(id),
-            name: Value(name),
-            artistId: Value(artistId),
-            year: const Value(2024),
-            isSingleGrouping: const Value(false),
-          ),
-        );
-    _albumIds[key] = id;
-    return id;
-  }
-
-  Future<void> _insertTrack({
-    required String uuid,
-    required String artist,
-    required int artistId,
-    required String album,
-    required int albumId,
-    required int trackNumber,
-  }) async {
-    final dto = ClientTrackDto.fromJson({
-      'uuid_id': uuid,
-      'created_at': 1700000000 + trackNumber,
-      'last_updated': 1700000100 + trackNumber,
-      'revision': 1700000000 + trackNumber,
-      'metadata': {
-        'title': 'Track $uuid',
-        'artist': artist,
-        'album': album,
-        'artist_id': artistId,
-        'album_id': albumId,
-        'track_number': trackNumber,
-        'disc_number': 1,
-        'duration': 180.0,
-        'bitrate_kbps': 320.0,
-        'sample_rate_hz': 44100,
-        'channels': 2,
-        'has_album_art': false,
-      },
-    });
-
-    await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
-    await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
-  }
 }
 
 /// Every play-order row of a session: (play position, canonical position,

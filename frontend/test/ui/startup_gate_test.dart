@@ -17,22 +17,11 @@ import 'package:frontend/ui/server_address_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 
 import '../helpers/server_binding.dart';
+import '../helpers/test_offline.dart';
 
-/// Forces [offlineModeProvider] to a starting value without running the real
-/// health-poll timer. [OfflineModeNotifier.exitOffline] still works because
-/// only `build()` is overridden.
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
-
-/// Drives the real `StartupGate._onConnect` through `ServerAddressPage`'s callback,
-/// without pumping the post-connect frame — so `AppShell` (whose provider
+/// Pumps the real `StartupGate` at the server-address screen; the tests call
+/// `ServerAddressPage.onConnect` (the session controller's `connect`)
+/// without pumping the post-connect frame, so `AppShell` (whose provider
 /// graph is irrelevant to these tests) is never built.
 Future<ServerAddressPage> _pumpServerAddressPage(
   WidgetTester tester,
@@ -66,7 +55,7 @@ void main() {
         unauthenticatedApiClientProvider.overrideWithValue(
           (url) => testApiClient(url, mock),
         ),
-        offlineModeProvider.overrideWith(() => _StubOffline(true)),
+        offlineModeProvider.overrideWith(() => TestOffline(true)),
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(startOnRead: false),
       ],
@@ -113,6 +102,7 @@ void main() {
     );
   });
 
+  // Not the gate: the health check a manual connect makes, called directly.
   test('a failed manual-connect health check uses a single attempt', () async {
     SharedPreferences.setMockInitialValues({});
     var attempts = 0;

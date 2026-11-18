@@ -1,6 +1,7 @@
-import 'package:frontend/playback/playback_target_resolver.dart'
-    show PlaybackSourceKind;
 import 'package:frontend/repositories/queue_repository.dart';
+
+/// Where an item plays from: its local download or the server's stream.
+enum PlaybackSourceKind { local, remote }
 
 /// What the engine is doing (SC-27 processing axis), independent of the
 /// desired transport ([EngineTransportState.playing]) and of the playback

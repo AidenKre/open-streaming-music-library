@@ -13,6 +13,7 @@ import 'package:frontend/ui/utils/library_search_controller.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/library_sync_status_view.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
+import 'package:frontend/ui/widgets/playback_notice.dart';
 import 'package:frontend/ui/widgets/search_status.dart';
 
 /// The global Search (SC-19): a sectioned feed of Artists, Albums and Songs
@@ -260,9 +261,12 @@ class SearchPageState extends ConsumerState<SearchPage> {
         title: 'Songs',
         entities: [for (final t in tracks) TrackEntity(t)],
         // The capped ranked list, from the tapped song.
-        onTap: (_, index) => ref
-            .read(libraryActionsProvider)
-            .playFromList(tracks, index, source: 'search'),
+        onTap: (_, index) => showPlaybackOutcome(
+          context,
+          ref
+              .read(libraryActionsProvider)
+              .playFromList(tracks, index, source: 'search'),
+        ),
         resetToken: rails,
         footer: capHint(SearchType.tracks, 'songs'),
       ),

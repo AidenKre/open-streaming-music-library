@@ -10,6 +10,8 @@ import pytest
 from app.database import DatabaseContext
 from app.database.database import Database
 from app.services import deletion_recovery
+from app.services.deletion_recovery import DeletionJanitor
+from app.services.deletion_worker import DeletionExecutor
 from app.services.track_locks import TrackLocks
 from app.services.upload_publish import SimulatedCrash
 from tests.deletion_world import (
@@ -42,6 +44,23 @@ def restarted_db(world):
     return Database(
         DatabaseContext(database_path=world.db.context.database_path, init_sql_path=INIT_SQL)
     )
+
+
+def janitor(world, seam=None):
+    """The janitor of a restarted process: its own connection and boot id."""
+    database = restarted_db(world)
+    executor = DeletionExecutor(
+        database,
+        music_library_dir=world.music,
+        track_locks=world.locks,
+        cover_art=world.cover_art,
+        cache=world.cache,
+        default_cache=world.default_cache,
+        boot_id=NEW_BOOT,
+        lock_timeout_s=0,
+        seam=seam,
+    )
+    return DeletionJanitor(database, executor=executor, music_library_dir=world.music)
 
 
 def recover(world, *, locks=None, database=None):

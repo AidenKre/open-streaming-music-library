@@ -10,7 +10,6 @@ import sqlite3
 
 import pytest
 
-from app.database.database import Database
 from tests.schema_fixtures import open_database
 
 
@@ -30,10 +29,6 @@ def _user(conn, username="Sam", *, key=None, folder=None, admin=0, master=0):
         "is_master_admin, library_folder, created_at) VALUES (?, ?, 'h', ?, ?, ?, 1)",
         (username, key or username.lower(), admin, master, folder or username.lower()),
     ).lastrowid
-
-
-def test_schema_version_is_17():
-    assert Database.LATEST_SCHEMA_VERSION == 17
 
 
 def test_a_user_row_round_trips_with_unknown_timestamps_null(conn):

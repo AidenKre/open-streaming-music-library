@@ -16,6 +16,7 @@ import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
 
 import '../browse_harness.dart';
 import '../fake_session_controls.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// 4B.1 short viewport (phase-4 §8): the banner region is capped at 30% of
 /// the body, scrolls, and says how many notifications it holds; the player

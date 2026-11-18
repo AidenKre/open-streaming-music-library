@@ -39,7 +39,7 @@ import 'package:frontend/ui/listening_stats/stats_ranked_card.dart';
 import '../../helpers/fake_clock.dart';
 import '../../helpers/server_binding.dart';
 import '../../repositories/catalog_seed.dart';
-import '../browse_harness.dart' show TestOffline;
+import '../../helpers/test_offline.dart';
 
 const _now = 1800000000000;
 const _hour = 3600000;

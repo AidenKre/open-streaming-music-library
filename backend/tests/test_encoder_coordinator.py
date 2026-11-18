@@ -80,7 +80,7 @@ class TestDefaultStateLocking:
         """
         c = _make_coordinator(tmp_path, default_quality="192")
         c.all_uuids_fn = lambda: []  # no warm work to actually do
-        start_gen = c._warm_generation
+        start_gen = c.warm_generation
 
         total_distinct_calls = 0
         for round_idx in range(5):
@@ -102,12 +102,12 @@ class TestDefaultStateLocking:
             for t in threads:
                 t.join()
 
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         # Every distinct call must have incremented the generation. Under a
         # broken lock, lost updates would make this strictly less than
         # ``total_distinct_calls`` with very high probability.
-        assert c._warm_generation == start_gen + total_distinct_calls
+        assert c.warm_generation == start_gen + total_distinct_calls
 
     def test_concurrent_set_and_encode__entries_land_in_consistent_tier(self, tmp_path):
         """While ``set_default_quality`` flips the default, concurrent encodes
@@ -146,7 +146,7 @@ class TestDefaultStateLocking:
             t.start()
         for t in threads:
             t.join()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         # No (uuid, quality) may be present in both caches.
         for uid, q in ((u, q) for u in uuids for q in qualities):
@@ -192,7 +192,7 @@ class TestDefaultStateLocking:
         stop.set()
         for r in readers:
             r.join()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         for q, gen in observations:
             if q == "original":
@@ -244,14 +244,14 @@ class TestDefaultStateLocking:
         stop.set()
         for r in readers:
             r.join()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         # Generation observed in snapshots must be monotonically non-decreasing
         # *for the same observer thread*. Across all readers it should be
         # non-decreasing too because the lock serializes mutations and reads.
         # We just check the trivial invariant: every generation in any
         # snapshot is in range [0, final_generation].
-        final = c._warm_generation
+        final = c.warm_generation
         for _, gen in snapshots:
             assert 0 <= gen <= final
 
@@ -315,7 +315,7 @@ class TestKeyLockDedup:
 
         for t in threads:
             t.join()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         # Exactly one transcode, despite 8 concurrent callers.
         assert sum(transcode_calls) == 1
@@ -413,7 +413,7 @@ class TestPersistAndSetDefaultQuality:
             c.persist_and_set_default_quality("256", persist)
 
         assert c.default_quality == "192"
-        c._executor.shutdown(wait=True)
+        c.drain()
 
     def test_no_op_when_quality_unchanged_skips_persist(self, tmp_path):
         c = _make_coordinator(tmp_path, default_quality="192")
@@ -427,14 +427,14 @@ class TestPersistAndSetDefaultQuality:
         assert changed is False
         assert warming is False
         assert persisted == []
-        c._executor.shutdown(wait=True)
+        c.drain()
 
     def test_live_matches_but_stored_differs__persists_without_warming(self, tmp_path):
         """U06-B-09: an invalid stored value (the live default came from the
         env fallback) is repaired by sending the effective quality again."""
         c = _make_coordinator(tmp_path, default_quality="192")
         c.all_uuids_fn = lambda: ["uuid-a"]
-        generation = c._warm_generation
+        generation = c.warm_generation
         persisted: list[str] = []
 
         changed, warming = c.persist_and_set_default_quality(
@@ -444,8 +444,8 @@ class TestPersistAndSetDefaultQuality:
         assert persisted == ["192"]
         assert (changed, warming) == (False, False)
         assert c.default_quality == "192"
-        assert c._warm_generation == generation  # no warm, no cache delete
-        c._executor.shutdown(wait=True)
+        assert c.warm_generation == generation  # no warm, no cache delete
+        c.drain()
 
     def test_live_and_stored_match__skips_persist(self, tmp_path):
         c = _make_coordinator(tmp_path, default_quality="192")
@@ -458,7 +458,7 @@ class TestPersistAndSetDefaultQuality:
 
         assert (changed, warming) == (False, False)
         assert persisted == []
-        c._executor.shutdown(wait=True)
+        c.drain()
 
     def test_concurrent_puts__persisted_matches_live(self, tmp_path):
         """Final persisted value and live default_quality must agree after
@@ -486,7 +486,7 @@ class TestPersistAndSetDefaultQuality:
             t.start()
         for t in threads:
             t.join()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         # Whichever caller serialized last, the persisted value MUST match the
         # in-memory default. The interleaving "persist A, persist B, live=B,
@@ -529,7 +529,7 @@ class TestEvictionDuringEncode:
         assert result is not None and result.transcoded
         target = default_cache if quality == "192" else c.cache
         assert target.has("u1", quality)
-        c._executor.shutdown(wait=True)
+        c.drain()
 
     def test_insert__stale_generation__dropped_and_source_deleted(self, tmp_path):
         cache = EncodedCache(ctx=EncodedCacheContext(cache_dir=tmp_path / "c", max_size_bytes=0))
@@ -562,7 +562,7 @@ class TestSubmitConversion:
 
         assert done.wait(timeout=5)
         assert received["job_id"] == 42
-        c._executor.shutdown(wait=True)
+        c.drain()
 
     def test_submit_conversion__uses_priority_conversion(self, tmp_path):
         from unittest.mock import MagicMock
@@ -623,7 +623,7 @@ class TestSourceChangedDuringEncode:
         target = default_cache if quality == "192" else c.cache
         assert target.has("u1", quality)
         assert source.read_bytes().endswith(b"the rest of the copy") == (change == "grows")
-        c._executor.shutdown(wait=True)
+        c.drain()
 
     def test_a_warm_of_a_source_that_changed_meanwhile_leaves_no_cache_entry(self, tmp_path):
         def transcode_fn(src: Path, dst: Path, bitrate: int) -> bool:
@@ -640,7 +640,7 @@ class TestSourceChangedDuringEncode:
 
         assert not default_cache.has("u1", "192")
         assert not c.cache.has("u1", "192")
-        c._executor.shutdown(wait=True)
+        c.drain()
 
 
 class TestShutdown:
@@ -684,3 +684,107 @@ class TestShutdown:
         assert not any(t.is_alive() for t in c._executor._threads)
         assert len(encoded) == 1  # only the encode that was already running
         assert conversions == []
+
+
+class TestPoolOrder:
+    """Other-issues row 48 (a): the order the pool runs queued work in, through
+    the public drain(). Today: prefetches first (newest first), then the
+    default-quality work (newest first), then conversions."""
+
+    def test_queued_work_runs_prefetches_then_warm_up_then_conversions(self, tmp_path):
+        release = threading.Event()
+        first_started = threading.Event()
+        ran: list[str] = []
+
+        def recording_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            ran.append(src.stem)
+            first_started.set()
+            assert release.wait(timeout=10)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        c = _make_coordinator(
+            tmp_path, workers=1, transcode_fn=recording_transcode,
+            all_uuids_fn=lambda: ["warm-1", "warm-2"],
+        )
+        sources = tmp_path / "sources"
+        sources.mkdir()
+
+        def source_of(uuid_id: str) -> Path:
+            path = sources / f"{uuid_id}.mp3"
+            path.write_bytes(b"audio" * 100)
+            return path
+
+        c.source_lookup = source_of
+        c.owner_lookup = lambda _uuid: ADMIN_OWNER
+
+        c.enqueue_prefetch("running", "320", source_bitrate_kbps=1000)
+        assert first_started.wait(timeout=10)
+        # Queued while the one worker is busy, in this order:
+        c.submit_conversion(lambda: ran.append("conversion-1"))
+        c.enqueue_prefetch("prefetch-1", "320", source_bitrate_kbps=1000)
+        c.set_default_quality("128")  # queues the cache clean-up and two warm tasks
+        c.enqueue_prefetch("prefetch-2", "256", source_bitrate_kbps=1000)
+        c.submit_conversion(lambda: ran.append("conversion-2"))
+        release.set()
+        c.drain()
+
+        assert ran == [
+            "running",
+            "prefetch-2", "prefetch-1",
+            "warm-2", "warm-1",
+            "conversion-2", "conversion-1",
+        ]
+
+
+class TestPoolErrorLog:
+    """Other-issues row 61: an exception the encoder pool drops leaves one line
+    with its type name (never its text, which may name a file)."""
+
+    LOGGER = "app.services.encoder_coordinator"
+
+    def _lines(self, caplog):
+        return [(r.levelname, r.getMessage()) for r in caplog.records if r.name == self.LOGGER]
+
+    def test_a_task_that_raises_in_the_pool_leaves_one_line_with_its_type(self, tmp_path, caplog):
+        c = _make_coordinator(tmp_path, workers=1)
+
+        def broken():
+            raise RuntimeError("/srv/music/Artist/Song.flac")
+
+        with caplog.at_level("DEBUG", logger=self.LOGGER):
+            c.submit_conversion(broken)
+            c.drain()
+
+        assert self._lines(caplog) == [("WARNING", "encoder pool task failed: RuntimeError")]
+
+    def test_a_failed_prefetch_leaves_one_line_with_its_type(self, tmp_path, caplog):
+        c = _make_coordinator(tmp_path, workers=1)
+
+        def owner_of(uuid_id):
+            raise LookupError("/srv/music/Artist/Song.flac")
+
+        c.owner_lookup = owner_of
+
+        with caplog.at_level("DEBUG", logger=self.LOGGER):
+            c.enqueue_prefetch("uuid-a", "320", source_bitrate_kbps=1000)
+            c.drain()
+
+        assert self._lines(caplog) == [("WARNING", "prefetch failed: LookupError")]
+
+    def test_a_failed_default_cache_clean_up_leaves_one_line_with_its_type(
+        self, tmp_path, caplog
+    ):
+        c = _make_coordinator(tmp_path, workers=1)
+        cache_dir = c.default_cache.ctx.cache_dir
+        cache_dir.rmdir()
+        cache_dir.write_bytes(b"not a folder")  # iterdir() raises NotADirectoryError
+
+        with caplog.at_level("DEBUG", logger=self.LOGGER):
+            c.set_default_quality(ORIGINAL_QUALITY)
+            c.drain()
+
+        assert self._lines(caplog) == [
+            ("WARNING", "default cache clean-up failed: NotADirectoryError")
+        ]

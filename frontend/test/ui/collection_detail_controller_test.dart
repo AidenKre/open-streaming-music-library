@@ -154,21 +154,25 @@ void main() {
 
   group('outcome to message', () {
     const failedCopy = "Couldn't start playback.";
-    final cases = <(String, PlaybackOutcome, String?)>[
-      ('Accepted', const Accepted(3), null),
-      ('Superseded', const Superseded(), null),
-      ('RejectedEmpty', const RejectedEmpty(), 'Nothing to play here right now.'),
+    // Pre-merge A6-03: Retry is offered only where trying again can help,
+    // which is a real failure; the two rejections give the same answer again.
+    final cases = <(String, PlaybackOutcome, String?, bool)>[
+      ('Accepted', const Accepted(3), null, false),
+      ('Superseded', const Superseded(), null, false),
+      ('RejectedEmpty', const RejectedEmpty(),
+          'Nothing to play here right now.', false),
       ('RejectedUnplayableOffline', const RejectedUnplayableOffline(),
-          'Nothing here plays offline.'),
-      ('Failed', Failed(StateError('x')), failedCopy),
+          'Nothing here plays offline.', false),
+      ('Failed', Failed(StateError('x')), failedCopy, true),
     ];
-    for (final (label, outcome, copy) in cases) {
-      test('$label → ${copy ?? 'no message'}', () async {
+    for (final (label, outcome, copy, retry) in cases) {
+      test('$label → ${copy ?? 'no message'}, '
+          '${retry ? 'with' : 'without'} Retry', () async {
         final c = controls();
         actions.next = outcome;
         await c.play();
         expect(c.message, copy);
-        expect(c.canRetry, copy != null);
+        expect(c.canRetry, retry);
       });
     }
 
@@ -209,13 +213,34 @@ void main() {
       expect(c.canRetry, isFalse);
     });
 
-    test('Retry re-runs a Play that found nothing playable offline',
-        () async {
+    // Was "Retry re-runs a Play that found nothing playable offline"
+    // (pre-merge A6-03: a retry cannot change these two answers).
+    for (final outcome in const <PlaybackOutcome>[
+      RejectedUnplayableOffline(),
+      RejectedEmpty(),
+    ]) {
+      test('after $outcome there is nothing to retry: retry submits nothing',
+          () async {
+        final c = controls();
+        actions.next = outcome;
+        await c.play();
+        expect(c.message, isNotNull, reason: 'the explanation stays');
+        expect(c.canRetry, isFalse);
+        await c.retry();
+        expect(actions.calls, ['play album(1,2)']);
+      });
+    }
+
+    test('a rejection after a failure leaves nothing to retry', () async {
       final c = controls();
-      actions.next = const RejectedUnplayableOffline();
+      actions.next = Failed(StateError('x'));
+      await c.shuffle();
+      expect(c.canRetry, isTrue);
+      actions.next = const RejectedEmpty();
       await c.play();
+      expect(c.canRetry, isFalse);
       await c.retry();
-      expect(actions.calls, ['play album(1,2)', 'play album(1,2)']);
+      expect(actions.calls, ['shuffle album(1,2)', 'play album(1,2)']);
     });
 
     test('Retry with nothing to retry submits nothing', () async {

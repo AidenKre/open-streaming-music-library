@@ -51,6 +51,15 @@ void main() {
   }
 
   group('SnapshotFreshness.watch', () {
+    // U26-A-15: the documented guard (an empty scope would watch nothing).
+    test('an empty kinds set throws ArgumentError', () async {
+      final t = await service.capture('k');
+      expect(
+        () => freshness.watch(t, kinds: const {}),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
     test('starts fresh for a current token', () async {
       await insert('a');
       final seen = await watching(await service.capture('k'));

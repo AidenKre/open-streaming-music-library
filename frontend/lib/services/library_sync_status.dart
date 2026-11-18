@@ -14,6 +14,10 @@ enum LibrarySyncStatus {
 
   /// The last sync failed while online; the user can retry.
   failed,
+
+  /// The last sync failed because the server's library looks restored from
+  /// an older backup: retrying cannot help, only a reset of this device.
+  serverRestored,
 }
 
 /// One model status for every surface that shows sync feedback.
@@ -24,6 +28,7 @@ final librarySyncStatusProvider = Provider<LibrarySyncStatus>((ref) {
   // Library (catalog) syncs only: a conflict's single-track refresh neither
   // shows progress nor sets or clears the library's error.
   if (state.librarySyncing) return LibrarySyncStatus.syncing;
+  if (state.libraryServerRestored) return LibrarySyncStatus.serverRestored;
   if (state.libraryError != null) return LibrarySyncStatus.failed;
   return LibrarySyncStatus.idle;
 });

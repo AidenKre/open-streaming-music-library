@@ -27,6 +27,7 @@ import '../helpers/server_binding.dart';
 import 'browse_harness.dart';
 import 'collection_playback_harness.dart';
 import 'fake_library_actions.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// Play and Shuffle wait for [gate], then answer [next].
 class _GatedActions extends FakeLibraryActions {
@@ -95,7 +96,7 @@ void main() {
     SeedTrack(uuid: 'k2', title: 'Kite Two', artistId: 1, artist: 'Ann',
         albumId: 2, album: 'Air', trackNumber: 2),
   ];
-  const page = TracksPage(artistId: 1, albumId: 2);
+  const page = TracksPage.album(AlbumScope(artistId: 1, albumId: 2));
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
@@ -260,7 +261,9 @@ void main() {
       await tester.runAsync(() => pumpEventQueue(times: 50));
       await tester.pumpAndSettle();
       expect(find.text('Nothing here plays offline.'), findsOneWidget);
-      expect(find.text('Retry'), findsOneWidget);
+      // Pre-merge A6-03: a retry would get the same answer, so none is
+      // offered (this expected Retry before).
+      expect(find.text('Retry'), findsNothing);
       expect(player.activated, isEmpty);
       expect(await recordedClicks(tester, db), isEmpty);
       await teardownTree(tester);

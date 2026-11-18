@@ -5,21 +5,8 @@ from starlette.requests import Request
 
 from app.auth.principal import Principal
 from app.library import Library, current_library
-from app.models import Track, TrackMetaData
+from tests.auth_helpers import flac_track
 from tests.conftest import bearer
-
-
-def _track(source, title):
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes(b"not really flac")
-    return Track(
-        file_path=source,
-        metadata=TrackMetaData(
-            title=title, artist="Radiohead", album="OK Computer", codec="flac",
-            duration=1.0, bitrate_kbps=900.0, sample_rate_hz=44100, channels=2,
-            track_number=1, disc_number=1,
-        ),
-    )
 
 
 def _register(client, username):
@@ -62,8 +49,8 @@ def test_each_caller_browses_only_their_own_tracks(app_client, tmp_path):
     body = _register(app_client, "Sam")
     sam = body["user"]["id"]
     sam_folder = db.get_user(sam)["library_folder"]
-    mine = _track(tmp_path / "music" / "admin" / "Airbag.flac", "Airbag")
-    theirs = _track(tmp_path / "music" / sam_folder / "Lucky.flac", "Lucky")
+    mine = flac_track(tmp_path / "music" / "admin" / "Airbag.flac", "Airbag")
+    theirs = flac_track(tmp_path / "music" / sam_folder / "Lucky.flac", "Lucky")
     assert app_client.app.state.admin_library.add_track(mine)
     assert Library(db, sam).add_track(theirs)
 

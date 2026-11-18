@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show Listenable;
 import 'package:drift/drift.dart' show QueryRow, Value, Variable;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -23,29 +24,17 @@ import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
 import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
-import 'package:frontend/services/sync_service.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../helpers/server_binding.dart';
+import '../helpers/test_offline.dart';
 
 class _SwapClient extends BaseClient {
   Client inner = MockClient((_) async => throw StateError('no client installed'));
   @override
   Future<StreamedResponse> send(BaseRequest request) => inner.send(request);
-}
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-
-  final bool _value;
-
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
 }
 
 /// An offline flag the test flips (8-R1-12).
@@ -99,12 +88,25 @@ Future<List<int>> _canonicalPositions(AppDatabase db, int sessionId) async {
   return rows.map((row) => row.read<int>('position')).toList();
 }
 
-Future<void> _waitFor(bool Function() condition) async {
-  for (var i = 0; i < 100; i++) {
-    if (condition()) return;
-    await Future<void>.delayed(const Duration(milliseconds: 10));
+/// Completes once [condition] holds, re-checked on every change [listenable]
+/// reports (no polling); fails after [limit] of real time, the bound for work
+/// that runs through real file I/O.
+Future<void> _whenChanged(Listenable listenable, bool Function() condition,
+    {Duration limit = const Duration(seconds: 5)}) async {
+  if (condition()) return;
+  final met = Completer<void>();
+  void check() {
+    if (!met.isCompleted && condition()) met.complete();
   }
-  throw StateError('condition was not met before timeout');
+
+  listenable.addListener(check);
+  try {
+    await met.future.timeout(limit,
+        onTimeout: () =>
+            throw StateError('condition was not met within $limit'));
+  } finally {
+    listenable.removeListener(check);
+  }
 }
 
 Map<String, dynamic> _minimalMetadataJson() => {
@@ -244,7 +246,7 @@ void main() {
         autoVerifiedGateOverride(),
         tracksApiProvider.overrideWithValue(TracksApi(api: api)),
         offlineModeProvider.overrideWith(
-            () => toggleOffline ?? _StubOffline(offline)),
+            () => toggleOffline ?? TestOffline(offline)),
         if (localCoverArtStore != null)
           localCoverArtStoreProvider.overrideWithValue(localCoverArtStore),
         if (downloadDirectory != null)
@@ -329,7 +331,8 @@ void main() {
     });
 
     test(
-      'first sync requests after_revision=0, upserts, saves lastRevision',
+      'first sync requests after_revision=0, upserts, saves the catalog '
+      'cursor',
       () async {
         final requestUrls = <Uri>[];
         installClient(
@@ -400,9 +403,7 @@ void main() {
     test(
       'subsequent sync sends the stored revision as after_revision',
       () async {
-        SharedPreferences.setMockInitialValues({
-          SyncService.lastRevisionKey: 5,
-        });
+        await SyncCursorStore(db).write(SyncStream.catalog, 5);
         // Seed a local row that must survive (proves no resetLocalData).
         await db
             .into(db.tracks)
@@ -575,12 +576,16 @@ void main() {
           }
         });
 
-        // Slow /changes carrying a delete; single-track GET reports gone.
+        // /changes carrying a delete, held until the refresh has been
+        // tried; single-track GET reports gone.
+        final changesEntered = Completer<void>();
+        final releaseChanges = Completer<void>();
         installClient(
           'http://localhost:8000',
           MockClient((req) async {
             if (req.url.path.endsWith('/changes')) {
-              await Future<void>.delayed(const Duration(milliseconds: 50));
+              if (!changesEntered.isCompleted) changesEntered.complete();
+              await releaseChanges.future;
               return _changesResponse([_delete(3, 'uuid-a')]);
             }
             return Response('', 404);
@@ -588,8 +593,9 @@ void main() {
         );
 
         final syncFuture = notifier.sync();
-        await Future<void>.delayed(const Duration(milliseconds: 10));
+        await changesEntered.future; // the sync is in flight
         final refreshedDuringSync = await notifier.refreshTrack('uuid-b');
+        releaseChanges.complete();
         await syncFuture;
 
         // Serialized: the refresh is skipped while the sync is in flight
@@ -667,6 +673,76 @@ void main() {
       },
     );
 
+    // Other-issues decision 3 (a): a server whose library looks restored from
+    // an older backup is its own library failure (a Retry cannot help); any
+    // other failure, and a good sync, clear it.
+    test(
+      'libraryServerRestored: set by a library sync that finds the server '
+      'behind this device, cleared by another failure and by a good sync',
+      () async {
+        installClient(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse([_upsert(5, _trackJson('uuid-1'))]),
+          ),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
+        final notifier = c.read(trackSyncProvider.notifier);
+        await notifier.sync();
+        expect(c.read(trackSyncProvider).value!.libraryServerRestored, isFalse);
+
+        // The server now reports a latest revision below this device's 5.
+        installClient(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse(const [], latestRevision: 2),
+          ),
+        );
+        await notifier.sync();
+        var state = c.read(trackSyncProvider).value!;
+        expect(state.libraryError, isNotNull);
+        expect(state.libraryServerRestored, isTrue);
+
+        installClient(
+          'http://localhost:8000',
+          MockClient((req) async => Response('server error', 500)),
+        );
+        await notifier.sync();
+        state = c.read(trackSyncProvider).value!;
+        expect(state.libraryError, isNotNull);
+        expect(state.libraryServerRestored, isFalse,
+            reason: 'another failure is an ordinary one, with Retry');
+
+        installClient(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse(const [], latestRevision: 2),
+          ),
+        );
+        await notifier.sync();
+        expect(c.read(trackSyncProvider).value!.libraryServerRestored, isTrue);
+        // A single-track refresh leaves the library's failure as it is.
+        installClient(
+          'http://localhost:8000',
+          MockClient((req) async => Response('server error', 500)),
+        );
+        await notifier.refreshTrack('uuid-1');
+        expect(c.read(trackSyncProvider).value!.libraryServerRestored, isTrue);
+
+        installClient(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse(const [], latestRevision: 5),
+          ),
+        );
+        await notifier.sync();
+        state = c.read(trackSyncProvider).value!;
+        expect(state.libraryError, isNull);
+        expect(state.libraryServerRestored, isFalse);
+      },
+    );
+
     test('offline sync skip makes no API request', () async {
       var callCount = 0;
       installClient(
@@ -738,9 +814,7 @@ void main() {
     test(
       'malformed change payload leaves existing watermark unchanged',
       () async {
-        SharedPreferences.setMockInitialValues({
-          SyncService.lastRevisionKey: 5,
-        });
+        await SyncCursorStore(db).write(SyncStream.catalog, 5);
         installClient(
           'http://localhost:8000',
           MockClient((req) async {
@@ -796,9 +870,7 @@ void main() {
     test(
       'mismatched change and track uuid leaves existing watermark unchanged',
       () async {
-        SharedPreferences.setMockInitialValues({
-          SyncService.lastRevisionKey: 5,
-        });
+        await SyncCursorStore(db).write(SyncStream.catalog, 5);
         installClient(
           'http://localhost:8000',
           MockClient((req) async {
@@ -1139,7 +1211,8 @@ void main() {
 
       deleteMode = true;
       await syncNotifier.sync();
-      await _waitFor(
+      await _whenChanged(
+        manager.downloadStatusVersion,
         () => manager.downloadStatusVersion.value > downloadStatusVersion,
       );
 
@@ -1393,7 +1466,7 @@ void main() {
 
     test('resuming from a saved watermark is idempotent', () async {
       // Simulate a prior partial sync that applied up to revision 1.
-      SharedPreferences.setMockInitialValues({SyncService.lastRevisionKey: 1});
+      await SyncCursorStore(db).write(SyncStream.catalog, 1);
       installClient(
         'http://localhost:8000',
         MockClient((req) async {
@@ -2076,9 +2149,11 @@ void main() {
     });
   });
 
-  group('Artist-rename orphan reproduction', () {
-    test('flushing an artist rename, then resuming the app, still leaves the '
-        'old artist on the browse grid', () async {
+  // Was "Artist-rename orphan reproduction": written when app resume ran
+  // no sync and the old artist stayed (other-issues row 22).
+  group('an artist rename flushed through the edit outbox', () {
+    test('flushing an artist rename, then resuming the app, removes the old '
+        'artist from the browse grid', () async {
       // Establish Artist "Old" (id 31) locally exactly like a freshly
       // synced library: one track, one artist, one album.
       var patched = false;
@@ -2159,12 +2234,11 @@ void main() {
       // ordinary "user put their phone away and picked it back up" edge.
       await c.read(recoveryServiceProvider).runFor(RecoveryTrigger.appResume);
 
-      // Desired: Artist "Old" has zero tracks left after the rename, so it
-      // should no longer show on the browse grid. Actual: nothing ever
-      // repointed the local artist_id FK or pruned the parent row — that
-      // only happens inside SyncService, and app resume never triggers a
-      // sync (`_SyncRecoverable` only fires on `networkRecovered`) — so the
-      // orphaned card survives resume entirely.
+      // Artist "Old" has no tracks left after the rename. Only SyncService
+      // repoints the local artist_id and prunes the parent row; app resume
+      // runs a catalog sync (`_SyncRecoverable` fires on `appResume` and
+      // `networkRecovered`), whose pull moves the track to Artist "New" and
+      // removes Artist "Old", so its card goes.
       final oldArtist = await (db.select(
         db.artists,
       )..where((a) => a.id.equals(31))).get();
@@ -2172,10 +2246,8 @@ void main() {
         oldArtist,
         isEmpty,
         reason:
-            'Artist "Old" has no remaining tracks after the rename '
-            'flushed, but resuming the app never reconciles it — the '
-            'orphaned card survives indefinitely until some other page '
-            'happens to trigger a sync.',
+            'Artist "Old" has no remaining tracks after the rename; the '
+            'sync that app resume runs prunes it.',
       );
     });
   });
@@ -2229,6 +2301,7 @@ void main() {
       final held = StreamController<List<int>>.broadcast();
       addTearDown(held.close);
       final streamed = <String>[];
+      final allBusyStreaming = Completer<void>();
       installClient(
         'http://localhost:8000',
         MockClient.streaming((req, _) async {
@@ -2244,6 +2317,10 @@ void main() {
           }
           if (path.endsWith('/stream')) {
             streamed.add(req.url.pathSegments[1]);
+            if (streamed.length == busy.length &&
+                !allBusyStreaming.isCompleted) {
+              allBusyStreaming.complete();
+            }
             return StreamedResponse(held.stream, 200, contentLength: 999,
                 headers: {'x-audio-extension': 'audio'});
           }
@@ -2266,14 +2343,15 @@ void main() {
       await manager.enqueueTracks(
           [for (final u in [...busy, 'uuid-drop']) await ui(u)],
           quality: '320');
-      await _waitFor(() => streamed.length == busy.length);
+      await allBusyStreaming.future.timeout(const Duration(seconds: 5));
       final drop = manager.snapshot().singleWhere((j) => j.uuidId == 'uuid-drop');
       expect(drop.isQueued, isTrue);
       final version = manager.downloadStatusVersion.value;
 
       deleteMode = true;
       await notifier.sync();
-      await _waitFor(() => manager.downloadStatusVersion.value > version);
+      await _whenChanged(manager.downloadStatusVersion,
+          () => manager.downloadStatusVersion.value > version);
 
       expect(manager.snapshot().map((j) => j.uuidId).toSet(), busy.toSet());
       expect(manager.snapshot().every((j) => j.isActive), isTrue);
@@ -2331,7 +2409,8 @@ void main() {
       expect(await db.getTrackByUuid('uuid-drop'), isEmpty);
       release.complete();
       // The tombstone's fence awaited the worker, then published.
-      await _waitFor(() => manager.downloadStatusVersion.value > version);
+      await _whenChanged(manager.downloadStatusVersion,
+          () => manager.downloadStatusVersion.value > version);
       expect(manager.snapshot(), isEmpty);
       await c.read(ownedFileCleanupRunnerProvider).whenIdle();
 

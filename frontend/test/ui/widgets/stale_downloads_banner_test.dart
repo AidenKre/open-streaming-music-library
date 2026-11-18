@@ -32,7 +32,7 @@ Future<void> _insertTrack(
   String? downloadedCodec,
   double bitrateKbps = 192.0,
   int? downloadedBitrateKbps,
-  String title = 'My Track',
+  String? title = 'My Track',
   String downloadedQuality = '192',
   String? filePath,
   int? fileSizeBytes,
@@ -584,7 +584,27 @@ void main() {
     await flushDispose(tester);
   });
 
-  testWidgets('a failed Re-download shows the "Couldn’t queue" snackbar',
+  // Coordinator round 2: an internal ID is never shown to a person.
+  testWidgets('a stale track without a title reads "Unknown track", never '
+      'its ID', (tester) async {
+    const id = '3f2c9a00-0000-4000-8000-000000000001';
+    await _insertTrack(
+      db,
+      uuid: id,
+      revision: 6,
+      downloadedAtRevision: 5,
+      title: null,
+      filePath: realFile(id),
+    );
+    await tester.pumpWidget(wrap());
+    await tester.pump();
+    await openSheet(tester);
+    expect(find.text('Unknown track'), findsOneWidget);
+    expect(find.textContaining(id), findsNothing);
+    await flushDispose(tester);
+  });
+
+  testWidgets('a failed Re-download shows the "Couldn\'t queue" snackbar',
       (tester) async {
     await _insertTrack(
       db,
@@ -601,7 +621,8 @@ void main() {
     await tapRedownloadAndWait(tester, find.byTooltip('Re-download'));
 
     expect(manager.snapshot(), isEmpty);
-    expect(find.text('Couldn’t queue re-download. Try again.'), findsOneWidget);
+    // D5 (owner, 2026-11-17): no "Try again.".
+    expect(find.text("Couldn't queue re-download."), findsOneWidget);
     expect(find.text('Re-download queued'), findsNothing);
     expect(find.byTooltip('Re-download'), findsOneWidget,
         reason: 'the row stays actionable, not stuck "Re-downloading…"');
@@ -639,7 +660,7 @@ void main() {
 
       expect(manager.snapshot().map((j) => j.uuidId), ['b']);
       expect(
-        find.text('Couldn’t queue re-download for 1 of 2 tracks. Try again.'),
+        find.text("Couldn't queue re-download for 1 of 2 tracks."),
         findsOneWidget,
       );
       expect(find.text('Re-download queued'), findsNothing);

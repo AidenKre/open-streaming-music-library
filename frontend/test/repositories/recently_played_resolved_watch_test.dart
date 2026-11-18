@@ -22,13 +22,13 @@ import '../helpers/fake_clock.dart';
 import '../helpers/server_binding.dart';
 import 'catalog_seed.dart';
 
-/// `type:id:label:downloaded/total`: what a card shows.
+/// `type:id:label`, plus a track's download state as `1/1` (downloaded) or
+/// `0/1`: what a card shows.
 String card(ResolvedRecent r) => switch (r.entity) {
-  TrackUI(:final uuidId, :final title) =>
-    'track:$uuidId:$title:${r.downloaded}/${r.total}',
-  AlbumUI(:final id, :final name) => 'album:$id:$name:${r.downloaded}/${r.total}',
-  ArtistUI(:final id, :final name) =>
-    'artist:$id:$name:${r.downloaded}/${r.total}',
+  TrackUI(:final uuidId, :final title, :final isDownloaded) =>
+    'track:$uuidId:$title:${isDownloaded ? 1 : 0}/1',
+  AlbumUI(:final id, :final name) => 'album:$id:$name',
+  ArtistUI(:final id, :final name) => 'artist:$id:$name',
   _ => 'unexpected',
 };
 
@@ -122,9 +122,9 @@ void main() {
 
   const all = [
     'track:b:Song B:1/1',
-    'album:1:One:1/1',
+    'album:1:One',
     'track:a:Song A:1/1',
-    'artist:2:Bram:1/2',
+    'artist:2:Bram',
   ];
 
   test('hydrates exactly the given refs in the given order', () async {
@@ -141,15 +141,16 @@ void main() {
     await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('a')))
         .write(const TrackmetadataCompanion(title: Value('Renamed')));
     await rec.until([all[0], all[1], 'track:a:Renamed:1/1', all[3]]);
-    await setDownload('c', on: true);
-    await rec.until([all[0], all[1], 'track:a:Renamed:1/1', 'artist:2:Bram:2/2']);
+    await setDownload('b', on: false);
+    await rec.until(
+        ['track:b:Song B:0/1', all[1], 'track:a:Renamed:1/1', all[3]]);
     await seed.click('track', 'c', at: 9999);
     await pumpEventQueue();
     expect(rec.emissions.last, [
-      all[0],
+      'track:b:Song B:0/1',
       all[1],
       'track:a:Renamed:1/1',
-      'artist:2:Bram:2/2',
+      all[3],
     ]);
     await rec.cancel();
   });
@@ -165,7 +166,7 @@ void main() {
       "DELETE FROM tracks WHERE uuid_id = 'b'",
       updates: {db.tracks},
     );
-    await rec.until([all[1], all[2], 'artist:2:Bram:0/1']);
+    await rec.until([all[1], all[2], all[3]]);
     await rec.cancel();
   });
 
@@ -179,9 +180,12 @@ void main() {
     await rec.until([all[0], all[3]]);
     await setDownload('a', on: true);
     await setDownload('c', on: true);
-    await rec.until([all[0], 'artist:2:Bram:2/2']);
+    // A later visible change: once it shows, both downloads were read.
+    await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('b')))
+        .write(const TrackmetadataCompanion(title: Value('B2')));
+    await rec.until(['track:b:B2:1/1', all[3]]);
     await pumpEventQueue();
-    expect(rec.emissions.last, [all[0], 'artist:2:Bram:2/2']);
+    expect(rec.emissions.last, ['track:b:B2:1/1', all[3]]);
     await rec.cancel();
   });
 
@@ -228,7 +232,7 @@ void main() {
       'track:b:Song B:0/1',
       all[1],
       all[2],
-      'artist:2:Bram:0/2',
+      all[3],
     ]);
     await rec2.cancel();
   });

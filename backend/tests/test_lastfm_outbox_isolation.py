@@ -15,7 +15,8 @@ import pytest
 
 from tests import lastfm_secrets as planted
 from tests.lastfm_outbox_helpers import add_catalog_track, history_uuids, hook_failures, listen, outbox, outbox_rig, post
-from tests.lastfm_routes import admin_id, clean_env, execute, seed_connection
+from tests.lastfm_routes import admin_id, clean_env, seed_connection
+from tests.lastfm_sender_rig import execute
 
 ORPHAN_PAYLOAD = {"artist": "Orphan", "track": "Row", "timestamp": 1}
 

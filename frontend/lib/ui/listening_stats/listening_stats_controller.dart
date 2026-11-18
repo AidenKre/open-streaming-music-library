@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/history_event.dart';
 import 'package:frontend/models/listening_stats.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/playback_requests.dart';
@@ -196,7 +197,7 @@ class ListeningStatsController extends ChangeNotifier
       _watchShown(next.stats);
       _freshness = _ref
           .read(snapshotFreshnessProvider)
-          .watch(token, kinds: const {'play'})
+          .watch(token, kinds: const {HistoryKind.play})
           .listen((value) {
             if (_stale(generation) || value == _notice) return;
             _notice = value;

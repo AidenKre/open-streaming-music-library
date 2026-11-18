@@ -2,16 +2,24 @@
 // deletion review sheet and its confirmation render what
 // DeletionReviewControls says and forward every input to it (SC-26).
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show LogicalKeyboardKey;
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/dto/library_tools_dtos.dart';
+import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/deletion/delete_job.dart';
 import 'package:frontend/services/deletion/delete_jobs_manager.dart';
+import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
 import 'package:frontend/services/deletion/deletion_preview.dart';
 import 'package:frontend/services/deletion/deletion_text.dart';
 import 'package:frontend/ui/manage_library/deletion_review_controller.dart';
 import 'package:frontend/ui/manage_library/deletion_review_sheet.dart';
 
 import '../../helpers/fake_library_tools_api.dart';
+import '../../helpers/run_once_track_sync.dart';
 import '../browse_harness.dart' show teardownTree;
+import '../fake_track_selection_controls.dart';
 import 'fake_manage_library_controls.dart';
 
 const _confirmButton = Key('confirm-deletion');
@@ -406,6 +414,25 @@ void main() {
       await teardownTree(tester);
     });
 
+    // DR-B-01: only Cancel or the confirm button closes it (PopScope with
+    // canPop false): Escape and the system back action leave it open.
+    testWidgets('Escape and the back action leave the dialog open', (
+      tester,
+    ) async {
+      await openReady(tester, readyPreview(['a', 'b']));
+      await openDialog(tester);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(find.byKey(_dialog), findsOne, reason: 'Escape');
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.byKey(_dialog), findsOne, reason: 'back');
+      expect(find.byType(DeletionReviewSheet), findsOne);
+      expect(fake.calls.where((c) => c.startsWith('confirm')), isEmpty);
+      expect(result, isNull);
+      await teardownTree(tester);
+    });
+
     testWidgets('confirming hands over the shown preview and the count', (
       tester,
     ) async {
@@ -631,4 +658,131 @@ void main() {
       });
     }
   });
+
+  testWidgets('a review that empties while its confirmation is open closes '
+      'both, and nothing is confirmed', (tester) async {
+    // As in the app: the sheet opens on a nested navigator (the session
+    // navigator, SessionHost), the confirmation on the root one.
+    fake.stage = ReviewStage.ready;
+    fake.preview = readyPreview(['a']);
+    tester.view.physicalSize = const Size(800, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Navigator(
+          onGenerateRoute: (_) => MaterialPageRoute<void>(
+            builder: (context) => Scaffold(
+              body: TextButton(
+                onPressed: () async =>
+                    result = await showDeletionReview(context, fake),
+                child: const Text('open review'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open review'));
+    await tester.pumpAndSettle();
+    await openDialog(tester);
+    expect(find.byKey(_dialog), findsOneWidget);
+    fake
+      ..stage = ReviewStage.idle
+      ..preview = null
+      ..nothingToReview = true
+      ..notify();
+    await tester.pumpAndSettle();
+    expect(find.byKey(_dialog), findsNothing);
+    expect(find.byType(DeletionReviewSheet), findsNothing);
+    expect(find.text('open review'), findsOneWidget);
+    expect(result, isFalse);
+    expect(fake.calls, isEmpty);
+    await teardownTree(tester);
+  });
+
+  testWidgets('on one navigator too, a review that empties under its '
+      'confirmation closes both', (tester) async {
+    await openReady(tester, readyPreview(['a']));
+    await openDialog(tester);
+    fake
+      ..stage = ReviewStage.idle
+      ..preview = null
+      ..nothingToReview = true
+      ..notify();
+    await tester.pumpAndSettle();
+    expect(find.byKey(_dialog), findsNothing);
+    expect(find.byType(DeletionReviewSheet), findsNothing);
+    expect(find.text('open review'), findsOneWidget);
+    expect(result, isFalse);
+    expect(fake.calls, isEmpty);
+    await teardownTree(tester);
+  });
+
+  testWidgets('removing the last target closes the sheet', (tester) async {
+    final c = ProviderContainer(
+      overrides: [
+        deleteJobsManagerProvider.overrideWithValue(_PreviewOnly()),
+        trackSyncProvider.overrideWith(RunOnceTrackSync.new),
+      ],
+    );
+    addTearDown(c.dispose);
+    c.listen(trackSyncProvider, (_, _) {});
+    final sel = FakeTrackSelectionControls()..select('a', baseRevision: 1);
+    addTearDown(sel.dispose);
+    final review = c.read(deletionReviewControllerFactoryProvider)(sel);
+    addTearDown(review.dispose);
+    await review.requestPreview();
+    expect(review.stage, ReviewStage.ready);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () async =>
+                  result = await showDeletionReview(context, review),
+              child: const Text('open review'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open review'));
+    await tester.pumpAndSettle();
+    expect(target('a'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('remove-a')));
+    await tester.pumpAndSettle();
+    expect(find.byType(DeletionReviewSheet), findsNothing);
+    expect(find.byKey(const Key('review-again')), findsNothing);
+    expect(result, isFalse);
+    await teardownTree(tester);
+  });
+}
+
+/// A delete-jobs model that only answers previews: every target is live at
+/// the revision sent.
+class _PreviewOnly implements DeleteJobsManager {
+  final _jobs = ValueNotifier<Map<String, DeleteJob>>(const {});
+
+  @override
+  ValueListenable<Map<String, DeleteJob>> get jobs => _jobs;
+
+  @override
+  bool awaitingAnswer(Iterable<String> uuids) => false;
+
+  @override
+  Future<DeletionPreview> preview(List<DeletionCandidate> candidates) async =>
+      DeletionPreview.fromServer(
+        candidates,
+        DeletionPreviewDto.fromJson({
+          'targets': [
+            for (final c in candidates)
+              previewTargetJson(c.uuid, c.baseRevision ?? 0),
+          ],
+        }),
+      );
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

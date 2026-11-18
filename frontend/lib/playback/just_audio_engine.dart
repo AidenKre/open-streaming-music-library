@@ -7,9 +7,8 @@ import 'package:frontend/api/token_permit.dart';
 import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/playback/playback_engine.dart';
-import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/playback/preview_engine.dart';
-import 'package:frontend/playback/track_cache_manager.dart';
+import 'package:frontend/playback/stream_uris.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/quality_presets.dart';
 
@@ -147,13 +146,7 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
 
   /// [redactAccessToken], plus this engine's literal media token wherever it
   /// appears (a plugin may quote it outside a URL).
-  String _scrub(String text) {
-    final redacted = redactAccessToken(text);
-    final token = _streamMediaToken;
-    return token == null || token.isEmpty
-        ? redacted
-        : redacted.replaceAll(token, '<redacted>');
-  }
+  String _scrub(String text) => redactMediaToken(text, _streamMediaToken);
 
   JustAudioEngine(this._player, {bool Function()? isOfflineFn,
       Future<bool> Function()? beforePlay, LocalSourcePolicy? localSources,
@@ -1858,14 +1851,8 @@ class JustAudioPreviewEngine implements PreviewEngine {
   String? _token;
 
   /// Player errors can quote the URL and its token: never logged raw.
-  void _logError(String what, Object error) {
-    var text = redactAccessToken('$what: $error');
-    final token = _token;
-    if (token != null && token.isNotEmpty) {
-      text = text.replaceAll(token, '<redacted>');
-    }
-    _log(text);
-  }
+  void _logError(String what, Object error) =>
+      _log(redactMediaToken('$what: $error', _token));
 
   @override
   Future<Duration?> load(Uri uri) async {

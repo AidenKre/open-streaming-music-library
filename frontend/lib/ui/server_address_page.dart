@@ -21,6 +21,8 @@ class _ServerAddressPageState extends State<ServerAddressPage> {
   }
 
   Future<void> _connect() async {
+    // Enter in the field bypasses the disabled button: one connect at a time.
+    if (_connecting) return;
     final url = _controller.text.trim();
     if (url.isEmpty) return;
     setState(() => _connecting = true);

@@ -1,6 +1,7 @@
 /// Strict readers for API DTOs: a [FormatException] on a missing or
 /// wrong-typed field; a nullable field keeps null as unknown (never 0/false).
-/// An int field must be a Dart `int` (not a double or a string).
+/// An int field must be a Dart `int` (not a double or a string), except
+/// through [jsonWholeInt], which also takes a whole float.
 library;
 
 /// [json] as a string-keyed object, else a [FormatException] naming [what].
@@ -82,4 +83,24 @@ double? jsonDoubleOrNull(Map<String, dynamic> m, String key) {
   if (v == null) return null;
   if (v is num) return v.toDouble();
   throw FormatException('$key must be a number or null');
+}
+
+/// A whole JSON number as an int, the tolerance the catalog readers always
+/// had: an int, or a float with no fractional part (`3.0` reads 3). A
+/// missing key, null, a fraction (`3.5`), a string or any other type is a
+/// [FormatException]; nothing malformed is read as 0.
+int jsonWholeInt(Map<String, dynamic> m, String key) {
+  final v = jsonWholeIntOrNull(m, key);
+  if (v != null) return v;
+  throw FormatException('$key must be an integer');
+}
+
+/// [jsonWholeInt] for a nullable field: missing or null is unknown (null),
+/// never 0; anything else that is not a whole number is a
+/// [FormatException].
+int? jsonWholeIntOrNull(Map<String, dynamic> m, String key) {
+  final v = m[key];
+  if (v == null || v is int) return v as int?;
+  if (v is double && v.isFinite && v == v.truncateToDouble()) return v.toInt();
+  throw FormatException('$key must be an integer or null');
 }

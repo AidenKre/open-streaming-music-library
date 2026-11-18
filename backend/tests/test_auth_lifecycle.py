@@ -6,24 +6,14 @@ The CLI arrives in M.2b; here the flags are written from another connection,
 exactly as an out-of-process CLI would.
 """
 
-import sqlite3
-
 import pytest
 
 from app.library import Library
 from app.models import Track, TrackMetaData
 from tests.conftest import TEST_ADMIN_PASSWORD, TEST_ADMIN_USERNAME, bearer, log_in
+from tests.sqlite_helpers import sql_exec
 
 PASSWORD = "correct horse battery"
-
-
-def _sql(client, statement, params=()):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        conn.execute(statement, params)
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _track(source):
@@ -55,7 +45,7 @@ def test_a_flagged_user_is_refused_on_the_next_request(app_client, tmp_path, col
               {"quality": "original", "access_token": sam["media_token"]})
     assert app_client.get("/tracks", headers=bearer(sam["token"])).status_code == 200
 
-    _sql(app_client, f"UPDATE users SET {column} = 1 WHERE id = ?", (sam["user"]["id"],))
+    sql_exec(app_client, f"UPDATE users SET {column} = 1 WHERE id = ?", (sam["user"]["id"],))
 
     assert _error(app_client.get("/tracks", headers=bearer(sam["token"]))) == (401, "invalid_token")
     app_client.headers.pop("Authorization")
@@ -66,7 +56,7 @@ def test_flagging_one_user_leaves_the_others_signed_in(app_client):
     sam = app_client.post("/auth/register", json={"username": "Sam", "password": PASSWORD}).json()
     alex = app_client.post("/auth/register", json={"username": "Alex", "password": PASSWORD}).json()
 
-    _sql(app_client, "UPDATE users SET disabled_at = 1 WHERE id = ?", (sam["user"]["id"],))
+    sql_exec(app_client, "UPDATE users SET disabled_at = 1 WHERE id = ?", (sam["user"]["id"],))
 
     assert app_client.get("/tracks", headers=bearer(alex["token"])).status_code == 200
     assert app_client.get("/tracks").status_code == 200  # the admin

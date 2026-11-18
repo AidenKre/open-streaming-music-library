@@ -16,8 +16,10 @@ const _noteQualifiedPlay =
 const _noteNames =
     "Names are the library's current metadata when the recap was generated, not the names at the time of listening.";
 
+/// Names the export's "unavailable" figures as the screens do ("Deleted or
+/// unknown tracks", decision 6). Proposed to the owner, not yet approved.
 const _noteUnavailable =
-    "Unavailable time is listening to tracks that were deleted or are not in this device's library. It is included in the totals but in no top list.";
+    "The \"unavailable\" figures count listening to deleted or unknown tracks (tracks that were deleted or are not in this device's library). They are included in the totals but in no top list.";
 
 const _noteLocalHistory =
     "Counted from the listening history on this device when the recap was generated. Listens from other devices that had not synced yet are not included.";

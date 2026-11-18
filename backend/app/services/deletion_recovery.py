@@ -8,17 +8,17 @@ import uuid
 from pathlib import Path
 
 from app.core.durable_fs import fsync_dir
-from app.core.internal_dirs import DELETING
 from app.core.operator_log import operator_logger
 from app.library import library_root
-from app.services import organizer
+from app.services import file_ops
 from app.services.startup_recovery import StartupStep
-from app.services.deletion_worker import (
-    _EXTENSION,
-    DeletionExecutor,
+from app.services.deletion_worker import _EXTENSION, DeletionExecutor
+from app.services.master_paths import (
     check_master_path,
     is_journaled_file,
     put_back_file,
+    quarantine_base,
+    quarantine_dir,
     quarantine_state,
 )
 
@@ -72,11 +72,12 @@ def quarantine_trusted(music_library_dir, row) -> bool:
     suffix = quarantine.name[len(uuid_id):] if quarantine.name.startswith(uuid_id) else None
     if suffix is None or (suffix and not _EXTENSION.match(suffix)):
         return False
-    base = Path(music_library_dir) / DELETING
-    op_dir = base / str(row["owner_id"]) / str(row["operation_uuid"])
+    base = quarantine_base(music_library_dir)
+    owner_dir = quarantine_dir(music_library_dir, row["owner_id"])
+    op_dir = owner_dir / str(row["operation_uuid"])
     if quarantine != op_dir / quarantine.name:
         return False
-    for folder in (base, base / str(row["owner_id"]), op_dir):
+    for folder in (base, owner_dir, op_dir):
         if not _real_dir_or_absent(folder):
             return False
     return True
@@ -116,7 +117,7 @@ def _verdict(database, row, user, music_library_dir) -> str:
         if q_state in ("free", "other"):
             return _CLEAR
         if q_state == "ours":
-            if not organizer.is_own_hard_link(quarantine, original):
+            if not file_ops.is_own_hard_link(quarantine, original):
                 return _KEEP
             os.unlink(quarantine)
             fsync_dir(quarantine.parent)
@@ -144,7 +145,7 @@ def _verdict(database, row, user, music_library_dir) -> str:
         # move happened, so its owner's quarantine folder must still be a real
         # directory (an unmounted one would read as empty); an "intent" journal's
         # move may never have created it.
-        quarantine_root = Path(music_library_dir) / DELETING / str(owner)
+        quarantine_root = quarantine_dir(music_library_dir, owner)
         if row["stage"] != "moved" or _is_real_dir(quarantine_root):
             return _CLEAR
     return _KEEP
@@ -224,7 +225,7 @@ def put_back_unrecorded(
     (OPEN-8-01 part A). True only when it was put back; any doubt returns False
     and touches nothing."""
     try:
-        parts = Path(path).relative_to(Path(music_library_dir) / DELETING).parts
+        parts = Path(path).relative_to(quarantine_base(music_library_dir)).parts
     except ValueError:
         return False
     if len(parts) != 3:
@@ -316,7 +317,7 @@ class DeletionJanitor:
             try:
                 roots = (
                     library_root(self._music_library_dir, user),
-                    Path(self._music_library_dir) / DELETING / str(row["owner_id"]),
+                    quarantine_dir(self._music_library_dir, row["owner_id"]),
                 )
             except Exception:
                 return False
@@ -369,7 +370,7 @@ class DeletionJanitor:
         """Startup only. A holding file no journal row names is put back at its
         track's place when it proves to be that live track's missing master;
         every other one is counted, reported and kept. Returns the kept count."""
-        base = Path(self._music_library_dir) / DELETING
+        base = quarantine_base(self._music_library_dir)
         try:
             entries = list(os.scandir(base))
         except OSError:

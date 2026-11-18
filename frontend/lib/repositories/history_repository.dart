@@ -7,7 +7,9 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/history_event.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
-import 'package:frontend/services/sync_service.dart' show ServerRegressedException;
+
+// Moved (B.13); re-exported so importers keep working.
+export 'package:frontend/models/history_event.dart' show HistoryUploadBatch;
 
 /// The server broke the history protocol (malformed/unexpected ACK, a page
 /// that is out of order, has duplicates, a wrong cursor or invalid fields).
@@ -28,14 +30,6 @@ class HistoryPayloadConflict implements Exception {
   @override
   String toString() =>
       'HistoryPayloadConflict(${events.map((e) => e.payload.eventUuid).toList()})';
-}
-
-/// One upload batch: the events and the exact UTF-8 request body.
-class HistoryUploadBatch {
-  HistoryUploadBatch(this.events, this.body);
-  final List<HistoryEventPayload> events;
-  final Uint8List body;
-  List<String> get eventUuids => [for (final e in events) e.eventUuid];
 }
 
 /// Diagnostics counts.
@@ -170,7 +164,7 @@ class HistoryRepository {
       try {
         finalPayload = row.finalPayloadJson == null
             ? null
-            : _payloadFromJson(jsonDecode(row.finalPayloadJson!));
+            : HistoryEventPayload.fromJson(jsonDecode(row.finalPayloadJson!));
       } catch (e) {
         developer.log(
           'listen draft skipped: unreadable final payload (${e.runtimeType})',
@@ -204,19 +198,6 @@ class HistoryRepository {
       (_db.delete(_db.activeListens)
             ..where((l) => l.listenUuid.equals(listenUuid)))
           .go();
-
-  static HistoryEventPayload _payloadFromJson(Object? json) {
-    final map = json as Map<String, Object?>;
-    return HistoryEventPayload(
-      eventUuid: map['event_uuid'] as String,
-      kind: map['kind'] as String,
-      entityType: map['entity_type'] as String,
-      entityRef: map['entity_ref'] as String,
-      occurredAt: map['occurred_at'] as int,
-      secondsPlayed: (map['seconds_played'] as num?)?.toDouble(),
-      trackLength: (map['track_length'] as num?)?.toDouble(),
-    );
-  }
 
   /// A locally produced event: inserted pending, atomically.
   Future<void> insertLocal(String bindingToken, HistoryEventPayload event) async {
@@ -270,7 +251,10 @@ class HistoryRepository {
         final event = _payload(row.readTable(history));
         final bytes = _eventBytes(event);
         if (_emptyBodyBytes + bytes > byteLimit) {
-          await _recordFailureIn(event.eventUuid, reason: 'oversized');
+          await _recordFailureIn(
+            event.eventUuid,
+            reason: HistoryFailureReason.oversized,
+          );
           continue;
         }
         final next = size + bytes + (events.isEmpty ? 0 : 1);
@@ -472,7 +456,8 @@ class HistoryRepository {
   Future<void> clearRetryableFailures(String bindingToken) =>
       _binding.runFenced(bindingToken, () async {
         await (_db.delete(_db.historySyncFailures)
-              ..where((t) => t.reason.equals('conflict').not()))
+              ..where((t) =>
+                  t.reason.equals(HistoryFailureReason.conflict).not()))
             .go();
       });
 

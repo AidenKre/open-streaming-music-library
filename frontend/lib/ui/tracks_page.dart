@@ -21,11 +21,12 @@ import 'package:frontend/ui/mixins/root_browse_mixin.dart';
 import 'package:frontend/ui/selection/track_selection_controller.dart';
 import 'package:frontend/ui/widgets/collection_action_header.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
+import 'package:frontend/ui/widgets/playback_notice.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
 class TracksPage extends ConsumerStatefulWidget {
-  final int? artistId;
-  final int? albumId;
+  /// The album this list shows, or null for the whole library.
+  final AlbumScope? album;
 
   /// Browse-all capability (the whole library with the Downloaded chip and
   /// in-page search), not "navigator root". Requires no album. The page owns
@@ -39,13 +40,14 @@ class TracksPage extends ConsumerStatefulWidget {
   /// and window changes. Null: the normal browse page.
   final TrackSelectionControls? selection;
 
-  const TracksPage({
-    super.key,
-    this.artistId,
-    this.albumId,
-    this.browseAll = false,
-    this.selection,
-  });
+  /// The whole library's tracks.
+  const TracksPage({super.key, this.browseAll = false, this.selection})
+    : album = null;
+
+  /// One album's tracks: a detail list, with no chip, search or selection.
+  const TracksPage.album(AlbumScope this.album, {super.key})
+    : browseAll = false,
+      selection = null;
 
   @override
   ConsumerState<TracksPage> createState() => _TracksPageState();
@@ -66,19 +68,18 @@ class _TracksPageState extends ConsumerState<TracksPage>
   bool get _downloadedOnly => filters.downloaded;
 
   /// The album this list shows, or null for the whole library.
-  AlbumScope? get _album => widget.albumId == null
-      ? null
-      : AlbumScope(artistId: widget.artistId!, albumId: widget.albumId!);
+  AlbumScope? get _album => widget.album;
 
   @override
   void initState() {
     super.initState();
-    assert(!widget.browseAll || widget.albumId == null);
     assert(widget.selection == null || widget.browseAll);
     // Creating a Tracks browse route refreshes the library (phase-4 §4);
-    // the initial sync belongs to the session host, so details don't.
+    // the initial sync belongs to the session host, so details don't, and
+    // neither does Manage library's track picker (a selection list; owner's
+    // decision 2026-11-17).
     if (widget.browseAll) {
-      _refreshLibrary();
+      if (widget.selection == null) _refreshLibrary();
       initRootBrowse(type: SearchType.tracks);
     }
     initPagination();
@@ -177,14 +178,17 @@ class _TracksPageState extends ConsumerState<TracksPage>
           track,
           rows,
           idHint: hints[track.uuidId],
-          onTap: () => ref
-              .read(libraryActionsProvider)
-              .playQuery(
-                track,
-                album: _album,
-                // Queue exactly what the filtered list shows.
-                downloadedOnly: _downloadedOnly,
-              ),
+          onTap: () => showPlaybackOutcome(
+            context,
+            ref
+                .read(libraryActionsProvider)
+                .playQuery(
+                  track,
+                  album: _album,
+                  // Queue exactly what the filtered list shows.
+                  downloadedOnly: _downloadedOnly,
+                ),
+          ),
         );
       },
     );
@@ -207,9 +211,12 @@ class _TracksPageState extends ConsumerState<TracksPage>
             rows,
             idHint: hints[track.uuidId],
             // Play the visible result list, like the global search.
-            onTap: () => ref
-                .read(libraryActionsProvider)
-                .playFromList(tracks, index, source: 'search'),
+            onTap: () => showPlaybackOutcome(
+              context,
+              ref
+                  .read(libraryActionsProvider)
+                  .playFromList(tracks, index, source: 'search'),
+            ),
           );
         },
       ),

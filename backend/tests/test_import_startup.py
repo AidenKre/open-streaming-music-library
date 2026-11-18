@@ -8,40 +8,15 @@
 """
 
 import logging
-import subprocess
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.import_startup_fixtures import WATCH, _drain_imports, _tone, requires_ffmpeg
 from tests.owned_database import add_test_user
 
 
 pytestmark = pytest.mark.usefixtures("fast_stability_poll")
-
-# Registered marker (plan D16): tests/conftest.py skips without ffmpeg/ffprobe.
-requires_ffmpeg = pytest.mark.requires_ffmpeg
-
-WATCH = {"ENABLE_FILE_WATCHER": "true"}
-
-
-def _tone(path, title):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.3",
-         "-metadata", f"title={title}", "-metadata", "artist=Radiohead",
-         "-c:a", "libmp3lame", str(path)],
-        check=True,
-    )
-
-
-def _drain_imports(client):
-    """Wait for every import the startup (or a signup) submitted, then give
-    each watcher a fresh executor so later submissions still run."""
-    for name in ("file_watcher", "user_file_watcher"):
-        watcher = getattr(client.app.state, name)
-        watcher.executor.shutdown(wait=True)
-        watcher.executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _titles(library):
@@ -130,6 +105,41 @@ def test_each_watcher_starts_before_its_startup_scan(configure_app, monkeypatch)
         assert calls.index(("start", name)) < calls.index(("scan", name)), calls
 
 
+def test_the_workspace_sweep_runs_before_any_watcher_or_scan(configure_app, monkeypatch):
+    """Pre-merge A2-04: the sweep deletes every unpack folder, which is safe only
+    while no import runs. Run after a watcher or the start-up scan, it could
+    remove the folder of an archive that scan is unpacking."""
+    from app.services.file_watcher import FileWatcher
+
+    calls = []
+    main = configure_app(env=WATCH)
+    real_sweep = main.sweep_workspace
+    real_start, real_scan = FileWatcher.start_file_watcher, FileWatcher.scan_existing
+
+    def sweep(root):
+        calls.append("sweep")
+        return real_sweep(root)
+
+    def start(self):
+        calls.append("start " + self.import_dir.name)
+        return real_start(self)
+
+    def scan(self, directory=None):
+        calls.append("scan " + self.import_dir.name)
+        return real_scan(self, directory)
+
+    monkeypatch.setattr(main, "sweep_workspace", sweep)
+    monkeypatch.setattr(FileWatcher, "start_file_watcher", start)
+    monkeypatch.setattr(FileWatcher, "scan_existing", scan)
+
+    with TestClient(main.app):
+        pass
+
+    assert calls[0] == "sweep", calls
+    assert calls.count("sweep") == 1, calls
+    assert {"start import", "start import-users", "scan import", "scan import-users"} <= set(calls), calls
+
+
 @requires_ffmpeg
 def test_admin_tracks_imported_by_the_startup_scan_are_prewarmed(
     configure_app, tmp_path, monkeypatch
@@ -139,7 +149,7 @@ def test_admin_tracks_imported_by_the_startup_scan_are_prewarmed(
     the admin's quality on that same start. A friend's import never is."""
     from app.library import Library
     from app.services.encoder_coordinator import EncoderCoordinator
-    from tests.test_default_quality import _store_quality
+    from tests.quality_fixtures import _store_quality
 
     with TestClient(configure_app().app) as c:
         sam_id = add_test_user(c.app.state.database, "sam")
@@ -155,7 +165,7 @@ def test_admin_tracks_imported_by_the_startup_scan_are_prewarmed(
 
     with TestClient(configure_app(env=WATCH).app) as c:
         _drain_imports(c)
-        c.app.state.encoder_coordinator._executor.shutdown(wait=True)
+        c.app.state.encoder_coordinator.drain()
         admin_uuids = [t.uuid_id for t in c.app.state.admin_library.get_tracks()]
         sam_uuids = [t.uuid_id for t in Library(c.app.state.database, sam_id).get_tracks()]
 

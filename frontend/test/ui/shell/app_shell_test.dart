@@ -21,6 +21,7 @@ import 'package:frontend/ui/widgets/track_card.dart';
 
 import '../browse_harness.dart';
 import '../fake_session_controls.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 class _CountingBrowse implements BrowseControls {
   int refreshes = 0;

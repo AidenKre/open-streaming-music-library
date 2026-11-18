@@ -33,6 +33,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../helpers/library_seed.dart';
 import '../../helpers/server_binding.dart';
 
 class _RecordingRunner extends SingleFlightRunner {
@@ -57,7 +58,9 @@ class _GatedPayloadRepository extends HistoryRepository {
   }
 }
 
-ApiClient api = testApiClient('', MockClient((_) async => throw StateError('no client installed')));
+/// The scope's API client: reset in setUp to one that fails every request;
+/// a test that needs answers installs its own (U26-B-07).
+late ApiClient api;
 
 class _StatusService extends HistorySyncService {
   _StatusService(AppDatabase db) : super(
@@ -86,6 +89,8 @@ void main() {
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    api = testApiClient(
+        '', MockClient((_) async => throw StateError('no client installed')));
     db = AppDatabase(NativeDatabase.memory());
     token = await seedTestBinding(db);
   });
@@ -191,6 +196,46 @@ void main() {
       expect(seen.every((d) => d.conflicts.isEmpty), isTrue);
     });
   }
+
+  // Pre-merge review A5-06: a conflict card names its track the way a person
+  // knows it (title and artist from this device's catalog), else Unknown
+  // track; never by the track's reference.
+  test("a conflict's track is named from the local catalog", () async {
+    await seedLibrary(db, const [
+      SeedTrack(uuid: 't-1', title: 'Aria', artistId: 1, artist: 'Artist 01'),
+    ]);
+    final repository = HistoryRepository(db);
+    await repository.insertLocal(token, _event('mine'));
+    await repository.insertLocal(token, HistoryEventPayload(
+      eventUuid: 'gone', kind: 'play', entityType: 'track',
+      entityRef: 't-gone', occurredAt: 1000, secondsPlayed: 3,
+    ));
+    final service = _StatusService(db);
+    final c = ProviderContainer(overrides: [
+      historyRepositoryProvider.overrideWithValue(repository),
+      historySyncServiceProvider.overrideWithValue(service),
+      databaseProvider.overrideWithValue(db),
+    ]);
+    addTearDown(c.dispose);
+    addTearDown(service.current.dispose);
+    c.listen(historyDiagnosticsProvider, (_, _) {});
+    await next(c, (d) => d.pending == 2);
+    service.current.value = HistorySyncStatus(blockedConflicts: [
+      HistoryServerEvent(
+          payload: _event('mine', seconds: 99), revision: 5, receivedAt: 7),
+      HistoryServerEvent(
+          payload: HistoryEventPayload(
+            eventUuid: 'gone', kind: 'play', entityType: 'track',
+            entityRef: 't-gone', occurredAt: 1000, secondsPlayed: 4,
+          ),
+          revision: 6,
+          receivedAt: 8),
+    ]);
+    final d = await next(c, (d) => d.conflicts.length == 2);
+    expect(d.trackNames['t-1'], 'Aria — Artist 01');
+    expect(d.trackNames['t-gone'], anyOf(isNull, 'Unknown track'));
+    expect(d.trackNames.values, isNot(contains('t-gone')));
+  });
 
   test('the sync status flows through (waiting for server support)', () async {
     final c = scope(supported: false);

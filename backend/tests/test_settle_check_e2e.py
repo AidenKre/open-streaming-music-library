@@ -23,7 +23,8 @@ from app.services.file_watcher import FileWatcher
 from app.services.import_outcome import ImportOutcome
 from app.services.settle_check import SETTLE_WINDOW_S, SettleCheck
 from tests.owned_database import add_test_user
-from tests.test_default_quality import _store_quality
+from tests.quality_fixtures import _store_quality
+from tests.track_paths import set_track_path
 
 pytestmark = [
     pytest.mark.usefixtures("fast_stability_poll"),
@@ -194,10 +195,7 @@ def test_a_track_relocated_by_an_edit_during_the_window_is_skipped(app, monkeypa
     # while something still grows the old path.
     moved = old_path.with_name("elsewhere.flac")
     shutil.copy(old_path, moved)
-    conn = __import__("sqlite3").connect(c.app.state.database.context.database_path)
-    conn.execute("UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(moved), track.uuid_id))
-    conn.commit()
-    conn.close()
+    set_track_path(c, track.uuid_id, moved)
     with open(old_path, "ab") as f:
         f.write(whole[len(whole) // 4:])
     refreshed = c.app.state.admin_library.get_track_by_uuid(track.uuid_id)

@@ -1,6 +1,6 @@
 // Fix 9-fix-r4-fe (live defect 9-L-03): the rewritten "More from your
 // artists" pool statement returns exactly what the shipped one returned
-// (suggestion_pools_legacy.dart, candidate aa5d50bd), row for row, on a
+// (suggestion_pools_legacy.dart), row for row, on a
 // seeded history built to sit on the edges: listens exactly at, 1 ms before
 // and 1 ms after the 14- and 30-day lines and the captured now, rows beyond
 // the insertion boundary, future, unqualified, zero, negative, null, infinite

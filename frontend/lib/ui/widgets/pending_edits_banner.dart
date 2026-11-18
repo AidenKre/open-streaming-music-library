@@ -1,9 +1,7 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'package:frontend/database/database.dart';
+import 'package:frontend/models/pending_edit_display.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/ui/edit_controller.dart';
 import 'package:frontend/ui/widgets/edit_conflict_dialog.dart';
@@ -25,12 +23,6 @@ class PendingEditsBanner extends ConsumerWidget {
 
     final colors = Theme.of(context).colorScheme;
     final needsAttention = counts.conflicted > 0 || counts.rejected > 0;
-    final parts = <String>[
-      if (counts.pending > 0) '${counts.pending} edit(s) pending',
-      if (counts.conflicted > 0) '${counts.conflicted} conflict(s)',
-      if (counts.rejected > 0) '${counts.rejected} rejected',
-    ];
-
     return Material(
       color:
           needsAttention ? colors.errorContainer : colors.secondaryContainer,
@@ -48,7 +40,15 @@ class PendingEditsBanner extends ConsumerWidget {
                     : colors.onSecondaryContainer,
               ),
               const SizedBox(width: 8),
-              Expanded(child: Text(parts.join(' • '))),
+              Expanded(
+                child: Text(
+                  pendingEditsSummary(
+                    pending: counts.pending,
+                    conflicted: counts.conflicted,
+                    rejected: counts.rejected,
+                  ),
+                ),
+              ),
               if (needsAttention) const Text('Review'),
             ],
           ),
@@ -65,15 +65,6 @@ class PendingEditsBanner extends ConsumerWidget {
   }
 }
 
-String _labelFor(PendingEdit row) {
-  try {
-    final values = jsonDecode(row.valuesJson) as Map<String, dynamic>;
-    final title = values['title'];
-    if (title is String && title.isNotEmpty) return title;
-  } catch (_) {}
-  return row.uuidId;
-}
-
 /// Conflicts (keep-mine / take-server) and rejections (reason + dismiss) in
 /// one sheet, both driven by live outbox streams.
 class _OutboxIssuesList extends ConsumerWidget {
@@ -81,8 +72,9 @@ class _OutboxIssuesList extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final conflicts = ref.watch(conflictedEditsProvider).value ?? const [];
-    final rejected = ref.watch(rejectedEditsProvider).value ?? const [];
+    final conflicts =
+        ref.watch(conflictedEditIssuesProvider).value ?? const [];
+    final rejected = ref.watch(rejectedEditIssuesProvider).value ?? const [];
     return SafeArea(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -92,11 +84,11 @@ class _OutboxIssuesList extends ConsumerWidget {
             for (final row in conflicts)
               ListTile(
                 leading: const Icon(Icons.sync_problem),
-                title: Text(_labelFor(row)),
+                title: Text(row.trackName),
                 onTap: () async {
                   final choice = await showEditConflictDialog(
                     context,
-                    trackLabel: _labelFor(row),
+                    trackLabel: row.trackName,
                   );
                   if (choice == null) return;
                   final edits = ref.read(editControlsProvider);
@@ -113,7 +105,7 @@ class _OutboxIssuesList extends ConsumerWidget {
             for (final row in rejected)
               ListTile(
                 leading: const Icon(Icons.block),
-                title: Text(_labelFor(row)),
+                title: Text(row.trackName),
                 subtitle: Text(
                   row.rejectionReason ?? 'Rejected by the server',
                 ),

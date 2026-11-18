@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Callable
 import errno
 import logging
-import shutil
 import signal
+import stat
 import threading
 import json
 import os
@@ -15,7 +15,8 @@ import tarfile
 
 from app.core.operator_log import operator_logger
 from app.services.import_archive import (
-    ArchiveNoSpace, ArchiveRefused, ArchiveStopped, ArchiveUnpacker, ArchiveWriteFailed, default_limits,
+    ArchiveChanged, ArchiveNoSpace, ArchiveRefused, ArchiveStopped, ArchiveUnpacker, ArchiveWriteFailed,
+    default_limits,
 )
 from app.services.import_outcome import ImportOutcome, file_identity, file_signature
 from app.services.ffmpeg_runner import (
@@ -82,6 +83,14 @@ class Ingestor:
         return outcome
 
     def _ingest(self, file_path: Path, imported_dir: Path | None) -> ImportOutcome:
+        # A symbolic link (or anything else that is not a regular file) is never
+        # imported and never read through: not probed, not unpacked. It stays
+        # where it is, like any file that is no audio file. Nor a file reached
+        # through a linked folder: it does not lie in this import folder, and
+        # moving it would take it from wherever it really is.
+        import_folder = imported_dir.parent if imported_dir is not None else None
+        if _is_no_regular_file(file_path) or _under_a_linked_folder(file_path, import_folder):
+            return ImportOutcome.NOT_AUDIO
         if is_archive(file_path):
             return self._ingest_archive(file_path, imported_dir)
         if not is_music_file(file_path):
@@ -112,7 +121,7 @@ class Ingestor:
         owner = self._archives.owner_id
         try:
             with self._archives.unpack(file_path, self.ctx.workspace_dir,
-                                       should_stop=self.ctx.should_stop) as unpacked:
+                                       should_stop=self.ctx.should_stop, expected=identity) as unpacked:
                 planned, other_audio = len(unpacked.files), unpacked.other_audio
                 if file_signature(file_path) != before:
                     return ImportOutcome.CHANGED
@@ -141,6 +150,8 @@ class Ingestor:
             return ImportOutcome.NO_SPACE if isinstance(e, ArchiveNoSpace) else ImportOutcome.UNPACK_FAILED
         except ArchiveStopped:
             return ImportOutcome.STOPPED
+        except ArchiveChanged:
+            return ImportOutcome.CHANGED
 
         if kept is not None:
             return kept
@@ -150,10 +161,18 @@ class Ingestor:
             return ImportOutcome.IMPORTED
         # Every audio file imported, from a regular file: delete. Otherwise (a
         # track refused for its own content, no audio, audio the server does
-        # not import, a symlink): set aside.
+        # not import): set aside.
         if imported > 0 and imported == planned and other_audio == 0 and identity is not None:
             return self._delete_archive(file_path, identity, imported)
-        target = move_to_imported(file_path, imported_dir)
+        # Only the very file that was looked at first is moved (as only that
+        # file would be deleted): not a link, and not another file that came
+        # to lie at the path meanwhile.
+        if identity is None or file_identity(file_path) != identity:
+            return ImportOutcome.CHANGED
+        try:
+            target = move_to_imported(file_path, imported_dir)
+        except SetAsideRefused:
+            return ImportOutcome.MOVE_FAILED
         if other_audio > 0:
             folder = imported_dir.parent
             operator_logger.warning(
@@ -197,6 +216,39 @@ class Ingestor:
         return as_outcome(self.organize_function(path))
 
 
+def _is_no_regular_file(path: Path) -> bool:
+    """Whether something is at ``path`` itself (a symbolic link is not
+    followed) that is not a regular file. A missing path is False: the
+    import's own checks answer for it."""
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _under_a_linked_folder(path: Path, import_folder: Path | None) -> bool:
+    """Whether a folder between ``import_folder`` and ``path`` is a symbolic
+    link. Neither the import folder itself (an operator may reach it through a
+    link) nor the file is looked at. False without a known import folder, for a
+    path not below it, and when a folder cannot be examined: the import's own
+    checks answer for a path that is not there."""
+    if import_folder is None:
+        return False
+    try:
+        parts = path.relative_to(import_folder).parts
+    except ValueError:
+        return False
+    folder = import_folder
+    for part in parts[:-1]:
+        folder = folder / part
+        try:
+            if stat.S_ISLNK(os.lstat(folder).st_mode):
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def _in_folder(path: Path, folder: Path) -> str:
     """The path relative to the import folder (never absolute in a log line);
     outside it, the file name only."""
@@ -222,6 +274,12 @@ def as_outcome(result: ImportOutcome | bool) -> ImportOutcome:
 _imported_lock = threading.Lock()
 
 
+class SetAsideRefused(Exception):
+    """The archive cannot be set aside in ``.imported``: the folder is a symbolic
+    link, something else has its name, or it is on another filesystem. Nothing
+    was moved."""
+
+
 def move_to_imported(archive_path: Path, imported_dir: Path) -> Path:
     """Move a handled archive into imported_dir without overwriting anything."""
     with _imported_lock:
@@ -229,19 +287,53 @@ def move_to_imported(archive_path: Path, imported_dir: Path) -> Path:
 
 
 def _move_to_imported(archive_path: Path, imported_dir: Path) -> Path:
-    imported_dir.mkdir(parents=True, exist_ok=True)
+    if imported_dir.is_symlink():
+        raise SetAsideRefused()
+    try:
+        imported_dir.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:  # a dangling link, or a file, put at the name after the look
+        raise SetAsideRefused() from None
     name = archive_path.name
     lower = name.lower()
     ext = next((e for e in ARCHIVE_EXTENSIONS if lower.endswith(e)), "")
     stem = name[: len(name) - len(ext)] if ext else name
     suffix = name[len(stem):]
-    target = imported_dir / name
-    n = 2
-    while target.exists():
-        target = imported_dir / f"{stem}-{n}{suffix}"
-        n += 1
-    shutil.move(str(archive_path), str(target))
-    return target
+    # The folder is opened once, never through a link, and the archive is moved
+    # into that very folder, so a link put at its name after the look changes
+    # nothing; no name found in the folder is replaced.
+    try:
+        folder = os.open(imported_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):  # a link put there after the look
+            raise SetAsideRefused() from None
+        raise
+    try:
+        candidate = name
+        n = 2
+        while _name_taken(candidate, folder):
+            candidate = f"{stem}-{n}{suffix}"
+            n += 1
+        try:
+            os.rename(archive_path, candidate, dst_dir_fd=folder)
+        except OSError as e:
+            if e.errno == errno.EXDEV:
+                # The folder is on another filesystem: the archive is not
+                # moved, and never copied by its name.
+                raise SetAsideRefused() from None
+            raise
+    finally:
+        os.close(folder)
+    return imported_dir / candidate
+
+
+def _name_taken(name: str, folder: int) -> bool:
+    """Whether anything (a dangling link too) has ``name`` in the opened
+    ``folder``; a link is never followed."""
+    try:
+        os.stat(name, dir_fd=folder, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
 
 def is_music_file(file_path: Path) -> bool:
     return file_path.suffix.lower() in AUDIO_EXTENSIONS
@@ -283,7 +375,7 @@ def does_music_pass_quick_check(file_path: Path, timeout: float | None = None) -
                 ],
                 timeout_s=probe_timeout(timeout),
                 max_stdout_bytes=SHORT_PROBE_MAX_STDOUT_BYTES,
-                **registration,
+                options=registration,
             )
     except CaptureOverflow:
         return False

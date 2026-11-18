@@ -16,8 +16,9 @@ import pytest
 
 from app.services.cover_art_manager import CoverArtContext, CoverArtManager
 from app.services.upload_publish import SimulatedCrash
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 from tests.upload_commit_fixtures import (
     FakeArt,
     FakeCoverArt,
@@ -30,11 +31,6 @@ from tests.upload_commit_fixtures import (
 )
 from tests.upload_publish_fixtures import RecordingSeam, make_publisher, track_row
 from tests.upload_validation_fixtures import detected, item_row
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -81,8 +77,8 @@ def upload_rows(db, commit, purpose):
 
 def other_users_track_at(db, path):
     other = add_test_user(db, "bob")
-    sql(db, "INSERT INTO tracks (uuid_id, file_path, owner_id) VALUES (?, ?, ?)",
-        (str(uuid.uuid4()), str(path), other))
+    sql(db, f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, owner_id) VALUES (?, {PATH_MARKS}, ?)",
+        (str(uuid.uuid4()), *path_values(path), other))
 
 
 def assert_failed(db, commit, version_before, *, final_none=True):
@@ -184,6 +180,34 @@ def test_an_unexpected_insert_error_after_the_move_removes_the_placed_file(db, m
     assert_failed(db, commit, version, final_none=False)
     assert not os.path.lexists(journal(db, commit)["final_path"])
     assert covers.released == [500]
+
+
+@pytest.mark.parametrize("spelling", ["the same spelling", "another letter case"])
+def test_a_row_that_takes_the_path_after_the_file_was_placed_fails_the_commit(db, music, spelling):
+    """Pre-merge PM-BE-PATHKEY: the path was free under the folder lock and the
+    file was placed; before the insert another track's row comes to name the
+    path. The database refuses the insert (the unique index on the folded
+    path) and the commit ends as for any collision: journal and item
+    ``upload_commit_failed``, retryable, the work copy and its reservation
+    gone, created art released, no track. The placed file stays: a file a
+    track's row names is never removed (plan D38)."""
+    commit, version = setup(db, music)
+    covers = FakeCoverArt(first_id=500)
+    seen = {}
+
+    def seam(name):
+        if name == "before_insert_commit" and not seen:
+            seen["final"] = final = journal(db, commit)["final_path"]
+            head, tail = os.path.split(final)
+            other_users_track_at(
+                db, final if spelling == "the same spelling" else os.path.join(head, tail.upper()))
+
+    assert run(db, music, art=b"img", cover_art=covers, seam=seam) == "failed"
+
+    assert_failed(db, commit, version, final_none=False)
+    assert os.path.isfile(seen["final"])
+    assert covers.released == [500]
+    assert sql(db, "SELECT COUNT(*) AS n FROM tracks")[0]["n"] == 1  # the other user's
 
 
 @pytest.mark.parametrize("created, released", [(True, [500]), (False, [])])

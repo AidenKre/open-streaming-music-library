@@ -2,15 +2,25 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/services/lastfm/lastfm_service.dart';
 import 'package:frontend/services/settings_service.dart';
 
+/// Shown when the server did not take a new default stream quality; the row
+/// keeps the old default.
+const saveDefaultQualityFailedMessage =
+    "Couldn't save the default quality. Try again.";
+
 /// Settings input (SC-26): every Settings change goes through here; the
 /// model `SettingsNotifier` owns persistence, the backend pre-transcode
 /// call and their rules.
 abstract interface class SettingsControls {
-  /// Whether the server quality rows accept a change now (the model's rule,
-  /// D29); the rows show their disabled-with-explanation state otherwise.
+  /// Whether a stream-quality default can be set now (the model's rule, D29
+  /// as amended 2026-11-17): the only quality setting whose change calls the
+  /// server. Download quality is saved on this device only and the
+  /// session-only stream quality is kept in memory only. The stream choice
+  /// sheet's "Set as default" shows its disabled-with-explanation state
+  /// otherwise.
   bool get canChangeServerQuality;
 
-  /// Persist as the default and ask the server to pre-transcode.
+  /// Persist as the default and ask the server to pre-transcode. Throws when
+  /// the server did not take the default; the old default then stays.
   Future<void> setStreamQualityDefault(String quality);
 
   /// This app session only; nothing persisted, no server call.

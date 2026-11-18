@@ -54,21 +54,14 @@ class _UploadsPageState extends ConsumerState<UploadsPage> {
   }
 
   void _reviewTags(UploadRow row) {
-    switch (_controls.reviewTags(row.itemUuid)) {
-      case ReviewTagsOutcome.open:
-        Navigator.of(context).push(
-          MaterialPageRoute<void>(
-            builder: (_) => UploadReviewPage(
-              batchUuid: row.batchUuid,
-              startAt: row.itemUuid,
-            ),
-          ),
-        );
-      case ReviewTagsOutcome.notAvailableYet:
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Reviewing tags isn't available yet")),
-        );
-    }
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => UploadReviewPage(
+          batchUuid: row.batchUuid,
+          startAt: row.itemUuid,
+        ),
+      ),
+    );
   }
 
   @override

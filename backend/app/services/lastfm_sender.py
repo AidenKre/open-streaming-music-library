@@ -3,16 +3,13 @@ shared worker base that sends each due user's pending outbox rows through the
 gate and applies Last.fm's answers to the rows that are still pending."""
 
 import json
-import time
 
 from app.services.lastfm_client import AnswerKind, RowRefused, check_scrobble_row
 from app.core.operator_log import operator_logger
+from app.models.lastfm import RESULT_INVALID_ROW
 from app.services.lastfm_crypto import CredentialUndecryptable, decrypt
 from app.services.lastfm_gate import GateBusy, GateCancelled, GateStopped
-from app.services.lastfm_now_playing import (
-    NOTICE_MAX_WAIT_S,
-    now_playing_track,
-)
+from app.services.lastfm_now_playing import now_playing_track
 from app.services.lastfm_state import wall_ms
 from app.services.worker_thread import WorkerThread
 
@@ -44,10 +41,8 @@ class ScrobbleSender(WorkerThread):
         notices,
         settle_delay_s,
         now_ms=wall_ms,
-        clock=time.monotonic,
     ):
         super().__init__()
-        self._clock = clock
         self.notices = notices
         notices.attach(self.wake)
         self._database = database
@@ -95,6 +90,20 @@ class ScrobbleSender(WorkerThread):
         operator_logger.warning(
             "Last.fm: a stored session key cannot be decrypted; that user must reconnect"
         )
+
+    def _session_key(self, stored, owner: int) -> str | None:
+        """The session key of ``stored`` (a read holding connection_id and
+        session_key_enc), or None when it cannot be decrypted: the connection is
+        then marked for reconnect."""
+        try:
+            return decrypt(
+                self._state.config.credential_key.get_secret_value(), stored["session_key_enc"]
+            )
+        except CredentialUndecryptable:
+            self._needs_reconnect_undecryptable(
+                stored["connection_id"], stored["session_key_enc"], owner
+            )
+            return None
 
     def _needs_reconnect_answered(self, connection_id, session_key_enc, owner: int) -> None:
         self._database.mark_lastfm_needs_reconnect(
@@ -145,7 +154,7 @@ class ScrobbleSender(WorkerThread):
         the pass is over because the gate stopped or the sender was cancelled)."""
         sent_any = False
         for notice in self.notices.waiting():
-            remaining = NOTICE_MAX_WAIT_S - (self._clock() - notice.queued_at)
+            remaining = self.notices.remaining_s(notice)
             try:
                 if self._send_notice(notice, remaining):
                     sent_any = True
@@ -173,14 +182,8 @@ class ScrobbleSender(WorkerThread):
             track = now_playing_track(target["track"])
             if track is None:
                 return False
-            try:
-                key = decrypt(
-                    self._state.config.credential_key.get_secret_value(), target["session_key_enc"]
-                )
-            except CredentialUndecryptable:
-                self._needs_reconnect_undecryptable(
-                    target["connection_id"], target["session_key_enc"], owner
-                )
+            key = self._session_key(target, owner)
+            if key is None:
                 return False
             answer = self._client.update_now_playing(key, track)
             slot.record(answer)
@@ -200,10 +203,8 @@ class ScrobbleSender(WorkerThread):
             )
             if batch is None:
                 return False
-            try:
-                key = decrypt(self._state.config.credential_key.get_secret_value(), batch["session_key_enc"])
-            except CredentialUndecryptable:
-                self._needs_reconnect_undecryptable(batch["connection_id"], batch["session_key_enc"], owner)
+            key = self._session_key(batch, owner)
+            if key is None:
                 return False
             uuids, rows, refused = [], [], []
             for event_uuid, payload in batch["rows"]:
@@ -213,7 +214,7 @@ class ScrobbleSender(WorkerThread):
                         raise RowRefused("a scrobble row is not an object")
                     check_scrobble_row(row)
                 except ValueError:  # RowRefused and JSON decode errors
-                    refused.append((event_uuid, "failed", "invalid_row"))
+                    refused.append((event_uuid, "failed", RESULT_INVALID_ROW))
                     continue
                 uuids.append(event_uuid)
                 rows.append(row)
@@ -244,7 +245,7 @@ class ScrobbleSender(WorkerThread):
             if outcome.status == "ignored":
                 code = _code_text(outcome.code)
             elif outcome.status == "dropped":
-                code = "no_answer"
+                code = outcome.code  # RESULT_NO_ANSWER: the reply did not mention the row
             else:
                 code = None
             results.append((event_uuid, outcome.status, code))

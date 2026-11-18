@@ -1,12 +1,11 @@
 import json
+from itertools import count
 from pathlib import Path
 from typing import List, Optional, Set
 
 import pytest
 
 from app.models import (
-    Album,
-    Artist,
     ChangeEntry,
     GetAlbumsResponse,
     GetArtistsResponse,
@@ -18,6 +17,7 @@ from app.models import (
 )
 from app.models.client_track import ClientTrack
 from app.database.database import EDITABLE_METADATA_COLUMNS
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 
 
 @pytest.fixture
@@ -56,6 +56,9 @@ def get_singles_album_id(client, artist_name: str) -> int:
     raise ValueError(f"Singles album for '{artist_name}' not found")
 
 
+_PATH_NUMBERS = count()  # one path per track, across calls
+
+
 # Tests assume that each track has a unique artist and album
 def add_tracks_to_client(
     client,
@@ -78,7 +81,7 @@ def add_tracks_to_client(
         if album:
             metadata.album = album
 
-        track = Track(file_path=Path(f"path_{i}"), metadata=metadata)
+        track = Track(file_path=Path(f"path_{next(_PATH_NUMBERS)}"), metadata=metadata)
 
         tracks.append(track)
 
@@ -466,9 +469,9 @@ class TestGetChanges:
         db = client.app.state.database
         with db._connection(commit=True) as conn:
             conn.execute(
-                "INSERT INTO tracks (uuid_id, file_path, created_at, "
-                "last_updated, revision, owner_id) VALUES ('orphan', '/o', 0, 0, 3, ?)",
-                (client.app.state.admin_user_id,),
+                f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, created_at, "
+                f"last_updated, revision, owner_id) VALUES ('orphan', {PATH_MARKS}, 0, 0, 3, ?)",
+                (*path_values("/o"), client.app.state.admin_user_id),
             )
             conn.execute("UPDATE revision_counter SET value = 3 WHERE id = 0")
 
@@ -497,9 +500,9 @@ class TestGetChanges:
         db = client.app.state.database
         with db._connection(commit=True) as conn:
             conn.execute(
-                "INSERT INTO tracks (uuid_id, file_path, created_at, "
-                "last_updated, revision, owner_id) VALUES ('final-orphan', '/o', 0, 0, 2, ?)",
-                (client.app.state.admin_user_id,),
+                f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, created_at, "
+                f"last_updated, revision, owner_id) VALUES ('final-orphan', {PATH_MARKS}, 0, 0, 2, ?)",
+                (*path_values("/o"), client.app.state.admin_user_id),
             )
             conn.execute("UPDATE revision_counter SET value = 2 WHERE id = 0")
 
@@ -1329,7 +1332,7 @@ class TestPatchTrack:
         # body, which the app resolves as its own applied edit.
         import os
 
-        from tests.test_track_editor import _make_audio
+        from tests.track_editor_fixtures import _make_audio
 
         library = client.app.state.admin_library
         audio = library.root / "Art" / "song.m4a"

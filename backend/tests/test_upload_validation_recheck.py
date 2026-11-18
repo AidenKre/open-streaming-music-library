@@ -9,6 +9,7 @@ from app.services.storage_ledger import UPLOAD_SOURCE
 from app.services.upload_errors import probe_timeout
 from app.services.upload_receipt import reconcile_upload_receipts
 from app.services.upload_validation import ValidationFailed
+from tests.database_fixtures import plain_database
 from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_validation_fixtures import (
@@ -36,19 +37,15 @@ def env(app_client):
 def db_env(tmp_path):
     """``env`` without the app, for the cases that make no HTTP call: a plain
     ``Database`` (as the app uses) with one real user and an uploads folder."""
-    from app.database.database import Database, DatabaseContext
-    from tests.identity_worker_fixtures import INIT_SQL
-
-    db = Database(DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL))
-    assert db.initialize()
+    db = plain_database(tmp_path)
     root = tmp_path / "music" / ".uploads"
     root.mkdir(parents=True)
-    return None, db, root, add_test_user(db, "alice")
+    return db, root, add_test_user(db, "alice")
 
 
 # RC1: the startup reconcile builds each row's path with that row's own owner.
 def test_a_dead_receipt_of_one_user_never_touches_the_others_file_at_startup(db_env):
-    _, db, root, alice = db_env
+    db, root, alice = db_env
     sam = add_test_user(db, "sam")
     mine = stage_item(db, root, owner_id=alice, batch_uuid=BATCH, item_uuid=ITEM, content=b"alice")
     make_worker(db, root).process_one()
@@ -69,7 +66,7 @@ def test_a_dead_receipt_of_one_user_never_touches_the_others_file_at_startup(db_
 
 # RC2: a step that keeps failing backs off instead of spinning.
 def test_after_an_error_the_loop_waits_its_poll_before_the_next_step(db_env):
-    _, db, root, _ = db_env
+    db, root, _ = db_env
     worker = make_worker(db, root, idle_poll_s=123)
     waits = []
 
@@ -103,7 +100,7 @@ def test_after_an_error_the_loop_waits_its_poll_before_the_next_step(db_env):
 
 # RC3: an item whose failure write raised is given back to the queue.
 def test_an_item_whose_failure_could_not_be_recorded_is_requeued(db_env, monkeypatch):
-    _, db, root, alice = db_env
+    db, root, alice = db_env
     staged = stage_item(db, root, owner_id=alice)
 
     def broken(**kwargs):
@@ -118,7 +115,7 @@ def test_an_item_whose_failure_could_not_be_recorded_is_requeued(db_env, monkeyp
 
 # RC4: a cancelled item's file that cannot be inspected stays counted.
 def test_a_cancelled_items_file_that_cannot_be_inspected_keeps_its_quota_row(db_env, monkeypatch):
-    _, db, root, alice = db_env
+    db, root, alice = db_env
     staged = stage_item(db, root, owner_id=alice)
     make_worker(db, root).process_one()
     sql(db, "UPDATE upload_items SET state = 'cancelled' WHERE item_uuid = ?", (staged["item_uuid"],))
@@ -173,7 +170,7 @@ def test_a_cancel_never_removes_a_file_in_another_owners_folder(env):
 
 
 def test_the_worker_never_reads_a_file_in_another_owners_folder(db_env):
-    _, db, root, alice = db_env
+    db, root, alice = db_env
     _, theirs, mine = _point_at_other_owners_file(db, root, alice)
     sql(db, "UPDATE upload_items SET source_path = ?, progress_at = 0 WHERE owner_id = ? AND item_uuid = ?",
         (str(theirs["source"]), alice, mine["item_uuid"]))
@@ -203,10 +200,10 @@ def test_a_retry_never_treats_a_path_outside_its_folder_as_its_source(env, tmp_p
 
 # RC6: the release after a failed item's removal is guarded by its state.
 def test_a_cancelled_source_release_needs_the_item_to_be_cancelled(db_env):
-    _, db, root, alice = db_env
+    db, root, alice = db_env
     staged = stage_item(db, root, owner_id=alice)
 
-    released = db.release_cancelled_upload_source(
+    released = db.release_removed_upload_source(
         staged["item_uuid"], owner_id=alice, source_path=str(staged["source"]), now=1)
 
     assert released is False

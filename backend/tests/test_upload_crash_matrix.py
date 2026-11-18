@@ -29,7 +29,7 @@ import pytest
 
 from app.services import organizer, upload_commit, upload_publish
 from app.services.upload_publish import SimulatedCrash
-from tests.identity_worker_fixtures import add_track, make_db, sql
+from tests.identity_worker_fixtures import add_track, sql
 from tests.owned_database import add_test_user
 from tests.upload_commit_fixtures import journal, reservations
 from tests.upload_publish_fixtures import library_track, track_row
@@ -67,11 +67,6 @@ class Seam:
             self.effect()
         if name == self.crash_at:
             raise SimulatedCrash(name)
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

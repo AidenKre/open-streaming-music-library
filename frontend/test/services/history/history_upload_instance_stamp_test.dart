@@ -28,14 +28,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../helpers/server_binding.dart';
 import '../../helpers/stamped_server.dart';
-
-class _Online extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
+import '../../helpers/test_offline.dart';
 
 HistoryEventPayload _event(int i) => HistoryEventPayload(
   eventUuid: 'e${i.toString().padLeft(4, '0')}',
@@ -73,7 +66,7 @@ void main() {
         appInfoProvider.overrideWith(
           (ref) async => AppInfo.fromJson({'history': {'version': 1}}),
         ),
-        offlineModeProvider.overrideWith(_Online.new),
+        offlineModeProvider.overrideWith(() => TestOffline(false)),
         serverBindingGateProvider.overrideWithValue(controlled.gate),
       ],
     );

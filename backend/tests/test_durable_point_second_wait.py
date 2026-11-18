@@ -20,11 +20,11 @@ import sqlite3
 
 import pytest
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
 from app.services.track_edit import WriteMode
 from app.services.track_editor import PendingOldMasters, TrackEditor
-from tests.test_identity_editor import _world
-from tests.test_track_editor import _lib
+from tests.identity_editor_fixtures import _world
+from tests.track_editor_fixtures import _lib
 
 pytestmark = pytest.mark.requires_ffmpeg
 

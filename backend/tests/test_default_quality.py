@@ -14,6 +14,7 @@ from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator
 from app.services.transcoder import ORIGINAL_QUALITY
 from tests.owned_database import add_test_user
+from tests.quality_fixtures import _store_quality
 
 # The master admin's id: only its tracks are routed to default_cache (M.2a).
 ADMIN_OWNER = 1
@@ -38,20 +39,6 @@ def _stored_quality(client, user_id=None):
             (user_id,),
         ).fetchone()
         return row[0] if row else None
-    finally:
-        conn.close()
-
-
-def _store_quality(client, value, user_id=None):
-    user_id = client.app.state.admin_user_id if user_id is None else user_id
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO user_settings (user_id, key, value) "
-            "VALUES (?, 'default_streaming_quality', ?)",
-            (user_id, value),
-        )
-        conn.commit()
     finally:
         conn.close()
 
@@ -104,8 +91,12 @@ def _install_fake_coordinator(client, payload=b"encoded" * 10):
 
 class TestTwoTierCache:
     def _make_coordinator(
-        self, tmp_path: Path, source: Path, default_quality: str = "192"
+        self, tmp_path: Path, source: Path, default_quality: str = "192", *,
+        workers: int = 2, all_uuids: list[str] | None = None, transcode_fn=None,
     ) -> tuple[EncoderCoordinator, list[int]]:
+        """A coordinator with a stream cache and an unlimited default cache. Its
+        transcode records each bitrate in the returned list and writes a small
+        file, unless the test passes its own ``transcode_fn``."""
         stream_cache = EncodedCache(
             ctx=EncodedCacheContext(
                 cache_dir=tmp_path / "stream",
@@ -130,10 +121,11 @@ class TestTwoTierCache:
             admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
-            workers=2,
-            transcode_fn=fake_transcode,
+            workers=workers,
+            transcode_fn=transcode_fn or fake_transcode,
             default_cache=default_cache,
             default_quality=default_quality,
+            all_uuids_fn=None if all_uuids is None else (lambda: all_uuids),
         )
         return coordinator, calls
 
@@ -203,7 +195,7 @@ class TestTwoTierCache:
         # Change to a new default quality; deletion runs in background.
         old_default_cache = c.default_cache
         c.set_default_quality("320")
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         # Old default-quality file should be deleted (not migrated to stream cache).
         assert not old_default_cache.has("uuid-a", "192")
@@ -213,40 +205,13 @@ class TestTwoTierCache:
         """_warm_all_tracks with an empty UUID list must not raise and must not encode."""
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
-        encode_calls: list[str] = []
-
-        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            encode_calls.append(str(bitrate))
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"encoded" * 10)
-            return True
-
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(
-                cache_dir=tmp_path / "stream",
-                max_size_bytes=10 * 1024 * 1024,
-            )
-        )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(
-                cache_dir=tmp_path / "default",
-                max_size_bytes=0,
-            )
-        )
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=2,
-            transcode_fn=fake_transcode,
-            default_cache=default_cache,
-            default_quality="192",
-            all_uuids_fn=lambda: [],  # empty library
+        c, encode_calls = self._make_coordinator(
+            tmp_path, source, default_quality="192", all_uuids=[]  # empty library
         )
 
         # Should complete without error and without any transcode calls.
-        c._submit_warm_tasks("256", c._warm_generation)
-        c._executor.shutdown(wait=True)
+        c._submit_warm_tasks("256", c.warm_generation)
+        c.drain()
 
         assert encode_calls == []
 
@@ -269,7 +234,7 @@ class TestTwoTierCache:
         new_default.write_bytes(b"encoded" * 10)
 
         c.set_default_quality("320")
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert not c.default_cache.has("uuid-a", "192")
         assert not stranded.exists()
@@ -299,7 +264,7 @@ class TestTwoTierCache:
         c.set_default_quality("320")
         c.set_default_quality("192")
         release.set()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert c.default_cache.has("uuid-a", "192")
         assert calls == [192]  # the warmed file was kept, never re-encoded
@@ -320,7 +285,7 @@ class TestTwoTierCache:
         c.all_uuids_fn = lambda: ["uuid-a"]
 
         result = c.set_default_quality("256")
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert result is True
 
@@ -330,7 +295,7 @@ class TestTwoTierCache:
         c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
 
         result = c.set_default_quality(ORIGINAL_QUALITY)
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert result is False
 
@@ -338,32 +303,13 @@ class TestTwoTierCache:
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
         uuids = [f"uuid-{i}" for i in range(10)]
-
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
+        c, _ = self._make_coordinator(
+            tmp_path, source, default_quality="original", workers=4, all_uuids=uuids
         )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
-        )
-
-        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"encoded" * 10)
-            return True
-
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=4,
-            transcode_fn=fake_transcode,
-            default_cache=default_cache,
-            default_quality="original",
-            all_uuids_fn=lambda: uuids,
-        )
+        default_cache = c.default_cache
 
         c.set_default_quality("192")
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert all(default_cache.has(uid, "192") for uid in uuids)
 
@@ -375,34 +321,22 @@ class TestTwoTierCache:
         uuids = [f"uuid-{i}" for i in range(10)]
         gate = _threading.Event()
 
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
-        )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
-        )
-
         def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
             gate.wait()  # block until both quality changes have been submitted
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"encoded" * 10)
             return True
 
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=2,
+        c, _ = self._make_coordinator(
+            tmp_path, source, default_quality="original", all_uuids=uuids,
             transcode_fn=fake_transcode,
-            default_cache=default_cache,
-            default_quality="original",
-            all_uuids_fn=lambda: uuids,
         )
+        default_cache = c.default_cache
 
         c.set_default_quality("128")   # generation=1, queues 10 tasks
         c.set_default_quality("256")   # generation=2, queues 10 more tasks
         gate.set()                     # let all tasks proceed
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         # "128" tasks bail (generation mismatch) or write to stream_cache (not default_cache)
         assert not any(default_cache.has(uid, "128") for uid in uuids)
@@ -412,20 +346,8 @@ class TestTwoTierCache:
     def test_startup__cleans_orphaned_scratch_files(self, tmp_path):
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
-
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
-        )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
-        )
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=1,
-            default_cache=default_cache,
-            default_quality=ORIGINAL_QUALITY,
+        c, _ = self._make_coordinator(
+            tmp_path, source, default_quality=ORIGINAL_QUALITY, workers=1
         )
 
         # Plant orphaned scratch files
@@ -434,7 +356,7 @@ class TestTwoTierCache:
         (c._scratch_dir / "orphan2.m4a").write_bytes(b"partial")
 
         c.startup()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         remaining = list(c._scratch_dir.iterdir())
         assert remaining == []
@@ -443,31 +365,8 @@ class TestTwoTierCache:
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
         uuids = ["uuid-0", "uuid-1", "uuid-2"]
-        encoded_uuids: list[str] = []
-
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
-        )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
-        )
-
-        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            # Figure out which uuid by reading its presence in encode_for_stream
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"encoded" * 10)
-            return True
-
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=2,
-            transcode_fn=fake_transcode,
-            default_cache=default_cache,
-            default_quality="192",
-            all_uuids_fn=lambda: uuids,
-        )
+        c, _ = self._make_coordinator(tmp_path, source, default_quality="192", all_uuids=uuids)
+        default_cache = c.default_cache
 
         # Pre-warm uuid-0 so it's already in default_cache
         c.encode_for_stream("uuid-0", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
@@ -477,7 +376,7 @@ class TestTwoTierCache:
         calls_before = sum(1 for uid in uuids if default_cache.has(uid, "192"))
 
         c.startup()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         now_cached = [uid for uid in uuids if default_cache.has(uid, "192")]
         assert len(now_cached) == 3  # all three cached after startup
@@ -489,30 +388,8 @@ class TestTwoTierCache:
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
         uuids = ["uuid-0", "uuid-1"]
-        encode_calls: list[int] = []
-
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
-        )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
-        )
-
-        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            encode_calls.append(bitrate)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"encoded" * 10)
-            return True
-
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=2,
-            transcode_fn=fake_transcode,
-            default_cache=default_cache,
-            default_quality="192",
-            all_uuids_fn=lambda: uuids,
+        c, encode_calls = self._make_coordinator(
+            tmp_path, source, default_quality="192", all_uuids=uuids
         )
 
         # Pre-warm all tracks
@@ -521,41 +398,19 @@ class TestTwoTierCache:
         encode_calls.clear()
 
         c.startup()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert encode_calls == []  # nothing re-encoded
 
     def test_startup__no_op_for_original_quality(self, tmp_path):
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
-        encode_calls: list[int] = []
-
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "stream", max_size_bytes=10 * 1024 * 1024)
-        )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
-        )
-
-        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            encode_calls.append(bitrate)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"encoded" * 10)
-            return True
-
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=2,
-            transcode_fn=fake_transcode,
-            default_cache=default_cache,
-            default_quality=ORIGINAL_QUALITY,
-            all_uuids_fn=lambda: ["uuid-a"],
+        c, encode_calls = self._make_coordinator(
+            tmp_path, source, default_quality=ORIGINAL_QUALITY, all_uuids=["uuid-a"]
         )
 
         c.startup()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert encode_calls == []
 
@@ -572,7 +427,7 @@ class TestTwoTierCache:
         stranded.write_bytes(b"encoded" * 10)
 
         c.startup()
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert not stranded.exists()
         assert c.default_cache.has("uuid-a", "192")
@@ -581,38 +436,12 @@ class TestTwoTierCache:
     def test_warm_all_tracks_encodes_at_new_default(self, tmp_path):
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
-        uuids_seen: list[str] = []
-
-        def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(b"encoded" * 10)
-            return True
-
-        stream_cache = EncodedCache(
-            ctx=EncodedCacheContext(
-                cache_dir=tmp_path / "stream",
-                max_size_bytes=10 * 1024 * 1024,
-            )
-        )
-        default_cache = EncodedCache(
-            ctx=EncodedCacheContext(
-                cache_dir=tmp_path / "default",
-                max_size_bytes=0,
-            )
-        )
-        c = EncoderCoordinator(
-            admin_owner_id=ADMIN_OWNER,
-            cache=stream_cache,
-            source_lookup=lambda _: source,
-            workers=2,
-            transcode_fn=fake_transcode,
-            default_cache=default_cache,
-            default_quality="192",
-            all_uuids_fn=lambda: ["uuid-a", "uuid-b"],
+        c, _ = self._make_coordinator(
+            tmp_path, source, default_quality="192", all_uuids=["uuid-a", "uuid-b"]
         )
 
         c.set_default_quality("256")
-        c._executor.shutdown(wait=True)
+        c.drain()
 
         assert c.default_cache.has("uuid-a", "256")
         assert c.default_cache.has("uuid-b", "256")

@@ -29,6 +29,9 @@ class FakeListeningRankingControls extends ChangeNotifier
   int retries = 0;
   int refreshes = 0;
   final played = <String>[];
+
+  /// What [playTrack] answers.
+  PlaybackOutcome playOutcome = const Accepted(1);
   bool disposed = false;
 
   /// Sets the visible state in one notification.
@@ -82,7 +85,7 @@ class FakeListeningRankingControls extends ChangeNotifier
   @override
   Future<PlaybackOutcome> playTrack(TrackUI track) async {
     played.add(track.uuidId);
-    return const Accepted(1);
+    return playOutcome;
   }
 
   @override

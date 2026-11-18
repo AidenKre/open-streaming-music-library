@@ -11,14 +11,11 @@ once, instead of being released under them.
 import logging
 import threading
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-import app.services.file_watcher as file_watcher
 from app.core.instance_lock import InstanceLockHeld, acquire_instance_lock
 from app.database import DatabaseContext
 from app.services.cover_art_manager import CoverArtContext, CoverArtManager
@@ -27,7 +24,7 @@ from app.services.import_outcome import ImportOutcome
 from app.services.pipeline import make_pipeline
 from tests.owned_database import OwnedTestDatabase, add_test_user
 from tests.schema_fixtures import INIT_SQL
-from tests.test_import_startup import WATCH, _tone, requires_ffmpeg
+from tests.import_startup_fixtures import WATCH, _tone, requires_ffmpeg
 
 
 def test_both_watchers_stop_accepting_work_before_either_is_drained(tmp_path):

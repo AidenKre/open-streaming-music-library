@@ -14,7 +14,7 @@ import struct
 
 import pytest
 
-from tests.identity_worker_fixtures import add_journal, add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import add_journal, add_track, identity, sql
 from tests.owned_database import add_test_user
 
 NOW = 1_800_000_000
@@ -30,11 +30,6 @@ def _fp(state="current", *, duration=30.0, data=BLOB, items=200, algorithm="chro
         duration = data = items = None
     return {"fp_state": state, "fp_algorithm": algorithm, "fp_backend": "fpcalc",
             "fp_duration_s": duration, "fp_item_count": items, "fp_data": data}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def _track(db, *, owner_id=None, **identity_values):

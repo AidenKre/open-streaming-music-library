@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from app.services import organizer
+from app.services import file_ops, organizer
+from tests.crash import Crash
 
 FALLBACK_RENAME = [errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK]
 _real_link = os.link
@@ -56,8 +57,8 @@ class Recorder:
     def __init__(self, monkeypatch):
         self.events = []
         self.modes = []
-        monkeypatch.setattr(organizer, "fsync_file", self._fsync_file, raising=False)
-        monkeypatch.setattr(organizer, "fsync_dir", self._fsync_dir)
+        monkeypatch.setattr(file_ops, "fsync_file", self._fsync_file)
+        monkeypatch.setattr(file_ops, "fsync_dir", self._fsync_dir)
         link, rename = os.link, os.rename
 
         def rec_link(src, dst, *args, **kwargs):
@@ -297,9 +298,6 @@ def test_a_failing_hook_places_nothing_and_leaves_no_folder(paths, monkeypatch):
 
 
 def test_a_crash_mid_copy_leaves_the_temp_for_recovery(paths, monkeypatch):
-    class Crash(BaseException):
-        pass
-
     source, _library, final = paths
     _refuse(monkeypatch, errno.EXDEV)
 

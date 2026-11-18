@@ -11,7 +11,7 @@ import pytest
 
 from app.services.storage_ledger import UPLOAD_SOURCE
 from app.services.upload_validation import staged_identity_columns
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_validation_fixtures import (
     BOOT,
     DEAD_BOOT,
@@ -28,11 +28,6 @@ from tests.upload_validation_fixtures import (
 )
 
 EMPTY_COVERAGE = {"library_pending": 0, "library_failed": 0, "library_not_comparable": 0}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

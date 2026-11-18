@@ -22,6 +22,7 @@ import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/uploads/upload_review_transport.dart';
 import 'package:http/http.dart' as http;
 
+import '../helpers/fake_uploads_api.dart' show itemJson;
 import '../helpers/server_binding.dart';
 import '../helpers/stamped_server.dart';
 
@@ -35,19 +36,15 @@ Map<String, dynamic> _itemJson({
   int reviewVersion = 1,
   String? resultTrack,
 }) => {
-  'item_uuid': _item,
-  'batch_uuid': _batch,
-  'parent_item_uuid': null,
-  'filename': 'Song.flac',
-  'selection_index': 0,
-  'member_order_key': '',
-  'state': state,
-  'expected_bytes': 6,
-  'expected_sha256': null,
-  'received_bytes': 6,
-  'review_version': reviewVersion,
-  'error': null,
-  'created_at': 1,
+  ...itemJson(
+    _item,
+    batchUuid: _batch,
+    filename: 'Song.flac',
+    state: state,
+    expectedBytes: 6,
+    receivedBytes: 6,
+    reviewVersion: reviewVersion,
+  ),
   'updated_at': 2,
   'result_track_uuid': resultTrack,
 };

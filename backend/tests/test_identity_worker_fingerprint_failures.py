@@ -25,6 +25,7 @@ import pytest
 from app.services import audio_identity
 from app.services.fingerprinter import FingerprintFailure, RawFingerprint
 from app.services.identity_worker import TOOL_MISSING_RETRY_S
+from tests.tool_call_capture import bound_to
 from tests.identity_worker_fakes import (
     T0,
     VARIED_ITEMS,
@@ -34,12 +35,8 @@ from tests.identity_worker_fakes import (
     bytes_digest,
     make_worker,
 )
-from tests.identity_worker_fixtures import add_track, identity, make_db, set_identity, sql
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
+from tests.identity_worker_fixtures import add_track, identity, set_identity, sql
+from tests.track_paths import set_track_path
 
 
 @pytest.fixture
@@ -97,7 +94,8 @@ FAILURES = {
 @pytest.mark.parametrize("reason", sorted(FAILURES))
 def test_a_failing_print_backs_off_then_fails_with_its_reason(db, music, reason, monkeypatch):
     # 6-5-L-03: the decoded duration is unknown too (the file is not real audio).
-    monkeypatch.setattr(audio_identity, "measure_decoded_duration", lambda *a, **k: None)
+    monkeypatch.setattr(audio_identity, "measure_decoded_duration",
+                        bound_to(audio_identity.measure_decoded_duration)(lambda *a, **k: None))
     path = _file(music)
     uuid_id = _settled(db, path)
     sql(db, "INSERT INTO track_audio_fingerprint (uuid_id, backend, algorithm, duration_s, item_count, data) "
@@ -221,7 +219,7 @@ def test_a_missing_master_whose_path_changed_retries_at_once(db, music):
     uuid_id = _settled(db, path)
     moved = _file(music, "moved.flac")
     fp = _failing(FingerprintFailure("master_missing"), times=1)
-    fp.mid = lambda: sql(db, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?", (str(moved), uuid_id))
+    fp.mid = lambda: set_track_path(db, uuid_id, moved)
     worker = make_worker(db, fingerprinter=fp)
 
     worker.process_one()

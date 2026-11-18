@@ -8,6 +8,7 @@ import 'dart:typed_data';
 import 'dart:ui' show Rect;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/recap_export_platform.dart';
 import 'package:path/path.dart' as p;
 
@@ -42,7 +43,7 @@ enum RecapShareOutcome { shared, dismissed, unknown, unavailable, failed }
 
 /// Writes recap exports to owned temporary files under
 /// `<temporary directory>/[folderName]` and hands them to the platform.
-class RecapExportFiles {
+class RecapExportFiles implements LocalResettable {
   RecapExportFiles({
     required RecapExportPlatform platform,
     void Function(String message)? log,
@@ -63,6 +64,11 @@ class RecapExportFiles {
 
   static void _defaultLog(String message) =>
       developer.log(message, name: 'recap-export');
+
+  /// One line per failed save or share: the step and the error's type,
+  /// never its message (it may hold a path).
+  void _logFailure(String step, Object error) =>
+      _log('recap $step failed (${error.runtimeType})');
 
   /// The folder (under the platform's temporary directory) this service
   /// owns; nothing outside it is ever removed.
@@ -87,7 +93,8 @@ class RecapExportFiles {
       final temp = File(p.join(exportDir, suggestedName));
       try {
         await temp.writeAsBytes(bytes, flush: true);
-      } on Object {
+      } on Object catch (e) {
+        _logFailure('save: writing the temporary file', e);
         return RecapSaveOutcome.failed;
       }
       final String? location;
@@ -96,7 +103,8 @@ class RecapExportFiles {
           suggestedName: suggestedName,
           type: type,
         );
-      } on Object {
+      } on Object catch (e) {
+        _logFailure('save: the save panel', e);
         return RecapSaveOutcome.failed;
       }
       if (location == null) return RecapSaveOutcome.cancelled;
@@ -105,7 +113,8 @@ class RecapExportFiles {
         return RecapSaveOutcome.destinationExists;
       }
       return await _place(temp, bytes, location, existed);
-    } on Object {
+    } on Object catch (e) {
+      _logFailure('save: preparing the export', e);
       return RecapSaveOutcome.failed;
     } finally {
       if (exportDir != null) await _remove(exportDir);
@@ -191,7 +200,8 @@ class RecapExportFiles {
         await dest.writeAsBytes(bytes, flush: true);
       }
       return RecapSaveOutcome.saved;
-    } on Object {
+    } on Object catch (e) {
+      _logFailure('save: placing the file', e);
       if (created) {
         try {
           await dest.delete();
@@ -234,7 +244,8 @@ class RecapExportFiles {
         RecapShareStatus.dismissed => RecapShareOutcome.dismissed,
         RecapShareStatus.unknown => RecapShareOutcome.unknown,
       };
-    } on Object {
+    } on Object catch (e) {
+      _logFailure('share', e);
       return RecapShareOutcome.failed;
     } finally {
       if (exportDir != null) {
@@ -249,6 +260,45 @@ class RecapExportFiles {
     final held = _held;
     _held = null;
     if (held != null) await _remove(held);
+  }
+
+  /// A local reset (Disconnect, a user switch) removes the owned folder, so
+  /// the previous person's shared recap does not stay until the next export
+  /// (pre-merge review C2-03). Only that folder: a link there is removed,
+  /// never what it points to.
+  @override
+  int get resetPriority => ResetPriority.deleteFiles;
+
+  @override
+  Future<void> resetLocalState() async {
+    _releaseEpoch++; // a share in flight does not hold its file
+    _held = null;
+    final Directory root;
+    try {
+      root = await _platform.temporaryDirectory();
+    } on Object catch (e) {
+      // No temporary directory here, so no export could be written there.
+      _logFailure('reset: finding the temporary directory', e);
+      return;
+    }
+    final path = p.join(root.path, folderName);
+    try {
+      switch (FileSystemEntity.typeSync(path, followLinks: false)) {
+        case FileSystemEntityType.notFound:
+          return;
+        case FileSystemEntityType.link:
+          await Link(path).delete();
+        case FileSystemEntityType.directory:
+          // A recursive delete removes links inside, never their targets.
+          await Directory(path).delete(recursive: true);
+        default:
+          await File(path).delete();
+      }
+    } on Object catch (e) {
+      // Logged, never a reset failure (that would keep the reset marker and
+      // refuse every connect); the next export's sweep removes what is left.
+      _logFailure('reset: removing the export folder', e);
+    }
   }
 }
 

@@ -12,7 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/services/feature_providers.dart';
-import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 
 import '../../helpers/fake_uploads_api.dart';
 import '../../helpers/upload_manager_harness.dart';

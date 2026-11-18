@@ -190,6 +190,21 @@ class ServerBindingGate implements TokenPermit {
   @override
   Future<void> verdictSettled() {
     if (!_verdictPending || _closed) return Future.value();
+    return waitWithinBound((s) => s is! BindingVerifying);
+  }
+
+  /// The gate's one bounded wait: completes when [ends] answers true for a
+  /// published state, when the states stream ends (the gate was disposed),
+  /// or when [tokenWaitBound] has passed, whichever comes first. One timer
+  /// for the whole wait, started now on the gate's injected timer: a state
+  /// that does not end the wait does not start the bound again. Never
+  /// throws ([ends] must not).
+  ///
+  /// The two waits differ only in [ends]: [verdictSettled] ends at any
+  /// verdict, a failed check included; a user's own action
+  /// (`sendWhenVerified` with `BindingWait.forPendingVerdict`) keeps waiting
+  /// through a failed check that is being retried.
+  Future<void> waitWithinBound(bool Function(BindingGateState state) ends) {
     final done = Completer<void>();
     StreamSubscription<BindingGateState>? sub;
     Timer? bound;
@@ -202,7 +217,7 @@ class ServerBindingGate implements TokenPermit {
 
     sub = _states.stream.listen(
       (s) {
-        if (s is! BindingVerifying) finish();
+        if (ends(s)) finish();
       },
       onDone: finish,
     );
@@ -212,12 +227,18 @@ class ServerBindingGate implements TokenPermit {
 
   /// The log-out/Disconnect revoke rule only (lenient): this scope verified
   /// the bound instance at exactly [baseUrl] and nothing failed since. True
-  /// while verified, or while a re-probe of it is in flight.
+  /// while verified, or while a re-probe of it is in flight. It differs from
+  /// [allowsTokenTo] on purpose: a log-out or Disconnect may still revoke
+  /// during a re-probe of the verified server, while ordinary requests wait
+  /// for a fresh verdict. The offline check is the caller's
+  /// (`LocalResetService`).
   bool maySendTokenTo(String baseUrl) =>
       _verifiedBaseUrl == baseUrl &&
       (_state is BindingVerified || _state is BindingVerifying);
 
-  /// How long [whenMaySendTokenTo] waits for a verdict.
+  /// The bound of [waitWithinBound]: how long a request waits for a verdict
+  /// ([verdictSettled], [whenMaySendTokenTo]) and a user's own action for a
+  /// verified connection.
   static const tokenWaitBound = Duration(seconds: 10);
 
   /// For requests that do not go through the token client (cover art, the
@@ -272,11 +293,7 @@ class ServerBindingGate implements TokenPermit {
   /// a later connection.
   void stop() {
     if (_closed || _signedOut) return;
-    _generation++;
-    _retryTimer?.cancel();
-    _retryTimer = null;
-    _verifiedToken = null;
-    _verifiedBaseUrl = null;
+    _invalidate();
     _publish(const BindingIdle());
   }
 
@@ -285,11 +302,7 @@ class ServerBindingGate implements TokenPermit {
   void closeSignedOut() {
     if (_closed || _signedOut) return;
     _signedOut = true;
-    _generation++;
-    _retryTimer?.cancel();
-    _retryTimer = null;
-    _verifiedToken = null;
-    _verifiedBaseUrl = null;
+    _invalidate();
     _publish(const BindingSignedOut());
   }
 
@@ -311,11 +324,7 @@ class ServerBindingGate implements TokenPermit {
         connection != _generation) {
       return;
     }
-    _generation++;
-    _retryTimer?.cancel();
-    _retryTimer = null;
-    _verifiedToken = null;
-    _verifiedBaseUrl = null;
+    _invalidate();
     _publish(
       BindingDifferentServer(
         boundInstanceId: changed.boundInstanceId,
@@ -334,6 +343,17 @@ class ServerBindingGate implements TokenPermit {
     _waiter?.completeError(BindingGateClosedException());
     _waiter = null;
     unawaited(_states.close());
+  }
+
+  /// Ends the current verdict: a probe in flight is dropped (by generation),
+  /// a scheduled retry is cancelled, and the verified token and base URL are
+  /// forgotten, so no token is handed out until a new verdict.
+  void _invalidate() {
+    _generation++;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _verifiedToken = null;
+    _verifiedBaseUrl = null;
   }
 
   bool _isStale(int generation) => _closed || generation != _generation;
@@ -374,6 +394,8 @@ class ServerBindingGate implements TokenPermit {
       }
       final bound = current.instanceId;
       final server = identity.instanceId;
+      // Exact on purpose (SC-01): this decides a reset, and both ids come from
+      // the server's own answers. Only the header stamp is compared leniently.
       if (bound != null && server != null && bound != server) {
         _verifiedBaseUrl = null;
         _publish(

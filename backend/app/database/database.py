@@ -19,6 +19,7 @@ from urllib.parse import quote
 from typing import Any, Callable, List, Literal, Mapping, Optional
 
 from app.core.operator_log import operator_logger
+from app.core.upload_states import ENDED_STATES, SOURCE_RELEASE_STATES
 from app.database.operation_receipts import (
     New as OpNew,
     OperationConflict,
@@ -31,7 +32,13 @@ from app.models.artist import Artist
 from app.models.cover_art import CoverArt
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.history import HistoryEvent
-from app.models.lastfm import BindOutcome, BindResult, EnableOutcome
+from app.models.lastfm import (
+    RESULT_TOO_MANY_TRIES,
+    RESULT_TOO_OLD,
+    BindOutcome,
+    BindResult,
+    EnableOutcome,
+)
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
@@ -141,331 +148,6 @@ def _owner_predicate(column: str, owner_id: object) -> tuple[str, tuple]:
     return f"{column} = ?", (_require_owner(owner_id),)
 
 
-# The v14 objects, created by the 13 -> 14 step. Each statement's text matched
-# init.sql's v14 (minus IF NOT EXISTS); since v16 the 15 -> 16 step replaces
-# live_tracks, and the fresh-vs-migrated parity tests compare the end result.
-SCHEMA_V14_DDL = (
-    """CREATE TABLE track_audio_identity (
-  uuid_id         TEXT PRIMARY KEY REFERENCES tracks(uuid_id) ON DELETE CASCADE,
-  generation      INTEGER NOT NULL DEFAULT 0,
-  exact_state     TEXT NOT NULL CHECK (exact_state IN ('pending','current','failed','unsupported')),
-  exact_kind      TEXT CHECK (exact_kind IN ('pcm_sha256','pcm_float_sha256','packets_sha256')),
-  exact_digest    TEXT,
-  sample_rate_hz  INTEGER, channels INTEGER, bits_per_sample INTEGER,
-  fp_state        TEXT NOT NULL CHECK (fp_state IN
-                    ('pending','current','unavailable','too_short','low_information','failed')),
-  fp_algorithm    TEXT,
-  match_state     TEXT NOT NULL DEFAULT 'pending' CHECK (match_state IN ('pending','current')),
-  matcher_version TEXT,
-  failure_reason  TEXT,
-  attempts        INTEGER NOT NULL DEFAULT 0,
-  next_attempt_at INTEGER,
-  priority        INTEGER NOT NULL DEFAULT 1,
-  stat_size       INTEGER, stat_mtime_ns INTEGER, stat_inode INTEGER,
-  computed_at     INTEGER,
-  tool_versions   TEXT
-)""",
-    """CREATE INDEX idx_tai_exact ON track_audio_identity(exact_kind, exact_digest)
-  WHERE exact_digest IS NOT NULL AND exact_state IN ('current','pending')""",
-    """CREATE INDEX idx_tai_work  ON track_audio_identity(priority, next_attempt_at)
-  WHERE exact_state = 'pending' OR fp_state = 'pending' OR match_state = 'pending'""",
-    """CREATE TABLE track_audio_fingerprint (
-  uuid_id     TEXT PRIMARY KEY REFERENCES track_audio_identity(uuid_id) ON DELETE CASCADE,
-  backend     TEXT NOT NULL, algorithm TEXT NOT NULL,
-  duration_s  REAL NOT NULL CHECK (duration_s > 0), item_count INTEGER NOT NULL,
-  data        BLOB NOT NULL
-)""",
-    """CREATE INDEX idx_taf_duration ON track_audio_fingerprint(duration_s)""",
-    """CREATE UNIQUE INDEX idx_tracks_uuid_owner ON tracks(uuid_id, owner_id)""",
-    """CREATE TABLE track_duplicate_candidates (
-  owner_id   INTEGER NOT NULL REFERENCES users(id),
-  uuid_a     TEXT NOT NULL,
-  uuid_b     TEXT NOT NULL,
-  kind       TEXT NOT NULL CHECK (kind IN ('exact','fingerprint')),
-  band_rank  INTEGER NOT NULL CHECK (band_rank IN (0,1,2)),
-  sort_score REAL NOT NULL,
-  matcher_version TEXT NOT NULL,
-  detected_at INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','dismissed')),
-  status_changed_at INTEGER,
-  PRIMARY KEY (uuid_a, uuid_b),
-  CHECK (uuid_a < uuid_b),
-  FOREIGN KEY (uuid_a, owner_id) REFERENCES tracks(uuid_id, owner_id) ON DELETE CASCADE,
-  FOREIGN KEY (uuid_b, owner_id) REFERENCES tracks(uuid_id, owner_id) ON DELETE CASCADE
-)""",
-    """CREATE INDEX idx_tdc_b    ON track_duplicate_candidates(uuid_b)""",
-    """CREATE INDEX idx_tdc_list ON track_duplicate_candidates(owner_id, status, band_rank, sort_score DESC, uuid_a, uuid_b)""",
-    """CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks""",
-)
-
-
-# The v15 objects, created by the 14 -> 15 step. Each statement's text must match
-# init.sql's (minus IF NOT EXISTS); the fresh-vs-migrated parity test in
-# tests/test_schema_upgrade_v15.py enforces it.
-SCHEMA_V15_DDL: tuple[str, ...] = (
-    """CREATE TABLE upload_batches (
-  owner_id   INTEGER NOT NULL REFERENCES users(id),
-  batch_uuid TEXT NOT NULL,
-  label      TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (owner_id, batch_uuid)
-)""",
-    "CREATE INDEX idx_upload_batches_list ON upload_batches(owner_id, created_at, batch_uuid)",
-    """CREATE TABLE upload_items (
-  owner_id             INTEGER NOT NULL REFERENCES users(id),
-  item_uuid            TEXT NOT NULL,
-  batch_uuid           TEXT NOT NULL,
-  parent_item_uuid     TEXT,
-  kind                 TEXT CHECK (kind IN ('audio','zip')),
-  filename             TEXT NOT NULL,
-  selection_index      INTEGER NOT NULL CHECK (selection_index >= 0),
-  member_order_key     TEXT NOT NULL DEFAULT '',
-  expected_bytes       INTEGER CHECK (expected_bytes >= 0),
-  expected_sha256      TEXT CHECK (length(expected_sha256) = 64 AND expected_sha256 NOT GLOB '*[^0-9a-f]*'),
-  received_bytes       INTEGER NOT NULL DEFAULT 0 CHECK (received_bytes >= 0),
-  received_sha256      TEXT CHECK (length(received_sha256) = 64 AND received_sha256 NOT GLOB '*[^0-9a-f]*'),
-  part_path            TEXT,
-  source_path          TEXT,
-  detected_metadata    TEXT,
-  review_version       INTEGER NOT NULL DEFAULT 0 CHECK (review_version >= 0),
-  state                TEXT NOT NULL CHECK (state IN ('allocated','receiving','validating','review_ready','committing','imported','duplicate','expanded','failed','duplicate_conflict','expired','cancelled')),
-  error_code           TEXT,
-  error_message        TEXT,
-  error_retryable      INTEGER CHECK (error_retryable IN (0,1)),
-  cancel_requested     INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1)),
-  lease_boot_id        TEXT,
-  duplicate_report     TEXT,
-  conflict_track_uuids TEXT,
-  skipped_members      INTEGER CHECK (skipped_members >= 0),
-  reserved_track_uuid  TEXT,
-  final_path           TEXT,
-  result_track_uuid    TEXT,
-  result_revision      INTEGER,
-  duplicate_kind       TEXT CHECK (duplicate_kind IN ('exact','fingerprint')),
-  created_at           INTEGER NOT NULL,
-  updated_at           INTEGER NOT NULL,
-  progress_at          INTEGER NOT NULL,
-  PRIMARY KEY (owner_id, item_uuid),
-  UNIQUE (owner_id, batch_uuid, item_uuid),
-  FOREIGN KEY (owner_id, batch_uuid) REFERENCES upload_batches(owner_id, batch_uuid) ON DELETE CASCADE,
-  FOREIGN KEY (owner_id, batch_uuid, parent_item_uuid) REFERENCES upload_items(owner_id, batch_uuid, item_uuid) ON DELETE CASCADE,
-  CHECK (parent_item_uuid IS NULL OR parent_item_uuid <> item_uuid),
-  CHECK ((parent_item_uuid IS NULL) = (member_order_key = '')),
-  CHECK (parent_item_uuid IS NOT NULL OR (expected_bytes IS NOT NULL AND expected_sha256 IS NOT NULL)),
-  CHECK (kind IS NOT 'zip' OR parent_item_uuid IS NULL),
-  CHECK (state <> 'expanded' OR kind IS 'zip'),
-  CHECK (state <> 'failed' OR error_code IS NOT NULL),
-  CHECK (state NOT IN ('imported','duplicate') OR result_track_uuid IS NOT NULL),
-  CHECK (state <> 'imported' OR result_revision IS NOT NULL),
-  CHECK ((duplicate_kind IS NOT NULL) = (state = 'duplicate'))
-)""",
-    "CREATE INDEX idx_upload_items_list ON upload_items(owner_id, batch_uuid, selection_index, member_order_key, item_uuid)",
-    "CREATE INDEX idx_upload_items_parent ON upload_items(owner_id, batch_uuid, parent_item_uuid)",
-    "CREATE INDEX idx_upload_items_state ON upload_items(state, updated_at)",
-    "CREATE INDEX idx_upload_items_result ON upload_items(owner_id, result_track_uuid) WHERE result_track_uuid IS NOT NULL",
-    """CREATE TABLE upload_item_audio_identity (
-  owner_id          INTEGER NOT NULL REFERENCES users(id),
-  item_uuid         TEXT NOT NULL,
-  exact_state       TEXT NOT NULL CHECK (exact_state IN ('current','failed','unsupported')),
-  exact_kind        TEXT CHECK (exact_kind IN ('pcm_sha256','pcm_float_sha256','packets_sha256')),
-  exact_digest      TEXT,
-  sample_rate_hz    INTEGER, channels INTEGER, bits_per_sample INTEGER,
-  failure_reason    TEXT,
-  computed_at       INTEGER NOT NULL,
-  tool_versions     TEXT,
-  fp_state          TEXT NOT NULL CHECK (fp_state IN ('current','unavailable','too_short','low_information','failed')),
-  fp_algorithm      TEXT,
-  fp_backend        TEXT,
-  fp_duration_s     REAL CHECK (fp_duration_s > 0),
-  fp_item_count     INTEGER,
-  fp_data           BLOB,
-  fp_failure_reason TEXT,
-  PRIMARY KEY (owner_id, item_uuid),
-  FOREIGN KEY (owner_id, item_uuid) REFERENCES upload_items(owner_id, item_uuid) ON DELETE CASCADE,
-  CHECK (exact_state <> 'current' OR (exact_kind IS NOT NULL AND exact_digest IS NOT NULL)),
-  CHECK (fp_state NOT IN ('current','low_information') OR (fp_data IS NOT NULL AND fp_duration_s IS NOT NULL AND fp_backend IS NOT NULL AND fp_algorithm IS NOT NULL))
-)""",
-    """CREATE TABLE operation_receipts (
-  owner_id       INTEGER NOT NULL REFERENCES users(id),
-  operation_uuid TEXT NOT NULL,
-  kind           TEXT NOT NULL CHECK (kind <> ''),
-  request_hash   TEXT NOT NULL CHECK (length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'),
-  created_at     INTEGER NOT NULL,
-  result_ref     TEXT,
-  PRIMARY KEY (owner_id, operation_uuid)
-)""",
-    """CREATE TABLE storage_reservations (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  owner_id      INTEGER NOT NULL REFERENCES users(id),
-  purpose       TEXT NOT NULL CHECK (purpose <> ''),
-  subject_ref   TEXT,
-  bytes         INTEGER NOT NULL CHECK (bytes >= 0),
-  lease_boot_id TEXT,
-  created_at    INTEGER NOT NULL
-)""",
-    "CREATE INDEX idx_storage_reservations_owner ON storage_reservations(owner_id, purpose, subject_ref)",
-    """CREATE TABLE upload_item_acknowledgements (
-  owner_id     INTEGER NOT NULL REFERENCES users(id),
-  item_uuid    TEXT NOT NULL,
-  subject_kind TEXT NOT NULL CHECK (subject_kind IN ('library_track','staged_item')),
-  subject_ref  TEXT NOT NULL,
-  PRIMARY KEY (owner_id, item_uuid, subject_kind, subject_ref),
-  FOREIGN KEY (owner_id, item_uuid) REFERENCES upload_items(owner_id, item_uuid) ON DELETE CASCADE
-)""",
-    "CREATE INDEX idx_upload_acks_subject ON upload_item_acknowledgements(owner_id, subject_kind, subject_ref)",
-    """CREATE TABLE upload_commit_journal (
-  owner_id                INTEGER NOT NULL REFERENCES users(id),
-  operation_uuid          TEXT NOT NULL,
-  item_uuid               TEXT NOT NULL,
-  state                   TEXT NOT NULL CHECK (state IN ('committing','prepared','moved','imported','duplicate_conflict','failed')),
-  base_review_version     INTEGER NOT NULL CHECK (base_review_version >= 0),
-  reserved_track_uuid     TEXT NOT NULL,
-  edits                   TEXT NOT NULL,
-  write_tags              INTEGER NOT NULL CHECK (write_tags IN (0,1)),
-  acknowledged_duplicates TEXT NOT NULL,
-  source_path             TEXT NOT NULL,
-  work_path               TEXT,
-  final_path              TEXT,
-  final_metadata          TEXT,
-  cover_art_id            INTEGER,
-  cover_art_created       INTEGER CHECK (cover_art_created IN (0,1)),
-  exact_state             TEXT CHECK (exact_state IN ('current','failed','unsupported')),
-  exact_kind              TEXT CHECK (exact_kind IN ('pcm_sha256','pcm_float_sha256','packets_sha256')),
-  exact_digest            TEXT,
-  sample_rate_hz          INTEGER, channels INTEGER, bits_per_sample INTEGER,
-  failure_reason          TEXT,
-  computed_at             INTEGER,
-  tool_versions           TEXT,
-  fp_state                TEXT CHECK (fp_state IN ('current','unavailable','too_short','low_information','failed')),
-  fp_algorithm            TEXT,
-  fp_backend              TEXT,
-  fp_duration_s           REAL CHECK (fp_duration_s > 0),
-  fp_item_count           INTEGER,
-  fp_data                 BLOB,
-  digest_check            TEXT CHECK (digest_check IN ('verified','changed','computed','unverified')),
-  error_code              TEXT,
-  lease_boot_id           TEXT,
-  created_at              INTEGER NOT NULL,
-  updated_at              INTEGER NOT NULL,
-  PRIMARY KEY (owner_id, operation_uuid),
-  FOREIGN KEY (owner_id, operation_uuid) REFERENCES operation_receipts(owner_id, operation_uuid),
-  FOREIGN KEY (owner_id, item_uuid) REFERENCES upload_items(owner_id, item_uuid)
-)""",
-    "CREATE INDEX idx_upload_journal_item ON upload_commit_journal(owner_id, item_uuid)",
-)
-
-
-# The v16 objects, created by the 15 -> 16 step. Each statement's text must match
-# init.sql's (minus IF NOT EXISTS); the fresh-vs-migrated parity test in
-# tests/test_schema_upgrade_v16.py enforces it. The DROP VIEW is migration-only
-# (init.sql has no DROP); the parity test compares the resulting sqlite_master.
-SCHEMA_V16_DDL: tuple[str, ...] = (
-    """CREATE TABLE deletion_jobs (
-  owner_id       INTEGER NOT NULL REFERENCES users(id),
-  operation_uuid TEXT NOT NULL,
-  created_at     INTEGER NOT NULL,
-  status         TEXT NOT NULL CHECK (status IN ('accepted','completed')),
-  PRIMARY KEY (owner_id, operation_uuid),
-  FOREIGN KEY (owner_id, operation_uuid) REFERENCES operation_receipts(owner_id, operation_uuid)
-)""",
-    "CREATE INDEX idx_deletion_jobs_list ON deletion_jobs(owner_id, created_at, operation_uuid)",
-    """CREATE TABLE deletion_job_items (
-  owner_id           INTEGER NOT NULL REFERENCES users(id),
-  operation_uuid     TEXT NOT NULL,
-  uuid_id            TEXT NOT NULL,
-  position           INTEGER NOT NULL CHECK (position >= 0),
-  base_revision      INTEGER NOT NULL,
-  status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','deleted','already_deleted','conflict','busy','failed')),
-  error_code         TEXT,
-  tombstone_revision INTEGER,
-  detail_json        TEXT,
-  lease_boot_id      TEXT,
-  cancel_requested   INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1)),
-  PRIMARY KEY (owner_id, operation_uuid, uuid_id),
-  UNIQUE (owner_id, operation_uuid, position),
-  FOREIGN KEY (owner_id, operation_uuid) REFERENCES deletion_jobs(owner_id, operation_uuid),
-  CHECK (status <> 'failed' OR error_code IS NOT NULL),
-  CHECK (status NOT IN ('deleted','already_deleted') OR tombstone_revision IS NOT NULL)
-)""",
-    """CREATE TABLE deletion_journal (
-  owner_id        INTEGER NOT NULL REFERENCES users(id),
-  operation_uuid  TEXT NOT NULL,
-  uuid_id         TEXT NOT NULL UNIQUE,
-  original_path   TEXT NOT NULL,
-  quarantine_path TEXT,
-  base_revision   INTEGER NOT NULL,
-  src_dev         INTEGER,
-  src_ino         INTEGER,
-  src_size        INTEGER,
-  src_mtime_ns    INTEGER,
-  exact_digest    TEXT,
-  cover_art_id    INTEGER,
-  master_missing  INTEGER NOT NULL CHECK (master_missing IN (0,1)),
-  stage           TEXT NOT NULL CHECK (stage IN ('intent','moved','committed')),
-  created_at      INTEGER NOT NULL,
-  updated_at      INTEGER NOT NULL,
-  PRIMARY KEY (owner_id, operation_uuid, uuid_id),
-  FOREIGN KEY (owner_id, operation_uuid, uuid_id) REFERENCES deletion_job_items(owner_id, operation_uuid, uuid_id),
-  CHECK (master_missing = 1 OR (quarantine_path IS NOT NULL AND src_dev IS NOT NULL AND src_ino IS NOT NULL AND src_size IS NOT NULL)),
-  CHECK (master_missing = 0 OR quarantine_path IS NULL)
-)""",
-    """CREATE TRIGGER deletion_journal_names_own_track BEFORE INSERT ON deletion_journal
-WHEN NOT EXISTS (SELECT 1 FROM tracks WHERE uuid_id = NEW.uuid_id AND owner_id = NEW.owner_id)
-BEGIN
-  SELECT RAISE(ABORT, 'deletion_journal must name a track of its owner');
-END""",
-    """CREATE TRIGGER deletion_journal_keeps_its_track BEFORE UPDATE OF owner_id, uuid_id ON deletion_journal
-WHEN NEW.owner_id IS NOT OLD.owner_id OR NEW.uuid_id IS NOT OLD.uuid_id
-BEGIN
-  SELECT RAISE(ABORT, 'deletion_journal owner and track never change');
-END""",
-    "DROP VIEW live_tracks",
-    """CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks
-  WHERE NOT EXISTS (SELECT 1 FROM deletion_journal d WHERE d.uuid_id = tracks.uuid_id)""",
-)
-
-
-# The v17 objects, created by the 16 -> 17 step. Each statement's text must match
-# init.sql's (minus IF NOT EXISTS); the fresh-vs-migrated parity test in
-# tests/test_schema_upgrade_v17.py enforces it.
-SCHEMA_V17_DDL: tuple[str, ...] = (
-    """CREATE TABLE lastfm_connections (
-  owner_id                 INTEGER NOT NULL UNIQUE REFERENCES users(id),
-  connection_id            TEXT,
-  account_name             TEXT,
-  session_key_enc          TEXT,
-  opted_in                 INTEGER NOT NULL DEFAULT 0 CHECK (opted_in IN (0,1)),
-  needs_reconnect          INTEGER NOT NULL DEFAULT 0 CHECK (needs_reconnect IN (0,1)),
-  pending_token_enc        TEXT,
-  pending_token_expires_at INTEGER,
-  created_at               INTEGER NOT NULL,
-  updated_at               INTEGER NOT NULL,
-  CHECK ((connection_id IS NULL AND account_name IS NULL AND session_key_enc IS NULL)
-      OR (connection_id IS NOT NULL AND account_name IS NOT NULL AND session_key_enc IS NOT NULL)),
-  CHECK ((pending_token_enc IS NULL) = (pending_token_expires_at IS NULL)),
-  CHECK (opted_in = 0 OR session_key_enc IS NOT NULL)
-)""",
-    """CREATE TABLE scrobble_outbox (
-  event_uuid    TEXT NOT NULL PRIMARY KEY,
-  owner_id      INTEGER NOT NULL REFERENCES users(id),
-  payload       TEXT NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'object'),
-  listened_at_s INTEGER NOT NULL,
-  status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','ignored','failed','dropped')),
-  result_code   TEXT,
-  attempts      INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-  alone         INTEGER NOT NULL DEFAULT 0 CHECK (alone IN (0,1)),
-  created_at    INTEGER NOT NULL,
-  done_at       INTEGER,
-  CHECK ((status = 'pending') = (done_at IS NULL)),
-  CHECK ((status IN ('pending','sent')) = (result_code IS NULL)),
-  CHECK (status <> 'dropped' OR result_code IN ('too_many_tries','too_old','no_answer'))
-)""",
-    "CREATE INDEX idx_scrobble_outbox_owner ON scrobble_outbox(owner_id, status, listened_at_s)",
-    "CREATE INDEX idx_scrobble_outbox_due ON scrobble_outbox(owner_id, created_at, listened_at_s) WHERE status = 'pending'",
-)
-
-
 class SchemaVersionRefused(Exception):
     """Fatal startup error: the database file is not at the supported schema."""
 
@@ -483,16 +165,11 @@ class SchemaVersionRefused(Exception):
                 f"This database is at schema {found_version}; start the server once "
                 f"to upgrade it to schema {supported_version}, then run this command again."
             )
-        elif found_version < minimum_version:
-            message = (
-                f"This database predates multi-user support (schema {found_version}). "
-                "Back it up, start with a fresh APP_DATA_DIR, and re-import your music."
-            )
         else:
             message = (
-                f"This database was written by a newer OSML server (schema {found_version}); "
-                f"it is newer than this server (schema {supported_version} supported). "
-                "Upgrade the server or start with a fresh APP_DATA_DIR."
+                f"This database has schema {found_version}; this server reads "
+                f"schema {supported_version}. Back it up and start with a fresh "
+                "APP_DATA_DIR."
             )
         super().__init__(message)
 
@@ -502,6 +179,29 @@ def _fold_path(p):
         return None
     nfd = unicodedata.normalize
     return nfd("NFD", nfd("NFD", p).casefold())
+
+
+class TrackPathTaken(Exception):
+    """Another track's row already names this file: the unique index on
+    ``tracks.file_path_fold`` refused the write, and the transaction it was in
+    wrote nothing. The writers' own checks (``track_path_in_use``, the
+    organizer's name choice) come first; this is what is left when two writers
+    pass their checks for one path."""
+
+
+def track_path_values(path) -> tuple[str, str, str]:
+    """What every write of a track's path stores, in the order (``file_path``,
+    ``file_path_fold``, ``file_folder_fold``): the path as given, its canonical
+    caseless form, and that form of the folder it lies in. The one place the
+    stored folds are computed, so no row's folds can differ from the folds of
+    its path."""
+    path = str(path)
+    return path, _fold_path(path), _fold_path(str(Path(path).parent))
+
+
+def _is_taken_path(error: sqlite3.IntegrityError) -> bool:
+    """Whether ``error`` is the unique index on the folded path refusing a row."""
+    return str(error) == "UNIQUE constraint failed: tracks.file_path_fold"
 
 # How long the purge waits for other programs' read snapshots before giving up.
 PURGE_BUSY_TIMEOUT_S = 5
@@ -539,6 +239,25 @@ def _problem_fields(raw: bytes) -> tuple[str | None, str | None]:
 
 class DatabaseUnreadable(Exception):
     """Fatal: the database path holds a file SQLite cannot read."""
+
+
+# Other-issues row 37, proposed to the owner: the refusal for a database file
+# the server cannot open or read. It is a file-system problem, not a damaged
+# database, so it does not advise starting over.
+UNREADABLE_DATABASE_FILE = (
+    "{path} cannot be read ({error}). Check the permissions and owner of this file, "
+    "its -wal and -shm files and its folder: the user the server runs as must be able "
+    "to read and write them."
+)
+
+
+def _is_file_system_error(exc: Exception, path: Path) -> bool:
+    """A permission error, or SQLite unable to open the database file although
+    it is a regular file (it cannot be read: its permissions or owner). Other
+    OSErrors (a full or failing disk while copying the -wal) are not."""
+    if isinstance(exc, PermissionError):
+        return True
+    return getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_CANTOPEN and path.is_file()
 
 
 class DatabaseMissing(Exception):
@@ -592,6 +311,8 @@ _UPLOAD_TRANSITION_FIELDS = frozenset(
 # Item states a worker holds (a transfer or a validation): cancelling one sets
 # the durable flag.
 _LEASED_STATES = frozenset({"receiving", "validating"})
+# One bound placeholder per ended state (``app.core.upload_states``), for ``state [NOT] IN (…)``.
+_ENDED_MARKS = ", ".join("?" * len(ENDED_STATES))
 
 
 class UploadItemsInUse(Exception):
@@ -706,6 +427,27 @@ def effective_artist(album_artist: Optional[str], artist: Optional[str]) -> Opti
     if artist and artist.strip():
         return artist.strip()
     return None
+
+
+def _library_identity(
+    artist: Optional[str], album: Optional[str], album_artist: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """A track's library identity from its tags: the effective artist (see
+    ``effective_artist``) and the album name (None when blank). Derived here
+    only, for insert, edit and the search text."""
+    album_name = album if album is not None and album.strip() != "" else None
+    return effective_artist(album_artist, artist), album_name
+
+
+def _track_search_text(
+    title: Optional[str], artist: Optional[str], album: Optional[str],
+    album_artist: Optional[str],
+) -> tuple[str, str, str]:
+    """The (title, artist_name, album_name) a track's ``fts_tracks`` row holds.
+    The table is contentless: a row is removed only by repeating exactly this
+    text, so insert, edit and delete all derive it here from the stored tags."""
+    effective, album_name = _library_identity(artist, album, album_artist)
+    return title or "", effective or "", album_name or ""
 
 
 class SearchEntityType(Flag):
@@ -903,8 +645,15 @@ class Database:
     # Schema version a freshly-initialized database lands on. ``initialize``
     # accepts MINIMUM_SCHEMA_VERSION..LATEST_SCHEMA_VERSION (upgrading in place);
     # the admin CLI accepts only LATEST. Keep LATEST in sync with ``init.sql``.
-    LATEST_SCHEMA_VERSION = 17
-    MINIMUM_SCHEMA_VERSION = 13
+    #
+    # The schema history was reset before the first release: ``init.sql`` is
+    # version 1 and there is no upgrade step, so every other version is
+    # refused. While nobody has a database to keep, a schema change is an edit
+    # of ``init.sql`` alone. The first change that must keep existing
+    # databases raises LATEST to 2 and adds its step to ``_schema_steps``;
+    # MINIMUM stays at the oldest version the steps start from.
+    LATEST_SCHEMA_VERSION = 1
+    MINIMUM_SCHEMA_VERSION = 1
 
     def _existing_schema_version(self) -> int | None:
         """Version of the existing file, or None when there is no schema yet.
@@ -943,6 +692,10 @@ class Database:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 tables = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
         except (sqlite3.DatabaseError, OSError) as exc:  # OperationalError is a subclass
+            if _is_file_system_error(exc, path):
+                raise DatabaseUnreadable(
+                    UNREADABLE_DATABASE_FILE.format(path=path, error=exc)
+                ) from exc
             if "not a database" in str(exc):
                 reason = "is not a SQLite database"
             else:
@@ -989,18 +742,23 @@ class Database:
         self._migrate()
         return True
 
+    def _schema_steps(self) -> dict[int, Callable[[sqlite3.Connection], None]]:
+        """The upgrade steps: each one upgrades from the version it is keyed by.
+
+        None yet. A step is a method taking the open connection, entered here
+        as ``{1: self._upgrade_1_to_2}``. It runs inside ``_migrate``'s
+        transaction, so it uses individual ``conn.execute`` calls
+        (``executescript`` would COMMIT first) and ends by stamping the
+        version it reaches (``PRAGMA user_version = 2``).
+        tests/test_schema_steps.py replaces this table with fake steps.
+        """
+        return {}
+
     def _migrate(self):
         with self._connection(commit=True, immediate=True) as conn:
             # Re-read inside the write transaction: the outer read may be stale.
             current = start = conn.execute("PRAGMA user_version").fetchone()[0]
-            # Ladder: each step upgrades from the version it is keyed by.
-            # Later phases add (version -> step) entries and bump LATEST.
-            steps = {
-                13: self._migrate_13_to_14,
-                14: self._migrate_14_to_15,
-                15: self._migrate_15_to_16,
-                16: self._migrate_16_to_17,
-            }
+            steps = self._schema_steps()
             if not self.MINIMUM_SCHEMA_VERSION <= current <= self.LATEST_SCHEMA_VERSION:
                 raise SchemaVersionRefused(
                     current, self.LATEST_SCHEMA_VERSION, self.MINIMUM_SCHEMA_VERSION
@@ -1021,37 +779,6 @@ class Database:
             self._ensure_server_instance_id(conn)
         if current > start:
             operator_logger.info("database schema upgraded from %d to %d", start, current)
-
-    def _migrate_13_to_14(self, conn) -> None:
-        # Individual conn.execute calls only: executescript would COMMIT first.
-        # Creates the v14 objects (SCHEMA_V14_DDL), then backfills one pending
-        # identity row per existing track, then stamps the version.
-        for statement in SCHEMA_V14_DDL:
-            conn.execute(statement)
-        conn.execute(
-            "INSERT INTO track_audio_identity "
-            "(uuid_id, exact_state, fp_state, match_state, priority) "
-            "SELECT uuid_id, 'pending', 'pending', 'pending', 1 FROM tracks"
-        )
-        conn.execute("PRAGMA user_version = 14")
-
-    def _migrate_14_to_15(self, conn) -> None:
-        # Individual conn.execute calls only: executescript would COMMIT first.
-        for statement in SCHEMA_V15_DDL:
-            conn.execute(statement)
-        conn.execute("PRAGMA user_version = 15")
-
-    def _migrate_15_to_16(self, conn) -> None:
-        # Individual conn.execute calls only: executescript would COMMIT first.
-        for statement in SCHEMA_V16_DDL:
-            conn.execute(statement)
-        conn.execute("PRAGMA user_version = 16")
-
-    def _migrate_16_to_17(self, conn) -> None:
-        # Individual conn.execute calls only: executescript would COMMIT first.
-        for statement in SCHEMA_V17_DDL:
-            conn.execute(statement)
-        conn.execute("PRAGMA user_version = 17")
 
     # --- Last.fm connection rows (9D.1b, spec §7.3/§7.4) -------------------------------
 
@@ -1326,7 +1053,8 @@ class Database:
                 (now - keep_done_ms,),
             )
             conn.execute(
-                "UPDATE scrobble_outbox SET status = 'dropped', result_code = 'too_old', done_at = ?"
+                f"UPDATE scrobble_outbox SET status = 'dropped', result_code = '{RESULT_TOO_OLD}',"
+                " done_at = ?"
                 " WHERE status = 'pending' AND listened_at_s < ?" + skip,
                 (now, now // 1000 - max_age_s, *owners),
             )
@@ -1340,7 +1068,8 @@ class Database:
                 conn.execute(
                     "UPDATE scrobble_outbox SET attempts = attempts + 1,"
                     " status = CASE WHEN attempts + 1 >= ? THEN 'dropped' ELSE status END,"
-                    " result_code = CASE WHEN attempts + 1 >= ? THEN 'too_many_tries' ELSE result_code END,"
+                    " result_code = CASE WHEN attempts + 1 >= ?"
+                    f" THEN '{RESULT_TOO_MANY_TRIES}' ELSE result_code END,"
                     " done_at = CASE WHEN attempts + 1 >= ? THEN ? ELSE done_at END"
                     " WHERE event_uuid = ? AND owner_id = ? AND status = 'pending'",
                     (max_tries, max_tries, max_tries, now, event_uuid, owner),
@@ -1603,6 +1332,8 @@ class Database:
                 " detected_metadata FROM upload_items"
                 " WHERE state = 'validating' AND cancel_requested = 0"
                 " AND (lease_boot_id IS NULL OR lease_boot_id <> ?)"
+                " AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = upload_items.owner_id"
+                " AND u.deleting_at IS NOT NULL)"  # a user being deleted gets no more work
                 " AND (parent_item_uuid IS NULL OR EXISTS (SELECT 1 FROM upload_items p"
                 " WHERE p.owner_id = upload_items.owner_id AND p.item_uuid = upload_items.parent_item_uuid"
                 " AND p.state = 'expanded'))"
@@ -1686,7 +1417,7 @@ class Database:
         error_code: str, error_message: str, error_retryable: bool, now: int
     ) -> list[dict] | None:
         """validating -> failed, guarded by this boot's lease and the claimed
-        review_version (False, nothing written, when it no longer holds). The
+        review_version (None, nothing written, when it no longer holds). The
         source path and its quota row are kept; giving them back is a separate
         guarded step once the file is gone. The item's archive children (a failed
         archive was never expanded, so they hold no source or quota rows) are
@@ -1706,11 +1437,18 @@ class Database:
             )
             if cur.rowcount != 1:
                 return None
+            # Children share the parent's batch (composite FK): naming it lets the
+            # lookup use the whole of idx_upload_items_parent.
+            (batch,) = conn.execute(
+                "SELECT batch_uuid FROM upload_items WHERE owner_id = ? AND item_uuid = ?",
+                (owner, key)).fetchone()
             children = [dict(r) for r in conn.execute(
-                "SELECT item_uuid, batch_uuid FROM upload_items WHERE owner_id = ? AND parent_item_uuid = ?",
-                (owner, key))]
+                "SELECT item_uuid, batch_uuid FROM upload_items WHERE owner_id = ? AND batch_uuid = ?"
+                " AND parent_item_uuid = ?",
+                (owner, batch, key))]
             conn.execute(
-                "DELETE FROM upload_items WHERE owner_id = ? AND parent_item_uuid = ?", (owner, key))
+                "DELETE FROM upload_items WHERE owner_id = ? AND batch_uuid = ? AND parent_item_uuid = ?",
+                (owner, batch, key))
             conn.execute(
                 "UPDATE upload_items SET skipped_members = NULL WHERE owner_id = ? AND item_uuid = ?",
                 (owner, key))
@@ -2419,12 +2157,14 @@ class Database:
             changed = cancel_one(conn, item_uuid)
             row = self._upload_item_in(conn, owner_id=owner_id, item_uuid=item_uuid)
             if row is not None and row["state"] in ("cancelled", "expanded"):
-                children = conn.execute(
-                    "SELECT item_uuid FROM upload_items WHERE owner_id = ? AND parent_item_uuid = ?"
-                    " ORDER BY item_uuid",
-                    (_require_owner(owner_id), row["item_uuid"]),
-                ).fetchall()
-                cancelled_children = [c["item_uuid"] for c in children if cancel_one(conn, c["item_uuid"])]
+                # Sorted here, not in SQL: an ORDER BY would make the planner walk
+                # the whole batch in item order instead of seeking the parent index.
+                children = sorted(r["item_uuid"] for r in conn.execute(
+                    "SELECT item_uuid FROM upload_items WHERE owner_id = ? AND batch_uuid = ?"
+                    " AND parent_item_uuid = ?",
+                    (_require_owner(owner_id), row["batch_uuid"], row["item_uuid"]),
+                ))
+                cancelled_children = [c for c in children if cancel_one(conn, c)]
         return changed, row, cancelled_children
 
     def retry_upload_item(
@@ -2616,6 +2356,8 @@ class Database:
                 " ON i.owner_id = j.owner_id AND i.item_uuid = j.item_uuid"
                 " WHERE j.state = 'committing' AND i.state = 'committing'"
                 " AND (j.lease_boot_id IS NULL OR j.lease_boot_id <> ?)"
+                " AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = j.owner_id"
+                " AND u.deleting_at IS NOT NULL)"  # a user being deleted gets no more work
                 " ORDER BY j.created_at, j.operation_uuid LIMIT 1",
                 (boot_id,),
             ).fetchone()
@@ -3091,7 +2833,7 @@ class Database:
             ).fetchone()
         return None if row is None else row["source_path"]
 
-    def release_cancelled_upload_source(
+    def release_removed_upload_source(
         self, item_uuid, *, owner_id: int, source_path: str, now: int,
         from_states=("cancelled",),
     ) -> bool:
@@ -3104,7 +2846,7 @@ class Database:
         owner = _require_owner(owner_id)
         key = str(uuid.UUID(str(item_uuid)))
         states = tuple(from_states)
-        allowed = {"cancelled", "failed", "expanded", "imported", "duplicate", "expired"}
+        allowed = set(SOURCE_RELEASE_STATES)
         if not states or not set(states) <= allowed:
             raise ValueError("from_states must be among " + ", ".join(sorted(allowed)))
         marks = ",".join("?" for _ in states)
@@ -3155,8 +2897,9 @@ class Database:
             if parent is None:
                 return None
             existing = conn.execute(
-                "SELECT 1 FROM upload_items WHERE owner_id = ? AND parent_item_uuid = ? LIMIT 1",
-                (owner, key),
+                "SELECT 1 FROM upload_items WHERE owner_id = ? AND batch_uuid = ?"
+                " AND parent_item_uuid = ? LIMIT 1",
+                (owner, parent["batch_uuid"], key),
             ).fetchone()
             if existing is None:
                 for name, declared in members:
@@ -3175,8 +2918,9 @@ class Database:
                 )
             rows = conn.execute(
                 "SELECT item_uuid, batch_uuid, member_order_key, state FROM upload_items"
-                " WHERE owner_id = ? AND parent_item_uuid = ? ORDER BY member_order_key",
-                (owner, key),
+                " WHERE owner_id = ? AND batch_uuid = ? AND parent_item_uuid = ?"
+                " ORDER BY member_order_key",
+                (owner, parent["batch_uuid"], key),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -3226,11 +2970,15 @@ class Database:
     def list_upload_children(self, *, owner_id: int, item_uuid: str) -> list[dict]:
         """An archive's child rows (ids and state only)."""
         owner = _require_owner(owner_id)
+        key = str(uuid.UUID(str(item_uuid)))
         with self._connection() as conn:
+            # The parent's batch (a missing parent has no children: NULL matches nothing).
             rows = conn.execute(
                 "SELECT item_uuid, batch_uuid, state FROM upload_items"
-                " WHERE owner_id = ? AND parent_item_uuid = ? ORDER BY member_order_key",
-                (owner, str(uuid.UUID(str(item_uuid)))),
+                " WHERE owner_id = ? AND batch_uuid = (SELECT batch_uuid FROM upload_items"
+                " WHERE owner_id = ? AND item_uuid = ?) AND parent_item_uuid = ?"
+                " ORDER BY member_order_key",
+                (owner, owner, key, key),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3317,9 +3065,9 @@ class Database:
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT owner_id, item_uuid, batch_uuid, state, source_path, part_path"
-                " FROM upload_items WHERE state IN"
-                " ('cancelled', 'expired', 'imported', 'duplicate', 'expanded')"
-                " ORDER BY owner_id, batch_uuid, item_uuid"
+                f" FROM upload_items WHERE state IN ({_ENDED_MARKS})"
+                " ORDER BY owner_id, batch_uuid, item_uuid",
+                ENDED_STATES,
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3329,8 +3077,8 @@ class Database:
         with self._connection() as conn:
             return conn.execute(
                 "SELECT count(*) FROM upload_items WHERE owner_id = ? AND batch_uuid = ?"
-                " AND state NOT IN ('cancelled', 'expired', 'imported', 'duplicate', 'expanded')",
-                (owner, str(uuid.UUID(str(batch_uuid)))),
+                f" AND state NOT IN ({_ENDED_MARKS})",
+                (owner, str(uuid.UUID(str(batch_uuid))), *ENDED_STATES),
             ).fetchone()[0]
 
     def list_upload_batches_for_retention(self, *, updated_before: int) -> list[dict]:
@@ -3375,14 +3123,14 @@ class Database:
                 return False
             kept = conn.execute(
                 "SELECT 1 FROM upload_items WHERE owner_id = ? AND batch_uuid = ? AND ("
-                " state NOT IN ('imported', 'duplicate', 'expanded', 'expired', 'cancelled')"
+                f" state NOT IN ({_ENDED_MARKS})"
                 " OR updated_at > ? OR source_path IS NOT NULL OR part_path IS NOT NULL"
                 " OR EXISTS (SELECT 1 FROM storage_reservations r WHERE r.owner_id = upload_items.owner_id"
                 "            AND r.subject_ref = upload_items.item_uuid)"
                 " OR EXISTS (SELECT 1 FROM upload_commit_journal j WHERE j.owner_id = upload_items.owner_id"
                 "            AND j.item_uuid = upload_items.item_uuid)"
                 ") LIMIT 1",
-                (owner, key, updated_before),
+                (owner, key, *ENDED_STATES, updated_before),
             ).fetchone()
             if kept is not None:
                 return False
@@ -3721,10 +3469,13 @@ class Database:
     @staticmethod
     def _mark_audio_identity_stale_in(conn, uuid_id: str, reason: str) -> bool:
         """SC-16a primitive: the audio bytes changed, so bump ``generation`` and
-        send the exact layer and the match back to pending (digest kept). A
-        'conversion' / 'settle' reason also re-pends the fingerprint, unless it
-        is 'unavailable' (a mark never claims a fingerprinter exists). Returns
-        whether a row existed; never inserts one."""
+        send the exact layer and the match back to pending. The exact digest is
+        kept only for 'tag_write' (the audio did not change). For 'conversion'
+        / 'settle' the audio changed, so the digest is cleared (unknown until
+        recomputed, never a wrong exact match), open exact pairs are dropped,
+        and the fingerprint is re-pended unless it is 'unavailable' (a mark
+        never claims a fingerprinter exists). Returns whether a row existed;
+        never inserts one."""
         if reason not in STALE_REASONS:
             raise ValueError(f"unknown audio identity stale reason {reason!r}")
         fp_state = (
@@ -3732,13 +3483,18 @@ class Database:
             if reason == "tag_write"
             else "CASE WHEN fp_state = 'unavailable' THEN fp_state ELSE 'pending' END"
         )
+        clear_digest = (
+            "" if reason == "tag_write" else "exact_kind = NULL, exact_digest = NULL, "
+        )
         cursor = conn.execute(
             "UPDATE track_audio_identity SET generation = generation + 1, "
             "exact_state = 'pending', match_state = 'pending', priority = 0, "
             "attempts = 0, next_attempt_at = NULL, failure_reason = NULL, "
-            f"fp_state = {fp_state} WHERE uuid_id = ?",
+            f"{clear_digest}fp_state = {fp_state} WHERE uuid_id = ?",
             (uuid_id,),
         )
+        if cursor.rowcount > 0 and reason != "tag_write":
+            Database._drop_open_pairs_in(conn, uuid_id, "exact")
         return cursor.rowcount > 0
 
     def mark_audio_identity_stale(self, uuid_id: str, reason: str, *, owner_id: int) -> bool:
@@ -3849,6 +3605,9 @@ class Database:
         "AND (exact_state = 'pending' OR fp_state = 'pending' OR match_state = 'pending') "
         "AND NOT EXISTS (SELECT 1 FROM edit_journal j WHERE j.uuid_id = i.uuid_id) "
         "AND EXISTS (SELECT 1 FROM live_tracks lt WHERE lt.uuid_id = i.uuid_id) "
+        # A user being deleted gets no more work.
+        "AND NOT EXISTS (SELECT 1 FROM tracks t JOIN users u ON u.id = t.owner_id "
+        "WHERE t.uuid_id = i.uuid_id AND u.deleting_at IS NOT NULL) "
         "ORDER BY priority, next_attempt_at, rowid"
     )
     # Two fixed texts (one bound parameter, ?1 = now): without a fingerprinter the
@@ -4776,19 +4535,25 @@ class Database:
                 ).rowcount
             return count
 
+    _COVER_ART_SELECT = "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts"
+
+    @staticmethod
+    def _cover_art_from_row(row: sqlite3.Row) -> CoverArt:
+        return CoverArt(
+            id=row["id"], sha256=row["sha256"], phash=row["phash"],
+            phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
+        )
+
     def _find_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
         """Like ``get_cover_art_by_id``, but a database error raises."""
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE id = ?",
+                f"{self._COVER_ART_SELECT} WHERE id = ?",
                 (cover_art_id,),
             ).fetchone()
             if row is None:
                 return None
-            return CoverArt(
-                id=row["id"], sha256=row["sha256"], phash=row["phash"],
-                phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
-            )
+            return self._cover_art_from_row(row)
 
     def get_cover_art_by_id(self, cover_art_id: int) -> CoverArt | None:
         try:
@@ -4801,15 +4566,12 @@ class Database:
         try:
             with self._connection() as conn:
                 row = conn.execute(
-                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE sha256 = ?",
+                    f"{self._COVER_ART_SELECT} WHERE sha256 = ?",
                     (sha256,),
                 ).fetchone()
                 if row is None:
                     return None
-                return CoverArt(
-                    id=row["id"], sha256=row["sha256"], phash=row["phash"],
-                    phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
-                )
+                return self._cover_art_from_row(row)
         except Exception as e:
             print(f"Failed to get cover art by sha256: {e}")
             return None
@@ -4818,16 +4580,10 @@ class Database:
         try:
             with self._connection() as conn:
                 rows = conn.execute(
-                    "SELECT id, sha256, phash, phash_prefix, file_path FROM cover_arts WHERE phash_prefix = ?",
+                    f"{self._COVER_ART_SELECT} WHERE phash_prefix = ?",
                     (prefix,),
                 ).fetchall()
-                return [
-                    CoverArt(
-                        id=row["id"], sha256=row["sha256"], phash=row["phash"],
-                        phash_prefix=row["phash_prefix"], file_path=Path(row["file_path"]),
-                    )
-                    for row in rows
-                ]
+                return [self._cover_art_from_row(row) for row in rows]
         except Exception as e:
             print(f"Failed to get cover arts by phash prefix: {e}")
             return []
@@ -4945,26 +4701,10 @@ class Database:
         _require_owner(owner_id)
         metadata = track.metadata
 
-        # Determine effective artist: album_artist takes priority
-        effective = effective_artist(
-            metadata.album_artist, metadata.artist
+        artist_id, album_id = self._upsert_identity(
+            conn, owner_id, metadata.artist, metadata.album, metadata.album_artist,
+            metadata.year,
         )
-
-        artist_id = None
-        if effective:
-            artist_id = self._upsert_artist(conn, effective, owner_id)
-
-        # Determine album type
-        album_name = metadata.album
-        has_album = album_name is not None and album_name.strip() != ""
-        album_id = None
-
-        if artist_id is not None and effective is not None:
-            album_id = self._upsert_album(
-                conn, album_name if has_album else None,
-                artist_id, metadata.year, effective,
-            )
-
         self._assert_parents_owned(conn, owner_id, artist_id, album_id)
 
         # Clear any stale tombstone so a re-added uuid is not also
@@ -4981,7 +4721,7 @@ class Database:
         track.owner_id = owner_id
         tracks_entry = (
             track.uuid_id,
-            str(track.file_path),
+            *track_path_values(track.file_path),
             track.created_at,
             track.last_updated,
             revision,
@@ -4989,10 +4729,15 @@ class Database:
         )
         tracks_sql_query = (
             "INSERT INTO tracks "
-            "(uuid_id, file_path, created_at, last_updated, revision, owner_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)"
+            "(uuid_id, file_path, file_path_fold, file_folder_fold, created_at, last_updated, "
+            "revision, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
-        temp = conn.cursor().execute(tracks_sql_query, tracks_entry)
+        try:
+            temp = conn.cursor().execute(tracks_sql_query, tracks_entry)
+        except sqlite3.IntegrityError as e:
+            if _is_taken_path(e):
+                raise TrackPathTaken(track.uuid_id) from e
+            raise
         track_db_id = temp.lastrowid
 
         # The write lock is held now: the art row cannot vanish between
@@ -5033,13 +4778,9 @@ class Database:
         )
         conn.cursor().execute(trackmetadata_sql_query, trackmetadata_entry)
 
-        # Insert into FTS for tracks
-        fts_title = metadata.title or ""
-        fts_artist = effective or ""
-        fts_album = album_name if has_album else ""
-        conn.execute(
-            "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) VALUES (?, ?, ?, ?)",
-            (track_db_id, fts_title, fts_artist, fts_album),
+        self._fts_add_track_in(
+            conn, track_db_id,
+            metadata.title, metadata.artist, metadata.album, metadata.album_artist,
         )
 
         self._insert_audio_identity_in(
@@ -5073,7 +4814,9 @@ class Database:
                 )
 
             return True
-        except CoverArtGone:
+        except (CoverArtGone, TrackPathTaken):
+            # The caller has an answer of its own for each: register the art
+            # again; choose another name for the file.
             raise
         except Exception as e:
             print(f"Failed to add track {track}. {e}")
@@ -5093,6 +4836,20 @@ class Database:
             (album_id, owner_id),
         ).fetchone() is None:
             raise OwnerMismatch(f"album {album_id} is not owned by {owner_id}")
+
+    def _upsert_identity(
+        self, conn, owner_id: int, artist: Optional[str], album: Optional[str],
+        album_artist: Optional[str], year: Optional[int],
+    ) -> tuple[Optional[int], Optional[int]]:
+        """The ids of the artist and album rows a track with these tags belongs
+        to, each created when new. Both None when the track has no artist (an
+        album row requires one)."""
+        effective, album_name = _library_identity(artist, album, album_artist)
+        if effective is None:
+            return None, None
+        artist_id = self._upsert_artist(conn, effective, owner_id)
+        album_id = self._upsert_album(conn, album_name, artist_id, year, effective)
+        return artist_id, album_id
 
     def _upsert_artist(self, conn, effective_artist: str, owner_id: int) -> int:
         conn.execute(
@@ -5290,21 +5047,11 @@ class Database:
         ):
             raise EmptyTrackEdit(uuid_id)
 
-        effective = effective_artist(new["album_artist"], new["artist"])
-        new_artist_id = None
-        new_album_id = None
-        if effective is not None:
-            new_artist_id = self._upsert_artist(conn, effective, owner_id)
-            has_album = bool(new["album"] and new["album"].strip())
-            new_album_id = self._upsert_album(
-                conn,
-                new["album"] if has_album else None,
-                new_artist_id,
-                new["year"],
-                effective,
-            )
-        # effective is None ⇒ artist cleared; both ids stay None (an album row
+        # No effective artist ⇒ artist cleared; both ids are None (an album row
         # requires a non-null artist).
+        new_artist_id, new_album_id = self._upsert_identity(
+            conn, owner_id, new["artist"], new["album"], new["album_artist"], new["year"],
+        )
         self._assert_parents_owned(conn, owner_id, new_artist_id, new_album_id)
 
         conn.execute(
@@ -5337,26 +5084,31 @@ class Database:
             self._recompute_named_album_year(conn, new_album_id)
 
         # Rewrite this track's own FTS row: delete old terms, insert new ones.
-        old_effective = effective_artist(cur["album_artist"], cur["artist"])
-        conn.execute(
-            "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
-            "VALUES('delete', ?, ?, ?, ?)",
-            (track_db_id, cur["title"] or "", old_effective or "", cur["album"] or ""),
-        )
-        new_fts_album = new["album"] if (new["album"] and new["album"].strip()) else ""
-        conn.execute(
-            "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) "
-            "VALUES (?, ?, ?, ?)",
-            (track_db_id, new["title"] or "", effective or "", new_fts_album),
+        self._fts_delete_track_in(conn, cur)
+        self._fts_add_track_in(
+            conn, track_db_id, new["title"], new["artist"], new["album"], new["album_artist"],
         )
 
         if new_file_path is not None:
-            conn.execute(
-                "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
-                (new_file_path, uuid_id),
-            )
+            self._set_track_path_in(conn, uuid_id, new_file_path)
 
         return self._bump_track_revision(conn, uuid_id)
+
+    @staticmethod
+    def _set_track_path_in(conn, uuid_id: str, path: str) -> None:
+        """The one statement that changes a track's path, its folded forms with
+        it. Raises ``TrackPathTaken`` when another track's row names the path
+        (any spelling of it); a new spelling of the track's own path is fine."""
+        try:
+            conn.execute(
+                "UPDATE tracks SET file_path = ?, file_path_fold = ?, file_folder_fold = ? "
+                "WHERE uuid_id = ?",
+                (*track_path_values(path), uuid_id),
+            )
+        except sqlite3.IntegrityError as e:
+            if _is_taken_path(e):
+                raise TrackPathTaken(uuid_id) from e
+            raise
 
     def apply_track_metadata_edit(
         self,
@@ -5719,7 +5471,7 @@ class Database:
         "ok", or "gone" (the item is not ours and running), "conflict" (the
         track changed) or "busy". Nothing is written unless "ok"."""
         owner = _require_owner(owner_id)
-        src = tuple(identity) if identity is not None else (None, None, None, None)
+        src = tuple(identity) if identity is not None else (None, None, None)
         with self._connection(commit=True, immediate=True) as conn:
             leased = conn.execute(
                 "SELECT 1 FROM deletion_job_items WHERE owner_id = ? AND operation_uuid = ?"
@@ -5743,9 +5495,9 @@ class Database:
             conn.execute(
                 "INSERT INTO deletion_journal (owner_id, operation_uuid, uuid_id,"
                 " original_path, quarantine_path, base_revision, src_dev, src_ino,"
-                " src_size, src_mtime_ns, exact_digest, cover_art_id, master_missing,"
+                " src_size, cover_art_id, master_missing,"
                 " stage, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'intent', ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intent', ?, ?)",
                 (
                     owner, operation_uuid, uuid_id, str(original_path), quarantine_path,
                     base_revision, *src, cover_art_id, 1 if master_missing else 0, now, now,
@@ -6061,15 +5813,15 @@ class Database:
         by canonical caseless form (NFD, casefold, NFD): APFS folds Unicode case and ignores the NFC/NFD
         difference (SQLite's NOCASE folds ASCII only), and ingest paths are not
         NFC-normalised, so two spellings can be the same file. Answering "in use"
-        too often is the safe side."""
+        too often is the safe side. One probe of the unique index on the stored
+        folded path (at most one row has it), whatever the size of the library."""
         suffix, params = _and_owner("owner_id", owner_id)
         if exclude_uuid is not None:
             suffix += " AND uuid_id != ?"
             params = (*params, exclude_uuid)
         with self._connection() as conn:
-            conn.create_function("osml_path_fold", 1, _fold_path, deterministic=True)
             return conn.execute(
-                "SELECT 1 FROM tracks WHERE osml_path_fold(file_path) = ?" + suffix + " LIMIT 1",
+                "SELECT 1 FROM tracks WHERE file_path_fold = ?" + suffix + " LIMIT 1",
                 (_fold_path(path), *params),
             ).fetchone() is not None
 
@@ -6077,19 +5829,17 @@ class Database:
         """Every track (of ``owner_id``, or of any owner with ``ANY_OWNER``) whose
         master file sits directly in ``folder``, with its stored exact audio hash
         (None columns when it has no identity row). Folders compare by the same
-        canonical caseless form as ``track_path_in_use``."""
+        canonical caseless form as ``track_path_in_use``. One probe of the index
+        on the stored folded folder: only the folder's own tracks are read,
+        whatever lies below it and whatever the size of the library."""
         suffix, params = _and_owner("t.owner_id", owner_id)
-
-        def parent_fold(p):
-            return None if p is None else _fold_path(str(Path(p).parent))
-
         with self._connection() as conn:
-            conn.create_function("osml_parent_fold", 1, parent_fold, deterministic=True)
             rows = conn.execute(
                 "SELECT t.file_path, i.exact_state, i.exact_kind, i.exact_digest, "
                 "i.sample_rate_hz, i.channels, i.bits_per_sample "
-                "FROM tracks t LEFT JOIN track_audio_identity i ON i.uuid_id = t.uuid_id "
-                "WHERE osml_parent_fold(t.file_path) = ?" + suffix,
+                "FROM tracks t INDEXED BY idx_tracks_file_folder_fold "
+                "LEFT JOIN track_audio_identity i ON i.uuid_id = t.uuid_id "
+                "WHERE t.file_folder_fold = ?" + suffix,
                 (_fold_path(folder), *params),
             ).fetchall()
             return [dict(row) for row in rows]
@@ -6224,8 +5974,9 @@ class Database:
         already cancelled by an external request is never clobbered.
 
         With ``after_commit`` it moves only a ``done`` job instead: a same-file
-        conversion that committed but whose final file swap failed (the next
-        start puts the file in place and settles the job)."""
+        conversion that committed, whose final file swap was refused and could
+        not be taken back (``undo_inplace_conversion``): the next start puts the
+        file in place and settles the job."""
         _require_owner(owner_id)
         suffix, params = _and_owner("owner_id", owner_id)
         status_clause = "status = 'done'" if after_commit else "status IN ('queued', 'running')"
@@ -6237,6 +5988,54 @@ class Database:
                 (error_text, job_id, *params),
             )
             return cursor.rowcount > 0
+
+    def undo_inplace_conversion(
+        self,
+        job_id: int,
+        uuid_id: str,
+        journal_id: int,
+        error_text: str,
+        *,
+        codec: Optional[str],
+        bitrate_kbps: Optional[float],
+        sample_rate_hz: Optional[int],
+        channels: Optional[int],
+        owner_id: int,
+    ) -> Optional[int]:
+        """One transaction that takes back an in-place ``complete_conversion_job``
+        whose final file swap was refused (the original is still the track's
+        file): the four intrinsic fields are written back as given (what they
+        were before that commit; ``file_path`` never changed), the revision is
+        bumped (a client that read the committed row reads the track again), the
+        journal row is deleted and the job goes done -> failed with
+        ``error_text``. The audio identity stays marked stale from the commit:
+        the worker hashes the file again.
+
+        Only a conversion still as its commit left it is undone: the owner's
+        job ``done`` and its own ``convert`` journal row still there. Otherwise
+        nothing changes and None is returned. Returns the new revision."""
+        _require_owner(owner_id)
+        with self._connection(commit=True, immediate=True) as conn:
+            pending = conn.execute(
+                "SELECT 1 FROM conversion_jobs j "
+                "JOIN tracks t ON t.uuid_id = j.uuid_id AND t.owner_id = j.owner_id "
+                "JOIN edit_journal e ON e.uuid_id = j.uuid_id AND e.owner_id = j.owner_id "
+                "WHERE j.id = ? AND j.uuid_id = ? AND j.owner_id = ? AND j.status = 'done' "
+                "AND e.id = ? AND e.intent = 'convert'",
+                (job_id, uuid_id, owner_id, journal_id),
+            ).fetchone()
+            if pending is None:
+                return None
+            revision = self._apply_conversion_result(
+                conn, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels
+            )
+            conn.execute("DELETE FROM edit_journal WHERE id = ?", (journal_id,))
+            conn.execute(
+                "UPDATE conversion_jobs SET status = 'failed', error_text = ?, "
+                "updated_at = unixepoch() WHERE id = ?",
+                (error_text, job_id),
+            )
+            return revision
 
     def settle_swapped_conversion_job(
         self, job_id: int, uuid_id: str, *, owner_id: int, error_text: Optional[str] = None
@@ -6311,8 +6110,10 @@ class Database:
 
         ``inplace_journal=(old_path, temp_path)`` also writes the same-path
         "convert" journal row on this commit, so for that case a journal row
-        exists iff the DB advanced -- the invariant ``_reconcile_inplace``
-        relies on to redo the pending replace. A non-None ``identity`` is written
+        exists iff the DB advanced -- the invariant start-up recovery
+        (``journal_settle``) relies on to redo the pending replace. That commit
+        also marks the identity stale ('conversion', old digest cleared), so it
+        never leaves the old digest ``current``. A non-None ``identity`` is written
         in the same transaction (None leaves it untouched) with ``stat``, the
         new master's snapshot (None stores NULL). Returns
         ``(revision, journal_id)``."""
@@ -6344,6 +6145,7 @@ class Database:
                     "FROM conversion_jobs WHERE id = ?",
                     (uuid_id, old_path, temp_path, job_id),
                 ).lastrowid
+                self._mark_audio_identity_stale_in(conn, uuid_id, "conversion")
             return revision, journal_id
 
     def _apply_conversion_result(
@@ -6381,10 +6183,7 @@ class Database:
                 (duration, uuid_id),
             )
         if file_path is not None:
-            conn.execute(
-                "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
-                (file_path, uuid_id),
-            )
+            self._set_track_path_in(conn, uuid_id, file_path)
         return self._bump_track_revision(conn, uuid_id)
 
     def refresh_track_audio_properties(
@@ -6420,22 +6219,26 @@ class Database:
             return revision
 
     @staticmethod
+    def _fts_add_track_in(conn, track_db_id: int, title, artist, album, album_artist) -> None:
+        conn.execute(
+            "INSERT INTO fts_tracks(rowid, title, artist_name, album_name) VALUES (?, ?, ?, ?)",
+            (track_db_id, *_track_search_text(title, artist, album, album_artist)),
+        )
+
+    @staticmethod
     def _fts_delete_track_in(conn, meta_row) -> None:
-        track_db_id = meta_row["track_id"]
-        fts_title = meta_row["title"] or ""
-
-        # Determine effective artist and album for FTS delete
-        effective_artist = ""
-        if meta_row["album_artist"] and meta_row["album_artist"].strip():
-            effective_artist = meta_row["album_artist"].strip()
-        elif meta_row["artist"] and meta_row["artist"].strip():
-            effective_artist = meta_row["artist"].strip()
-
-        fts_album = meta_row["album"] or ""
+        """Remove a track's ``fts_tracks`` row. ``meta_row`` holds the stored
+        track_id, title, artist, album and album_artist."""
         conn.execute(
             "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) "
             "VALUES('delete', ?, ?, ?, ?)",
-            (track_db_id, fts_title, effective_artist, fts_album),
+            (
+                meta_row["track_id"],
+                *_track_search_text(
+                    meta_row["title"], meta_row["artist"], meta_row["album"],
+                    meta_row["album_artist"],
+                ),
+            ),
         )
 
     def _delete_track_in(self, conn, uuid_id: str, *, owner_id: int) -> int:
@@ -6662,11 +6465,13 @@ class Database:
         _require_owner(owner_id)
         try:
             with self._connection(timeout=timeout) as conn:
+                # Two single-table MAX subqueries, so each is one seek on its
+                # (owner_id, revision) index; a MAX over a UNION ALL reads every
+                # one of the owner's rows.
                 latest = conn.execute(
-                    "SELECT COALESCE(MAX(revision), 0) FROM ("
-                    "SELECT revision FROM tracks WHERE owner_id = ? "
-                    "UNION ALL "
-                    "SELECT revision FROM track_tombstones WHERE owner_id = ?)",
+                    "SELECT max("
+                    "COALESCE((SELECT MAX(revision) FROM tracks WHERE owner_id = ?), 0), "
+                    "COALESCE((SELECT MAX(revision) FROM track_tombstones WHERE owner_id = ?), 0))",
                     (owner_id, owner_id),
                 ).fetchone()[0]
                 stream = conn.execute(
@@ -7298,9 +7103,8 @@ def alias_map(column: str) -> str:
         return "t"
 
 
-# Sort-key cursor pagination logic.
-# This cursor logic is linked to the frontend's getTrackPage() / getAlbumTrackPage()
-# in frontend/lib/database/database.dart — keep them in sync.
+# Sort-key cursor pagination logic. The app no longer keeps a copy of it
+# (its own was deleted as unused, U15-FE-DB-B-02), so nothing there must match.
 def filter_for_cursor(
     row_filter_list: List[RowFilterParameter],
     order_parameters: List[OrderParameter],

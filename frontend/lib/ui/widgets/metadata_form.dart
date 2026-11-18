@@ -14,8 +14,8 @@ typedef SuggestionsFor = Future<List<String>> Function(String key, String query)
 /// Driven entirely by [fields] (the capabilities-derived descriptors), a
 /// [current] value lookup, and a [MetadataEdit] it mutates via [onChanged]. It
 /// knows nothing of uuid, outbox, PATCH, or sync — the owning page decides what
-/// to do with the resulting [MetadataEdit] and when to call [onSubmit]. This is
-/// what lets bulk edit and Upload confirm-tags reuse the same form later.
+/// to do with the resulting [MetadataEdit] and when to save it. This is what
+/// lets Get Info and the upload review use the same form.
 class MetadataForm extends StatefulWidget {
   const MetadataForm({
     super.key,

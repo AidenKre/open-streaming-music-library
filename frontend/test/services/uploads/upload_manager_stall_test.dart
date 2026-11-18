@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_manager.dart';
+import 'package:frontend/services/uploads/uploads_overview.dart';
 
 import '../../helpers/upload_manager_harness.dart';
 
@@ -53,6 +54,29 @@ void main() {
           calls.lastIndexOf('putContent u-2')),
       contains('getItem u-2'),
     );
+  });
+
+  // A7-03 (pre-merge review): during the wait after a stall no byte moves;
+  // the row says the upload was interrupted, not "Uploading".
+  test('a stalled transfer reads interrupted, not uploading, while it waits',
+      () async {
+    final put = h.api.openPuts.single;
+    h.clock.advance(UploadManager.stallTimeout);
+    check();
+    await h.pump();
+    expect(put.aborted, isTrue);
+
+    final intent = (await h.intents()).single;
+    expect(intent['last_state'], 'allocated');
+    expect(intent['last_error_code'], 'upload_interrupted');
+    final row = UploadsOverview.of(
+      intents: await h.store.forBinding(h.token),
+      progress: h.manager.progress.value,
+      availability: UploadsAvailability.available,
+    ).rows.single;
+    expect(row.statusText, 'Queued');
+    expect(row.detailText, 'The upload was interrupted. It will start again.');
+    expect(row.sending, isFalse);
   });
 
   test('progress keeps a slow transfer alive', () async {

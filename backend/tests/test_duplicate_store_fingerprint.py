@@ -20,15 +20,11 @@ from app.database.database import Database
 from app.services.duplicate_detection import DuplicateMatch, TrackRef
 from tests.fingerprint_fixtures import ALGO, fp_track
 from tests.identity_worker_fakes import FakeFingerprinter, make_worker
-from tests.identity_worker_fixtures import add_track, identity, make_db, set_identity, sql
+from tests.identity_worker_fixtures import add_track, identity, set_identity, sql
+from tests.pending_deletion import mark_pending_deletion
 
 NOW = 1_800_000_000
 V1 = "matcher-v1"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def mark_stale(db, uuid_id, reason):
@@ -126,9 +122,7 @@ def test_a_fingerprint_pair_survives_a_partner_with_no_identity_row(db):
 def test_a_fingerprint_pair_survives_a_partner_that_is_not_live(db):
     x, y = subject_and_partner(db)
     seed(db, x, y)
-    sql(db, "DROP VIEW live_tracks")
-    sql(db, "CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks "
-            f"WHERE uuid_id <> '{y}'")
+    mark_pending_deletion(db.context.database_path, y)
 
     store(db, x)
 

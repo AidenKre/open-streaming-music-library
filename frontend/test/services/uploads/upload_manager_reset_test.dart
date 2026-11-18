@@ -197,16 +197,10 @@ void main() {
     test('a reset quiesces uploads after history and before submissions, '
         'without building the manager', () async {
       final participants = c.read(localQuiescablesProvider);
-      expect([for (final q in participants) q.quiesceName], [
-        'playback',
-        'listens',
-        'preview',
-        'history',
-        'uploads',
-        'delete-jobs',
-        'owned-file-cleanup',
-        'submissions',
-      ]);
+      // Only this participant's place; the full list is pinned once, in
+      // local_reset_service_test.dart.
+      expect([for (final q in participants) q.quiesceName],
+          containsAllInOrder(['history', 'uploads', 'submissions']));
       await participants
           .singleWhere((q) => q.quiesceName == 'uploads')
           .quiesce();

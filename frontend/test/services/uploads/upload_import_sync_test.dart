@@ -16,25 +16,14 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/uploads/upload_manager.dart'
     show uploadIntentStoreProvider;
 
-UploadIntentRecord _intent(String uuid, String state) => UploadIntentRecord(
-  itemUuid: uuid,
+import '../../helpers/upload_intent_record.dart';
+
+UploadIntentRecord _intent(String uuid, String state) => intentRecord(
+  uuid,
   batchUuid: 'b-1',
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: '$uuid.flac',
-  lastState: state,
-  lastErrorCode: null,
-  lastErrorMessage: null,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
+  state: state,
   localBindingId: 'bind',
-  createdAtMs: 0,
-  updatedAtMs: 0,
-  expectedLength: null,
-  expectedSha256: null,
-  descriptor: null,
 );
 
 List<UploadIntentRecord> _list(Map<String, String> states) => [

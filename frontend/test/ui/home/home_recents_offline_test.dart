@@ -19,7 +19,8 @@ import 'package:frontend/ui/home/home_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 
 import '../browse_harness.dart';
-import 'home_recents_section_test.dart' show FakeHomeControls;
+import '../../helpers/fake_home_controls.dart' show FakeHomeControls;
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 TrackUI _track(String uuid, {bool downloaded = false}) => TrackUI(
   uuidId: uuid,

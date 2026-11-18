@@ -88,6 +88,36 @@ void main() {
         [('a', 'original', true, file.path)]);
   });
 
+  // D5 (owner, 2026-11-17): the manager's count of tracks it could not
+  // queue reaches the view, which reports it.
+  test('redownloadDamaged returns how many tracks could not be queued',
+      () async {
+    final ok = await c
+        .read(downloadsControlsProvider)
+        .redownloadDamaged([damagedTrack('/dl/a', legacy: true)]);
+    expect(ok, (failed: 0, total: 1));
+
+    final flaky = _FailingDownloadManager(
+      db: db,
+      coverArtStore: await LocalCoverArtStore.create(
+          directoryProvider: () async => tempDir, apiClient: noServerApi()),
+      apiClient: noServerApi(),
+      directoryProvider: () async => tempDir,
+      isOfflineFn: () => true,
+    );
+    addTearDown(flaky.dispose);
+    final failing = ProviderContainer(overrides: [
+      databaseProvider.overrideWithValue(db),
+      downloadManagerProvider.overrideWithValue(flaky),
+      downloadQualityProvider.overrideWithValue('256'),
+    ]);
+    addTearDown(failing.dispose);
+    final result = await failing
+        .read(downloadsControlsProvider)
+        .redownloadDamaged([damagedTrack('/dl/a', legacy: true)]);
+    expect(result, (failed: 1, total: 1));
+  });
+
   test('a plain Download of a damaged track replaces it (it is not "already '
       'downloaded"), at the quality it was downloaded at', () async {
     final file = File('${tempDir.path}/a.bad')..writeAsBytesSync([9]);
@@ -121,4 +151,23 @@ void main() {
         .getSingle();
     expect(row.damagedFilePath, isNull);
   });
+}
+
+/// Every enqueue throws (a local fault while queueing).
+class _FailingDownloadManager extends DownloadManager {
+  _FailingDownloadManager({
+    required super.apiClient,
+    required super.db,
+    required super.coverArtStore,
+    required super.directoryProvider,
+    required super.isOfflineFn,
+  });
+
+  @override
+  Future<void> enqueueTracksAtQuality(
+    List<TrackUI> tracks, {
+    required String quality,
+    bool force = false,
+  }) async =>
+      throw StateError('enqueue failed');
 }

@@ -18,14 +18,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'fake_session_controls.dart';
 import 'browse_harness.dart' show teardownTree;
 import '../helpers/test_credentials.dart';
-
-class _Online extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
+import '../helpers/test_offline.dart';
 
 class _FakeControls implements SyncDiagnosticsControls {
   final calls = <String>[];
@@ -66,7 +59,7 @@ void main() {
       overrides: [
         sharedPreferencesProvider.overrideWith((_) async => prefs),
         credentialStoreTestOverride(),
-        offlineModeProvider.overrideWith(_Online.new),
+        offlineModeProvider.overrideWith(() => TestOffline(false)),
         sessionControlsProvider.overrideWithValue(FakeSessionControls()),
         historyDiagnosticsProvider.overrideWith((ref) => Stream.value(diagnostics)),
         syncDiagnosticsControlsProvider.overrideWithValue(controls),
@@ -127,14 +120,18 @@ void main() {
     Future<void> page(WidgetTester tester, HistoryDiagnostics d) =>
         pump(tester, d, home: const SyncDiagnosticsPage());
 
-    testWidgets('shows counts and the last error; Retry is the controller\'s',
-        (tester) async {
+    // Pre-merge review A5-06: the raw error text is not a sentence; the
+    // page says the sync failed (the row's own sentence).
+    testWidgets('shows counts and that the last sync failed, never the raw '
+        "error; Retry is the controller's", (tester) async {
       await page(tester, const HistoryDiagnostics(
-        pending: 3, quarantined: 2, lastError: 'Server said 503',
+        pending: 3, quarantined: 2,
+        lastError: 'ApiException(500): {"detail":"boom"}',
       ));
       expect(find.textContaining('Waiting to upload: 3'), findsOneWidget);
       expect(find.textContaining('Held back: 2'), findsOneWidget);
-      expect(find.textContaining('Server said 503'), findsOneWidget);
+      expect(find.text('Last sync failed'), findsOneWidget);
+      expect(find.textContaining('ApiException'), findsNothing);
       await tester.tap(find.widgetWithText(FilledButton, 'Retry'));
       await tester.pumpAndSettle();
       expect(controls.calls, ['retry']);
@@ -147,7 +144,9 @@ void main() {
       ));
       expect(find.textContaining('Listens waiting to be saved: 1'),
           findsOneWidget);
-      expect(find.textContaining('Bad state: disk full'), findsOneWidget);
+      // Pre-merge review A5-06: the row's sentence, not the raw error.
+      expect(find.text('A listen could not be saved'), findsOneWidget);
+      expect(find.textContaining('Bad state'), findsNothing);
       expect(find.textContaining('last 5 seconds'), findsOneWidget);
     });
 
@@ -172,7 +171,9 @@ void main() {
       await page(tester, HistoryDiagnostics(conflicts: [_conflict]));
       expect(find.textContaining('30.5'), findsOneWidget);
       expect(find.textContaining('99'), findsOneWidget);
-      expect(find.textContaining('track-abc'), findsWidgets);
+      // Pre-merge review A5-06: never the track's internal reference.
+      expect(find.textContaining('track-abc'), findsNothing);
+      expect(find.textContaining('Unknown track'), findsWidgets);
       await tester.tap(find.widgetWithText(FilledButton, 'Keep server version'));
       await tester.pumpAndSettle();
       expect(controls.calls, isEmpty, reason: 'confirmation first');
@@ -180,6 +181,16 @@ void main() {
       await tester.tap(find.widgetWithText(FilledButton, 'Keep server version').last);
       await tester.pumpAndSettle();
       expect(controls.calls, ['keep mine@5']);
+    });
+
+    testWidgets('a conflict card names the track by title and artist, never '
+        'its id', (tester) async {
+      await page(tester, HistoryDiagnostics(
+        conflicts: [_conflict],
+        trackNames: const {'track-abc': 'Aria — Artist 01'},
+      ));
+      expect(find.textContaining('Aria — Artist 01'), findsNWidgets(2));
+      expect(find.textContaining('track-abc'), findsNothing);
     });
 
     testWidgets('cancelling the confirmation keeps the conflict', (tester) async {
@@ -207,7 +218,10 @@ void main() {
       expect(find.textContaining('1970-01-01T00:00:01.000Z'), findsOneWidget);
       expect(find.textContaining('1970-01-01T00:00:02.000Z'), findsOneWidget);
       expect(find.textContaining('track length: unknown'), findsOneWidget);
-      expect(find.textContaining('track length: 100.0 s'), findsOneWidget);
+      // Other-issues row 33: a whole number of seconds reads like the
+      // seconds played ("100 s", not "100.0 s").
+      expect(find.textContaining('track length: 100 s'), findsOneWidget);
+      expect(find.textContaining('100.0 s'), findsNothing);
       expect(controls.calls, isEmpty);
     });
   });

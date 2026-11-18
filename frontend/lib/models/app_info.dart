@@ -79,6 +79,29 @@ bool? isLosslessCodec(String? codec) {
   return null;
 }
 
+/// Whether a stale download's audio matches the current master, so only its
+/// tags or artwork changed on the server: the same codec (any case) and
+/// either a lossless codec (a lossless master can't be re-encoded to its own
+/// codec -- the server rejects that as a no-op -- so its audio is unchanged
+/// whatever the bitrates say) or bitrates within 1 kbps. The tolerance is
+/// needed because the server's `X-Audio-Bitrate-Kbps` header (stored as the
+/// downloaded bitrate) is the TRUNCATED master bitrate, so 899.7 kbps
+/// downloads as 899. An unknown codec never matches; an unknown bitrate
+/// matches only for a lossless codec.
+bool isDownloadedAudioUnchanged({
+  required String? downloadedCodec,
+  required String? codec,
+  required double? downloadedBitrateKbps,
+  required double? bitrateKbps,
+}) =>
+    downloadedCodec != null &&
+    codec != null &&
+    downloadedCodec.toLowerCase() == codec.toLowerCase() &&
+    ((isLosslessCodec(codec) ?? false) ||
+        (downloadedBitrateKbps != null &&
+            bitrateKbps != null &&
+            (downloadedBitrateKbps - bitrateKbps).abs() <= 1));
+
 const _losslessCodecs = {'flac', 'alac', 'wav', 'pcm', 'wavpack', 'ape'};
 const _lossyCodecs = {'aac', 'mp3', 'opus', 'vorbis'};
 

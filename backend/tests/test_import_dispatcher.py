@@ -34,17 +34,22 @@ class _FakeIngestor:
     def __init__(self, owner_id, seen):
         self.owner_id = owner_id
         self.seen = seen
+        self.imported_dirs: list = []
 
     def ingest_file(self, path, *, imported_dir=None):
         self.seen.append((self.owner_id, path))
         self.imported_dirs.append(imported_dir)
         return True
 
-    imported_dirs: list = []
+
+@pytest.fixture
+def ingestors():
+    """Every ``_FakeIngestor`` the test's dispatcher built, in order."""
+    return []
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, ingestors):
     db = OwnedTestDatabase(
         DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
     )
@@ -55,7 +60,9 @@ def env(tmp_path):
 
     def factory(user):
         built.append(user["id"])
-        return None, _FakeIngestor(user["id"], seen)
+        ingestor = _FakeIngestor(user["id"], seen)
+        ingestors.append(ingestor)
+        return None, ingestor
 
     dispatcher = ImportDispatcher(user_import_dir=root, database=db, make_pipeline=factory)
     return db, root, dispatcher, seen, built
@@ -80,17 +87,16 @@ def test_a_file_under_a_users_folder_goes_to_that_users_pipeline(env):
     assert alex not in {owner for owner, _ in seen}
 
 
-def test_a_handled_archive_is_set_aside_in_its_own_import_folder(env):
+def test_a_handled_archive_is_set_aside_in_its_own_import_folder(env, ingestors):
     """Review r1 m-R1-02 / DEV-M-10: the dispatcher hands the ingestor the
     ``.imported/`` of the folder the file was dropped in (its on-disk name)."""
     db, root, dispatcher, seen, _ = env
     add_test_user(db, "sam")
-    _FakeIngestor.imported_dirs = []
     drop = _drop(root, "Sam/Albums/album.zip")
 
     dispatcher.dispatch(drop)
 
-    assert _FakeIngestor.imported_dirs == [root / "Sam" / ".imported"]
+    assert [d for ingestor in ingestors for d in ingestor.imported_dirs] == [root / "Sam" / ".imported"]
 
 
 def test_folders_match_by_casefold(env):

@@ -539,3 +539,61 @@ def test_review_r1_f2_the_summary_is_one_consistent_read(db, sam, monkeypatch):
     assert settled
     assert summary["counts"]["pending"] == 1 and summary["counts"]["sent"] == 0
     assert summary["last_success_at"] is None
+
+
+# --- the sender's writes (pre-merge C1-02) ---------------------------------------------------
+# The sender passes the owner it read from the due scan; each write's own owner
+# condition is the only owner check on these statements.
+
+
+def _outbox_row(db, event):
+    conn = sqlite3.connect(db.context.database_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return dict(conn.execute("SELECT * FROM scrobble_outbox WHERE event_uuid = ?", (event,)).fetchone())
+    finally:
+        conn.close()
+
+
+SENDER_WRITES = {
+    "settle_lastfm_rows": lambda db, event, conn_id, key_enc, owner: db.settle_lastfm_rows(
+        [(event, "sent", None)], LATER, owner_id=owner),
+    "count_lastfm_try": lambda db, event, conn_id, key_enc, owner: db.count_lastfm_try(
+        [event], LATER, max_tries=1, owner_id=owner),
+    "mark_lastfm_needs_reconnect": lambda db, event, conn_id, key_enc, owner: db.mark_lastfm_needs_reconnect(
+        conn_id, key_enc, LATER, owner_id=owner),
+    "mark_lastfm_alone": lambda db, event, conn_id, key_enc, owner: db.mark_lastfm_alone(
+        [event], owner_id=owner),
+}
+
+
+def _sender_world(db, sam, alex):
+    _, sam_key = _bound(sam, connection_id="conn-sam")
+    _bound(alex, connection_id="conn-alex")
+    _queue(db, sam.owner_id, "sam-row")
+    _queue(db, alex.owner_id, "alex-row")
+    return sam_key
+
+
+@pytest.mark.parametrize("write", sorted(SENDER_WRITES))
+def test_the_senders_writes_never_touch_another_owners_rows(db, sam, alex, write):
+    sam_key = _sender_world(db, sam, alex)
+    before = (_outbox_row(db, "sam-row"), _row(db, sam.owner_id),
+              _outbox_row(db, "alex-row"), _row(db, alex.owner_id))
+
+    SENDER_WRITES[write](db, "sam-row", "conn-sam", sam_key, alex.owner_id)
+
+    after = (_outbox_row(db, "sam-row"), _row(db, sam.owner_id),
+             _outbox_row(db, "alex-row"), _row(db, alex.owner_id))
+    assert after == before
+
+
+@pytest.mark.parametrize("write", sorted(SENDER_WRITES))
+def test_the_senders_writes_change_the_named_owners_rows(db, sam, alex, write):
+    """The control for the test above: the same call with the right owner writes."""
+    sam_key = _sender_world(db, sam, alex)
+    before = (_outbox_row(db, "sam-row"), _row(db, sam.owner_id))
+
+    SENDER_WRITES[write](db, "sam-row", "conn-sam", sam_key, sam.owner_id)
+
+    assert (_outbox_row(db, "sam-row"), _row(db, sam.owner_id)) != before

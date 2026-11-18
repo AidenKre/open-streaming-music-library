@@ -13,14 +13,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.database import ANY_OWNER, DatabaseContext
+from app.database import ANY_OWNER
 from app.services.storage_ledger import (
     CONVERSION,
     InsufficientStorage,
     StorageLedger,
 )
 from tests.owned_database import OwnedTestDatabase
-from tests.schema_fixtures import INIT_SQL
 
 BOOT = "boot-current"
 
@@ -41,15 +40,6 @@ class FakeDisk:
         if self.error is not None:
             raise self.error
         return SimpleNamespace(total=10 * self.free + 1, used=0, free=self.free)
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 @pytest.fixture

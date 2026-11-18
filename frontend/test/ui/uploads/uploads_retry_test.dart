@@ -24,31 +24,21 @@ import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/uploads/uploads_controller.dart';
 import 'package:frontend/ui/uploads/uploads_page.dart';
 
+import '../../helpers/upload_intent_record.dart';
 import '../browse_harness.dart';
 import '../fake_session_controls.dart';
 import '../fake_uploads_controls.dart';
 
 // A file picked on this device (it has the digest): a lost received file
 // can be sent again from here (review r1 #2 keeps Retry for such rows only).
-UploadIntentRecord _intent(String state, {String? code}) => UploadIntentRecord(
-  itemUuid: 'i',
+UploadIntentRecord _intent(String state, {String? code}) => intentRecord(
+  'i',
   batchUuid: 'b',
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: 'a.flac',
-  lastState: state,
+  state: state,
   lastErrorCode: code,
-  lastErrorMessage: null,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
   localBindingId: 'bind',
-  createdAtMs: 0,
-  updatedAtMs: 0,
-  expectedLength: null,
   expectedSha256: 'abc',
-  descriptor: null,
 );
 
 UploadRow _row(String state, {String? code, bool online = true}) =>
@@ -192,6 +182,20 @@ void main() {
       manager.gate!.complete();
       await first;
       expect(manager.calls, ['retry i']);
+      c.dispose();
+    });
+
+    // A7-04 (pre-merge review): the guard is per file.
+    test('a retry of another file while one runs is still sent', () async {
+      manager.gate = Completer<void>();
+      final c = create();
+      final first = c.retry('a');
+      final second = c.retry('b');
+      await Future<void>.delayed(Duration.zero);
+      expect(manager.calls, ['retry a', 'retry b']);
+      manager.gate!.complete();
+      await first;
+      await second;
       c.dispose();
     });
   });

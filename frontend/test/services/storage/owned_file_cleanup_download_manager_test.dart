@@ -21,16 +21,11 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
 
 import '../../helpers/server_binding.dart';
+import '../../helpers/owned_file_cleanup_rows.dart';
 
-Future<List<Map<String, Object?>>> _cleanupRows(AppDatabase db) async => [
-  for (final r in await db
-      .customSelect(
-        'SELECT path, root_kind, size, local_binding_id, attempts '
-        'FROM owned_file_cleanup ORDER BY id',
-      )
-      .get())
-    r.data,
-];
+Future<List<Map<String, Object?>>> _cleanupRows(AppDatabase db) =>
+    ownedFileCleanupRows(
+        db, const ['path', 'root_kind', 'size', 'local_binding_id', 'attempts']);
 
 Future<(String?, String?)> _paths(AppDatabase db, String uuid) async {
   final row = await (db.select(db.tracks)
@@ -195,6 +190,64 @@ void main() {
         expect(await _paths(db, 'u1'), (null, null));
         expect(outside.existsSync(), isTrue);
         expect(await _cleanupRows(db), isEmpty);
+      });
+
+      // A.2 characterization: only the listed track's files are read.
+      test("another track's download and damaged copy are left alone",
+          () async {
+        final f = download('u1.m4a');
+        final other = download('u2.m4a');
+        final otherDamaged = download('u2.damaged.m4a');
+        await insertTrack('u1', filePath: f.path);
+        await insertTrack('u2',
+            filePath: other.path, damagedFilePath: otherDamaged.path);
+        await delete(buildManager(), 'u1');
+        expect(f.existsSync(), isFalse);
+        expect((other.existsSync(), otherDamaged.existsSync()), (true, true));
+        expect(await _paths(db, 'u2'), (other.path, otherDamaged.path));
+        expect(await _cleanupRows(db), isEmpty);
+      });
+
+      // A.2 characterization: a damaged download keeps its path in both
+      // columns; it is enqueued once.
+      test('a path held in both columns is enqueued once', () async {
+        final f = download('u1.m4a');
+        await insertTrack('u1', filePath: f.path, damagedFilePath: f.path);
+        unlinkError = const FileSystemException('Cannot delete file');
+        await delete(buildManager(), 'u1');
+        expect([for (final r in await _cleanupRows(db)) r['path']], [f.path]);
+      });
+
+      // A.2 characterization: the clean-up refuses a path a track still
+      // names, so only what is enqueued shows that another track's files
+      // are not read. An attempt that cannot resolve the root keeps the rows.
+      test("only the listed track's files are enqueued", () async {
+        final f = download('u1.m4a');
+        final d = download('u1.damaged.m4a');
+        await insertTrack('u1', filePath: f.path, damagedFilePath: d.path);
+        await insertTrack('u2',
+            filePath: download('u2.m4a').path,
+            damagedFilePath: download('u2.damaged.m4a').path);
+        final manager = DownloadManager(
+          apiClient: testApiClient(
+            'http://test:8080',
+            MockClient((_) async => http.Response('', 404)),
+          ),
+          db: db,
+          coverArtStore: coverStore,
+          directoryProvider: () async => docs,
+          ownedFileCleanup: OwnedFileCleanup(
+            db: db,
+            documentsDirectory: () async =>
+                throw const FileSystemException('no'),
+            locks: OwnedPathLocks(),
+          ),
+          onOwnedCleanupPending: () => retryRequests++,
+        );
+        addTearDown(manager.dispose);
+        await delete(manager, 'u1');
+        expect([for (final r in await _cleanupRows(db)) r['path']],
+            [f.path, d.path]);
       });
     });
   }

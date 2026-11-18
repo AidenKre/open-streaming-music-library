@@ -7,76 +7,8 @@ library;
 
 import 'dart:convert';
 
+import 'package:frontend/models/dto/json_fields.dart';
 import 'package:frontend/models/feature_blocks.dart';
-
-Map<String, dynamic> _map(Object? json, String what) {
-  if (json is! Map) throw FormatException('$what must be an object');
-  return Map<String, dynamic>.from(json);
-}
-
-String _str(Map<String, dynamic> m, String key) {
-  final v = m[key];
-  if (v is String) return v;
-  throw FormatException('$key must be a string');
-}
-
-String? _strOrNull(Map<String, dynamic> m, String key) {
-  final v = m[key];
-  if (v == null) return null;
-  if (v is String) return v;
-  throw FormatException('$key must be a string or null');
-}
-
-int _int(Map<String, dynamic> m, String key) {
-  final v = m[key];
-  if (v is int) return v;
-  throw FormatException('$key must be an integer');
-}
-
-int? _intOrNull(Map<String, dynamic> m, String key) {
-  final v = m[key];
-  if (v == null) return null;
-  if (v is int) return v;
-  throw FormatException('$key must be an integer or null');
-}
-
-double? _numOrNull(Map<String, dynamic> m, String key) {
-  final v = m[key];
-  if (v == null) return null;
-  if (v is num) return v.toDouble();
-  throw FormatException('$key must be a number or null');
-}
-
-bool? _boolOrNull(Map<String, dynamic> m, String key) {
-  final v = m[key];
-  if (v == null) return null;
-  if (v is bool) return v;
-  throw FormatException('$key must be a boolean or null');
-}
-
-List<Object?> _list(Map<String, dynamic> m, String key) {
-  final v = m[key];
-  if (v is List) return v;
-  throw FormatException('$key must be a list');
-}
-
-/// Item states of spec §3; [unknown] for a state this client doesn't know
-/// (the raw value is kept on the item).
-enum UploadItemState {
-  allocated,
-  receiving,
-  validating,
-  reviewReady,
-  committing,
-  imported,
-  duplicate,
-  expanded,
-  failed,
-  duplicateConflict,
-  expired,
-  cancelled,
-  unknown,
-}
 
 /// An item's last error (`{code, message?, retryable?}`).
 class UploadItemError {
@@ -123,11 +55,11 @@ class UploadItem {
   });
 
   factory UploadItem.fromJson(Object? json) {
-    final m = _map(json, 'upload item');
+    final m = jsonObject(json, 'upload item');
     final errorJson = m['error'];
     final Map<String, dynamic>? err = errorJson == null
         ? null
-        : _map(errorJson, 'error');
+        : jsonObject(errorJson, 'error');
     final retryable = err?['retryable'];
     if (retryable != null && retryable is! bool) {
       throw const FormatException('retryable must be a boolean or null');
@@ -136,41 +68,41 @@ class UploadItem {
     final detected = m['detected_metadata'];
     final conflicts = m['conflict_matches'];
     return UploadItem(
-      itemUuid: _str(m, 'item_uuid'),
-      batchUuid: _str(m, 'batch_uuid'),
-      parentItemUuid: _strOrNull(m, 'parent_item_uuid'),
-      filename: _str(m, 'filename'),
-      selectionIndex: _int(m, 'selection_index'),
-      memberOrderKey: _str(m, 'member_order_key'),
-      rawState: _str(m, 'state'),
-      expectedBytes: _intOrNull(m, 'expected_bytes'),
-      expectedSha256: _strOrNull(m, 'expected_sha256'),
-      receivedBytes: _int(m, 'received_bytes'),
-      reviewVersion: _int(m, 'review_version'),
+      itemUuid: jsonString(m, 'item_uuid'),
+      batchUuid: jsonString(m, 'batch_uuid'),
+      parentItemUuid: jsonStringOrNull(m, 'parent_item_uuid'),
+      filename: jsonString(m, 'filename'),
+      selectionIndex: jsonInt(m, 'selection_index'),
+      memberOrderKey: jsonString(m, 'member_order_key'),
+      rawState: jsonString(m, 'state'),
+      expectedBytes: jsonIntOrNull(m, 'expected_bytes'),
+      expectedSha256: jsonStringOrNull(m, 'expected_sha256'),
+      receivedBytes: jsonInt(m, 'received_bytes'),
+      reviewVersion: jsonInt(m, 'review_version'),
       error: err == null
           ? null
           : UploadItemError(
-              code: _str(err, 'code'),
-              message: _strOrNull(err, 'message'),
+              code: jsonString(err, 'code'),
+              message: jsonStringOrNull(err, 'message'),
               retryable: retryable as bool?,
             ),
-      createdAt: _int(m, 'created_at'),
-      updatedAt: _int(m, 'updated_at'),
+      createdAt: jsonInt(m, 'created_at'),
+      updatedAt: jsonInt(m, 'updated_at'),
       duplicateCheck: duplicate == null
           ? null
           : DuplicateCheck.fromJson(duplicate),
-      kind: _strOrNull(m, 'kind'),
-      skippedMembers: _intOrNull(m, 'skipped_members'),
+      kind: jsonStringOrNull(m, 'kind'),
+      skippedMembers: jsonIntOrNull(m, 'skipped_members'),
       detectedMetadata: detected == null
           ? null
           : DetectedMetadata.fromJson(detected),
-      tagWriteSupported: _boolOrNull(m, 'tag_write_supported'),
-      resultTrackUuid: _strOrNull(m, 'result_track_uuid'),
-      resultRevision: _intOrNull(m, 'result_revision'),
-      duplicateKind: _strOrNull(m, 'duplicate_kind'),
+      tagWriteSupported: jsonBoolOrNull(m, 'tag_write_supported'),
+      resultTrackUuid: jsonStringOrNull(m, 'result_track_uuid'),
+      resultRevision: jsonIntOrNull(m, 'result_revision'),
+      duplicateKind: jsonStringOrNull(m, 'duplicate_kind'),
       conflictMatches: conflicts == null
           ? null
-          : [for (final x in _list(m, 'conflict_matches')) DuplicateMatch.fromJson(x)],
+          : [for (final x in jsonList(m, 'conflict_matches')) DuplicateMatch.fromJson(x)],
     );
   }
 
@@ -218,22 +150,6 @@ class UploadItem {
   /// The library tracks a `duplicate_conflict` item conflicts with.
   final List<DuplicateMatch>? conflictMatches;
 
-  UploadItemState get state => switch (rawState) {
-    'allocated' => UploadItemState.allocated,
-    'receiving' => UploadItemState.receiving,
-    'validating' => UploadItemState.validating,
-    'review_ready' => UploadItemState.reviewReady,
-    'committing' => UploadItemState.committing,
-    'imported' => UploadItemState.imported,
-    'duplicate' => UploadItemState.duplicate,
-    'expanded' => UploadItemState.expanded,
-    'failed' => UploadItemState.failed,
-    'duplicate_conflict' => UploadItemState.duplicateConflict,
-    'expired' => UploadItemState.expired,
-    'cancelled' => UploadItemState.cancelled,
-    _ => UploadItemState.unknown,
-  };
-
   Map<String, dynamic> toJson() => {
     'item_uuid': itemUuid,
     'batch_uuid': batchUuid,
@@ -276,7 +192,7 @@ class UploadBatch {
   });
 
   factory UploadBatch.fromJson(Object? json) {
-    final m = _map(json, 'upload batch');
+    final m = jsonObject(json, 'upload batch');
     final counts = m['state_counts'];
     if (counts is! Map) {
       throw const FormatException('state_counts must be an object');
@@ -291,13 +207,13 @@ class UploadBatch {
       stateCounts[k] = v;
     }
     return UploadBatch(
-      batchUuid: _str(m, 'batch_uuid'),
-      label: _strOrNull(m, 'label'),
-      createdAt: _int(m, 'created_at'),
-      updatedAt: _int(m, 'updated_at'),
-      itemCount: _int(m, 'item_count'),
+      batchUuid: jsonString(m, 'batch_uuid'),
+      label: jsonStringOrNull(m, 'label'),
+      createdAt: jsonInt(m, 'created_at'),
+      updatedAt: jsonInt(m, 'updated_at'),
+      itemCount: jsonInt(m, 'item_count'),
       stateCounts: stateCounts,
-      itemsPath: _str(m, 'items_path'),
+      itemsPath: jsonString(m, 'items_path'),
     );
   }
 
@@ -326,10 +242,10 @@ class UploadBatch {
 class UploadBatchPage {
   const UploadBatchPage({required this.batches, required this.nextAfter});
   factory UploadBatchPage.fromJson(Object? json) {
-    final m = _map(json, 'batch page');
+    final m = jsonObject(json, 'batch page');
     return UploadBatchPage(
-      batches: [for (final b in _list(m, 'batches')) UploadBatch.fromJson(b)],
-      nextAfter: _strOrNull(m, 'next_after'),
+      batches: [for (final b in jsonList(m, 'batches')) UploadBatch.fromJson(b)],
+      nextAfter: jsonStringOrNull(m, 'next_after'),
     );
   }
   final List<UploadBatch> batches;
@@ -342,10 +258,10 @@ class UploadBatchPage {
 class UploadItemPage {
   const UploadItemPage({required this.items, required this.nextAfter});
   factory UploadItemPage.fromJson(Object? json) {
-    final m = _map(json, 'item page');
+    final m = jsonObject(json, 'item page');
     return UploadItemPage(
-      items: [for (final i in _list(m, 'items')) UploadItem.fromJson(i)],
-      nextAfter: _strOrNull(m, 'next_after'),
+      items: [for (final i in jsonList(m, 'items')) UploadItem.fromJson(i)],
+      nextAfter: jsonStringOrNull(m, 'next_after'),
     );
   }
   final List<UploadItem> items;
@@ -360,12 +276,12 @@ class AllocationResult {
     required this.limits,
   });
   factory AllocationResult.fromJson(Object? json) {
-    final m = _map(json, 'allocation result');
+    final m = jsonObject(json, 'allocation result');
     final limits = m['limits'];
     if (limits is! Map) throw const FormatException('limits must be an object');
     return AllocationResult(
       batch: UploadBatch.fromJson(m['batch']),
-      items: [for (final i in _list(m, 'items')) UploadItem.fromJson(i)],
+      items: [for (final i in jsonList(m, 'items')) UploadItem.fromJson(i)],
       limits: UploadLimits.fromJson(limits),
     );
   }
@@ -537,37 +453,38 @@ class DuplicateMatch {
 
   /// A [FormatException] when the match is malformed.
   factory DuplicateMatch.fromJson(Object? json) {
-    final m = _map(json, 'match');
-    final subjectKind = _str(m, 'subject_kind');
-    final kind = _str(m, 'kind');
-    final band = _str(m, 'band');
-    final score = _numOrNull(m, 'score');
+    // A copy: an unknown subject keeps it as its raw match.
+    final m = Map<String, dynamic>.from(jsonObject(json, 'match'));
+    final subjectKind = jsonString(m, 'subject_kind');
+    final kind = jsonString(m, 'kind');
+    final band = jsonString(m, 'band');
+    final score = jsonDoubleOrNull(m, 'score');
     final DuplicateSubject subject;
     switch (subjectKind) {
       case 'library_track':
         final trackJson = m['track'];
-        final track = trackJson == null ? null : _map(trackJson, 'track');
+        final track = trackJson == null ? null : jsonObject(trackJson, 'track');
         subject = LibraryTrackSubject(
-          trackUuid: _str(m, 'track_uuid'),
-          available: _boolOrNull(m, 'available'),
-          title: track == null ? null : _strOrNull(track, 'title'),
-          artist: track == null ? null : _strOrNull(track, 'artist'),
-          album: track == null ? null : _strOrNull(track, 'album'),
-          codec: track == null ? null : _strOrNull(track, 'codec'),
-          bitrateKbps: track == null ? null : _numOrNull(track, 'bitrate_kbps'),
-          sampleRateHz: track == null ? null : _intOrNull(track, 'sample_rate_hz'),
-          durationS: track == null ? null : _numOrNull(track, 'duration_s'),
+          trackUuid: jsonString(m, 'track_uuid'),
+          available: jsonBoolOrNull(m, 'available'),
+          title: track == null ? null : jsonStringOrNull(track, 'title'),
+          artist: track == null ? null : jsonStringOrNull(track, 'artist'),
+          album: track == null ? null : jsonStringOrNull(track, 'album'),
+          codec: track == null ? null : jsonStringOrNull(track, 'codec'),
+          bitrateKbps: track == null ? null : jsonDoubleOrNull(track, 'bitrate_kbps'),
+          sampleRateHz: track == null ? null : jsonIntOrNull(track, 'sample_rate_hz'),
+          durationS: track == null ? null : jsonDoubleOrNull(track, 'duration_s'),
         );
       case 'staged_item':
         final stagedJson = m['staged_item'];
-        final staged = stagedJson == null ? null : _map(stagedJson, 'staged_item');
+        final staged = stagedJson == null ? null : jsonObject(stagedJson, 'staged_item');
         subject = StagedItemSubject(
-          itemUuid: _str(m, 'item_uuid'),
-          available: _boolOrNull(m, 'available'),
-          filename: staged == null ? null : _strOrNull(staged, 'filename'),
-          batchUuid: staged == null ? null : _strOrNull(staged, 'batch_uuid'),
+          itemUuid: jsonString(m, 'item_uuid'),
+          available: jsonBoolOrNull(m, 'available'),
+          filename: staged == null ? null : jsonStringOrNull(staged, 'filename'),
+          batchUuid: staged == null ? null : jsonStringOrNull(staged, 'batch_uuid'),
           batchCreatedAt:
-              staged == null ? null : _intOrNull(staged, 'batch_created_at'),
+              staged == null ? null : jsonIntOrNull(staged, 'batch_created_at'),
         );
       default:
         subject = UnknownDuplicateSubject(subjectKind, m);
@@ -651,7 +568,7 @@ class DuplicateCheck {
   /// Never throws: malformed input is an unreadable check.
   factory DuplicateCheck.fromJson(Object? json) {
     try {
-      final m = _map(json, 'duplicate check');
+      final m = jsonObject(json, 'duplicate check');
       final version = m['version'];
       final status = m['status'];
       final reported = m['no_duplicates_found'];
@@ -661,7 +578,7 @@ class DuplicateCheck {
         reportedNoDuplicates: reported is bool ? reported : null,
         exact: LayerCoverage.fromJson(m['exact']),
         fingerprint: LayerCoverage.fromJson(m['fingerprint']),
-        matches: [for (final x in _list(m, 'matches')) DuplicateMatch.fromJson(x)],
+        matches: [for (final x in jsonList(m, 'matches')) DuplicateMatch.fromJson(x)],
       );
     } on FormatException {
       return const DuplicateCheck.unreadable();
@@ -689,6 +606,10 @@ class DuplicateCheck {
   final List<DuplicateMatch> matches;
   final bool isReadable;
 
+  /// The check was read and ran to completion (`status` is `complete`). An
+  /// unreadable or failed check is never "no duplicates found".
+  bool get ranToCompletion => isReadable && status == 'complete';
+
   /// The SC-25 rule: "no duplicates found" may be said for [layers] only
   /// for a readable, complete check with no matches and every named layer
   /// complete.
@@ -696,7 +617,7 @@ class DuplicateCheck {
     if (layers.isEmpty) {
       throw ArgumentError.value(layers, 'layers', 'must name a layer');
     }
-    if (!isReadable || status != 'complete' || matches.isNotEmpty) return false;
+    if (!ranToCompletion || matches.isNotEmpty) return false;
     return layers.every(
       (l) => (l == DuplicateLayer.exact ? exact : fingerprint).isComplete,
     );
@@ -732,17 +653,17 @@ class DetectedTags {
   /// An absent or null `tags` object is all-null tags.
   factory DetectedTags.fromJson(Object? json) {
     if (json == null) return const DetectedTags();
-    final m = _map(json, 'tags');
+    final m = jsonObject(json, 'tags');
     return DetectedTags(
-      title: _strOrNull(m, 'title'),
-      artist: _strOrNull(m, 'artist'),
-      album: _strOrNull(m, 'album'),
-      albumArtist: _strOrNull(m, 'album_artist'),
-      date: _strOrNull(m, 'date'),
-      year: _intOrNull(m, 'year'),
-      genre: _strOrNull(m, 'genre'),
-      trackNumber: _intOrNull(m, 'track_number'),
-      discNumber: _intOrNull(m, 'disc_number'),
+      title: jsonStringOrNull(m, 'title'),
+      artist: jsonStringOrNull(m, 'artist'),
+      album: jsonStringOrNull(m, 'album'),
+      albumArtist: jsonStringOrNull(m, 'album_artist'),
+      date: jsonStringOrNull(m, 'date'),
+      year: jsonIntOrNull(m, 'year'),
+      genre: jsonStringOrNull(m, 'genre'),
+      trackNumber: jsonIntOrNull(m, 'track_number'),
+      discNumber: jsonIntOrNull(m, 'disc_number'),
     );
   }
 
@@ -800,16 +721,16 @@ class DetectedMetadata {
   });
 
   factory DetectedMetadata.fromJson(Object? json) {
-    final m = _map(json, 'detected metadata');
+    final m = jsonObject(json, 'detected metadata');
     return DetectedMetadata(
-      container: _strOrNull(m, 'container'),
-      codec: _strOrNull(m, 'codec'),
-      mime: _strOrNull(m, 'mime'),
-      durationS: _numOrNull(m, 'duration_s'),
-      bitrateKbps: _numOrNull(m, 'bitrate_kbps'),
-      sampleRateHz: _intOrNull(m, 'sample_rate_hz'),
-      channels: _intOrNull(m, 'channels'),
-      hasAlbumArt: _boolOrNull(m, 'has_album_art'),
+      container: jsonStringOrNull(m, 'container'),
+      codec: jsonStringOrNull(m, 'codec'),
+      mime: jsonStringOrNull(m, 'mime'),
+      durationS: jsonDoubleOrNull(m, 'duration_s'),
+      bitrateKbps: jsonDoubleOrNull(m, 'bitrate_kbps'),
+      sampleRateHz: jsonIntOrNull(m, 'sample_rate_hz'),
+      channels: jsonIntOrNull(m, 'channels'),
+      hasAlbumArt: jsonBoolOrNull(m, 'has_album_art'),
       tags: DetectedTags.fromJson(m['tags']),
     );
   }

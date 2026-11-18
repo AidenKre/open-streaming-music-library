@@ -7,6 +7,7 @@ import pytest
 
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
+from tests.jobs_api_fixtures import _post_job
 
 # Registered marker (plan D16): tests/conftest.py skips without ffmpeg/ffprobe.
 requires_ffmpeg = pytest.mark.requires_ffmpeg
@@ -102,17 +103,6 @@ def _make_audio(path: Path, codec: str = "flac") -> None:
         *codec_flags, str(path),
     ]
     subprocess.run(cmd, check=True)
-
-
-def _post_job(client, uuid_id, target_codec, base_revision, target_bitrate_kbps=None, **overrides):
-    body = {
-        "type": "conversion",
-        "uuid_id": uuid_id,
-        "params": {"target_codec": target_codec, "target_bitrate_kbps": target_bitrate_kbps},
-        "base_revision": base_revision,
-    }
-    body.update(overrides)
-    return client.post("/jobs", json=body)
 
 
 class TestPostJobs:
@@ -224,6 +214,109 @@ class TestPostJobsBitrateValidation:
         r = _post_job(held_client, track.uuid_id, codec, track.revision, None)
         assert r.status_code == 200, r.text
         assert r.json()["target_bitrate"] is None
+
+
+class TestPostJobsRefusalAnswers:
+    """Refactor BE-TIDY row 6, written before the catch in post_job is
+    narrowed: the full answer of every request refusal POST /jobs gives today.
+    None of them may become a 500. Texts typed by hand."""
+
+    @pytest.mark.parametrize(
+        "source_codec, source_bitrate, filename, target, bitrate, detail",
+        [
+            ("flac", 1000.0, "song.flac", "wav", None,
+             "unsupported or unavailable target codec: wav"),
+            ("flac", 1000.0, "song.flac", "aac", None,
+             "aac requires a target bitrate of one of [320, 256, 192, 128]"),
+            ("flac", 1000.0, "song.flac", "mp3", 999,
+             "mp3 requires a target bitrate of one of [320, 256, 192, 128]"),
+            ("mp3", 320.0, "song.mp3", "flac", 320,
+             "flac is lossless and takes no target bitrate"),
+            # U06-B-06: a same-codec lossy request at the same or a higher bitrate.
+            ("mp3", 320.0, "song.mp3", "mp3", 320,
+             "The track is already in this format at this bitrate or higher"),
+            ("aac", 190.0, "song.m4a", "aac", 192,
+             "The track is already in this format at this bitrate or higher"),
+            ("flac", 1000.0, "song.flac", "flac", None,
+             "Target codec is the same lossless codec as the source"),
+        ],
+        ids=["unsupported", "lossy-no-bitrate", "lossy-non-preset", "lossless-with-bitrate",
+             "same-lossy-same-bitrate", "same-lossy-higher-bitrate", "same-lossless"],
+    )
+    def test_a_refused_request_answers_422_with_its_text(
+        self, held_client, tmp_path, source_codec, source_bitrate, filename, target, bitrate,
+        detail,
+    ):
+        track = _add_track_with_file(
+            held_client, tmp_path, codec=source_codec, bitrate_kbps=source_bitrate,
+            filename=filename,
+        )
+
+        r = _post_job(held_client, track.uuid_id, target, track.revision, bitrate)
+
+        assert (r.status_code, r.json()) == (422, {"detail": detail})
+        assert held_client.held.submitted == []
+
+    def test_an_encoder_missing_on_this_server_answers_422_with_its_text(self, held_client, tmp_path):
+        held_client.app.state.conversion_orchestrator.available_encoders = frozenset({"aac"})
+        track = _add_track_with_file(held_client, tmp_path, codec="flac")
+
+        r = _post_job(held_client, track.uuid_id, "mp3", track.revision, 320)
+
+        assert (r.status_code, r.json()) == (
+            422, {"detail": "unsupported or unavailable target codec: mp3"}
+        )
+
+    def test_a_taken_target_path_answers_409_target_exists(self, held_client, tmp_path):
+        track = _add_track_with_file(held_client, tmp_path, codec="flac")
+        (Path(track.file_path).with_suffix(".mp3")).write_bytes(b"someone else")
+
+        r = _post_job(held_client, track.uuid_id, "mp3", track.revision, 320)
+
+        assert (r.status_code, r.json()) == (409, {"detail": {"error": "target_exists"}})
+
+    def test_a_kept_journal_row_answers_409_pending_recovery_before_the_request_checks(
+        self, held_client, tmp_path
+    ):
+        # The kept-row check runs before _validate_request: even an invalid
+        # request (same lossless codec) is answered pending_recovery.
+        track = _add_track_with_file(held_client, tmp_path, codec="flac")
+        held_client.app.state.admin_library.insert_journal_entry(
+            "convert", track.uuid_id, old_path=str(track.file_path),
+            temp_path=str(tmp_path / "pending.tagged.flac"),
+        )
+
+        r = _post_job(held_client, track.uuid_id, "flac", track.revision)
+
+        assert (r.status_code, r.json()) == (409, {"detail": {"error": "pending_recovery"}})
+
+
+class TestPostJobsInternalError:
+    def test_an_unrelated_value_error_under_enqueue_answers_500_without_its_text(
+        self, held_client, tmp_path, monkeypatch
+    ):
+        """Refactor BE-TIDY row 6 (U06-A-06): only a refused request answers
+        422; an internal ValueError is a server error, and its text (which may
+        name a path) is never sent."""
+        from fastapi.testclient import TestClient
+
+        track = _add_track_with_file(held_client, tmp_path, codec="flac")
+
+        def broken_check(**kwargs):
+            raise ValueError("internal detail /srv/music/admin/song.flac")
+
+        monkeypatch.setattr(
+            held_client.app.state.conversion_orchestrator.storage_ledger, "check", broken_check
+        )
+        quiet = TestClient(
+            held_client.app, raise_server_exceptions=False, headers=held_client.headers
+        )
+
+        r = _post_job(quiet, track.uuid_id, "aac", track.revision, 192)
+
+        assert r.status_code == 500
+        assert "internal detail" not in r.text and "/srv/music" not in r.text
+        assert held_client.held.submitted == []
 
 
 class TestPostJobsConflicts:

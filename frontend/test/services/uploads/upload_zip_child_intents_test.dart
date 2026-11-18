@@ -19,6 +19,7 @@ import 'package:frontend/services/uploads/upload_manager.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 
 import '../../helpers/fake_uploads_api.dart';
+import '../../helpers/upload_intent_record.dart';
 import '../../helpers/upload_manager_harness.dart';
 
 Map<String, dynamic> _child(
@@ -35,25 +36,13 @@ Map<String, dynamic> _child(
 };
 
 UploadIntentRecord _record(String uuid, {String? parent, String state =
-    'review_ready'}) => UploadIntentRecord(
-  itemUuid: uuid,
+    'review_ready'}) => intentRecord(
+  uuid,
   batchUuid: 'b-1',
   parentItemUuid: parent,
-  selectionIndex: 0,
   displayName: uuid,
-  lastState: state,
-  lastErrorCode: null,
-  lastErrorMessage: null,
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
+  state: state,
   localBindingId: 'bind-1',
-  createdAtMs: 0,
-  updatedAtMs: 0,
-  expectedLength: null,
-  expectedSha256: null,
-  descriptor: null,
 );
 
 void main() {

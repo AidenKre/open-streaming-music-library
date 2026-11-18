@@ -339,8 +339,15 @@ class OwnedFileCleanup {
   /// The SingleFlightRunner pass body: every pending row, in id order and
   /// batches of 100.
   Future<PassOutcome> runPass(Set<String> reasons) async {
-    final token = (await ServerBindingRepository(_db).current())
-        ?.localBindingId;
+    final String? token;
+    try {
+      token = (await ServerBindingRepository(_db).current())?.localBindingId;
+    } catch (e) {
+      // A database of another schema version stays refused until a reset
+      // replaces it and rebuilds the scope: a retry cannot help.
+      if (databaseVersionRefusalIn(e) != null) return const PassParked();
+      rethrow;
+    }
     // A pass needs a binding to fence on; a later trigger retries.
     if (token == null) return const PassDone();
     final ids = await (_db.selectOnly(_db.ownedFileCleanupEntries)

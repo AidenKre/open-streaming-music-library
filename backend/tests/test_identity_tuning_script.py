@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services.ffmpeg_runner import NO_OPTIONS
 from app.services.fingerprinter import RawFingerprint
 from tests.fingerprint_fixtures import noisy, pin_matcher_settings, random_print
 
@@ -52,7 +53,8 @@ class ScriptedFingerprinter:
         self.prints = prints
         self.durations = durations or {}
 
-    def fingerprint(self, path, *, max_seconds=120, registry=None, job_id=None, low_priority=False):
+    def fingerprint(self, path, *, max_seconds=120, options=NO_OPTIONS):
+        assert options == NO_OPTIONS  # the tuning script runs the tool with no per-run options
         name = Path(path).name
         return RawFingerprint(self.prints[name], self.durations.get(name, 120.0))
 

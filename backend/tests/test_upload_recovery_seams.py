@@ -12,7 +12,6 @@ import pytest
 
 from app.services import organizer, upload_commit, upload_publish
 from app.services.upload_publish import SimulatedCrash
-from tests.identity_worker_fixtures import make_db
 from tests.upload_commit_fixtures import (
     FakeArt,
     accept,
@@ -28,11 +27,6 @@ WORKER_POINTS = ["after_work_fsync", "after_art_registered", "before_prepared_jo
                  "after_prepared_journal"]
 PUBLISHER_IMPORT_POINTS = ["before_link", "after_link", "after_moved_journal", "after_work_unlink",
                            "before_insert_commit", "after_insert_commit", "after_source_removed"]
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

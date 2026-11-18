@@ -4,14 +4,18 @@ import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/feed_header.dart';
 import 'package:frontend/ui/home/home_controller.dart';
+import 'package:frontend/ui/home/home_sections.dart';
 import 'package:frontend/repositories/home_suggestions_service.dart' show SuggestionRail;
 import 'package:frontend/ui/home/home_suggestions_controller.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/library_sync_status_view.dart';
+import 'package:frontend/ui/widgets/playback_notice.dart';
 
-/// One Home entry point (SC-07). Phase 9 appends `listening_stats`.
+export 'package:frontend/ui/home/home_sections.dart' show HomeSectionIds;
+
+/// One Home entry point (SC-07).
 @immutable
 class HomeEntryPoint {
   const HomeEntryPoint({
@@ -63,30 +67,8 @@ final homeEntryPointsProvider = Provider<List<HomeEntryPoint>>(
   ],
 );
 
-/// Stable Home section ids, in feed order (SC-07). Reserving an id fixes its
-/// position; it does not render anything until its phase registers a spec.
-abstract final class HomeSectionIds {
-  static const search = 'home.search';
-  static const syncStatus = 'home.sync_status'; // library sync feedback
-  static const entryPoints = 'home.entry_points';
-  static const filters = 'home.filters'; // Phase 6 (the Downloaded chip)
-  static const recents = 'home.recents'; // Phase 6
-  static const rediscover = 'home.rediscover'; // Phase 9B
-  static const moreFromArtists = 'home.more_from_artists'; // Phase 9B
-
-  static const order = [
-    search,
-    syncStatus,
-    entryPoints,
-    filters,
-    recents,
-    rediscover,
-    moreFromArtists,
-  ];
-}
-
-/// One Home section (SC-07). [hidePreferenceKey] is the only seam for
-/// Phase 9B's `HomeLayoutPreferences` (always null in Phase 4).
+/// One Home section (SC-07). A section with a [hidePreferenceKey] can be
+/// hidden in Settings (`HomeLayoutPreferences`); one without is always shown.
 @immutable
 class HomeSectionSpec {
   const HomeSectionSpec({required this.id, this.build, this.hidePreferenceKey});
@@ -99,9 +81,8 @@ class HomeSectionSpec {
   final String? hidePreferenceKey;
 }
 
-/// Home's sections, listed in [HomeSectionIds.order] (a test guards it; a
-/// later phase inserts its spec at its id's position). Phase 4 registers the
-/// search header, the library sync status and the entry points.
+/// Home's sections, listed in [HomeSectionIds.order] (a test guards it),
+/// without the hidden ones.
 final homeSectionsProvider = Provider<List<HomeSectionSpec>>((ref) {
   final preferences = ref.watch(homeLayoutPreferencesProvider);
   // A hideable section stays out while the preference is unknown.
@@ -191,8 +172,10 @@ FeedSection _suggestionsSection(
           subtitle: subtitle,
           entities: [for (final t in tracks) TrackEntity(t)],
           resetToken: resetToken,
-          onTap: (entity, _) =>
-              controls.playTrack((entity as TrackEntity).track),
+          onTap: (entity, _) => showPlaybackOutcome(
+            context,
+            controls.playTrack((entity as TrackEntity).track),
+          ),
           emptyMessage: emptiedByFilter ? 'No downloaded suggestions' : null,
           onEngagementChanged: engagement,
           notice: showNotice
@@ -269,7 +252,10 @@ EntityRailSection _recentsRail(BuildContext context, HomeControls controls) {
       newActivityLabel: label,
       trailing: seeAll,
       onTap: (entity, _) => switch (entity) {
-        TrackEntity(:final track) => controls.playTrack(track),
+        TrackEntity(:final track) => showPlaybackOutcome(
+          context,
+          controls.playTrack(track),
+        ),
         AlbumEntity(:final album) => openAlbumDetail(context, album),
         ArtistEntity(:final artist) => openArtistDetail(context, artist),
       },

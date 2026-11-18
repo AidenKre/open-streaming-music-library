@@ -9,18 +9,11 @@
 
 import sqlite3
 
-import pytest
-
 from app.services.audio_identity import KIND_PCM, AudioIdentity, ExactAudioHash
 from app.services.duplicate_detection import find_duplicates
 from tests.identity_worker_fakes import make_worker
-from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, sql
 from tests.owned_database import add_test_user
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def test_every_finder_statement_uses_an_index_and_never_scans(db):

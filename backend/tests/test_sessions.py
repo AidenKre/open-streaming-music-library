@@ -7,7 +7,6 @@ returned once and never stored. Lookup is one primary-key read joined to
 disabled user or a deleting user is rejected on the very next lookup.
 """
 
-import hashlib
 import sqlite3
 import threading
 
@@ -23,9 +22,10 @@ from app.auth.sessions import (
     revoke_session_hash,
 )
 from app.database.database import Database, DatabaseContext
-from tests.auth_helpers import create_session
+from tests.auth_helpers import create_session, sha256_hex
 from tests.owned_database import add_test_user
 from tests.schema_fixtures import INIT_SQL
+from tests.sqlite_helpers import sql_rows
 
 
 @pytest.fixture
@@ -37,26 +37,12 @@ def db(tmp_path):
     return database
 
 
-def _sql(db, statement, params=()):
-    conn = sqlite3.connect(db.context.database_path)
-    try:
-        rows = conn.execute(statement, params).fetchall()
-        conn.commit()
-        return rows
-    finally:
-        conn.close()
-
-
 def _dump(db) -> str:
     conn = sqlite3.connect(db.context.database_path)
     try:
         return "\n".join(conn.iterdump())
     finally:
         conn.close()
-
-
-def _sha256(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _lookup(db, token):
@@ -89,7 +75,7 @@ def test_every_session_gets_fresh_tokens():
 def test_the_stored_hashes_are_the_sha256_of_the_tokens():
     tokens = new_session_tokens()
     assert (tokens.token_hash, tokens.media_hash) == (
-        _sha256(tokens.token), _sha256(tokens.media_token)
+        sha256_hex(tokens.token), sha256_hex(tokens.media_token)
     )
 
 
@@ -97,11 +83,11 @@ def test_the_stored_hashes_are_the_sha256_of_the_tokens():
 
 def test_a_live_api_token_resolves_to_its_user(db):
     user_id = add_test_user(db, "sam")
-    _sql(db, "UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
+    sql_rows(db, "UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
     tokens = create_session(db, user_id)
 
     assert _lookup(db, tokens.token) == LiveSession(
-        session_hash=_sha256(tokens.token),
+        session_hash=sha256_hex(tokens.token),
         user_id=user_id,
         is_admin=True,
         is_master_admin=False,
@@ -121,7 +107,7 @@ def test_the_media_token_is_not_an_api_token(db):
 
 def test_the_stored_hash_is_not_accepted_as_a_token(db):
     tokens = create_session(db, add_test_user(db, "sam"))
-    assert _lookup(db, _sha256(tokens.token)) is None
+    assert _lookup(db, sha256_hex(tokens.token)) is None
 
 
 @pytest.mark.parametrize("column", ["disabled_at", "deleting_at"])
@@ -131,7 +117,7 @@ def test_a_disabled_or_deleting_user_is_rejected_on_the_next_lookup(db, column):
     assert _lookup(db, tokens.token) is not None
 
     # A CLI-style write from another connection, with no cache to invalidate.
-    _sql(db, f"UPDATE users SET {column} = 5 WHERE id = ?", (user_id,))
+    sql_rows(db, f"UPDATE users SET {column} = 5 WHERE id = ?", (user_id,))
 
     assert _lookup(db, tokens.token) is None
 
@@ -139,7 +125,7 @@ def test_a_disabled_or_deleting_user_is_rejected_on_the_next_lookup(db, column):
 def test_one_users_flag_leaves_another_users_session_alone(db):
     sam, alex = add_test_user(db, "sam"), add_test_user(db, "alex")
     sams, alexs = create_session(db, sam), create_session(db, alex)
-    _sql(db, "UPDATE users SET disabled_at = 5 WHERE id = ?", (sam,))
+    sql_rows(db, "UPDATE users SET disabled_at = 5 WHERE id = ?", (sam,))
 
     assert _lookup(db, sams.token) is None
     assert _lookup(db, alexs.token).user_id == alex
@@ -174,21 +160,21 @@ def test_revoking_rejects_the_session_and_keeps_the_row(db):
     revoke_session_hash(db, hash_token(tokens.token))
 
     assert _lookup(db, tokens.token) is None
-    [(revoked_at,)] = _sql(db, "SELECT revoked_at FROM auth_sessions")
+    [(revoked_at,)] = sql_rows(db, "SELECT revoked_at FROM auth_sessions")
     assert revoked_at is not None
 
 
 def test_revoking_is_idempotent_and_keeps_the_first_time(db):
     tokens = create_session(db, add_test_user(db, "sam"))
     revoke_session_hash(db, hash_token(tokens.token))
-    [(first,)] = _sql(db, "SELECT revoked_at FROM auth_sessions")
-    _sql(db, "UPDATE auth_sessions SET revoked_at = 1")
+    [(first,)] = sql_rows(db, "SELECT revoked_at FROM auth_sessions")
+    sql_rows(db, "UPDATE auth_sessions SET revoked_at = 1")
 
     revoke_session_hash(db, hash_token(tokens.token))
     revoke_session_hash(db, hash_token("unknown-token"))
 
     assert first is not None
-    assert _sql(db, "SELECT revoked_at FROM auth_sessions") == [(1,)]
+    assert sql_rows(db, "SELECT revoked_at FROM auth_sessions") == [(1,)]
 
 
 def test_revoking_one_session_leaves_the_users_other_sessions(db):
@@ -205,13 +191,13 @@ def test_revoking_one_session_leaves_the_users_other_sessions(db):
 
 def test_a_live_media_token_resolves_to_its_session_and_user(db):
     user_id = add_test_user(db, "sam")
-    _sql(db, "UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
+    sql_rows(db, "UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
     tokens = create_session(db, user_id)
 
     # The principal names the session by its API-token hash in both cases, so
     # a logout through either token revokes the same row.
     assert _lookup_media(db, tokens.media_token) == LiveSession(
-        session_hash=_sha256(tokens.token),
+        session_hash=sha256_hex(tokens.token),
         user_id=user_id,
         is_admin=True,
         is_master_admin=False,
@@ -231,7 +217,7 @@ def test_the_api_token_is_not_a_media_token(db):
 
 def test_the_stored_media_hash_is_not_accepted_as_a_media_token(db):
     tokens = create_session(db, add_test_user(db, "sam"))
-    assert _lookup_media(db, _sha256(tokens.media_token)) is None
+    assert _lookup_media(db, sha256_hex(tokens.media_token)) is None
 
 
 def test_revoking_the_session_rejects_its_media_token_too(db):
@@ -250,7 +236,7 @@ def test_a_disabled_or_deleting_users_media_token_is_rejected_next_lookup(db, co
     tokens = create_session(db, user_id)
     assert _lookup_media(db, tokens.media_token) is not None
 
-    _sql(db, f"UPDATE users SET {column} = 5 WHERE id = ?", (user_id,))
+    sql_rows(db, f"UPDATE users SET {column} = 5 WHERE id = ?", (user_id,))
 
     assert _lookup_media(db, tokens.media_token) is None
 

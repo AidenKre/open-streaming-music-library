@@ -21,6 +21,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/ui/get_info_page.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
+import '../helpers/test_offline.dart';
 
 const _knownJson = {
   'title': 't',
@@ -66,14 +67,6 @@ TrackUI _unknownTrack() => TrackUI.fromDrift(
     channels: const Value(null),
   ),
 );
-
-class _StubOffline extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return true;
-  }
-}
 
 void main() {
   group('wire DTO', () {
@@ -189,7 +182,7 @@ void main() {
         overrides: [
           databaseProvider.overrideWithValue(db),
           appInfoProvider.overrideWith((ref) async => defaultAppInfo()),
-          offlineModeProvider.overrideWith(_StubOffline.new),
+          offlineModeProvider.overrideWith(() => TestOffline(true)),
         ],
         child: MaterialApp(home: GetInfoPage(track: _unknownTrack())),
       ),

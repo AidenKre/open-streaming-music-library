@@ -29,7 +29,9 @@ import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/ui/manage_library/manage_library_controller.dart';
 
 import '../../helpers/delete_jobs_harness.dart';
-import '../browse_harness.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
+import '../../helpers/stub_track_sync.dart';
+import '../../helpers/test_offline.dart';
 
 const _on = AdvertisedFeature(
   LibraryToolsFeature(version: 1, serverDelete: true, duplicateReview: false),

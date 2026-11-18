@@ -10,9 +10,7 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.services.upload_limits import UploadLimits, effective_upload_limits
-
-MiB = 1024 * 1024
-GiB = 1024 * MiB
+from tests.upload_limit_values import EFFECTIVE_DEFAULTS, GiB, MiB
 
 # Spec §3, quoted: "One batch holds up to 100 selected files/archives; ZIP can
 # expand to 1000 audio candidates total per batch. Defaults: 250 MiB per
@@ -33,22 +31,6 @@ SPEC_DEFAULTS = {
     "upload_max_receives": 2,
     "upload_staged_quota_bytes": 10 * GiB,
     "storage_free_space_floor_bytes": 256 * MiB,
-}
-
-EFFECTIVE_DEFAULTS = {
-    "max_files_per_batch": 100,
-    "max_file_bytes": 250 * MiB,
-    "max_batch_bytes": 2 * GiB,
-    "max_expanded_bytes_per_batch": 2 * GiB,
-    "max_expanded_member_bytes": 250 * MiB,
-    "max_audio_items_per_batch": 1000,
-    "max_archive_members": 2000,
-    "max_compression_ratio": 100,
-    "receives": 2,
-    "staged_quota_bytes": 10 * GiB,
-    # O4 / DEV-7-02 (tests/test_upload_fairness.py).
-    "receives_per_user": 1,
-    "user_staged_quota_bytes": 5 * GiB,
 }
 
 

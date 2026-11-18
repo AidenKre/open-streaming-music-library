@@ -2,13 +2,16 @@ import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
+import 'package:frontend/models/library_scope.dart';
 
 import 'browse_harness.dart';
 import 'fake_library_actions.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// SC-26: every row tap on today's pages goes to LibraryActionControls
 /// (never to the queue player), with the right scope, list and filter.
@@ -72,7 +75,7 @@ void main() {
   testWidgets('album detail row tap plays the album query', (tester) async {
     await pump(
       tester,
-      const Scaffold(body: TracksPage(artistId: 1, albumId: 2)),
+      const Scaffold(body: TracksPage.album(AlbumScope(artistId: 1, albumId: 2))),
     );
     await tester.tap(find.text('Kite Two'));
     expect(actions.calls, ['playQuery k2 album(1,2) downloadedOnly=false']);
@@ -114,6 +117,21 @@ void main() {
     await pump(tester, const DownloadedTracksPage());
     await tester.tap(find.text('Kite Two'));
     expect(actions.calls, ['playQuery k2 library downloadedOnly=true']);
+    await teardownTree(tester);
+  });
+
+  // Coordinator round 2 (owner decision 5): the Downloaded page's row tap
+  // says so when playback does not start, like every other row tap.
+  testWidgets('a Downloaded row tap that does not start playback says so', (
+    tester,
+  ) async {
+    actions.playOutcome = const RejectedUnplayableOffline();
+    await pump(tester, const DownloadedTracksPage());
+    expect(find.text('Nothing here plays offline.'), findsNothing);
+    await tester.tap(find.text('Kite Two'));
+    await tester.pumpAndSettle();
+    expect(actions.calls, ['playQuery k2 library downloadedOnly=true']);
+    expect(find.text('Nothing here plays offline.'), findsOneWidget);
     await teardownTree(tester);
   });
 }

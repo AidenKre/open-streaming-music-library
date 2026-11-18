@@ -3,8 +3,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/browse_filter_controller.dart';
+import '../helpers/test_offline.dart';
 
-import 'browse_harness.dart';
 
 void main() {
   late TestOffline offline;

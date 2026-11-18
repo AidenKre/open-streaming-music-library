@@ -26,17 +26,12 @@ from app.services.import_archive import (
 from app.services.storage_ledger import IMPORT_UNPACK
 from app.services.upload_zip import ArchivePlan, Member
 from tests.archive_builders import rar4, rar5, write_rar, write_tar
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_zip_fixtures import Entry, build_zip, corrupt_member_data, make_ledger, tiny_limits
 
 A, B = b"A" * 300, b"B" * 200
 UNPACK = re.compile(r"^unpack-[0-9a-f]{32}$")
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

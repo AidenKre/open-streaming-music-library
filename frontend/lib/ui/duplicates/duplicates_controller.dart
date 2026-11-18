@@ -1,8 +1,9 @@
 // Phase 8 spec §6 "Possible duplicates": the page's input and presentation
 // state (SC-26). Page-scoped: created when the page opens, disposed when it
 // closes. Every rule (badge, differing fields, header words, order,
-// availability of server deletion, the delete review) lives in the model;
-// this controller forwards and translates.
+// availability of server deletion, the delete review, when "Delete this
+// copy" is blocked and what a pair's deletion status says) lives in the
+// model; this controller forwards and translates.
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
@@ -10,20 +11,23 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/api/library_tools_api.dart';
 import 'package:frontend/models/dto/library_tools_dtos.dart';
+import 'package:frontend/models/server_blocked_reason.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/playback/preview_player.dart';
-import 'package:frontend/services/deletion/deletion_text.dart';
 import 'package:frontend/services/deletion/delete_job.dart';
 import 'package:frontend/services/deletion/delete_jobs_manager.dart';
 import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
+import 'package:frontend/services/duplicates/duplicates_delete_rules.dart';
 import 'package:frontend/services/duplicates/duplicates_header.dart';
 import 'package:frontend/services/deletion/server_delete_availability.dart';
 import 'package:frontend/services/deletion/sync_touch.dart';
 import 'package:frontend/services/duplicates/duplicates_review.dart';
 import 'package:frontend/services/feature_providers.dart';
+import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/ui/preview_controller.dart';
 import 'package:frontend/ui/selection/track_selection_controller.dart';
 import 'package:frontend/ui/manage_library/deletion_review_controller.dart';
@@ -84,7 +88,7 @@ class DuplicatePairView {
   /// Fields whose known values differ (unknown never differs).
   final Set<DuplicateField> differing;
 
-  String get key => '${pair.uuidA}|${pair.uuidB}';
+  String get key => pairKey(pair.uuidA, pair.uuidB);
 }
 
 abstract interface class DuplicatesControls implements Listenable {
@@ -109,6 +113,10 @@ abstract interface class DuplicatesControls implements Listenable {
 
   /// Loads the summary and the first page of the current chip again.
   Future<void> refresh();
+
+  /// What the page says while [summaryLoad] or [listLoad] is
+  /// [DuplicatesLoad.needsConnection]: why nothing can be read now.
+  String get unreachableText;
 
   /// Plain words for the last failed action; null when there is none.
   String? get message;
@@ -181,6 +189,7 @@ class DuplicatesController extends ChangeNotifier
     });
     _offlineSub = _ref.container.listen(offlineModeProvider, (prev, next) {
       if (next) {
+        _refusal = null;
         _notify();
       } else {
         refresh();
@@ -194,6 +203,10 @@ class DuplicatesController extends ChangeNotifier
       libraryToolsFeatureProvider,
       (_, _) => _notify(),
     );
+    _blockedSub = _ref.container.listen(
+      libraryToolsServerBlockedProvider,
+      (_, _) => _notify(),
+    );
     // Jobs started elsewhere count too.
     _watchJobs();
     refresh();
@@ -202,6 +215,7 @@ class DuplicatesController extends ChangeNotifier
   final Ref _ref;
   late final ProviderSubscription<PreviewState> _previewSub;
   late final ProviderSubscription<Object?> _featureSub;
+  late final ProviderSubscription<ServerBlockedReason> _blockedSub;
   late final ProviderSubscription<AsyncValue<TrackSyncState>> _syncSub;
   late final ProviderSubscription<bool> _offlineSub;
   bool _disposed = false;
@@ -252,6 +266,7 @@ class DuplicatesController extends ChangeNotifier
   @override
   Future<void> refresh() async {
     if (_disposed) return;
+    _refusal = null;
     if (_ref.read(offlineModeProvider)) {
       _summarySeq++;
       _listSeq++;
@@ -261,7 +276,19 @@ class DuplicatesController extends ChangeNotifier
       _notify();
       return;
     }
-    await Future.wait([_loadSummary(), _startListing()]);
+    await Future.wait([_loadSummary(), _startListing(), _loadUnfinished()]);
+  }
+
+  /// The server's unfinished deletions were read during this page's life.
+  bool _unfinishedKnown = false;
+
+  Future<void> _loadUnfinished() async {
+    final manager = _manager;
+    if (manager == null) return;
+    if (await manager.loadUnfinished() && !_disposed) {
+      _unfinishedKnown = true;
+      _notify();
+    }
   }
 
   /// Reads the scan summary. A quiet read while a header is shown keeps that
@@ -283,15 +310,16 @@ class DuplicatesController extends ChangeNotifier
       _header = duplicatesHeader(dto);
       _summaryLoad = DuplicatesLoad.loaded;
       _summaryOwed = false;
-    } on LibraryToolsNotConnected {
+    } on LibraryToolsNotConnected catch (e) {
       if (_disposed || seq != _summarySeq) return;
+      _refusal = e.reason;
       if (keepPlace) {
         _summaryOwed = true;
       } else {
         _header = null;
         _summaryLoad = DuplicatesLoad.needsConnection;
       }
-      _reloadWhenVerified();
+      _reload.arm();
     } catch (_) {
       if (_disposed || seq != _summarySeq) return;
       if (keepPlace) return;
@@ -301,39 +329,34 @@ class DuplicatesController extends ChangeNotifier
     _notify();
   }
 
-  bool _awaitingVerified = false;
-
   /// A quiet summary read that was refused as not connected, while a header
   /// was shown and kept.
   bool _summaryOwed = false;
 
   /// A load that failed fast as not connected reloads by itself once the
-  /// binding verifies (one pending wait; no polling). Only what needs it is
-  /// read again: the summary (quietly if a header is shown) and, only when
-  /// the listing itself needs a connection, the listing. Offline: nothing
-  /// (coming back online reloads).
-  void _reloadWhenVerified() {
-    if (_awaitingVerified) return;
-    _awaitingVerified = true;
-    _ref.read(libraryToolsApiProvider).whenVerified().then(
-      (_) {
-        _awaitingVerified = false;
-        if (_disposed || _ref.read(offlineModeProvider)) return;
-        if (_summaryLoad == DuplicatesLoad.needsConnection || _summaryOwed) {
-          unawaited(_loadSummary(quiet: _header != null));
-        }
-        if (_listLoad == DuplicatesLoad.needsConnection) {
-          unawaited(_startListing());
-        }
-      },
-      onError: (Object _) {
-        _awaitingVerified = false;
-      },
-    );
+  /// binding verifies.
+  late final _reload = ReloadWhenVerified(
+    whenVerified: () => _ref.read(libraryToolsApiProvider).whenVerified(),
+    onVerified: _onVerified,
+  );
+
+  /// Only what needs it is read again: the summary (quietly if a header is
+  /// shown) and, only when the listing itself needs a connection, the
+  /// listing. Offline: nothing (coming back online reloads).
+  void _onVerified() {
+    if (_disposed || _ref.read(offlineModeProvider)) return;
+    if (_summaryLoad == DuplicatesLoad.needsConnection || _summaryOwed) {
+      unawaited(_loadSummary(quiet: _header != null));
+    }
+    if (_listLoad == DuplicatesLoad.needsConnection) {
+      unawaited(_startListing());
+    }
+    if (!_unfinishedKnown) unawaited(_loadUnfinished());
   }
 
   Future<void> _startListing() {
     if (_ref.read(offlineModeProvider)) {
+      _refusal = null;
       _listSeq++;
       _pageInFlight = false;
       _listLoad = DuplicatesLoad.needsConnection;
@@ -380,7 +403,7 @@ class DuplicatesController extends ChangeNotifier
         for (final p in page.pairs)
           if (!_asideActive(p.uuidA, p.uuidB, filter) &&
               !_hasDeletedMember(p) &&
-              !_pairs.any((q) => q.key == '${p.uuidA}|${p.uuidB}'))
+              !_pairs.any((q) => q.key == pairKey(p.uuidA, p.uuidB)))
             _view(p),
       ];
       _cursor = page.nextAfter;
@@ -397,7 +420,10 @@ class DuplicatesController extends ChangeNotifier
       _listLoad = e is LibraryToolsNotConnected
           ? DuplicatesLoad.needsConnection
           : DuplicatesLoad.failed;
-      if (e is LibraryToolsNotConnected) _reloadWhenVerified();
+      if (e is LibraryToolsNotConnected) {
+        _refusal = e.reason;
+        _reload.arm();
+      }
     }
     _pageInFlight = false;
     _notify();
@@ -421,6 +447,18 @@ class DuplicatesController extends ChangeNotifier
   );
 
   String? _message;
+
+  /// Why the latest summary or list read was refused (the latest refusal
+  /// wins); cleared when a load starts or takes the offline branch.
+  BindingRefusal? _refusal;
+
+  @override
+  String get unreachableText => duplicatesUnreachableText(
+    libraryToolsUnreachable(
+      blocked: _ref.read(libraryToolsServerBlockedProvider),
+      refusal: _refusal,
+    ),
+  );
 
   @override
   String? get message => _message;
@@ -536,7 +574,7 @@ class DuplicatesController extends ChangeNotifier
   /// A set-aside of [uuidA]|[uuidB] on [filter] that is neither undone nor
   /// failed: the server is (or will be) holding the pair on the other chip.
   bool _asideActive(String uuidA, String uuidB, DuplicatesFilter filter) {
-    final a = _asides['$uuidA|$uuidB'];
+    final a = _asides[pairKey(uuidA, uuidB)];
     return a != null && !a.undone && !a.failed && a.filter == filter;
   }
 
@@ -650,7 +688,11 @@ class DuplicatesController extends ChangeNotifier
     if (d == null || d.review != review) return;
     final op = review.submittedOperation;
     if (op != null) {
-      _ops.add(_TrackedOp(op, '${d.pair.uuidA}|${d.pair.uuidB}', d.uuid));
+      _ops.add((
+        operation: op,
+        pairKey: pairKey(d.pair.uuidA, d.pair.uuidB),
+        uuid: d.uuid,
+      ));
       _watchJobs();
     }
     _endActive();
@@ -717,7 +759,7 @@ class DuplicatesController extends ChangeNotifier
     if (changed) _message = _changed;
   }
 
-  final _ops = <_TrackedOp>[];
+  final _ops = <SubmittedCopyDeletion>[];
   ValueListenable<Map<String, DeleteJob>>? _watched;
 
   void _watchJobs() {
@@ -745,28 +787,6 @@ class DuplicatesController extends ChangeNotifier
     }
   }
 
-  /// The jobs that delete a copy of [pair], oldest first.
-  List<DeleteJob> _jobsOf(DuplicatePairView pair) => [
-    for (final j in _jobs.values)
-      if (j.targets.any(
-        (t) => t.uuidId == pair.pair.uuidA || t.uuidId == pair.pair.uuidB,
-      ))
-        j,
-  ];
-
-  /// Only a rejection, or a finished job that positively says this copy was
-  /// not deleted (conflict, busy, failed), frees the pair. Anything else,
-  /// unrecognised outcomes included, keeps it blocked.
-  bool _frees(DeleteJob job, String uuid) {
-    if (job.phase == DeleteJobPhase.rejected) return true;
-    if (!job.phase.isTerminal) return false;
-    final item = _itemOf(job, uuid);
-    return item != null &&
-        (item.status == DeleteItemStatus.conflict ||
-            item.status == DeleteItemStatus.busy ||
-            item.status == DeleteItemStatus.failed);
-  }
-
   void _endActive() {
     final d = _delete;
     if (d == null) return;
@@ -786,64 +806,23 @@ class DuplicatesController extends ChangeNotifier
     // Offline or a capability change: the review goes, but the pair did not
     // change, so it is not said to have.
     if (!canDeleteCopy) return _dropActiveDelete(changed: false);
-    if (_pairs.any((p) => _sameSnapshot(p.pair, d.pair))) return;
+    if (_pairs.any((p) => sameDuplicatePairSnapshot(p.pair, d.pair))) return;
     _dropActiveDelete();
   }
 
-  bool _sameSnapshot(DuplicatePairDto x, DuplicatePairDto y) =>
-      x.uuidA == y.uuidA &&
-      x.uuidB == y.uuidB &&
-      x.status == y.status &&
-      x.trackA.revision == y.trackA.revision &&
-      x.trackB.revision == y.trackB.revision;
+  @override
+  String? deleteStatus(DuplicatePairView pair) =>
+      duplicateDeleteStatus(pair.pair, _jobs.values);
 
   @override
-  String? deleteStatus(DuplicatePairView pair) {
-    final jobs = _jobsOf(pair);
-    if (jobs.isEmpty) return null;
-    final job = jobs.last;
-    for (final i in job.items) {
-      if (i.uuid == pair.pair.uuidA || i.uuid == pair.pair.uuidB) {
-        return deleteItemOutcomeText(i);
-      }
-    }
-    if (job.phase == DeleteJobPhase.rejected) {
-      return deletionErrorText(job.rejectionCode);
-    }
-    return jobPhaseText(job.phase);
-  }
-
-  /// An op concerns a pair when it was started on it or deletes one of its
-  /// copies (a track can be in several pairs).
-  bool Function(_TrackedOp) _concerns(DuplicatePairView pair) =>
-      (o) =>
-          o.key == pair.key ||
-          o.uuid == pair.pair.uuidA ||
-          o.uuid == pair.pair.uuidB;
-
-  DeleteJobItem? _itemOf(DeleteJob job, String uuid) {
-    for (final i in job.items) {
-      if (i.uuid == uuid) return i;
-    }
-    return null;
-  }
-
-  @override
-  bool deleteBlocked(DuplicatePairView pair) {
-    // Submitted here but not yet in the manager's map.
-    for (final t in _ops) {
-      if (_concerns(pair)(t) && !_jobs.containsKey(t.op)) return true;
-    }
-    for (final job in _jobsOf(pair)) {
-      for (final t in job.targets) {
-        if ((t.uuidId == pair.pair.uuidA || t.uuidId == pair.pair.uuidB) &&
-            !_frees(job, t.uuidId)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
+  bool deleteBlocked(DuplicatePairView pair) =>
+      duplicateDeleteBlocked(
+        pair.pair,
+        jobs: _jobs,
+        submitted: _ops,
+        // Without a manager nothing can be deleted from here.
+        unfinishedKnown: _unfinishedKnown || _manager == null,
+      );
 
   @override
   void dispose() {
@@ -853,6 +832,7 @@ class DuplicatesController extends ChangeNotifier
     _offlineSub.close();
     _previewSub.close();
     _featureSub.close();
+    _blockedSub.close();
     _endActive();
     _watched?.removeListener(_jobsChanged);
     _watched = null;
@@ -888,11 +868,4 @@ class _ActiveDelete {
   late VoidCallback listener;
   final TrackSelectionControls selection;
   final DeletionReviewControls review;
-}
-
-class _TrackedOp {
-  _TrackedOp(this.op, this.key, this.uuid);
-  final String op;
-  final String key;
-  final String uuid;
 }

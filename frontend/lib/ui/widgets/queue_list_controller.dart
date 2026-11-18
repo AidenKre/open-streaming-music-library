@@ -16,6 +16,9 @@ class QueueRow {
 
 enum QueueReloadKind { none, initial, visible }
 
+/// A read of more rows at one end of the loaded window.
+enum QueuePage { before, after }
+
 /// The full player's queue list (SC-27 `QueueListControls`): pages the
 /// active session's play order in a window around the current item, exposes
 /// rows whose availability comes from the model (`PlaybackAvailability`),
@@ -29,6 +32,10 @@ abstract interface class QueueListControls implements Listenable {
   bool get hasMoreBefore;
   bool get hasMoreAfter;
   Object? get error;
+
+  /// The page read [error] came from, for Retry to repeat it in place; null
+  /// with no error, or when it came from an initial or visible load.
+  QueuePage? get failedPage;
 
   /// Set after an initial load: the view should centre the current item.
   bool get shouldScrollToCurrent;
@@ -115,8 +122,21 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
   bool _hasMoreAfter = false;
   bool _shouldScrollToCurrent = false;
   Object? _error;
+  QueuePage? _errorPage;
   (int, int, int, int)? _failedInitialLoad;
   bool _disposed = false;
+
+  /// Bumped by every load that replaces the window ([loadInitial],
+  /// [reloadVisible]): a read started under an older value finishes
+  /// without touching the window (section 6 #7), so a slow read never
+  /// overwrites a newer one.
+  int _loadGeneration = 0;
+
+  /// The generation of the initial / visible load that set its flag: a
+  /// superseded load clears its flag only if no newer load of its kind took
+  /// it over.
+  int _initialGeneration = 0;
+  int _viewportGeneration = 0;
 
   @override
   List<QueueRow> get rows {
@@ -150,6 +170,8 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
   @override
   Object? get error => _error;
   @override
+  QueuePage? get failedPage => _error == null ? null : _errorPage;
+  @override
   bool get shouldScrollToCurrent => _shouldScrollToCurrent;
   @override
   void scrolledToCurrent() => _shouldScrollToCurrent = false;
@@ -158,8 +180,29 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     if (!_disposed) notifyListeners();
   }
 
-  bool _stale(int sessionId, int expectedQueueVersion) =>
-      _disposed || _sessionId != sessionId || _queueVersion != expectedQueueVersion;
+  /// A page read succeeded: the error of an earlier failed page read is
+  /// over. The error of an initial or visible load stays (the rows on
+  /// screen are still the old ones) until such a load succeeds.
+  void _clearPageError() {
+    if (_errorPage == null) return;
+    _error = null;
+    _errorPage = null;
+  }
+
+  /// A superseded initial or visible load ends: its busy flag clears if no
+  /// newer load of its kind took it over, and the view is told, so it plans
+  /// again (a queue change it skipped while the flag was set is loaded).
+  void _settleSuperseded({bool initial = false, bool viewport = false}) {
+    if (initial) _isInitialLoad = false;
+    if (viewport) _isViewportReload = false;
+    if (initial || viewport) _notify();
+  }
+
+  bool _stale(int sessionId, int expectedQueueVersion, int generation) =>
+      _disposed ||
+      _sessionId != sessionId ||
+      _queueVersion != expectedQueueVersion ||
+      _loadGeneration != generation;
 
   @override
   QueueReloadKind plan({
@@ -202,6 +245,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     required int totalCount,
   }) async {
     if (_disposed) return;
+    final generation = _initialGeneration = ++_loadGeneration;
     _isInitialLoad = true;
     _error = null;
     _failedInitialLoad = null;
@@ -224,8 +268,8 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
         startPlayPosition: start,
         limit: limit,
       );
-      if (_stale(sessionId, expectedQueueVersion)) {
-        _isInitialLoad = false;
+      if (_stale(sessionId, expectedQueueVersion, generation)) {
+        _settleSuperseded(initial: generation == _initialGeneration);
         return;
       }
       _tracks = tracks;
@@ -238,7 +282,12 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       _notify();
     } catch (error) {
       if (_disposed) return;
+      if (generation != _loadGeneration) {
+        _settleSuperseded(initial: generation == _initialGeneration);
+        return;
+      }
       _error = error;
+      _errorPage = null;
       _failedInitialLoad =
           (sessionId, expectedQueueVersion, currentPlayPosition, totalCount);
       _isInitialLoad = false;
@@ -264,6 +313,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       );
       return null;
     }
+    final generation = _viewportGeneration = ++_loadGeneration;
     _isViewportReload = true;
     _error = null;
     _notify();
@@ -272,8 +322,8 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     final desiredLimit = totalCount < _tracks.length ? totalCount : _tracks.length;
     try {
       final anchorEntry = await _repo.getPlaybackEntryForItem(sessionId, anchorItemId);
-      if (_stale(sessionId, expectedQueueVersion)) {
-        _isViewportReload = false;
+      if (_stale(sessionId, expectedQueueVersion, generation)) {
+        _settleSuperseded(viewport: generation == _viewportGeneration);
         return null;
       }
       final maxStart = totalCount > desiredLimit ? totalCount - desiredLimit : 0;
@@ -287,8 +337,8 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
               startPlayPosition: start,
               limit: desiredLimit,
             );
-      if (_stale(sessionId, expectedQueueVersion)) {
-        _isViewportReload = false;
+      if (_stale(sessionId, expectedQueueVersion, generation)) {
+        _settleSuperseded(viewport: generation == _viewportGeneration);
         return null;
       }
       _tracks = tracks;
@@ -303,7 +353,12 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       return newIndex == -1 ? null : newIndex;
     } catch (error) {
       if (_disposed) return null;
+      if (generation != _loadGeneration) {
+        _settleSuperseded(viewport: generation == _viewportGeneration);
+        return null;
+      }
       _error = error;
+      _errorPage = null;
       _isViewportReload = false;
       _notify();
       return null;
@@ -316,6 +371,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     final sessionId = _sessionId;
     if (sessionId == null) return 0;
     final expectedQueueVersion = _queueVersion;
+    final generation = _loadGeneration;
     final fetchStart = (_startPlayPosition - pageSize).clamp(0, _startPlayPosition);
     final limit = _startPlayPosition - fetchStart;
     if (limit <= 0) {
@@ -331,7 +387,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
         startPlayPosition: fetchStart,
         limit: limit,
       );
-      if (_stale(sessionId, expectedQueueVersion)) {
+      if (_stale(sessionId, expectedQueueVersion, generation)) {
         _isLoadingBefore = false;
         return 0;
       }
@@ -340,12 +396,15 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       _hasMoreBefore = fetchStart > 0;
       _hasMoreAfter = _startPlayPosition + _tracks.length < totalCount;
       _isLoadingBefore = false;
+      _clearPageError();
       _notify();
       return tracks.length;
     } catch (error) {
       if (_disposed) return 0;
-      _error = error;
       _isLoadingBefore = false;
+      if (generation != _loadGeneration) return 0; // superseded
+      _error = error;
+      _errorPage = QueuePage.before;
       _notify();
       return 0;
     }
@@ -357,6 +416,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
     final sessionId = _sessionId;
     if (sessionId == null) return;
     final expectedQueueVersion = _queueVersion;
+    final generation = _loadGeneration;
     final fetchStart = _startPlayPosition + _tracks.length;
     final remaining = totalCount - fetchStart;
     if (remaining <= 0) {
@@ -373,7 +433,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
         startPlayPosition: fetchStart,
         limit: limit,
       );
-      if (_stale(sessionId, expectedQueueVersion)) {
+      if (_stale(sessionId, expectedQueueVersion, generation)) {
         _isLoadingAfter = false;
         return;
       }
@@ -381,11 +441,14 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       _hasMoreBefore = _startPlayPosition > 0;
       _hasMoreAfter = _startPlayPosition + _tracks.length < totalCount;
       _isLoadingAfter = false;
+      _clearPageError();
       _notify();
     } catch (error) {
       if (_disposed) return;
-      _error = error;
       _isLoadingAfter = false;
+      if (generation != _loadGeneration) return; // superseded
+      _error = error;
+      _errorPage = QueuePage.after;
       _notify();
     }
   }

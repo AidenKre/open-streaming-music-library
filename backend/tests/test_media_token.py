@@ -7,29 +7,17 @@ with every other method, an API token is not accepted in its place, and it is
 revoked with its session.
 """
 
+import re
+
 import pytest
-from fastapi.routing import APIRoute
 
 from app.auth.sessions import hash_token, revoke_session_hash
 from app.library import Library
-from app.models import Track, TrackMetaData
+from tests.auth_helpers import flac_track
 from tests.conftest import log_in
 from tests.owned_database import add_test_user
 
 OTHER_METHODS = ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
-
-
-def _track(source, title):
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes(b"not really flac")
-    return Track(
-        file_path=source,
-        metadata=TrackMetaData(
-            title=title, artist="Radiohead", album="OK Computer", codec="flac",
-            duration=1.0, bitrate_kbps=900.0, sample_rate_hz=44100, channels=2,
-            track_number=1, disc_number=1,
-        ),
-    )
 
 
 @pytest.fixture
@@ -37,7 +25,7 @@ def media(app_client, tmp_path):
     """The admin's tokens and own track, on a client that sends no header."""
     tokens = log_in(app_client)
     app_client.headers.pop("Authorization")
-    track = _track(tmp_path / "music" / "admin" / "Airbag.flac", "Airbag")
+    track = flac_track(tmp_path / "music" / "admin" / "Airbag.flac", "Airbag")
     assert app_client.app.state.admin_library.add_track(track)
     return app_client, tokens, track
 
@@ -50,12 +38,19 @@ def _stream(client, uuid_id, token, method="GET"):
     )
 
 
-def _concrete(path: str) -> str:
-    return (
-        path.replace("{uuid_id}", "00000000-0000-4000-8000-000000000000")
-        .replace("{cover_art_id}", "1")
-        .replace("{job_id}", "1")
-    )
+ANY_UUID = "00000000-0000-4000-8000-000000000000"
+
+
+def _concrete(path: str, uuid_value: str = ANY_UUID) -> str:
+    """The route path with every ``{name}`` or ``{name:convertor}`` filled in:
+    a uuid for a ``uuid`` convertor or a name ending in ``uuid``/``uuid_id``,
+    otherwise ``1``."""
+
+    def value(match):
+        name, convertor = match.group(1), match.group(2)
+        return uuid_value if convertor == "uuid" or name.endswith(("uuid", "uuid_id")) else "1"
+
+    return re.sub(r"\{(\w+)(?::(\w+))?\}", value, path)
 
 
 def test_the_media_token_streams_the_callers_track(media):
@@ -70,7 +65,7 @@ def test_the_media_token_streams_the_callers_track(media):
 def test_the_media_token_authenticates_as_its_user(media, tmp_path):
     client, tokens, _ = media
     db = client.app.state.database
-    theirs = _track(tmp_path / "music" / "sam" / "Lucky.flac", "Lucky")
+    theirs = flac_track(tmp_path / "music" / "sam" / "Lucky.flac", "Lucky")
     assert Library(db, add_test_user(db, "sam")).add_track(theirs)
 
     # Authenticated (not 401), and as the admin: another user's track is absent.
@@ -95,13 +90,16 @@ def test_every_other_route_and_method_refuses_the_media_token(media):
     for route in routes:
         if route.path in PUBLIC:
             continue
-        path = _concrete(route.path).replace(
-            "00000000-0000-4000-8000-000000000000", track.uuid_id
-        )
+        path = _concrete(route.path, track.uuid_id)
+        # U02-B-01: every probe reaches the route it was made for, so the
+        # refusal it sees comes from the token rule, not from a missing route.
+        assert route.path_regex.match(path), (route.path, path)
         # Media routes (7A.2c adds the upload preview): only their other methods.
         methods = OTHER_METHODS if route.name in MEDIA_ROUTES else sorted(route.methods)
         probes += [(method, path) for method in methods]
     assert len(probes) > 20
+    assert {p for _, p in probes} >= {f"/tracks/{track.uuid_id}/stream",
+                                       f"/tracks/uploads/items/{track.uuid_id}/preview"}
 
     accepted = {
         (method, path): status

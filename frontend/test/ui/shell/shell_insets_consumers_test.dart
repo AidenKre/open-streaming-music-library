@@ -17,6 +17,7 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 
 import '../browse_harness.dart';
 import '../fake_session_controls.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// 4B.1 (phase-4 §8): every surface inside the shell pads its end by the
 /// MEASURED bottom chrome, so its last item is reachable above the glass.

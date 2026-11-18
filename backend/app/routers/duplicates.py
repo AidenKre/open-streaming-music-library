@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import ValidationError
 from fastapi import APIRouter, Depends, Query, Request
 
+from app.core.api_errors import answer_errors
 from app.core.bounded_body import bounded_body, validation_error_422
 from app.library import Library, current_library
 from app.models.duplicates import DuplicatePairPage, DuplicateSummaryOut, PairRequest, PairStatusOut
@@ -35,10 +36,8 @@ def _set_status(library: Library, raw: bytes, status: str) -> PairStatusOut:
         body = PairRequest.model_validate_json(raw)
     except ValidationError as exc:
         raise validation_error_422(exc) from exc
-    try:
+    with answer_errors(DeletionError):
         return duplicate_rules.set_status(library, body, status)
-    except DeletionError as exc:
-        raise exc.to_http() from exc
 
 
 @router.post("/dismiss", response_model=PairStatusOut)

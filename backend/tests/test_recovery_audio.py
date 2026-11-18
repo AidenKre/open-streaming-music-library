@@ -26,11 +26,10 @@ from pathlib import Path
 import pytest
 
 from app.database import ANY_OWNER
-from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services import audio_identity
 from app.services import metadata as metadata_mod
-from app.services.ffmpeg_runner import CaptureOverflow, CaptureResult, CaptureTimeout
+from app.services.ffmpeg_runner import CaptureOverflow, CaptureResult, CaptureTimeout, run_capture
 from app.services import organizer
 from app.services.audio_identity import ExactAudioHash, ExactUnavailable
 from app.services.metadata import ProbeUnavailable, probe_unavailable_raises
@@ -47,7 +46,8 @@ from app.services.recovery_audio import (
     leftover_verdict,
     read_audio,
 )
-from tests.test_track_editor import _add_track, _db
+from tests.track_editor_fixtures import _add_track, _db
+from tests.tool_call_capture import tool_call
 
 META = TrackMetaData(codec="aac", duration=1.0, bitrate_kbps=192.0, sample_rate_hz=44100,
                      channels=2, title="T")
@@ -149,8 +149,8 @@ def test_a_probe_that_times_out_reads_as_unknown_never_refused(tmp_path, monkeyp
     path.write_bytes(b"x")
     seen = {}
 
-    def slow(cmd, *args, timeout_s, **kwargs):
-        seen["timeout"] = timeout_s
+    def slow(cmd, **kwargs):
+        seen["timeout"] = timeout_s = tool_call(run_capture, cmd, **kwargs)["timeout_s"]
         raise CaptureTimeout(f"ffprobe timed out after {timeout_s}s")
 
     monkeypatch.setattr(metadata_mod, "run_capture", slow)
@@ -184,8 +184,8 @@ def test_the_probe_timeout_is_bounded():
 def _capture_run(monkeypatch):
     seen = {}
 
-    def fake(cmd, *args, **kwargs):
-        seen.update(kwargs)
+    def fake(cmd, **kwargs):
+        seen.update(tool_call(run_capture, cmd, **kwargs))
         return CaptureResult(returncode=0, stdout=b"{}", stderr="")
 
     monkeypatch.setattr(metadata_mod, "run_capture", fake)
@@ -202,7 +202,8 @@ def test_other_callers_get_the_shared_probe_bound(tmp_path, monkeypatch):
 
 
 def test_a_timed_out_probe_answers_none_or_raises_unavailable_when_asked(tmp_path, monkeypatch):
-    def slow(cmd, *args, timeout_s, **kwargs):
+    def slow(cmd, **kwargs):
+        timeout_s = tool_call(run_capture, cmd, **kwargs)["timeout_s"]
         raise CaptureTimeout(f"ffprobe timed out after {timeout_s}s")
 
     monkeypatch.setattr(metadata_mod, "run_capture", slow)
@@ -329,7 +330,8 @@ def test_a_killed_or_garbled_probe_reads_as_unknown_never_refused(tmp_path, monk
     path = tmp_path / "a.m4a"
     path.write_bytes(b"x")
 
-    def fake(cmd, *args, **kwargs):
+    def fake(cmd, **kwargs):
+        tool_call(run_capture, cmd, **kwargs)
         return CaptureResult(returncode=returncode, stdout=stdout.encode(), stderr="")
 
     monkeypatch.setattr(metadata_mod, "run_capture", fake)
@@ -346,7 +348,8 @@ def test_a_probe_whose_answer_overflows_its_bound_reads_as_unknown_never_refused
     path = tmp_path / "a.m4a"
     path.write_bytes(b"x")
 
-    def flood(cmd, *args, max_stdout_bytes, **kwargs):
+    def flood(cmd, **kwargs):
+        max_stdout_bytes = tool_call(run_capture, cmd, **kwargs)["max_stdout_bytes"]
         raise CaptureOverflow(f"ffprobe stdout exceeded {max_stdout_bytes} bytes")
 
     monkeypatch.setattr(metadata_mod, "run_capture", flood)

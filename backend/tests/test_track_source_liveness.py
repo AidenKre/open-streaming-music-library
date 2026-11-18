@@ -3,24 +3,11 @@
 live" (a pending deletion) apart from live, tombstoned, unknown and foreign
 tracks, through ``live_tracks`` alone."""
 
-import pytest
-
-from app.database import DatabaseContext
 from app.library import Library
 from app.models import Track, TrackMetaData
 from app.services.deletion_errors import TRACK_PENDING_DELETION, track_pending_deletion_error
-from tests.owned_database import OwnedTestDatabase, add_test_user
+from tests.owned_database import add_test_user
 from tests.pending_deletion import clear_pending_deletion, mark_pending_deletion
-from tests.schema_fixtures import INIT_SQL
-
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 def _add(db, title, *, owner_id=None):

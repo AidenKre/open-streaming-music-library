@@ -16,16 +16,19 @@ from app.models.track_meta_data import TrackMetaData
 from app.services.settle_check import make_settle_refresh
 from app.services.track_locks import TrackLocks
 from tests.owned_database import add_test_user
-from tests.test_identity_editor import DIGEST, SpyWakeup, _identity, _settle
-from tests.test_track_editor import _add_track, _db
+from tests.identity_editor_fixtures import SpyWakeup, _identity, _settle
+from tests.track_editor_fixtures import _add_track, _db
 
 WHOLE = TrackMetaData(title="Lucky", artist="Radiohead", codec="flac", duration=4.0,
                       bitrate_kbps=900.0, sample_rate_hz=44100, channels=2)
 
 
 def _settle_marked(row, fp_state="pending"):
-    return (row["generation"], row["exact_state"], row["exact_digest"], row["fp_state"],
-            row["match_state"], row["priority"]) == (4, "pending", DIGEST, fp_state, "pending", 0)
+    # Pre-merge A3-01: the file changed, so the old digest is cleared (unknown
+    # until the worker hashes it again), never left to match as an exact copy.
+    return (row["generation"], row["exact_state"], row["exact_kind"], row["exact_digest"],
+            row["fp_state"], row["match_state"], row["priority"]) \
+        == (4, "pending", None, None, fp_state, "pending", 0)
 
 
 def _world(tmp_path):

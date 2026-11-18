@@ -17,12 +17,13 @@ with a live lease"; 7-U07): the expiry janitor, driven by an injected clock.
   (the publisher may still be finishing a fresh one)."""
 
 import os
+from pathlib import Path
 
 import pytest
 
 from app.services.upload_janitor import UploadJanitor
 from app.services.upload_receipt import ReceiptFiles
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_commit_fixtures import reservations
 from tests.upload_recovery_fixtures import World
@@ -33,11 +34,6 @@ NOW = 2_000_000_000  # after the wall clock: a janitor reading time.time() fails
 EXPIRY = 7 * DAY
 OLD = NOW - EXPIRY  # exactly seven days: expired
 YOUNG = NOW - EXPIRY + 1
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -151,6 +147,21 @@ def test_an_ended_item_still_recording_its_source_gives_it_back(db, music, state
     assert sources(db, staged) == []
 
 
+def test_an_expanded_archive_still_recording_its_source_gives_it_back(db, music):
+    """Pre-merge A4-05: an archive whose removal failed after its expansion is
+    removed and stops counting while the server runs, not only at the next start."""
+    staged = staged_in(db, music, "expanded", progress_at=NOW)
+    assert sources(db, staged) == ["upload_source"]
+
+    janitor(db, music).run_once()
+
+    row = item_row(db, staged)
+    assert row["state"] == "expanded"
+    assert row["source_path"] is None
+    assert not staged["source"].exists()
+    assert sources(db, staged) == []
+
+
 def test_a_source_that_cannot_be_removed_stays_recorded_and_counted(db, music, monkeypatch):
     staged = stage_item(db, music / ".uploads", state="review_ready", progress_at=OLD)
     monkeypatch.setattr(ReceiptFiles, "remove", lambda self, path: (_ for _ in ()).throw(OSError("busy")))
@@ -166,6 +177,28 @@ def test_a_source_that_cannot_be_removed_stays_recorded_and_counted(db, music, m
     janitor(db, music).run_once()
 
     assert_expired_and_gone(db, staged)
+
+
+def test_a_part_that_cannot_be_removed_stays_recorded_while_the_source_still_goes(db, music, monkeypatch):
+    staged = staged_in(db, music, "cancelled", progress_at=NOW)
+    part = staged["source"].parent / "leftover.part"
+    part.write_bytes(b"part")
+    sql(db, "UPDATE upload_items SET part_path = ? WHERE item_uuid = ?", (str(part), staged["item_uuid"]))
+    real = ReceiptFiles.remove
+
+    def refuse_part(self, path):
+        if Path(path) == part:
+            raise OSError("busy")
+        return real(self, path)
+
+    monkeypatch.setattr(ReceiptFiles, "remove", refuse_part)
+
+    janitor(db, music).run_once()
+
+    row = item_row(db, staged)
+    assert row["part_path"] == str(part) and part.exists()
+    assert row["source_path"] is None and not staged["source"].exists()
+    assert sources(db, staged) == []
 
 
 def test_a_recorded_path_outside_the_owners_stage_is_never_removed(db, music):

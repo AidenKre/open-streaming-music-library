@@ -166,8 +166,8 @@ class DownloadQueue extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Cancels a queued job. In-flight downloads keep running — cancelling
-  /// mid-stream is intentionally not supported in v1.
+  /// Cancels a queued job. A download in progress is cancelled through the
+  /// worker pool (`WorkerPool.cancelActive`).
   void cancelQueued(String uuidId) {
     if (_disposed) return;
     final idx = _state.jobs.indexWhere((j) => j.uuidId == uuidId);

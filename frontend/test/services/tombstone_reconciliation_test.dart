@@ -89,7 +89,6 @@ void main() {
       db: db,
       api: TracksApi(api: api),
       queueRepository: QueueRepository(db),
-      prefs: await SharedPreferences.getInstance(),
       bindingToken: token,
       ownedFileCleanup: OwnedFileCleanup(
         db: db,
@@ -121,6 +120,9 @@ void main() {
       for (final u in ['u1', 'u2', 'u3', 'u4']) {
         await seed.track(u, artistId: 1, albumId: 1);
       }
+      // The sync updates the search index per track (PM-APP-SEARCH): index
+      // the seeded rows, as every app write path does.
+      await db.rebuildFtsIndexes();
     });
 
     test('pending and conflicted edits become rejected with the visible '
@@ -176,6 +178,9 @@ void main() {
       for (final u in ['t1', 't2']) {
         await seed.track(u, artistId: 1, albumId: 1);
       }
+      // The sync updates the search index per track (PM-APP-SEARCH): index
+      // the seeded rows, as every app write path does.
+      await db.rebuildFtsIndexes();
     });
 
     test('the tombstone keeps every history event and the listen draft of '

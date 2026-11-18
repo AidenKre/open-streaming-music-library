@@ -19,14 +19,15 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 import '../helpers/server_binding.dart';
 import 'catalog_seed.dart';
 
-/// `type:id:label:art:downloaded/total` per card: what a card shows.
+/// `type:id:label:art` per card, plus a track's download state as `1/1`
+/// (downloaded) or `0/1`: what a card shows.
 String _card(ResolvedRecent r) => switch (r.entity) {
-  TrackUI(:final uuidId, :final title, :final coverArtId) =>
-    'track:$uuidId:$title:$coverArtId:${r.downloaded}/${r.total}',
+  TrackUI(:final uuidId, :final title, :final coverArtId, :final isDownloaded) =>
+    'track:$uuidId:$title:$coverArtId:${isDownloaded ? 1 : 0}/1',
   AlbumUI(:final id, :final name, :final coverArtId) =>
-    'album:$id:$name:$coverArtId:${r.downloaded}/${r.total}',
+    'album:$id:$name:$coverArtId',
   ArtistUI(:final id, :final name, :final coverArtId) =>
-    'artist:$id:$name:$coverArtId:${r.downloaded}/${r.total}',
+    'artist:$id:$name:$coverArtId',
   _ => 'unexpected',
 };
 
@@ -94,7 +95,7 @@ void main() {
 
   tearDown(() => db.close());
 
-  const initial = ['album:1:One:5:0/2', 'track:a:Song A:5:0/1'];
+  const initial = ['album:1:One:5', 'track:a:Song A:5:0/1'];
 
   test('emits the current recents, then a new click', () async {
     final rec = _Recorder(repo.watchRecent());
@@ -115,8 +116,8 @@ void main() {
     await (db.update(db.tracks)..where((t) => t.uuidId.equals('a'))).write(
       const TracksCompanion(filePath: Value('/local/a.flac')),
     );
-    await all.until(['album:1:One:5:1/2', 'track:a:Song A:5:1/1']);
-    await local.until(['album:1:One:5:1/2', 'track:a:Song A:5:1/1']);
+    await all.until(['album:1:One:5', 'track:a:Song A:5:1/1']);
+    await local.until(['album:1:One:5', 'track:a:Song A:5:1/1']);
 
     // The shared clear path used by delete/reset.
     await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
@@ -135,17 +136,17 @@ void main() {
     // (sync does this for real catalogs).
     await db.rebuildFtsIndexes();
     await db.applyOptimisticTrackEdit('a', {'title': 'Renamed'});
-    await rec.until(['album:1:One:5:0/2', 'track:a:Renamed:5:0/1']);
+    await rec.until(['album:1:One:5', 'track:a:Renamed:5:0/1']);
     await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('a')))
         .write(const TrackmetadataCompanion(coverArtId: Value(9)));
-    await rec.until(['album:1:One:9:0/2', 'track:a:Renamed:9:0/1']);
+    await rec.until(['album:1:One:9', 'track:a:Renamed:9:0/1']);
     await rec.cancel();
   });
 
   test('album and artist rows (albums, artists) re-emit', () async {
     await seed.click('artist', 'srv-1:1', at: 100);
     final rec = _Recorder(repo.watchRecent());
-    await rec.until([...initial, 'artist:1:Aria:5:0/2']);
+    await rec.until([...initial, 'artist:1:Aria:5']);
     await (db.update(db.albums)..where((a) => a.id.equals(1))).write(
       const AlbumsCompanion(name: Value('Uno')),
     );
@@ -153,14 +154,14 @@ void main() {
       const ArtistsCompanion(name: Value('Arya')),
     );
     await rec.until([
-      'album:1:Uno:5:0/2',
+      'album:1:Uno:5',
       'track:a:Song A:5:0/1',
-      'artist:1:Arya:5:0/2',
+      'artist:1:Arya:5',
     ]);
     await rec.cancel();
   });
 
-  test('a deleted member track disappears and the album counts shrink',
+  test('a deleted member track disappears and the album card updates',
       () async {
     final rec = _Recorder(repo.watchRecent());
     await rec.until(initial);
@@ -169,7 +170,7 @@ void main() {
           .go();
       await (db.delete(db.tracks)..where((t) => t.uuidId.equals('a'))).go();
     });
-    await rec.until(['album:1:One:null:0/1']);
+    await rec.until(['album:1:One:null']);
     await rec.cancel();
   });
 
@@ -187,7 +188,7 @@ void main() {
 
   test('a burst of writes settles on the latest state', () async {
     final rec = _Recorder(repo.watchRecent(limit: 1));
-    await rec.until(['album:1:One:5:0/2']);
+    await rec.until(['album:1:One:5']);
     for (var i = 0; i < 10; i++) {
       unawaited(seed.click('track', i.isEven ? 'a' : 'b', at: 1000 + i));
     }

@@ -2,8 +2,8 @@
 // content, commit and resolve-duplicate all go through the shared
 // DurableSubmission helper"; §4 commit / resolve-duplicate; SC-14: a new
 // operation id only for a deliberately changed request, e.g. a new review
-// version). The server routes are not built yet: the transport is an
-// interface whose default says "not available"; the manager freezes the
+// version). The transport is an interface (the HTTP transport by default,
+// a fake in these tests); the manager freezes the
 // request with one operation id per review version, sends it through the
 // runner, and resolves a lost answer by the item's status first.
 import 'dart:convert';
@@ -178,11 +178,31 @@ void main() {
     expect(sub['kind'], 'upload_resolve_duplicate');
   });
 
-  test('the default transport says the route is not available yet', () {
+  // Refactor APP-UPLOAD (B.9): the "route unavailable" default is gone;
+  // without a transport the manager sends through the uploads API.
+  test('without a transport given, a review action goes to the uploads API',
+      () async {
+    final plain = await UploadHarness.create();
+    addTearDown(plain.dispose);
+    plain.feature = h.feature;
+    await plain.verify();
+    await plain.manager.addFiles([await plain.file('a.flac', 'abc')]);
+    await plain.pump();
+    plain.api.openPuts.single.complete(state: 'review_ready');
+    await plain.pump();
+
+    await plain.manager.submitReviewAction(
+      'u-2',
+      ReviewActionKind.commit,
+      reviewVersion: 1,
+      body: {'base_review_version': 1, 'edits': {}, 'write_tags': false},
+    );
+    await plain.pump();
+
+    expect(plain.api.calls, contains('commit u-2'));
     expect(
-      () => const UnavailableUploadReviewTransport()
-          .send(ReviewActionKind.commit, 'u-2', '{}'),
-      throwsA(isA<UploadReviewRouteUnavailable>()),
+      (await plain.states())['u-2'],
+      'committing',
     );
   });
 }

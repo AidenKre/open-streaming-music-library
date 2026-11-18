@@ -17,12 +17,7 @@ import pytest
 
 from app.services.audio_identity import ExactUnavailable
 from tests.identity_worker_fakes import FakeClock, FakeCompute, FakeFingerprinter, bytes_digest, make_worker
-from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, make_db, sql
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
+from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, sql
 
 
 @pytest.fixture

@@ -4,6 +4,10 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The settings file, relative to the working directory: Settings reads it, and
+# start-up warns when it is readable by group or others.
+ENV_FILE = ".env"
+
 
 class Settings(BaseSettings):
     # Project directories
@@ -12,23 +16,18 @@ class Settings(BaseSettings):
     music_library_dir: Path = Path("./music")
     app_data_dir: Path = Path("./data")
 
-    # Server settings
-    debug: bool = True
-    host: str = "0.0.0.0"
-    port: int = 8000
-
     # Feature flags
     enable_file_watcher: bool = True
-    enable_upload_commit_worker: bool = True  # prepares accepted upload commits (7A.3a); off leaves them committing
-    enable_upload_validation_worker: bool = True  # probes and duplicate-checks received uploads (7A.2c); off leaves them validating
-    enable_upload_janitor: bool = True  # periodically expires and cleans staged uploads (7A.3c); off leaves them until the next start
+    enable_upload_commit_worker: bool = True  # prepares accepted upload commits; off leaves them committing
+    enable_upload_validation_worker: bool = True  # probes and duplicate-checks received uploads; off leaves them validating
+    enable_upload_janitor: bool = True  # periodically expires and cleans staged uploads; off leaves them until the next start
     upload_janitor_interval_s: int = Field(3600, ge=1)  # seconds between periodic janitor passes
     upload_stage_expiry_s: int = Field(7 * 86400, ge=1)  # an unconfirmed staged item expires after this long without progress
     upload_retention_s: int = Field(30 * 86400, ge=1)  # ended batch and item records are pruned after this long
-    library_delete_enabled: bool = False  # operator switch for server-side library delete (8A); off hides it and refuses it
-    enable_deletion_worker: bool = True  # executes accepted server deletion jobs (8A.3c); off leaves them pending until a start with it on
+    library_delete_enabled: bool = False  # operator switch for server-side library delete; off hides it and refuses it
+    enable_deletion_worker: bool = True  # executes accepted server deletion jobs; off leaves them pending until a start with it on
     deletion_janitor_interval_s: int = Field(3600, ge=1)  # seconds between the deletion worker's retries of pending committed clean-ups
-    enable_identity_worker: bool = True  # background audio-identity scan (6.5); off stops identity backfill and recompute
+    enable_identity_worker: bool = True  # background audio-identity scan; off stops identity backfill and recompute
     enable_lastfm_sender: bool = True  # test seam, not an operator setting (off silently queues listens without sending); left out of the operator guide
 
     # Encoded tracks cache (used for transcoded streams)
@@ -72,14 +71,13 @@ class Settings(BaseSettings):
     fpcalc_path: Path | None = None
     fpcalc_timeout_s: float = Field(60.0, gt=0)
 
-    # Fingerprint matcher (Phase 6.5). Counts are fingerprint items, not
+    # Fingerprint matcher. Counts are fingerprint items, not
     # seconds: fpcalc 1.6.2 gives about 8.08 items per second, less a fixed
     # edge loss of about 21 items (221 items for 30 s, 948 for 120 s), so 120 items
     # ~ 17 s and 24 items ~ 3.0 s. fp_max_offset is searched both around 0 and
     # around the offset the two durations imply.
     # Thresholds and window were validated on 2026-11-17 on 1,111 compared
-    # tracks of one Creative Commons catalogue (MTG-Jamendo, mono ~100 kbps MP3;
-    # the project's report fingerprint-validation-jamendo.md, kept outside git).
+    # tracks of one Creative Commons catalogue (MTG-Jamendo, mono ~100 kbps MP3).
     # No unrelated pair scored above 0.591, 0.11 below 0.70. That is a zero
     # count: its 95 % bound still allows about 1 false pair per 1,000 tracks in a
     # 10,000-track library. Known cost of 0.70: about 1 vocal/instrumental pair
@@ -106,7 +104,7 @@ class Settings(BaseSettings):
     fp_duration_tolerance_s: float = Field(7.0, ge=0)
     fp_duration_tolerance_frac: float = Field(0.02, ge=0)
 
-    # Upload limits (spec §3). Advertised and enforced only through
+    # Upload limits. Advertised and enforced only through
     # services/upload_limits.effective_upload_limits, which applies the caps.
     # They apply to uploads only, except upload_max_compression_ratio, which is
     # also the bomb guard of archives in import folders (import_archive).
@@ -126,14 +124,14 @@ class Settings(BaseSettings):
     import_archive_max_entries: int = Field(100_000, ge=1)
     upload_max_receives: int = Field(2, ge=1)
     upload_staged_quota_bytes: int = Field(10 * 1024**3, ge=1)
-    # O4 / DEV-7-02 per-user fairness.
+    # Per-user fairness: one user's share of the receive and staging limits.
     upload_max_receives_per_user: int = Field(1, ge=1)
     upload_user_staged_quota_bytes: int = Field(5 * 1024**3, ge=1)
     # Server-internal free-disk floor for the storage ledger; not advertised.
     storage_free_space_floor_bytes: int = Field(256 * 1024**2, ge=0)
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", validate_default=True
+        env_file=ENV_FILE, env_file_encoding="utf-8", validate_default=True
     )
 
     @model_validator(mode="after")

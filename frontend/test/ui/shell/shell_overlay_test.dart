@@ -12,12 +12,11 @@ import 'package:frontend/ui/shell/app_shell.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/widgets/offline_banner.dart';
-import 'package:frontend/ui/widgets/pending_edits_banner.dart';
 import 'package:frontend/ui/widgets/server_blocked_banner.dart';
-import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
 
 import '../browse_harness.dart';
 import '../fake_session_controls.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// 4B.1 (phase-4 §8): a full-height shell body with overlay chrome whose
 /// MEASURED size every nested surface gets as insets.
@@ -145,32 +144,6 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byKey(AppShell.bottomStackKey), findsOneWidget);
     expect(homeInsets(tester).bottom, greaterThan(0));
-    await teardownTree(tester);
-  });
-
-  testWidgets('bottom stack order: pending, stale, offline, player, tabs', (
-    tester,
-  ) async {
-    await pumpShell(tester);
-    h.offline.set(true);
-    final track = await tester.runAsync(
-      () => BrowseRepository(db).getTrack('d1'),
-    );
-    h.audio.showTrack(track!);
-    await tester.pumpAndSettle();
-    // 4B.1d: banners sit in their own (cappable) region now, so check the
-    // on-screen order rather than one Column's children.
-    final stack = find.byKey(AppShell.bottomStackKey);
-    double top(Type t) => tester
-        .getTopLeft(find.descendant(of: stack, matching: find.byType(t)))
-        .dy;
-    expect(
-      top(PendingEditsBanner),
-      lessThanOrEqualTo(top(StaleDownloadsBanner)),
-    );
-    expect(top(StaleDownloadsBanner), lessThanOrEqualTo(top(OfflineBanner)));
-    expect(top(OfflineBanner), lessThan(top(MiniPlayer)));
-    expect(top(MiniPlayer), lessThan(top(NavigationBar)));
     await teardownTree(tester);
   });
 

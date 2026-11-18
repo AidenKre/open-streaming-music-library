@@ -22,7 +22,6 @@ from app.services.audio_identity import (
     identity_from_columns,
 )
 from app.services.upload_validation import staged_identity_columns
-from tests.identity_worker_fixtures import make_db
 from tests.upload_commit_fixtures import (
     FakeExact,
     FakeTagWriter,
@@ -32,11 +31,6 @@ from tests.upload_commit_fixtures import (
     ready_item,
 )
 from tests.upload_validation_fixtures import exact_for, print_of
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

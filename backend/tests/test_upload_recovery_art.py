@@ -11,16 +11,11 @@ ownership. Art a track already uses is never adopted, so it survives."""
 
 import pytest
 
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import journal
 from tests.upload_publish_fixtures import library_track
 from tests.upload_recovery_fixtures import World, art_ids
 from tests.upload_validation_fixtures import item_row
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

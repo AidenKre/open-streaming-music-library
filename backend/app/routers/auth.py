@@ -3,7 +3,12 @@ from pydantic import ValidationError
 
 from app.auth import accounts
 from app.auth.principal import Principal, auth_error, current_principal
-from app.auth.passwords import AuthBusy, WeakPassword
+from app.auth.passwords import (
+    MAX_PASSWORD_LENGTH,
+    MIN_PASSWORD_LENGTH,
+    AuthBusy,
+    WeakPassword,
+)
 from app.auth.sessions import revoke_session_hash
 from app.auth.signup_policy import SignupDisabled, UserLimitReached
 from app.core.api_errors import api_error
@@ -17,7 +22,12 @@ router = APIRouter(prefix="/auth")
 # exception -> (status, code, message, retryable); messages are fixed text.
 _REFUSALS = {
     accounts.InvalidUsername: (422, "invalid_username", "That username is not allowed.", False),
-    WeakPassword: (422, "weak_password", "The password must be 8-1024 characters.", False),
+    WeakPassword: (
+        422,
+        "weak_password",
+        f"The password must be {MIN_PASSWORD_LENGTH}-{MAX_PASSWORD_LENGTH} characters.",
+        False,
+    ),
     UsernameTaken: (409, "username_taken", "That username is already taken.", False),
     SignupDisabled: (403, "signup_disabled", "Signup is disabled.", False),
     UserLimitReached: (403, "user_limit_reached", "The user limit has been reached.", False),

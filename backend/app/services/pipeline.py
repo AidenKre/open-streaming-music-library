@@ -7,7 +7,7 @@ from typing import Callable
 from app.database import ANY_OWNER
 from app.library import Library, library_root
 from app.services import audio_identity
-from app.services.ffmpeg_runner import FfmpegProcessRegistry
+from app.services.ffmpeg_runner import FfmpegProcessRegistry, ToolOptions
 from app.services.import_archive import ArchiveUnpacker, ImportArchiveLimits, default_limits
 from app.services.ingestion import Ingestor, IngestorContext
 from app.services.organizer import Organizer, OrganizerContext
@@ -52,7 +52,7 @@ def make_pipeline(
         job_id = object()  # unique per call: concurrent ingests never share a kill flag
         try:
             return audio_identity.compute_identity(
-                path, codec_hint, registry=identity_registry, job_id=job_id
+                path, codec_hint, options=ToolOptions(registry=identity_registry, job_id=job_id)
             )
         finally:
             if identity_registry is not None:

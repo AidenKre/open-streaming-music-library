@@ -8,9 +8,11 @@ Every value is made up (``tests/lastfm_secrets.py``)."""
 import json
 import sqlite3
 import uuid
+from concurrent.futures import Future
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
+from app.models import Track, TrackMetaData
 from app.services.lastfm_client import LastfmClient
 from app.services.lastfm_crypto import encrypt
 from app.services.lastfm_gate import LastfmGate
@@ -58,7 +60,7 @@ class SenderRig:
         return ScrobbleSender(
             self.db, self.state, client=self.client, gate=gate,
             notices=NowPlayingNotices(clock=self.gate_clock),
-            settle_delay_s=SETTLE_S, now_ms=self.wall, clock=self.gate_clock,
+            settle_delay_s=SETTLE_S, now_ms=self.wall,
         )
 
 
@@ -74,7 +76,7 @@ def make_rig(tmp_path, *, settle_delay_s: int = SETTLE_S, db=None) -> SenderRig:
     sender = ScrobbleSender(
         db, state, client=client, gate=gate,
         notices=NowPlayingNotices(clock=gate_clock),  # 9D.2c: a notice's age is on the gate's clock
-        settle_delay_s=settle_delay_s, now_ms=wall, clock=gate_clock,
+        settle_delay_s=settle_delay_s, now_ms=wall,
     )
     return SenderRig(db, state, fake, gate_clock, wall, client, gate, sender)
 
@@ -210,3 +212,89 @@ def sent(rig: SenderRig) -> list[Sent]:
         fields = [by_index[i] for i in sorted(by_index)]
         out.append(Sent(form["method"], form.get("sk"), [int(f["timestamp"]) for f in fields if "timestamp" in f], fields))
     return out
+
+
+# --- shared by the Now Playing and sender app tests --------------------------------------
+
+
+def add_track(rig, tmp_path, owner, *, duration=284.2, **tags) -> str:
+    """A live track of ``owner`` with exactly these four tags (default: a real song)."""
+    folder = tmp_path / f"music-{owner}"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{uuid.uuid4().hex}.flac"
+    path.write_bytes(b"not really flac")
+    track = Track(
+        file_path=path,
+        metadata=TrackMetaData(codec="flac", duration=284.0, bitrate_kbps=900.0,
+                               sample_rate_hz=44100, channels=2, title="Airbag", artist="Radiohead"),
+    )
+    assert rig.db.add_track(track, owner_id=owner)
+    values = {"title": "Airbag", "artist": "Radiohead", "album": "OK Computer", "album_artist": None}
+    values.update(tags)
+    conn = sqlite3.connect(rig.db.context.database_path)
+    try:
+        conn.execute(
+            "UPDATE trackmetadata SET title = ?, artist = ?, album = ?, album_artist = ?, duration = ?"
+            " WHERE uuid_id = ?",
+            (values["title"], values["artist"], values["album"], values["album_artist"], duration,
+             track.uuid_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return track.uuid_id
+
+
+def method(rig, index=-1) -> str:
+    return dict(rig.fake.form(index))["method"]
+
+
+def sk(rig, index=-1) -> str:
+    return dict(rig.fake.form(index))["sk"]
+
+
+class FakeSender:
+    instances: list["FakeSender"] = []
+
+    def __init__(self, database, state, *, client, gate, notices, settle_delay_s, **kwargs):
+        self.database, self.state, self.client, self.gate = database, state, client, gate
+        self.settle_delay_s = settle_delay_s
+        self.events: list[str] = []
+        self.done: Future = Future()
+        self.alive = False
+        self.join_ends_thread = True
+        # 9-R1-11: the sender is handed the accounts' Now Playing notices and listens to them.
+        self.notices = notices
+        notices.attach(self.wake)
+        FakeSender.instances.append(self)
+
+    def start(self):
+        self.events.append("start")
+        self.alive = True
+
+    def request_stop(self):
+        self.events.append("request_stop")
+
+    def wake(self):
+        self.events.append("wake")
+
+    def join(self, timeout=None):
+        self.events.append("join while the client is " + ("closed" if self.client._client.is_closed else "open"))
+        if self.join_ends_thread:
+            self.finish()
+        return not self.alive
+
+    def finish(self):
+        self.alive = False
+        if not self.done.done():
+            self.done.set_result(None)
+
+    def stop(self, timeout=None):
+        self.request_stop()
+        return self.join(timeout)
+
+    def is_alive(self):
+        return self.alive
+
+
+SENDER_ON = {"ENABLE_LASTFM_SENDER": "true"}

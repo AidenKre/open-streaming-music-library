@@ -46,7 +46,7 @@ class ClickRecorder {
   Future<void> record(HistoryIntent intent) async {
     final event = HistoryEventPayload(
       eventUuid: _newEventUuid(),
-      kind: 'clicked',
+      kind: HistoryKind.clicked,
       entityType: intent.entityType,
       entityRef: intent.entityRef,
       occurredAt: _clock.nowUtcMs(),

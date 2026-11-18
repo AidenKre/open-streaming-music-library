@@ -21,6 +21,7 @@ import 'package:frontend/ui/listening_stats_page.dart';
 import '../browse_harness.dart';
 import '../fake_listening_stats_controls.dart';
 import 'stats_page_harness.dart' show sevenDays;
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// Catalog: artist 1 "Ann" (album 10 "One": t-a "Same", remote), artist 2
 /// "Bea" (album 20 "Two": t-b "Same", downloaded). Same titles, other uuids.

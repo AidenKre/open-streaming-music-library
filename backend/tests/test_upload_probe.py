@@ -12,13 +12,21 @@ from pathlib import Path
 
 import pytest
 
-from app.services.ffmpeg_runner import CaptureOverflow, CaptureResult, CaptureTimeout, FfmpegError
+from app.services.ffmpeg_runner import (
+    CaptureOverflow,
+    CaptureResult,
+    CaptureTimeout,
+    FfmpegError,
+    ToolOptions,
+    run_capture,
+)
 from app.services.upload_validation import (
     PROBE_TIMEOUT_S,
     ValidationFailed,
     ValidationInterrupted,
     probe_upload,
 )
+from tests.tool_call_capture import tool_call
 
 SECRET = "secret-dir-name"
 
@@ -43,7 +51,7 @@ class FakeRun:
         self.calls = []
 
     def __call__(self, cmd, **kwargs):
-        self.calls.append((cmd, kwargs))
+        self.calls.append((cmd, tool_call(run_capture, cmd, **kwargs)))
         if self.raises is not None:
             raise self.raises
         return self.result
@@ -185,7 +193,7 @@ def test_the_probe_runs_once_through_the_runner_with_a_timeout_and_bounded_outpu
     registry = object()
     run = _ok(_probe_json())
 
-    probe_upload(source, run=run, registry=registry, job_id=("upload", 7), timeout_s=3)
+    probe_upload(source, run=run, options=ToolOptions(registry=registry, job_id=("upload", 7)), timeout_s=3)
 
     [(cmd, kwargs)] = run.calls
     assert cmd[0] == "ffprobe" and cmd[-1] == str(source)
@@ -194,6 +202,16 @@ def test_the_probe_runs_once_through_the_runner_with_a_timeout_and_bounded_outpu
     assert kwargs["registry"] is registry and kwargs["job_id"] == ("upload", 7)
     assert kwargs["low_priority"] is True
     assert 0 < kwargs["max_stdout_bytes"] <= 4 * 1024 * 1024
+
+
+def test_by_default_the_probe_runs_at_low_priority_with_no_registry(tmp_path):
+    # Was pinned by the test above while it passed registry and job id only.
+    run = _ok(_probe_json())
+
+    probe_upload(_source(tmp_path), run=run)
+
+    [(_, kwargs)] = run.calls
+    assert (kwargs["low_priority"], kwargs["registry"], kwargs["job_id"]) == (True, None, None)
 
 
 def test_the_default_timeout_is_bounded():

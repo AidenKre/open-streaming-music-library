@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_validation_fixtures import FakeProbe, item_row, source_rows
 from tests.upload_zip_fixtures import (
@@ -23,11 +23,6 @@ from tests.upload_zip_fixtures import (
 B, A = b"B" * 30, bytes(range(40))
 NAMES = ("disc1/02.flac", "disc2/01.flac")
 PARTS = {"disc1", "disc2", "01.flac", "02.flac", "cover.jpg", "notes.txt"}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

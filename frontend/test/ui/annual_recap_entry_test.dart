@@ -17,7 +17,7 @@ import 'package:frontend/ui/listening_stats/listening_stats_controller.dart';
 import 'package:frontend/ui/listening_stats_page.dart';
 
 import '../helpers/fake_clock.dart';
-import 'annual_recap_page_test.dart' show FakeRecapControls;
+import '../helpers/recap_page_fixtures.dart' show FakeRecapControls;
 import 'browse_harness.dart' show teardownTree;
 import 'listening_stats/stats_page_harness.dart';
 

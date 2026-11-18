@@ -12,16 +12,14 @@ import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 
-from app.database.database import Database, DatabaseContext
 from app.models import Track, TrackMetaData
-from tests.schema_fixtures import INIT_SQL
+from tests.database_fixtures import plain_database
+from tests.sqlite_helpers import sql_rows
 
 
 @pytest.fixture
 def db(tmp_path):
-    database = Database(DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL))
-    assert database.initialize()
-    return database
+    return plain_database(tmp_path)
 
 
 def _user(db, name):
@@ -34,14 +32,6 @@ def _user(db, name):
         ).lastrowid
         conn.commit()
         return uid
-    finally:
-        conn.close()
-
-
-def _rows(db, sql, params=()):
-    conn = sqlite3.connect(db.context.database_path)
-    try:
-        return conn.execute(sql, params).fetchall()
     finally:
         conn.close()
 
@@ -67,8 +57,8 @@ def test_add_track_stores_the_owner_on_the_track_and_its_parents(db):
 
     assert db.add_track(track, owner_id=sam)
 
-    assert _rows(db, "SELECT owner_id FROM tracks WHERE uuid_id = ?", (track.uuid_id,)) == [(sam,)]
-    assert _rows(db, "SELECT name, owner_id FROM artists") == [("Radiohead", sam)]
+    assert sql_rows(db, "SELECT owner_id FROM tracks WHERE uuid_id = ?", (track.uuid_id,)) == [(sam,)]
+    assert sql_rows(db, "SELECT name, owner_id FROM artists") == [("Radiohead", sam)]
     assert db.get_track_by_uuid(track.uuid_id, owner_id=sam).owner_id == sam
 
 
@@ -79,16 +69,16 @@ def test_two_owners_get_their_own_artist_and_album(db):
     assert db.add_track(_track("Lucky", artist="RADIOHEAD"), owner_id=alex)
     assert db.add_track(_track("Karma Police"), owner_id=sam)
 
-    artists = _rows(db, "SELECT owner_id, name_lower FROM artists ORDER BY owner_id")
+    artists = sql_rows(db, "SELECT owner_id, name_lower FROM artists ORDER BY owner_id")
     assert artists == sorted([(sam, "radiohead"), (alex, "radiohead")])
-    albums = _rows(
+    albums = sql_rows(
         db,
         "SELECT ar.owner_id, al.name_lower FROM albums al "
         "JOIN artists ar ON ar.id = al.artist_id ORDER BY ar.owner_id",
     )
     assert albums == sorted([(sam, "ok computer"), (alex, "ok computer")])
     # Each track links to its own owner's parents.
-    links = _rows(
+    links = sql_rows(
         db,
         "SELECT t.owner_id, ar.owner_id FROM tracks t "
         "JOIN trackmetadata tm ON tm.uuid_id = t.uuid_id "
@@ -110,7 +100,7 @@ def test_an_edit_links_parents_of_the_tracks_own_owner(db):
         owner_id=alex,
     )
 
-    [(artist_owner, album_artist_owner)] = _rows(
+    [(artist_owner, album_artist_owner)] = sql_rows(
         db,
         "SELECT ar.owner_id, al_ar.owner_id FROM trackmetadata tm "
         "JOIN artists ar ON ar.id = tm.artist_id "
@@ -119,7 +109,7 @@ def test_an_edit_links_parents_of_the_tracks_own_owner(db):
         (alex_track.uuid_id,),
     )
     assert (artist_owner, album_artist_owner) == (alex, alex)
-    assert sorted(_rows(db, "SELECT owner_id FROM artists WHERE name_lower = 'radiohead'")) == sorted(
+    assert sorted(sql_rows(db, "SELECT owner_id FROM artists WHERE name_lower = 'radiohead'")) == sorted(
         [(sam,), (alex,)]
     )
 
@@ -131,7 +121,7 @@ def test_a_tombstone_keeps_the_deleted_tracks_owner(db):
 
     assert db.delete_track(track.uuid_id, owner_id=sam)
 
-    assert _rows(
+    assert sql_rows(
         db, "SELECT owner_id FROM track_tombstones WHERE uuid_id = ?", (track.uuid_id,)
     ) == [(sam,)]
 
@@ -163,7 +153,7 @@ def test_conversion_jobs_require_and_store_an_owner(db):
 
     job_id = db.insert_conversion_job(track.uuid_id, "aac", "m4a", 192, owner_id=sam)
 
-    assert _rows(db, "SELECT owner_id FROM conversion_jobs WHERE id = ?", (job_id,)) == [(sam,)]
+    assert sql_rows(db, "SELECT owner_id FROM conversion_jobs WHERE id = ?", (job_id,)) == [(sam,)]
     assert db.get_conversion_job(job_id, owner_id=sam)["owner_id"] == sam
     assert [j["owner_id"] for j in db.list_conversion_jobs_with_status("queued", owner_id=sam)] == [sam]
 
@@ -178,7 +168,7 @@ def test_journal_entries_require_and_store_an_owner(db):
         "inplace", track.uuid_id, old_path="/a", temp_path="/t", owner_id=sam
     )
 
-    assert _rows(db, "SELECT owner_id FROM edit_journal WHERE id = ?", (entry,)) == [(sam,)]
+    assert sql_rows(db, "SELECT owner_id FROM edit_journal WHERE id = ?", (entry,)) == [(sam,)]
     assert [e["owner_id"] for e in db.list_journal_entries(owner_id=sam)] == [sam]
 
 
@@ -193,7 +183,7 @@ def test_an_inplace_conversion_journal_row_takes_the_jobs_owner(db):
         inplace_journal=(str(track.file_path), "/staging/t.m4a"), owner_id=sam,
     )
 
-    assert _rows(db, "SELECT owner_id FROM edit_journal WHERE id = ?", (entry,)) == [(sam,)]
+    assert sql_rows(db, "SELECT owner_id FROM edit_journal WHERE id = ?", (entry,)) == [(sam,)]
 
 
 # ── history (S14) ───────────────────────────────────────────────────────────
@@ -215,7 +205,7 @@ def test_history_inserts_require_and_store_an_owner(db):
 
     db.insert_history_events([_history_event()], owner_id=sam)
 
-    assert _rows(db, "SELECT owner_id, typeof(owner_id) FROM history_events") == [(sam, "integer")]
+    assert sql_rows(db, "SELECT owner_id, typeof(owner_id) FROM history_events") == [(sam, "integer")]
 
 
 def test_history_hooks_see_the_owner_of_each_new_event(db):

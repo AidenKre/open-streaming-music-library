@@ -37,11 +37,12 @@ final _badAccountChars = RegExp(
 );
 
 /// The account name when plausible: 1-64 characters (runes) with no control, format, surrogate or separator
-/// characters; otherwise null.
+/// characters, and not `.` or `..`; otherwise null.
 String? plausibleLastfmAccountName(Object? v) {
   if (v is! String) return null;
   final n = v.runes.length;
   if (n < 1 || n > 64 || _badAccountChars.hasMatch(v)) return null;
+  if (v == '.' || v == '..') return null;
   return v;
 }
 

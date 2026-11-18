@@ -19,17 +19,11 @@ from app.database.database import Database, TrackAlreadyDeleted, TrackNotFound
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from tests.pending_deletion import mark_pending_deletion
-from tests.identity_worker_fixtures import make_db
 from tests.owned_database import add_test_user
 
 
 class Boom(Exception):
     pass
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def add(db, tmp_path, uuid_id, title, artist, album, owner_id=None):

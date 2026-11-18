@@ -10,8 +10,9 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_providers.dart';
+import '../helpers/library_seed.dart' show SeedTrack, markDownloaded, seedLibrary;
+import '../helpers/test_offline.dart';
 
-import '../ui/browse_harness.dart';
 
 /// Real in-memory DB whose batched count queries can be held open and are
 /// counted, to prove "unknown while loading" and "one grouped query".

@@ -8,8 +8,6 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
 import 'package:frontend/services/background/backoff_schedule.dart';
 import 'package:frontend/services/background/single_flight_runner.dart';
-import 'package:frontend/services/sync_service.dart'
-    show ServerRegressedException;
 
 /// What the history diagnostics row shows (SC-21), owned by the model.
 @immutable
@@ -233,11 +231,13 @@ class HistorySyncService {
               _update(lastError: 'Invalid history conflict response: no submitted UUIDs');
               return const PassFailed(BackoffReason.transient);
             }
-            await _quarantine(token, ids, 'conflict', e.detailMessage);
+            await _quarantine(
+                token, ids, HistoryFailureReason.conflict, e.detailMessage);
           case 413 when batch.events.length > 1:
             _batchEvents = batch.events.length ~/ 2;
           case 413:
-            await _quarantine(token, batch.eventUuids, 'rejected', e.detailMessage);
+            await _quarantine(token, batch.eventUuids,
+                HistoryFailureReason.rejected, e.detailMessage);
           case 422:
             final indices = <int>{};
             for (final error in e.validationErrors ?? const []) {
@@ -255,7 +255,8 @@ class HistorySyncService {
             final ids = indices.isEmpty ? batch.eventUuids : [
               for (final index in indices) batch.events[index].eventUuid,
             ];
-            await _quarantine(token, ids, 'rejected', e.detailMessage);
+            await _quarantine(
+                token, ids, HistoryFailureReason.rejected, e.detailMessage);
           case 404:
             return _capabilityMissing();
           default:

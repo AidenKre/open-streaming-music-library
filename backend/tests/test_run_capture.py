@@ -25,8 +25,10 @@ from app.services.ffmpeg_runner import (
     CaptureTimeout,
     FfmpegError,
     FfmpegProcessRegistry,
+    ToolOptions,
     run_capture,
 )
+from tests.process_state import pid_alive, process_state
 
 PY = sys.executable
 
@@ -52,16 +54,48 @@ def popen_spy(monkeypatch):
 
 
 def _wait_gone(pid: int, deadline_s: float = 5.0) -> bool:
-    """True once ``pid`` no longer exists (an orphan is reaped by init
-    asynchronously, so this observes with a deadline; it asserts no timing)."""
+    """True once ``pid`` no longer runs: gone, or a zombie nobody reaps (an
+    orphan is reaped by init asynchronously where there is one, so this
+    observes with a deadline; it asserts no timing)."""
     end = time.monotonic() + deadline_s
     while time.monotonic() < end:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not pid_alive(pid):
             return True
         time.sleep(0.01)
     return False
+
+
+def _old_pid_alive(pid: int) -> bool:
+    """The check both files used before pre-merge D2-02."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_a_zombie_counts_as_gone_though_signal_zero_still_reaches_it():
+    """Pre-merge D2-02: a child that has exited and that nobody reaped (the test
+    is its parent and does not reap it yet) is a zombie. ``os.kill(pid, 0)``
+    still succeeds on it; ``pid_alive`` must call it gone."""
+    read_end, write_end = os.pipe()
+    proc = subprocess.Popen(py("pass"), stdout=write_end)
+    os.close(write_end)
+    try:
+        assert os.read(read_end, 1) == b""  # the pipe closes as the child exits
+        state = None
+        end = time.monotonic() + 5.0
+        for _ in range(20_000):  # no sleep; a hard cap and a deadline
+            state = process_state(proc.pid)
+            if (state is not None and state.startswith("Z")) or time.monotonic() > end:
+                break
+        assert state is not None and state.startswith("Z"), state
+        assert _old_pid_alive(proc.pid) is True, "signal 0 reaches a zombie"
+        assert pid_alive(proc.pid) is False
+    finally:
+        os.close(read_end)
+        proc.wait()
+    assert pid_alive(proc.pid) is False
 
 
 class _ReadinessClock:
@@ -264,7 +298,7 @@ class TestRegistry:
 
         registry.register = register
         result = run_capture(
-            py("print('ok')"), timeout_s=10, registry=registry, job_id="job-1", max_stdout_bytes=64
+            py("print('ok')"), timeout_s=10, options=ToolOptions(registry=registry, job_id="job-1"), max_stdout_bytes=64
         )
         assert result.returncode == 0
         assert seen["job_id"] == "job-1"
@@ -282,7 +316,8 @@ class TestRegistry:
     def test_discarded_after_a_failed_run_too(self, code, error):
         registry = FfmpegProcessRegistry()
         with pytest.raises(error):
-            run_capture(py(code), timeout_s=0.5, registry=registry, job_id="job-x", max_stdout_bytes=100)
+            run_capture(py(code), timeout_s=0.5,
+                options=ToolOptions(registry=registry, job_id="job-x"), max_stdout_bytes=100)
         assert "job-x" not in registry._procs
 
     def test_registry_kill_from_another_thread_ends_the_run(self, tmp_path, popen_spy):
@@ -313,7 +348,8 @@ class TestRegistry:
 
         thread = threading.Thread(target=killer)
         thread.start()
-        result = run_capture(py(code), timeout_s=30, registry=registry, job_id="job-2", max_stdout_bytes=64)
+        result = run_capture(py(code), timeout_s=30,
+            options=ToolOptions(registry=registry, job_id="job-2"), max_stdout_bytes=64)
         thread.join(10)
         assert result.returncode == -signal.SIGKILL
         assert popen_spy[0]["proc"].returncode == -signal.SIGKILL
@@ -326,8 +362,7 @@ class TestRegistry:
         result = run_capture(
             py("import time; time.sleep(60)"),
             timeout_s=30,
-            registry=registry,
-            job_id="job-3",
+            options=ToolOptions(registry=registry, job_id="job-3"),
             max_stdout_bytes=64,
         )
         assert result.returncode == -signal.SIGKILL
@@ -336,7 +371,8 @@ class TestRegistry:
     def test_registry_without_job_id_is_not_used(self):
         registry = FfmpegProcessRegistry()
         registry.register = lambda job_id, proc: pytest.fail("registered without a job id")
-        result = run_capture(py("print('ok')"), timeout_s=10, registry=registry, max_stdout_bytes=64)
+        result = run_capture(py("print('ok')"), timeout_s=10,
+            options=ToolOptions(registry=registry), max_stdout_bytes=64)
         assert result.returncode == 0
 
 
@@ -362,7 +398,8 @@ class TestLowPriority:
 
         monkeypatch.setattr(ffmpeg_runner.subprocess, "Popen", refuse)
         with pytest.raises(FfmpegError):
-            run_capture(["ffmpeg", "-version"], timeout_s=5, max_stdout_bytes=64, low_priority=True)
+            run_capture(["ffmpeg", "-version"], timeout_s=5, max_stdout_bytes=64,
+                options=ToolOptions(low_priority=True))
         assert "preexec_fn" not in popen_spy[-1]["kwargs"] or popen_spy[-1]["kwargs"]["preexec_fn"] is None
         return popen_spy[-1]["cmd"]
 
@@ -389,7 +426,8 @@ class TestLowPriority:
         # must still be reported as missing, before anything is started.
         monkeypatch.setattr(ffmpeg_runner.shutil, "which", self._which("nice"))
         with pytest.raises(FfmpegError) as exc_info:
-            run_capture(["/nonexistent/ffmpeg-xyz"], timeout_s=5, max_stdout_bytes=16, low_priority=True)
+            run_capture(["/nonexistent/ffmpeg-xyz"], timeout_s=5, max_stdout_bytes=16,
+                options=ToolOptions(low_priority=True))
         assert "ffmpeg-xyz" in str(exc_info.value) and "not found" in str(exc_info.value)
         assert popen_spy == []
 
@@ -401,7 +439,7 @@ class TestLowPriority:
             py("import os; print(os.getpriority(os.PRIO_PROCESS, 0))"),
             timeout_s=10,
             max_stdout_bytes=64,
-            low_priority=True,
+            options=ToolOptions(low_priority=True),
         )
         assert result.returncode == 0
         assert int(result.stdout) == min(19, parent + 10)

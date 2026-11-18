@@ -16,18 +16,12 @@ from app.services.storage_ledger import (
 )
 from app.services.upload_commit import TAG_WRITE_HEADROOM_BYTES
 from tests import upload_commit_fixtures
-from tests.identity_worker_fixtures import make_db
 from tests.owned_database import add_test_user
 from tests.upload_commit_fixtures import accept, make_commit_worker, make_ledger, ready_item, reservations
 from tests.upload_publish_fixtures import make_publisher
 from tests.upload_validation_fixtures import item_row
 
 SIZE = 100
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

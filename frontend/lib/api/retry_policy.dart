@@ -42,15 +42,8 @@ class RetryPolicy {
 
   /// Single-attempt policy for non-idempotent mutations (PUT/POST default)
   /// and for health-probe one-shots. Still fires the offline hook unless
-  /// explicitly opted out (see [coverArt] and `healthCheck`).
+  /// explicitly opted out (see `healthCheck`).
   static const RetryPolicy noRetry = RetryPolicy(maxAttempts: 1);
-
-  /// Cover-art tiles: single attempt, and a failing thumbnail must NOT
-  /// flip the whole app into offline mode.
-  static const RetryPolicy coverArt = RetryPolicy(
-    maxAttempts: 1,
-    triggerOfflineHook: false,
-  );
 
   RetryPolicy copyWith({
     int? maxAttempts,

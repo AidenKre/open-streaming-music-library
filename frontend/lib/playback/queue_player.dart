@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:developer' as developer;
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/playback/audio_dependencies.dart';
@@ -56,8 +57,45 @@ import 'package:frontend/services/settings_service.dart';
 ///     queue data, at most 3 times per run.
 ///  14. Its dependencies are scope-bound providers; a reset rebuilds them.
 ///  15. Unknown duration is null, never zero.
+///
+/// State written outside the lane, and its guard (today's behaviour):
+///  * `_onPlayerStateChanged` (synchronous engine listener):
+///    `_engineReportsPlaying`, and on a ready report clears `_endAccepted`
+///    and `_queueEnd`, all before the `_stopInProgress` check; behind it, a
+///    newly accepted end sets `_endAccepted` and clears `_queueEnd`, and the
+///    transport axes are published.
+///  * `_onPositionChanged`, behind `_stopInProgress`: publishes the
+///    position; behind `_admissionClosed` it restarts `_sinceCursorSave` and
+///    queues the cursor save on the lane.
+///  * `_onObservation`, behind `_stopInProgress` and `uncertain`:
+///    `_lastSettledItemId`, clears `_damageEvidence` once confirmed, may end
+///    the failure run, and publishes the measured duration of the current
+///    item only.
+///  * `_onSourceFailure` (off-lane task): before its awaits, behind the
+///    session and `_recoveryExhausted` check, `_attemptedSources` and a drop
+///    of `_damageEvidence`; after them, behind the session and `_failureRun`
+///    re-check, `_damageEvidence` and `_transientStreamFailure`.
+///  * `_rescueStreamFailureOffline` (offline listener): clears
+///    `_transientStreamFailure`, no guard.
+///  * The command-failure listener: `_engineDiverged`, only for the current
+///    seed's revision.
+///  * The stream-quality, download-status and binding-gate listeners:
+///    `_sourceConfigVersion`, no guard.
+///  * [setVolume]: the volume and its preference, behind `_admissionClosed`
+///    before its first await and `ref.mounted` plus `_admissionClosed` after
+///    each await.
+///  * `_restorePersistedVolume` (the volume) and the session-ready callback
+///    (`_lifecycle` none to active): behind `ref.mounted`.
+///  * The stream-quality listener hands the new preset to the engine
+///    (`setStreamQuality`) outside the lane, no guard.
+///  * Off-lane durable writes: the missing-download reconcile and the
+///    damage mark (through `downloadReconciliationServiceProvider`, behind
+///    `ref.mounted`, failures logged), the suspect set of
+///    `LocalSourcePolicy`, and the startup prune of inactive sessions.
+///  * [admitReplacement], [stop] and [quiesce] advance `_requestRevision`
+///    synchronously by design; [quiesce] also closes admission synchronously.
 class QueuePlayer extends Notifier<AudioState>
-    implements AudioFocusOwner, FocusRelinquisher {
+    implements AudioFocusOwner, FocusRelinquisher, FocusReturnListener {
   static const _volumePreferenceKey = 'audioVolume';
 
   /// How soon after the queue's real end an added track still continues
@@ -82,6 +120,11 @@ class QueuePlayer extends Notifier<AudioState>
   /// Set when an OS interruption paused playing audio; any later transport
   /// command by the user clears it, so their choice is never undone.
   bool _resumeAfterInterruption = false;
+
+  /// Set when handing the output over paused playing audio; any later pause
+  /// or play of the library clears it. Read when the output comes back
+  /// unused ([onFocusReturned]).
+  bool _resumeWhenFocusReturns = false;
 
   final List<StreamSubscription<Object?>> _subscriptions = [];
   Future<void> _mutationTail = Future<void>.value();
@@ -308,7 +351,9 @@ class QueuePlayer extends Notifier<AudioState>
       final previous = state.queue.sessionId;
       try {
         await _queueRepo.activateSession(sessionId);
-      } on StateError {
+      } on PreparedSessionGone {
+        // Any other error propagates: the request ends Failed (section 6
+        // #6); the activation's transaction changed nothing.
         result = ActivationResult.stale;
         return;
       }
@@ -552,17 +597,24 @@ class QueuePlayer extends Notifier<AudioState>
     return result;
   }
 
-  /// The shared successful manual-queue edit sequence. Keep command and
-  /// persistence ordering unchanged during the 5B.0b extraction.
+  /// The shared successful manual-queue edit sequence. The items and the
+  /// new play order are written in one transaction (section 6 #1): a crash
+  /// or a failed order write leaves the queue as it was, never with the
+  /// added tracks at its end, and no outside reader sees them unordered.
+  /// The order rebuild reads inside it, so it sees the added items as
+  /// before. The engine and state follow only after the commit.
   Future<void> _applyQueueEdit(int sessionId, int currentItemId,
       Future<void> Function() mutate) async {
-    await mutate();
-    await _orderManager.rebuildEffectiveOrder(
-      sessionId,
-      currentItemId: currentItemId,
-      preserveShuffledMainFuture: state.shuffle.shuffleOn,
-      isShuffleOn: state.shuffle.shuffleOn,
-    );
+    final shuffleOn = state.shuffle.shuffleOn;
+    await _queueRepo.writeAtomically(() async {
+      await mutate();
+      await _orderManager.rebuildEffectiveOrder(
+        sessionId,
+        currentItemId: currentItemId,
+        preserveShuffledMainFuture: shuffleOn,
+        isShuffleOn: shuffleOn,
+      );
+    });
     await _refreshLoadedEntriesMetadata(sessionId);
     await _replaceLoadedFutureSuffixForCurrent(
       sessionId,
@@ -650,6 +702,8 @@ class QueuePlayer extends Notifier<AudioState>
   @override
   void onInterruptionBegan() {
     _runTask('interruption', () async {
+      // Whatever a hand-over paused stays paused once this was heard.
+      _resumeWhenFocusReturns = false;
       if (!state.playback.playWhenReady) return;
       await _pauseInLane();
       _resumeAfterInterruption = true;
@@ -671,6 +725,7 @@ class QueuePlayer extends Notifier<AudioState>
     _runTask('noisy output', () async {
       if (state.playback.playWhenReady) await _pauseInLane();
       _resumeAfterInterruption = false;
+      _resumeWhenFocusReturns = false;
     });
   }
 
@@ -680,6 +735,7 @@ class QueuePlayer extends Notifier<AudioState>
   /// leave it false and keep the yield guard.
   Future<void> _resumeInLane({bool user = false}) async {
     _resumeAfterInterruption = false;
+    _resumeWhenFocusReturns = false;
     // A user resume starts a new failure run (a pending check stays valid).
     _resetFailureRun(staleChecks: false);
     _setPlayWhenReady(true);
@@ -694,9 +750,10 @@ class QueuePlayer extends Notifier<AudioState>
     } else {
       await _player.play();
     }
-    // Mirror of _pauseInLane: publish the command's result so a toggle
-    // queued behind it alternates. A buffering engine corrects it to
-    // `loading` with its own state event.
+    // Mirror of _pauseInLane: publish the command's result now for the
+    // status readers (the OS media session, Last.fm Now Playing); a toggle
+    // decides from playWhenReady, set above. A buffering engine corrects it
+    // to `loading` with its own state event.
     if (state.playback.status == PlayerStatus.paused) {
       _setPlaybackStatus(PlayerStatus.playing);
     }
@@ -704,11 +761,13 @@ class QueuePlayer extends Notifier<AudioState>
 
   Future<void> _pauseInLane() async {
     _resumeAfterInterruption = false;
+    _resumeWhenFocusReturns = false;
     _setPlayWhenReady(false);
     await _player.pause();
-    // The paused state is the result of this command: publish it now so a
-    // toggle queued behind it decides from it (the engine's own state event
-    // confirms it later).
+    // The paused state is the result of this command: publish it now for
+    // the status readers (the OS media session, Last.fm Now Playing); a
+    // toggle decides from playWhenReady, set above. The engine's own state
+    // event confirms or corrects it later.
     if (state.playback.status == PlayerStatus.playing) {
       _setPlaybackStatus(PlayerStatus.paused);
     }
@@ -732,8 +791,16 @@ class QueuePlayer extends Notifier<AudioState>
     }
     try {
       await _serialize(() async {
+        _resumeWhenFocusReturns = false;
         // A transfer refused at the bound leaves the library the holder.
-        if (_focus.yieldedBy(AudioOutput.queue)) await _pauseInLane();
+        if (!_focus.yieldedBy(AudioOutput.queue)) return;
+        final wasPlaying = state.playback.playWhenReady;
+        try {
+          await _pauseInLane();
+        } finally {
+          // Remembered until the next pause or play of the library.
+          _resumeWhenFocusReturns = wasPlaying;
+        }
       });
     } catch (error, stack) {
       developer.log('Playback task "relinquish" failed',
@@ -743,6 +810,22 @@ class QueuePlayer extends Notifier<AudioState>
     if (!_engineReportsPlaying) return;
     await _player.transportStateStream
         .firstWhere((s) => !s.playing, orElse: () => const EngineTransportState(false, EngineProcessingState.idle));
+  }
+
+  /// The output came back unused (a preview that never sounded was paused
+  /// or closed, [AudioFocus.handBack]): what the hand-over paused plays
+  /// again, at the same track and position, unless the library was paused,
+  /// played or stopped by anything else meanwhile.
+  @override
+  void onFocusReturned() {
+    _runTask('focus returned', () async {
+      // Queued behind lane work: the player may be gone by now (a page
+      // left while the session scope is torn down).
+      if (!ref.mounted) return;
+      final resume = _resumeWhenFocusReturns;
+      _resumeWhenFocusReturns = false;
+      if (resume && state.queue.sessionId != null) await _resumeInLane();
+    });
   }
 
   /// Whether the playback runtime accepts work (SC-27 lifecycle axis).
@@ -804,6 +887,7 @@ class QueuePlayer extends Notifier<AudioState>
     });
   }
 
+  @visibleForTesting
   Future<void> reconcileAfterSyncQueueMutation(Set<int> affectedSessionIds) =>
       _serialize(() => _reconcileInLane(affectedSessionIds));
 
@@ -897,8 +981,13 @@ class QueuePlayer extends Notifier<AudioState>
   Future<void> setVolume(double volume) async {
     if (_admissionClosed) return;
     await _player.setVolume(volume);
+    // The player may have closed meanwhile (a reset or sign-out quiesced
+    // it, or its scope was disposed): then nothing is written, so a wiped
+    // preference is not written back for the next user (U17-B-04).
+    if (!ref.mounted || _admissionClosed) return;
     state = state.copyWith(playback: state.playback.copyWith(volume: volume));
     final prefs = await ref.read(sharedPreferencesProvider.future);
+    if (!ref.mounted || _admissionClosed) return;
     await prefs.setDouble(_volumePreferenceKey, volume);
   }
 
@@ -1192,6 +1281,12 @@ class QueuePlayer extends Notifier<AudioState>
         event.playPosition != next) {
       return;
     }
+    // A rescue of the current item (its download went away) while paused
+    // lands paused, like [_skipFailedItem] (sign-off DEV-8-09's rule). Read
+    // before the awaits below: engine reports arrive between them. A natural
+    // advance happens while playing and always plays on.
+    final pausedRescue = event.itemId == state.queue.currentItemId &&
+        !state.playback.playWhenReady;
 
     final resolution = await _resolveAdvance(
       sessionId: sessionId,
@@ -1209,7 +1304,7 @@ class QueuePlayer extends Notifier<AudioState>
         cause: PlaybackTransitionCause.naturalAdvance);
     await _player.seekToItem(target.entry.itemId,
         cause: PlaybackTransitionCause.naturalAdvance);
-    if (_focus.yieldedBy(AudioOutput.queue)) return;
+    if (_focus.yieldedBy(AudioOutput.queue) || pausedRescue) return;
     await _player.play();
   }
 
@@ -1221,32 +1316,37 @@ class QueuePlayer extends Notifier<AudioState>
   /// Off: the whole queue returns to its original order (see
   /// [QueueOrderManager.restoreCanonicalOrder]). On: what is ahead of the
   /// current item is shuffled and the rest stays as played.
-  Future<void> _toggleShuffleInternal({bool? forceEnable}) async {
+  Future<void> _toggleShuffleInternal() async {
     final sessionId = state.queue.sessionId;
     final currentItemId = state.queue.currentItemId;
     if (sessionId == null || currentItemId == null) {
-      final nextValue = forceEnable ?? !state.shuffle.shuffleOn;
+      final nextValue = !state.shuffle.shuffleOn;
       state = state.copyWith(shuffle: ShuffleSlice(shuffleOn: nextValue));
       return;
     }
 
-    final enable = forceEnable ?? !state.shuffle.shuffleOn;
+    final enable = !state.shuffle.shuffleOn;
     if (enable == state.shuffle.shuffleOn) {
       return;
     }
 
-    await _queueRepo.updateShuffleEnabled(sessionId, enable);
-    if (enable) {
-      await _orderManager.rebuildEffectiveOrder(
-        sessionId,
-        currentItemId: currentItemId,
-        preserveShuffledMainFuture: false,
-        shuffleMainFuture: true,
-        isShuffleOn: state.shuffle.shuffleOn,
-      );
-    } else {
-      await _orderManager.restoreCanonicalOrder(sessionId);
-    }
+    // The flag and the order are written in one transaction, like a manual
+    // queue edit ([_applyQueueEdit]): a crash or a failed order write never
+    // leaves a shuffled order stored with the flag off, or the reverse.
+    await _queueRepo.writeAtomically(() async {
+      await _queueRepo.updateShuffleEnabled(sessionId, enable);
+      if (enable) {
+        await _orderManager.rebuildEffectiveOrder(
+          sessionId,
+          currentItemId: currentItemId,
+          preserveShuffledMainFuture: false,
+          shuffleMainFuture: true,
+          isShuffleOn: state.shuffle.shuffleOn,
+        );
+      } else {
+        await _orderManager.restoreCanonicalOrder(sessionId);
+      }
+    });
     await _reseatEngineAroundCurrent(sessionId, currentItemId,
         shuffleOn: enable);
   }
@@ -1456,8 +1556,6 @@ class QueuePlayer extends Notifier<AudioState>
         wantPlay: wantPlay);
   }
 
-  /// Reseeds [entry] at [position] from queue data, then plays if wanted
-  /// and the library still owns the output.
   /// Seeks the current item; an untrusted engine is reseeded there instead.
   Future<void> _seekCurrentInLane(Duration position,
       {required bool wantPlay}) async {
@@ -1497,6 +1595,8 @@ class QueuePlayer extends Notifier<AudioState>
         : _queueRepo.getPlaybackEntryForItem(sessionId, item);
   }
 
+  /// Reseeds [entry] at [position] from queue data, then plays if wanted
+  /// and the library still owns the output.
   /// The yield guard on [wantPlay] is for automatic plays, which never take
   /// the output back from preview. A user play sets [takeFocus] and plays
   /// regardless; the engine's `beforePlay` then takes the output back.
@@ -1675,9 +1775,6 @@ class QueuePlayer extends Notifier<AudioState>
     _scheduleForwardHydration();
   }
 
-  /// The engine is the authoritative echo of desired transport (it also
-  /// clears it at the end of the queue); both axes are published as
-  /// reported, plus the derived status.
   /// Every async task started from a listener runs in the lane with an
   /// error sink (SC-27 invariant 13): logged and published as a diagnostic.
   void _runTask(String task, Future<void> Function() body) =>
@@ -1914,15 +2011,8 @@ class QueuePlayer extends Notifier<AudioState>
         await _player.refreshLoadedSourcesForAvailabilityChanges([
           // The stream stand-in: no file, but its codecs, so an "original"
           // stream of a codec this device can't decode streams transcoded.
-          QueuePlaybackEntry(
-            itemId: entry.itemId,
-            queueType: entry.queueType,
-            canonicalPosition: entry.canonicalPosition,
-            playPosition: entry.playPosition,
-            uuidId: entry.uuidId,
-            downloadedCodec: entry.downloadedCodec,
-            sourceCodec: entry.sourceCodec,
-          ),
+          // A copy, not a re-read: a newer download is not picked up here.
+          entry.withoutDownload(),
         ]);
         return;
       case SourceFailureKind.missingLocalFile:
@@ -2007,6 +2097,9 @@ class QueuePlayer extends Notifier<AudioState>
     );
   }
 
+  /// The engine is the authoritative echo of desired transport (it also
+  /// clears it at the end of the queue); both axes are published as
+  /// reported, plus the derived status.
   void _onPlayerStateChanged(EngineTransportState playerState) {
     _engineReportsPlaying = playerState.playing;
     if (playerState.processingState == EngineProcessingState.ready) {
@@ -2055,6 +2148,9 @@ class QueuePlayer extends Notifier<AudioState>
   }
 
   void _onPositionChanged(Duration position) {
+    // Like the other engine listeners: a report that arrives while a stop
+    // (or a quiesce, for good) is in progress is not published (U17-B-01).
+    if (_stopInProgress) return;
     state = state.copyWith(
       playback: state.playback.copyWith(position: position),
     );

@@ -27,44 +27,29 @@ from app.services.deletion_worker import DeletionExecutor
 from app.services.track_locks import TrackLocks
 from app.services.upload_publish import SimulatedCrash
 from tests.deletion_world import SpyCache
+from tests.recovery_steps import capture_steps, named
 from tests.schema_fixtures import INIT_SQL
-
-EXPECTED_ORDER = [
-    ("edit journal", True),
-    ("conversion jobs", True),
-    ("audio identity", True),
-    ("upload commit journal", False),
-    ("deletion journal", False),
-    ("upload receipts", False),
-    ("upload validation", False),
-    ("deletion jobs", False),
-    ("storage reservations", False),
-    ("upload janitor", False),
-    ("deletion janitor", False),
-]
-
-
-def _capture_steps(main, monkeypatch):
-    captured = []
-    real = main.run_startup_recovery
-
-    def capture(steps):
-        captured.append(list(steps))
-        return real(steps)
-
-    monkeypatch.setattr(main, "run_startup_recovery", capture)
-    return captured
-
 
 def test_the_deletion_steps_sit_in_the_registry_in_their_stated_order(configure_app, monkeypatch):
     main = configure_app()
-    captured = _capture_steps(main, monkeypatch)
+    captured = capture_steps(main, monkeypatch)
 
     with TestClient(main.app):
         pass
 
     [steps] = captured
-    assert [(s.name, s.fatal) for s in steps] == EXPECTED_ORDER
+    names = named(steps)
+    # The full order: tests/test_startup_recovery_order.py. Here, the three
+    # deletion steps' places next to their neighbours (SC-16e).
+    at = names.index(("deletion journal", False))
+    assert names[at - 1 : at + 2] == [
+        ("upload commit journal", False), ("deletion journal", False), ("upload receipts", False),
+    ]
+    at = names.index(("deletion jobs", False))
+    assert names[at - 1 : at + 2] == [
+        ("upload validation", False), ("deletion jobs", False), ("storage reservations", False),
+    ]
+    assert names[-1] == ("deletion janitor", False)
 
 
 def test_the_factory_gives_the_three_steps_in_order(tmp_path):
@@ -100,7 +85,7 @@ def test_a_failing_deletion_step_never_stops_the_start_or_the_later_steps(
     configure_app, monkeypatch, target
 ):
     main = configure_app()
-    captured = _capture_steps(main, monkeypatch)
+    captured = capture_steps(main, monkeypatch)
     ran = []
 
     def boom(*args, **kwargs):

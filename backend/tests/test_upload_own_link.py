@@ -10,16 +10,10 @@ import os
 import pytest
 
 from app.services import organizer
-from tests.identity_worker_fixtures import make_db
 from tests.upload_commit_fixtures import journal
 from tests.upload_publish_fixtures import track_row
 from tests.upload_recovery_fixtures import World
 from tests.upload_validation_fixtures import item_row
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -4,7 +4,6 @@ import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -100,8 +99,7 @@ void main() {
           .getSingle())
       .read<int>('m');
 
-  test('hydrates each kind with its read model, scope and counts, in '
-      'recency order', () async {
+  test('hydrates each kind with its read model, in recency order', () async {
     await seed.click('artist', 'srv-1:1', at: 500);
     await seed.click('track', 'd', at: 400);
     await seed.click('album', 'srv-1:1', at: 300);
@@ -121,23 +119,23 @@ void main() {
 
     final artist = got[0];
     expect((artist.entity as ArtistUI).name, 'Aria');
-    expect(artist.scope, const ArtistScope(artistId: 1));
-    expect((artist.downloaded, artist.total), (1, 3));
+    expect((artist.entity as ArtistUI).id, 1);
 
     final track = got[1];
     expect((track.entity as TrackUI).title, 'Dee');
-    expect(track.scope, isA<TrackScope>());
-    expect((track.scope as TrackScope).track.uuidId, 'd');
-    expect((track.downloaded, track.total), (0, 1));
+    expect((track.entity as TrackUI).uuidId, 'd');
+    expect((track.entity as TrackUI).isDownloaded, isFalse);
 
     final album = got[2];
     expect((album.entity as AlbumUI).artist, 'Aria');
     expect((album.entity as AlbumUI).coverArtId, 11);
-    expect(album.scope, const AlbumScope(artistId: 1, albumId: 1));
-    expect((album.downloaded, album.total), (1, 2));
+    expect(
+      ((album.entity as AlbumUI).artistId, (album.entity as AlbumUI).id),
+      (1, 1),
+    );
 
-    expect((got[3].downloaded, got[3].total), (0, 1));
-    expect((got[4].downloaded, got[4].total), (1, 1));
+    expect((got[3].entity as AlbumUI).id, 3);
+    expect((got[4].entity as TrackUI).isDownloaded, isTrue);
   });
 
   test('downloadedOnly picks local art for collections', () async {

@@ -21,7 +21,7 @@ from app.services.audio_identity import (
     compute_fingerprint,
 )
 from app.services.duplicate_detection import MatcherParams
-from app.services.ffmpeg_runner import CaptureOverflow, CaptureTimeout
+from app.services.ffmpeg_runner import NO_OPTIONS, CaptureOverflow, CaptureTimeout, ToolOptions
 from app.services.fingerprinter import FingerprintFailure, RawFingerprint
 from app.services.identity_reasons import CaptureFailed
 
@@ -43,9 +43,10 @@ class FakeFingerprinter:
         self.raises = raises
         self.calls = []
 
-    def fingerprint(self, path, *, max_seconds=120, registry=None, job_id=None, low_priority=False):
-        self.calls.append({"path": path, "max_seconds": max_seconds, "registry": registry,
-                           "job_id": job_id, "low_priority": low_priority})
+    def fingerprint(self, path, *, max_seconds=120, options=NO_OPTIONS):
+        self.calls.append({"path": path, "max_seconds": max_seconds, "registry": options.registry,
+                           "job_id": options.job_id, "low_priority": options.low_priority,
+                           "input_format": options.input_format})
         if self.raises is not None:
             raise self.raises
         return self.result
@@ -133,9 +134,9 @@ class FakeMeasure:
         self.raises = None
         self.calls = []
 
-    def __call__(self, path, *, registry=None, job_id=None, low_priority=False):
-        self.calls.append({"path": path, "registry": registry, "job_id": job_id,
-                           "low_priority": low_priority})
+    def __call__(self, path, *, options=NO_OPTIONS):
+        self.calls.append({"path": path, "registry": options.registry, "job_id": options.job_id,
+                           "low_priority": options.low_priority, "input_format": options.input_format})
         if self.raises is not None:
             raise self.raises
         return self.value
@@ -169,10 +170,10 @@ def test_the_file_is_not_decoded_again_when_a_duration_is_known_or_not_needed(me
 def test_the_decode_gets_the_file_and_the_callers_process_options(measured):
     registry, job_id = object(), object()
     fp = FakeFingerprinter(RawFingerprint(VARIED, None))
-    compute_fingerprint(Path("/m/a.flac"), fp, params=PARAMS, registry=registry, job_id=job_id,
-                        low_priority=True)
+    compute_fingerprint(Path("/m/a.flac"), fp, params=PARAMS,
+                        options=ToolOptions(registry=registry, job_id=job_id, low_priority=True))
     assert measured.calls == [{"path": Path("/m/a.flac"), "registry": registry, "job_id": job_id,
-                               "low_priority": True}]
+                               "low_priority": True, "input_format": None}]
 
 
 @pytest.mark.parametrize(
@@ -202,11 +203,11 @@ def test_the_duration_unknown_reason_is_in_the_shared_vocabulary():
 def test_registry_job_and_priority_reach_the_fingerprinter():
     fp = FakeFingerprinter(RawFingerprint(VARIED, 30.0))
     registry = object()
-    compute_fingerprint(Path("/m/a.flac"), fp, params=PARAMS, registry=registry, job_id=("identity", 7),
-                        low_priority=True)
+    compute_fingerprint(Path("/m/a.flac"), fp, params=PARAMS,
+                        options=ToolOptions(registry=registry, job_id=("identity", 7), low_priority=True))
     [call] = fp.calls
     assert call == {"path": Path("/m/a.flac"), "max_seconds": 120, "registry": registry,
-                    "job_id": ("identity", 7), "low_priority": True}
+                    "job_id": ("identity", 7), "low_priority": True, "input_format": None}
 
 
 @pytest.mark.integration
@@ -237,7 +238,8 @@ from app.services.audio_identity import (  # noqa: E402
     identity_from_columns,
     identity_to_columns,
 )
-from app.services.ffmpeg_runner import CaptureResult, FfmpegError  # noqa: E402
+from app.services.ffmpeg_runner import CaptureResult, FfmpegError, run_capture  # noqa: E402
+from tests.tool_call_capture import tool_call  # noqa: E402
 from app.services.fingerprinter import FpcalcFingerprinter  # noqa: E402
 
 EXACT = ExactAudioHash(KIND_PCM, "ab" * 32, 44100, 2, 16)
@@ -245,8 +247,11 @@ EXACT = ExactAudioHash(KIND_PCM, "ab" * 32, 44100, 2, 16)
 
 @pytest.fixture
 def exact_only(monkeypatch):
-    monkeypatch.setattr(audio_identity, "compute_exact", lambda path, codec, **kw: EXACT)
-    monkeypatch.setattr(audio_identity, "tool_versions", lambda **kw: "ffmpeg 9.0.2")
+    real_exact, real_versions = audio_identity.compute_exact, audio_identity.tool_versions
+    monkeypatch.setattr(audio_identity, "compute_exact",
+                        lambda path, codec, **kw: tool_call(real_exact, path, codec, **kw) and EXACT)
+    monkeypatch.setattr(audio_identity, "tool_versions",
+                        lambda **kw: tool_call(real_versions, **kw) and "ffmpeg 9.0.2")
 
 
 def test_compute_identity_without_a_fingerprinter_has_no_fingerprint(exact_only):
@@ -264,7 +269,8 @@ def test_compute_identity_with_a_fingerprinter_computes_both_layers(exact_only):
 def test_compute_identity_forwards_process_options_to_the_fingerprinter(exact_only):
     fp = FakeFingerprinter(RawFingerprint(VARIED, 30.0))
     registry = object()
-    compute_identity(Path("/m/a.flac"), "flac", fingerprinter=fp, registry=registry, job_id="w", low_priority=True)
+    compute_identity(Path("/m/a.flac"), "flac", fingerprinter=fp,
+                     options=ToolOptions(registry=registry, job_id="w", low_priority=True))
     [call] = fp.calls
     assert (call["registry"], call["job_id"], call["low_priority"]) == (registry, "w", True)
 
@@ -282,6 +288,7 @@ class TestToolVersionsWithAFingerprinter:
         self.answers = [CaptureResult(0, b"ffmpeg version 9.0.2 Copyright\n", "")]
 
         def fake(cmd, **kwargs):
+            tool_call(run_capture, cmd, **kwargs)
             answer = self.answers[0]
             if isinstance(answer, BaseException):
                 raise answer

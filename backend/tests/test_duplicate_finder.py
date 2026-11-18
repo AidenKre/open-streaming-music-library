@@ -32,15 +32,11 @@ from app.services.duplicate_detection import (
     TrackRef,
     find_duplicates,
 )
-from tests.identity_worker_fixtures import DIGEST_A, DIGEST_B, add_track, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, DIGEST_B, add_track
 from tests.owned_database import add_test_user
+from tests.pending_deletion import mark_pending_deletion
 
 T = 1_800_000_000
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -200,13 +196,7 @@ def test_owner_is_keyword_only_and_required(db, conn):
 def test_a_track_the_live_tracks_view_leaves_out_is_never_matched(db, conn):
     hidden = track(db, "hidden")
     shown = track(db, "shown")
-    # Phase 8 will add its pending-deletion marker to this view; simulate it.
-    sql(db, "DROP VIEW live_tracks")
-    sql(
-        db,
-        "CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks "
-        f"WHERE uuid_id <> '{hidden}'",
-    )
+    mark_pending_deletion(db.context.database_path, hidden)
 
     report = find_duplicates(conn, ident(pcm()), owner_id=db.owner_id)
 

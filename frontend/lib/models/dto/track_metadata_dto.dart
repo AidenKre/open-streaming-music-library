@@ -1,3 +1,5 @@
+import 'package:frontend/models/dto/json_fields.dart';
+
 class TrackMetadataDto {
   final String? title;
   final String? artist;
@@ -41,28 +43,45 @@ class TrackMetadataDto {
     this.albumId,
   });
 
+  /// Typed reads: a malformed field is a [FormatException]; a missing or null
+  /// nullable field is unknown (null).
   factory TrackMetadataDto.fromJson(Map<String, dynamic> json) {
     return TrackMetadataDto(
-      title: json['title'] as String?,
-      artist: json['artist'] as String?,
-      album: json['album'] as String?,
-      albumArtist: json['album_artist'] as String?,
-      year: (json['year'] as num?)?.toInt(),
-      date: json['date'] as String?,
-      genre: json['genre'] as String?,
-      trackNumber: (json['track_number'] as num?)?.toInt(),
-      discNumber: (json['disc_number'] as num?)?.toInt(),
-      codec: json['codec'] as String?,
+      title: jsonStringOrNull(json, 'title'),
+      artist: jsonStringOrNull(json, 'artist'),
+      album: jsonStringOrNull(json, 'album'),
+      albumArtist: jsonStringOrNull(json, 'album_artist'),
+      year: jsonWholeIntOrNull(json, 'year'),
+      date: jsonStringOrNull(json, 'date'),
+      genre: jsonStringOrNull(json, 'genre'),
+      trackNumber: jsonWholeIntOrNull(json, 'track_number'),
+      discNumber: jsonWholeIntOrNull(json, 'disc_number'),
+      codec: jsonStringOrNull(json, 'codec'),
       duration: _positiveOrUnknown(json['duration'])?.toDouble(),
-      bitrateKbps: (json['bitrate_kbps'] as num?)?.toDouble(),
+      bitrateKbps: jsonDoubleOrNull(json, 'bitrate_kbps'),
       sampleRateHz: _positiveOrUnknown(json['sample_rate_hz'])?.toInt(),
       channels: _positiveOrUnknown(json['channels'])?.toInt(),
-      hasAlbumArt: json['has_album_art'] as bool? ?? false,
-      coverArtId: (json['cover_art_id'] as num?)?.toInt(),
-      artistId: (json['artist_id'] as num?)?.toInt(),
-      albumId: (json['album_id'] as num?)?.toInt(),
+      hasAlbumArt: jsonBoolOrNull(json, 'has_album_art') ?? false,
+      coverArtId: jsonWholeIntOrNull(json, 'cover_art_id'),
+      artistId: jsonWholeIntOrNull(json, 'artist_id'),
+      albumId: jsonWholeIntOrNull(json, 'album_id'),
     );
   }
+
+  /// The server's value of the editable field [key] (a key of
+  /// `defaultEditableTrackFields`); null for an unknown key.
+  Object? editableValue(String key) => switch (key) {
+        'title' => title,
+        'artist' => artist,
+        'album' => album,
+        'album_artist' => albumArtist,
+        'year' => year,
+        'date' => date,
+        'genre' => genre,
+        'track_number' => trackNumber,
+        'disc_number' => discNumber,
+        _ => null,
+      };
 
   /// Duration, sample rate and channels are never really 0: a pre-v10
   /// server sends 0 as its "unknown" stand-in (SC-16l), and its later

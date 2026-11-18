@@ -177,7 +177,7 @@
     "Listening time is recorded playback time. Rewinding and playing on two devices at once both add time, and a listen cut short when the app was stopped may lose its last seconds.",
     "A qualified play is a listen of at least 30 seconds, or of at least half the track when the track is shorter than a minute. This is OSML's own threshold.",
     "Names are the library's current metadata when the recap was generated, not the names at the time of listening.",
-    "Unavailable time is listening to tracks that were deleted or are not in this device's library. It is included in the totals but in no top list.",
+    "The \"unavailable\" figures count listening to deleted or unknown tracks (tracks that were deleted or are not in this device's library). They are included in the totals but in no top list.",
     "Counted from the listening history on this device when the recap was generated. Listens from other devices that had not synced yet are not included."
   ]
 }

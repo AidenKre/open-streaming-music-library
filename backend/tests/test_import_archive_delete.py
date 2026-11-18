@@ -209,16 +209,20 @@ def test_g5_a_planned_audio_file_missing_from_the_unpack_keeps_the_archive(tmp_p
 
 
 def test_a_symlinked_archive_is_never_deleted(tmp_path, caplog):
+    """Since the pre-merge review (A4-01) a link is not read through either: it
+    is not unpacked and not set aside, it stays where it is."""
     folder = _folder(tmp_path)
     target = _album_zip(tmp_path, "elsewhere.zip")
     before = target.read_bytes()
     link = folder / "album.zip"
     link.symlink_to(target)
+    organize = MagicMock(return_value=ImportOutcome.IMPORTED)
 
-    assert _ingest(tmp_path, link, caplog) is ImportOutcome.IMPORTED
+    assert _ingest(tmp_path, link, caplog, organize) is ImportOutcome.NOT_AUDIO
 
+    organize.assert_not_called()
     assert target.read_bytes() == before
-    assert (folder / ".imported" / "album.zip").is_symlink()
+    assert link.is_symlink() and not (folder / ".imported").exists()
     assert DELETED not in _lines(caplog)
 
 
@@ -347,3 +351,38 @@ def test_an_archive_whose_member_clashes_with_a_different_track_is_deleted_after
     assert not (folder / ".imported").exists()
     assert rig.names() == ["a.flac", "b (2).flac", "b.flac"]
     assert (rig.folder / "b.flac").read_bytes() == b"library|t"
+
+
+def test_an_archive_whose_member_meets_a_library_file_that_cannot_be_read_now_stays(
+        tmp_path, caplog, monkeypatch):
+    """Owner's decision 2026-11-17 (U05-B-01 review #4) with DEV-M-10 ("an
+    outside failure -> stays"): the member's import is environmental, so the
+    archive stays where it is, neither set aside nor deleted, for a later try."""
+    from unittest.mock import patch
+
+    from tests.name_clash_rig import META, Rig
+
+    rig = Rig(tmp_path, monkeypatch)
+    rig.folder.mkdir(parents=True)
+    existing = rig.folder / "b.flac"
+    existing.write_bytes(b"library|untracked")
+    rig.failures[existing] = "tool_missing"
+    folder = _folder(tmp_path)
+    archive = _zip(folder / "album.zip", {"Album/a.flac": b"a|t", "Album/b.flac": b"member b|t"})
+    before = archive.read_bytes()
+
+    with (
+        patch("app.services.organizer.get_track_metadata", return_value=META),
+        patch("app.services.organizer.extract_cover_art_bytes", return_value=None),
+        caplog.at_level(logging.INFO),
+    ):
+        outcome = rig.ingestor.ingest(archive, imported_dir=folder / ".imported")
+
+    assert outcome is ImportOutcome.TOOL_UNAVAILABLE
+    assert archive.read_bytes() == before
+    assert not (folder / ".imported").exists()
+    assert sorted(p.name for p in rig.folder.iterdir()) == ["a.flac", "b.flac"]
+    assert existing.read_bytes() == b"library|untracked"
+    deferred = [r.getMessage() for r in caplog.records if r.name == "app.services.organizer"]
+    assert "import deferred: the audio of the file already under this name cannot be read now" in deferred
+    assert not any(str(tmp_path) in line for line in deferred)

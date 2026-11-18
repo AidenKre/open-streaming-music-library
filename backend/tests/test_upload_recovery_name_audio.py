@@ -19,20 +19,15 @@ from pathlib import Path
 
 import pytest
 
-from app.services import audio_identity, upload_recovery
+from app.services import upload_recovery
 from app.services.audio_identity import ExactUnavailable
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import FakeExact, journal, library_root, make_commit_worker
 from tests.upload_publish_fixtures import make_publisher, prepared_commit, track_row
 from tests.upload_recovery_fixtures import World
 from tests.upload_validation_fixtures import item_row
 
 OPERATOR = "uvicorn.error"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -115,8 +110,8 @@ def test_a_final_whose_audio_matches_finishes_the_import(world, db, music, caplo
     assert journal(db, commit)["state"] == "imported"
     assert not commit["source"].exists()  # the staged source is released as for any import
     # One bounded decode at restart: the final, its probed demuxer forced, low priority.
-    assert exact.calls == [{"path": final, "codec_hint": "flac", "low_priority": True,
-                            "input_format": "flac"}]
+    assert exact.calls == [{"path": final, "codec_hint": "flac", "registry": None, "job_id": None,
+                            "low_priority": True, "input_format": "flac"}]
     [line] = lines
     assert commit["op"] in line and commit["item_uuid"] in line
     assert "/" not in line and "Airbag" not in line and str(commit["owner_id"]) + "/" not in line
@@ -302,6 +297,7 @@ def test_every_checked_digest_state_finishes_the_import(world, db, music, digest
     assert track_row(db, commit["track"])["file_path"] == str(final)
 
 
+@pytest.mark.requires_chmod_denial
 def test_a_final_the_server_cannot_open_is_unknown_not_other_audio(world, db, music, caplog):
     """S7LF-R-01: ffprobe on a file it cannot open exits non-zero, which reads as
     a decode error (the file's content). A final that cannot be opened proves

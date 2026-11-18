@@ -11,7 +11,7 @@ import pytest
 from app.library import Library
 from app.models.uploads import CommitRequest, ResolveDuplicateOperation, ResolveDuplicateRequest
 from app.services import upload_commit
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_commit_fixtures import journal, library_root, ready_item
 from tests.upload_publish_fixtures import library_track, make_publisher, prepared_commit
@@ -20,11 +20,6 @@ from tests.upload_validation_fixtures import item_row
 BATCH = "c3000000-0000-4000-8000-000000000001"
 ITEM = "c3000000-0000-4000-8000-000000000002"
 NOW = 1_700_000_000
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

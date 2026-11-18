@@ -24,11 +24,9 @@ import 'package:http/testing.dart';
 import 'package:path/path.dart' as p;
 
 import '../../helpers/server_binding.dart';
+import '../../helpers/owned_file_cleanup_rows.dart';
 
-Future<int> _pending(AppDatabase db) async => (await db
-        .customSelect('SELECT COUNT(*) AS n FROM owned_file_cleanup')
-        .getSingle())
-    .read<int>('n');
+Future<int> _pending(AppDatabase db) => pendingOwnedFileCleanups(db);
 
 void main() {
   late AppDatabase db;

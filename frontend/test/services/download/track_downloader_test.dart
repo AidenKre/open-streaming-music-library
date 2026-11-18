@@ -172,6 +172,45 @@ void main() {
         unregisterCanceller: () {},
       );
 
+  // Section 6 #8: a download committed while its cover is being removed
+  // (the delete of another download that used it) asks for the cover only
+  // after the removal, so it fetches it again instead of skipping a file
+  // about to go.
+  test('a cover removed while the download commits is fetched again',
+      () async {
+    await _insertTrack(db, 'abc');
+    await db.customStatement(
+        "UPDATE trackmetadata SET has_album_art = 1, cover_art_id = 5 "
+        "WHERE uuid_id = 'abc'");
+    coverStore.fileFor(5).writeAsBytesSync([1]);
+    var coverRequests = 0;
+    final downloader = buildDownloader(MockClient((req) async {
+      if (req.url.path.contains('cover_art')) {
+        coverRequests++;
+        return http.Response.bytes([6, 6], 200);
+      }
+      return http.Response.bytes([1, 2, 3], 200);
+    }));
+    final asking = Completer<void>();
+    final unused = Completer<bool>();
+    final removal = coverStore.removeIfUnused(5, () {
+      asking.complete();
+      return unused.future;
+    });
+    await asking.future;
+
+    final download = run(downloader, _job('abc'));
+    while ((await _row(db, 'abc')).filePath == null) {
+      await pumpEventQueue();
+    }
+    unused.complete(false); // asked before the commit: nothing used it
+
+    expect(await removal, isTrue);
+    expect((await download).kind, DownloadOutcomeKind.success);
+    expect(coverRequests, 1);
+    expect(coverStore.fileFor(5).readAsBytesSync(), [6, 6]);
+  });
+
   // Review major 1: a truncated body is never committed (it would only fail
   // at playback and look damaged).
   test('a body shorter than Content-Length fails and commits nothing',
@@ -1005,6 +1044,165 @@ void main() {
     expect((await second).kind, DownloadOutcomeKind.success);
     expect((await third).kind, DownloadOutcomeKind.success);
     expect(calls, 3, reason: 'a second preparation (and sweep) started');
+  });
+
+  // The reset's delete of the downloads (coordinator's note 1, the owner on
+  // 2026-11-17: "route the reset through the same checks"; option A). The
+  // recorded files go through the owned-file clean-up; the downloads folder
+  // goes as a whole afterwards (inside the app's own folder, links are
+  // removed, never followed). A recorded file the clean-up cannot prove is
+  // the app's own (outside the folder, by path or through a link) stays
+  // where it is and the reset says so once.
+  group('the reset\'s delete of the downloads', () {
+    late Directory elsewhere;
+    late Directory tracks;
+
+    setUp(() async {
+      elsewhere = await Directory.systemTemp.createTemp('reset_elsewhere_');
+      tracks = Directory(p.join(tempDir.path, 'tracks'))
+        ..createSync(recursive: true);
+    });
+    tearDown(() async {
+      if (await elsewhere.exists()) await elsewhere.delete(recursive: true);
+    });
+
+    File fileIn(Directory dir, String name, [List<int> bytes = const [1]]) =>
+        File(p.join(dir.path, name))..writeAsBytesSync(bytes);
+
+    Future<void> setPaths(String u, {String? file, String? damaged}) async {
+      await _insertTrack(db, u);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(u))).write(
+          TracksCompanion(
+              filePath: Value(file),
+              damagedFilePath: Value(damaged),
+              downloadedQuality: const Value('320')));
+    }
+
+    Future<List<String?>> recordedPaths() async => [
+          for (final t in await db.select(db.tracks).get()) ...[
+            t.filePath,
+            t.damagedFilePath,
+          ],
+        ];
+
+    Future<Object?> reset(TrackDownloader d) async {
+      try {
+        await d.deleteDownloadsForReset();
+        return null;
+      } catch (e) {
+        return e;
+      }
+    }
+
+    test('every recorded file and damaged copy in the downloads folder goes, '
+        'and the folder with what else it holds', () async {
+      final f1 = fileIn(tracks, 'u1.m4a');
+      final d2 = fileIn(tracks, 'u2.damaged.m4a');
+      final f3 = fileIn(tracks, 'u3.m4a');
+      final d3 = fileIn(tracks, 'u3.damaged.m4a');
+      fileIn(tracks, 'u9.m4a.partial'); // not recorded
+      await setPaths('u1', file: f1.path);
+      await setPaths('u2', damaged: d2.path);
+      await setPaths('u3', file: f3.path, damaged: d3.path);
+
+      final error = await reset(
+          buildDownloader(MockClient((_) async => http.Response('', 404))));
+
+      expect(error, isNull);
+      expect(tracks.existsSync(), isFalse);
+      expect(await recordedPaths(), everyElement(isNull),
+          reason: 'no track refers to a download any more');
+    });
+
+    test('a recorded file outside the downloads folder is left with its '
+        'content and reported once', () async {
+      final outside = fileIn(elsewhere, 'u1.m4a', [4, 5, 6]);
+      final inside = fileIn(tracks, 'u2.m4a');
+      await setPaths('u1', file: outside.path);
+      await setPaths('u2', file: inside.path);
+      final downloader =
+          buildDownloader(MockClient((_) async => http.Response('', 404)));
+
+      final error = await reset(downloader);
+
+      expect(error, isA<DownloadsLeftByReset>());
+      expect(error.toString(), downloadsLeftByResetMessage);
+      expect(outside.readAsBytesSync(), [4, 5, 6]);
+      expect(inside.existsSync(), isFalse);
+      expect(await recordedPaths(), everyElement(isNull));
+      // The rerun (the next launch finishing the reset) has nothing to
+      // report: no loop.
+      expect(await reset(downloader), isNull);
+      expect(outside.readAsBytesSync(), [4, 5, 6]);
+    });
+
+    test('a recorded path that is a link outside the folder is not followed: '
+        'the link and its target stay, reported', () async {
+      final target = fileIn(elsewhere, 'target.m4a', [7, 7]);
+      final link = Link(p.join(elsewhere.path, 'u1.m4a'))
+        ..createSync(target.path);
+      await setPaths('u1', file: link.path);
+
+      final error = await reset(
+          buildDownloader(MockClient((_) async => http.Response('', 404))));
+
+      expect(error, isA<DownloadsLeftByReset>());
+      expect(link.existsSync(), isTrue);
+      expect(target.readAsBytesSync(), [7, 7]);
+    });
+
+    // Review 2 F1: a file an earlier delete queued for the clean-up (no
+    // track names it any more) is part of the reset too: attempted, and
+    // reported when it stays outside the folder.
+    test('a file still queued by an earlier delete is attempted and, outside '
+        'the folder, reported', () async {
+      final outside = fileIn(elsewhere, 'old.m4a', [2, 2]);
+      final inside = fileIn(tracks, 'gone.m4a');
+      await db.transaction(() => OwnedFileCleanup(
+            db: db,
+            documentsDirectory: () async => tempDir,
+          ).enqueueInTransaction([outside.path, inside.path],
+              localBindingId: null));
+
+      final error = await reset(
+          buildDownloader(MockClient((_) async => http.Response('', 404))));
+
+      expect(error, isA<DownloadsLeftByReset>());
+      expect(outside.readAsBytesSync(), [2, 2]);
+      expect(inside.existsSync(), isFalse);
+      expect(await db.select(db.ownedFileCleanupEntries).get(), isEmpty);
+    });
+
+    test('a link inside the folder goes as a link; its target outside is '
+        'intact', () async {
+      final target = fileIn(elsewhere, 'target.m4a', [8, 8, 8]);
+      final link = Link(p.join(tracks.path, 'u1.m4a'))
+        ..createSync(target.path);
+      await setPaths('u1', file: link.path);
+      Link(p.join(tracks.path, 'stray')).createSync(target.path);
+
+      final error = await reset(
+          buildDownloader(MockClient((_) async => http.Response('', 404))));
+
+      expect(error, isNull);
+      expect(link.existsSync(), isFalse);
+      expect(tracks.existsSync(), isFalse);
+      expect(target.readAsBytesSync(), [8, 8, 8]);
+    });
+
+    test('a recorded file reached through a linked folder inside the '
+        'downloads folder is left and reported', () async {
+      final real = fileIn(elsewhere, 'u1.m4a', [3, 3]);
+      Link(p.join(tracks.path, 'sub')).createSync(elsewhere.path);
+      await setPaths('u1', file: p.join(tracks.path, 'sub', 'u1.m4a'));
+
+      final error = await reset(
+          buildDownloader(MockClient((_) async => http.Response('', 404))));
+
+      expect(error, isA<DownloadsLeftByReset>());
+      expect(real.readAsBytesSync(), [3, 3]);
+      expect(tracks.existsSync(), isFalse);
+    });
   });
 
   test('non-2xx HTTP becomes otherFailure', () async {

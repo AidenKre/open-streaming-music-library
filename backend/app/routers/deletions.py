@@ -2,13 +2,13 @@
 
 import logging
 import time
-from contextlib import contextmanager
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from app.core.api_errors import answer_errors
 from app.core.bounded_body import bounded_body, validation_error_422
 from app.library import Library, current_library
 from app.models.deletions import (
@@ -30,20 +30,17 @@ def deletion_clock() -> int:
     return int(time.time())
 
 
-@contextmanager
 def _api_errors():
     """Service calls run inside this: DeletionError becomes the SC-22 HTTP error."""
-    try:
-        yield
-    except DeletionError as exc:
-        raise exc.to_http() from exc
+    return answer_errors(DeletionError)
 
 
 logger = logging.getLogger(__name__)
 
 
 def _wake_deletion_worker(request: Request) -> None:
-    """8A.3c sets app.state.deletion_worker; job creation tells it there is work."""
+    """``main.py`` sets app.state.deletion_worker at start-up (8A.3c); job
+    creation tells it there is work."""
     worker = getattr(request.app.state, "deletion_worker", None)
     if worker is not None:
         try:

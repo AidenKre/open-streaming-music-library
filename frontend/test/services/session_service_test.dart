@@ -17,18 +17,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/server_binding.dart';
 import '../helpers/test_credentials.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    // Keep the product's dispose wiring (cancels the health-poll timer that
-    // the inherited enterOffline starts); the stub's value stays the state.
-    super.build();
-    return _value;
-  }
-}
+import '../helpers/test_offline.dart';
 
 class _FakeReset extends LocalResetService {
   _FakeReset(super.ref, {this.failure});
@@ -82,7 +71,7 @@ void main() {
         credentialStoreTestOverride(),
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(startOnRead: false),
-        offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+        offlineModeProvider.overrideWith(() => TestOffline(offline)),
         localResetServiceProvider.overrideWith(
           (ref) => reset = _FakeReset(ref, failure: failure),
         ),

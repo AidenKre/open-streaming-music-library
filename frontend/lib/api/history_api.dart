@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/history_event.dart';
 import 'package:frontend/models/instance_stamp.dart';
-import 'package:frontend/repositories/history_repository.dart';
 
 /// The /history transport (Phase 5 §4).
 class HistoryApi {
@@ -12,7 +11,7 @@ class HistoryApi {
   final ApiClient _api;
 
   /// POST /history with [batch]'s exact body. Returns the raw `acknowledged`
-  /// value (validated by [HistoryRepository.applyAck]); HTTP rejections are
+  /// value (validated by `HistoryRepository.applyAck`); HTTP rejections are
   /// [ApiException]s (409 `history_event_conflict` carries
   /// `conflicting_event_uuids` in its details).
   ///
@@ -39,55 +38,18 @@ class HistoryApi {
     if (nextCursor != null && nextCursor is! int) {
       throw const FormatException('nextCursor is not an int or null');
     }
+    // The same check and message as before the shared event reader.
+    final latestRevision = json['latestRevision'];
+    if (latestRevision is! int) {
+      throw json.containsKey('latestRevision')
+          ? const FormatException('latestRevision is not an int')
+          : const FormatException('missing latestRevision');
+    }
     return HistoryPage(
-      events: [for (final e in events) _event(e)],
+      events: [for (final e in events) HistoryServerEvent.fromJson(e)],
       nextCursor: nextCursor as int?,
-      latestRevision: _int(json, 'latestRevision'),
+      latestRevision: latestRevision,
       servedBy: instanceStampFrom(response.headers),
     );
-  }
-
-  static HistoryServerEvent _event(Object? raw) {
-    if (raw is! Map) throw const FormatException('event is not an object');
-    return HistoryServerEvent(
-      payload: HistoryEventPayload(
-        eventUuid: _string(raw, 'event_uuid'),
-        kind: _string(raw, 'kind'),
-        entityType: _string(raw, 'entity_type'),
-        entityRef: _string(raw, 'entity_ref'),
-        occurredAt: _int(raw, 'occurred_at'),
-        secondsPlayed: _measure(raw, 'seconds_played'),
-        trackLength: _measure(raw, 'track_length'),
-      ),
-      revision: _int(raw, 'revision'),
-      receivedAt: _int(raw, 'received_at'),
-    );
-  }
-
-  static void _require(Map raw, String key) {
-    if (!raw.containsKey(key)) throw FormatException('missing $key');
-  }
-
-  static int _int(Map raw, String key) {
-    _require(raw, key);
-    final v = raw[key];
-    if (v is! int) throw FormatException('$key is not an int');
-    return v;
-  }
-
-  static String _string(Map raw, String key) {
-    _require(raw, key);
-    final v = raw[key];
-    if (v is! String) throw FormatException('$key is not a string');
-    return v;
-  }
-
-  /// A measure: a number (as double) or null; unknown is not zero.
-  static double? _measure(Map raw, String key) {
-    _require(raw, key);
-    final v = raw[key];
-    if (v == null) return null;
-    if (v is! num) throw FormatException('$key is not a number or null');
-    return v.toDouble();
   }
 }

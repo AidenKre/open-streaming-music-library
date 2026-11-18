@@ -379,16 +379,6 @@ void main() {
       expect(counts[albumB]!.downloaded, 0);
     });
 
-    test('getAllAlbumDownloadCounts matches the per-id query', () async {
-      final (_, albumA) =
-          await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
-      await markDownloaded('a1');
-
-      final all = await db.getAllAlbumDownloadCounts();
-      final scoped = await db.getAlbumDownloadCounts([albumA!]);
-      expect(all[albumA], scoped[albumA]);
-    });
-
     test('getAllArtistDownloadCounts groups every artist', () async {
       final (artistA, _) =
           await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
@@ -485,63 +475,6 @@ void main() {
         expect(uuids, ['4', '3', '2', '1']);
       },
     );
-
-    test('cursor skips rows before cursor position', () async {
-      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
-      await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 2);
-      await insertTrack(db, uuid: '3', artist: 'A', album: 'A', trackNumber: 3);
-
-      final results = await db.getTracks(
-        orderBy: allTracksOrder,
-        cursorFilters: [
-          RowFilterParameter(column: 'artist', value: 'A'),
-          RowFilterParameter(column: 'album', value: 'A'),
-          RowFilterParameter(column: 'track_number', value: 1),
-          RowFilterParameter(column: 'uuid_id', value: '1'),
-        ],
-        limit: 100,
-      );
-      expect(results.length, 2);
-      expect(results.first.read<String>('uuid_id'), '2');
-    });
-
-    test('cursor works across different artists', () async {
-      await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
-      await insertTrack(db, uuid: '2', artist: 'B', album: 'A', trackNumber: 1);
-      await insertTrack(db, uuid: '3', artist: 'C', album: 'A', trackNumber: 1);
-
-      final results = await db.getTracks(
-        orderBy: allTracksOrder,
-        cursorFilters: [
-          RowFilterParameter(column: 'artist', value: 'A'),
-          RowFilterParameter(column: 'album', value: 'A'),
-          RowFilterParameter(column: 'track_number', value: 1),
-          RowFilterParameter(column: 'uuid_id', value: '1'),
-        ],
-        limit: 100,
-      );
-      expect(results.length, 2);
-      final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
-      expect(uuids, ['2', '3']);
-    });
-
-    test('cursor handles null sort key values', () async {
-      await insertTrack(db, uuid: '1', trackNumber: 1);
-      await insertTrack(db, uuid: '2', artist: 'A', album: 'A', trackNumber: 1);
-
-      final results = await db.getTracks(
-        orderBy: allTracksOrder,
-        cursorFilters: [
-          RowFilterParameter(column: 'artist', value: null),
-          RowFilterParameter(column: 'album', value: null),
-          RowFilterParameter(column: 'track_number', value: 1),
-          RowFilterParameter(column: 'uuid_id', value: '1'),
-        ],
-        limit: 100,
-      );
-      expect(results.length, 1);
-      expect(results.first.read<String>('uuid_id'), '2');
-    });
 
     test('limit caps result count', () async {
       await insertTrack(db, uuid: '1', artist: 'A', album: 'A', trackNumber: 1);
@@ -689,53 +622,15 @@ void main() {
         throwsArgumentError,
       );
     });
-
-    test('cursor pagination within album', () async {
-      await insertTrack(
-        db,
-        uuid: '1',
-        artist: 'Artist',
-        album: 'Album',
-        trackNumber: 1,
-      );
-      await insertTrack(
-        db,
-        uuid: '2',
-        artist: 'Artist',
-        album: 'Album',
-        trackNumber: 2,
-      );
-      await insertTrack(
-        db,
-        uuid: '3',
-        artist: 'Artist',
-        album: 'Album',
-        trackNumber: 3,
-      );
-
-      final results = await db.getTracks(
-        artistId: artistIdFor('Artist'),
-        albumId: albumIdFor('Artist', 'Album'),
-        orderBy: albumOrder,
-        cursorFilters: [
-          RowFilterParameter(column: 'track_number', value: 1),
-          RowFilterParameter(column: 'uuid_id', value: '1'),
-        ],
-        limit: 100,
-      );
-      expect(results.length, 2);
-      final uuids = results.map((r) => r.read<String>('uuid_id')).toList();
-      expect(uuids, ['2', '3']);
-    });
   });
 
-  group('getArtists', () {
+  group('watchArtists', () {
     test('returns distinct artists sorted alphabetically', () async {
       await insertTrack(db, uuid: '1', artist: 'Charlie');
       await insertTrack(db, uuid: '2', artist: 'Alice');
       await insertTrack(db, uuid: '3', artist: 'Bob');
 
-      final rows = await db.getArtists();
+      final rows = await db.watchArtists().first;
       final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Alice', 'Bob', 'Charlie']);
     });
@@ -745,7 +640,7 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'Alice');
       await insertTrack(db, uuid: '3', artist: 'ALICE');
 
-      final rows = await db.getArtists();
+      final rows = await db.watchArtists().first;
       expect(rows.length, 1);
       // Should return one of the casing variants
       expect(rows.first.read<String>('name').toLowerCase(), 'alice');
@@ -759,7 +654,7 @@ void main() {
         albumArtist: 'Album Artist',
       );
 
-      final rows = await db.getArtists();
+      final rows = await db.watchArtists().first;
       final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Album Artist']);
     });
@@ -767,7 +662,7 @@ void main() {
     test('falls back to artist when albumArtist is null', () async {
       await insertTrack(db, uuid: '1', artist: 'Solo Artist');
 
-      final rows = await db.getArtists();
+      final rows = await db.watchArtists().first;
       final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Solo Artist']);
     });
@@ -775,7 +670,7 @@ void main() {
     test('excludes tracks with no artist and no albumArtist', () async {
       await insertTrack(db, uuid: '1');
 
-      final rows = await db.getArtists();
+      final rows = await db.watchArtists().first;
       expect(rows, isEmpty);
     });
 
@@ -784,78 +679,38 @@ void main() {
       await insertTrack(db, uuid: '2', artist: 'B');
       await insertTrack(db, uuid: '3', artist: 'C');
 
-      final rows = await db.getArtists(limit: 2);
+      final rows = await db.watchArtists(limit: 2).first;
       final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists.length, 2);
       expect(artists, ['A', 'B']);
     });
 
-    test('respects limit and offset', () async {
-      await insertTrack(db, uuid: '1', artist: 'A');
-      await insertTrack(db, uuid: '2', artist: 'B');
-      await insertTrack(db, uuid: '3', artist: 'C');
+    test('downloadedOnly keeps only artists with a downloaded track',
+        () async {
+      await insertTrack(db, uuid: '1', artist: 'Kept');
+      await insertTrack(db, uuid: '2', artist: 'Remote');
+      await db.customUpdate(
+        "UPDATE tracks SET file_path = '/tmp/1.audio' WHERE uuid_id = ?",
+        variables: [Variable.withString('1')],
+        updates: {db.tracks},
+      );
 
-      final rows = await db.getArtists(limit: 2, offset: 1);
-      final artists = rows.map((r) => r.read<String>('name')).toList();
-      expect(artists, ['B', 'C']);
+      final all = await db.watchArtists().first;
+      expect(all.map((r) => r.read<String>('name')), ['Kept', 'Remote']);
+      final rows = await db.watchArtists(downloadedOnly: true).first;
+      expect(rows.map((r) => r.read<String>('name')), ['Kept']);
     });
   });
 
   final defaultArtistOrder = [ArtistOrderParameter(column: 'name')];
 
-  group('getArtists with cursor', () {
-    test('cursor pagination skips artists before cursor', () async {
-      await insertTrack(db, uuid: '1', artist: 'Alice');
-      await insertTrack(db, uuid: '2', artist: 'Bob');
-      await insertTrack(db, uuid: '3', artist: 'Charlie');
-
-      final rows = await db.getArtists(
-        orderBy: defaultArtistOrder,
-        cursorFilters: [ArtistRowFilterParameter(column: 'name', value: 'Bob')],
-      );
-      final artists = rows.map((r) => r.read<String>('name')).toList();
-      expect(artists, ['Charlie']);
-    });
-
-    test('cursor works across pages', () async {
-      await insertTrack(db, uuid: '1', artist: 'Alice');
-      await insertTrack(db, uuid: '2', artist: 'Bob');
-      await insertTrack(db, uuid: '3', artist: 'Charlie');
-      await insertTrack(db, uuid: '4', artist: 'Dave');
-      await insertTrack(db, uuid: '5', artist: 'Eve');
-
-      // First page
-      final page1 = await db.getArtists(orderBy: defaultArtistOrder, limit: 2);
-      final page1Names = page1.map((r) => r.read<String>('name')).toList();
-      expect(page1Names, ['Alice', 'Bob']);
-
-      // Second page via cursor
-      final page2 = await db.getArtists(
-        orderBy: defaultArtistOrder,
-        cursorFilters: [ArtistRowFilterParameter(column: 'name', value: 'Bob')],
-        limit: 2,
-      );
-      final page2Names = page2.map((r) => r.read<String>('name')).toList();
-      expect(page2Names, ['Charlie', 'Dave']);
-
-      // Third page
-      final page3 = await db.getArtists(
-        orderBy: defaultArtistOrder,
-        cursorFilters: [
-          ArtistRowFilterParameter(column: 'name', value: 'Dave'),
-        ],
-        limit: 2,
-      );
-      final page3Names = page3.map((r) => r.read<String>('name')).toList();
-      expect(page3Names, ['Eve']);
-    });
-
-    test('with orderBy and no cursor returns all sorted', () async {
+  group('watchArtists with an order', () {
+    test('with orderBy returns all sorted', () async {
       await insertTrack(db, uuid: '1', artist: 'Charlie');
       await insertTrack(db, uuid: '2', artist: 'Alice');
       await insertTrack(db, uuid: '3', artist: 'Bob');
 
-      final rows = await db.getArtists(orderBy: defaultArtistOrder);
+      final rows = await db.watchArtists(orderBy: defaultArtistOrder).first;
       final artists = rows.map((r) => r.read<String>('name')).toList();
       expect(artists, ['Alice', 'Bob', 'Charlie']);
     });
@@ -1234,28 +1089,6 @@ void main() {
       },
     );
 
-    test('cursor pagination skips rows before cursor', () async {
-      await insertTrack(db, uuid: '1', artist: 'A', album: 'Alpha', year: 2020);
-      await insertTrack(db, uuid: '2', artist: 'A', album: 'Beta', year: 2021);
-      await insertTrack(db, uuid: '3', artist: 'A', album: 'Gamma', year: 2022);
-
-      final rows = await db.getAlbums(
-        artistId: null,
-        orderBy: defaultAlbumOrder,
-        cursorFilters: [
-          AlbumRowFilterParameter(column: 'name', value: 'Alpha'),
-          AlbumRowFilterParameter(column: 'artist', value: 'A'),
-          AlbumRowFilterParameter(column: 'year', value: 2020),
-          AlbumRowFilterParameter(column: 'is_single_grouping', value: 0),
-        ],
-      );
-      final albums = rows
-          .where((r) => r.read<int>('is_single_grouping') == 0)
-          .map((r) => r.read<String>('name'))
-          .toList();
-      expect(albums, ['Beta', 'Gamma']);
-    });
-
     test('nullsLast puts null album after non-null', () async {
       await insertTrack(
         db,
@@ -1446,11 +1279,11 @@ void main() {
     );
   });
 
-  group('getArtists cover_art_id subquery', () {
+  group('watchArtists cover_art_id subquery', () {
     test('returns null cover_art_id when no tracks have art', () async {
       await insertTrack(db, uuid: '1', artist: 'Artist');
 
-      final rows = await db.getArtists();
+      final rows = await db.watchArtists().first;
       expect(rows.length, 1);
       expect(rows.first.readNullable<int>('cover_art_id'), equals(null));
     });
@@ -1465,7 +1298,7 @@ void main() {
         updates: {db.trackmetadata},
       );
 
-      final rows = await db.getArtists();
+      final rows = await db.watchArtists().first;
       expect(rows.length, 1);
       expect(rows.first.readNullable<int>('cover_art_id'), 7);
     });
@@ -1783,10 +1616,122 @@ void main() {
     );
   });
 
+  // U15-FE-DB-A-09: every table is seeded, so a table added later without a
+  // seed here fails, and the reset must leave every one of them empty.
+  test('a local reset leaves every table and search table empty', () async {
+    const statements = [
+      "INSERT INTO artists (id, name) VALUES (1, 'A')",
+      "INSERT INTO albums (id, name, artist_id) VALUES (1, 'B', 1)",
+      "INSERT INTO tracks (uuid_id, created_at, last_updated, file_path) "
+          "VALUES ('t1', 1, 1, '/tmp/t1.m4a')",
+      "INSERT INTO trackmetadata (uuid_id, title, artist_id, album_id) "
+          "VALUES ('t1', 'Song', 1, 1)",
+      "INSERT INTO queue_sessions (id, created_at, updated_at, source_type) "
+          "VALUES (1, 1, 1, 'library')",
+      "INSERT INTO queue_session_items (item_id, session_id, position, uuid_id) "
+          "VALUES (1, 1, 0, 't1')",
+      "INSERT INTO queue_session_play_order (session_id, play_position, item_id) "
+          "VALUES (1, 0, 1)",
+      "INSERT INTO pending_edits (uuid_id, values_json, write_mode, updated_at) "
+          "VALUES ('t1', '{}', 'db_only', 1)",
+      "INSERT INTO server_binding (local_binding_id, last_base_url, bound_at) "
+          "VALUES ('b1', 'http://test:8080', 1)",
+      "INSERT INTO sync_cursors (stream, value) VALUES ('catalog', 5)",
+      "INSERT INTO history_events (event_uuid, kind, entity_type, entity_ref, "
+          "occurred_at, pending_upload) VALUES ('e1', 'play', 'track', 't1', 1, 1)",
+      "INSERT INTO local_counters (key, value) VALUES ('other', 3)",
+      "INSERT INTO history_sync_failures (event_uuid, reason, failed_at) "
+          "VALUES ('e1', 'invalid', 1)",
+      "INSERT INTO history_conflict_archive (event_uuid, payload_json, "
+          "archived_at) VALUES ('e1', '{}', 1)",
+      "INSERT INTO active_listens (listen_uuid, queue_session_id, "
+          "queue_item_id, track_uuid, started_at, accumulated_micros, "
+          "last_checkpoint_at, state) "
+          "VALUES ('l1', 1, 1, 't1', 1, 0, 1, 'accumulating')",
+      "INSERT INTO durable_submissions (operation_uuid, kind, local_binding_id, "
+          "state, created_at, updated_at) "
+          "VALUES ('o1', 'k', 'b1', 'prepared', 1, 1)",
+      "INSERT INTO upload_intents (item_uuid, batch_uuid, selection_index, "
+          "display_name, last_state, local_binding_id, created_at, updated_at) "
+          "VALUES ('i1', 'batch', 0, 'a.flac', 'selected', 'b1', 1, 1)",
+      "INSERT INTO owned_file_cleanup (path, root_kind, created_at) "
+          "VALUES ('/tmp/x', 'downloads', 1)",
+      "INSERT INTO fts_tracks (rowid, title, artist_name, album_name) "
+          "VALUES (1, 'Song', 'A', 'B')",
+      "INSERT INTO fts_artists (rowid, name) VALUES (1, 'A')",
+      "INSERT INTO fts_albums (rowid, name, artist_name) VALUES (1, 'B', 'A')",
+    ];
+    for (final sql in statements) {
+      await db.customStatement(sql);
+    }
+    Future<int> count(String table) async => (await db
+            .customSelect('SELECT COUNT(*) AS c FROM "$table"')
+            .getSingle())
+        .read<int>('c');
+    Future<int> ftsHits(String table, String term) async => (await db
+            .customSelect(
+              "SELECT rowid FROM $table WHERE $table MATCH '\"$term\"'",
+            )
+            .get())
+        .length;
+
+    final tables = [for (final t in db.allTables) t.actualTableName];
+    expect(tables, hasLength(18));
+    // The search tables are not Drift tables; a new one must be added here.
+    final searchTables = await db
+        .customSelect(
+          "SELECT name FROM sqlite_master WHERE type = 'table' "
+          "AND sql LIKE 'CREATE VIRTUAL TABLE%USING fts5%' ORDER BY name",
+        )
+        .get();
+    expect([for (final r in searchTables) r.read<String>('name')],
+        ['fts_albums', 'fts_artists', 'fts_tracks']);
+    for (final table in tables) {
+      expect(await count(table), greaterThan(0),
+          reason: '$table is not seeded by this test');
+    }
+    expect(await count('sqlite_sequence'), greaterThan(0));
+
+    await db.resetLocalData();
+
+    for (final table in tables) {
+      expect(await count(table), 0, reason: '$table survived the reset');
+    }
+    expect(await count('sqlite_sequence'), 0);
+    expect(await ftsHits('fts_tracks', 'Song'), 0);
+    expect(await ftsHits('fts_artists', 'A'), 0);
+    expect(await ftsHits('fts_albums', 'B'), 0);
+  });
+
+  // U15-FE-DB-A-03: a column that marks a track as downloaded must be in
+  // clearedDownloadColumns, or a delete leaves the row half-cleared. Every
+  // tracks column is either server-owned or one of these.
+  test('clearedDownloadColumns nulls every download column of tracks', () {
+    const downloadColumns = {
+      'file_path',
+      'damaged_file_path',
+      'downloaded_bitrate_kbps',
+      'file_size_bytes',
+      'downloaded_quality',
+      'downloaded_at_revision',
+      'downloaded_codec',
+      'stale_dismissed_at_revision',
+    };
+    const serverOwned = {'uuid_id', 'created_at', 'last_updated', 'revision'};
+    final cleared = clearedDownloadColumns.toColumns(false);
+    expect(cleared.keys.toSet(), downloadColumns);
+    for (final entry in cleared.entries) {
+      expect((entry.value as Variable).value, isNull, reason: entry.key);
+    }
+    final columns = {for (final c in db.tracks.$columns) c.name};
+    expect(columns.difference(serverOwned), downloadColumns,
+        reason: 'a new tracks column is server-owned or a download column');
+  });
+
   group('schema', () {
     // A fresh install lands directly on the latest schema version with the
-    // newest columns present (upgrades are covered by the real-file migration
-    // tests under test/database/ and test/drift/).
+    // newest columns present (the version rules are in
+    // test/database/schema_version_test.dart).
     test('fresh database is created at the latest version with the full current shape',
         () async {
       final version = await db

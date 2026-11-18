@@ -1,13 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'package:frontend/models/app_info.dart' show isLosslessCodec;
+import 'package:frontend/models/track_names.dart';
+import 'package:frontend/models/app_info.dart'
+    show isDownloadedAudioUnchanged;
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/services/download_manager.dart' show formatBytes;
+import 'package:frontend/models/byte_text.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/services/stale_downloads_provider.dart';
 import 'package:frontend/ui/downloads_controller.dart';
+import 'package:frontend/ui/library_actions.dart' show redownloadResultMessage;
 
 /// Always-evaluated surface for downloads whose track changed on the server
 /// (audio, tags or artwork) since the download completed -- structural mirror
@@ -69,7 +72,6 @@ class StaleDownloadsBanner extends ConsumerWidget {
 /// Banner copy. Deliberately names all three kinds of server-side change:
 /// staleness is revision-derived, so a tag or artwork edit made elsewhere
 /// flags a download just like a master conversion does.
-@visibleForTesting
 String staleDownloadsBannerLabel(int count) =>
     '$count downloaded track${count == 1 ? '' : 's'} changed on the server '
     'since you downloaded ${count == 1 ? 'it' : 'them'} '
@@ -79,28 +81,21 @@ String staleDownloadsBannerLabel(int count) =>
 /// and file size (each when known) against the current master's codec and
 /// bitrate. An unknown (null) bitrate is omitted; a real 0 is shown.
 ///
-/// When the downloaded audio already matches the current master, the change
-/// must have been to tags or artwork, so say that instead of an identical
-/// "flac, 900 kbps -> flac, 900 kbps". "Matches" means the same codec and
-/// either a lossless codec (a lossless master can't be re-encoded to its own
-/// codec -- the server rejects that as a no-op -- so its audio is unchanged
-/// whatever the bitrates say) or bitrates within 1 kbps. The tolerance is
-/// needed because the server's `X-Audio-Bitrate-Kbps` header (stored as the
-/// downloaded bitrate) is the TRUNCATED master bitrate, so 899.7 kbps
-/// downloads as 899.
-@visibleForTesting
+/// When the downloaded audio already matches the current master
+/// ([isDownloadedAudioUnchanged]), the change must have been to tags or
+/// artwork, so say that instead of an identical
+/// "flac, 900 kbps -> flac, 900 kbps".
 String staleDownloadDiffLabel(TrackUI track) {
   final oldCodec = track.downloadedCodec;
   final newCodec = track.codec;
   final oldBitrate = track.downloadedBitrateKbps?.toDouble();
   final newBitrate = track.bitrateKbps;
-  if (oldCodec != null &&
-      newCodec != null &&
-      oldCodec.toLowerCase() == newCodec.toLowerCase() &&
-      ((isLosslessCodec(newCodec) ?? false) ||
-          (oldBitrate != null &&
-              newBitrate != null &&
-              (oldBitrate - newBitrate).abs() <= 1))) {
+  if (isDownloadedAudioUnchanged(
+    downloadedCodec: oldCodec,
+    codec: newCodec,
+    downloadedBitrateKbps: oldBitrate,
+    bitrateKbps: newBitrate,
+  )) {
     return 'Audio unchanged — tags or artwork updated';
   }
   final size = track.fileSizeBytes;
@@ -208,12 +203,7 @@ class _StaleDownloadsList extends ConsumerWidget {
     final result = await ref
         .read(downloadsControlsProvider)
         .redownloadStale(tracks);
-    final message = result.failed == 0
-        ? 'Re-download queued'
-        : result.failed == result.total
-            ? 'Couldn’t queue re-download. Try again.'
-            : 'Couldn’t queue re-download for ${result.failed} of '
-                '${result.total} tracks. Try again.';
+    final message = redownloadResultMessage(result) ?? 'Re-download queued';
     messenger?.showSnackBar(SnackBar(content: Text(message)));
   }
 }
@@ -235,7 +225,7 @@ class _StaleRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return ListTile(
       title: Text(
-        track.title ?? track.uuidId,
+        trackTitleOrUnknown(track.title),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),

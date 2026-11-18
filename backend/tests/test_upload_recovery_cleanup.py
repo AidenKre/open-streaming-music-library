@@ -19,17 +19,12 @@ import pytest
 
 from app.services.upload_publish import SimulatedCrash
 from app.services.upload_receipt import ReceiptFiles
-from tests.identity_worker_fixtures import add_track, make_db, sql
+from tests.identity_worker_fixtures import add_track, sql
 from tests.owned_database import add_test_user
 from tests.upload_commit_fixtures import journal, reservations
 from tests.upload_publish_fixtures import RecordingSeam, library_track, track_row
 from tests.upload_recovery_fixtures import World, art_ids
 from tests.upload_validation_fixtures import item_row, stage_item
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -175,6 +170,22 @@ def test_an_import_journal_pointing_outside_the_owners_stage_removes_nothing(wor
     world.recover()
 
     assert_bystanders_untouched(bystanders)
+
+
+def test_an_imported_source_recorded_outside_the_owners_stage_is_never_removed(world, bystanders):
+    """The source release's own path check: the work path is the operation's,
+    but the item and the journal both record another owner's staged file."""
+    staged, _ = bystanders
+    commit = world.crash_at("after_insert_commit")
+    sql(world.db, "UPDATE upload_commit_journal SET source_path = ? WHERE owner_id = ? AND operation_uuid = ?",
+        (str(staged["source"]), commit["owner_id"], commit["op"]))
+    sql(world.db, "UPDATE upload_items SET source_path = ? WHERE owner_id = ? AND item_uuid = ?",
+        (str(staged["source"]), commit["owner_id"], commit["item_uuid"]))
+
+    world.recover()
+
+    assert_bystanders_untouched(bystanders)
+    assert item_row(world.db, commit)["source_path"] == str(staged["source"])
 
 
 # ── duplicate_conflict ─────────────────────────────────────────────────────

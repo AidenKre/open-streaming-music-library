@@ -116,6 +116,7 @@ class _ObservedDownloader extends TrackDownloader {
     required void Function(Future<void> Function() canceller)
         registerCanceller,
     required void Function() unregisterCanceller,
+    bool Function()? isCancelled,
   }) async {
     final outcome = await super.download(
       job: job,
@@ -123,9 +124,59 @@ class _ObservedDownloader extends TrackDownloader {
       onProgress: onProgress,
       registerCanceller: registerCanceller,
       unregisterCanceller: unregisterCanceller,
+      isCancelled: isCancelled,
     );
     if (!finished.isCompleted) finished.complete(outcome);
     return outcome;
+  }
+}
+
+/// The real downloader, holding its result until [release] completes: a
+/// cancel landing then lands after the commit step finished.
+class _HeldAfterDownload extends TrackDownloader {
+  _HeldAfterDownload({
+    required super.db,
+    required super.coverArtStore,
+    required super.directoryProvider,
+    required super.apiClient,
+  });
+
+  final returned = Completer<void>();
+  final release = Completer<void>();
+
+  @override
+  Future<DownloadOutcome> download({
+    required DownloadJob job,
+    required bool Function() generationCheck,
+    required void Function(double progress) onProgress,
+    required void Function(Future<void> Function() canceller)
+        registerCanceller,
+    required void Function() unregisterCanceller,
+    bool Function()? isCancelled,
+  }) async {
+    final outcome = await super.download(
+      job: job,
+      generationCheck: generationCheck,
+      onProgress: onProgress,
+      registerCanceller: registerCanceller,
+      unregisterCanceller: unregisterCanceller,
+      isCancelled: isCancelled,
+    );
+    returned.complete();
+    await release.future;
+    return outcome;
+  }
+}
+
+/// Waits in real time, at most [limit], until [done] holds: for work started
+/// without being awaited that goes through real file I/O, which a fixed
+/// number of event-queue turns does not bound. The expect after it reports a
+/// condition that never came.
+Future<void> _eventually(bool Function() done,
+    {Duration limit = const Duration(seconds: 5)}) async {
+  final elapsed = Stopwatch()..start();
+  while (!done() && elapsed.elapsed < limit) {
+    await Future<void>.delayed(const Duration(milliseconds: 5));
   }
 }
 
@@ -451,6 +502,242 @@ void main() {
           ..where((t) => t.uuidId.equals('b')))
         .getSingle();
     expect(row.filePath, isNull);
+  });
+
+  // Other-issues row 74: Cancel on a download in progress. The end state is
+  // the cancelled queued row's: the row leaves the list, the slot is freed
+  // for the next job, and no file of the download stays (partial or new).
+  // A cancel that lands while the commit step runs: before the commit's last
+  // check the cancel wins (that end state); after it the download wins (the
+  // row is Completed and the file recorded). Both are clean.
+  group('cancelActive', () {
+    List<String> trackFiles() {
+      final dir = Directory('${tempDir.path}/tracks');
+      return dir.existsSync()
+          ? [for (final f in dir.listSync()) f.uri.pathSegments.last]
+          : const [];
+    }
+
+    Future<String?> recordedPath(String uuid) async =>
+        (await (db.select(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+                .getSingle())
+            .filePath;
+
+    test('a download receiving its body: the row leaves, the slot goes to '
+        'the next job, no partial file stays', () async {
+      final gate = Completer<void>();
+      final client = _GatedClient(gate);
+      final dl = TrackDownloader(
+        db: db,
+        coverArtStore: coverStore,
+        directoryProvider: () async => tempDir,
+        apiClient: testApiClient('http://test:8080', client),
+      );
+      var completed = 0;
+      final allCompleted = Completer<void>();
+      final pool = WorkerPool(
+        queue: queue,
+        downloader: dl,
+        isOffline: () => false,
+        onCompleted: () {
+          if (++completed == 4) allCompleted.complete();
+        },
+      );
+      for (var i = 0; i < 5; i++) {
+        await _insertTrack(db, 'u$i');
+      }
+      queue.addAll([for (var i = 0; i < 5; i++) _job('u$i')]);
+      pool.pump();
+      await client.sentAtLeast(4);
+      // The partial file is created by real file I/O that nothing here
+      // awaits: wait for it in real time, bounded.
+      await _eventually(() => trackFiles().contains('u0.m4a.partial'));
+      expect(trackFiles(), contains('u0.m4a.partial'));
+
+      await pool.cancelActive('u0');
+      expect(queue.state.jobs.map((j) => j.uuidId), isNot(contains('u0')));
+      await client.sentAtLeast(5);
+      expect(queue.state.jobs.singleWhere((j) => j.uuidId == 'u4').isActive,
+          isTrue, reason: 'the freed slot runs the next queued job');
+      expect(trackFiles().where((f) => f.startsWith('u0.')), isEmpty);
+
+      gate.complete();
+      await allCompleted.future;
+      expect(queue.state.jobs.map((j) => j.uuidId),
+          unorderedEquals(['u1', 'u2', 'u3', 'u4']));
+      expect(queue.state.jobs.every((j) => j.isCompleted), isTrue);
+      expect(await recordedPath('u0'), isNull);
+      expect(trackFiles().where((f) => f.startsWith('u0.')), isEmpty);
+    });
+
+    test('a cancel landing in the commit step before its last check: the '
+        'cancel wins, nothing is recorded and no file stays', () async {
+      final hold = Completer<void>();
+      final atRecord = Completer<void>();
+      final dl = _ObservedDownloader(
+        db: db,
+        coverArtStore: coverStore,
+        directoryProvider: () async => tempDir,
+        apiClient: testApiClient(
+          'http://test:8080',
+          MockClient((_) async => http.Response.bytes([1, 2, 3], 200,
+              headers: {'x-audio-extension': 'm4a'})),
+        ),
+      );
+      dl.testHookBeforeDbWrite = (_) async {
+        atRecord.complete();
+        await hold.future;
+      };
+      final pool = WorkerPool(
+        queue: queue,
+        downloader: dl,
+        isOffline: () => false,
+        onCompleted: () {},
+      );
+      await _insertTrack(db, 'a');
+      queue.addAll([_job('a')]);
+      pool.pump();
+      await atRecord.future;
+
+      final cancel = pool.cancelActive('a');
+      hold.complete();
+      await cancel;
+      expect((await dl.finished.future).kind, DownloadOutcomeKind.cancelled);
+      expect(queue.state.jobs, isEmpty);
+      expect(await recordedPath('a'), isNull);
+      expect(trackFiles(), isEmpty);
+    });
+
+    // Review F1: once the row swap of a re-download has committed, a cancel
+    // loses: the new file is recorded and the replaced one goes, as for a
+    // finished download (it must not end with neither file).
+    test('a cancel landing after the row swap of a re-download: the download '
+        'wins', () async {
+      final dl = _ObservedDownloader(
+        db: db,
+        coverArtStore: coverStore,
+        directoryProvider: () async => tempDir,
+        apiClient: testApiClient(
+          'http://test:8080',
+          MockClient((_) async => http.Response.bytes([1, 2, 3], 200,
+              headers: {'x-audio-extension': 'm4a'})),
+        ),
+      );
+      final pool = WorkerPool(
+        queue: queue,
+        downloader: dl,
+        isOffline: () => false,
+        onCompleted: () {},
+      );
+      await _insertTrack(db, 'a');
+      final old = File('${tempDir.path}/tracks/a.m4a');
+      await old.create(recursive: true);
+      await old.writeAsBytes([9, 9]);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
+          .write(TracksCompanion(filePath: Value(old.path)));
+      Future<void>? cancel;
+      dl.testHookAfterRecord = (_) async {
+        cancel = pool.cancelActive('a');
+      };
+      queue.addAll([
+        DownloadJob(
+          uuidId: 'a',
+          title: 't',
+          artist: 'a',
+          quality: '320',
+          status: const Queued(),
+          replacesFilePath: old.path,
+        ),
+      ]);
+      pool.pump();
+      expect((await dl.finished.future).kind, DownloadOutcomeKind.success);
+      await cancel;
+      expect(queue.state.jobs.single.isCompleted, isTrue);
+      final path = await recordedPath('a');
+      expect(path, isNotNull);
+      expect(path, isNot(old.path));
+      expect(File(path!).existsSync(), isTrue);
+      expect(old.existsSync(), isFalse, reason: 'the replaced file goes');
+    });
+
+    test('a cancel landing after the commit step: the download wins, the '
+        'row is Completed and the file recorded', () async {
+      final dl = _HeldAfterDownload(
+        db: db,
+        coverArtStore: coverStore,
+        directoryProvider: () async => tempDir,
+        apiClient: testApiClient(
+          'http://test:8080',
+          MockClient((_) async => http.Response.bytes([1, 2, 3], 200,
+              headers: {'x-audio-extension': 'm4a'})),
+        ),
+      );
+      final pool = WorkerPool(
+        queue: queue,
+        downloader: dl,
+        isOffline: () => false,
+        onCompleted: () {},
+      );
+      await _insertTrack(db, 'a');
+      queue.addAll([_job('a')]);
+      pool.pump();
+      await dl.returned.future;
+
+      final cancel = pool.cancelActive('a');
+      dl.release.complete();
+      await cancel;
+      expect(queue.state.jobs.single.isCompleted, isTrue);
+      final path = await recordedPath('a');
+      expect(path, isNotNull);
+      expect(File(path!).existsSync(), isTrue);
+      expect(trackFiles(), ['a.m4a']);
+    });
+
+    test('a cancel waiting for the response that then fails on the network: '
+        'the row leaves instead of going back to the queue', () async {
+      final answer = Completer<void>();
+      final dl = TrackDownloader(
+        db: db,
+        coverArtStore: coverStore,
+        directoryProvider: () async => tempDir,
+        apiClient: testApiClient(
+          'http://test:8080',
+          MockClient((_) async {
+            await answer.future;
+            throw const SocketException('connection reset');
+          }),
+        ),
+      );
+      final pool = WorkerPool(
+        queue: queue,
+        downloader: dl,
+        isOffline: () => false,
+        onCompleted: () {},
+      );
+      await _insertTrack(db, 'a');
+      queue.addAll([_job('a')]);
+      pool.pump();
+      await pumpEventQueue();
+
+      final cancel = pool.cancelActive('a');
+      answer.complete();
+      await cancel;
+      expect(queue.state.jobs, isEmpty);
+      expect(trackFiles(), isEmpty);
+    });
+
+    test('a track that is not downloading: nothing happens', () async {
+      final pool = WorkerPool(
+        queue: queue,
+        downloader: downloader,
+        isOffline: () => true,
+        onCompleted: () {},
+      );
+      queue.addAll([_job('q')]);
+      await pool.cancelActive('q');
+      await pool.cancelActive('missing');
+      expect(queue.state.jobs.single.isQueued, isTrue);
+    });
   });
 
   test('pump is a no-op when offline', () async {

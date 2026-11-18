@@ -4,9 +4,9 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/providers/providers.dart';
-import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 
@@ -14,9 +14,12 @@ import 'package:frontend/services/uploads/upload_source.dart';
 ///
 /// Every call first waits for the binding gate ([ServerBindingGate.
 /// awaitVerified]): nothing is built or sent to a server this connection has
-/// not verified (OPEN-M-11, plan §6). Every call goes through the bound
-/// client (`boundApiClientProvider`): an answer stamped by another instance
-/// throws `ServerInstanceChangedException` (never a body or an
+/// not verified (OPEN-M-11, plan §6). One call can be asked to wait only
+/// within the gate's bound: [listItems] with
+/// [BindingWait.forPendingVerdict] fails, and sends nothing either, when the
+/// server is not verified by then. Every call goes through the
+/// bound client (`boundApiClientProvider`): an answer stamped by another
+/// instance throws `ServerInstanceChangedException` (never a body or an
 /// [ApiException]); before rethrowing it, this class reports it to the gate
 /// with the connection captured with the token, so the different-server
 /// flow runs and later calls wait at the gate. The caller leaves its local
@@ -34,46 +37,45 @@ class UploadsApi {
   final ApiClient _api;
   final ServerBindingGate _gate;
 
-  /// Waits for the gate, then runs [send]; an answer from another instance
-  /// is reported to the gate (with the connection captured alongside the
-  /// token) before it is rethrown.
+  /// Waits for the gate without a limit, then runs [send]
+  /// ([sendWhenVerified]): an answer from another instance is reported to
+  /// the gate (with the connection captured alongside the token) before it
+  /// is rethrown.
   ///
   /// [abortTrigger] (completing, with or without an error) ends a wait at
   /// the gate with [UploadTransferAborted] and sends nothing. Once [send]
   /// is under way only [putContent] can be stopped (its body stream); the
   /// JSON calls are short and the client can't cancel them mid-flight.
+  ///
+  /// A read for a page a person is looking at passes
+  /// [BindingWait.forPendingVerdict] as [wait]: it behaves like a person's
+  /// own action. A check in flight, or a failed one that is being retried,
+  /// is waited for within the gate's one bound. A different server, no
+  /// session, signed out, and offline while the server is still verified
+  /// fail at once with [BindingNotVerified] and its reason; a check that has
+  /// not passed at the bound fails then (offline after a failed re-check is
+  /// that case: it waits out the bound). It reads a token withheld at the
+  /// send the same way. Nothing is sent in any of these cases, and it never
+  /// waits without a limit.
   Future<T> _gated<T>(
-    Future<T> Function() send, [
-    Future<void>? abortTrigger,
-  ]) async {
-    var aborted = false;
-    final signal = Completer<void>();
-    void fire() {
-      aborted = true;
-      if (!signal.isCompleted) signal.complete();
-    }
-
-    abortTrigger?.then((_) => fire(), onError: (Object _) => fire());
-    if (aborted) throw const UploadTransferAborted();
-    final verified = _gate.awaitVerified();
-    if (abortTrigger == null) {
-      await verified;
-    } else {
-      // Future.any keeps listening to both, so a later error of either is
-      // handled.
-      await Future.any<Object?>([
-        verified,
-        signal.future.then<Object?>((_) => throw const UploadTransferAborted()),
-      ]);
-    }
-    final connection = _gate.verifiedConnection;
-    if (aborted) throw const UploadTransferAborted();
-    try {
-      return await send();
-    } on ServerInstanceChangedException catch (e) {
-      if (connection != null) _gate.reportDifferentInstance(connection, e);
-      rethrow;
-    }
+    Future<T> Function() send,
+    Future<void>? abortTrigger, {
+    BindingWait wait = BindingWait.untilVerified,
+  }) {
+    final unlimited = wait == BindingWait.untilVerified;
+    // Future.sync: a base URL that does not parse fails the call's future,
+    // as every other refusal does; it is never thrown at the caller.
+    return Future.sync(
+      () => sendWhenVerified(
+        _gate,
+        send,
+        wait: wait,
+        url: unlimited ? null : Uri.parse(_api.baseUrl),
+        abortTrigger: abortTrigger,
+        abortError: const UploadTransferAborted(),
+        withheldAsNotVerified: !unlimited,
+      ),
+    );
   }
 
   Map<String, String> _pageQuery(String? after, int? limit) => {
@@ -122,18 +124,27 @@ class UploadsApi {
       }, abortTrigger);
 
   /// `GET /tracks/uploads/{batch}/items?after=&limit=`.
+  ///
+  /// [wait]: the manager's own reads keep the default and wait for the
+  /// server check without a limit. A page a person is looking at ("Files in
+  /// this archive", the review page) passes
+  /// [BindingWait.forPendingVerdict]: a check in flight is waited for within
+  /// the gate's bound, and anything else that is not "verified and online"
+  /// throws [BindingNotVerified] instead of waiting (other-issues row 72).
+  /// That mode does not watch [abortTrigger] during its bounded wait.
   Future<UploadItemPage> listItems(
     String batchUuid, {
     String? after,
     int? limit,
     Future<void>? abortTrigger,
+    BindingWait wait = BindingWait.untilVerified,
   }) => _gated(() async {
     final json = await _api.getJson(
       ['tracks', 'uploads', batchUuid, 'items'],
       query: _pageQuery(after, limit),
     );
     return UploadItemPage.fromJson(json);
-  }, abortTrigger);
+  }, abortTrigger, wait: wait);
 
   /// `DELETE /tracks/uploads/items/{item}`: cancel (a repeat answers 200).
   Future<UploadItem> cancelItem(String itemUuid, {Future<void>? abortTrigger}) => _gated(() async {

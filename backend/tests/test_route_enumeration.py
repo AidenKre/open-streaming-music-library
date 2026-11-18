@@ -28,8 +28,12 @@ def _probes(app):
     for route in app.routes:
         methods = getattr(route, "methods", None)
         assert methods, f"route without methods: {route!r}"  # no Mounts/WebSockets yet
+        path = _concrete(route)
+        # The probe reaches the route it was made for, so its 401 comes from
+        # the token rule and not from a path no route serves.
+        assert route.path_regex.match(path), (route.path, path)
         for method in sorted(methods):
-            probes.append((method, route.path, _concrete(route)))
+            probes.append((method, route.path, path))
     return probes
 
 

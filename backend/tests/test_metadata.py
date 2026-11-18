@@ -8,7 +8,13 @@ from unittest.mock import patch
 import pytest
 
 import app.services.metadata as metadata
-from app.services.ffmpeg_runner import CaptureResult
+from app.services.ffmpeg_runner import (
+    CaptureOverflow,
+    CaptureResult,
+    CaptureTimeout,
+    FfmpegError,
+    FfmpegProcessRegistry,
+)
 
 
 def _completed(args, returncode, stdout, stderr):
@@ -117,7 +123,7 @@ class TestFfprobeForMetadata:
     def test_ffprobe_for_metadata__nonzero_exit_code__returns_none(
         self, tmp_path: Path
     ):
-        with patch("app.services.metadata.run_capture") as subprocess_run:
+        with patch("app.services.metadata.run_capture", autospec=True) as subprocess_run:
             subprocess_run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=1,
@@ -128,7 +134,7 @@ class TestFfprobeForMetadata:
             assert json_data is None
 
     def test_ffprobe_for_metadata__valid_file__returns_output_json(self):
-        with patch("app.services.metadata.run_capture") as subprocess_run:
+        with patch("app.services.metadata.run_capture", autospec=True) as subprocess_run:
             fake_output_json = {
                 "streams": [],
                 "format": {
@@ -150,7 +156,7 @@ class TestFfprobeForMetadata:
             assert json_data == fake_output_json
 
     def test_ffprobe_for_metadata__invalid_json__returns_none(self):
-        with patch("app.services.metadata.run_capture") as subprocess_run:
+        with patch("app.services.metadata.run_capture", autospec=True) as subprocess_run:
             subprocess_run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -161,7 +167,7 @@ class TestFfprobeForMetadata:
             assert json_data is None
 
     def test_ffprobe_for_metadata__empty_stdout__returns_empty_dict(self):
-        with patch("app.services.metadata.run_capture") as subprocess_run:
+        with patch("app.services.metadata.run_capture", autospec=True) as subprocess_run:
             subprocess_run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -179,7 +185,7 @@ class TestTheMetadataProbesReadExitsLikeTheSharedRule:
     def test_a_sigkill_is_unavailable_for_now_when_asked(self):
         import signal
 
-        with patch("app.services.metadata.run_capture",
+        with patch("app.services.metadata.run_capture", autospec=True,
                    return_value=_completed([], -signal.SIGKILL, "", "")):
             assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
             with metadata.probe_unavailable_raises(), pytest.raises(metadata.ProbeUnavailable):
@@ -192,7 +198,7 @@ class TestTheMetadataProbesReadExitsLikeTheSharedRule:
         unknown here (test_recovery_audio "crashed"); outside the block None."""
         import signal
 
-        with patch("app.services.metadata.run_capture",
+        with patch("app.services.metadata.run_capture", autospec=True,
                    return_value=_completed([], -getattr(signal, sig), "", "")):
             assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
             with metadata.probe_unavailable_raises(), pytest.raises(metadata.ProbeUnavailable):
@@ -202,7 +208,7 @@ class TestTheMetadataProbesReadExitsLikeTheSharedRule:
         import errno
 
         error = OSError(errno.EMFILE, "Too many open files")
-        with patch("app.services.metadata.run_capture", side_effect=error):
+        with patch("app.services.metadata.run_capture", autospec=True, side_effect=error):
             assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
             assert metadata.get_audio_bitrate_kbps(Path("a.flac")) is None
             with metadata.probe_unavailable_raises(), pytest.raises(metadata.ProbeUnavailable):
@@ -466,47 +472,83 @@ class TestBuildTrackMetadata:
 
 
 class TestExtractCoverArtBytes:
-    def test_returns_none_on_timeout(self):
-        with patch(
-            "app.services.metadata.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="ffmpeg", timeout=30),
-        ):
-            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+    # Pre-merge A3-04: the extraction runs through the bounded runner
+    # (run_capture), so these fakes stand in for it, not for subprocess.run.
+    # The answers are the ones the subprocess.run fakes pinned before.
 
-        assert result is None
+    @staticmethod
+    def _runner(monkeypatch, result=None, raises=None):
+        def fake(cmd, **kwargs):
+            if raises is not None:
+                raise raises
+            return result
+        monkeypatch.setattr(metadata, "run_capture", fake)
 
-    def test_returns_none_when_ffmpeg_not_found(self):
-        with patch(
-            "app.services.metadata.subprocess.run",
-            side_effect=FileNotFoundError,
-        ):
-            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+    def test_returns_none_on_timeout(self, monkeypatch):
+        self._runner(monkeypatch, raises=CaptureTimeout("ffmpeg timed out after 30s"))
+        assert metadata.extract_cover_art_bytes(Path("/fake/file.mp3")) is None
 
-        assert result is None
+    def test_returns_none_when_ffmpeg_not_found(self, monkeypatch):
+        self._runner(monkeypatch, raises=FfmpegError("ffmpeg not found", category="not found"))
+        assert metadata.extract_cover_art_bytes(Path("/fake/file.mp3")) is None
 
-    def test_returns_none_on_nonzero_exit(self):
-        mock_result = subprocess.CompletedProcess(
-            args=["ffmpeg"], returncode=1, stdout=b""
-        )
-        with patch(
-            "app.services.metadata.subprocess.run",
-            return_value=mock_result,
-        ):
-            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+    def test_returns_none_on_nonzero_exit(self, monkeypatch):
+        self._runner(monkeypatch, result=CaptureResult(1, b"", ""))
+        assert metadata.extract_cover_art_bytes(Path("/fake/file.mp3")) is None
 
-        assert result is None
+    def test_returns_bytes_on_success(self, monkeypatch):
+        self._runner(monkeypatch, result=CaptureResult(0, b"\x89PNG fake image data", ""))
+        assert metadata.extract_cover_art_bytes(Path("/fake/file.mp3")) == b"\x89PNG fake image data"
 
-    def test_returns_bytes_on_success(self):
-        mock_result = subprocess.CompletedProcess(
-            args=["ffmpeg"], returncode=0, stdout=b"\x89PNG fake image data"
-        )
-        with patch(
-            "app.services.metadata.subprocess.run",
-            return_value=mock_result,
-        ):
-            result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
+    def test_a_cover_over_the_output_bound_is_no_cover(self, monkeypatch):
+        self._runner(monkeypatch, raises=CaptureOverflow("ffmpeg stdout exceeded 16777216 bytes"))
+        assert metadata.extract_cover_art_bytes(Path("/fake/file.mp3")) is None
 
-        assert result == b"\x89PNG fake image data"
+
+# --- pre-merge A3-04: the cover extraction on staged upload bytes is bounded ---------
+
+
+def _ffmpeg_make(*args):
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", *args], check=True)
+
+
+def _jpeg_count(data: bytes) -> int:
+    return data.count(b"\xff\xd8\xff")
+
+
+@pytest.mark.requires_ffmpeg
+class TestCoverArtExtractionIsBounded:
+    @pytest.fixture(scope="class")
+    def files(self, tmp_path_factory):
+        root = tmp_path_factory.mktemp("cover-bound")
+        video = root / "video.m4a"  # an .m4a carrying a real video stream: 50 frames
+        _ffmpeg_make("-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                     "-f", "lavfi", "-i", "testsrc=size=128x128:rate=25:duration=2",
+                     "-map", "0:a", "-map", "1:v", "-c:a", "aac", "-c:v", "mjpeg", "-f", "mp4", str(video))
+        cover = root / "cover.m4a"  # an ordinary attached picture
+        _ffmpeg_make("-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                     "-f", "lavfi", "-i", "testsrc=size=128x128:rate=1:duration=1",
+                     "-map", "0:a", "-map", "1:v", "-c:a", "aac", "-c:v", "mjpeg",
+                     "-frames:v", "1", "-disposition:v", "attached_pic", "-f", "mp4", str(cover))
+        return {"video": video, "cover": cover}
+
+    def test_a_video_stream_gives_one_picture_not_the_whole_stream(self, files):
+        data = metadata.extract_cover_art_bytes(files["video"], input_format="mov")
+        assert data is not None and _jpeg_count(data) == 1
+
+    def test_an_ordinary_cover_is_still_read(self, files):
+        data = metadata.extract_cover_art_bytes(files["cover"], input_format="mov")
+        assert data is not None and _jpeg_count(data) == 1
+
+    def test_a_picture_larger_than_the_bound_is_no_cover(self, files, monkeypatch):
+        monkeypatch.setattr(metadata, "COVER_ART_MAX_BYTES", 1024, raising=False)
+        assert metadata.extract_cover_art_bytes(files["cover"], input_format="mov") is None
+
+    def test_a_shutdown_kills_the_extraction(self, files):
+        registry = FfmpegProcessRegistry()
+        registry.close()  # shutting down: every run registered from now on is killed
+        with metadata.probes_killed_by(registry):
+            assert metadata.extract_cover_art_bytes(files["cover"], input_format="mov") is None
 
 
 # --- U05-A-06: every probe here is bounded ---------------------------------------

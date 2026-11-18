@@ -2,11 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/duration_text.dart';
 import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/playback/media_token_binding.dart';
-import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/widgets/queue_list_controller.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
@@ -240,12 +240,15 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      formatDuration(displayedPosition),
+                      formatTrackDuration(
+                          displayedPosition.inMilliseconds / 1000),
                       key: const Key('now_playing_elapsed'),
                       style: textTheme.bodySmall,
                     ),
                     Text(
-                      duration == null ? '--:--' : formatDuration(duration),
+                      duration == null
+                          ? '--:--'
+                          : formatTrackDuration(duration.inMilliseconds / 1000),
                       key: const Key('now_playing_duration'),
                       style: textTheme.bodySmall,
                     ),
@@ -421,6 +424,9 @@ class _QueueViewState extends ConsumerState<_QueueView> {
   // never touches it in build).
   late final QueueListControls _list;
 
+  /// The playing item of the last build, to notice a track change.
+  int? _builtCurrentItemId;
+
   @override
   void initState() {
     super.initState();
@@ -459,14 +465,15 @@ class _QueueViewState extends ConsumerState<_QueueView> {
   }
 
   Future<void> _loadBefore() async {
-    final previousOffset = _scrollController.hasClients
-        ? _scrollController.offset
-        : 0.0;
     final prepended = await _list.loadBefore(totalCount: _totalCount);
     if (prepended == 0 || !mounted) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
-      _scrollController.jumpTo(previousOffset + (prepended * _itemExtent));
+      // From where the list is now, not where it was before the read: a
+      // scroll made meanwhile (the person's, or one that followed the
+      // playing track) is kept.
+      _scrollController.jumpTo(
+          _scrollController.offset + (prepended * _itemExtent));
     });
   }
 
@@ -531,6 +538,41 @@ class _QueueViewState extends ConsumerState<_QueueView> {
     final localIndex = currentPlayPosition - _list.startPlayPosition;
     if (localIndex < 0 || localIndex >= rowCount) return;
     _list.scrolledToCurrent();
+    _centreRowAfterFrame(localIndex);
+  }
+
+  /// The playing track changed to another loaded row. When its old row was
+  /// in view (the person is looking at the playing track), the list keeps
+  /// the new playing row in view; when the person had scrolled it out of
+  /// view, the list stays where they put it. A track outside the loaded rows
+  /// is shown by the load that [QueueListControls.plan] starts for it
+  /// ([_scrollToCurrentTrack]).
+  void _followCurrentTrack(int? currentItemId, List<QueueRow> rows) {
+    final previousItemId = _builtCurrentItemId;
+    _builtCurrentItemId = currentItemId;
+    if (previousItemId == null ||
+        currentItemId == null ||
+        previousItemId == currentItemId ||
+        !_scrollController.hasClients) {
+      return;
+    }
+    final previousIndex =
+        rows.indexWhere((row) => row.entry.itemId == previousItemId);
+    final currentIndex =
+        rows.indexWhere((row) => row.entry.itemId == currentItemId);
+    if (previousIndex < 0 || currentIndex < 0) return;
+    final position = _scrollController.position;
+    final viewTop = position.pixels;
+    final viewBottom = viewTop + position.viewportDimension;
+    final previousInView = previousIndex * _itemExtent < viewBottom &&
+        (previousIndex + 1) * _itemExtent > viewTop;
+    final currentInView = currentIndex * _itemExtent >= viewTop &&
+        (currentIndex + 1) * _itemExtent <= viewBottom;
+    if (!previousInView || currentInView) return;
+    _centreRowAfterFrame(currentIndex);
+  }
+
+  void _centreRowAfterFrame(int localIndex) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
       const itemHeight = _itemExtent;
@@ -576,16 +618,18 @@ class _QueueViewState extends ConsumerState<_QueueView> {
       totalCount: totalCount,
     );
     final rows = _list.rows;
+    _followCurrentTrack(currentItemId, rows);
     _scrollToCurrentTrack(currentPlayPosition, rows.length);
 
     if (_list.isInitialLoad && rows.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (_list.error != null && rows.isEmpty) {
-      return Center(
-        child: SingleChildScrollView(
-          child: Column(
+    // A failed read: the text and Retry, alone or, with rows still on
+    // screen, above them (other-issues row 69).
+    final errorNotice = _list.error == null
+        ? null
+        : Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
@@ -593,21 +637,28 @@ class _QueueViewState extends ConsumerState<_QueueView> {
                 style: textTheme.bodyMedium?.copyWith(color: colors.onSurfaceVariant),
               ),
               TextButton(
-                onPressed: () => _list.loadInitial(
-                  sessionId: sessionId,
-                  expectedQueueVersion: queueVersion,
-                  currentPlayPosition: currentPlayPosition,
-                  totalCount: totalCount,
-                ),
+                // A failed read of more rows is repeated where the person
+                // is; any other failed read reloads around the current track.
+                onPressed: () => switch (_list.failedPage) {
+                  QueuePage.before => _loadBefore(),
+                  QueuePage.after => _list.loadAfter(totalCount: totalCount),
+                  null => _list.loadInitial(
+                    sessionId: sessionId,
+                    expectedQueueVersion: queueVersion,
+                    currentPlayPosition: currentPlayPosition,
+                    totalCount: totalCount,
+                  ),
+                },
                 child: const Text('Retry'),
               ),
             ],
-          ),
-        ),
-      );
+          );
+
+    if (errorNotice != null && rows.isEmpty) {
+      return Center(child: SingleChildScrollView(child: errorNotice));
     }
 
-    return ListView.builder(
+    final list = ListView.builder(
       controller: _scrollController,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       itemCount: rows.length,
@@ -655,6 +706,12 @@ class _QueueViewState extends ConsumerState<_QueueView> {
         );
       },
     );
+    // One tree with or without the notice, so the list keeps its scroll
+    // position when the notice appears or goes.
+    return Column(children: [
+      ?errorNotice,
+      Expanded(key: const ValueKey('queue rows'), child: list),
+    ]);
   }
 
   bool _shouldShowQueueTypeBoundary(

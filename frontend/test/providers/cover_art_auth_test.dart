@@ -388,12 +388,14 @@ void main() {
     });
   });
 
-  // Review m-R3c-01: on an offline launch the gate is never started and stays
-  // Idle, where the permit waits out its 10 s bound. Art that is already in
-  // the disk cache (and still valid) needs no network fetch, so it is served
-  // at once instead of waiting on the permit.
+  // Review m-R3c-01: while the server's check has not answered (a launch
+  // whose server does not respond), the permit waits for the verdict, up to
+  // its 10 s bound. Art that is already in the disk cache (and still valid)
+  // needs no network fetch, so it is served at once instead of waiting on
+  // the permit. (An Idle gate answers "no" at once and could not show this;
+  // pre-merge review D5-04.)
   group('a disk-cache hit does not wait on the permit', () {
-    test('Idle gate: cached art loads without waiting out the bound',
+    test('pending verdict: cached art loads without waiting out the bound',
         () async {
       // Put the art in the disk cache through a permitted fetch.
       await manager(credentials: _alice)
@@ -402,9 +404,11 @@ void main() {
 
       final db = AppDatabase(NativeDatabase.memory());
       addTearDown(db.close);
+      final repository = ServerBindingRepository(db);
+      await repository.ensureProvisional('http://srv:1', userId: _alice.userId);
       final bounds = <Duration>[];
       final gate = ServerBindingGate(
-        repository: ServerBindingRepository(db),
+        repository: repository,
         signedInUserId: _alice.userId,
         probe: ({required String baseUrl, required bool reportOffline}) =>
             Completer<ServerIdentity>().future,
@@ -416,24 +420,39 @@ void main() {
         },
       );
       addTearDown(gate.dispose);
-      expect(gate.state, isA<BindingIdle>());
+      // The check starts and its probe never answers: the verdict stays
+      // pending, so the permit would wait on the (never firing) bound.
+      unawaited(gate.startConnection('http://srv:1'));
+      await pumpEventQueue();
+      expect(gate.state, isA<BindingVerifying>());
 
-      final idle = CoverArtCacheManager(
+      final pending = CoverArtCacheManager(
         api: _client(),
         cache: disk,
         authHeaders: {'Authorization': 'Bearer ${_alice.token}'},
         mayAttachToken: () => gate.whenMaySendTokenTo('http://srv:1'),
       );
-      final provider = idle.imageProvider(42) as CoverArtImageProvider;
-      io.File? loaded;
-      unawaited(provider.load().then((f) => loaded = f));
-      await pumpEventQueue();
-
-      expect(loaded, isNotNull, reason: 'served from the disk cache at once');
-      expect(await loaded!.readAsBytes(), [1, 2, 3, 4]);
+      final provider = pending.imageProvider(42) as CoverArtImageProvider;
+      // The cache read is real file I/O, so it is awaited (bounded) rather
+      // than given a fixed number of event-queue turns; the gate's timer
+      // never fires here, so a load that waited on the permit never ends.
+      final loaded = await provider.load().timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => fail('not served from the disk cache at once'),
+      );
+      expect(await loaded.readAsBytes(), [1, 2, 3, 4]);
       expect(bounds, isNot(contains(ServerBindingGate.tokenWaitBound)),
           reason: 'the permit was not waited on');
       expect(network.fetches, hasLength(1), reason: 'no second fetch');
+
+      // Fixture check: in this state the permit really does wait.
+      var answered = false;
+      unawaited(gate
+          .whenMaySendTokenTo('http://srv:1')
+          .then((_) => answered = true));
+      await pumpEventQueue();
+      expect(answered, isFalse);
+      expect(bounds, contains(ServerBindingGate.tokenWaitBound));
     });
   });
 }

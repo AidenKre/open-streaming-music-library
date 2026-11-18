@@ -8,14 +8,14 @@ from uuid import UUID, uuid4
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from app.auth.passwords import prepare_dummy_hash
 from app.bootstrap import bootstrap_master_admin
-from app.config import settings
+from app.config import ENV_FILE, settings
 from app.services.lastfm_accounts import build_lastfm_accounts, lastfm_available
 from app.services.lastfm_outbox import (
     install_scrobble_outbox,
@@ -27,6 +27,7 @@ from app.auth.middleware import AuthMiddleware
 from app.core.access_log import install_access_log_redaction
 from app.library import Library, current_library, library_root
 from app.core.instance_lock import acquire_instance_lock
+from app.core.operator_log import operator_logger
 from app.core.internal_dirs import STAGING, UPLOADS, ensure_internal_dirs, is_or_inside as _is_or_inside
 from app.services.user_delete import (
     RECORDED_ROOT_KEYS,
@@ -105,7 +106,7 @@ from app.services import upload_commit, upload_janitor, upload_publish, upload_r
 from app.services import upload_receipt as upload_receipts
 from app.services import upload_validation, upload_zip
 from app.services import filesystem_check
-from app.core.byte_range import parse_byte_range, ranged_file_response
+from app.core.byte_range import ranged_file_response
 from app.services.upload_receipt import ReceiptRuntime, TransferSlots
 from app.services.track_edit import (
     TrackPatchRequest,
@@ -114,6 +115,7 @@ from app.services.track_edit import (
 from app.services.conversion import (
     ConversionJobStatus,
     ConversionOrchestrator,
+    ConversionRequestInvalid,
     InsufficientDiskSpace,
     MasterNotFound,
     NoOpConversion,
@@ -417,22 +419,25 @@ def startup_event():
     app.state.encoded_cache = None
     app.state.default_cache = None
     app.state.encoder_coordinator = None
-    app.state.identity_worker = None
-    app.state.lastfm_sender = None
-    app.state.upload_validation_worker = None
-    app.state.upload_commit_worker = None
-    app.state.upload_janitor_thread = None
-    app.state.deletion_worker = None
-    app.state.upload_commit_registry = None
-    app.state.upload_validation_registry = None
+    for worker, registry in _BACKGROUND_WORKERS:
+        setattr(app.state, worker, None)
+        if registry is not None:
+            setattr(app.state, registry, None)
     app.state.fingerprinter = None
     app.state.boot_id = None
     app.state.storage_ledger = None
     app.state.import_unpack_ledger = None
     app.state.upload_cancel_tokens = None
     app.state.upload_receipt = None
-    # Per-uuid edit lock. Built once here so slice 4's master-file staging and
-    # Phase 2's conversion worker share the identical instance.
+    # The teardown reads these: a failed start-up never acts on an earlier start's objects.
+    app.state.import_stop = None
+    app.state.settle_check = None
+    app.state.identity_registry = None
+    app.state.conversion_orchestrator = None
+    # Per-uuid track lock. Built once here so the paths that serialize on one
+    # track (metadata edits, conversions, deletions and the deletion start-up
+    # recovery, the settle check, finishing kept journal rows) share the
+    # identical instance.
     app.state.track_locks = TrackLocks()
     app.state.settings = settings
     # 9D: a wrong Last.fm setting leaves it off or stopped, never stops startup.
@@ -450,15 +455,12 @@ def startup_event():
         app.state.lastfm_accounts = build_lastfm_accounts(app.state.lastfm)
         _startup_locked()
     except BaseException:
-        workers = _background_workers(app.state)
         try:
-            _request_stop(workers)
-            _join(workers)
-            _close_lastfm_client()
-        finally:
-            _release_instance_lock(app.state.instance_lock, _still_running(workers))
+            _teardown(app.state)
+        except Exception as e:  # the start-up error stays the one raised
+            logger.warning("stopping after a failed start-up failed: %s", type(e).__name__)
         raise
-    # Registered only once startup succeeded: a failed startup runs no shutdown.
+    # Registered only once startup succeeded: a failed start-up's teardown has no hook to remove.
     install_scrobble_outbox(app.state.lastfm)
 
 
@@ -499,18 +501,27 @@ def _startup_locked():
 
     # Set up database
     database = server_database(settings.app_data_dir)
+    uploads_root = settings.music_library_dir.resolve() / UPLOADS
     database.context.database_path.parent.mkdir(parents=True, exist_ok=True)
     if database.initialize() is not True:
         raise RuntimeError("Database initialization failed")
     app.state.server_instance_id = database.get_server_instance_id()
     app.state.admin_user_id = bootstrap_master_admin(
-        database, settings, env_file=Path(".env")
+        database, settings, env_file=Path(ENV_FILE)
     )
     for key in RECORDED_ROOT_KEYS:
         database.set_setting(key, str(Path(getattr(settings, key)).resolve()))
     resume_user_deletes(database, DeletePaths.from_settings(settings))
     # Build the dummy hash now so the first unknown-user login is not slower.
     prepare_dummy_hash(settings)
+    if settings.osml_insecure_fast_password_hashing:
+        operator_logger.warning(
+            "OSML_INSECURE_FAST_PASSWORD_HASHING is on: passwords are hashed with "
+            "weak settings meant only for tests, so anyone with a copy of the "
+            "database can guess them far more easily. Turn it off on a real "
+            "server; each password is then hashed again with the normal settings "
+            "at its user's next sign-in."
+        )
     app.state.admin_library = Library(
         database,
         app.state.admin_user_id,
@@ -535,7 +546,8 @@ def _startup_locked():
         floor_bytes=settings.storage_free_space_floor_bytes,
         boot_id=app.state.boot_id,
     )
-    # One token registry for the upload receipt and, later, DELETE.
+    # One token registry for the upload receipt, the validation worker and the
+    # cancel route (DELETE).
     app.state.upload_cancel_tokens = CancelTokens()
     app.state.upload_receipt = ReceiptRuntime(
         ledger=app.state.storage_ledger,
@@ -544,7 +556,7 @@ def _startup_locked():
             per_user=effective_upload_limits(settings).receives_per_user,
         ),
         tokens=app.state.upload_cancel_tokens,
-        uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+        uploads_root=uploads_root,
         boot_id=app.state.boot_id,
     )
     # Old masters kept after a failed durable point; every runtime journal finisher
@@ -608,7 +620,7 @@ def _startup_locked():
             matcher_version=matcher_version,
             fingerprinter=fingerprinter,
             storage_ledger=app.state.storage_ledger,
-            uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+            uploads_root=uploads_root,
             boot_id=app.state.boot_id,
             cover_art=app.state.cover_art_manager,
             track_locks=app.state.track_locks,
@@ -618,7 +630,7 @@ def _startup_locked():
     # Once per start: warn when a library root cannot take hard links (never fatal).
     upload_publish.probe_library_links(
         database,
-        uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+        uploads_root=uploads_root,
         music_library_dir=settings.music_library_dir,
     )
 
@@ -644,9 +656,9 @@ def _startup_locked():
     # targets and POST /jobs' enqueue guard read it: advertised == accepted.
     app.state.available_encoders = probe_available_encoders()
 
-    # Master-type conversion orchestration (Phase 2). Shares the staging dir,
-    # per-uuid TrackLocks, and encoder pool with the edit path above -- no
-    # new subsystems.
+    # Master-type conversion orchestration (Phase 2). Shares the staging dir
+    # and per-uuid TrackLocks with the metadata edit path (``patch_track``),
+    # and the streaming encoder pool -- no new subsystems.
     app.state.conversion_orchestrator = ConversionOrchestrator(
         database=database,
         music_library_dir=settings.music_library_dir,
@@ -765,14 +777,14 @@ def _startup_locked():
         app.state.upload_validation_registry = FfmpegProcessRegistry()
         validation = upload_validation.UploadValidationWorker(
             database,
-            uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+            uploads_root=uploads_root,
             boot_id=app.state.boot_id,
             tokens=app.state.upload_cancel_tokens,
             registry=app.state.upload_validation_registry,
             fingerprinter=app.state.fingerprinter,
             zip_handler=upload_zip.ZipExpander(
                 database,
-                uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+                uploads_root=uploads_root,
                 boot_id=app.state.boot_id,
                 ledger=app.state.storage_ledger,
                 limits=lambda: effective_upload_limits(settings),
@@ -786,7 +798,7 @@ def _startup_locked():
         app.state.upload_commit_registry = FfmpegProcessRegistry()
         commit = upload_commit.UploadCommitWorker(
             database,
-            uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+            uploads_root=uploads_root,
             music_library_dir=settings.music_library_dir.resolve(),
             boot_id=app.state.boot_id,
             ledger=app.state.storage_ledger,
@@ -796,7 +808,7 @@ def _startup_locked():
             registry=app.state.upload_commit_registry,
             after_prepared=upload_publish.UploadPublisher(
                 database,
-                uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+                uploads_root=uploads_root,
                 music_library_dir=settings.music_library_dir.resolve(),
                 cover_art=app.state.cover_art_manager,
                 identity_signal=app.state.identity_wakeup,
@@ -812,7 +824,7 @@ def _startup_locked():
         janitor_thread = upload_janitor.UploadJanitorThread(
             upload_janitor.UploadJanitor(
                 database,
-                uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+                uploads_root=uploads_root,
                 music_library_dir=settings.music_library_dir.resolve(),
                 cover_art=app.state.cover_art_manager,
                 expiry_s=settings.upload_stage_expiry_s,
@@ -835,6 +847,8 @@ def _startup_locked():
             cache=app.state.encoded_cache,
             default_cache=app.state.default_cache,
             boot_id=app.state.boot_id,
+            pending_old_masters=app.state.pending_old_masters,
+            identity_signal=app.state.identity_wakeup,
         )
         deletion_worker = DeletionWorker(
             deletion_executor,
@@ -891,20 +905,28 @@ def _startup_locked():
         sender.start()
 
 
+# The one list of background worker threads, in stop order: each worker's state
+# name with the state name of the kill registry it owns (None when it owns
+# none). Start-up sets these names to None; the teardown, used by shutdown and
+# by a failed start-up, stops exactly these, and the instance lock is kept
+# while any of them is alive. A new worker adds one line here.
+_BACKGROUND_WORKERS: tuple[tuple[str, str | None], ...] = (
+    ("lastfm_sender", None),
+    ("deletion_worker", None),
+    ("upload_janitor_thread", None),
+    ("upload_commit_worker", "upload_commit_registry"),
+    ("upload_validation_worker", "upload_validation_registry"),
+    # Its registry is shared with imports: the teardown closes it with them.
+    ("identity_worker", None),
+)
+
+
 def _background_workers(state) -> list[tuple[object, object]]:
-    """The one list of background worker threads, in stop order, each with the
-    kill registry it owns (None when it owns none). Startup's failure path and
-    shutdown stop exactly these, and the instance lock is kept while any of them
-    is alive. A new worker (Phase 8's deletion worker, Phase 9's sender) adds
-    one line here."""
+    """The workers of ``_BACKGROUND_WORKERS`` that exist, in stop order, each
+    with its kill registry (None when it owns none)."""
     entries = (
-        (getattr(state, "lastfm_sender", None), None),
-        (getattr(state, "deletion_worker", None), None),
-        (getattr(state, "upload_janitor_thread", None), None),
-        (getattr(state, "upload_commit_worker", None), getattr(state, "upload_commit_registry", None)),
-        (getattr(state, "upload_validation_worker", None), getattr(state, "upload_validation_registry", None)),
-        # Its registry is shared with imports: shutdown closes it with them.
-        (getattr(state, "identity_worker", None), None),
+        (getattr(state, worker, None), getattr(state, registry, None) if registry else None)
+        for worker, registry in _BACKGROUND_WORKERS
     )
     return [(worker, registry) for worker, registry in entries if worker is not None]
 
@@ -925,9 +947,17 @@ def _request_stop(workers) -> None:
 
 
 def _join(workers) -> None:
+    # IDENTITY_JOIN_TIMEOUT_S is one deadline for all workers, not a bound each.
+    # Every worker was asked to stop before the first join begins, so each has
+    # the whole deadline to end whatever the join order: a later join that gets
+    # a remaining timeout of 0 is still a worker that had its full time. Do not
+    # give each join its own bound again. A worker still running at the
+    # deadline is left running: shutdown goes on and the instance lock is kept
+    # until it ends.
+    deadline = time.monotonic() + IDENTITY_JOIN_TIMEOUT_S
     for worker, _ in workers:
         try:
-            worker.join(timeout=IDENTITY_JOIN_TIMEOUT_S)
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
         except Exception as e:
             logger.warning("background worker join failed: %s", type(e).__name__)
 
@@ -943,37 +973,61 @@ def _release_instance_lock(instance_lock, not_done: set) -> None:
         instance_lock.release()
 
 
-def _close_lastfm_client() -> None:
-    """Closes the Last.fm client if one was built; a failure never propagates."""
+def _close_lastfm_client(client) -> None:
+    """Closes the given Last.fm client; a failure never propagates."""
     try:
-        client = getattr(getattr(app.state, "lastfm_accounts", None), "client", None)
-        if client is not None:
-            client.close()
+        client.close()
     except Exception as e:
         logger.warning("Last.fm client close failed: %s", type(e).__name__)
 
 
-def shutdown_event():
-    workers = _background_workers(app.state)
+def _close_lastfm_client_when_sender_ends(state) -> None:
+    """Shutdown's rule, also used by a failed start-up: while the sender still
+    runs, a request may be in flight, so the client closes when the sender ends;
+    otherwise it closes now. A failure of the direct close propagates. The
+    client is the one ``state`` holds now, never one a later start builds."""
+    client = getattr(getattr(state, "lastfm_accounts", None), "client", None)
+    if client is None:
+        return
+    sender = getattr(state, "lastfm_sender", None)
+    if sender is not None and sender.is_alive():
+        sender.done.add_done_callback(lambda _: _close_lastfm_client(client))
+    else:
+        client.close()
+
+
+def _teardown(state, *, before_lock_release=None):
+    """Stops everything a start-up started, in one fixed order; used by shutdown
+    and by a failed start-up. A step that raises skips no later step: its error
+    is kept, a later step's error is logged by type, and the first error is
+    raised once everything was asked to stop. ``before_lock_release`` runs even
+    when a step raised."""
+    workers = _background_workers(state)
     leftover_imports: set = set()
+    errors: list[Exception] = []
+
+    def step(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # the rest still stops; the first error is raised at the end
+            if errors:
+                logger.warning("stop step failed: %s", type(e).__name__)
+            errors.append(e)
+            return None
+
     try:
         # The encoder pool is asked to stop first (its stop markers sort ahead of
         # the backlog, and the call does not wait), so nothing only queued starts
         # while the server waits for the watchers and workers; a warm or prefetch
-        # resumes at the next start and a queued conversion stays queued. If it
-        # raises, the rest still runs and the error is raised at the end.
-        coordinator = getattr(app.state, "encoder_coordinator", None)
-        stop_error = None
+        # resumes at the next start and a queued conversion stays queued.
+        coordinator = getattr(state, "encoder_coordinator", None)
         if coordinator:
-            try:
-                coordinator.shutdown()
-            except Exception as e:  # the rest still stops; raised once it has
-                stop_error = e
+            step(coordinator.shutdown)
         watchers = [
             w
             for w in (
-                getattr(app.state, "file_watcher", None),
-                getattr(app.state, "user_file_watcher", None),
+                getattr(state, "file_watcher", None),
+                getattr(state, "user_file_watcher", None),
             )
             if w
         ]
@@ -984,43 +1038,44 @@ def shutdown_event():
         # hash is stored pending and the import still lands. A worker is told to
         # stop before the kill so its killed hash reads as a stop, not as a
         # failed attempt.
-        import_stop = getattr(app.state, "import_stop", None)
+        import_stop = getattr(state, "import_stop", None)
         if import_stop is not None:
-            import_stop.set()
+            step(import_stop.set)
         _request_stop(workers)
-        identity_registry = getattr(app.state, "identity_registry", None)
+        identity_registry = getattr(state, "identity_registry", None)
         if identity_registry is not None:
-            identity_registry.close()
-        leftover_imports = set(stop_watchers(watchers, WATCHER_STOP_TIMEOUT_S))
-        settle_check = getattr(app.state, "settle_check", None)
+            step(identity_registry.close)
+        leftover_imports = set(step(stop_watchers, watchers, WATCHER_STOP_TIMEOUT_S) or ())
+        settle_check = getattr(state, "settle_check", None)
         if settle_check is not None:
-            settle_check.join(timeout=2)  # the shared stop flag ended it
+            step(settle_check.join, timeout=2)  # the shared stop flag ended it
         _join(workers)
         # Closing the conversion registry kills a running conversion's ffmpeg (it
         # runs in its own session and would outlive this process) and kills on
         # arrival one that starts later; the job's own thread then marks that job
         # failed (if the process ends first, the next startup fails the row left
         # 'running'), and a job that was only queued stays queued for the next start.
-        orchestrator = getattr(app.state, "conversion_orchestrator", None)
+        orchestrator = getattr(state, "conversion_orchestrator", None)
         if orchestrator:
-            orchestrator.shutdown()
-        sender = getattr(app.state, "lastfm_sender", None)
-        if sender is not None and sender.is_alive():
-            # A request may still be in flight: the client closes when the sender ends.
-            sender.done.add_done_callback(lambda _: _close_lastfm_client())
-        elif (client := getattr(getattr(app.state, "lastfm_accounts", None), "client", None)) is not None:
-            client.close()  # a failure here is reported, as before; the finally still runs
-        if stop_error is not None:
-            raise stop_error  # reported as before, after everything was asked to stop
+            step(orchestrator.shutdown)
+        step(_close_lastfm_client_when_sender_ends, state)
+        if errors:
+            raise errors[0]  # reported once everything was asked to stop
     finally:
         try:
-            # Removed even when a shutdown step raised above (audit DR-f17e5c12-B-03).
-            uninstall_scrobble_outbox()
+            if before_lock_release is not None:
+                before_lock_release()
         finally:
-            instance_lock = getattr(app.state, "instance_lock", None)
+            instance_lock = getattr(state, "instance_lock", None)
             if instance_lock is not None:
                 # Kept while an import or any worker still runs; released after the last.
                 _release_instance_lock(instance_lock, leftover_imports | _still_running(workers))
+
+
+def shutdown_event():
+    # The history hook is removed even when a shutdown step raised. The global
+    # is read here, when shutdown runs.
+    _teardown(app.state, before_lock_release=uninstall_scrobble_outbox)
 
 
 def _release_lock_when_done(instance_lock, futures: set) -> None:
@@ -1045,7 +1100,10 @@ def _release_lock_when_done(instance_lock, futures: set) -> None:
         future.add_done_callback(one_done)
 
 
-@app.get("/tracks", response_model=GetTracksResponse)
+# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
+# the app keeps its own copy of the library through GET /changes. It stays live
+# for other clients.
+@app.get("/tracks", response_model=GetTracksResponse, deprecated=True)
 def get_tracks(
     cursor: Optional[str] = None,
     limit: int = Query(500, ge=1, le=1000),
@@ -1260,11 +1318,6 @@ def get_cover_art(cover_art_id: int, library: Library = Depends(current_library)
     )
 
 
-
-# Kept under its old name: tests and callers import it from here.
-_parse_byte_range = parse_byte_range
-
-
 @app.get("/tracks/{uuid_id:uuid}/stream")
 def stream_track(
     uuid_id: UUID,
@@ -1338,7 +1391,10 @@ def stream_track(
     )
 
 
-@app.get("/artists", response_model=GetArtistsResponse)
+# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
+# the app keeps its own copy of the library through GET /changes. It stays live
+# for other clients.
+@app.get("/artists", response_model=GetArtistsResponse, deprecated=True)
 def get_artists(
     cursor: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
@@ -1424,7 +1480,10 @@ def get_artists(
     return GetArtistsResponse(data=returned_artists, nextCursor=nextCursor)
 
 
-@app.get("/albums", response_model=GetAlbumsResponse)
+# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
+# the app keeps its own copy of the library through GET /changes. It stays live
+# for other clients.
+@app.get("/albums", response_model=GetAlbumsResponse, deprecated=True)
 def get_albums(
     cursor: Optional[str] = None,
     limit: int = Query(500, ge=1, le=1000),
@@ -1541,7 +1600,10 @@ def get_albums(
     return GetAlbumsResponse(data=returned_albums, nextCursor=nextCursor)
 
 
-@app.get("/search", response_model=GetSearchResponse)
+# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
+# the app keeps its own copy of the library through GET /changes. It stays live
+# for other clients.
+@app.get("/search", response_model=GetSearchResponse, deprecated=True)
 def search(
     q: str = Query(..., min_length=1),
     types: str = Query("tracks,artists,albums"),
@@ -1685,9 +1747,8 @@ def get_app_info():
         ConversionTargetInfo(codec=codec, is_lossless=is_lossless(codec))
         for codec in sorted(SUPPORTED_TARGET_CODECS & available_encoders)
     ]
-    database: Database = cast(Database, app.state.database)
     return AppInfoResponse(
-        server=ServerInfo(instance_id=database.get_server_instance_id()),
+        server=ServerInfo(instance_id=app.state.server_instance_id),
         history=HistoryCapabilities(),
         auth=AuthCapabilities(signup_enabled=settings.osml_signup_enabled),
         uploads=UploadsCapabilities(
@@ -1854,7 +1915,7 @@ def post_job(
             status_code=422,
             detail="Target codec is the same lossless codec as the source",
         )
-    except ValueError as e:
+    except ConversionRequestInvalid as e:
         raise HTTPException(status_code=422, detail=str(e))
     except InsufficientDiskSpace as e:
         raise api_error(

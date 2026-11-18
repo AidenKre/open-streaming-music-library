@@ -16,16 +16,13 @@ import 'package:path/path.dart' as p;
 
 import '../../helpers/fake_clock.dart';
 import '../../helpers/server_binding.dart';
+import '../../helpers/owned_file_cleanup_rows.dart';
 
-Future<List<Map<String, Object?>>> _rows(AppDatabase db) async => [
-  for (final r in await db
-      .customSelect(
-        'SELECT id, path, root_kind, dev, ino, size, mtime, local_binding_id, '
-        'attempts, last_error, created_at FROM owned_file_cleanup ORDER BY id',
-      )
-      .get())
-    r.data,
-];
+Future<List<Map<String, Object?>>> _rows(AppDatabase db) =>
+    ownedFileCleanupRows(db, const [
+      'id', 'path', 'root_kind', 'dev', 'ino', 'size', 'mtime',
+      'local_binding_id', 'attempts', 'last_error', 'created_at',
+    ]);
 
 void main() {
   late Directory docs;
@@ -436,6 +433,38 @@ void main() {
       expect(await cleanup.runPass({'retry'}), isA<PassDone>());
       expect(a.existsSync(), isFalse);
       expect(await _rows(db), isEmpty);
+    });
+
+    // Pre-merge review D3-01: a database of another schema version stays
+    // refused until a reset replaces it (and rebuilds the scope), so a retry
+    // cannot help: the runner parks instead of re-reading it every 30 s
+    // while the refusal screen shows.
+    test('a database of another version parks the runner', () async {
+      final refused = AppDatabase(NativeDatabase.memory(
+        setup: (raw) => raw.execute('PRAGMA user_version = 8'),
+      ));
+      addTearDown(refused.close);
+      final pass = OwnedFileCleanup(
+        db: refused,
+        documentsDirectory: () async => docs,
+        locks: OwnedPathLocks(),
+        clock: clock,
+      ).runPass;
+      expect(await pass({'coldStart'}), isA<PassParked>());
+    });
+
+    test('any other database failure still asks for a retry', () async {
+      final broken = AppDatabase(NativeDatabase.memory());
+      await broken.customSelect('SELECT 1').get();
+      await broken.close(); // a closed database refuses every query
+      final pass = OwnedFileCleanup(
+        db: broken,
+        documentsDirectory: () async => docs,
+        locks: OwnedPathLocks(),
+        clock: clock,
+      ).runPass;
+      await expectLater(pass({'coldStart'}), throwsA(anything),
+          reason: 'the runner turns a thrown pass into a retry');
     });
   });
 }

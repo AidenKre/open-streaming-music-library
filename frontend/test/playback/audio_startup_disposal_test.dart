@@ -13,7 +13,7 @@ import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'queue_player_test.dart' show FakePlaybackEngine;
+import '../helpers/fake_playback_engine.dart' show FakePlaybackEngine;
 
 class _HeldVolumePlayer extends FakePlaybackEngine {
   final volumeStarted = Completer<void>();

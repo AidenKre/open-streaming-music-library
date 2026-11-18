@@ -198,6 +198,40 @@ void main() {
     expect(store.has(3), isFalse);
   });
 
+  // Section 6 #8: the downloads' cover clean-up.
+  test('removeIfUnused deletes a cover only when nothing uses it', () async {
+    final store = await buildStore();
+    store.fileFor(4).writeAsBytesSync([1]);
+
+    expect(await store.removeIfUnused(4, () async => true), isFalse);
+    expect(store.has(4), isTrue);
+    expect(await store.removeIfUnused(4, () async => false), isTrue);
+    expect(store.has(4), isFalse);
+    expect(await store.removeIfUnused(4, () async => false), isFalse,
+        reason: 'nothing to remove');
+  });
+
+  // A download committed while its cover is being removed must not skip the
+  // cover on the strength of a file about to go: the lookup waits for the
+  // removal, then answers.
+  test('a lookup during a removal answers after it', () async {
+    final store = await buildStore();
+    store.fileFor(6).writeAsBytesSync([1]);
+    final checking = Completer<void>();
+    final answer = Completer<bool>();
+
+    final removal = store.removeIfUnused(6, () {
+      checking.complete();
+      return answer.future;
+    });
+    await checking.future;
+    final stored = store.holds(6);
+    answer.complete(false);
+
+    expect(await removal, isTrue);
+    expect(await stored, isFalse);
+  });
+
   test('clear removes every stored file', () async {
     final store = await buildStore(
       client: MockClient((_) async => http.Response.bytes([1], 200)),

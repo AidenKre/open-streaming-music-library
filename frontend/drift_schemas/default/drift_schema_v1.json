@@ -315,6 +315,16 @@
             "default_dart": null,
             "default_client_dart": null,
             "dsl_features": []
+          },
+          {
+            "name": "damaged_file_path",
+            "getter_name": "damagedFilePath",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
           }
         ],
         "is_virtual": false,
@@ -519,7 +529,7 @@
             "name": "duration",
             "getter_name": "duration",
             "moor_type": "double",
-            "nullable": false,
+            "nullable": true,
             "customConstraints": null,
             "default_dart": null,
             "default_client_dart": null,
@@ -539,7 +549,7 @@
             "name": "sample_rate_hz",
             "getter_name": "sampleRateHz",
             "moor_type": "int",
-            "nullable": false,
+            "nullable": true,
             "customConstraints": null,
             "default_dart": null,
             "default_client_dart": null,
@@ -549,7 +559,7 @@
             "name": "channels",
             "getter_name": "channels",
             "moor_type": "int",
-            "nullable": false,
+            "nullable": true,
             "customConstraints": null,
             "default_dart": null,
             "default_client_dart": null,
@@ -1037,25 +1047,1011 @@
     },
     {
       "id": 8,
-      "references": [
-        0
-      ],
-      "type": "index",
+      "references": [],
+      "type": "table",
       "data": {
-        "on": 0,
-        "name": "idx_artists_name_lower",
-        "sql": null,
-        "unique": false,
+        "name": "server_binding",
+        "was_declared_in_moor": false,
         "columns": [
           {
-            "column": "name_lower",
-            "order_by": null
+            "name": "id",
+            "getter_name": "id",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": "const CustomExpression('1')",
+            "default_client_dart": null,
+            "dsl_features": [
+              {
+                "check": {
+                  "dart_expression": {
+                    "elements": [
+                      {
+                        "lexeme": "id",
+                        "tag": "id"
+                      },
+                      ".equals(1)"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "instance_id",
+            "getter_name": "instanceId",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "local_binding_id",
+            "getter_name": "localBindingId",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "last_base_url",
+            "getter_name": "lastBaseUrl",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "bound_at",
+            "getter_name": "boundAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "catalog_reconciled_at_binding",
+            "getter_name": "catalogReconciledAtBinding",
+            "moor_type": "bool",
+            "nullable": false,
+            "customConstraints": null,
+            "defaultConstraints": "CHECK (\"catalog_reconciled_at_binding\" IN (0, 1))",
+            "dialectAwareDefaultConstraints": {
+              "sqlite": "CHECK (\"catalog_reconciled_at_binding\" IN (0, 1))"
+            },
+            "default_dart": "const CustomExpression('0')",
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "user_id",
+            "getter_name": "userId",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
           }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": [],
+        "explicit_pk": [
+          "id"
         ]
       }
     },
     {
       "id": 9,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "sync_cursors",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "stream",
+            "getter_name": "stream",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "value",
+            "getter_name": "value",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": [],
+        "explicit_pk": [
+          "stream"
+        ]
+      }
+    },
+    {
+      "id": 10,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "history_events",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "local_id",
+            "getter_name": "localId",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "defaultConstraints": "PRIMARY KEY AUTOINCREMENT",
+            "dialectAwareDefaultConstraints": {
+              "sqlite": "PRIMARY KEY AUTOINCREMENT"
+            },
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": [
+              "auto-increment"
+            ]
+          },
+          {
+            "name": "event_uuid",
+            "getter_name": "eventUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "defaultConstraints": "UNIQUE",
+            "dialectAwareDefaultConstraints": {
+              "sqlite": "UNIQUE"
+            },
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": [
+              "unique"
+            ]
+          },
+          {
+            "name": "kind",
+            "getter_name": "kind",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "entity_type",
+            "getter_name": "entityType",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "entity_ref",
+            "getter_name": "entityRef",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "occurred_at",
+            "getter_name": "occurredAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "seconds_played",
+            "getter_name": "secondsPlayed",
+            "moor_type": "double",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "track_length",
+            "getter_name": "trackLength",
+            "moor_type": "double",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "server_revision",
+            "getter_name": "serverRevision",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "defaultConstraints": "UNIQUE",
+            "dialectAwareDefaultConstraints": {
+              "sqlite": "UNIQUE"
+            },
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": [
+              "unique"
+            ]
+          },
+          {
+            "name": "received_at",
+            "getter_name": "receivedAt",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "pending_upload",
+            "getter_name": "pendingUpload",
+            "moor_type": "bool",
+            "nullable": false,
+            "customConstraints": null,
+            "defaultConstraints": "CHECK (\"pending_upload\" IN (0, 1))",
+            "dialectAwareDefaultConstraints": {
+              "sqlite": "CHECK (\"pending_upload\" IN (0, 1))"
+            },
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": []
+      }
+    },
+    {
+      "id": 11,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "local_counters",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "key",
+            "getter_name": "key",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "value",
+            "getter_name": "value",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": [],
+        "explicit_pk": [
+          "key"
+        ]
+      }
+    },
+    {
+      "id": 12,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "history_sync_failures",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "event_uuid",
+            "getter_name": "eventUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "reason",
+            "getter_name": "reason",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "detail",
+            "getter_name": "detail",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "failed_at",
+            "getter_name": "failedAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": [],
+        "explicit_pk": [
+          "event_uuid"
+        ]
+      }
+    },
+    {
+      "id": 13,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "history_conflict_archive",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "archive_id",
+            "getter_name": "archiveId",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "defaultConstraints": "PRIMARY KEY AUTOINCREMENT",
+            "dialectAwareDefaultConstraints": {
+              "sqlite": "PRIMARY KEY AUTOINCREMENT"
+            },
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": [
+              "auto-increment"
+            ]
+          },
+          {
+            "name": "event_uuid",
+            "getter_name": "eventUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "payload_json",
+            "getter_name": "payloadJson",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "archived_at",
+            "getter_name": "archivedAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": []
+      }
+    },
+    {
+      "id": 14,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "active_listens",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "listen_uuid",
+            "getter_name": "listenUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "queue_session_id",
+            "getter_name": "queueSessionId",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "queue_item_id",
+            "getter_name": "queueItemId",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "track_uuid",
+            "getter_name": "trackUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "started_at",
+            "getter_name": "startedAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "duration_seconds",
+            "getter_name": "durationSeconds",
+            "moor_type": "double",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "accumulated_micros",
+            "getter_name": "accumulatedMicros",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "last_checkpoint_at",
+            "getter_name": "lastCheckpointAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "state",
+            "getter_name": "state",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": [
+              {
+                "check": {
+                  "dart_expression": {
+                    "elements": [
+                      {
+                        "lexeme": "state",
+                        "tag": "state"
+                      },
+                      ".isIn(['accumulating','finalizing'])"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "final_payload_json",
+            "getter_name": "finalPayloadJson",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": [],
+        "explicit_pk": [
+          "listen_uuid"
+        ]
+      }
+    },
+    {
+      "id": 15,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "durable_submissions",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "operation_uuid",
+            "getter_name": "operationUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "kind",
+            "getter_name": "kind",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "local_binding_id",
+            "getter_name": "localBindingId",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "frozen_body_json",
+            "getter_name": "frozenBodyJson",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "state",
+            "getter_name": "state",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": "NOT NULL CHECK (state IN ('prepared', 'sent', 'accepted', 'rejected', 'ambiguous'))",
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "receipt_json",
+            "getter_name": "receiptJson",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "error_code",
+            "getter_name": "errorCode",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "created_at",
+            "getter_name": "createdAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "updated_at",
+            "getter_name": "updatedAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": [
+          "PRIMARY KEY(operation_uuid)"
+        ]
+      }
+    },
+    {
+      "id": 16,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "upload_intents",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "item_uuid",
+            "getter_name": "itemUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "batch_uuid",
+            "getter_name": "batchUuid",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "parent_item_uuid",
+            "getter_name": "parentItemUuid",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "selection_index",
+            "getter_name": "selectionIndex",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "display_name",
+            "getter_name": "displayName",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "source_descriptor_json",
+            "getter_name": "sourceDescriptorJson",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "expected_sha256",
+            "getter_name": "expectedSha256",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "expected_length",
+            "getter_name": "expectedLength",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "last_state",
+            "getter_name": "lastState",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "last_error_code",
+            "getter_name": "lastErrorCode",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "last_error_message",
+            "getter_name": "lastErrorMessage",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "operation_uuid",
+            "getter_name": "operationUuid",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "transfer_operation_uuid",
+            "getter_name": "transferOperationUuid",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "review_generation",
+            "getter_name": "reviewGeneration",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "draft_json",
+            "getter_name": "draftJson",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "local_binding_id",
+            "getter_name": "localBindingId",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "created_at",
+            "getter_name": "createdAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "updated_at",
+            "getter_name": "updatedAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": [
+          "PRIMARY KEY(item_uuid)"
+        ]
+      }
+    },
+    {
+      "id": 17,
+      "references": [],
+      "type": "table",
+      "data": {
+        "name": "owned_file_cleanup",
+        "was_declared_in_moor": false,
+        "columns": [
+          {
+            "name": "id",
+            "getter_name": "id",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "defaultConstraints": "PRIMARY KEY AUTOINCREMENT",
+            "dialectAwareDefaultConstraints": {
+              "sqlite": "PRIMARY KEY AUTOINCREMENT"
+            },
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": [
+              "auto-increment"
+            ]
+          },
+          {
+            "name": "path",
+            "getter_name": "path",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "root_kind",
+            "getter_name": "rootKind",
+            "moor_type": "string",
+            "nullable": false,
+            "customConstraints": "NOT NULL CHECK (root_kind IN ('downloads'))",
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "dev",
+            "getter_name": "dev",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "ino",
+            "getter_name": "ino",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "size",
+            "getter_name": "size",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "mtime",
+            "getter_name": "mtime",
+            "moor_type": "int",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "local_binding_id",
+            "getter_name": "localBindingId",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "attempts",
+            "getter_name": "attempts",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": "const CustomExpression('0')",
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "last_error",
+            "getter_name": "lastError",
+            "moor_type": "string",
+            "nullable": true,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          },
+          {
+            "name": "created_at",
+            "getter_name": "createdAt",
+            "moor_type": "int",
+            "nullable": false,
+            "customConstraints": null,
+            "default_dart": null,
+            "default_client_dart": null,
+            "dsl_features": []
+          }
+        ],
+        "is_virtual": false,
+        "without_rowid": false,
+        "constraints": []
+      }
+    },
+    {
+      "id": 18,
       "references": [
         1
       ],
@@ -1074,7 +2070,7 @@
       }
     },
     {
-      "id": 10,
+      "id": 19,
       "references": [
         1
       ],
@@ -1093,7 +2089,7 @@
       }
     },
     {
-      "id": 11,
+      "id": 20,
       "references": [
         1
       ],
@@ -1107,7 +2103,7 @@
       }
     },
     {
-      "id": 12,
+      "id": 21,
       "references": [
         1
       ],
@@ -1121,7 +2117,7 @@
       }
     },
     {
-      "id": 13,
+      "id": 22,
       "references": [
         3
       ],
@@ -1140,7 +2136,7 @@
       }
     },
     {
-      "id": 14,
+      "id": 23,
       "references": [
         3
       ],
@@ -1159,7 +2155,7 @@
       }
     },
     {
-      "id": 15,
+      "id": 24,
       "references": [
         3
       ],
@@ -1178,7 +2174,7 @@
       }
     },
     {
-      "id": 16,
+      "id": 25,
       "references": [
         3
       ],
@@ -1197,7 +2193,7 @@
       }
     },
     {
-      "id": 17,
+      "id": 26,
       "references": [
         3
       ],
@@ -1216,7 +2212,7 @@
       }
     },
     {
-      "id": 18,
+      "id": 27,
       "references": [
         3
       ],
@@ -1235,7 +2231,7 @@
       }
     },
     {
-      "id": 19,
+      "id": 28,
       "references": [
         3
       ],
@@ -1254,7 +2250,7 @@
       }
     },
     {
-      "id": 20,
+      "id": 29,
       "references": [
         3
       ],
@@ -1273,7 +2269,7 @@
       }
     },
     {
-      "id": 21,
+      "id": 30,
       "references": [
         3
       ],
@@ -1292,7 +2288,7 @@
       }
     },
     {
-      "id": 22,
+      "id": 31,
       "references": [
         3
       ],
@@ -1306,7 +2302,7 @@
       }
     },
     {
-      "id": 23,
+      "id": 32,
       "references": [
         3
       ],
@@ -1325,7 +2321,7 @@
       }
     },
     {
-      "id": 24,
+      "id": 33,
       "references": [
         3
       ],
@@ -1344,7 +2340,7 @@
       }
     },
     {
-      "id": 25,
+      "id": 34,
       "references": [
         3
       ],
@@ -1363,7 +2359,7 @@
       }
     },
     {
-      "id": 26,
+      "id": 35,
       "references": [
         3
       ],
@@ -1382,7 +2378,7 @@
       }
     },
     {
-      "id": 27,
+      "id": 36,
       "references": [
         3
       ],
@@ -1401,7 +2397,7 @@
       }
     },
     {
-      "id": 28,
+      "id": 37,
       "references": [
         3
       ],
@@ -1420,7 +2416,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 38,
       "references": [
         3
       ],
@@ -1439,7 +2435,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 39,
       "references": [
         3
       ],
@@ -1458,7 +2454,7 @@
       }
     },
     {
-      "id": 31,
+      "id": 40,
       "references": [
         3
       ],
@@ -1472,7 +2468,7 @@
       }
     },
     {
-      "id": 32,
+      "id": 41,
       "references": [
         3
       ],
@@ -1486,7 +2482,7 @@
       }
     },
     {
-      "id": 33,
+      "id": 42,
       "references": [
         3
       ],
@@ -1500,7 +2496,7 @@
       }
     },
     {
-      "id": 34,
+      "id": 43,
       "references": [
         5
       ],
@@ -1527,7 +2523,7 @@
       }
     },
     {
-      "id": 35,
+      "id": 44,
       "references": [
         5
       ],
@@ -1550,7 +2546,7 @@
       }
     },
     {
-      "id": 36,
+      "id": 45,
       "references": [
         6
       ],
@@ -1573,7 +2569,7 @@
       }
     },
     {
-      "id": 37,
+      "id": 46,
       "references": [
         6
       ],
@@ -1590,6 +2586,111 @@
           },
           {
             "column": "item_id",
+            "order_by": null
+          }
+        ]
+      }
+    },
+    {
+      "id": 47,
+      "references": [
+        10
+      ],
+      "type": "index",
+      "data": {
+        "on": 10,
+        "name": "idx_history_events_pending",
+        "sql": null,
+        "unique": false,
+        "columns": [
+          {
+            "column": "pending_upload",
+            "order_by": null
+          },
+          {
+            "column": "local_id",
+            "order_by": null
+          }
+        ]
+      }
+    },
+    {
+      "id": 48,
+      "references": [
+        10
+      ],
+      "type": "index",
+      "data": {
+        "on": 10,
+        "name": "idx_history_events_kind_occurred",
+        "sql": "CREATE INDEX idx_history_events_kind_occurred ON history_events (kind, occurred_at DESC, event_uuid DESC)",
+        "unique": false,
+        "columns": []
+      }
+    },
+    {
+      "id": 49,
+      "references": [
+        14
+      ],
+      "type": "index",
+      "data": {
+        "on": 14,
+        "name": "idx_active_listens_accumulating",
+        "sql": "CREATE UNIQUE INDEX idx_active_listens_accumulating ON active_listens (state) WHERE state = 'accumulating'",
+        "unique": true,
+        "columns": []
+      }
+    },
+    {
+      "id": 50,
+      "references": [
+        15
+      ],
+      "type": "index",
+      "data": {
+        "on": 15,
+        "name": "idx_durable_submissions_unresolved",
+        "sql": null,
+        "unique": false,
+        "columns": [
+          {
+            "column": "local_binding_id",
+            "order_by": null
+          },
+          {
+            "column": "kind",
+            "order_by": null
+          },
+          {
+            "column": "state",
+            "order_by": null
+          }
+        ]
+      }
+    },
+    {
+      "id": 51,
+      "references": [
+        16
+      ],
+      "type": "index",
+      "data": {
+        "on": 16,
+        "name": "idx_upload_intents_batch",
+        "sql": null,
+        "unique": false,
+        "columns": [
+          {
+            "column": "local_binding_id",
+            "order_by": null
+          },
+          {
+            "column": "batch_uuid",
+            "order_by": null
+          },
+          {
+            "column": "selection_index",
             "order_by": null
           }
         ]
@@ -1620,7 +2721,7 @@
       "sql": [
         {
           "dialect": "sqlite",
-          "sql": "CREATE TABLE IF NOT EXISTS \"tracks\" (\"uuid_id\" TEXT NOT NULL, \"file_path\" TEXT NULL, \"created_at\" INTEGER NOT NULL, \"last_updated\" INTEGER NOT NULL, \"revision\" INTEGER NULL, \"downloaded_bitrate_kbps\" INTEGER NULL, \"file_size_bytes\" INTEGER NULL, \"downloaded_quality\" TEXT NULL, \"downloaded_at_revision\" INTEGER NULL, \"downloaded_codec\" TEXT NULL, \"stale_dismissed_at_revision\" INTEGER NULL, PRIMARY KEY (\"uuid_id\"));"
+          "sql": "CREATE TABLE IF NOT EXISTS \"tracks\" (\"uuid_id\" TEXT NOT NULL, \"file_path\" TEXT NULL, \"created_at\" INTEGER NOT NULL, \"last_updated\" INTEGER NOT NULL, \"revision\" INTEGER NULL, \"downloaded_bitrate_kbps\" INTEGER NULL, \"file_size_bytes\" INTEGER NULL, \"downloaded_quality\" TEXT NULL, \"downloaded_at_revision\" INTEGER NULL, \"downloaded_codec\" TEXT NULL, \"stale_dismissed_at_revision\" INTEGER NULL, \"damaged_file_path\" TEXT NULL, PRIMARY KEY (\"uuid_id\"));"
         }
       ]
     },
@@ -1629,7 +2730,7 @@
       "sql": [
         {
           "dialect": "sqlite",
-          "sql": "CREATE TABLE IF NOT EXISTS \"trackmetadata\" (\"uuid_id\" TEXT NOT NULL REFERENCES tracks (uuid_id), \"title\" TEXT NULL, \"artist\" TEXT NULL, \"album\" TEXT NULL, \"album_artist\" TEXT NULL, \"artist_id\" INTEGER NULL REFERENCES artists (id), \"album_id\" INTEGER NULL REFERENCES albums (id), \"year\" INTEGER NULL, \"date\" TEXT NULL, \"genre\" TEXT NULL, \"track_number\" INTEGER NULL, \"disc_number\" INTEGER NULL, \"codec\" TEXT NULL, \"duration\" REAL NOT NULL, \"bitrate_kbps\" REAL NULL, \"sample_rate_hz\" INTEGER NOT NULL, \"channels\" INTEGER NOT NULL, \"has_album_art\" INTEGER NOT NULL DEFAULT 0 CHECK (\"has_album_art\" IN (0, 1)), \"cover_art_id\" INTEGER NULL, PRIMARY KEY (\"uuid_id\"));"
+          "sql": "CREATE TABLE IF NOT EXISTS \"trackmetadata\" (\"uuid_id\" TEXT NOT NULL REFERENCES tracks (uuid_id), \"title\" TEXT NULL, \"artist\" TEXT NULL, \"album\" TEXT NULL, \"album_artist\" TEXT NULL, \"artist_id\" INTEGER NULL REFERENCES artists (id), \"album_id\" INTEGER NULL REFERENCES albums (id), \"year\" INTEGER NULL, \"date\" TEXT NULL, \"genre\" TEXT NULL, \"track_number\" INTEGER NULL, \"disc_number\" INTEGER NULL, \"codec\" TEXT NULL, \"duration\" REAL NULL, \"bitrate_kbps\" REAL NULL, \"sample_rate_hz\" INTEGER NULL, \"channels\" INTEGER NULL, \"has_album_art\" INTEGER NOT NULL DEFAULT 0 CHECK (\"has_album_art\" IN (0, 1)), \"cover_art_id\" INTEGER NULL, PRIMARY KEY (\"uuid_id\"));"
         }
       ]
     },
@@ -1670,11 +2771,92 @@
       ]
     },
     {
-      "name": "idx_artists_name_lower",
+      "name": "server_binding",
       "sql": [
         {
           "dialect": "sqlite",
-          "sql": "CREATE INDEX idx_artists_name_lower ON artists (name_lower)"
+          "sql": "CREATE TABLE IF NOT EXISTS \"server_binding\" (\"id\" INTEGER NOT NULL DEFAULT 1 CHECK(\"id\" = 1), \"instance_id\" TEXT NULL, \"local_binding_id\" TEXT NOT NULL, \"last_base_url\" TEXT NOT NULL, \"bound_at\" INTEGER NOT NULL, \"catalog_reconciled_at_binding\" INTEGER NOT NULL DEFAULT 0 CHECK (\"catalog_reconciled_at_binding\" IN (0, 1)), \"user_id\" INTEGER NULL, PRIMARY KEY (\"id\"));"
+        }
+      ]
+    },
+    {
+      "name": "sync_cursors",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"sync_cursors\" (\"stream\" TEXT NOT NULL, \"value\" INTEGER NOT NULL, PRIMARY KEY (\"stream\"));"
+        }
+      ]
+    },
+    {
+      "name": "history_events",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"history_events\" (\"local_id\" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, \"event_uuid\" TEXT NOT NULL UNIQUE, \"kind\" TEXT NOT NULL, \"entity_type\" TEXT NOT NULL, \"entity_ref\" TEXT NOT NULL, \"occurred_at\" INTEGER NOT NULL, \"seconds_played\" REAL NULL, \"track_length\" REAL NULL, \"server_revision\" INTEGER NULL UNIQUE, \"received_at\" INTEGER NULL, \"pending_upload\" INTEGER NOT NULL CHECK (\"pending_upload\" IN (0, 1)));"
+        }
+      ]
+    },
+    {
+      "name": "local_counters",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"local_counters\" (\"key\" TEXT NOT NULL, \"value\" INTEGER NOT NULL, PRIMARY KEY (\"key\"));"
+        }
+      ]
+    },
+    {
+      "name": "history_sync_failures",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"history_sync_failures\" (\"event_uuid\" TEXT NOT NULL, \"reason\" TEXT NOT NULL, \"detail\" TEXT NULL, \"failed_at\" INTEGER NOT NULL, PRIMARY KEY (\"event_uuid\"));"
+        }
+      ]
+    },
+    {
+      "name": "history_conflict_archive",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"history_conflict_archive\" (\"archive_id\" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, \"event_uuid\" TEXT NOT NULL, \"payload_json\" TEXT NOT NULL, \"archived_at\" INTEGER NOT NULL);"
+        }
+      ]
+    },
+    {
+      "name": "active_listens",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"active_listens\" (\"listen_uuid\" TEXT NOT NULL, \"queue_session_id\" INTEGER NOT NULL, \"queue_item_id\" INTEGER NOT NULL, \"track_uuid\" TEXT NOT NULL, \"started_at\" INTEGER NOT NULL, \"duration_seconds\" REAL NULL, \"accumulated_micros\" INTEGER NOT NULL, \"last_checkpoint_at\" INTEGER NOT NULL, \"state\" TEXT NOT NULL CHECK(\"state\" IN ('accumulating', 'finalizing')), \"final_payload_json\" TEXT NULL, PRIMARY KEY (\"listen_uuid\"));"
+        }
+      ]
+    },
+    {
+      "name": "durable_submissions",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"durable_submissions\" (\"operation_uuid\" TEXT NOT NULL, \"kind\" TEXT NOT NULL, \"local_binding_id\" TEXT NOT NULL, \"frozen_body_json\" TEXT NULL, \"state\" TEXT NOT NULL CHECK (state IN ('prepared', 'sent', 'accepted', 'rejected', 'ambiguous')), \"receipt_json\" TEXT NULL, \"error_code\" TEXT NULL, \"created_at\" INTEGER NOT NULL, \"updated_at\" INTEGER NOT NULL, PRIMARY KEY(operation_uuid));"
+        }
+      ]
+    },
+    {
+      "name": "upload_intents",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"upload_intents\" (\"item_uuid\" TEXT NOT NULL, \"batch_uuid\" TEXT NOT NULL, \"parent_item_uuid\" TEXT NULL, \"selection_index\" INTEGER NOT NULL, \"display_name\" TEXT NOT NULL, \"source_descriptor_json\" TEXT NULL, \"expected_sha256\" TEXT NULL, \"expected_length\" INTEGER NULL, \"last_state\" TEXT NOT NULL, \"last_error_code\" TEXT NULL, \"last_error_message\" TEXT NULL, \"operation_uuid\" TEXT NULL, \"transfer_operation_uuid\" TEXT NULL, \"review_generation\" INTEGER NULL, \"draft_json\" TEXT NULL, \"local_binding_id\" TEXT NOT NULL, \"created_at\" INTEGER NOT NULL, \"updated_at\" INTEGER NOT NULL, PRIMARY KEY(item_uuid));"
+        }
+      ]
+    },
+    {
+      "name": "owned_file_cleanup",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE TABLE IF NOT EXISTS \"owned_file_cleanup\" (\"id\" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, \"path\" TEXT NOT NULL, \"root_kind\" TEXT NOT NULL CHECK (root_kind IN ('downloads')), \"dev\" INTEGER NULL, \"ino\" INTEGER NULL, \"size\" INTEGER NULL, \"mtime\" INTEGER NULL, \"local_binding_id\" TEXT NULL, \"attempts\" INTEGER NOT NULL DEFAULT 0, \"last_error\" TEXT NULL, \"created_at\" INTEGER NOT NULL);"
         }
       ]
     },
@@ -1936,6 +3118,51 @@
         {
           "dialect": "sqlite",
           "sql": "CREATE INDEX idx_queue_session_play_order_session_item ON queue_session_play_order (session_id, item_id)"
+        }
+      ]
+    },
+    {
+      "name": "idx_history_events_pending",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE INDEX idx_history_events_pending ON history_events (pending_upload, local_id)"
+        }
+      ]
+    },
+    {
+      "name": "idx_history_events_kind_occurred",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE INDEX idx_history_events_kind_occurred ON history_events (kind, occurred_at DESC, event_uuid DESC)"
+        }
+      ]
+    },
+    {
+      "name": "idx_active_listens_accumulating",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE UNIQUE INDEX idx_active_listens_accumulating ON active_listens (state) WHERE state = 'accumulating'"
+        }
+      ]
+    },
+    {
+      "name": "idx_durable_submissions_unresolved",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE INDEX idx_durable_submissions_unresolved ON durable_submissions (local_binding_id, kind, state)"
+        }
+      ]
+    },
+    {
+      "name": "idx_upload_intents_batch",
+      "sql": [
+        {
+          "dialect": "sqlite",
+          "sql": "CREATE INDEX idx_upload_intents_batch ON upload_intents (local_binding_id, batch_uuid, selection_index)"
         }
       ]
     }

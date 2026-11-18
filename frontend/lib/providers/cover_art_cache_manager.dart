@@ -7,12 +7,29 @@ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/local_resettable.dart';
 
 /// The process-wide disk cache, overridden at startup; null means no disk
 /// cache.
 final coverArtDiskCacheProvider = Provider<BaseCacheManager?>((ref) => null);
+
+/// How often the connection has come back (offline to online) in this
+/// scope. A cover tile whose load failed uses it as its retry counter, so it
+/// loads again when the connection returns (other-issues row 73).
+final coverArtReconnectsProvider =
+    NotifierProvider<CoverArtReconnects, int>(CoverArtReconnects.new);
+
+class CoverArtReconnects extends Notifier<int> {
+  @override
+  int build() {
+    ref.listen<bool>(offlineModeProvider, (previous, next) {
+      if (previous == true && !next) state++;
+    });
+    return 0;
+  }
+}
 
 /// Encapsulates all cover-art caching logic.
 ///
@@ -86,11 +103,14 @@ class CoverArtCacheManager implements LocalResettable {
   /// the network cache.
   ///
   /// Optional [cacheWidth] and [cacheHeight] allow the image to be decoded at
-  /// the size the UI actually needs instead of full resolution.
+  /// the size the UI actually needs instead of full resolution. A different
+  /// [retry] gives a different image key, so a load that failed is tried
+  /// again instead of served from the image cache.
   ImageProvider imageProvider(
     int coverArtId, {
     int? cacheWidth,
     int? cacheHeight,
+    int retry = 0,
   }) {
     final local = _localStore;
     if (local != null && local.has(coverArtId)) {
@@ -104,7 +124,12 @@ class CoverArtCacheManager implements LocalResettable {
     final cache = _cache;
     final ImageProvider provider = cache == null
         ? NetworkImage(url)
-        : CoverArtImageProvider(url, cache, () => _fetch(cache, url));
+        : CoverArtImageProvider(
+            url,
+            cache,
+            () => _fetch(cache, url),
+            retry: retry,
+          );
     return ResizeImage.resizeIfNeeded(cacheWidth, cacheHeight, provider);
   }
 
@@ -192,7 +217,11 @@ class CoverArtImageProvider extends ImageProvider<CoverArtImageProvider> {
   /// token-free.
   final Future<File> Function() load;
 
-  const CoverArtImageProvider(this.url, this.cache, this.load);
+  /// Part of identity: a new value is a new image-cache key (a retry).
+  final int retry;
+
+  const CoverArtImageProvider(this.url, this.cache, this.load,
+      {this.retry = 0});
 
   @override
   ImageStreamCompleter loadImage(
@@ -219,11 +248,13 @@ class CoverArtImageProvider extends ImageProvider<CoverArtImageProvider> {
 
   @override
   bool operator ==(Object other) =>
-      other is CoverArtImageProvider && other.url == url;
+      other is CoverArtImageProvider &&
+      other.url == url &&
+      other.retry == retry;
 
   @override
-  int get hashCode => url.hashCode;
+  int get hashCode => Object.hash(url, retry);
 
   @override
-  String toString() => 'CoverArtImageProvider($url)';
+  String toString() => 'CoverArtImageProvider($url, retry: $retry)';
 }

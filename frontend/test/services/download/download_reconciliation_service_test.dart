@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Value;
+import 'package:drift/drift.dart' show Value, Variable;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -50,6 +50,17 @@ Future<({String? filePath, int? bitrate, int? size, String? quality})>
   );
 }
 
+/// Whether [uuid]'s row counts as a usable download (the predicate every
+/// "Downloaded" status reads), read directly from the row.
+Future<bool> _usable(AppDatabase db, String uuid) async {
+  final rows = await db.customSelect(
+    'SELECT t.uuid_id FROM tracks AS t '
+    'WHERE t.uuid_id = ? AND $usableDownloadPredicate',
+    variables: [Variable.withString(uuid)],
+  ).get();
+  return rows.isNotEmpty;
+}
+
 void main() {
   late AppDatabase db;
   late DownloadStatusReader reader;
@@ -58,7 +69,7 @@ void main() {
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
-    reader = DownloadStatusReader(db: db);
+    reader = DownloadStatusReader();
     service = DownloadReconciliationService(db: db, statusReader: reader);
     tmp = await Directory.systemTemp.createTemp('reconcile_test_');
   });
@@ -126,9 +137,9 @@ void main() {
         () async {
       final file = File(p.join(tmp.path, 'a.m4a'))..writeAsStringSync('x');
       await _insertTrack(db, 'a', filePath: file.path);
-      expect(await reader.downloadedUuidsForUuids(['a']), {'a'});
+      expect(await _usable(db, 'a'), isTrue);
       await service.markDamaged('a', file.path);
-      expect(await reader.downloadedUuidsForUuids(['a']), isEmpty);
+      expect(await _usable(db, 'a'), isFalse);
     });
 
     test('the full reconcile clears a damaged download whose file is gone',

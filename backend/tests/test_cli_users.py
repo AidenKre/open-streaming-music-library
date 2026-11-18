@@ -6,11 +6,10 @@ bootstrap and refuses any schema version but the current one.
 """
 
 import os
-import sqlite3
 
 import pytest
 
-from app.database.database import Database
+from app.database.database import Database, SchemaVersionRefused
 from tests.cli_fixtures import (
     ADMIN,
     add_track,
@@ -21,7 +20,7 @@ from tests.cli_fixtures import (
     run_cli,
     sql,
 )
-from tests.schema_fixtures import make_legacy_database
+from tests.schema_fixtures import REFUSED_VERSIONS, make_database_at
 
 PAST_NS = 1_000_000_000_000_000_000
 
@@ -151,22 +150,21 @@ def test_every_command_refuses_a_missing_database_and_creates_nothing(settings, 
 
 
 @pytest.mark.parametrize("argv", COMMANDS)
-@pytest.mark.parametrize("version", [12, 13, 14, 15, 16, Database.LATEST_SCHEMA_VERSION + 1])
+@pytest.mark.parametrize("version", REFUSED_VERSIONS)
 def test_every_command_refuses_another_schema_version_untouched(settings, tmp_path, argv, version):
     path = database_file(settings)
-    path.parent.mkdir(parents=True)
-    make_legacy_database(path, 12)
-    conn = sqlite3.connect(path)
-    conn.execute(f"PRAGMA user_version = {version}")
-    conn.commit()
-    conn.close()
+    make_database_at(path, version)
     before = _snapshot(path)
     listing = sorted(os.listdir(path.parent))
 
     result = run_cli(settings, tmp_path, *argv, prompt=lambda _: "x" * 12, confirm=lambda _: "Sam")
 
     assert result.code == 1
-    assert f"schema {version}" in result.err
+    # The command prints the refusal itself and nothing else (its words are
+    # pinned in test_schema_refusal.py).
+    assert result.err.strip() == str(SchemaVersionRefused(
+        version, Database.LATEST_SCHEMA_VERSION, Database.MINIMUM_SCHEMA_VERSION
+    ))
     assert _snapshot_now(path) == before
     assert sorted(os.listdir(path.parent)) == listing
 

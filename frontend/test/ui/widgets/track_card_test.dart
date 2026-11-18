@@ -12,6 +12,7 @@ import 'package:frontend/ui/widgets/track_card.dart';
 
 import '../browse_harness.dart';
 import '../fake_library_actions.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 void main() {
   late AppDatabase db;

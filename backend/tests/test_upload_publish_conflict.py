@@ -18,9 +18,10 @@ from PIL import Image
 from app.database.database import DatabaseContext
 from app.services.cover_art_manager import CoverArtContext, CoverArtManager
 from app.services.upload_publish import SimulatedCrash
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import OwnedTestDatabase
 from tests.schema_fixtures import INIT_SQL
+from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
 from tests.upload_commit_fixtures import (
     NOW,
     FakeArt,
@@ -37,11 +38,6 @@ from tests.upload_publish_fixtures import RecordingSeam, frozen_acks, library_tr
 from tests.upload_validation_fixtures import detected, item_row, new_uuid
 
 KEPT_COLUMNS = ("review_version", "source_path", "detected_metadata", "duplicate_report")
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -320,8 +316,8 @@ def test_a_final_file_that_a_track_now_names_is_never_removed(db, music):
 
     def claim(name):
         if name == "after_conflict_journal":
-            sql(db, "INSERT INTO tracks (uuid_id, file_path, owner_id) VALUES (?, ?, ?)",
-                (new_uuid(), journal(db, a)["final_path"], other))
+            sql(db, f"INSERT INTO tracks (uuid_id, {PATH_COLUMNS}, owner_id) VALUES (?, {PATH_MARKS}, ?)",
+                (new_uuid(), *path_values(journal(db, a)["final_path"]), other))
 
     a_worker, _ = _race(db, music, a, b, also=claim)
 

@@ -2,7 +2,8 @@
 
 Reuses Phase 1's shared crash-safety machinery end to end: the per-uuid
 ``TrackLocks`` lock, the ``edit_journal`` table (via a third ``"convert"``
-intent handled in ``track_editor._reconcile_one``), and the existing
+intent, settled by both journal recoveries: ``journal_settle`` at start-up and
+``journal_recovery.reconcile_one`` at runtime), and the existing
 ``EncoderCoordinator`` thread pool (via ``PRIORITY_CONVERSION``). No new job
 scheduler, no new lock registry, no new staging directory.
 """
@@ -11,7 +12,6 @@ import enum
 import logging
 import os
 import stat
-import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, FrozenSet, Optional
@@ -33,7 +33,7 @@ from app.services import audio_identity
 from app.services.audio_identity import AudioIdentity, ExactAudioHash
 from app.services.encoded_cache import EncodedCache, evict_track_caches
 from app.services.encoder_coordinator import EncoderCoordinator
-from app.services.ffmpeg_runner import FfmpegProcessRegistry, kill_orphaned_ffmpeg
+from app.services.ffmpeg_runner import FfmpegProcessRegistry, ToolOptions, kill_orphaned_ffmpeg
 from app.services.metadata import (
     TagWriteError,
     build_ffmpeg_tags,
@@ -41,16 +41,16 @@ from app.services.metadata import (
     ffprobe_for_metadata,
     write_metadata_tags,
 )
-from app.services.organizer import flush_move, move_back, move_file, prune_empty_dirs
+from app.services.organizer import flush_move
 from app.services.path_sanitize import PathEscapesRoot, assert_within
 from app.services.storage_ledger import CONVERSION, InsufficientStorage, StorageLedger
-from app.services.track_editor import (
+from app.services.journal_recovery import (
     PendingOldMasters,
     finish_track_journal_rows,
-    flush_journal_row,
+    is_regular_file,
     reached_durable_point,
-    settle_old_master,
 )
+from app.services.master_replace import MoveRefused, move_to_new_path
 from app.services.track_locks import TrackLocks
 from app.services.transcoder import (
     QUALITY_BITRATES_KBPS,
@@ -80,11 +80,17 @@ AUDIO_UNVERIFIED_ERROR = (
 SOURCE_DAMAGED_ERROR = (
     "Conversion stopped: the original has damaged audio, so it was not converted."
 )
-# U06-B-06: the same-file swap failed twice; the next start puts the file in place.
+# A same-file swap that was refused is taken back (the owner's decision of
+# 2026-11-18: one attempt, "make the conversion fail and say to convert again").
+SWAP_REFUSED_ERROR = (
+    "The converted file could not replace the original, so the original was kept. "
+    "Convert it again."
+)
+# Only when that could not be taken back (U06-B-06): the committed conversion and
+# its journal row stay, and the next start puts the file in place.
 SWAP_PENDING_ERROR = (
     "The converted file could not replace the original. The server finishes it at its next start."
 )
-SWAP_RETRY_PAUSE_S = 1.0
 # A lossy target whose codec the track already has, at a preset no lower than the
 # stored bitrate (less this tolerance: encoders land near, not on, their preset),
 # would only lose quality: re-encoding cannot add what the file lacks.
@@ -100,6 +106,12 @@ logger = logging.getLogger(__name__)
 class MasterNotFound(Exception):
     """The track exists but its master file is missing on disk -- unlike
     Phase 1's PATCH, conversion has no DB-only fallback."""
+
+
+class ConversionRequestInvalid(ValueError):
+    """A conversion request the server refuses (POST /jobs answers 422 with its
+    text). Raised only by ``_validate_request``; a ValueError, so any caller
+    that catches ValueError still does."""
 
 
 class NoOpConversion(Exception):
@@ -181,7 +193,7 @@ def _probe_intrinsic_fields(
     FLAC, which has no stream-level bit_rate)."""
     raw = ffprobe_for_metadata(path)
     if raw is None:
-        logger.warning("post-conversion probe of %s failed", path)
+        logger.warning("post-conversion probe of %s failed", path.name)  # no folder
         raise ConversionFailed("post-conversion probe failed")
     metadata = build_track_metadata(raw)
     if metadata is None or metadata.codec != target_codec:
@@ -218,13 +230,17 @@ def _reservation_bytes(track: Track, source: Path, target_codec: str,
     return int(estimate * 2.2) + 16 * 1024 * 1024
 
 
-def _resolve_dest(source: Path, target_codec: str) -> Path:
+def _resolve_dest(
+    source: Path, target_codec: str, named_by_another_track: Callable[[Path], bool]
+) -> Path:
     """The converted master's path: same stem, the target's extension. When
     that names the source itself (same extension, or one differing only in
     case on a case-insensitive filesystem) the source path is returned, and
     the conversion replaces the master in place. Raises ``TargetPathTaken``
     if the path belongs to a different file -- checked before transcoding,
-    and never left for ``move_file``/reconcile to trip over."""
+    and never left for ``move_file``/reconcile to trip over. The path also
+    counts as taken when another track's row names it, even with no file
+    there."""
     dest = source.with_suffix("." + CODEC_TO_EXT[target_codec])
     if dest == source:
         return source
@@ -232,21 +248,23 @@ def _resolve_dest(source: Path, target_codec: str) -> Path:
         if os.path.samefile(dest, source):
             return source
         raise TargetPathTaken(str(dest))
+    if named_by_another_track(dest):
+        raise TargetPathTaken(str(dest))
     return dest
 
 
 def _validate_request(track: Track, target_codec: str, target_bitrate_kbps: Optional[int],
                       available_encoders: FrozenSet[str]) -> None:
     if target_codec not in SUPPORTED_TARGET_CODECS or target_codec not in available_encoders:
-        raise ValueError(f"unsupported or unavailable target codec: {target_codec}")
+        raise ConversionRequestInvalid(f"unsupported or unavailable target codec: {target_codec}")
     if is_lossy(target_codec):
         if target_bitrate_kbps not in LOSSY_BITRATE_PRESETS_KBPS:
-            raise ValueError(
+            raise ConversionRequestInvalid(
                 f"{target_codec} requires a target bitrate of one of "
                 f"{sorted(LOSSY_BITRATE_PRESETS_KBPS, reverse=True)}"
             )
     elif target_bitrate_kbps is not None:
-        raise ValueError(f"{target_codec} is lossless and takes no target bitrate")
+        raise ConversionRequestInvalid(f"{target_codec} is lossless and takes no target bitrate")
 
     source_codec = track.metadata.codec
     source_bitrate = track.metadata.bitrate_kbps
@@ -259,7 +277,7 @@ def _validate_request(track: Track, target_codec: str, target_bitrate_kbps: Opti
         # U06-B-06: re-encoding a lossy file into its own codec at the same or a
         # higher bitrate only loses quality (e.g. a Retry after the next start
         # finished the swap; ffmpeg's AAC can land far below its preset).
-        raise ValueError(ALREADY_IN_FORMAT_ERROR)
+        raise ConversionRequestInvalid(ALREADY_IN_FORMAT_ERROR)
     if (
         source_codec is not None
         and is_lossless(source_codec)
@@ -299,10 +317,6 @@ class ConversionOrchestrator:
     check_strict_decode: Callable[..., Optional[str]] = field(
         default=audio_identity.check_strict_decode
     )
-    # U06-B-06: the pause before the one retry of a failed same-file swap.
-    swap_retry_pause: Callable[[], None] = field(
-        default=lambda: time.sleep(SWAP_RETRY_PAUSE_S)
-    )
     _registry: FfmpegProcessRegistry = field(default_factory=FfmpegProcessRegistry)
 
     def __post_init__(self) -> None:
@@ -317,6 +331,13 @@ class ConversionOrchestrator:
             self.pending_old_masters,
         )
 
+    def _named_by_another_track(self, uuid_id: str) -> Callable[[Path], bool]:
+        """Whether a path is the master path of a track other than ``uuid_id``
+        (any owner; letter case and Unicode form folded)."""
+        return lambda path: self.database.track_path_in_use(
+            str(path), owner_id=ANY_OWNER, exclude_uuid=uuid_id
+        )
+
     def enqueue(
         self,
         library: Library,
@@ -327,8 +348,9 @@ class ConversionOrchestrator:
     ) -> int:
         """Validate everything synchronously and persist a queued job, then
         schedule the worker. All input validation happens here -- the
-        scheduler's worker loop silently swallows any exception a submitted
-        function raises, so nothing may rely on it to surface a bad request.
+        scheduler's worker loop logs only the type of any exception a submitted
+        function raises and drops it, so nothing may rely on it to surface a
+        bad request.
         Raises ``ConversionJobActive`` if the track already has one queued or
         running (a double-tap, or a retry of a timed-out-but-landed POST,
         must not re-encode an already-converted master). Raises
@@ -364,7 +386,7 @@ class ConversionOrchestrator:
             if library.has_journal_entry_for_uuid(uuid_id):
                 raise PendingRecovery(uuid_id)
             _validate_request(track, target_codec, target_bitrate_kbps, self.available_encoders)
-            _resolve_dest(source, target_codec)
+            _resolve_dest(source, target_codec, self._named_by_another_track(uuid_id))
 
             self.staging_dir.mkdir(parents=True, exist_ok=True)
             # Read-only: a queued job holds nothing; the run reserves.
@@ -420,13 +442,14 @@ class ConversionOrchestrator:
             return "the master or its destination is outside the owner's library"
         if isinstance(e, MasterNotFound):
             return "master file not found"
-        logger.warning("conversion job failed: %s: %s", type(e).__name__, e)
+        # The type only: an arbitrary exception's text may name a path.
+        logger.warning("conversion job failed: %s", type(e).__name__)
         return f"conversion failed ({type(e).__name__})"
 
     def _run_job(self, job_id: int) -> None:
-        # Mandatory outer catch: EncoderCoordinator's pool silently discards
-        # any exception a submitted function raises, so nothing upstream of
-        # this would ever learn the job failed.
+        # Mandatory outer catch: EncoderCoordinator's pool logs only the type
+        # of any exception a submitted function raises and drops it, so nothing
+        # upstream of this would ever learn the job failed.
         try:
             # The one by-id read without an owner: the job row names its owner,
             # and everything after runs as that owner.
@@ -461,10 +484,10 @@ class ConversionOrchestrator:
             raise ConversionFailed(TRACK_CHANGED_ERROR)
         try:
             _validate_request(track, target_codec, target_bitrate, self.available_encoders)
-        except ValueError as e:
+        except ConversionRequestInvalid as e:
             raise ConversionFailed(str(e)) from e
         source = Path(track.file_path)
-        dest = _resolve_dest(source, target_codec)
+        dest = _resolve_dest(source, target_codec, self._named_by_another_track(uuid_id))
         # Owner's root; a missing user row raises here and fails the job.
         root = library_root(
             self.music_library_dir, self.database.get_user(library.owner_id)
@@ -506,11 +529,12 @@ class ConversionOrchestrator:
             result = transcode(
                 source, transcoded_temp, target_codec, target_bitrate,
                 source_params=source_params, strip_video=False,
-                registry=self._registry, job_id=job_id,
+                options=ToolOptions(registry=self._registry, job_id=job_id),
             )
             self._raise_if_cancelled(library, job_id)
             if not result.ok:
-                logger.warning("transcode failed: %s", result.stderr)
+                # ffmpeg's text names files and tags: it stays in result.stderr.
+                logger.warning("conversion job %s: transcode to %s failed", job_id, target_codec)
                 raise ConversionFailed("transcode failed")
 
             # Bake every editable tag from the CURRENT DB metadata --
@@ -526,7 +550,7 @@ class ConversionOrchestrator:
             try:
                 write_metadata_tags(
                     transcoded_temp, tagged_temp, build_ffmpeg_tags(fields),
-                    registry=self._registry, job_id=job_id,
+                    options=ToolOptions(registry=self._registry, job_id=job_id),
                 )
             except TagWriteError as e:
                 self._raise_if_cancelled(library, job_id)
@@ -540,7 +564,7 @@ class ConversionOrchestrator:
             )
             # Never raises: a failure is a 'failed' value the writer stores as pending.
             identity = self.compute_identity(
-                tagged_temp, target_codec, registry=self._registry, job_id=job_id
+                tagged_temp, target_codec, options=ToolOptions(registry=self._registry, job_id=job_id)
             )
             self._raise_if_cancelled(library, job_id)
             audio_unchanged, source_side = self._verify_lossless(
@@ -568,54 +592,51 @@ class ConversionOrchestrator:
                 self._raise_if_cancelled(library, job_id)
 
                 if dest != source:
-                    entry = library.insert_journal_entry(
-                        "convert", uuid_id,
-                        old_path=str(source), new_path=str(dest),
-                        temp_path=str(tagged_temp),
-                    )
-                    flushed = flush_journal_row(self.database, entry, uuid_id)
-                    if not move_file(file_path=tagged_temp, destination_path=dest):
-                        # While the row exists the staged temp is its evidence
-                        # that the move never happened; drop it only after the
-                        # row is gone.
-                        journal_owns_temp = True
-                        library.delete_journal_entry(entry)
+                    # From this call on the journal owns the staged temp: the
+                    # ``finally`` below may drop it only after the shared moving
+                    # sequence released it (its row is gone, or was never
+                    # written), so no way out of here (an interruption included)
+                    # drops it while the row exists.
+                    journal_owns_temp = True
+
+                    def release_staged() -> None:
+                        nonlocal journal_owns_temp
                         journal_owns_temp = False
-                        logger.warning("could not place converted master at %s", dest)
-                        raise ConversionFailed("could not place the converted master")
-                    flush_move(dest, tagged_temp, root)
+
+                    def after_commit() -> None:
+                        nonlocal committed
+                        committed = True
+                        self._evict(uuid_id)
+
+                    placed = True
                     try:
-                        library.complete_conversion_job(
-                            job_id, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels,
-                            file_path=str(dest),
-                            identity=identity, audio_unchanged=audio_unchanged,
-                            stat=audio_identity.stat_snapshot(dest),
+                        move_to_new_path(
+                            library, uuid_id, intent="convert", source=source, dest=dest,
+                            staged=tagged_temp, root=root,
+                            pending_old_masters=self.pending_old_masters,
+                            # DB did not commit (incl. cancelled in the meantime)
+                            # -> the sequence puts the new copy back in staging
+                            # and keeps the old master.
+                            commit=lambda: library.complete_conversion_job(
+                                job_id, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels,
+                                file_path=str(dest),
+                                identity=identity, audio_unchanged=audio_unchanged,
+                                stat=audio_identity.stat_snapshot(dest),
+                            ),
+                            release_staged=release_staged, after_commit=after_commit,
                         )
-                    except BaseException:
-                        # DB did not commit (incl. cancelled in the meantime) ->
-                        # revert: put the new copy back in staging and keep the
-                        # old master. The staged temp stays while the row does,
-                        # showing recovery that the move was undone.
-                        if not move_back(dest, tagged_temp):
-                            dest.unlink(missing_ok=True)
-                        prune_empty_dirs(dest.parent, root)
-                        journal_owns_temp = True
-                        library.delete_journal_entry(entry)
-                        journal_owns_temp = False
-                        raise
-                    committed = True
-                    self._evict(uuid_id)
-                    # Committed: DB now points at `dest`; the old master is redundant.
-                    settle_old_master(
-                        library, entry, uuid_id, source, dest, root, self.pending_old_masters,
-                        wait=flushed,
-                    )
+                    except MoveRefused:
+                        placed = False
+                    if not placed:
+                        logger.warning("could not place the converted master of %s", uuid_id)
+                        raise ConversionFailed("could not place the converted master")
                     self._notify_identity()
                 else:
                     # The journal row commits WITH the DB update, so "row
-                    # exists" means "DB advanced" -- exactly what
-                    # _reconcile_inplace assumes when it redoes a pending
-                    # replace after a crash. From here the journal owns the temp.
+                    # exists" means "DB advanced" -- exactly what start-up
+                    # recovery (``journal_settle``) assumes when it redoes a
+                    # pending replace after a crash. From here the journal owns
+                    # the temp.
                     _, entry = library.complete_conversion_job(
                         job_id, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels,
                         file_path=None, inplace_journal=(str(source), str(tagged_temp)),
@@ -630,25 +651,16 @@ class ConversionOrchestrator:
                         )
                     try:
                         os.replace(tagged_temp, source)
-                    except OSError:
-                        self.swap_retry_pause()
-                        try:
-                            os.replace(tagged_temp, source)
-                        except OSError as e:
-                            # The row and the staged file are kept: the next start
-                            # puts the file in place and marks the job done.
-                            library.mark_conversion_job_failed(
-                                job_id, SWAP_PENDING_ERROR, after_commit=True
-                            )
-                            logger.warning(
-                                "conversion of %s: the converted file could not replace"
-                                " the original (%s); kept for the next start",
-                                uuid_id, type(e).__name__,
-                            )
-                            return
-                        # The old bytes were served under the committed revision
-                        # during the pause: clients must see the change.
-                        library.bump_track_revision(uuid_id)
+                    except OSError as e:
+                        # One attempt: the conversion fails and the original is kept.
+                        logger.warning(
+                            "conversion of %s: the converted file could not replace"
+                            " the original (%s)", uuid_id, type(e).__name__,
+                        )
+                        self._undo_refused_swap(
+                            library, job_id, uuid_id, entry, current, tagged_temp
+                        )
+                        return
                     flush_move(source, tagged_temp)
                     self._evict(uuid_id)
                     try:
@@ -681,6 +693,59 @@ class ConversionOrchestrator:
                     self._evict(uuid_id)
             finally:
                 self._release(reservation)
+
+    def _undo_refused_swap(
+        self, library: Library, job_id: int, uuid_id: str, entry: int, before: Track,
+        staged: Path,
+    ) -> None:
+        """The same-file swap was refused after its commit: take the commit back.
+        The caller holds the track lock; ``before`` is the track as read under
+        it just before the commit.
+
+        One transaction (``undo_inplace_conversion``) writes the catalog row back,
+        deletes the journal row and fails the job with ``SWAP_REFUSED_ERROR``.
+        Then, in this order: the identity worker is woken (the commit's mark
+        stays: the unchanged file is hashed again, no old digest is put back
+        unverified); a durable point; the staged copy goes. Without the durable
+        point the staged copy stays: a power cut could bring its journal row
+        back, which needs it; the next start removes a copy no row names.
+
+        When the commit cannot be taken back (the transaction is refused, or the
+        staged copy is no longer there, so the rename may have happened) nothing
+        is improvised: the committed conversion, its journal row and whatever is
+        staged stay, as after a crash at this instant, the job says the next
+        start finishes it, and the next start does."""
+        undone = None
+        if is_regular_file(staged):
+            meta = before.metadata
+            try:
+                undone = library.undo_inplace_conversion(
+                    job_id, uuid_id, entry, SWAP_REFUSED_ERROR,
+                    codec=meta.codec, bitrate_kbps=meta.bitrate_kbps,
+                    sample_rate_hz=meta.sample_rate_hz, channels=meta.channels,
+                )
+            except Exception as e:
+                logger.warning(
+                    "conversion of %s: the commit could not be taken back (%s)",
+                    uuid_id, type(e).__name__,
+                )
+        if undone is None:
+            library.mark_conversion_job_failed(job_id, SWAP_PENDING_ERROR, after_commit=True)
+            logger.warning("conversion of %s: kept for the next start", uuid_id)
+            return
+        self._notify_identity()
+        if not reached_durable_point(self.database):
+            logger.warning(
+                "conversion of %s: its staged copy waits for the next start", uuid_id
+            )
+            return
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(
+                "conversion of %s: its staged copy could not be removed (%s)",
+                uuid_id, type(e).__name__,
+            )
 
     def _release(self, reservation: int) -> None:
         try:
@@ -741,7 +806,7 @@ class ConversionOrchestrator:
         else:
             stored = False
             exact = self.compute_identity(
-                source, codec, registry=self._registry, job_id=job_id
+                source, codec, options=ToolOptions(registry=self._registry, job_id=job_id)
             ).exact
         return _SourceSide(exact, generation, stored, source, codec)
 
@@ -753,18 +818,18 @@ class ConversionOrchestrator:
         check still runs). A FLAC that fails it is decoded once more without a
         recognised trailing tag or padding (ffmpeg reads FLAC to the end of the
         file); that second result is the verdict when it is one (a pass, damaged
-        or killed), else the first stands."""
-        reason = self.check_strict_decode(
-            source, registry=self._registry, job_id=job_id, low_priority=True
-        )
+        or killed), else the first stands. The retry tries each candidate audio
+        end (a last CRC byte 0x00 can read as padding) until one is not damaged."""
+        options = ToolOptions(registry=self._registry, job_id=job_id, low_priority=True)
+        reason = self.check_strict_decode(source, options=options)
         if reason == audio_identity.REASON_DECODE_ERROR and codec == "flac":
-            end = audio_identity.audio_end_without_trailer(source)
-            if end is not None:
+            ends = audio_identity.audio_end_candidates(source)
+            if ends:
                 logger.info("strict decode retried without a trailing tag for %s", uuid_id)
-                retry = self.check_strict_decode(
-                    source, registry=self._registry, job_id=job_id, low_priority=True,
-                    audio_end=end,
-                )
+                for end in ends:
+                    retry = self.check_strict_decode(source, options=options, audio_end=end)
+                    if retry != audio_identity.REASON_DECODE_ERROR:
+                        break
                 if retry in (
                     None, audio_identity.REASON_DECODE_ERROR, audio_identity.REASON_KILLED
                 ):
@@ -847,7 +912,8 @@ class ConversionOrchestrator:
         ):
             return True, source_side
         fresh = self.compute_identity(
-            source_side.path, source_side.codec, registry=self._registry, job_id=job_id
+            source_side.path, source_side.codec,
+            options=ToolOptions(registry=self._registry, job_id=job_id),
         ).exact
         if not isinstance(fresh, ExactAudioHash):
             if getattr(fresh, "reason", None) == audio_identity.REASON_KILLED:

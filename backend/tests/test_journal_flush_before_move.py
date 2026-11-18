@@ -22,12 +22,12 @@ import sqlite3
 
 import pytest
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
 from app.services.track_edit import WriteMode
 from app.services.track_editor import PendingOldMasters, TrackEditor, reconcile_journal
-from tests.test_identity_editor import _world
+from tests.identity_editor_fixtures import _world
 from tests.test_journal_settle import C_TEMP, INITIAL, _add, _db_path, _rows, fake_read, run, world
-from tests.test_track_editor import _db, _lib
+from tests.track_editor_fixtures import _db, _lib
 
 OPERATOR = "uvicorn.error"
 FAILURES = [False, sqlite3.OperationalError("database is locked")]

@@ -1,16 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/models/duration_text.dart';
 import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 import 'package:frontend/ui/widgets/full_player.dart';
-
-String formatDuration(Duration d) {
-  final minutes = d.inMinutes;
-  final seconds = d.inSeconds % 60;
-  return '$minutes:${seconds.toString().padLeft(2, '0')}';
-}
 
 class MiniPlayer extends ConsumerWidget {
   const MiniPlayer({super.key});
@@ -106,7 +101,8 @@ class MiniPlayer extends ConsumerWidget {
                           ),
                           const SizedBox(width: 4),
                           Text(
-                            formatDuration(position),
+                            formatTrackDuration(
+                                position.inMilliseconds / 1000),
                             style: textTheme.bodySmall?.copyWith(
                               color: colors.onSurfaceVariant,
                             ),

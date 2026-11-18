@@ -13,6 +13,7 @@ import 'package:frontend/ui/widgets/library_card.dart';
 import 'package:frontend/ui/widgets/search_status.dart';
 
 import 'browse_harness.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// 4A.4: the new all-Albums browse (phase-4 §6): watchAlbums(artistId:
 /// null), the Downloaded chip (filter before limit), album-only search.
@@ -161,7 +162,10 @@ void main() {
     await tester.tap(find.text('Quartz'));
     await tester.pumpAndSettle();
     final page = tester.widget<TracksPage>(find.byType(TracksPage));
-    expect((page.artistId, page.albumId, page.browseAll), (3, 30, false));
+    expect(
+      (page.album?.artistId, page.album?.albumId, page.browseAll),
+      (3, 30, false),
+    );
     expect(find.byType(FilterBar), findsNothing);
     await teardownTree(tester);
   });
@@ -238,7 +242,7 @@ void main() {
       await tester.tap(bo);
       await tester.pumpAndSettle();
       final d = tester.widget<TracksPage>(find.byType(TracksPage));
-      expect((d.albumId, d.artistId), (20, 2));
+      expect((d.album?.albumId, d.album?.artistId), (20, 2));
       await teardownTree(tester);
     });
   });
@@ -267,7 +271,10 @@ void main() {
 
     await tester.tap(card(30));
     await tester.pumpAndSettle();
-    expect(tester.widget<TracksPage>(find.byType(TracksPage)).albumId, 30);
+    expect(
+      tester.widget<TracksPage>(find.byType(TracksPage)).album?.albumId,
+      30,
+    );
     await teardownTree(tester);
   });
 

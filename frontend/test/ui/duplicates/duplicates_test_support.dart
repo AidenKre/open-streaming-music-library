@@ -13,23 +13,8 @@ import 'package:frontend/ui/preview_controller.dart';
 
 import '../../helpers/duplicate_fixtures.dart';
 import '../../helpers/fake_library_tools_api.dart';
-import '../browse_harness.dart' show TestOffline;
-
-/// A track sync whose runs the test starts and finishes.
-class DupSync extends TrackSyncNotifier {
-  @override
-  Future<TrackSyncState> build() async => const TrackSyncState();
-
-  @override
-  Future<void> sync() async {}
-
-  /// One finished run that deleted [deleted] locally (none: a no-op run,
-  /// as on every resume).
-  void runOnce({Set<String> deleted = const {}}) {
-    state = const AsyncData(TrackSyncState(isSyncing: true));
-    state = AsyncData(TrackSyncState(deletedTrackUuids: deleted));
-  }
-}
+import '../../helpers/run_once_track_sync.dart';
+import '../../helpers/test_offline.dart';
 
 /// Records every preview input.
 class RecordingPreviewControls implements PreviewControls {
@@ -56,20 +41,21 @@ class RecordingPreviewControls implements PreviewControls {
 /// A controller over a fake server: [pages] by status then cursor (null =
 /// first page), [summary], and the given offline / switch state.
 class DupHarness {
-  DupHarness() {
-    api.onListDuplicates = (status, after, limit) async =>
+  /// [api] defaults to a plain [FakeLibraryToolsApi].
+  DupHarness({FakeLibraryToolsApi? api}) : api = api ?? FakeLibraryToolsApi() {
+    this.api.onListDuplicates = (status, after, limit) async =>
         pages[status]![after] ?? (throw StateError('no page $status $after'));
-    api.onDuplicateSummary = () async => summary;
+    this.api.onDuplicateSummary = () async => summary;
   }
 
-  final api = FakeLibraryToolsApi();
+  final FakeLibraryToolsApi api;
   final preview = RecordingPreviewControls();
   final pages = <String, Map<String?, DuplicatePairPageDto>>{
     'open': {null: dupPage(const [])},
     'dismissed': {null: dupPage(const [])},
   };
   DuplicateSummaryDto summary = dupSummary();
-  late DupSync sync;
+  late RunOnceTrackSync sync;
   late TestOffline offline;
   late ProviderContainer container;
   late DuplicatesControls dup;
@@ -85,7 +71,7 @@ class DupHarness {
     container = ProviderContainer(
       overrides: [
         libraryToolsApiProvider.overrideWithValue(api),
-        trackSyncProvider.overrideWith(() => sync = DupSync()),
+        trackSyncProvider.overrideWith(() => sync = RunOnceTrackSync()),
         offlineModeProvider.overrideWith(() => offline),
         previewControlsProvider.overrideWithValue(preview),
         libraryToolsFeatureProvider.overrideWith(

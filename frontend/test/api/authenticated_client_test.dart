@@ -13,6 +13,8 @@ import 'package:frontend/api/token_permit.dart';
 import 'package:frontend/services/credential_store.dart';
 import 'package:http/http.dart' as http;
 
+import '../helpers/spy_inner_client.dart';
+
 const _alice = Credentials(
   token: 'api-token-A',
   mediaToken: 'media-token-A',
@@ -25,31 +27,6 @@ const _bob = Credentials(
   userId: 8,
   username: 'bob',
 );
-
-/// The shared inner transport: records every request it is handed and
-/// whether anyone closed it.
-class _SpyInner extends http.BaseClient {
-  _SpyInner({this.status = 200, this.gate});
-  int status;
-  final Completer<void>? gate;
-  final List<http.BaseRequest> requests = [];
-  bool closed = false;
-
-  @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    if (closed) throw StateError('inner client used after close');
-    requests.add(request);
-    await gate?.future;
-    return http.StreamedResponse(
-      Stream.value('{}'.codeUnits),
-      status,
-      request: request,
-    );
-  }
-
-  @override
-  void close() => closed = true;
-}
 
 String? _auth(http.BaseRequest r) => r.headers['Authorization'];
 
@@ -82,11 +59,11 @@ final _allowAll = _FakePermit();
 
 void main() {
   group('AuthenticatedClient adds the header', () {
-    late _SpyInner inner;
+    late SpyInnerClient inner;
     late ApiClient api;
 
     setUp(() {
-      inner = _SpyInner();
+      inner = SpyInnerClient();
       api = testApiClient('http://srv:1', AuthenticatedClient(inner, _alice, permit: _allowAll));
     });
 
@@ -161,7 +138,7 @@ void main() {
   group('onUnauthorized', () {
     test('is called on a 401, synchronously, before the caller gets the '
         'response', () async {
-      final inner = _SpyInner(status: 401);
+      final inner = SpyInnerClient(status: 401);
       var callerHasResponse = false;
       final seenByHook = <bool>[];
       final client = AuthenticatedClient(
@@ -180,7 +157,7 @@ void main() {
 
     test('is called once per 401 through ApiClient, which still throws the '
         '401', () async {
-      final inner = _SpyInner(status: 401);
+      final inner = SpyInnerClient(status: 401);
       var calls = 0;
       final api = testApiClient(
         'http://srv:1',
@@ -195,7 +172,7 @@ void main() {
 
     test('is not called for other statuses', () async {
       for (final status in [200, 204, 403, 404, 409, 500]) {
-        final inner = _SpyInner(status: status);
+        final inner = SpyInnerClient(status: status);
         var calls = 0;
         final client = AuthenticatedClient(
           inner,
@@ -209,7 +186,7 @@ void main() {
     });
 
     test('is a no-op after dispose', () async {
-      final inner = _SpyInner(status: 401);
+      final inner = SpyInnerClient(status: 401);
       var calls = 0;
       final client = AuthenticatedClient(
         inner,
@@ -227,7 +204,7 @@ void main() {
     test('a 401 arriving after dispose for a request sent before it is a '
         'no-op', () async {
       final gate = Completer<void>();
-      final inner = _SpyInner(status: 401, gate: gate);
+      final inner = SpyInnerClient(status: 401, gate: gate);
       var calls = 0;
       final client = AuthenticatedClient(
         inner,
@@ -249,7 +226,7 @@ void main() {
   group('scope lifetime', () {
     test('a request created by a disposed client still carries its own '
         "token, not the next scope's", () async {
-      final inner = _SpyInner();
+      final inner = SpyInnerClient();
       final a = AuthenticatedClient(inner, _alice, permit: _allowAll);
       final b = AuthenticatedClient(inner, _bob, permit: _allowAll);
       a.dispose();
@@ -262,7 +239,7 @@ void main() {
     });
 
     test('close() leaves the shared inner client open', () async {
-      final inner = _SpyInner();
+      final inner = SpyInnerClient();
       AuthenticatedClient(inner, _alice, permit: _allowAll).close();
       expect(inner.closed, isFalse);
       final next = AuthenticatedClient(inner, _bob, permit: _allowAll);
@@ -278,13 +255,13 @@ void main() {
   // is never handed to the transport and fails with its own error, which
   // ApiClient neither retries nor reports as a lost connection.
   group('permit', () {
-    late _SpyInner inner;
+    late SpyInnerClient inner;
     late _FakePermit permit;
     late ApiClient api;
     late int networkFailures;
 
     setUp(() {
-      inner = _SpyInner();
+      inner = SpyInnerClient();
       permit = _FakePermit(allow: false);
       api = testApiClient(
         'http://srv:1',
@@ -400,12 +377,12 @@ void main() {
   // exemption sends exactly one POST /auth/logout with the scope's token,
   // whatever the permit says afterwards, and nothing else.
   group('revoke exemption', () {
-    late _SpyInner inner;
+    late SpyInnerClient inner;
     late _FakePermit permit;
     late ApiClient api;
 
     setUp(() {
-      inner = _SpyInner();
+      inner = SpyInnerClient();
       permit = _FakePermit(allow: false);
       api = testApiClient(
         'http://srv:1',
@@ -458,7 +435,7 @@ void main() {
   group('UnauthenticatedClient', () {
     test('forUrl builds a client for that URL that sends no Authorization '
         'header', () async {
-      final inner = _SpyInner();
+      final inner = SpyInnerClient();
       final api = UnauthenticatedClient.forUrl('http://new:2', inner);
       expect(api.baseUrl, 'http://new:2');
       await api.getJson(['app', 'info']);
@@ -472,7 +449,7 @@ void main() {
 
     test('keeps an explicit Authorization header the caller sets (the '
         'cancel-time revoke)', () async {
-      final inner = _SpyInner();
+      final inner = SpyInnerClient();
       final api = UnauthenticatedClient.forUrl('http://new:2', inner);
       await api.postJson(
         ['auth', 'logout'],
@@ -482,7 +459,7 @@ void main() {
     });
 
     test('close() leaves the shared inner client open', () async {
-      final inner = _SpyInner();
+      final inner = SpyInnerClient();
       final client = UnauthenticatedClient(inner)..close();
       expect(inner.closed, isFalse);
       final response = await client.send(

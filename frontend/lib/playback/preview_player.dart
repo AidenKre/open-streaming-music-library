@@ -12,7 +12,7 @@ import 'package:frontend/playback/playback_engine.dart';
 import 'package:frontend/playback/preview_engine.dart';
 
 import 'package:frontend/api/api_client_provider.dart';
-import 'package:frontend/playback/track_cache_manager.dart';
+import 'package:frontend/playback/stream_uris.dart';
 import 'package:frontend/providers/track_codec_lookup_provider.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/server_binding_gate.dart';
@@ -169,7 +169,9 @@ final previewPlayerProvider =
 /// close or dispose makes older work a no-op), and output happens only while
 /// it holds focus: it acquires from the library first, which pauses and
 /// acknowledges, and it stops and acknowledges when the library takes the
-/// output back. Closing leaves the library paused for the user to resume.
+/// output back. Closing after it sounded leaves the library paused for the
+/// user to resume; closed or paused before it sounded, it hands the output
+/// back and the library plays on.
 class PreviewPlayer extends Notifier<PreviewState>
     implements AudioFocusOwner, FocusRelinquisher {
   late AudioFocus _focus;
@@ -183,6 +185,13 @@ class PreviewPlayer extends Notifier<PreviewState>
   bool _wantPlaying = false;
   bool _loaded = false;
   bool _engineReportsPlaying = false;
+
+  /// Whether a pause or a close by the person gives the output back to the
+  /// library, so that the music is never left paused for a preview that
+  /// never sounded: true from a hand-over by the library until this preview
+  /// produces sound, or until an OS interruption or unplugged headphones
+  /// reach it (the library must not start by itself after those).
+  bool _handsBack = false;
 
   /// Set when an OS interruption paused playing preview; any later command
   /// clears it, so the user's choice is never undone.
@@ -255,10 +264,16 @@ class PreviewPlayer extends Notifier<PreviewState>
       _set(source, refusal);
       return;
     }
+    // Paused while its source was still resolving: the output is not taken,
+    // so the library keeps playing; Resume starts this preview again.
+    if (!_wantPlaying) return;
+    // A hand-over from the library starts here: nothing has sounded yet.
+    if (_focus.holder != AudioOutput.preview) _handsBack = true;
     final granted = await _focus.acquire(AudioOutput.preview);
     if (!_current(generation)) return;
     if (!granted) {
-      _set(source, PreviewStatus.failed);
+      // Refused, unless the person paused meanwhile and gave it up.
+      if (_wantPlaying) _set(source, PreviewStatus.failed);
       return;
     }
     final engine = _ensureEngine();
@@ -275,10 +290,16 @@ class PreviewPlayer extends Notifier<PreviewState>
       _set(source, state.status, duration);
       return;
     }
+    _handsBack = false;
     unawaited(engine.play());
     _set(source, PreviewStatus.playing, duration);
   }
 
+  /// Pauses. A preview the person pauses before it sounded also gives the
+  /// output back (or gives up the hand-over it is waiting for): the library
+  /// plays on, and Resume asks for the output again. The pause of an OS
+  /// interruption or of unplugged headphones keeps the output
+  /// ([_handsBack] is cleared first).
   Future<void> pause() async {
     if (_quiesced) return;
     _resumeAfterInterruption = false;
@@ -288,6 +309,7 @@ class PreviewPlayer extends Notifier<PreviewState>
     if (status == PreviewStatus.playing || status == PreviewStatus.loading) {
       _set(state.source, PreviewStatus.paused, state.duration);
     }
+    if (_handsBack) _focus.handBack(AudioOutput.preview);
   }
 
   Future<void> resume() async {
@@ -321,8 +343,10 @@ class PreviewPlayer extends Notifier<PreviewState>
     if (!_disposed) state = const PreviewState();
   }
 
-  /// Stops, disposes the engine and gives the output up. The library is left
-  /// paused for the user to resume. The stop and the focus hand-back are
+  /// Stops, disposes the engine and gives the output up. After the preview
+  /// sounded, the library is left paused for the user to resume; a preview
+  /// closed before it sounded gives the output back, and the library plays
+  /// on. The stop and the focus hand-back are
   /// immediate; only the state write is deferred a microtask, because a
   /// widget's dispose may call this and Riverpod forbids provider writes
   /// during the build/finalize pass. A play started meanwhile owns the state.
@@ -332,7 +356,11 @@ class PreviewPlayer extends Notifier<PreviewState>
     final generation = ++_generation;
     _wantPlaying = false;
     _disposeEngine();
-    _focus.giveUp(AudioOutput.preview);
+    if (_handsBack) {
+      _focus.handBack(AudioOutput.preview);
+    } else {
+      _focus.giveUp(AudioOutput.preview);
+    }
     await Future<void>.microtask(() {});
     if (_current(generation)) state = const PreviewState();
   }
@@ -363,6 +391,7 @@ class PreviewPlayer extends Notifier<PreviewState>
   @override
   void onInterruptionBegan() {
     if (_quiesced) return;
+    _handsBack = false;
     if (!_wantPlaying) return;
     unawaited(pause());
     _resumeAfterInterruption = true;
@@ -379,6 +408,7 @@ class PreviewPlayer extends Notifier<PreviewState>
   @override
   void onBecameNoisy() {
     if (_quiesced) return;
+    _handsBack = false;
     if (_wantPlaying) unawaited(pause());
     _resumeAfterInterruption = false;
   }

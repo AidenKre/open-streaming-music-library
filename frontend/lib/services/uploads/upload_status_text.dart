@@ -3,7 +3,7 @@
 // review flow and the duplicate banners say the same thing. Plain words: no
 // error codes, paths, IDs, and never the server's raw `message`. Model code:
 // nothing from ui/.
-import 'package:frontend/services/uploads/upload_manager.dart'
+import 'package:frontend/services/uploads/upload_types.dart'
     show LeftOutReason, ReselectOutcome, RetryOutcome;
 
 /// What to tell the user about a retry's [outcome]; null when it was
@@ -15,11 +15,49 @@ String? retryOutcomeText(RetryOutcome outcome) => switch (outcome) {
     'This file changed on the server. Check its status and try again.',
 };
 
+/// The catch-all after an upload action failed for a reason the app cannot
+/// name.
+const uploadActionFailedText = 'Something went wrong. Try again.';
+
 /// The status of an adopted item whose bytes another device is sending.
 const otherDeviceSendingStatus = 'Uploading from another device';
 
 /// Its explanation.
 const otherDeviceSendingText = 'Another device is sending this upload.';
+
+/// A file of an unpacked archive whose received copy the server lost: the
+/// server does not retry such a file, and the archive's file list offers no
+/// Retry or Cancel, so the one step that works is adding the archive again
+/// (refactor APP-UPLOAD).
+const archiveFileSourceMissingText =
+    'The server no longer has this file from the archive. Add the archive '
+    'again to upload it.';
+
+/// The status and detail an item in [state] shows, the same on the Uploads
+/// page and in the review. [fromOtherDevice]: see `sentFromOtherDevice`;
+/// [paused] and [bytesHere] as for [uploadStatusText] and
+/// [uploadDetailText].
+({String status, String? detail}) uploadItemTexts(
+  String state, {
+  String? errorCode,
+  required bool bytesHere,
+  required bool paused,
+  required bool fromOtherDevice,
+  bool fromArchive = false,
+}) => (
+  // Only the row being received is uploading; a waiting one still waits.
+  status: fromOtherDevice && state == 'receiving'
+      ? otherDeviceSendingStatus
+      : uploadStatusText(state, errorCode: errorCode, paused: paused),
+  detail: fromOtherDevice
+      ? otherDeviceSendingText
+      : uploadDetailText(
+          state,
+          errorCode: errorCode,
+          bytesHere: bytesHere,
+          fromArchive: fromArchive,
+        ),
+);
 
 /// The short status of an item in [state] (a server item state or a local
 /// `UploadIntentState`), given its last [errorCode].
@@ -66,11 +104,13 @@ String uploadStatusText(
 
 /// A longer explanation for an item in [state], or null when the status
 /// says it all. [bytesHere]: this device holds the file's bytes (it was
-/// picked here); false for an adopted row.
+/// picked here); false for an adopted row. [fromArchive]: a file of an
+/// unpacked archive (a ZIP child).
 String? uploadDetailText(
   String state, {
   String? errorCode,
   bool bytesHere = true,
+  bool fromArchive = false,
 }) =>
     switch (state) {
       'allocated' => switch (errorCode) {
@@ -142,6 +182,8 @@ String? uploadDetailText(
         // Retry needs the bytes again: only a device that has them can
         // send it (sign-off s7-app-texts review r1 #2). The device that
         // added it is not named: it often can't retry either (review-8 #3).
+        'upload_source_missing' when fromArchive =>
+          archiveFileSourceMissingText,
         'upload_source_missing' when !bytesHere =>
           'The server no longer has the received file, and this device '
               'cannot find it. Cancel it and add it again.',

@@ -15,6 +15,11 @@ from watchdog.observers import Observer
 logger = logging.getLogger(__name__)
 
 
+def is_import_candidate(path: Path) -> bool:
+    """The name rule for the import folder: only audio files and archives."""
+    return is_music_file(path) or is_archive(path)
+
+
 def under_dot_folder(path: Path, root: Path) -> bool:
     """True when a directory component of ``path`` below ``root`` starts with a dot."""
     try:
@@ -68,11 +73,12 @@ class FileWatcher(FileSystemEventHandler):
         self._on_event(Path(os.fsdecode(event.src_path)))
 
     def _on_event(self, path: Path, *, created: bool = False) -> None:
-        """Event entry point (``scan_existing`` bypasses these rules): ignore
-        names that are neither audio nor archives, and, for modify/move events,
-        a file an earlier attempt left behind that has not changed since. A
-        create event is a new file at the path, so it is always attempted."""
-        if not (is_music_file(path) or is_archive(path)):
+        """Event entry point: ignore names that are neither audio nor archives
+        (``scan_existing`` shares that name rule) and, for modify/move events,
+        a file an earlier attempt left behind that has not changed since
+        (the scan does not apply that rule). A create event is a new file at
+        the path, so it is always attempted."""
+        if not is_import_candidate(path):
             return
         left = self._left_behind.get(path)
         if left is not None:
@@ -107,29 +113,31 @@ class FileWatcher(FileSystemEventHandler):
 
     def scan_existing(self, directory: Path | None = None) -> None:
         """Feed every existing file under ``directory`` (default: the import
-        dir) through the same path as a newly created file."""
+        dir) through the same path as a newly created file; names that are
+        neither audio nor archives are skipped."""
         root = directory or self.import_dir
         if not root.is_dir():
             return
         for path in sorted(p for p in root.rglob("*") if p.is_file()):
-            self._submit_new(path)
+            if is_import_candidate(path):
+                self._submit_new(path)
 
     def start_file_watcher(self):
         if self.observer is None or not self.observer.is_alive():
-            self.observer = Observer()
-            self.observer.schedule(self, str(self.import_dir), recursive=True)
-            self.observer.start()
+            observer = Observer()
+            observer.schedule(self, str(self.import_dir), recursive=True)
+            observer.start()
+            # Kept only once it runs: stopping never meets an observer that never started.
+            self.observer = observer
             print(f"File watcher started for {self.import_dir}")
 
     def stop_file_watcher(self, timeout: float = 30.0):
         return stop_watchers([self], timeout)
 
     def handle_new_file(self, path: Path):
-        # print(f"Handling new file {path}")
         return self.on_file(path)
 
     def process_file_after_stable(self, path: Path) -> bool:
-        # print(f"Processing file {path} after stable")
         if not wait_until_ready(path, stop=self._stopping):
             # Not handled: forget it so a later scan feeds it again.
             self.processed.discard(path)

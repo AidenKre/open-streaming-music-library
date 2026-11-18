@@ -84,7 +84,6 @@ void main() {
       db: db,
       api: TracksApi(api: api),
       queueRepository: QueueRepository(db),
-      prefs: await SharedPreferences.getInstance(),
       bindingToken: token,
     );
   }

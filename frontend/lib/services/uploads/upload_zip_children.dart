@@ -1,13 +1,15 @@
 // The files of an unpacked ZIP (spec §7 para 3: "Expanded ZIP parent opens
 // its child list with valid/failed/skipped counts"). A read-only projection
 // over the server's item pages (the upload manager keeps no intents for ZIP
-// children); the API call awaits the binding gate. Model code: nothing from
+// children); the API call waits for a server check in flight only within
+// the binding gate's bound, never without a limit. Model code: nothing from
 // ui/.
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/api/uploads_api.dart';
-import 'package:frontend/services/uploads/upload_status_text.dart';
-import 'package:frontend/services/uploads/uploads_overview.dart'
+import 'package:frontend/services/uploads/upload_item_rules.dart'
     show isServerRefusedReview, needsUserAttention, offersReview;
+import 'package:frontend/services/uploads/upload_status_text.dart';
 
 const _validStates = {
   'review_ready',
@@ -90,7 +92,16 @@ class UploadZipChildren {
     int? skipped;
     String? cursor;
     do {
-      final page = await _api.listItems(batchUuid, after: cursor, limit: 100);
+      // A page a person is looking at: like the person's own action, it
+      // waits for a server check only within the gate's bound, and fails at
+      // once on a different server, signed out, or offline with the server
+      // still verified (row 72).
+      final page = await _api.listItems(
+        batchUuid,
+        after: cursor,
+        limit: 100,
+        wait: BindingWait.forPendingVerdict,
+      );
       for (final item in page.items) {
         if (item.itemUuid == parentItemUuid) skipped = item.skippedMembers;
         if (item.parentItemUuid != parentItemUuid) continue;
@@ -101,7 +112,11 @@ class UploadZipChildren {
             itemUuid: item.itemUuid,
             displayName: item.filename,
             statusText: uploadStatusText(state, errorCode: code),
-            detailText: uploadDetailText(state, errorCode: code),
+            detailText: uploadDetailText(
+              state,
+              errorCode: code,
+              fromArchive: true,
+            ),
             needsAttention: needsUserAttention(state, code),
             offersReviewTags: offersReview(state, code),
           ),

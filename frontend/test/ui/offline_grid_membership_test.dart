@@ -10,6 +10,7 @@ import 'package:frontend/ui/widgets/album_card.dart';
 
 import 'browse_harness.dart';
 import 'fake_library_actions.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 /// Page-level wiring of the model's offline grid rule, and the album card's
 /// scope through the REAL availability provider (only the network-bound

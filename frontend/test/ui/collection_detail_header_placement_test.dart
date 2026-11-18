@@ -13,9 +13,11 @@ import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/collection_action_header.dart';
+import 'package:frontend/models/library_scope.dart';
 
 import 'browse_harness.dart';
 import 'fake_library_actions.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
 void main() {
   late AppDatabase db;
@@ -64,7 +66,7 @@ void main() {
   group('detail modes show the header', () {
     testWidgets('an album track list: Play and Shuffle the album',
         (tester) async {
-      await pump(tester, const TracksPage(artistId: 1, albumId: 2));
+      await pump(tester, const TracksPage.album(AlbumScope(artistId: 1, albumId: 2)));
       expectEnabled(tester, 'Play album', true);
       expectEnabled(tester, 'Shuffle album', true);
       await tester.tap(find.bySemanticsLabel('Play album'));
@@ -87,7 +89,7 @@ void main() {
     });
 
     testWidgets('the header sits in the body, above the list', (tester) async {
-      await pump(tester, const TracksPage(artistId: 1, albumId: 2));
+      await pump(tester, const TracksPage.album(AlbumScope(artistId: 1, albumId: 2)));
       final header = tester.getRect(find.byType(CollectionActionHeader));
       final firstRow = tester.getRect(find.text('Kite One'));
       expect(header.bottom, lessThanOrEqualTo(firstRow.top));
@@ -125,7 +127,7 @@ void main() {
   group('states from the real availability', () {
     testWidgets('offline, a partly downloaded album can play (O2)',
         (tester) async {
-      await pump(tester, const TracksPage(artistId: 1, albumId: 2),
+      await pump(tester, const TracksPage.album(AlbumScope(artistId: 1, albumId: 2)),
           offline: true);
       expectEnabled(tester, 'Play album', true);
       expectEnabled(tester, 'Shuffle album', true);
@@ -134,7 +136,7 @@ void main() {
 
     testWidgets('offline, an album with no download is disabled, with the '
         'reason', (tester) async {
-      await pump(tester, const TracksPage(artistId: 1, albumId: 3),
+      await pump(tester, const TracksPage.album(AlbumScope(artistId: 1, albumId: 3)),
           offline: true);
       expectEnabled(tester, 'Play album', false);
       expectEnabled(tester, 'Shuffle album', false);
@@ -144,7 +146,7 @@ void main() {
 
     testWidgets('an album with no tracks is empty and disabled',
         (tester) async {
-      await pump(tester, const TracksPage(artistId: 1, albumId: 99));
+      await pump(tester, const TracksPage.album(AlbumScope(artistId: 1, albumId: 99)));
       expectEnabled(tester, 'Play album', false);
       expect(find.text('No tracks to play.'), findsOneWidget);
       await teardownTree(tester);
@@ -159,7 +161,7 @@ void main() {
     });
 
     testWidgets('a loaded album is not empty', (tester) async {
-      await pump(tester, const TracksPage(artistId: 1, albumId: 2));
+      await pump(tester, const TracksPage.album(AlbumScope(artistId: 1, albumId: 2)));
       expect(find.text('No tracks to play.'), findsNothing);
       await teardownTree(tester);
     });

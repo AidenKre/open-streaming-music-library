@@ -8,28 +8,13 @@ so timing doesn't tell them apart. A hash made with other parameters is
 rehashed on a successful login.
 """
 
-import hashlib
-import sqlite3
-
 import pytest
 from argon2 import PasswordHasher, extract_parameters
 
+from tests.auth_helpers import sha256_hex
+from tests.sqlite_helpers import sql_dicts
+
 PASSWORD = "a long enough password"
-
-
-def _sha256(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def _sql(client, statement, params=()):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = [dict(r) for r in conn.execute(statement, params)]
-        conn.commit()
-        return rows
-    finally:
-        conn.close()
 
 
 def _login(client, username="Sam", password=PASSWORD):
@@ -58,7 +43,7 @@ def verifies(monkeypatch):
 
 
 def _sam(client):
-    return _sql(client, "SELECT * FROM users WHERE username_key = 'sam'")[0]
+    return sql_dicts(client, "SELECT * FROM users WHERE username_key = 'sam'")[0]
 
 
 # ── success ─────────────────────────────────────────────────────────────────
@@ -72,8 +57,8 @@ def test_login_returns_a_new_session_and_the_user(client):
     assert set(body) == {"token", "media_token", "server_instance_id", "user"}
     assert body["user"] == {"id": sam["id"], "username": "Sam", "is_admin": False, "is_master_admin": False}
     assert body["server_instance_id"] == client.get("/app/info").json()["server"]["instance_id"]
-    sessions = _sql(client, "SELECT token_hash, media_hash FROM auth_sessions WHERE user_id = ?", (sam["id"],))
-    assert {"token_hash": _sha256(body["token"]), "media_hash": _sha256(body["media_token"])} in sessions
+    sessions = sql_dicts(client, "SELECT token_hash, media_hash FROM auth_sessions WHERE user_id = ?", (sam["id"],))
+    assert {"token_hash": sha256_hex(body["token"]), "media_hash": sha256_hex(body["media_token"])} in sessions
     assert len(sessions) == 2  # register's session is kept
 
 
@@ -97,7 +82,7 @@ def test_a_decomposed_spelling_logs_in(open_app_client):
 
 def test_a_hash_with_other_parameters_is_rehashed_on_login(client):
     old = PasswordHasher(time_cost=1, memory_cost=16, parallelism=1).hash(PASSWORD)
-    _sql(client, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (old,))
+    sql_dicts(client, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (old,))
 
     assert _login(client).status_code == 200
 
@@ -126,9 +111,9 @@ def _refusal(response):
 
 def _setup_path(client, path):
     if path == "disabled":
-        _sql(client, "UPDATE users SET disabled_at = 5 WHERE username_key = 'sam'")
+        sql_dicts(client, "UPDATE users SET disabled_at = 5 WHERE username_key = 'sam'")
     elif path == "deleting":
-        _sql(client, "UPDATE users SET deleting_at = 5 WHERE username_key = 'sam'")
+        sql_dicts(client, "UPDATE users SET deleting_at = 5 WHERE username_key = 'sam'")
 
 
 _PATHS = {
@@ -145,13 +130,13 @@ _PATHS = {
 @pytest.mark.parametrize("path", list(_PATHS))
 def test_every_refused_login_is_the_same_401(client, path):
     _setup_path(client, path)
-    sessions_before = _sql(client, "SELECT * FROM auth_sessions")
+    sessions_before = sql_dicts(client, "SELECT * FROM auth_sessions")
 
     body = _refusal(_login(client, *_PATHS[path]))
 
     reference = _refusal(_login(client, "nobody", PASSWORD))
     assert body == reference
-    assert _sql(client, "SELECT * FROM auth_sessions") == sessions_before
+    assert sql_dicts(client, "SELECT * FROM auth_sessions") == sessions_before
 
 
 @pytest.mark.parametrize("path", [*_PATHS, "success"])
@@ -227,7 +212,7 @@ def _change_during_verify(client, monkeypatch, statement, params=()):
 
     def racing_verify(hasher, *args, **kwargs):
         result = real_verify(hasher, *args, **kwargs)
-        _sql(client, statement, params)
+        sql_dicts(client, statement, params)
         return result
 
     monkeypatch.setattr(PasswordHasher, "verify", racing_verify)
@@ -235,7 +220,7 @@ def _change_during_verify(client, monkeypatch, statement, params=()):
 
 def test_a_password_reset_during_login_refuses_the_login(client, monkeypatch):
     reset = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1).hash("the new password")
-    sessions_before = _sql(client, "SELECT * FROM auth_sessions")
+    sessions_before = sql_dicts(client, "SELECT * FROM auth_sessions")
     _change_during_verify(
         client, monkeypatch, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (reset,)
     )
@@ -243,14 +228,14 @@ def test_a_password_reset_during_login_refuses_the_login(client, monkeypatch):
     _refusal(_login(client))
 
     assert _sam(client)["password_hash"] == reset
-    assert _sql(client, "SELECT * FROM auth_sessions") == sessions_before
+    assert sql_dicts(client, "SELECT * FROM auth_sessions") == sessions_before
 
 
 def test_a_password_reset_during_a_rehashing_login_is_not_undone(client, monkeypatch):
     old = PasswordHasher(time_cost=1, memory_cost=16, parallelism=1).hash(PASSWORD)
-    _sql(client, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (old,))
+    sql_dicts(client, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (old,))
     reset = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1).hash("the new password")
-    sessions_before = _sql(client, "SELECT * FROM auth_sessions")
+    sessions_before = sql_dicts(client, "SELECT * FROM auth_sessions")
     _change_during_verify(
         client, monkeypatch, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (reset,)
     )
@@ -258,14 +243,79 @@ def test_a_password_reset_during_a_rehashing_login_is_not_undone(client, monkeyp
     _refusal(_login(client))
 
     assert _sam(client)["password_hash"] == reset
-    assert _sql(client, "SELECT * FROM auth_sessions") == sessions_before
+    assert sql_dicts(client, "SELECT * FROM auth_sessions") == sessions_before
+
+
+def test_two_rehashing_logins_with_the_right_password_both_succeed(client, monkeypatch):
+    """Pre-merge A1-01: two sign-ins on a hash with old parameters both verify
+    against it and both rehash; the one that stores second finds the first's
+    new hash. That is not a password reset: it signs in too."""
+    from app.auth import accounts
+
+    old = PasswordHasher(time_cost=1, memory_cost=16, parallelism=1).hash(PASSWORD)
+    sql_dicts(client, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (old,))
+    sessions_before = len(sql_dicts(client, "SELECT * FROM auth_sessions"))
+    real_verify = PasswordHasher.verify
+    other = []
+
+    def other_login_during_verify(hasher, *args, **kwargs):
+        result = real_verify(hasher, *args, **kwargs)
+        if not other:  # once: the other device's whole sign-in lands here
+            other.append(None)
+            state = client.app.state
+            other[0] = accounts.login(state.database, state.settings, "Sam", PASSWORD)
+        return result
+
+    monkeypatch.setattr(PasswordHasher, "verify", other_login_during_verify)
+
+    response = _login(client)
+
+    assert other[0] is not None
+    assert response.status_code == 200, response.text
+    assert len(sql_dicts(client, "SELECT * FROM auth_sessions")) == sessions_before + 2
+    stored = _sam(client)["password_hash"]
+    assert stored != old and real_verify(PasswordHasher(), stored, PASSWORD)
+
+
+def test_a_login_whose_own_rehash_was_busy_still_signs_in_after_another_rehash(client, monkeypatch):
+    """Pre-merge A1-01 review: the login that loses the race may have had no
+    hashing slot for its own rehash; it signs in all the same."""
+    from app.auth import accounts
+    from app.auth.passwords import AuthBusy
+
+    old = PasswordHasher(time_cost=1, memory_cost=16, parallelism=1).hash(PASSWORD)
+    sql_dicts(client, "UPDATE users SET password_hash = ? WHERE username_key = 'sam'", (old,))
+    real_verify, real_hash = PasswordHasher.verify, accounts.hash_password
+    other, hashes = [], []
+
+    def other_login_during_verify(hasher, *args, **kwargs):
+        result = real_verify(hasher, *args, **kwargs)
+        if not other:
+            other.append(None)
+            state = client.app.state
+            other[0] = accounts.login(state.database, state.settings, "Sam", PASSWORD)
+        return result
+
+    def busy_after_the_first(settings, password):
+        hashes.append(None)
+        if len(hashes) > 1:  # the other sign-in rehashed; ours finds no slot
+            raise AuthBusy("password hashing is busy")
+        return real_hash(settings, password)
+
+    monkeypatch.setattr(PasswordHasher, "verify", other_login_during_verify)
+    monkeypatch.setattr(accounts, "hash_password", busy_after_the_first)
+
+    response = _login(client)
+
+    assert other[0] is not None and len(hashes) == 2
+    assert response.status_code == 200, response.text
 
 
 @pytest.mark.parametrize("column", ["disabled_at", "deleting_at"])
 def test_a_disable_during_login_refuses_the_login(client, monkeypatch, column):
-    sessions_before = _sql(client, "SELECT * FROM auth_sessions")
+    sessions_before = sql_dicts(client, "SELECT * FROM auth_sessions")
     _change_during_verify(client, monkeypatch, f"UPDATE users SET {column} = 5 WHERE username_key = 'sam'")
 
     _refusal(_login(client))
 
-    assert _sql(client, "SELECT * FROM auth_sessions") == sessions_before
+    assert sql_dicts(client, "SELECT * FROM auth_sessions") == sessions_before

@@ -18,10 +18,13 @@ import 'package:frontend/services/uploads/upload_duplicate_summary.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart'
     show UploadsOverview;
-import 'package:frontend/services/uploads/upload_manager.dart';
+import 'package:frontend/services/uploads/upload_manager.dart'
+    show uploadIntentsProvider;
+import 'package:frontend/services/uploads/upload_types.dart'
+    show RetryOutcome;
 import 'package:frontend/services/uploads/upload_review.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart'
-    show retryOutcomeText;
+    show retryOutcomeText, uploadActionFailedText;
 import 'package:frontend/services/uploads/uploads_overview_provider.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/ui/preview_controller.dart';
@@ -111,6 +114,8 @@ class UploadReviewController extends ChangeNotifier
     _subs.add(
       _ref.listen<UploadsOverview?>(uploadsOverviewProvider, (_, o) {
         _online = o?.networkActionsEnabled ?? false;
+        _otherDeviceSending = o?.otherDeviceSending ?? const {};
+        _transfersPaused = o?.transfersPaused ?? false;
         _notify();
       }, fireImmediately: true),
     );
@@ -121,6 +126,11 @@ class UploadReviewController extends ChangeNotifier
   final _subs = <ProviderSubscription<Object?>>[];
   ProviderSubscription<Object?>? _intentsSub;
   bool _online = false;
+
+  /// The Uploads page's other-device and paused inputs, so the review says
+  /// the same thing about an item.
+  Set<String> _otherDeviceSending = const {};
+  bool _transfersPaused = false;
   bool _disposed = false;
 
   String _batch = '';
@@ -172,6 +182,8 @@ class UploadReviewController extends ChangeNotifier
       intent: _intents.where((i) => i.itemUuid == item.itemUuid).firstOrNull,
       online: _online,
       chosen: _review.chosenDuplicates(item),
+      otherDeviceSending: _otherDeviceSending,
+      transfersPaused: _transfersPaused,
     );
   }
 
@@ -425,7 +437,7 @@ class UploadReviewController extends ChangeNotifier
     } on SubmissionConflict {
       _notice = 'This file is already being imported.';
     } catch (_) {
-      _notice = 'Something went wrong. Try again.';
+      _notice = uploadActionFailedText;
     } finally {
       _busy = false;
       _notify();
@@ -452,11 +464,12 @@ class UploadReviewController extends ChangeNotifier
   @override
   Future<void> cancelItem() async {
     final uuid = _currentUuid;
-    if (uuid == null || !(current?.canCancel ?? false)) return;
+    // Like Confirm and Skip: nothing while a review submit is being sent.
+    if (uuid == null || !(current?.canCancel ?? false) || _busy) return;
     try {
       await _review.cancel(uuid);
     } catch (_) {
-      _notice = 'Something went wrong. Try again.';
+      _notice = uploadActionFailedText;
       _notify();
     }
   }
@@ -479,7 +492,7 @@ class UploadReviewController extends ChangeNotifier
       if (_currentUuid != uuid) unawaited(_preview.close());
       await _loadDraft(_currentUuid);
     } catch (_) {
-      _notice = 'Something went wrong. Try again.';
+      _notice = uploadActionFailedText;
     }
     _notify();
   }
@@ -503,7 +516,7 @@ class UploadReviewController extends ChangeNotifier
   @override
   void chooseDuplicates(DuplicateGroup group) {
     final item = _currentItem;
-    if (item == null || current?.canDecideDuplicates != true) return;
+    if (item == null || current?.canDecideDuplicates != true || _busy) return;
     _review.chooseDuplicates(item, group);
     _notify();
   }
@@ -538,7 +551,7 @@ class UploadReviewController extends ChangeNotifier
         _notice = retryOutcomeText(outcome);
       }
     } catch (_) {
-      _notice = 'Something went wrong. Try again.';
+      _notice = uploadActionFailedText;
     } finally {
       _busy = false;
       _notify();

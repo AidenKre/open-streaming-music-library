@@ -5,21 +5,22 @@ gate, or discards it silently (replaced, foreign or unknown track, field rules,
 ineligible user, waited 10 seconds, server not running). Injected clocks only;
 the fake Last.fm never opens a socket."""
 
-import sqlite3
 import uuid
 
 import pytest
 
-from app.models import Track, TrackMetaData
 from app.services.lastfm_now_playing import NOTICE_MAX_WAIT_S, NowPlayingNotices
 from tests.lastfm_fake import FakeClock, ok_now_playing, xml_reply
 from tests.lastfm_sender_rig import (
     GAP_S,
     WALL_MS,
+    add_track,
     connect_user,
     execute,
     make_rig,
+    method,
     session_key_for,
+    sk,
 )
 
 SIGNING = {"method", "sk", "api_key", "api_sig"}
@@ -30,45 +31,9 @@ def rig(tmp_path):
     return make_rig(tmp_path)
 
 
-def add_track(rig, tmp_path, owner, *, duration=284.2, **tags) -> str:
-    """A live track of ``owner`` with exactly these four tags (default: a real song)."""
-    folder = tmp_path / f"music-{owner}"
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{uuid.uuid4().hex}.flac"
-    path.write_bytes(b"not really flac")
-    track = Track(
-        file_path=path,
-        metadata=TrackMetaData(codec="flac", duration=284.0, bitrate_kbps=900.0,
-                               sample_rate_hz=44100, channels=2, title="Airbag", artist="Radiohead"),
-    )
-    assert rig.db.add_track(track, owner_id=owner)
-    values = {"title": "Airbag", "artist": "Radiohead", "album": "OK Computer", "album_artist": None}
-    values.update(tags)
-    conn = sqlite3.connect(rig.db.context.database_path)
-    try:
-        conn.execute(
-            "UPDATE trackmetadata SET title = ?, artist = ?, album = ?, album_artist = ?, duration = ?"
-            " WHERE uuid_id = ?",
-            (values["title"], values["artist"], values["album"], values["album_artist"], duration,
-             track.uuid_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return track.uuid_id
-
-
 def track_fields(rig, index=-1) -> dict:
     """The track fields of a captured request (everything but the signing fields)."""
     return {k: v for k, v in rig.fake.form(index) if k not in SIGNING}
-
-
-def method(rig, index=-1) -> str:
-    return dict(rig.fake.form(index))["method"]
-
-
-def sk(rig, index=-1) -> str:
-    return dict(rig.fake.form(index))["sk"]
 
 
 # --- the holder ------------------------------------------------------------------------
@@ -359,6 +324,27 @@ def test_a_notice_younger_than_ten_seconds_is_sent(rig, tmp_path):
     rig.sender.run_pass()
 
     assert len(rig.fake.requests) == 1
+
+
+def test_a_notice_waits_at_the_gate_only_for_what_is_left_of_its_ten_seconds(rig, tmp_path, monkeypatch):
+    """F903-R-03: the age is measured on the clock the notice was queued on."""
+    ana = connect_user(rig, "ana")
+    rig.sender.notices.put(ana, add_track(rig, tmp_path, ana))
+    rig.gate_clock.advance(4)
+    budgets = []
+    enter = rig.gate.enter
+
+    def recording_enter(*, max_wait_s=None, cancel=None):
+        budgets.append(max_wait_s)
+        return enter(max_wait_s=max_wait_s, cancel=cancel)
+
+    monkeypatch.setattr(rig.gate, "enter", recording_enter)
+    rig.fake.queue(ok_now_playing())
+
+    rig.sender.run_pass()
+
+    assert budgets == [NOTICE_MAX_WAIT_S - 4]
+    assert method(rig) == "track.updateNowPlaying"
 
 
 def test_a_notice_that_has_waited_ten_seconds_is_discarded_by_the_sender(rig, tmp_path):

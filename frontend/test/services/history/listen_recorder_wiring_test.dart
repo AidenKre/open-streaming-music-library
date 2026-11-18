@@ -34,13 +34,14 @@ class _FakeRecorder implements ListenRecorder {
 }
 
 void main() {
-  test('a reset quiesces the listen recorder right after playback (SC-15)',
-      () {
+  test('a reset quiesces the listen recorder after playback and before '
+      'preview and history (SC-15)', () {
     final c = ProviderContainer();
     addTearDown(c.dispose);
+    // Only this participant's place; the full list is pinned once, in
+    // local_reset_service_test.dart.
     expect(c.read(localQuiescablesProvider).map((q) => q.quiesceName),
-        ['playback', 'listens', 'preview', 'history', 'uploads', 'delete-jobs',
-          'owned-file-cleanup', 'submissions']);
+        containsAllInOrder(['playback', 'listens', 'preview', 'history']));
   });
 
   test('the listens participant quiesces a built recorder and never builds '

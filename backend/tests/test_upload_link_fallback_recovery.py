@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from app.services import organizer, upload_placement, upload_recovery
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import (
     FakeCoverArt, accept, journal, library_root, make_commit_worker, ready_item,
 )
@@ -21,11 +21,6 @@ from tests.upload_recovery_fixtures import World
 from tests.upload_validation_fixtures import item_row
 
 _real_link = os.link
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

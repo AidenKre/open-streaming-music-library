@@ -141,6 +141,13 @@ void main() {
       deleteJobsManagerProvider.overrideWithValue(jobs.manager),
     ];
 
+    /// What was asked of the server beyond the job list the page reads when
+    /// it opens and on each refresh.
+    List<String> sent() => [
+      for (final c in jobs.api.calls)
+        if (!c.startsWith('listJobs ')) c,
+    ];
+
     test('is offered only with a live switch that is on, online', () async {
       await h.open(extra: manager());
       expect(h.dup.canDeleteCopy, isTrue);
@@ -169,7 +176,7 @@ void main() {
       await pumpEventQueue();
       expect(h.dup.startDeleteCopy(h.row('a1|b1'), 'b1'), isNull);
       await jobs.pump();
-      expect(jobs.api.calls, isEmpty);
+      expect(sent(), isEmpty);
     });
 
     test('previews exactly the tapped copy at the revision the row showed',
@@ -177,7 +184,7 @@ void main() {
       await h.open(extra: manager());
       final review = h.dup.startDeleteCopy(h.row('a1|b1'), 'b1')!;
       await jobs.pump();
-      expect(jobs.api.calls, ['preview b1']);
+      expect(sent(), ['preview b1']);
       expect(jobs.api.previews.single, {
         'targets': [
           {'uuid_id': 'b1', 'base_revision': 7},
@@ -224,7 +231,7 @@ void main() {
       await h.open(extra: manager());
       expect(h.dup.startDeleteCopy(h.row('a1|b1'), 'a2'), isNull);
       await jobs.pump();
-      expect(jobs.api.calls, isEmpty);
+      expect(sent(), isEmpty);
     });
 
     test('a row that is no longer listed starts nothing', () async {
@@ -235,7 +242,7 @@ void main() {
       await pumpEventQueue();
       expect(h.dup.startDeleteCopy(stale, 'b1'), isNull);
       await jobs.pump();
-      expect(jobs.api.calls, isEmpty);
+      expect(sent(), isEmpty);
     });
 
     group('a review that is no longer the pair as tapped cannot be confirmed',

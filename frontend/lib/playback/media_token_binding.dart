@@ -59,23 +59,13 @@ MediaTokenAction mediaTokenActionFor(BindingGateState state) => switch (state) {
 /// Whether remote streams cannot be played now (offline, or the server check
 /// failed), read at call time. The playback core and the engine treat a
 /// stream then like a non-downloaded item offline.
-final streamsUnavailableProvider = Provider<bool Function()>((ref) => () {
-      BindingGateState gate;
-      try {
-        gate = ref.read(serverBindingGateProvider).state;
-      } catch (_) {
-        gate = const BindingIdle();
-      }
-      var lastFailed = false;
-      try {
-        lastFailed = ref.read(serverBindingGateProvider).lastVerdictFailed;
-      } catch (_) {}
-      return remoteStreamsUnavailable(
-        offline: ref.read(offlineModeProvider),
-        gate: gate,
-        lastVerdictFailed: lastFailed,
-      );
-    });
+final streamsUnavailableProvider = Provider<bool Function()>((ref) => () =>
+    _streamsUnavailable(
+      offline: ref.read(offlineModeProvider),
+      gateState: () => ref.read(serverBindingGateProvider).state,
+      lastVerdictFailed: () =>
+          ref.read(serverBindingGateProvider).lastVerdictFailed,
+    ));
 
 /// The reactive form of [streamsUnavailableProvider], for the screens to
 /// watch: it rebuilds on offline changes and on every gate state. A pending
@@ -93,13 +83,37 @@ final streamsUnavailableNowProvider = Provider<bool>((ref) {
     final sub = gate.states.listen((_) => ref.invalidateSelf());
     ref.onDispose(sub.cancel);
   }
+  // Read outside the guard, as before: only the provider read above and
+  // the last verdict are guarded here.
+  final state = gate?.state ?? const BindingIdle();
+  return _streamsUnavailable(
+    offline: offline,
+    gateState: () => state,
+    lastVerdictFailed: () => gate?.lastVerdictFailed ?? false,
+  );
+});
+
+/// The guarded reads both providers share: a gate state that cannot be read
+/// counts as no verdict ([BindingIdle]); a last verdict that cannot be read
+/// counts as not failed. Then [remoteStreamsUnavailable] decides.
+bool _streamsUnavailable({
+  required bool offline,
+  required BindingGateState Function() gateState,
+  required bool Function() lastVerdictFailed,
+}) {
+  BindingGateState gate;
+  try {
+    gate = gateState();
+  } catch (_) {
+    gate = const BindingIdle();
+  }
   var lastFailed = false;
   try {
-    lastFailed = gate?.lastVerdictFailed ?? false;
+    lastFailed = lastVerdictFailed();
   } catch (_) {}
   return remoteStreamsUnavailable(
     offline: offline,
-    gate: gate?.state ?? const BindingIdle(),
+    gate: gate,
     lastVerdictFailed: lastFailed,
   );
-});
+}

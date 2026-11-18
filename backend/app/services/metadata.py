@@ -1,11 +1,10 @@
 import json
 import logging
 import math
-import subprocess
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track_meta_data import TrackMetaData
@@ -14,8 +13,11 @@ from app.services.media_input import ffmpeg_input_args
 from app.services.ffmpeg_runner import (
     CaptureOverflow,
     CaptureTimeout,
+    NO_OPTIONS,
     FfmpegError,
     FfmpegProcessRegistry,
+    ToolOptions,
+    describe_tool_error,
     run_capture,
     run_ffmpeg,
     scaled_timeout,
@@ -27,6 +29,8 @@ logger = logging.getLogger(__name__)
 # bitrate and quick-check probes print a few bytes.
 METADATA_PROBE_MAX_STDOUT_BYTES = 16 * 1024 * 1024
 SHORT_PROBE_MAX_STDOUT_BYTES = 64 * 1024
+# One embedded picture; more than this is not a cover.
+COVER_ART_MAX_BYTES = 16 * 1024 * 1024
 
 # DB column -> ffmpeg metadata key, for the columns whose tag name differs —
 # derived from the single field-spec table.
@@ -75,9 +79,8 @@ def write_metadata_tags(
     source: Path,
     dest: Path,
     tags: dict[str, str | None],
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
-    input_format: Optional[str] = None,
+    *,
+    options: ToolOptions = NO_OPTIONS,
 ) -> None:
     """Copy ``source`` to ``dest`` with ``tags`` applied, audio bytes untouched.
 
@@ -87,15 +90,16 @@ def write_metadata_tags(
     the named tags are overwritten. Because the audio bytes are unchanged, the
     ``(uuid, quality)``-keyed encoded cache stays valid across an edit. Verifies
     by re-probing ``dest`` and raises ``TagWriteError`` on any failure.
-    ``registry``/``job_id`` (both required together) allow a conversion job's
-    tag-baking pass to be cancelled — see ``FfmpegProcessRegistry``.
+    ``options.registry``/``options.job_id`` (both required together) allow a
+    conversion job's tag-baking pass to be cancelled — see
+    ``FfmpegProcessRegistry``; ``options.input_format`` forces an upload's demuxer.
     """
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
         "-y",
-        *ffmpeg_input_args(input_format),
+        *ffmpeg_input_args(options.input_format),
         "-i", str(source),
         "-map", "0",
         "-c", "copy",
@@ -108,16 +112,17 @@ def write_metadata_tags(
     try:
         run_ffmpeg(
             cmd, dest, timeout=scaled_timeout(source),
-            registry=registry, job_id=job_id,
+            options=options,
         )
     except FfmpegError as e:
-        logger.warning("tag write failed: %s", e)
+        # The category only: ffmpeg's text names the file and the tag values.
+        logger.warning("tag write failed: %s", describe_tool_error(e))
         raise TagWriteError("tag write failed") from e
 
     # Verify the output is still a probe-able audio file (catches a silently
     # corrupt remux). Field-level verification is intentionally light — ffmpeg
     # normalizes some tag spellings, so we confirm probe-ability, not equality.
-    if ffprobe_for_metadata(dest, input_format) is None:
+    if ffprobe_for_metadata(dest, options.input_format) is None:
         dest.unlink(missing_ok=True)
         raise TagWriteError("re-probe of written file failed")
 
@@ -162,16 +167,16 @@ def probes_killed_by(registry: Optional[FfmpegProcessRegistry]):
 
 @contextmanager
 def probe_registration():
-    """The ``registry``/``job_id`` arguments for one probe's ``run_capture``:
-    the registry set by ``probes_killed_by`` under a fresh job id, forgotten
-    afterwards; nothing outside such a block."""
+    """The ``ToolOptions`` for one probe's ``run_capture``: the registry set by
+    ``probes_killed_by`` under a fresh job id, forgotten afterwards; no
+    options outside such a block."""
     registry = _probe_registry.get()
     if registry is None:
-        yield {}
+        yield NO_OPTIONS
         return
     job_id = object()  # unique per call: concurrent probes never share a kill flag
     try:
-        yield {"registry": registry, "job_id": job_id}
+        yield ToolOptions(registry=registry, job_id=job_id)
     finally:
         registry.forget(job_id)
 
@@ -265,7 +270,7 @@ def ffprobe_for_metadata(
                 ],
                 timeout_s=probe_timeout(timeout),
                 max_stdout_bytes=METADATA_PROBE_MAX_STDOUT_BYTES,
-                **registration,
+                options=registration,
             )
     except CaptureOverflow as e:
         return _probe_unavailable("ffprobe answered too much", e)
@@ -363,25 +368,23 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
 def extract_cover_art_bytes(file_path: Path, input_format: str | None = None) -> bytes | None:
     """Extract embedded cover art from an audio file using ffmpeg."""
     try:
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                *ffmpeg_input_args(input_format),
-                "-i", str(file_path),
-                "-an",
-                "-vcodec", "copy",
-                "-f", "image2pipe",
-                "-",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=30,
-        )
-    except FileNotFoundError:
-        print("ffmpeg not found")
-        return None
-    except (OSError, subprocess.TimeoutExpired):
+        with probe_registration() as registration:
+            result = run_capture(
+                [
+                    "ffmpeg",
+                    *ffmpeg_input_args(input_format),
+                    "-i", str(file_path),
+                    "-an",
+                    "-vcodec", "copy",
+                    "-frames:v", "1",
+                    "-f", "image2pipe",
+                    "-",
+                ],
+                timeout_s=30,
+                max_stdout_bytes=COVER_ART_MAX_BYTES,
+                options=registration,
+            )
+    except (FfmpegError, OSError):
         return None
 
     if result.returncode != 0 or not result.stdout:

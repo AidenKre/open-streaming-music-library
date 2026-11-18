@@ -242,7 +242,8 @@ class FakeLibraryToolsApi implements LibraryToolsApi {
   }
 
   /// Possible duplicates (8B.3). The defaults throw: the delete-jobs model
-  /// never calls them.
+  /// never calls them. The Possible duplicates tests (test/ui/duplicates/)
+  /// set the ones they need.
   Future<DuplicatePairPageDto> Function(String? status, String? after, int? limit)
   onListDuplicates = (status, after, limit) =>
       throw UnimplementedError('not used by the delete-jobs model');

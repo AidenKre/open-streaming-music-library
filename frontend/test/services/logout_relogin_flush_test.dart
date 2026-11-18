@@ -44,6 +44,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/fake_secure_backend.dart';
 import '../helpers/server_binding.dart';
+import '../helpers/test_offline.dart';
 
 const _oldCredentials = Credentials(
   token: 'tok-old',
@@ -55,14 +56,6 @@ const _oldCredentials = Credentials(
 /// Every request the model sends, as "METHOD /path [Authorization]", plus
 /// "wipe" markers: one ordered log.
 final _log = <String>[];
-
-class _OfflineOff extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
 
 class _Wipe implements LocalResettable {
   @override
@@ -177,7 +170,7 @@ void main() {
       serverBindingGateProvider.overrideWithValue(gate.gate),
       localQuiescablesProvider.overrideWithValue(const []),
       localResettablesProvider.overrideWithValue([_Wipe(), store]),
-      offlineModeProvider.overrideWith(_OfflineOff.new),
+      offlineModeProvider.overrideWith(() => TestOffline(false)),
       appInfoProvider
           .overrideWith((ref) async => const AppInfo(features: FeatureBlocks(history: HistoryFeature(version: 1)))),
       onSessionChangedProvider.overrideWithValue(() async => rebuilds++),

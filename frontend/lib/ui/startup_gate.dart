@@ -24,6 +24,7 @@ class _StartupGateState extends ConsumerState<StartupGate> {
   bool _finishingReset = false;
   bool _askingServerSwitch = false;
   bool _askingUserSwitch = false;
+  bool _askingReset = false;
 
   @override
   void initState() {
@@ -106,6 +107,25 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     }
   }
 
+  /// The refused database's Reset…: the shared Disconnect confirmation,
+  /// then the reset. One at a time: a second tap while the losses are read
+  /// or the sheet is open does nothing.
+  Future<void> _resetRefusedDatabase() async {
+    if (_askingReset) return;
+    _askingReset = true;
+    try {
+      final losses = await _session.pendingLossSummaries();
+      if (!mounted) return;
+      final confirmed = await showDisconnectConfirmSheet(
+        context,
+        losses: losses,
+      );
+      if (confirmed && mounted) await _session.disconnect();
+    } finally {
+      _askingReset = false;
+    }
+  }
+
   /// Show a partial reset honestly, then rebuild the provider scope (or, in
   /// tests without a rebuild hook, return to the login screen).
   Future<void> _finishReset() async {
@@ -115,20 +135,20 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     // Only a failed wipe leaves data behind. A quiesce step that failed or
     // timed out (a request still in flight) is logged: the wipe ran and the
     // fence keeps its late work out of the new store.
-    if (failure != null && failure.failures.every((f) => f.quiesce)) {
+    if (failure != null && failure.quiesceOnly) {
       developer.log('Reset completed; quiesce issues: $failure', name: 'StartupGate');
     }
-    if (failure != null && failure.failures.any((f) => !f.quiesce)) {
-      final notSaved = _session.signInNotSavedNotice;
+    // The sentence is the model's, never a failure's own text (row 66).
+    final notSaved = _session.signInNotSavedNotice;
+    final message = notSaved ?? _session.resetIncompleteMessage;
+    if (failure != null && failure.wipeFailed && message != null) {
       await showDialog<void>(
         context: context,
         builder: (ctx) => AlertDialog(
           title: Text(
             notSaved != null ? 'Sign-in not saved' : 'Reset incomplete',
           ),
-          content: Text(
-            notSaved ?? 'Some local data could not be cleared:\n\n$failure',
-          ),
+          content: Text(message),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(ctx).pop(),
@@ -170,34 +190,58 @@ class _StartupGateState extends ConsumerState<StartupGate> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // A fault thrown at launch: whether a sign-in is stored is
-                  // not known, so only the saved session is named.
-                  if (_session.launchFailed)
+                  // The database was made by another version of the app
+                  // (pre-merge review D3-01, text approved 2026-11-18):
+                  // trying again cannot open it; Reset… deletes it.
+                  if (_session.databaseRefused) ...[
                     const Text(
-                      "This device's saved session could not be read.",
-                      textAlign: TextAlign.center,
-                    )
-                  else ...[
-                    const Text(
-                      'Your sign-in could not be read.',
+                      "This device's saved app data was made by a different "
+                      "version of the app and can't be opened. Resetting "
+                      "removes this device's downloads, settings and "
+                      'sign-in. Nothing on the server changes.',
                       textAlign: TextAlign.center,
                     ),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Your saved sign-in is still on this device. Try again, or log in again to '
-                      'replace it.',
-                      textAlign: TextAlign.center,
+                    const SizedBox(height: 16),
+                    FilledButton(
+                      onPressed: _resetRefusedDatabase,
+                      child: const Text('Reset…'),
+                    ),
+                  ] else ...[
+                    // A fault thrown at launch: whether a sign-in is stored is
+                    // not known, so only the saved session is named.
+                    if (_session.launchFailed) ...[
+                      const Text(
+                        "This device's saved session could not be read.",
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Logging in again replaces any sign-in saved on this '
+                        'device.',
+                        textAlign: TextAlign.center,
+                      ),
+                    ] else ...[
+                      const Text(
+                        'Your sign-in could not be read.',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Your saved sign-in is still on this device. Try again, or log in again to '
+                        'replace it.',
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    FilledButton(
+                      onPressed: _session.retryCredentials,
+                      child: const Text('Try again'),
+                    ),
+                    TextButton(
+                      onPressed: _session.logInAgain,
+                      child: const Text('Log in again'),
                     ),
                   ],
-                  const SizedBox(height: 16),
-                  FilledButton(
-                    onPressed: _session.retryCredentials,
-                    child: const Text('Try again'),
-                  ),
-                  TextButton(
-                    onPressed: _session.logInAgain,
-                    child: const Text('Log in again'),
-                  ),
                 ],
               ),
             ),

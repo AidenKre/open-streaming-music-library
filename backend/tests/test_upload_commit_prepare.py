@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_commit_fixtures import (
     FakeProbe,
@@ -33,11 +33,6 @@ FINAL_KEYS = {
     "disc_number", "codec", "duration", "bitrate_kbps", "sample_rate_hz", "channels",
     "has_album_art", "cover_art_id",
 }
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -24,14 +24,9 @@ from app.services.audio_identity import KIND_PCM, AudioIdentity, ExactAudioHash,
 from app.services.duplicate_detection import DuplicateMatch, TrackRef, find_duplicates
 from tests.pending_deletion import clear_pending_deletion, mark_pending_deletion
 from tests.fingerprint_fixtures import ALGO, BASE, fp_track
-from tests.identity_worker_fixtures import DIGEST_A, DIGEST_B, add_track, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, DIGEST_B, add_track, sql
 
 NOW = 1_800_000_000
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def hashed(digest=DIGEST_A, **extra):

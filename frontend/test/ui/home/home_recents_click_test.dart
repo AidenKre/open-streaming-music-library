@@ -27,7 +27,8 @@ import 'package:frontend/ui/home/home_controller.dart';
 import '../../helpers/fake_clock.dart';
 import '../../helpers/server_binding.dart';
 import '../../repositories/catalog_seed.dart';
-import '../browse_harness.dart';
+import '../../helpers/library_seed.dart' show SeedTrack, seedLibrary;
+import '../../helpers/test_offline.dart';
 
 /// The audio player, faked: every activation succeeds.
 class _Player extends QueuePlayer {

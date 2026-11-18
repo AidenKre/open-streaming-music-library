@@ -16,10 +16,9 @@ EDITABLE_FIELD_META: dict[str, tuple[str, str]] = {
 
 
 class WriteMode(str, Enum):
-    """Where a metadata edit is persisted. Phase 1 implements ``db_only``; the
-    master-file path (``db_and_master``) lands in slice 4 and returns 501 until
-    then. The value is part of the request shape now so the API doesn't change
-    between slices."""
+    """Where a metadata edit is persisted: ``db_only`` (Phase 1) writes the
+    database row; ``db_and_master`` (slice 4) also rewrites the master file's
+    tags. The value is part of the request shape."""
 
     db_only = "db_only"
     db_and_master = "db_and_master"

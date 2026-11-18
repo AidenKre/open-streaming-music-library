@@ -35,21 +35,13 @@ export 'package:frontend/services/download/download_queue.dart'
         Failed,
         DownloadQueueState;
 
-String formatBytes(int bytes) {
-  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-  if (bytes < 1024 * 1024 * 1024) {
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-  }
-  return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-}
-
 /// Coordinates concurrent track + cover-art downloads.
 ///
 /// Façade over four single-responsibility collaborators:
 /// * [DownloadQueue] — the in-memory job list + change notifications.
 /// * [TrackDownloader] — the per-job HTTP→file→DB pipeline.
 /// * [WorkerPool] — concurrency + generation gating.
-/// * [DownloadStatusReader] — DB read-side helpers + change-version.
+/// * [DownloadStatusReader] — the downloaded-status change-version.
 ///
 /// The public API forwards to these — see each method for which one it
 /// delegates to. Active jobs sit at the top of the UI list, completed at
@@ -59,6 +51,7 @@ String formatBytes(int bytes) {
 /// copy.
 class DownloadManager extends ChangeNotifier implements LocalResettable {
   final AppDatabase _db;
+  final LocalCoverArtStore _coverArtStore;
   final OwnedFileCleanup _ownedCleanup;
   final void Function()? _onOwnedCleanupPending;
   // Optional: if supplied, the server is asked to pre-transcode queued tracks
@@ -142,6 +135,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     OwnedFileCleanup? ownedFileCleanup,
     void Function()? onOwnedCleanupPending,
   }) : _db = db,
+       _coverArtStore = coverArtStore,
        _ownedCleanup =
            ownedFileCleanup ??
            OwnedFileCleanup(
@@ -153,7 +147,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
        _warmService = warmService,
        _streamQualityFn = streamQualityFn,
        _codecSupportFn = codecSupportFn {
-    _status = DownloadStatusReader(db: db);
+    _status = DownloadStatusReader();
     _queue = DownloadQueue();
     _queue.addListener(notifyListeners);
     _downloader = TrackDownloader(
@@ -209,7 +203,6 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     required Map<String, String> replacements,
     bool explicitQuality = false,
   }) async {
-    final existingByUuid = {for (final j in _queue.state.jobs) j.uuidId: j};
     // Tracks both pre-existing queued/active jobs AND uuids already added in
     // this batch. Without this, a duplicate uuid in [tracks] would mint a
     // second job writing the same partial/destination path as the first.
@@ -231,10 +224,6 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
           t.isDownloaded &&
           await File(t.filePath!).exists()) {
         continue; // already downloaded
-      }
-      final existing = existingByUuid[t.uuidId];
-      if (existing != null && (existing.isQueued || existing.isActive)) {
-        continue;
       }
       seenUuids.add(t.uuidId);
       // A damaged download is replaced at the quality it was downloaded at
@@ -288,18 +277,13 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   }
 
   /// Schedules [tracks] for download at [quality], re-downloading any track
-  /// whose currently-stored file is at a different bitrate. Tracks whose
-  /// `downloadedBitrateKbps` already matches the requested kbps are skipped.
+  /// whose copy was not downloaded at [quality] (its stored quality differs
+  /// or is missing). Tracks already downloaded at [quality] are skipped.
   ///
   /// This is the "explicit user intent" path: when someone picks
   /// "Download at 320 kbps" from the split-download menu, they want a 320
   /// kbps copy regardless of what's on disk. Compare with [enqueueTracks],
   /// which preserves whatever copy already exists.
-  ///
-  /// Edge case: when [quality] is `original`, the requested-kbps lookup is
-  /// undefined (the source bitrate is unknown to the client). We treat that
-  /// as "always re-download" if a file is on disk — that's strictly better
-  /// than silently no-op'ing.
   Future<void> enqueueTracksAtQuality(
     List<TrackUI> tracks, {
     required String quality,
@@ -350,24 +334,10 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// `downloadedQuality='320'`). Matching on the actual bitrate would cause
   /// non-idempotent redownload loops in that case.
   ///
-  /// Returns false when `downloadedQuality` is null, which happens for files
-  /// downloaded before this column existed; the explicit-quality path will
-  /// then re-download once to populate the field.
-  bool _qualityMatches(TrackUI track, String quality) {
-    final stored = track.downloadedQuality;
-    if (stored != null) return stored == quality;
-    // Back-compat for files saved before downloadedQuality existed: keep the
-    // old bitrate-based check so we don't force a redownload of every
-    // pre-migration file the first time the user touches it. Original-quality
-    // requests still conservatively re-download (we can't know the source
-    // bitrate from the client).
-    if (quality == originalQuality) return false;
-    final bitrate = track.downloadedBitrateKbps;
-    if (bitrate == null) return false;
-    final requested = int.tryParse(quality);
-    if (requested == null) return false;
-    return bitrate == requested;
-  }
+  /// A copy without a stored quality never matches: every commit stores one,
+  /// so it can only come from data this app no longer opens.
+  bool _qualityMatches(TrackUI track, String quality) =>
+      track.downloadedQuality == quality;
 
   /// Queues a forced replacement download for each stale track at the
   /// quality its copy was downloaded at (the two-phase `replacements` path,
@@ -419,17 +389,22 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// Drops the failed/completed history. Active and queued jobs are kept.
   void clearFinished() => _queue.clearFinished();
 
-  /// Cancels a queued job. In-flight downloads keep running — cancelling
-  /// mid-stream is intentionally not supported in v1 since aborting an http
-  /// stream cleanly is fiddly and the user didn't ask for it.
+  /// Cancels a queued job; a download in progress is [cancelActive]'s.
   void cancelQueued(String uuidId) => _queue.cancelQueued(uuidId);
+
+  /// Cancels a download in progress (other-issues row 74); see
+  /// [WorkerPool.cancelActive] for the end state.
+  Future<void> cancelActive(String uuidId) => _pool.cancelActive(uuidId);
 
   /// Full local-reset hook. Cancels in-flight workers, clears the in-memory
   /// queue, deletes completed/partial files, and prevents stale workers from
   /// writing DB state if they complete after the reset generation changes.
   Future<void> resetAndDeleteFiles() async {
-    await _pool.reset();
-    _status.bumpVersion();
+    try {
+      await _pool.reset();
+    } finally {
+      _status.bumpVersion();
+    }
   }
 
   // --- LocalResettable -------------------------------------------------------
@@ -444,8 +419,8 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   Future<void> resetLocalState() => resetAndDeleteFiles();
 
   /// Removes the local file (if any), and a kept damaged copy, and clears
-  /// `tracks.file_path` so the track reverts to streaming. Cover art is intentionally NOT deleted: it
-  /// may be referenced by other tracks the user has downloaded.
+  /// `tracks.file_path` so the track reverts to streaming. Its stored cover
+  /// goes too when no remaining download uses it (see [_dropDownloads]).
   ///
   /// Cancels any queued/active download for [uuidId] first so a late
   /// `_commitDownload` can't restore the row after we null it out.
@@ -485,25 +460,16 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
 
   /// Clears the downloaded-state columns of [uuids] and, in the same
   /// transaction, enqueues their owned files (including a kept damaged copy)
-  /// for durable cleanup. After the commit it attempts the deletions now.
-  /// A transaction failure propagates (nothing is cleared). Returns whether
-  /// any cleanup row was kept for a later retry.
+  /// for durable cleanup. After the commit it attempts the deletions now,
+  /// then deletes each of their stored covers that no remaining download
+  /// uses (owner, 2026-11-17). A transaction failure propagates (nothing is
+  /// cleared). Returns whether any cleanup row was kept for a later retry.
   Future<bool> _dropDownloads(List<String> uuids, String? token) async {
+    late final Set<int> covers;
     final ids = await _db.transaction(() async {
       final placeholders = List.filled(uuids.length, '?').join(', ');
-      final rows = await _db
-          .customSelect(
-            'SELECT file_path, damaged_file_path FROM tracks '
-            'WHERE uuid_id IN ($placeholders) '
-            'AND (file_path IS NOT NULL OR damaged_file_path IS NOT NULL)',
-            variables: uuids.map(Variable.withString).toList(),
-          )
-          .get();
-      final paths = <String>{
-        for (final row in rows)
-          for (final column in const ['file_path', 'damaged_file_path'])
-            if (row.readNullable<String>(column) case final path?) path,
-      };
+      final paths = await _db.ownedTrackFilePaths(uuids: uuids);
+      covers = await _db.downloadedCoverArtIds(uuids);
       // Cleared without notifying the tracks watchers: they learn of it once
       // the whole operation is over (see the publish below), so no DB work
       // follows the notification. The SET list comes from
@@ -522,11 +488,31 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       return _ownedCleanup.enqueueInTransaction(paths, localBindingId: token);
     });
     try {
-      return await _attemptCleanup(ids, token);
+      final kept = await _attemptCleanup(ids, token);
+      await _removeUnusedCovers(covers);
+      return kept;
     } finally {
       _db.notifyUpdates({
         TableUpdate.onTable(_db.tracks, kind: UpdateKind.update),
       });
+    }
+  }
+
+  /// After the rows are cleared: deletes each of [covers] that no remaining
+  /// download uses. Best effort: a failure keeps the cover and is logged.
+  Future<void> _removeUnusedCovers(Set<int> covers) async {
+    for (final id in covers) {
+      try {
+        await _coverArtStore.removeIfUnused(
+          id,
+          () => _db.coverArtUsedByDownload(id),
+        );
+      } catch (e) {
+        developer.log(
+          'stored cover kept: ${e.runtimeType}',
+          name: 'DownloadManager',
+        );
+      }
     }
   }
 
@@ -550,12 +536,6 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// queued while offline or withheld because the server was not verified
   /// (sign-off OPEN-M-11); it does not clear the signed-out (401) pause.
   void resumeIfPaused() => _pool.resumeAfterVerified();
-
-  /// Returns the set of uuid_ids that have a non-null `file_path` (and the
-  /// file actually exists on disk). Used by aggregate "fully downloaded"
-  /// queries for albums/artists.
-  Future<Set<String>> downloadedUuidsForUuids(Iterable<String> uuids) =>
-      _status.downloadedUuidsForUuids(uuids);
 
   /// Stable, paginated view used by the downloading page.
   UnmodifiableListView<DownloadJob> snapshot() => _queue.snapshot();

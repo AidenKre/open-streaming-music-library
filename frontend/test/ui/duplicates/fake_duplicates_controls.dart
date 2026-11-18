@@ -43,6 +43,8 @@ class FakeDuplicatesControls extends ChangeNotifier
   @override
   bool hasMore = false;
   @override
+  String unreachableText = 'Possible duplicates needs a connection';
+  @override
   String? message;
   @override
   bool canPlay = true;

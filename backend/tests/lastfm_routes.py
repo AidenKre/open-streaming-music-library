@@ -24,20 +24,12 @@ from tests.auth_helpers import create_session
 from tests.conftest import bearer
 from tests.lastfm_fake import FakeClock, FakeLastfm
 from tests.lastfm_secrets import LASTFM_ENV, valid_env
+from tests.lastfm_sender_rig import WallClock, execute
 from tests.owned_database import add_test_user
 
 BASE = "/settings/integrations/lastfm"
-WALL_MS = 1_800_000_000_000
 DAY_MS = 86_400_000
 TOKEN_LIFETIME_MS = 600_000
-
-
-class WallClock:
-    def __init__(self, ms: int = WALL_MS):
-        self.ms = ms
-
-    def __call__(self) -> int:
-        return self.ms
 
 
 @dataclass
@@ -74,9 +66,6 @@ class RecordingNotices:
 
     def drop(self, owner_id) -> None:
         self.dropped.append(owner_id)
-
-    def __len__(self) -> int:
-        return 0
 
 
 def clean_env(monkeypatch):
@@ -149,15 +138,6 @@ def rows(rig: Rig, sql: str, params=()) -> list:
 def _one(rig, sql, params=()):
     [row] = rows(rig, sql, params)
     return row
-
-
-def execute(rig: Rig, sql: str, params=()) -> None:
-    conn = sqlite3.connect(rig.db.context.database_path)
-    try:
-        conn.execute(sql, params)
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def enc(value: str) -> str:

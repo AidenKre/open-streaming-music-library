@@ -1,6 +1,6 @@
 """Upload validation (Phase 7 spec §5 "Duplicate check", "Quick probe"): the
-probe of a received upload, its detected metadata, and (later steps) the
-bounded validation worker."""
+probe of a received upload, its detected metadata, and the bounded
+validation worker (``UploadValidationWorker``)."""
 
 import itertools
 import os
@@ -32,7 +32,7 @@ from app.services.duplicate_detection import (
     find_duplicates,
 )
 from app.services.path_sanitize import assert_within
-from app.services.ffmpeg_runner import run_capture
+from app.services.ffmpeg_runner import NO_OPTIONS, ToolOptions, run_capture
 from app.services.identity_reasons import (
     REASON_INTERNAL_ERROR,
     REASON_KILLED,
@@ -44,7 +44,9 @@ from app.services.identity_reasons import (
 )
 from app.services.worker_thread import PollingWorkerThread
 # Importing upload_receipt also registers the upload_items job table.
-from app.services.upload_receipt import ReceiptFiles, discard_child_files, owner_dir, remove_verified
+from app.services.upload_receipt import (
+    ReceiptFiles, discard_child_files, owner_dir, remove_then_release, remove_verified,
+)
 from app.services.media_input import UPLOAD_PROBE_ARGS, demuxer_for
 from app.services.metadata import build_track_metadata
 
@@ -99,15 +101,17 @@ def _fail_for_reason(reason):
     raise ValidationFailed(upload_errors.upload_invalid_audio())
 
 
-def probe_upload(path, *, timeout_s=PROBE_TIMEOUT_S, registry=None, job_id=None,
-                 low_priority=True, run=run_capture) -> dict:
+def probe_upload(path, *, timeout_s=PROBE_TIMEOUT_S, options=NO_OPTIONS, run=run_capture) -> dict:
     """Probe ``path`` and return the detected-metadata JSON v1 dict; unknown is
-    null. Raises ValidationFailed (typed item error) or ValidationInterrupted."""
+    null. Raises ValidationFailed (typed item error) or ValidationInterrupted.
+    The probe of staged bytes always runs at low priority, whatever ``options``
+    say. The command restricts its own input (``UPLOAD_PROBE_ARGS``): it never
+    reads ``options.input_format``."""
+    options = replace(options, low_priority=True)
     cmd = ["ffprobe", "-v", "error", "-hide_banner", "-show_streams",
            "-show_format", "-of", "json", *UPLOAD_PROBE_ARGS, str(path)]
     try:
-        result = run(cmd, timeout_s=timeout_s, max_stdout_bytes=PROBE_MAX_STDOUT_BYTES,
-                     registry=registry, job_id=job_id, low_priority=low_priority)
+        result = run(cmd, timeout_s=timeout_s, max_stdout_bytes=PROBE_MAX_STDOUT_BYTES, options=options)
     except Exception as e:
         _fail_for_reason(reason_for_capture_exception(e)[0])
     if result.returncode != 0:
@@ -324,13 +328,16 @@ class UploadValidationWorker(PollingWorkerThread):
         # Store only what reads back: a print that would not is kept as failed.
         return staged_identity_columns(staged_identity_from_row(columns), fingerprinter_present=present)
 
+    def _probe_step(self, path, *, job_id):
+        return self._probe(path, options=ToolOptions(registry=self._registry, job_id=job_id, low_priority=True))
+
     def _compute(self, path, detected, job_id):
         try:
             return self._compute_identity(
                 path, detected["codec"], fingerprinter=self._fingerprinter,
                 known_duration_s=detected["duration_s"], params=self._params,
-                registry=self._registry, job_id=job_id, low_priority=True,
-                input_format=demuxer_for(detected["container"]))
+                options=ToolOptions(registry=self._registry, job_id=job_id, low_priority=True,
+                                    input_format=demuxer_for(detected["container"])))
         except ValidationInterrupted:
             raise
         except Exception as e:  # advisory: the item stays reviewable
@@ -360,11 +367,13 @@ class UploadValidationWorker(PollingWorkerThread):
             except Exception as e:
                 log.warning("failed archive child files not removed: %s", type(e).__name__)
         if not error.retryable and path is not None:
-            try:
-                if remove_verified(ReceiptFiles(), path):
-                    self._database.release_cancelled_upload_source(
+            try:  # the path was checked inside the owner's stage when the step read it
+                remove_then_release(
+                    ReceiptFiles(), path,
+                    lambda: self._database.release_removed_upload_source(
                         item, owner_id=owner, source_path=str(path),
-                        now=int(self._clock()), from_states=("failed",))
+                        now=int(self._clock()), from_states=("failed",)),
+                    remove=remove_verified)
             except Exception as e:
                 log.warning("failed upload source not released: %s", type(e).__name__)
         return "failed"
@@ -432,12 +441,11 @@ class UploadValidationWorker(PollingWorkerThread):
                     if self._zip_handler is not None:
                         return self._zip_handler(claimed, token=token, stopping=self._stop.is_set)
                     return self._fail(claimed, upload_errors.upload_archive_unsupported(), path=path)
-                detected = self._process_step(
-                    self._probe, path, registry=self._registry, job_id=job_id, low_priority=True)
+                detected = self._process_step(self._probe_step, path, job_id=job_id)
                 if (why := self._unfinished(token)) is not None:
                     return why
                 columns = self._identity_columns(
-                    self._process_step(self._compute, path, detected, job_id))
+                    self._process_step(self._compute, path, detected, job_id=job_id))
                 detected_json = json.dumps(detected)
             if (why := self._unfinished(token)) is not None:
                 return why

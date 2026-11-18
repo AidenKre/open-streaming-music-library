@@ -31,6 +31,7 @@ import 'package:frontend/ui/manage_library/deletion_review_controller.dart';
 import 'package:frontend/ui/selection/track_selection_controller.dart';
 
 import '../../helpers/delete_jobs_harness.dart';
+import '../../helpers/run_once_track_sync.dart';
 
 TrackUI _track(String uuid, {int? revision}) => TrackUI(
   uuidId: uuid,
@@ -45,22 +46,6 @@ TrackUI _track(String uuid, {int? revision}) => TrackUI(
   hasAlbumArt: false,
 );
 
-/// A sync whose runs the test starts and finishes.
-class _Sync extends TrackSyncNotifier {
-  @override
-  Future<TrackSyncState> build() async => const TrackSyncState();
-
-  @override
-  Future<void> sync() async {}
-
-  /// One finished run that deleted [deleted] locally (none: a no-op run,
-  /// as on every resume).
-  void runOnce({Set<String> deleted = const {}}) {
-    state = const AsyncData(TrackSyncState(isSyncing: true));
-    state = AsyncData(TrackSyncState(deletedTrackUuids: deleted));
-  }
-}
-
 void main() {
   late DeleteJobsHarness h;
   late ProviderContainer c;
@@ -73,7 +58,7 @@ void main() {
     c = ProviderContainer(
       overrides: [
         deleteJobsManagerProvider.overrideWithValue(h.manager),
-        trackSyncProvider.overrideWith(_Sync.new),
+        trackSyncProvider.overrideWith(RunOnceTrackSync.new),
       ],
     );
     c.listen(trackSyncProvider, (_, _) {});
@@ -202,7 +187,7 @@ void main() {
         'confirmation', () async {
       select('a', 1);
       final shown = await previewed();
-      (c.read(trackSyncProvider.notifier) as _Sync).runOnce();
+      (c.read(trackSyncProvider.notifier) as RunOnceTrackSync).runOnce();
       await h.pump();
       expect(review.stage, ReviewStage.ready);
       expect(review.preview, same(shown));
@@ -216,7 +201,7 @@ void main() {
     test('a sync that deleted other tracks keeps the preview', () async {
       select('a', 1);
       final shown = await previewed();
-      (c.read(trackSyncProvider.notifier) as _Sync).runOnce(deleted: {'z'});
+      (c.read(trackSyncProvider.notifier) as RunOnceTrackSync).runOnce(deleted: {'z'});
       await h.pump();
       expect(review.preview, same(shown));
       expect(review.message, isNull);
@@ -226,7 +211,7 @@ void main() {
         'stale and says so', () async {
       select('a', 1);
       await previewed();
-      (c.read(trackSyncProvider.notifier) as _Sync).runOnce(deleted: {'a'});
+      (c.read(trackSyncProvider.notifier) as RunOnceTrackSync).runOnce(deleted: {'a'});
       await h.pump();
       expect(review.preview, isNull);
       expect(review.canConfirm, isFalse);
@@ -364,8 +349,6 @@ void main() {
       select('b', 2);
       select('a', 1);
       final p = await previewed();
-      expect(review.typedCountAccepted('2'), isTrue);
-      expect(review.typedCountAccepted('3'), isFalse);
 
       expect(await review.confirm(p, confirmedCount: 2), isTrue);
       await h.pump();
@@ -413,7 +396,7 @@ void main() {
         () async {
       select('a', 1);
       final shown = await previewed();
-      (c.read(trackSyncProvider.notifier) as _Sync).runOnce(deleted: {'a'});
+      (c.read(trackSyncProvider.notifier) as RunOnceTrackSync).runOnce(deleted: {'a'});
       await h.pump();
       expect(await review.confirm(shown, confirmedCount: 1), isFalse);
       await h.pump();
@@ -517,11 +500,6 @@ void main() {
         contains(unavailableText(DeleteJobsUnavailableReason.switchedOff)),
       );
       expect(selected(), [('a', 1)]);
-    });
-
-    test('no preview: typed counts are never accepted', () {
-      expect(review.typedCountAccepted('0'), isFalse);
-      expect(review.typedCountAccepted(''), isFalse);
     });
   });
 

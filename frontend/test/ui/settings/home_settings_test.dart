@@ -21,14 +21,7 @@ import 'package:frontend/ui/settings_controller.dart';
 import 'package:frontend/ui/settings_page.dart';
 
 import '../../helpers/test_credentials.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
+import '../../helpers/test_offline.dart';
 
 /// Records the Home toggles; everything else is irrelevant here.
 class _RecordingSettings implements SettingsControls {
@@ -88,7 +81,7 @@ void main() {
           apiClientProvider.overrideWithValue(api),
           sharedPreferencesProvider.overrideWith((_) async => prefs),
           credentialStoreTestOverride(),
-          offlineModeProvider.overrideWith(_StubOffline.new),
+          offlineModeProvider.overrideWith(() => TestOffline(false)),
           ...overrides,
         ],
         child: MaterialApp(

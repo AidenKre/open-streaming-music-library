@@ -378,4 +378,44 @@ void main() {
     expect(job.items.single.uuid, 'z');
     expect(await h.submissions(), isEmpty, reason: 'following writes nothing');
   });
+
+  test('opening the receipt of a finished job reads it once more and shows '
+      'what the server says now', () async {
+    await h.submitAll([('a', 1)]);
+    await h.pump();
+    serverSays('op-1', 'succeeded', [
+      deletionItemJson(
+        'a',
+        status: 'deleted',
+        tombstoneRevision: 50,
+        details: ['master_missing', 'storage_cleanup_pending'],
+      ),
+    ]);
+    h.timers.fire();
+    await h.pump();
+    expect(h.job('op-1')!.items.single.storageCleanupPending, isTrue);
+    final polls = h.api.callsOf('getJob').length;
+
+    // The server's clean-up finished.
+    serverSays('op-1', 'succeeded', [
+      deletionItemJson(
+        'a',
+        status: 'deleted',
+        tombstoneRevision: 50,
+        details: ['master_missing'],
+      ),
+    ]);
+    h.manager.follow('op-1');
+    await h.pump();
+    expect(h.api.callsOf('getJob').length, polls + 1);
+    final item = h.job('op-1')!.items.single;
+    expect(item.storageCleanupPending, isFalse);
+    expect(item.masterMissing, isTrue);
+
+    // Read once: nothing more afterwards.
+    h.timers.fire();
+    h.manager.request('appResume', bypassBackoff: true);
+    await h.pump();
+    expect(h.api.callsOf('getJob').length, polls + 1);
+  });
 }

@@ -1,7 +1,10 @@
 import 'package:drift/drift.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/binding_errors.dart';
 import 'package:frontend/models/instance_stamp.dart';
 import 'package:uuid/uuid.dart';
+
+export 'package:frontend/models/binding_errors.dart';
 
 /// The local binding to one server (SC-01): the `server_binding` row.
 ///
@@ -24,35 +27,6 @@ class ServerBindingRecord {
   final int boundAtMs;
   final bool catalogReconciled;
   final int? userId;
-}
-
-/// A fenced write's captured `local_binding_id` no longer matches the
-/// binding row (a reset deleted it, or a re-bind replaced it). The write did
-/// not happen.
-class BindingFencedException implements Exception {
-  BindingFencedException(this.token);
-  final String token;
-
-  @override
-  String toString() => 'BindingFencedException($token)';
-}
-
-/// SC-01 rule 6: a server response was stamped by another instance than the
-/// bound one. The page it carried was not committed, or the write response
-/// was treated as not delivered. Its text names neither id (they are not for
-/// user-visible logs).
-class ServerInstanceChangedException implements Exception {
-  ServerInstanceChangedException({
-    required this.boundInstanceId,
-    required this.servedBy,
-  });
-  final String boundInstanceId;
-  final String servedBy;
-
-  @override
-  String toString() =>
-      'ServerInstanceChangedException: a different server answered; '
-      'the response was not applied';
 }
 
 /// Owns the single `server_binding` row and the durable write fence.
@@ -116,6 +90,8 @@ class ServerBindingRepository {
   }) {
     return runFenced(token, () async {
       final row = await _select().getSingle();
+      // Exact on purpose (SC-01): this refuses a rebind, and both ids come
+      // from the server's own answers. Only the header stamp is lenient.
       if (row.instanceId != null &&
           instanceId != null &&
           row.instanceId != instanceId) {
@@ -208,7 +184,9 @@ class ServerBindingRepository {
     _assertServedBy(row?.instanceId, servedBy);
   }
 
-  /// The one comparison rule: no bound id or no stamp means no check.
+  /// The header stamp's rule: lenient ([sameServerInstance]), since a proxy
+  /// may reformat a header; no bound id or no stamp means no check. The
+  /// identity checks of [recordVerified], the gate and the session are exact.
   static void _assertServedBy(String? bound, String? servedBy) {
     if (servedBy != null &&
         bound != null &&

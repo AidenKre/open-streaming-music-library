@@ -17,14 +17,9 @@ import sqlite3
 import pytest
 
 from app.library import Library
-from tests.identity_worker_fixtures import add_track, make_db, sql
+from tests.identity_worker_fixtures import add_track, sql
 from tests.owned_database import add_test_user
 from tests.pending_deletion import clear_pending_deletion, mark_pending_deletion
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def tracks(db, count, owner_id=None, prefix="t"):

@@ -8,8 +8,8 @@ import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import '../helpers/library_seed.dart' show SeedTrack, seedLibrary;
 
-import '../ui/browse_harness.dart' show SeedTrack, seedLibrary;
 
 QueuePlaybackEntry entry(int id, {String? path}) => QueuePlaybackEntry(
   itemId: id, queueType: QueueItemTypes.main, canonicalPosition: id - 1,

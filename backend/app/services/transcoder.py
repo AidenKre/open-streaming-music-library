@@ -5,17 +5,28 @@ streaming quality path. The "original" quality preset bypasses transcoding
 entirely.
 """
 
+import logging
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, FrozenSet, Optional
+from typing import FrozenSet, Optional
 
 from app.services.ffmpeg_runner import (
+    NO_OPTIONS,
     FfmpegError,
-    FfmpegProcessRegistry,
+    ToolOptions,
+    describe_tool_error,
     run_ffmpeg,
     scaled_timeout,
 )
+
+logger = logging.getLogger(__name__)
+
+# The kinds of transcode failure (target codec, error type) already warned
+# about; a successful transcode clears them.
+_failures_warned: set[tuple[str, str]] = set()
+_failures_lock = threading.Lock()
 
 
 # Quality presets. The "original" preset means do not transcode.
@@ -123,17 +134,17 @@ def transcode(
     bitrate_kbps: Optional[int] = None,
     source_params: Optional[SourceAudioParams] = None,
     strip_video: bool = False,
-    registry: Optional[FfmpegProcessRegistry] = None,
-    job_id: Optional[Any] = None,
+    *,
+    options: ToolOptions = NO_OPTIONS,
 ) -> TranscodeResult:
     """Transcode ``source`` to ``target_codec``, writing ``dest``.
 
     Writes to a temp file first and atomically renames onto ``dest`` so a
     partial output is never visible. ``strip_video`` should be True for the
     streaming path (which never wants embedded cover art in the response) and
-    False for conversion (which must carry cover art through). ``registry``/
-    ``job_id`` (both required together) let a conversion job be cancelled
-    mid-transcode — see ``FfmpegProcessRegistry``.
+    False for conversion (which must carry cover art through).
+    ``options.registry``/``options.job_id`` (both required together) let a
+    conversion job be cancelled mid-transcode — see ``FfmpegProcessRegistry``.
     """
     if target_codec not in _CODEC_FLAGS:
         raise ValueError(f"unsupported target codec: {target_codec}")
@@ -161,14 +172,29 @@ def transcode(
         # Shared runner: size-scaled timeout + stderr diagnostics.
         run_ffmpeg(
             cmd, tmp_path, timeout=scaled_timeout(source),
-            registry=registry, job_id=job_id,
+            options=options,
         )
     except FfmpegError as e:
-        print(f"transcode of {source} to {target_codec} failed: {e.stderr[-500:]}")
+        _log_failure(target_codec, e)
         return TranscodeResult(ok=False, stderr=e.stderr)
 
     tmp_path.replace(dest)
+    with _failures_lock:
+        _failures_warned.clear()
     return TranscodeResult(ok=True)
+
+
+def _log_failure(target_codec: str, error: Exception) -> None:
+    """The target codec and the error type with the runner's category (e.g.
+    ``FfmpegError (exit 1)``), never ffmpeg's text (it names the source file
+    and its tags; it stays in TranscodeResult.stderr). The first
+    failure of a kind warns; repeats are at debug level until a transcode
+    succeeds again, so a warm-up failing for every track warns once."""
+    kind = (target_codec, describe_tool_error(error))
+    with _failures_lock:
+        first = kind not in _failures_warned
+        _failures_warned.add(kind)
+    logger.log(logging.WARNING if first else logging.DEBUG, "transcode to %s failed: %s", *kind)
 
 
 def transcode_to_aac_m4a(

@@ -5,15 +5,11 @@ user.library_folder``; ``assert_within(path, root)`` refuses any path that is
 not strictly inside ``root`` once symlinks are resolved.
 """
 
-from pathlib import Path
-
 import pytest
 
-from app.database import DatabaseContext
 from app.library import library_root
 from app.services.path_sanitize import PathEscapesRoot, assert_within
-from tests.owned_database import OwnedTestDatabase, add_test_user
-from tests.schema_fixtures import INIT_SQL
+from tests.owned_database import add_test_user
 
 
 # ── assert_within ───────────────────────────────────────────────────────────
@@ -85,14 +81,6 @@ def test_library_root_refuses_a_folder_that_is_not_one_plain_component(tmp_path,
 
 
 # ── users lookups (server-wide) ─────────────────────────────────────────────
-
-@pytest.fixture
-def db(tmp_path):
-    database = OwnedTestDatabase(
-        DatabaseContext(database_path=tmp_path / "db.sqlite", init_sql_path=INIT_SQL)
-    )
-    assert database.initialize()
-    return database
 
 
 def test_get_user_returns_the_row_or_none(db):

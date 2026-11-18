@@ -16,6 +16,8 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 
+import '../helpers/test_offline.dart';
+
 /// A gate whose states the test publishes.
 class _StatesGate extends Fake implements ServerBindingGate {
   final _states = StreamController<BindingGateState>.broadcast();
@@ -35,6 +37,12 @@ class _StatesGate extends Fake implements ServerBindingGate {
   BindingGateState get state => _state;
   @override
   Stream<BindingGateState> get states => _states.stream;
+}
+
+/// A gate whose last verdict cannot be read.
+class _UnreadableVerdictGate extends _StatesGate {
+  @override
+  bool get lastVerdictFailed => throw StateError('unreadable');
 }
 
 const _notDownloaded = TrackUI(
@@ -147,6 +155,42 @@ void main() {
     gate.publish(const BindingVerified(token: 't', instanceId: 'i'));
     await pumpEventQueue();
     expect(seen, [false, true, false]);
+  });
+
+  // Characterization before the two providers share their guarded reads
+  // (refactor worklist 1.4 #5): a gate that cannot be read counts as no
+  // verdict; a last verdict that cannot be read counts as not failed.
+  group('guarded gate reads', () {
+    for (final offline in [false, true]) {
+      test('a gate that cannot be built: only the offline flag decides '
+          '(${offline ? 'offline' : 'online'})', () {
+        final broken = ProviderContainer(overrides: [
+          serverBindingGateProvider
+              .overrideWith((ref) => throw StateError('no gate')),
+          offlineModeProvider.overrideWith(() => TestOffline(offline)),
+        ]);
+        addTearDown(broken.dispose);
+        broken.listen(streamsUnavailableNowProvider, (_, _) {});
+        expect(broken.read(streamsUnavailableProvider)(), offline);
+        expect(broken.read(streamsUnavailableNowProvider), offline);
+      });
+    }
+
+    test('a last verdict that cannot be read counts as not failed', () async {
+      final unreadable = _UnreadableVerdictGate();
+      addTearDown(unreadable.close);
+      final c2 = ProviderContainer(overrides: [
+        serverBindingGateProvider.overrideWithValue(unreadable),
+        offlineModeProvider.overrideWith(() => TestOffline(false)),
+      ]);
+      addTearDown(c2.dispose);
+      c2.listen(streamsUnavailableNowProvider, (_, _) {});
+      unreadable.publish(BindingUnverified(StateError('x')));
+      unreadable.publish(const BindingVerifying()); // a retry
+      await pumpEventQueue();
+      expect(c2.read(streamsUnavailableProvider)(), isFalse);
+      expect(c2.read(streamsUnavailableNowProvider), isFalse);
+    });
   });
 
   test('a track that is not downloaded: under a failed check its play state '

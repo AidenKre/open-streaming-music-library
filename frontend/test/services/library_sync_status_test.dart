@@ -3,8 +3,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/library_sync_status.dart';
+import '../helpers/test_offline.dart';
 
-import '../ui/browse_harness.dart';
 
 class _ScriptedSync extends TrackSyncNotifier {
   _ScriptedSync(this.initial);
@@ -52,6 +52,22 @@ void main() {
     expect(c.read(librarySyncStatusProvider), LibrarySyncStatus.failed);
     sync.set(const TrackSyncState());
     expect(c.read(librarySyncStatusProvider), LibrarySyncStatus.idle);
+  });
+
+  // Other-issues decision 3 (a): a restored server is its own status.
+  test('a library sync that found the server restored: serverRestored, '
+      'offline idle', () async {
+    final (c, sync, off) = await make(const TrackSyncState(
+      error: 'boom',
+      libraryError: 'boom',
+      libraryServerRestored: true,
+    ));
+    expect(c.read(librarySyncStatusProvider), LibrarySyncStatus.serverRestored);
+    off.set(true);
+    expect(c.read(librarySyncStatusProvider), LibrarySyncStatus.idle);
+    off.set(false);
+    sync.set(const TrackSyncState(error: 'boom', libraryError: 'boom'));
+    expect(c.read(librarySyncStatusProvider), LibrarySyncStatus.failed);
   });
 
   test('a single-track refresh neither shows progress nor an error', () async {

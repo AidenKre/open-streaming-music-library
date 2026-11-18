@@ -1,5 +1,3 @@
-import 'dart:math';
-
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client_provider.dart';
@@ -18,11 +16,6 @@ import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/playback/queue_order_manager.dart';
 import 'package:frontend/playback/queue_window.dart';
-
-/// The generator every queue shuffle draws from (SC-27: injected, so tests
-/// can seed it).
-final queueRandomProvider =
-    Provider<Random>((ref) => Random());
 
 final queueOrderManagerProvider = Provider<QueueOrderManager>((ref) =>
     QueueOrderManager(

@@ -8,18 +8,13 @@ foreign uuids acknowledge nothing)."""
 import pytest
 
 from app.services.audio_identity import AudioIdentity, identity_to_columns
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
 from tests.upload_publish_fixtures import import_item, library_track, prepared_commit
 from tests.upload_validation_fixtures import exact_for, new_uuid, print_of
 
 TABLES = ("upload_commit_journal", "upload_items", "upload_item_acknowledgements",
           "track_duplicate_candidates")
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

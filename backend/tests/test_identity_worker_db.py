@@ -17,18 +17,12 @@ from tests.identity_worker_fixtures import (
     add_journal,
     add_track,
     identity,
-    make_db,
     set_identity,
     sql,
 )
 from tests.owned_database import add_test_user
 
 NOW = 1_800_000_000
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def _next(db, now=NOW, skip=None):
@@ -262,7 +256,7 @@ def test_the_cas_write_with_another_owner_changes_nothing(db):
 def test_the_cas_write_leaves_other_owners_rows_alone(db):
     other_owner = add_test_user(db, "alex")
     mine = add_track(db, "/m/1.flac", identity={"generation": 3})
-    theirs = add_track(db, "/m/1.flac", owner_id=other_owner, identity={"generation": 3})
+    theirs = add_track(db, "/m/alex/1.flac", owner_id=other_owner, identity={"generation": 3})
     before = identity(db, theirs)
     assert _cas(db, mine) is True
     assert identity(db, theirs) == before

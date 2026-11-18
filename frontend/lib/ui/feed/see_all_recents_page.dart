@@ -7,6 +7,8 @@ import 'package:frontend/ui/feed/see_all_recents_controller.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
+import 'package:frontend/ui/widgets/playback_notice.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
 /// See all recently played: a snapshot grid (Phase 6 §3, §7).
@@ -110,14 +112,9 @@ class _SeeAllRecentsPageState extends ConsumerState<SeeAllRecentsPage> {
       if (!_controls.failed) {
         return const Center(child: CircularProgressIndicator());
       }
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Couldn’t load.'),
-            TextButton(onPressed: _controls.retry, child: const Text('Retry')),
-          ],
-        ),
+      return LoadFailureNotice(
+        message: 'Couldn’t load.',
+        onRetry: _controls.retry,
       );
     }
     // Rows may all be gone while later pages remain: keep the grid path, so
@@ -189,7 +186,10 @@ class _SeeAllRecentsPageState extends ConsumerState<SeeAllRecentsPage> {
   }
 
   void _tap(FeedEntity entity) => switch (entity) {
-    TrackEntity(:final track) => _controls.playTrack(track),
+    TrackEntity(:final track) => showPlaybackOutcome(
+      context,
+      _controls.playTrack(track),
+    ),
     AlbumEntity(:final album) => openAlbumDetail(context, album),
     ArtistEntity(:final artist) => openArtistDetail(context, artist),
   };

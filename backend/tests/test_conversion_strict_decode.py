@@ -21,12 +21,23 @@ from pathlib import Path
 
 import pytest
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
+from app.services import conversion as conversion_module
 from app.services import audio_identity
 from app.services.audio_identity import ExactAudioHash, check_strict_decode, compute_exact
 from app.services.conversion import AUDIO_CHECK_STOPPED_ERROR, SOURCE_DAMAGED_ERROR
-from app.services.ffmpeg_runner import CaptureResult, CaptureTimeout, FfmpegError, scaled_timeout
-from tests.test_identity_conversion import _identity, _settled, _sql
+from app.services.ffmpeg_runner import (
+    CaptureResult,
+    CaptureTimeout,
+    FfmpegError,
+    ToolOptions,
+    run_capture,
+    scaled_timeout,
+)
+from tests.sqlite_helpers import sql_dicts
+from tests.identity_conversion_fixtures import _settled
+from tests.identity_rows import _identity
+from tests.tool_call_capture import tool_call
 
 LOGGER = "app.services.conversion"
 DAMAGED_TEXT = "Conversion stopped: the original has damaged audio, so it was not converted."
@@ -105,7 +116,7 @@ class _FakeCapture:
         self.result, self.raises, self.calls = result, raises, []
 
     def __call__(self, cmd, **kwargs):
-        self.calls.append((cmd, kwargs))
+        self.calls.append((cmd, tool_call(run_capture, cmd, **kwargs)))
         if self.raises is not None:
             raise self.raises
         return self.result
@@ -125,7 +136,7 @@ def test_the_strict_decode_runs_low_priority_on_the_shared_runner_with_strict_fl
     monkeypatch.setattr(audio_identity, "run_capture", fake)
     registry = object()
 
-    assert check_strict_decode(path, registry=registry, job_id=7, low_priority=True) is None
+    assert check_strict_decode(path, options=ToolOptions(registry=registry, job_id=7, low_priority=True)) is None
 
     [(cmd, kwargs)] = fake.calls
     assert cmd[0] == "ffmpeg"
@@ -175,7 +186,7 @@ class _Order:
 
     def __init__(self, monkeypatch, orch, strict=None):
         self.events, self.strict_calls = [], []
-        real_transcode = conv.conversion_module.transcode
+        real_transcode = conversion_module.transcode
         real_compute = orch.compute_identity
 
         def transcode(*args, **kwargs):
@@ -189,10 +200,11 @@ class _Order:
 
         def check(path, **kwargs):
             self.events.append("strict decode")
-            self.strict_calls.append((Path(path), kwargs))
-            return check_strict_decode(path, **kwargs) if strict is None else strict(path, kwargs)
+            call = tool_call(check_strict_decode, path, **kwargs)
+            self.strict_calls.append((Path(path), call))
+            return check_strict_decode(path, **kwargs) if strict is None else strict(path, call)
 
-        monkeypatch.setattr(conv.conversion_module, "transcode", transcode)
+        monkeypatch.setattr(conversion_module, "transcode", transcode)
         orch.compute_identity = compute
         orch.check_strict_decode = check
 
@@ -204,7 +216,7 @@ def _world(tmp_path, monkeypatch, fixture, codec, target, bitrate=None, *, stric
     track = conv._add_track(db, source, codec=codec)
     _settled(db, track.uuid_id)
     # The stored digest is stale, so the job hashes the source itself.
-    _sql(db, "UPDATE track_audio_identity SET exact_state = 'pending' WHERE uuid_id = ?",
+    sql_dicts(db, "UPDATE track_audio_identity SET exact_state = 'pending' WHERE uuid_id = ?",
          (track.uuid_id,))
     before = _identity(db, track.uuid_id)
     order = _Order(monkeypatch, orch, strict)
@@ -425,7 +437,7 @@ def test_the_retry_reads_the_original_up_to_the_audio_end_and_writes_nothing(
     fake = _FakeCapture(CaptureResult(returncode=0, stdout=b"", stderr=""))
     monkeypatch.setattr(audio_identity, "run_capture", fake)
 
-    assert check_strict_decode(path, job_id=7, audio_end=2000, low_priority=True) is None
+    assert check_strict_decode(path, options=ToolOptions(job_id=7, low_priority=True), audio_end=2000) is None
 
     [(cmd, kwargs)] = fake.calls
     assert cmd[cmd.index("-i") + 1] == f"subfile,,start,0,end,2000,,:file:{path.resolve()}"
@@ -641,3 +653,119 @@ def test_the_retry_compares_the_decoded_length_with_the_header(
 
     [(cmd, kwargs)] = fake.calls
     assert cmd[cmd.index("-progress") + 1] == "pipe:1"
+
+
+# --- pre-merge review A3-02: a healthy last frame whose CRC ends in a zero byte -------
+#
+# A FLAC frame ends with its CRC-16, whose low byte is 0x00 in about 1 frame of 256.
+# The retry strips a trailing tag, then a run of zero bytes, and that run must not
+# take the CRC's own zero byte. The file is built here, frame by frame (verbatim
+# subframes), so its last CRC byte is zero by construction, not by luck.
+
+
+def _crc8(data: bytes) -> int:
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+
+def _crc16(data: bytes) -> int:
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x8005) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+_BLOCK = 4096  # blocksize code 0b1100
+
+
+def _verbatim_frame(number: int, samples: list[int]) -> bytes:
+    """One fixed-blocksize frame: 44.1 kHz, mono, 16 bits, one VERBATIM subframe."""
+    assert len(samples) == _BLOCK and number < 128
+    header = bytes([0xFF, 0xF8, 0xC9, 0x08, number])
+    header += bytes([_crc8(header)])
+    body = header + b"\x02" + b"".join(s.to_bytes(2, "big", signed=True) for s in samples)
+    return body + _crc16(body).to_bytes(2, "big")
+
+
+def _verbatim_flac(frames: int = 8) -> bytes:
+    """A healthy FLAC whose last frame's CRC-16 ends in 0x00 (its last sample is
+    nudged until it does)."""
+    import math
+
+    blocks = [[int(8000 * math.sin(2 * math.pi * 440 * (f * _BLOCK + i) / 44100)) for i in range(_BLOCK)]
+              for f in range(frames)]
+    last = blocks[-1]
+    for nudge in range(1 << 16):
+        last[-1] = (last[-1] + 1) if nudge else last[-1]
+        if _verbatim_frame(frames - 1, last)[-1] == 0:
+            break
+    total = frames * _BLOCK
+    info = (_BLOCK.to_bytes(2, "big") * 2 + b"\0" * 6
+            + ((44100 << 44) | (0 << 41) | (15 << 36) | total).to_bytes(8, "big") + b"\0" * 16)
+    stream = b"fLaC" + bytes([0x80]) + len(info).to_bytes(3, "big") + info
+    return stream + b"".join(_verbatim_frame(n, block) for n, block in enumerate(blocks))
+
+
+@pytest.fixture(scope="module")
+def zero_crc(tmp_path_factory):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not available")
+    root = tmp_path_factory.mktemp("zero-crc")
+    audio_bytes = _verbatim_flac()
+    damaged = bytearray(audio_bytes)
+    damaged[200] ^= 0xFF  # a sample of the first frame: its CRC no longer matches
+    files = {
+        "plain": audio_bytes,
+        "id3v1": audio_bytes + ID3V1,
+        "zeros": audio_bytes + b"\0" * 4096,
+        "damaged_id3v1": bytes(damaged) + ID3V1,
+    }
+    paths = {}
+    for name, data in files.items():
+        paths[name] = root / f"{name}.flac"
+        paths[name].write_bytes(data)
+    paths["size"] = len(audio_bytes)
+    return paths
+
+
+@pytest.mark.requires_ffmpeg
+def test_the_built_flac_is_healthy_and_its_last_crc_byte_is_zero(zero_crc):
+    plain = zero_crc["plain"]
+    assert plain.read_bytes()[-1] == 0
+    assert check_strict_decode(plain) is None
+    assert _default_decode_rc(plain) == 0
+
+
+@pytest.mark.requires_ffmpeg
+@pytest.mark.parametrize("name", ["id3v1", "zeros"])
+def test_a_healthy_flac_whose_last_crc_byte_is_zero_converts_with_a_trailer(
+    tmp_path, monkeypatch, zero_crc, name
+):
+    db, orch, coordinator, track, source, before, order, job_id = _world(
+        tmp_path, monkeypatch, zero_crc[name], "flac", "alac")
+
+    conv._run_submitted(coordinator)
+
+    job = db.get_conversion_job(job_id)
+    assert (job["status"], job["error_text"]) == ("done", None)
+    assert order.strict_calls[-1][1]["audio_end"] == zero_crc["size"]
+    assert _identity(db, track.uuid_id)["fp_state"] == "current"  # the audio check passed
+
+
+@pytest.mark.requires_ffmpeg
+def test_damaged_audio_whose_last_crc_byte_is_zero_is_still_refused(tmp_path, monkeypatch, zero_crc):
+    db, orch, coordinator, track, source, before, order, job_id = _world(
+        tmp_path, monkeypatch, zero_crc["damaged_id3v1"], "flac", "alac")
+    original = source.read_bytes()
+
+    conv._run_submitted(coordinator)
+
+    job = db.get_conversion_job(job_id)
+    assert (job["status"], job["error_text"]) == ("failed", DAMAGED_TEXT)
+    _assert_nothing_changed(db, track, source, original, before, tmp_path)

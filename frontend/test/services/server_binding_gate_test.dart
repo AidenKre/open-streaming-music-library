@@ -778,6 +778,33 @@ void main() {
         expect(gate.maySendTokenTo('http://a'), isTrue);
         expect(gate.allowsTokenTo(Uri.parse('http://a/tracks')), isFalse);
       });
+
+      // U21-FE-SESSION-A-07: stopping and a different-instance report forget
+      // the verified URL, so the revoke rule does not count the re-probe
+      // that follows as a re-probe of a verified server.
+      test('after a stop or a different-instance report, a new probe of the '
+          'same URL is not a verified re-probe', () async {
+        await repo.recordVerified(token, instanceId: 'inst-1', baseUrl: 'http://a');
+        await verify();
+        gate.stop();
+        unawaited(gate.startConnection('http://a'));
+        await settle();
+        expect(gate.state, isA<BindingVerifying>());
+        expect(gate.maySendTokenTo('http://a'), isFalse);
+
+        probes.last.complete(const ServerIdentity('inst-1'));
+        await settle();
+        expect(gate.state, isA<BindingVerified>());
+        gate.reportDifferentInstance(
+          gate.verifiedConnection!,
+          ServerInstanceChangedException(
+              boundInstanceId: 'inst-1', servedBy: 'inst-X'),
+        );
+        unawaited(gate.startConnection('http://a'));
+        await settle();
+        expect(gate.state, isA<BindingVerifying>());
+        expect(gate.maySendTokenTo('http://a'), isFalse);
+      });
     });
   });
 

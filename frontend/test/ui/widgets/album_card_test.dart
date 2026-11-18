@@ -15,18 +15,7 @@ import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/download_quality_sheet.dart';
 
 import '../fake_library_actions.dart';
-
-/// Forces [offlineModeProvider] to a fixed value without starting the real
-/// health-poll timer.
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../../helpers/test_offline.dart';
 
 // Distinct so a swapped (artist, album) scope cannot pass.
 const _kArtistId = 3;
@@ -79,7 +68,7 @@ Widget buildCard(
       albumDownloadCountsProvider.overrideWith(
         (ref, albumId) => AsyncData(effectiveCounts),
       ),
-      offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+      offlineModeProvider.overrideWith(() => TestOffline(offline)),
       // The menu reads availability for its scope from the same counts.
       playbackAvailabilityProvider.overrideWith(
         (ref, scope) => PlaybackAvailability.of(

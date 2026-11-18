@@ -13,6 +13,7 @@ from defusedxml import DefusedXmlException
 from defusedxml import ElementTree as SafeET
 from xml.etree.ElementTree import Element  # noqa: S405 - type only; parsing is via defusedxml
 
+from app.models.lastfm import RESULT_NO_ANSWER
 from app.services.lastfm_config import LastfmConfig
 from app.services.lastfm_log import log_exception, log_request_failure, request_secrets
 from app.version import OSML_VERSION
@@ -210,7 +211,7 @@ def _row_outcomes(root: Element, rows: Sequence[Mapping[str, str | int]]) -> tup
         message = _child(result, "ignoredmessage")
         code = _int_attr(message, "code") if message is not None else 0
         outcomes[index] = RowOutcome(RowStatus.SENT) if code == 0 else RowOutcome(RowStatus.IGNORED, code)
-    return tuple(o if o is not None else RowOutcome(RowStatus.DROPPED, "no_answer") for o in outcomes)
+    return tuple(o if o is not None else RowOutcome(RowStatus.DROPPED, RESULT_NO_ANSWER) for o in outcomes)
 
 
 def sign(params: Mapping[str, str], secret: str) -> str:

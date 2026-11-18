@@ -68,3 +68,16 @@ class TestCodecMime:
         # header silently falls back to the source suffix.
         for codec, mime in CODEC_MIME.items():
             assert mime in MIME_EXTENSION, f"{codec} -> {mime} has no MIME_EXTENSION entry"
+
+
+class TestCodecExtensionAgreesWithMime:
+    """U04-A-09: the extension a master is written with (CODEC_TO_EXT) and the
+    extension the stream advertises for that codec (CODEC_MIME, then
+    MIME_EXTENSION, the X-Audio-Extension header) are kept in step by hand."""
+
+    def test_both_tables_name_the_same_codecs(self):
+        assert set(CODEC_TO_EXT) == set(CODEC_MIME)
+
+    @pytest.mark.parametrize("codec", sorted(CODEC_TO_EXT))
+    def test_the_codec_extension_equals_its_media_type_extension(self, codec):
+        assert CODEC_TO_EXT[codec] == MIME_EXTENSION[CODEC_MIME[codec]]

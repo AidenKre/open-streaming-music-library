@@ -1,10 +1,9 @@
-// Phase 7B.2c S12: where the review starts (7B.2b hand-over: "Plug in:
-// return ReviewTagsOutcome.open and push the review route in the page's
-// _reviewTags"). `Review tags` on an Uploads row opens the review of that
-// row's batch at that file; a ready file of an unpacked ZIP gets its own
-// `Review tags` in the archive's file list (a ZIP child is reviewed like any
-// item, 7A.2d), opening the same review at that file. Network-gated like
-// every other review input.
+// Phase 7B.2c S12: where the review starts (7B.2b hand-over: the page's
+// _reviewTags pushes the review route). `Review tags` on an Uploads row
+// opens the review of that row's batch at that file; a ready file of an
+// unpacked ZIP gets its own `Review tags` in the archive's file list (a ZIP
+// child is reviewed like any item, 7A.2d), opening the same review at that
+// file. Network-gated like every other review input.
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -85,8 +84,7 @@ void main() {
       tester.view.physicalSize = const Size(900, 1400);
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.reset);
-      uploads = FakeUploadsControls(overview: overview)
-        ..reviewOutcome = ReviewTagsOutcome.open;
+      uploads = FakeUploadsControls(overview: overview);
       await tester.pumpWidget(harness.wrap(
         const UploadsPage(),
         appInfo: defaultAppInfo(),
@@ -109,7 +107,6 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byType(UploadReviewPage), findsOneWidget);
-      expect(uploads.calls, contains('reviewTags c'));
       expect(review.calls, contains('start b-7 c'));
       await teardownTree(tester);
     });

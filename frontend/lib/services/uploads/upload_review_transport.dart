@@ -7,11 +7,6 @@ import 'package:frontend/api/uploads_api.dart';
 /// Which review action a request is.
 enum ReviewActionKind { commit, resolveDuplicate }
 
-/// Thrown by [UnavailableUploadReviewTransport]: no review route to send to.
-class UploadReviewRouteUnavailable implements Exception {
-  const UploadReviewRouteUnavailable();
-}
-
 /// Sends one frozen review request and returns the server's item JSON.
 abstract interface class UploadReviewTransport {
   Future<Map<String, dynamic>> send(
@@ -20,18 +15,6 @@ abstract interface class UploadReviewTransport {
     String frozenBodyJson, {
     Future<void>? abortTrigger,
   });
-}
-
-/// Every send throws [UploadReviewRouteUnavailable].
-class UnavailableUploadReviewTransport implements UploadReviewTransport {
-  const UnavailableUploadReviewTransport();
-  @override
-  Future<Map<String, dynamic>> send(
-    ReviewActionKind kind,
-    String itemUuid,
-    String frozenBodyJson, {
-    Future<void>? abortTrigger,
-  }) => throw const UploadReviewRouteUnavailable();
 }
 
 /// Sends review requests through [UploadsApi] and returns the item as JSON.

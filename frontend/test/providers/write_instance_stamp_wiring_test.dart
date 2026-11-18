@@ -19,14 +19,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/server_binding.dart';
 import '../helpers/stamped_server.dart';
-
-class _Online extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return false;
-  }
-}
+import '../helpers/test_offline.dart';
 
 void main() {
   late AppDatabase db;
@@ -50,7 +43,7 @@ void main() {
       overrides: [
         databaseProvider.overrideWithValue(db),
         apiClientProvider.overrideWithValue(server.client),
-        offlineModeProvider.overrideWith(_Online.new),
+        offlineModeProvider.overrideWith(() => TestOffline(false)),
         serverBindingGateProvider.overrideWithValue(controlled.gate),
       ],
     );

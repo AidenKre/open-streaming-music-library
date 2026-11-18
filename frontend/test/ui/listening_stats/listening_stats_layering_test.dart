@@ -16,18 +16,29 @@ List<String> _imports(String source) => [
     m.group(1)!,
 ];
 
-const _views = [
+/// The statistics page, every Dart file of `lib/ui/listening_stats/` and the
+/// Year in music files (`lib/ui/annual_recap_*.dart`), read from disk so a
+/// new file is checked by default (other-issues rows 92 and 83).
+final List<String> _files = [
   'lib/ui/listening_stats_page.dart',
-  'lib/ui/listening_stats/bucket_chart.dart',
-  'lib/ui/listening_stats/listening_stats_format.dart',
-  'lib/ui/listening_stats/top_lists.dart',
-  'lib/ui/listening_stats/listening_ranking_page.dart',
-  'lib/ui/listening_stats/stats_ranked_card.dart',
+  ..._dartFiles('lib/ui/listening_stats', (name) => true),
+  ..._dartFiles('lib/ui', (name) => name.startsWith('annual_recap_')),
+]..sort();
+
+List<String> _dartFiles(String dir, bool Function(String name) keep) => [
+  for (final e in Directory(dir).listSync())
+    if (e is File && e.path.endsWith('.dart'))
+      if (keep(e.uri.pathSegments.last)) e.path.replaceAll(r'\', '/'),
 ];
-const _controller = 'lib/ui/listening_stats/listening_stats_controller.dart';
-const _controllers = [
-  _controller,
-  'lib/ui/listening_stats/listening_ranking_controller.dart',
+
+/// Controllers by name; every other file is a view.
+final List<String> _controllers = [
+  for (final f in _files)
+    if (f.endsWith('_controller.dart')) f,
+];
+final List<String> _views = [
+  for (final f in _files)
+    if (!f.endsWith('_controller.dart')) f,
 ];
 const _model = [
   'lib/models/listening_stats.dart',
@@ -47,6 +58,24 @@ final _forbiddenForViews = [
 ];
 
 void main() {
+  test('the file lists are read from disk and hold the known files', () {
+    expect(_views, containsAll([
+      'lib/ui/listening_stats_page.dart',
+      'lib/ui/listening_stats/bucket_chart.dart',
+      'lib/ui/listening_stats/listening_stats_format.dart',
+      'lib/ui/listening_stats/top_lists.dart',
+      'lib/ui/listening_stats/listening_ranking_page.dart',
+      'lib/ui/listening_stats/stats_ranked_card.dart',
+      'lib/ui/annual_recap_page.dart',
+      'lib/ui/annual_recap_export_image.dart',
+    ]));
+    expect(_controllers, containsAll([
+      'lib/ui/listening_stats/listening_stats_controller.dart',
+      'lib/ui/listening_stats/listening_ranking_controller.dart',
+      'lib/ui/annual_recap_controller.dart',
+    ]));
+  });
+
   for (final path in _views) {
     test('$path imports no data, I/O or playback layer', () {
       final hits = [

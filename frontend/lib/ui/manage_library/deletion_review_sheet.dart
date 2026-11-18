@@ -49,7 +49,12 @@ class DeletionReviewSheet extends StatelessWidget {
   final Map<String, List<String>> details;
 
   @override
-  Widget build(BuildContext context) => ListenableBuilder(
+  Widget build(BuildContext context) => _CloseWhenNothingToReview(
+    review: review,
+    child: _content(),
+  );
+
+  Widget _content() => ListenableBuilder(
     listenable: review,
     builder: (context, _) {
       final theme = Theme.of(context);
@@ -121,14 +126,80 @@ class DeletionReviewSheet extends StatelessWidget {
       // A dismissal must never look like Cancel while a deletion is being
       // handed over: Cancel is the only way out.
       barrierDismissible: false,
-      builder: (_) => _ConfirmationDialog(
+      // The dialog may be on another navigator than the sheet (the root
+      // one): it closes itself too.
+      builder: (_) => _CloseWhenNothingToReview(
         review: review,
-        shown: shown,
-        details: details,
+        child: _ConfirmationDialog(
+          review: review,
+          shown: shown,
+          details: details,
+        ),
       ),
     );
     if (confirmed == true) navigator.pop(true);
   }
+}
+
+/// Closes the route it is in (the sheet, or the confirmation over it) once
+/// its review has nothing left in it; the page underneath says why when
+/// there is a reason.
+class _CloseWhenNothingToReview extends StatefulWidget {
+  const _CloseWhenNothingToReview({required this.review, required this.child});
+
+  final DeletionReviewControls review;
+  final Widget child;
+
+  @override
+  State<_CloseWhenNothingToReview> createState() =>
+      _CloseWhenNothingToReviewState();
+}
+
+class _CloseWhenNothingToReviewState extends State<_CloseWhenNothingToReview> {
+  ModalRoute<Object?>? _route;
+  bool _closed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.review.addListener(_check);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _route = ModalRoute.of(context);
+  }
+
+  @override
+  void dispose() {
+    widget.review.removeListener(_check);
+    super.dispose();
+  }
+
+  void _check() {
+    final route = _route;
+    // Only its own popup route (the sheet or the dialog), never a page.
+    if (_closed ||
+        !mounted ||
+        !widget.review.nothingToReview ||
+        route is! PopupRoute ||
+        !route.isActive) {
+      return;
+    }
+    _closed = true;
+    // Its own route only, on its own navigator: popped when on top, else
+    // removed from under the route above it.
+    final navigator = Navigator.of(context);
+    if (route.isCurrent) {
+      navigator.pop(false);
+    } else {
+      navigator.removeRoute(route);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 /// The id hint per uuid for look-alike targets of [preview].

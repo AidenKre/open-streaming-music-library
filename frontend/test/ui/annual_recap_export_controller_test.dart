@@ -19,7 +19,20 @@ import 'package:frontend/ui/annual_recap_controller.dart';
 import 'package:path/path.dart' as p;
 
 import '../helpers/fake_recap_export_platform.dart';
-import 'annual_recap_controller_test.dart' show FakeRecapService, token, utc;
+import '../helpers/listening_stats_builder.dart' show utc;
+import '../helpers/recap_service_fake.dart' show FakeRecapService, token;
+
+/// Waits in real time, at most [limit], until [done] holds: for work started
+/// without being awaited that goes through real file I/O, which a fixed
+/// number of event-queue turns does not bound. The expect after it reports a
+/// condition that never came.
+Future<void> _eventually(bool Function() done,
+    {Duration limit = const Duration(seconds: 5)}) async {
+  final elapsed = Stopwatch()..start();
+  while (!done() && elapsed.elapsed < limit) {
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+}
 
 void main() {
   late Directory root;
@@ -226,7 +239,9 @@ void main() {
 
     controller.dispose();
     disposed = true;
-    await pumpEventQueue();
+    // dispose() starts the release without awaiting it, and the delete runs
+    // on real file I/O: wait for it in real time, bounded.
+    await _eventually(() => tempFiles().isEmpty);
 
     expect(tempFiles(), isEmpty);
   });

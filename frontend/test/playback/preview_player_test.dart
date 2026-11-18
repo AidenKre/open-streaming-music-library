@@ -13,9 +13,8 @@ import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/playback/playback_engine.dart';
-import 'package:frontend/playback/preview_engine.dart';
 import 'package:frontend/playback/preview_player.dart';
-import 'package:frontend/playback/track_cache_manager.dart';
+import 'package:frontend/playback/stream_uris.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -25,8 +24,10 @@ import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 
 import '../helpers/test_credentials.dart';
-import 'audio_focus_test.dart'
+import '../helpers/fake_audio_focus.dart'
     show FakeAudioSessionPort, FakeTimers, RelinquishingOwner;
+import '../helpers/fake_preview_engine.dart';
+import '../helpers/test_offline.dart';
 
 /// The scope's binding gate: answers the token permit with [allowed].
 class _Gate extends Fake implements ServerBindingGate {
@@ -38,14 +39,6 @@ class _Gate extends Fake implements ServerBindingGate {
   Future<bool> whenMaySendTokenTo(String baseUrl) async {
     asked.add(baseUrl);
     return allowed;
-  }
-}
-
-class _Offline extends OfflineModeNotifier {
-  @override
-  bool build() {
-    super.build();
-    return true;
   }
 }
 
@@ -133,7 +126,7 @@ void main() {
             MockClient((_) async => http.Response('', 500)))),
         credentialsProvider.overrideWithValue(testCredentials),
         serverBindingGateProvider.overrideWithValue(gate),
-        offlineModeProvider.overrideWith(_Offline.new),
+        offlineModeProvider.overrideWith(() => TestOffline(true)),
       ]);
       addTearDown(c.dispose);
       final r = await c
@@ -467,6 +460,218 @@ void main() {
       expect(engines.fold<int>(0, (n, e) => n + e.plays), 0);
     });
 
+    // Pre-merge A6-04.
+    test('a pause while preview is still resolving its source: the library '
+        'is never asked to stop, and Resume starts the preview', () async {
+      gate = Completer<void>();
+      final c = container();
+      unawaited(player(c).play(const StagedUploadPreview('i1')));
+      await pumpEventQueue();
+      expect(state(c).status, PreviewStatus.loading);
+      await player(c).pause();
+      expect(state(c).status, PreviewStatus.paused);
+      gate!.complete();
+      gate = null;
+      await pumpEventQueue();
+      expect(library.relinquishes, 0,
+          reason: 'a preview paused before it started never takes the output');
+      expect(focus.holder, isNot(AudioOutput.preview));
+      expect(state(c).status, PreviewStatus.paused);
+      expect(state(c).source, const StagedUploadPreview('i1'));
+      expect(engines.expand((e) => e.loads), isEmpty);
+
+      unawaited(player(c).resume());
+      await pumpEventQueue();
+      expect(library.relinquishes, 1, reason: 'now the preview is wanted');
+      library.acknowledge();
+      await pumpEventQueue();
+      engines.single.finishLoad(const Duration(seconds: 30));
+      await pumpEventQueue();
+      expect(engines.single.plays, 1);
+      expect(state(c).status, PreviewStatus.playing);
+      expect(focus.holder, AudioOutput.preview);
+    });
+
+    // Pre-merge R2-L-02 (live case R5): a preview the person paused or
+    // closed before it produced any sound never leaves the music paused.
+    // The orders of the three events (hand-over asked, hand-over granted,
+    // preview paused or closed) not covered by the test above.
+    group('a preview that never sounded gives the output back', () {
+      const source = StagedUploadPreview('i1');
+
+      /// The library holds the output (it is playing) before any preview.
+      Future<ProviderContainer> libraryHolding() async {
+        expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+        return container();
+      }
+
+      test('paused while it loads (asked, granted, paused): the library '
+          'holds the output again and is told; the late load never plays; '
+          'Resume asks for the output again', () async {
+        final c = await libraryHolding();
+        final engine = await loading(c);
+        expect(focus.holder, AudioOutput.preview);
+        await player(c).pause();
+        expect(state(c).status, PreviewStatus.paused);
+        expect(focus.holder, AudioOutput.queue);
+        expect(focus.yieldedBy(AudioOutput.queue), isFalse);
+        expect(library.returns, 1);
+        engine.finishLoad(const Duration(seconds: 30));
+        await pumpEventQueue();
+        expect(engine.plays, 0);
+        expect(state(c).status, PreviewStatus.paused);
+
+        unawaited(player(c).resume());
+        await pumpEventQueue();
+        expect(library.relinquishes, 2, reason: 'a new hand-over');
+        library.acknowledge();
+        await pumpEventQueue();
+        engines.last.finishLoad(const Duration(seconds: 30));
+        await pumpEventQueue();
+        expect(engines.last.plays, 1);
+        expect(state(c).status, PreviewStatus.playing);
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 1);
+      });
+
+      test('paused while the hand-over is pending (asked, paused, then the '
+          'library acknowledges): the library keeps the output and is told; '
+          'the preview shows paused, not a failure', () async {
+        final c = await libraryHolding();
+        unawaited(player(c).play(source));
+        await pumpEventQueue();
+        expect(library.relinquishes, 1);
+        await player(c).pause();
+        await pumpEventQueue();
+        expect(focus.holder, AudioOutput.queue);
+        expect(focus.yieldedBy(AudioOutput.queue), isFalse);
+        expect(library.returns, 1);
+        expect(state(c).status, PreviewStatus.paused);
+        library.acknowledge(); // the late acknowledgement changes nothing
+        await pumpEventQueue();
+        expect(focus.holder, AudioOutput.queue);
+        expect(state(c).status, PreviewStatus.paused);
+        expect(engines.expand((e) => e.loads), isEmpty);
+        expect(library.returns, 1);
+      });
+
+      test('closed while it loads: the library holds the output again and '
+          'is told', () async {
+        final c = await libraryHolding();
+        final engine = await loading(c);
+        await player(c).close();
+        expect(focus.holder, AudioOutput.queue);
+        expect(focus.yieldedBy(AudioOutput.queue), isFalse);
+        expect(library.returns, 1);
+        expect(engine.disposed, isTrue);
+        expect(state(c).status, PreviewStatus.idle);
+      });
+
+      test('closed while the hand-over is pending: the library keeps the '
+          'output and is told', () async {
+        final c = await libraryHolding();
+        unawaited(player(c).play(source));
+        await pumpEventQueue();
+        await player(c).close();
+        library.acknowledge();
+        await pumpEventQueue();
+        expect(focus.holder, AudioOutput.queue);
+        expect(focus.yieldedBy(AudioOutput.queue), isFalse);
+        expect(library.returns, 1);
+        expect(engines.expand((e) => e.loads), isEmpty);
+      });
+
+      test('paused, then closed, after it sounded: nothing is handed back '
+          '(the library stays paused for the person to resume)', () async {
+        final c = await libraryHolding();
+        await playing(c);
+        await player(c).pause();
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 0);
+        await player(c).close();
+        expect(focus.holder, isNull);
+        expect(library.returns, 0);
+        expect(focus.yieldedBy(AudioOutput.queue), isTrue);
+      });
+
+      test('a second preview started after the first sounded, paused while '
+          'it loads: nothing is handed back', () async {
+        final c = await libraryHolding();
+        await playing(c);
+        unawaited(player(c).play(const LibraryTrackPreview('t2')));
+        await pumpEventQueue();
+        expect(state(c).status, PreviewStatus.loading);
+        await player(c).pause();
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 0);
+      });
+
+      test('a new hand-over after an earlier preview sounded and the '
+          'library took the output back: paused while it loads, it is '
+          'handed back', () async {
+        final c = await libraryHolding();
+        final engine = await playing(c);
+        final back = focus.beforePlay(AudioOutput.queue);
+        await pumpEventQueue();
+        engine.emit(
+            const EngineTransportState(false, EngineProcessingState.idle));
+        expect(await back, isTrue);
+        unawaited(player(c).play(const LibraryTrackPreview('t2')));
+        await pumpEventQueue();
+        library.acknowledge();
+        await pumpEventQueue();
+        expect(focus.holder, AudioOutput.preview);
+        await player(c).pause();
+        expect(focus.holder, AudioOutput.queue);
+        expect(library.returns, 1);
+      });
+
+      test('an OS interruption while it loads pauses the preview and hands '
+          'nothing back, nor does a pause or a close by the person '
+          'afterwards', () async {
+        final c = await libraryHolding();
+        await loading(c);
+        player(c).onInterruptionBegan();
+        await pumpEventQueue();
+        expect(state(c).status, PreviewStatus.paused);
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 0);
+        await player(c).pause();
+        expect(focus.holder, AudioOutput.preview);
+        await player(c).close();
+        expect(library.returns, 0);
+        expect(focus.holder, isNull);
+      });
+
+      test('unplugged headphones while it loads: nothing is handed back, '
+          'nor by a close afterwards', () async {
+        final c = await libraryHolding();
+        await loading(c);
+        player(c).onBecameNoisy();
+        await pumpEventQueue();
+        expect(state(c).status, PreviewStatus.paused);
+        await player(c).close();
+        expect(library.returns, 0);
+        expect(focus.holder, isNull);
+      });
+
+      test('an OS interruption that ends with resume: the preview loads and '
+          'plays, the library is not told anything', () async {
+        final c = await libraryHolding();
+        final engine = await loading(c);
+        player(c).onInterruptionBegan();
+        player(c).onInterruptionEnded(shouldResume: true);
+        await pumpEventQueue();
+        engine.finishLoad(null); // the first load, superseded
+        engines.last.finishLoad(const Duration(seconds: 30));
+        await pumpEventQueue();
+        expect(state(c).status, PreviewStatus.playing);
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 0);
+        expect(library.relinquishes, 1);
+      });
+    });
+
     test('asked to give the output up while playing, preview stops and '
         'acknowledges once its engine reports not playing', () async {
       final c = container();
@@ -779,9 +984,10 @@ void main() {
         'order)', () {
       final c = ProviderContainer();
       addTearDown(c.dispose);
+      // Only this participant's place; the full list is pinned once, in
+      // local_reset_service_test.dart.
       expect([for (final q in c.read(localQuiescablesProvider)) q.quiesceName],
-          ['playback', 'listens', 'preview', 'history', 'uploads', 'delete-jobs',
-           'owned-file-cleanup', 'submissions']);
+          containsAllInOrder(['listens', 'preview', 'history']));
     });
 
     test('quiescing never builds a preview player', () async {
@@ -835,61 +1041,6 @@ void main() {
 class _NoSession implements AudioSessionPort {
   @override
   Stream<AudioSessionEvent> get events => const Stream.empty();
-}
-
-/// A preview engine whose loads the test completes, recording commands.
-class FakePreviewEngine implements PreviewEngine {
-  final loads = <Uri>[];
-  final _pending = <Completer<Duration?>>[];
-  final _transport = StreamController<EngineTransportState>.broadcast();
-  int plays = 0;
-  int pauses = 0;
-  int stops = 0;
-  bool disposed = false;
-
-  /// Completes the oldest pending load.
-  void finishLoad(Duration? duration) =>
-      _pending.removeAt(0).complete(duration);
-
-  void failLoad() =>
-      _pending.removeAt(0).completeError(const PreviewLoadFailed());
-
-  EngineTransportState? _last;
-
-  void emit(EngineTransportState state) {
-    _last = state;
-    _transport.add(state);
-  }
-
-  @override
-  Future<Duration?> load(Uri uri) {
-    loads.add(uri);
-    final load = Completer<Duration?>();
-    _pending.add(load);
-    return load.future;
-  }
-
-  @override
-  Future<void> play() async => plays++;
-
-  @override
-  Future<void> pause() async => pauses++;
-
-  /// Like just_audio 0.10.5 (U19-A-06): stopping a finished player reports
-  /// `(false, completed)` before it goes idle.
-  @override
-  Future<void> stop() async {
-    stops++;
-    if (_last?.processingState == EngineProcessingState.completed) {
-      emit(const EngineTransportState(false, EngineProcessingState.completed));
-    }
-  }
-
-  @override
-  Stream<EngineTransportState> get transportStates => _transport.stream;
-
-  @override
-  void dispose() => disposed = true;
 }
 
 /// The local catalog, as far as a preview needs it: each track's codec.

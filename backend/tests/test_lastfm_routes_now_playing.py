@@ -22,8 +22,7 @@ from tests.lastfm_routes import (
     seed_connection,
 )
 from tests.lastfm_secrets import valid_env
-from tests.test_lastfm_now_playing import add_track
-from tests.test_lastfm_sender_app import SENDER_ON, FakeSender
+from tests.lastfm_sender_rig import FakeSender, SENDER_ON, add_track
 
 PATH = f"{BASE}/now-playing"
 

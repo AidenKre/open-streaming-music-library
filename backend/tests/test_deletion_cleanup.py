@@ -17,6 +17,7 @@ from tests.deletion_world import (
     add_art,
     add_master,
     build_world,
+    files_under,
     item,
     journal,
     make_executor,
@@ -126,6 +127,7 @@ def test_an_art_release_failure_keeps_the_journal(world):
     assert j["cover_art_id"] == art
 
 
+@pytest.mark.requires_chmod_denial
 def test_an_unlink_failure_keeps_the_quarantine_copy_and_the_journal(world):
     uuid_id = add_master(world, "A/a.flac")
     op = accept_job(world, (uuid_id, revision(world, uuid_id)))
@@ -184,9 +186,13 @@ def test_a_quarantine_path_replaced_by_a_symlink_is_never_followed(world):
 def test_the_emptied_operation_folder_is_removed(world):
     uuid_id = add_master(world, "A/a.flac")
     op = accept_job(world, (uuid_id, revision(world, uuid_id)))
+    master = path_of(world, uuid_id)
+    owner_folder = world.music / ".deleting" / str(world.owner)
 
     make_executor(world).run_one()
 
-    assert not (world.music / ".deleting" / str(world.owner) / op).exists()
-    assert (world.music / ".deleting").is_dir()
-    assert path_of is not None
+    assert not os.path.lexists(master)  # it went through the operation folder
+    assert not (owner_folder / op).exists()
+    # Only the operation's own folder goes: the owner's and the base stay.
+    assert owner_folder.is_dir() and (world.music / ".deleting").is_dir()
+    assert files_under(world.music) == {}

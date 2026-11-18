@@ -16,6 +16,7 @@ import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 
 import '../../helpers/fake_uploads_api.dart';

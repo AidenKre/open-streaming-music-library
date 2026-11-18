@@ -15,13 +15,8 @@ from app.database import ANY_OWNER
 from app.services.duplicate_detection import MatcherParams, matcher_version
 from app.services.identity_worker import reconcile_audio_identity
 from tests.identity_worker_fakes import TOOLS, make_worker
-from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, make_db, sql
+from tests.identity_worker_fixtures import DIGEST_A, add_track, identity, sql
 from tests.owned_database import add_test_user
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def _reconcile(db, version):

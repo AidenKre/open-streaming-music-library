@@ -21,11 +21,9 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../helpers/server_binding.dart';
+import '../../helpers/owned_file_cleanup_rows.dart';
 
-Future<int> _pending(AppDatabase db) async => (await db
-        .customSelect('SELECT COUNT(*) AS n FROM owned_file_cleanup')
-        .getSingle())
-    .read<int>('n');
+Future<int> _pending(AppDatabase db) => pendingOwnedFileCleanups(db);
 
 void main() {
   late AppDatabase db;
@@ -73,16 +71,10 @@ void main() {
   });
 
   test('the cleanup quiesces after uploads and before submissions', () {
-    expect([for (final q in c.read(localQuiescablesProvider)) q.quiesceName], [
-      'playback',
-      'listens',
-      'preview',
-      'history',
-      'uploads',
-      'delete-jobs',
-      'owned-file-cleanup',
-      'submissions',
-    ]);
+    // Only this participant's place; the full list is pinned once, in
+    // local_reset_service_test.dart.
+    expect([for (final q in c.read(localQuiescablesProvider)) q.quiesceName],
+        containsAllInOrder(['uploads', 'owned-file-cleanup', 'submissions']));
   });
 
   test('quiescing closes the runner: later requests run no pass', () async {

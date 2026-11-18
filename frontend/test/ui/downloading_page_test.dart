@@ -20,11 +20,11 @@ import 'package:frontend/ui/downloads_controller.dart';
 
 import 'fake_downloads_controls.dart';
 
-TrackUI _track(String uuid) => TrackUI(
+TrackUI _track(String uuid, {bool untitled = false}) => TrackUI(
       uuidId: uuid,
       createdAt: 0,
       lastUpdated: 0,
-      title: 'Title $uuid',
+      title: untitled ? null : 'Title $uuid',
       artist: 'Artist',
       duration: 120,
       bitrateKbps: 320,
@@ -159,7 +159,54 @@ void main() {
 
     await tester.pumpWidget(wrap(manager));
     expect(find.byIcon(Icons.error_outline), findsOneWidget);
-    expect(find.textContaining('Failed:'), findsOneWidget);
+    // Other-issues row 66: a fixed sentence, never the exception's text.
+    expect(find.textContaining("Couldn't download this track."),
+        findsOneWidget);
+    expect(find.textContaining('boom'), findsNothing);
+    expect(find.textContaining('Exception'), findsNothing);
+  });
+
+  // Coordinator round 2: an internal ID is never shown to a person.
+  testWidgets('a download without a title reads "Unknown track", never its '
+      'ID', (tester) async {
+    const id = '3f2c9a00-0000-4000-8000-000000000001';
+    await _insertTrack(db, id);
+    final offlineManager = DownloadManager(
+      apiClient: api,
+      db: db,
+      coverArtStore: coverStore,
+      directoryProvider: () async => tempDir,
+      isOfflineFn: () => true, // the job stays queued, observable
+    );
+    addTearDown(offlineManager.dispose);
+    await tester.runAsync(() => offlineManager
+        .enqueueTracks([_track(id, untitled: true)], quality: '320'));
+    await tester.pumpWidget(wrap(offlineManager));
+    await tester.pump();
+    expect(find.text('Unknown track'), findsOneWidget);
+    expect(find.textContaining(id), findsNothing);
+  });
+
+  // Other-issues row 74: a download in progress has the same Cancel control
+  // as a queued one, through DownloadsControls.
+  testWidgets('an active download has Cancel, which goes to the controller',
+      (tester) async {
+    await _insertTrack(db, 'act');
+    final answer = Completer<http.Response>();
+    final manager = buildManager(client: MockClient((_) => answer.future));
+    addTearDown(manager.dispose);
+    await tester.runAsync(() async {
+      await manager.enqueueTracks([_track('act')], quality: '320');
+      await pumpEventQueue();
+    });
+    expect(manager.snapshot().single.isActive, isTrue);
+    final controls = FakeDownloadsControls();
+    await tester.pumpWidget(wrap(manager, controls: controls));
+    await tester.pump();
+    expect(find.text('Active'), findsOneWidget);
+    expect(find.byType(LinearProgressIndicator), findsOneWidget);
+    await tester.tap(find.byTooltip('Cancel'));
+    expect(controls.calls, ['cancelActive act']);
   });
 
   testWidgets('Clear and Cancel go through DownloadsControls (SC-26)',

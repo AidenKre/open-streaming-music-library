@@ -8,16 +8,21 @@ being unable to verify), and cancel. A reservation the worker never took is
 never released by it. A kill or crash leaves the row to the startup reconcile.
 """
 
+import inspect
 import shutil
 import sqlite3
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from app.services import file_ops, master_replace
 import app.services.conversion as conv_mod
-import tests.test_conversion as conv
-from app.services.metadata import TagWriteError
+import tests.conversion_fixtures as conv
+from app.services.conversion import TRACK_CHANGED_ERROR
+from tests.owned_database import OwnedTestDatabase
+from tests.test_conversion import _cancel_race_setup
+from app.services.audio_identity import compute_identity
+from app.services.metadata import TagWriteError, write_metadata_tags
 from app.services.storage_ledger import (
     CONVERSION,
     InsufficientStorage,
@@ -25,15 +30,15 @@ from app.services.storage_ledger import (
     StorageLedger,
     register_purpose,
 )
-from app.services.transcoder import TranscodeResult
-from tests.test_identity_conversion import (  # noqa: F401  (fixtures is a fixture)
+from app.services.transcoder import TranscodeResult, transcode
+from tests.identity_conversion_fixtures import (  # noqa: F401  (fixtures is a fixture)
     _ComputeSpy,
-    _failed,
     _lossless_world,
-    _mismatched,
     fixtures,
 )
+from tests.test_identity_conversion import _failed, _mismatched
 from tests.test_identity_conversion_stale_digest import STALE, _failing_source_rehash
+from tests.tool_call_capture import bound_to
 
 BOOT = "boot-now"
 MIB = 1024 * 1024
@@ -147,6 +152,7 @@ def test_a_running_job_holds_its_estimate_for_its_owner_under_this_boot(tmp_path
     db, orch, coordinator, spy, track, source, job_id = _fake_world(tmp_path)
     seen = []
 
+    @bound_to(transcode)
     def fake_transcode(src, dest, *args, **kwargs):
         seen.append(_rows(db))
         return TranscodeResult(ok=False, stderr="boom")
@@ -170,7 +176,7 @@ def test_a_job_the_ledger_refuses_at_start_fails_without_a_path_and_runs_nothing
     # Free space shrank between enqueue and start.
     spy._disk_usage = lambda _p: SimpleNamespace(free=MIB)
     transcoded = []
-    monkeypatch.setattr(conv_mod, "transcode", lambda *a, **k: transcoded.append(a))
+    monkeypatch.setattr(conv_mod, "transcode", bound_to(transcode)(lambda *a, **k: transcoded.append(a)))
 
     conv._run_submitted(coordinator)
 
@@ -193,7 +199,7 @@ def test_a_job_refused_at_start_tells_no_figure_that_moves_with_other_users(tmp_
     spy._disk_usage = lambda _p: SimpleNamespace(free=10 * MIB)  # some room, not enough
     other = add_test_user(db, "bob")
     spy.reserve(owner_id=other, purpose=CONVERSION, nbytes=3 * MIB, subject_ref="other")
-    monkeypatch.setattr(conv_mod, "transcode", lambda *a, **k: pytest.fail("ran"))
+    monkeypatch.setattr(conv_mod, "transcode", bound_to(transcode)(lambda *a, **k: pytest.fail("ran")))
 
     conv._run_submitted(coordinator)
 
@@ -241,7 +247,7 @@ def test_an_exit_before_the_job_starts_its_work_never_holds_or_releases(
 ):
     db, orch, coordinator, spy, track, source, job_id = _fake_world(tmp_path)
     before_run(db, orch, track, source, job_id)
-    monkeypatch.setattr(conv_mod, "transcode", lambda *a, **k: TranscodeResult(ok=True))
+    monkeypatch.setattr(conv_mod, "transcode", bound_to(transcode)(lambda *a, **k: TranscodeResult(ok=True)))
 
     conv._run_submitted(coordinator)
 
@@ -254,11 +260,12 @@ def test_an_exit_before_the_job_starts_its_work_never_holds_or_releases(
 
 def _transcode_fails(monkeypatch, orch, job_id):
     monkeypatch.setattr(
-        conv_mod, "transcode", lambda *a, **k: TranscodeResult(ok=False, stderr="boom")
+        conv_mod, "transcode", bound_to(transcode)(lambda *a, **k: TranscodeResult(ok=False, stderr="boom"))
     )
 
 
 def _cancel_mid_transcode(monkeypatch, orch, job_id):
+    @bound_to(transcode)
     def fake(src, dest, *args, **kwargs):
         dest.write_bytes(b"partial")
         orch.cancel(conv._lib(orch), job_id)
@@ -267,6 +274,7 @@ def _cancel_mid_transcode(monkeypatch, orch, job_id):
     monkeypatch.setattr(conv_mod, "transcode", fake)
 
 
+@bound_to(transcode)
 def _writes_temp(src, dest, *args, **kwargs):
     dest.write_bytes(b"transcoded")
     return TranscodeResult(ok=True)
@@ -275,6 +283,7 @@ def _writes_temp(src, dest, *args, **kwargs):
 def _tag_write_fails(monkeypatch, orch, job_id):
     monkeypatch.setattr(conv_mod, "transcode", _writes_temp)
 
+    @bound_to(write_metadata_tags)
     def fail(source, dest, *args, **kwargs):
         dest.write_bytes(b"half-tagged")
         raise TagWriteError("tag write failed")
@@ -285,6 +294,7 @@ def _tag_write_fails(monkeypatch, orch, job_id):
 def _tagged(monkeypatch):
     monkeypatch.setattr(conv_mod, "transcode", _writes_temp)
 
+    @bound_to(write_metadata_tags)
     def tag(source, dest, *args, **kwargs):
         dest.write_bytes(b"tagged")
 
@@ -306,6 +316,7 @@ def _unexpected_error(monkeypatch, orch, job_id):
         conv_mod, "_probe_intrinsic_fields", lambda path, codec: ("aac", 192.0, 44100, 2)
     )
 
+    @bound_to(compute_identity)
     def boom(*args, **kwargs):
         raise RuntimeError("unexpected")
 
@@ -350,7 +361,7 @@ def test_a_release_that_fails_keeps_the_jobs_own_outcome_and_leaves_the_row(
 
 def _real_world(tmp_path, case):
     db, orch, coordinator, track, source, dest, original, target, bitrate = (
-        conv._cancel_race_setup(tmp_path, case)
+        _cancel_race_setup(tmp_path, case)
     )
     spy = _spy(orch, db, tmp_path)
     job_id = orch.enqueue(conv._lib(orch), track.uuid_id, target, bitrate, track.revision)
@@ -390,11 +401,20 @@ def test_a_commit_refused_by_a_cancel_releases_once(tmp_path, monkeypatch, case)
 @pytest.mark.requires_ffmpeg
 def test_a_failed_move_releases_once(tmp_path, monkeypatch):
     db, orch, coordinator, spy, track, source, dest, job_id = _real_world(tmp_path, "flac_to_aac")
-    monkeypatch.setattr(conv_mod, "move_file", lambda **kwargs: False)
+    refused = []
+
+    def refuse(*args, **kwargs):
+        inspect.signature(file_ops.move_file).bind(*args, **kwargs)  # the real helper's signature
+        refused.append(True)
+        return False
+
+    monkeypatch.setattr(master_replace, "move_file", refuse)
 
     conv._run_submitted(coordinator)
 
-    assert db.get_conversion_job(job_id)["status"] == "failed"
+    job = db.get_conversion_job(job_id)
+    assert (job["status"], job["error_text"]) == ("failed", "could not place the converted master")
+    assert refused == [True]
     _assert_held_once_and_released_once(spy, db)
 
 
@@ -412,7 +432,7 @@ def test_a_track_change_under_the_lock_releases_once(tmp_path, monkeypatch):
     conv._run_submitted(coordinator)
 
     job = db.get_conversion_job(job_id)
-    assert (job["status"], job["error_text"]) == ("failed", conv.TRACK_CHANGED_ERROR)
+    assert (job["status"], job["error_text"]) == ("failed", TRACK_CHANGED_ERROR)
     _assert_held_once_and_released_once(spy, db)
 
 
@@ -508,7 +528,7 @@ def _competing_world(tmp_path, *, free, floor):
     job_id = orch.enqueue(conv._lib(orch), track.uuid_id, "aac", 192, track.revision)
     # The upload side runs on its own Database (its own connections).
     upload = StorageLedger(
-        conv.OwnedTestDatabase(db.context), path=tmp_path, floor_bytes=floor, boot_id=BOOT,
+        OwnedTestDatabase(db.context), path=tmp_path, floor_bytes=floor, boot_id=BOOT,
         disk_usage=lambda _p: SimpleNamespace(free=free),
     )
     return db, orch, coordinator, spy, track, source, job_id, upload
@@ -522,7 +542,7 @@ def test_an_upload_reservation_first_means_the_conversion_does_not_start(
     upload.reserve(owner_id=db.owner_id, purpose=UPLOAD, nbytes=20 * MIB,
                    subject_ref="item", quota=QUOTA)
     transcoded = []
-    monkeypatch.setattr(conv_mod, "transcode", lambda *a, **k: transcoded.append(a))
+    monkeypatch.setattr(conv_mod, "transcode", bound_to(transcode)(lambda *a, **k: transcoded.append(a)))
 
     conv._run_submitted(coordinator)
 
@@ -538,6 +558,7 @@ def test_a_running_conversion_first_means_the_upload_reservation_is_refused(
         tmp_path, free=40 * MIB, floor=10 * MIB)
     refused = []
 
+    @bound_to(transcode)
     def transcode_while_an_upload_tries(src, dest, *args, **kwargs):
         try:
             upload.reserve(owner_id=db.owner_id, purpose=UPLOAD, nbytes=20 * MIB,

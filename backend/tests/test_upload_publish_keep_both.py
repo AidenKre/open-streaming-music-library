@@ -10,17 +10,12 @@ import pytest
 
 from app.database.database import DatabaseContext
 from app.services.audio_identity import AudioIdentity, identity_to_columns
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.owned_database import OwnedTestDatabase, add_test_user
 from tests.schema_fixtures import INIT_SQL
 from tests.upload_commit_fixtures import NOW, accept, make_commit_worker, ready_item
 from tests.upload_publish_fixtures import frozen_acks, library_track, make_publisher
 from tests.upload_validation_fixtures import exact_for, item_row, new_uuid, print_of, stage_item
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -3,101 +3,15 @@
 // ordering (late results, failures, dispose) is driven by hand.
 // 9-R1-15: the cases for opening with a year and a token, with a token only
 // and with a year only were removed with the dead token/year paths.
-import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/models/annual_recap.dart';
-import 'package:frontend/models/listening_stats.dart';
 import 'package:frontend/repositories/history_snapshot.dart';
 import 'package:frontend/services/annual_recap_service.dart';
 import 'package:frontend/ui/annual_recap_controller.dart';
 
-int utc(int y, [int m = 1, int d = 1, int h = 0]) =>
-    DateTime.utc(y, m, d, h).millisecondsSinceEpoch;
-
-HistorySnapshotToken token(int boundary, int nowMs, {Object key = 'k'}) =>
-    HistorySnapshotToken(
-      boundaryLocalId: boundary,
-      historyContentVersion: 0,
-      capturedNowUtcMs: nowMs,
-      filterKey: key,
-    );
-
-/// A recap of [year] under [t] with [seconds] of listening in January.
-AnnualRecap recapOf(int year, HistorySnapshotToken t, {double seconds = 0}) {
-  final range = StatsRange.year(year);
-  return AnnualRecap.fromStats(
-    ListeningStats(
-      range: range,
-      window: range.resolve(t.capturedNowUtcMs),
-      boundaryLocalId: t.boundaryLocalId,
-      totals: ListeningTotals(
-        listeningSeconds: seconds,
-        qualifiedPlays: 0,
-        uniqueTracks: 0,
-        activeDays: 0,
-      ),
-      unavailable: const ListeningSubtotal(
-        listeningSeconds: 0,
-        qualifiedPlays: 0,
-      ),
-      futureTimestampCount: 0,
-      overlongListenCount: 0,
-      buckets: [
-        ListeningBucket(
-          startUtcMs: utc(year),
-          endUtcMs: utc(year, 2),
-          listeningSeconds: seconds,
-        ),
-      ],
-      chartCapped: false,
-      topTracks: const [],
-      topArtists: const [],
-      topAlbums: const [],
-    ),
-    t,
-  );
-}
-
-class FakeRecapService implements AnnualRecapService {
-  final snapshots =
-      <({int? year, Completer<AnnualRecapSnapshot> done})>[];
-
-  @override
-  Future<AnnualRecapSnapshot> snapshot({int? year}) {
-    final c = Completer<AnnualRecapSnapshot>();
-    snapshots.add((year: year, done: c));
-    return c.future;
-  }
-
-  // The controller reads only through snapshot().
-  @override
-  Future<AnnualRecap> load(int year, HistorySnapshotToken token) =>
-      throw UnsupportedError('the controller must use snapshot()');
-
-  @override
-  Future<List<int>> years(HistorySnapshotToken token) =>
-      throw UnsupportedError('the controller must use snapshot()');
-
-  /// Answers a snapshot (the last by default) with a recap of [year] (default:
-  /// the year it asked for) under [t]; [years] null = the list failed.
-  void answer(
-    HistorySnapshotToken t, {
-    int? year,
-    List<int>? years,
-    double seconds = 0,
-    int index = -1,
-  }) {
-    final s = index < 0 ? snapshots.last : snapshots[index];
-    s.done.complete(
-      AnnualRecapSnapshot(
-        recap: recapOf(year ?? s.year!, t, seconds: seconds),
-        years: years,
-      ),
-    );
-  }
-}
+import '../helpers/listening_stats_builder.dart';
+import '../helpers/recap_service_fake.dart';
 
 void main() {
   late FakeRecapService service;

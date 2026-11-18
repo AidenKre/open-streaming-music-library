@@ -23,16 +23,7 @@ import 'package:frontend/ui/widgets/library_card.dart';
 
 import '../browse_harness.dart' show teardownTree;
 import '../fake_library_actions.dart';
-
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
+import '../../helpers/test_offline.dart';
 
 const _album = AlbumUI(
     id: 7, name: 'Test Album', artist: 'Test Artist', artistId: 3);
@@ -67,7 +58,7 @@ Widget _build(
           counts == null ? const AsyncLoading() : AsyncData(counts)),
       artistDownloadCountsProvider.overrideWith((ref, id) =>
           counts == null ? const AsyncLoading() : AsyncData(counts)),
-      offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+      offlineModeProvider.overrideWith(() => TestOffline(offline)),
       playbackAvailabilityProvider.overrideWith((ref, scope) => availability),
       libraryActionsProvider.overrideWithValue(FakeLibraryActions()),
     ],

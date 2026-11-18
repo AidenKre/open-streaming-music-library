@@ -108,8 +108,8 @@ def _attempt(
             generation=token,
         )
     except SourceUnavailable:
-        # Row exists but its source file is gone: 404 so clients drop it
-        # instead of retrying a permanently-missing file as if it were transient.
+        # Row exists but its source file is not at its path: 404 says the file
+        # is gone, not a passing failure (clients keep the track).
         return failed(
             TrackSourceError(404, f"Source file for track {uuid_id} is no longer available")
         )

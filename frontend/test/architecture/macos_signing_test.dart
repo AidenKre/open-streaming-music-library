@@ -89,7 +89,7 @@ void main() {
   });
 
   test('a team is found in the project file and in an xcconfig', () {
-    expect(_namesTeam('\t\t\t\tDEVELOPMENT_TEAM = RJ2N337XYG;'), isTrue);
+    expect(_namesTeam('\t\t\t\tDEVELOPMENT_TEAM = AB12CD34EF;'), isTrue);
     expect(_namesTeam('\t\t\t\tDEVELOPMENT_TEAM = "";'), isFalse);
     expect(
       _namesTeam('#include "Warnings.xcconfig"\nDEVELOPMENT_TEAM = AB12CD34EF\n'),

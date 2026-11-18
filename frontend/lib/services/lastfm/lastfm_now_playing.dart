@@ -54,9 +54,12 @@ bool lastfmNowPlayingAllowed(LastfmAccount? account) =>
 /// [lastfmServiceProvider], which it starts listening to only when something
 /// first plays.
 ///
-/// One notice per item becoming current, after one uninterrupted
-/// [lastfmNowPlayingDwell] of playing while online and enabled. Nothing is
-/// queued, a failed notice is never retried, and nothing is shown or logged.
+/// One notice each time an item becomes current, and again when the current
+/// item comes back within its first [lastfmNowPlayingDwell] (a restart:
+/// repeat-one, Previous, or a seek back near its start), each after one
+/// uninterrupted [lastfmNowPlayingDwell] of playing while online and
+/// enabled. Nothing is queued, a failed notice is never retried, and nothing
+/// is shown or logged.
 class LastfmNowPlaying {
   LastfmNowPlaying(this._ref) {
     _ref.listen(

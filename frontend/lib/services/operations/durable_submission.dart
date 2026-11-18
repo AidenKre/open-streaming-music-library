@@ -109,7 +109,12 @@ final class SubmissionAmbiguous extends SubmissionOutcome {
 }
 
 /// The binding the operation was created under is gone (reset, logout,
-/// user switch, another server): nothing was sent or recorded.
+/// user switch, another server). Gone before anything went out: nothing was
+/// sent or recorded. Gone while a request was out (the send, or the status
+/// query of an earlier attempt): that request may have reached the server,
+/// and a send may have been accepted, but its answer was not recorded; the
+/// row, which belongs to the gone binding, stays as last written (`sent`
+/// after a send).
 final class SubmissionFenced extends SubmissionOutcome {
   const SubmissionFenced();
 }
@@ -249,7 +254,10 @@ class DurableSubmission implements Quiescable {
   ///
   /// A submit of an operation already in flight returns that same future (no
   /// second send or status query). A binding change (SC-01 fence) before or
-  /// during the call yields [SubmissionFenced] and leaves the row untouched.
+  /// during the call yields [SubmissionFenced], and nothing more is written
+  /// to the row: a request already out (the send, or an earlier attempt's
+  /// status query) may have reached the server, and the row stays as last
+  /// written (`sent` after a send).
   Future<SubmissionOutcome> submit(
     String operationUuid, {
     required SubmissionSend send,

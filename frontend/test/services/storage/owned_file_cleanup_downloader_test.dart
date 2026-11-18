@@ -23,6 +23,7 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
 
 import '../../helpers/server_binding.dart';
+import '../../helpers/owned_file_cleanup_rows.dart';
 
 TrackUI _track(String uuid) => TrackUI(
   uuidId: uuid,
@@ -37,14 +38,8 @@ TrackUI _track(String uuid) => TrackUI(
   hasAlbumArt: false,
 );
 
-Future<List<Map<String, Object?>>> _cleanupRows(AppDatabase db) async => [
-  for (final r in await db
-      .customSelect(
-        'SELECT id, path, attempts FROM owned_file_cleanup ORDER BY id',
-      )
-      .get())
-    r.data,
-];
+Future<List<Map<String, Object?>>> _cleanupRows(AppDatabase db) =>
+    ownedFileCleanupRows(db, const ['id', 'path', 'attempts']);
 
 Future<void> _waitForFinish(DownloadManager m) async {
   for (var i = 0; i < 2000; i++) {

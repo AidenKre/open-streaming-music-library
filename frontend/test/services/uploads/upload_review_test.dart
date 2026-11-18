@@ -10,8 +10,8 @@
 //  * Submit: Confirm sends the draft's edits and the write-tags choice at
 //    the item's review version; Skip sends empty edits and `write_tags:
 //    false` whatever the draft holds; the acknowledged duplicates come from
-//    the one place the duplicate decisions live (empty in 7B.2c, filled by
-//    7B.2d); Cancel this item is the manager's cancel.
+//    the one place the duplicate decisions live (empty until the user
+//    decides); Cancel this item is the manager's cancel.
 import 'dart:convert';
 
 import 'package:drift/drift.dart' show Value;

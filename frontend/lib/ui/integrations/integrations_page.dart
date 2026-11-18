@@ -126,9 +126,7 @@ class _IntegrationsPageState extends ConsumerState<IntegrationsPage> {
       if (offer.showStopped)
         KeyedSubtree(
           key: const Key('integrations.stopped'),
-          child: _note(
-            'Scrobbling is stopped on this server. Ask whoever runs it.',
-          ),
+          child: _note(lastfmProblemText(LastfmProblem.stopped)),
         ),
       if (!view.online)
         _note(

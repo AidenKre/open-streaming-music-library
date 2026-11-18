@@ -197,6 +197,37 @@ def test_a_replay_after_the_operation_ended_answers_200(env):
     assert len(env.journals()) == 1
 
 
+@pytest.mark.parametrize("journal_state, status", [
+    ("imported", 200), ("duplicate_conflict", 200), ("failed", 200),
+    ("committing", 202), ("prepared", 202), ("moved", 202),
+])
+def test_a_replay_answers_200_for_every_ended_operation_and_202_while_it_runs(env, journal_state, status):
+    """Other-issues row 43: every state of the commit journal, not only failed."""
+    staged = env.ready()
+    first, data = env.commit(staged)
+    sql(env.db, "UPDATE upload_commit_journal SET state = ?", (journal_state,))
+
+    again = env.client.post(f"/tracks/uploads/items/{staged['item_uuid']}/commit", json=data)
+
+    assert again.status_code == status, again.text
+    assert again.json()["item_uuid"] == staged["item_uuid"]
+    assert len(env.journals()) == 1
+    assert len(env.receipts()) == 1
+
+
+def test_a_replay_after_the_finished_journal_was_cleaned_answers_200(env):
+    """The janitor deletes a finished journal; its receipt stays and still answers."""
+    staged = env.ready()
+    first, data = env.commit(staged)
+    sql(env.db, "DELETE FROM upload_commit_journal")
+
+    again = env.client.post(f"/tracks/uploads/items/{staged['item_uuid']}/commit", json=data)
+
+    assert again.status_code == 200, again.text
+    assert again.json()["item_uuid"] == staged["item_uuid"]
+    assert env.journals() == []
+
+
 @pytest.mark.parametrize(
     "change",
     [

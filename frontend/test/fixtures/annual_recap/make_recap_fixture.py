@@ -44,8 +44,9 @@ NOTES = [
     "threshold.",
     "Names are the library's current metadata when the recap was generated, "
     "not the names at the time of listening.",
-    "Unavailable time is listening to tracks that were deleted or are not in "
-    "this device's library. It is included in the totals but in no top list.",
+    "The \"unavailable\" figures count listening to deleted or unknown tracks "
+    "(tracks that were deleted or are not in this device's library). They are "
+    "included in the totals but in no top list.",
     "Counted from the listening history on this device when the recap was "
     "generated. Listens from other devices that had not synced yet are not "
     "included.",

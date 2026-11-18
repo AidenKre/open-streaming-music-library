@@ -34,15 +34,9 @@ from tests.identity_worker_fixtures import (
     DIGEST_A,
     add_track,
     identity,
-    make_db,
     set_identity,
     sql,
 )
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

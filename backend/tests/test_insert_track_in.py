@@ -20,15 +20,10 @@ from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services import audio_identity
 from app.services.audio_identity import AudioIdentity, ExactAudioHash, FingerprintIdentity
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 
 DIGEST = "ab" * 32
 STAT = (4321, 1_700_000_000_123_456_789, 98765)
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 def _identity():

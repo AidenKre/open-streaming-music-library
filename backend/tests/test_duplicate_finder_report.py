@@ -32,16 +32,11 @@ from app.services.duplicate_detection import (
     TrackRef,
     find_duplicates,
 )
-from tests.identity_worker_fixtures import add_track, make_db
+from tests.identity_worker_fixtures import add_track
 from tests.fingerprint_fixtures import ALGO, BASE, EXPLICIT, fp_track, noisy, random_print
 
 T = 1_800_000_000
 SUBJECT_DIGEST = "ee" * 32
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

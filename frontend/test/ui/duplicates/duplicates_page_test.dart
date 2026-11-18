@@ -19,6 +19,7 @@ import 'package:frontend/ui/duplicates/duplicates_controller.dart';
 import 'package:frontend/ui/duplicates/duplicates_page.dart';
 import 'package:frontend/ui/manage_library/deletion_review_controller.dart';
 import 'package:frontend/ui/manage_library/deletion_review_sheet.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 
 import '../../helpers/duplicate_fixtures.dart';
 import '../../helpers/fake_library_tools_api.dart';
@@ -451,6 +452,58 @@ void main() {
     });
   });
 
+  // Refactor APP-DUP (SP-UX-01(b), guide B.14): the page's "Couldn't load"
+  // notices are the shared LoadFailureNotice (its look: spacing and text
+  // style), with the page's own words and Retry.
+  group('the shared load-failure notice', () {
+    Finder notice(String text) => find.ancestor(
+      of: find.text(text),
+      matching: find.byType(LoadFailureNotice),
+    );
+
+    testWidgets('a failed summary: in the header, Retry refreshes',
+        (tester) async {
+      fake.summaryLoad = DuplicatesLoad.failed;
+      await open(tester);
+      expect(notice("Couldn't load the scan status"), findsOne);
+      expect(
+        find.descendant(of: header(), matching: find.byType(LoadFailureNotice)),
+        findsOne,
+      );
+      await tester.tap(find.descendant(
+        of: notice("Couldn't load the scan status"),
+        matching: find.text('Retry'),
+      ));
+      expect(fake.calls, contains('refresh'));
+      await teardownTree(tester);
+    });
+
+    testWidgets('a failed first page: full size in place of the list',
+        (tester) async {
+      fake.listLoad = DuplicatesLoad.failed;
+      await open(tester);
+      expect(notice("Couldn't load the pairs"), findsOne);
+      expect(tester.widget<LoadFailureNotice>(find.byType(LoadFailureNotice)).compact,
+          isFalse);
+      await tester.tap(find.descendant(
+        of: notice("Couldn't load the pairs"),
+        matching: find.text('Retry'),
+      ));
+      expect(fake.calls, contains('refresh'));
+      await teardownTree(tester);
+    });
+
+    testWidgets('a failed later page with rows kept: compact', (tester) async {
+      fake.pairs = [pairView(dupPair('a1', 'b1'))];
+      fake.listLoad = DuplicatesLoad.failed;
+      await open(tester);
+      expect(notice("Couldn't load the pairs"), findsOne);
+      expect(tester.widget<LoadFailureNotice>(find.byType(LoadFailureNotice)).compact,
+          isTrue);
+      await teardownTree(tester);
+    });
+  });
+
   // U33-B-02: "needs a connection" (offline, or the binding unverified)
   // offers one Retry, which refreshes, and never spins.
   testWidgets('needs a connection offers Retry, which refreshes',
@@ -464,6 +517,25 @@ void main() {
     await tester.tap(find.byKey(const Key('retry-connection')));
     await tester.pump();
     expect(fake.calls, contains('refresh'));
+    await teardownTree(tester);
+  });
+
+  // Refactor APP-DUP (section 6 #11): the page says the controller's reason
+  // at both sites, the header and the list.
+  testWidgets('needs a connection says the controller\'s reason at both sites',
+      (tester) async {
+    fake.unreachableText = 'Reason words.';
+    fake.summaryLoad = DuplicatesLoad.needsConnection;
+    fake.listLoad = DuplicatesLoad.loaded;
+    await open(tester);
+    expect(inHeader('Reason words.'), findsOne);
+    fake.summaryLoad = DuplicatesLoad.loaded;
+    fake.listLoad = DuplicatesLoad.needsConnection;
+    fake.notify();
+    await tester.pump();
+    expect(find.text('Reason words.'), findsOne);
+    expect(inHeader('Reason words.'), findsNothing);
+    expect(find.text('Possible duplicates needs a connection'), findsNothing);
     await teardownTree(tester);
   });
 

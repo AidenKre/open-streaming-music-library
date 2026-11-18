@@ -28,3 +28,12 @@ const List<FieldDescriptor> defaultEditableTrackFields = [
 final Set<String> editableMetadataColumns = {
   for (final f in defaultEditableTrackFields) f.key,
 };
+
+/// The editable fields that offer suggestions from the library while typing
+/// (the edit outbox's `fieldSuggestions` resolves each).
+const Set<String> suggestedEditableFields = {
+  'artist',
+  'album_artist',
+  'album',
+  'genre',
+};

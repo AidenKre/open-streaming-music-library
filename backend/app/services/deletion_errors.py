@@ -2,7 +2,7 @@
 
 from fastapi import HTTPException
 
-from app.core.api_errors import api_error
+from app.core.api_errors import ApiError
 
 TRACK_PENDING_DELETION = "track_pending_deletion"
 
@@ -15,23 +15,8 @@ ITEM_ERROR_CODES = (
 ITEM_DETAIL_CODES = ("master_missing", "storage_cleanup_pending")
 
 
-class DeletionError(Exception):
-    def __init__(self, status, code, message, *, retryable, **extra):
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
-        self.retryable = retryable
-        self.extra = extra
-
-    def to_http(self) -> HTTPException:
-        return api_error(
-            self.status,
-            self.code,
-            self.message,
-            retryable=self.retryable,
-            **self.extra,
-        )
+class DeletionError(ApiError):
+    """An error of the deletion and duplicate-review routes."""
 
 
 def track_pending_deletion_error(status: int) -> HTTPException:

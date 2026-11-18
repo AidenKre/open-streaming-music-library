@@ -1,12 +1,12 @@
 // PR 5A: the /history transport and the `history` capability (SC-03).
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/history_api.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/history_event.dart';
-import 'package:frontend/repositories/history_repository.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
@@ -63,6 +63,31 @@ void main() {
     test('a response without an ACK list returns it as-is (null)', () async {
       serve((_) => json({'unexpected': true}));
       expect(await HistoryApi(api: client).post(_batch([_event('a')])), isNull);
+    });
+
+    // Other-issues row 68: the POST is idempotent by event UUID, so it is
+    // retried at transport level (and on a retryable status) with the same
+    // bytes.
+    test('a transport error and a 503 are retried with the same body',
+        () async {
+      var calls = 0;
+      requests = [];
+      client = testApiClient(
+        'http://srv',
+        MockClient((req) async {
+          requests.add(req);
+          calls++;
+          if (calls == 1) throw const SocketException('reset');
+          if (calls == 2) return json({'detail': 'busy'}, 503);
+          return json({'acknowledged': ['a']});
+        }),
+      );
+      final batch = _batch([_event('a')]);
+      expect(await HistoryApi(api: client).post(batch), ['a']);
+      expect(requests, hasLength(3));
+      for (final req in requests) {
+        expect(req.bodyBytes, batch.body);
+      }
     });
 
     test('a 409 conflict is a typed ApiException', () async {

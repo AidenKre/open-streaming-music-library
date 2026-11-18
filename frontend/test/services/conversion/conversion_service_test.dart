@@ -26,6 +26,7 @@ import 'package:frontend/services/conversion/conversion_service.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 
 import '../../helpers/server_binding.dart';
+import '../../helpers/test_offline.dart';
 
 class _Sync extends TrackSyncNotifier {
   _Sync({this.result = true, this.onSync});
@@ -53,16 +54,6 @@ class _FastFailSync extends _Sync {
   Future<bool> syncFresh() async {
     calls++;
     return gate.state is BindingVerified;
-  }
-}
-
-class _Offline extends OfflineModeNotifier {
-  _Offline(this.value);
-  final bool value;
-  @override
-  bool build() {
-    super.build();
-    return value;
   }
 }
 
@@ -119,6 +110,9 @@ const _caps = AppInfo(
     bitratePresets: [320, 256, 192, 128],
   ),
 );
+
+ApiException _apiError(int status, Object detail) =>
+    ApiException(status, jsonEncode({'detail': detail}));
 
 TrackUI _loaded(String uuid) => TrackUI(
   uuidId: uuid,
@@ -185,7 +179,7 @@ void main() {
           return capsNow?.call() ?? caps;
         }),
         conversionJobsProvider.overrideWith(() => j),
-        offlineModeProvider.overrideWith(() => _Offline(offline)),
+        offlineModeProvider.overrideWith(() => TestOffline(offline)),
         if (gate != null) serverBindingGateProvider.overrideWithValue(gate),
       ],
     );
@@ -521,6 +515,63 @@ void main() {
       expect(
         await service(s.c).cancel(5),
         "Couldn't cancel the conversion. Try again.",
+      );
+    });
+  });
+
+  group('conversionErrorMessage', () {
+    test('maps each backend error to readable text', () {
+      expect(
+        conversionErrorMessage(_apiError(409, {'error': 'target_exists'})),
+        "A file already exists at the converted file's location.",
+      );
+      expect(
+        conversionErrorMessage(_apiError(409, {'error': 'pending_recovery'})),
+        'The server is still finishing a previous change to this track. '
+        'Try again later.',
+      );
+      expect(conversionErrorMessage(_apiError(404, 'Track not found')),
+          'Track or its file was not found on the server.');
+      expect(conversionErrorMessage(_apiError(507, 'disk')),
+          'Not enough disk space on the server.');
+      expect(conversionErrorMessage(_apiError(422, 'bitrate must be one of 320, 256')),
+          "Can't convert: bitrate must be one of 320, 256");
+      expect(
+        conversionErrorMessage(_apiError(422, [
+          {'loc': ['body'], 'msg': 'Field required', 'type': 'missing'},
+        ])),
+        "Can't convert: Field required",
+      );
+      expect(conversionErrorMessage(ApiException(500, 'Internal Server Error')),
+          'Could not start the conversion.');
+      expect(
+        conversionErrorMessage(NetworkException('down', attemptsMade: 1)),
+        "Couldn't reach the server. Try again.",
+      );
+    });
+  });
+
+  group('canConvertTrack', () {
+    test('requires online, the convert action, and an allowed target', () {
+      expect(
+        canConvertTrack(isOffline: false, appInfo: _caps, codec: 'flac'),
+        isTrue,
+      );
+      expect(
+        canConvertTrack(isOffline: true, appInfo: _caps, codec: 'flac'),
+        isFalse,
+      );
+      expect(
+        canConvertTrack(
+          isOffline: false,
+          appInfo: AppInfo(conversion: _caps.conversion),
+          codec: 'flac',
+        ),
+        isFalse,
+      );
+      expect(
+        canConvertTrack(isOffline: false, appInfo: null, codec: 'flac'),
+        isFalse,
       );
     });
   });

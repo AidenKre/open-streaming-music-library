@@ -12,49 +12,36 @@ import 'package:frontend/services/uploads/upload_review_rules.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 
+import '../../helpers/fake_uploads_api.dart' show itemJson;
+import '../../helpers/upload_intent_record.dart';
+
 const _code = 'upload_library_links_unsupported';
 const _words =
     "This server's music library can't accept uploads. Ask whoever runs the "
     'server to check its storage.';
 
 UploadItem _item({Map<String, dynamic>? error}) => UploadItem.fromJson({
-  'item_uuid': 'i-1',
-  'batch_uuid': 'b-1',
-  'parent_item_uuid': null,
-  'filename': 'song.flac',
-  'selection_index': 0,
-  'member_order_key': '',
-  'state': 'review_ready',
-  'expected_bytes': 3,
-  'expected_sha256': null,
-  'received_bytes': 3,
-  'review_version': 2,
-  'error': error,
-  'created_at': 1,
-  'updated_at': 1,
+  ...itemJson(
+    'i-1',
+    state: 'review_ready',
+    expectedBytes: 3,
+    receivedBytes: 3,
+    reviewVersion: 2,
+    error: error,
+  ),
   'tag_write_supported': true,
   'result_track_uuid': null,
 });
 
-UploadIntentRecord _intent(String state, {String? code}) => UploadIntentRecord(
-  itemUuid: 'i-1',
+UploadIntentRecord _intent(String state, {String? code}) => intentRecord(
+  'i-1',
   batchUuid: 'b-1',
-  parentItemUuid: null,
-  selectionIndex: 0,
   displayName: 'song.flac',
-  lastState: state,
+  state: state,
   lastErrorCode: code,
   lastErrorMessage: 'raw server text',
-  operationUuid: null,
-  transferOperationUuid: null,
-  reviewGeneration: null,
-  draftJson: null,
   localBindingId: 'bind-1',
-  createdAtMs: 0,
-  updatedAtMs: 0,
   expectedLength: 3,
-  expectedSha256: null,
-  descriptor: null,
 );
 
 void main() {

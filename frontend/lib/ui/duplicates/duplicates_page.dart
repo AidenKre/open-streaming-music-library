@@ -7,6 +7,7 @@ import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/services/duplicates/duplicates_review.dart';
 import 'package:frontend/ui/duplicates/duplicates_controller.dart';
 import 'package:frontend/ui/manage_library/deletion_review_sheet.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 
 class DuplicatesPage extends ConsumerStatefulWidget {
   const DuplicatesPage({super.key});
@@ -91,22 +92,17 @@ class _DuplicatesPageState extends ConsumerState<DuplicatesPage> {
         content = Wrap(
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            const Text('Possible duplicates needs a connection'),
+            Text(controls.unreachableText),
             if (controls.listLoad != DuplicatesLoad.needsConnection)
               _connectionRetry(),
           ],
         );
       case DuplicatesLoad.failed:
-        content = Wrap(
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            const Text("Couldn't load the scan status"),
-            TextButton(
-              key: const Key('retry-summary'),
-              onPressed: controls.refresh,
-              child: const Text('Retry'),
-            ),
-          ],
+        content = LoadFailureNotice(
+          message: "Couldn't load the scan status",
+          onRetry: controls.refresh,
+          retryKey: const Key('retry-summary'),
+          compact: true,
         );
       case DuplicatesLoad.idle:
       case DuplicatesLoad.loaded:
@@ -176,16 +172,11 @@ class _DuplicatesPageState extends ConsumerState<DuplicatesPage> {
             : const [];
       case DuplicatesLoad.failed:
         return [
-          Wrap(
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              const Text("Couldn't load the pairs"),
-              TextButton(
-                key: const Key('retry-list'),
-                onPressed: controls.refresh,
-                child: const Text('Retry'),
-              ),
-            ],
+          LoadFailureNotice(
+            message: "Couldn't load the pairs",
+            onRetry: controls.refresh,
+            retryKey: const Key('retry-list'),
+            compact: !empty,
           ),
         ];
       case DuplicatesLoad.needsConnection:
@@ -193,7 +184,7 @@ class _DuplicatesPageState extends ConsumerState<DuplicatesPage> {
           Wrap(
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              const Text('Possible duplicates needs a connection'),
+              Text(controls.unreachableText),
               _connectionRetry(),
             ],
           ),

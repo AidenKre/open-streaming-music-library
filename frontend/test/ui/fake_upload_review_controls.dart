@@ -6,9 +6,11 @@ import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/uploads/upload_duplicate_decisions.dart';
 import 'package:frontend/services/uploads/upload_duplicate_summary.dart';
-import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/upload_review_rules.dart';
 import 'package:frontend/ui/uploads/upload_review_controller.dart';
+
+import '../helpers/fake_uploads_api.dart' show itemJson;
+import '../helpers/upload_intent_record.dart';
 
 /// Scriptable review controller for widget tests.
 class FakeUploadReviewControls extends ChangeNotifier
@@ -147,45 +149,27 @@ ReviewItemView fakeReviewView(
   Set<DuplicateGroup> chosen = const {},
 }) => ReviewItemView.of(
   item: UploadItem.fromJson({
-    'item_uuid': uuid,
-    'batch_uuid': 'b-1',
-    'parent_item_uuid': null,
-    'filename': '$uuid.flac',
-    'selection_index': 0,
-    'member_order_key': '',
-    'state': state,
-    'expected_bytes': 3,
-    'expected_sha256': null,
-    'received_bytes': 3,
-    'review_version': version,
-    'error': null,
-    'created_at': 1,
-    'updated_at': 1,
+    ...itemJson(
+      uuid,
+      filename: '$uuid.flac',
+      state: state,
+      expectedBytes: 3,
+      receivedBytes: 3,
+      reviewVersion: version,
+    ),
     'tag_write_supported': tagWrite,
     'result_track_uuid': result,
     'duplicate_check': check,
     'conflict_matches': conflicts,
     'detected_metadata': detected,
   }),
-  intent: UploadIntentRecord(
-    itemUuid: uuid,
+  intent: intentRecord(
+    uuid,
     batchUuid: 'b-1',
-    parentItemUuid: null,
-    selectionIndex: 0,
     displayName: '$uuid.flac',
-    lastState: state,
+    state: state,
     lastErrorCode: code,
-    lastErrorMessage: null,
-    operationUuid: null,
-    transferOperationUuid: null,
-    reviewGeneration: null,
-    draftJson: null,
     localBindingId: 'bind',
-    createdAtMs: 0,
-    updatedAtMs: 0,
-    expectedLength: null,
-    expectedSha256: null,
-    descriptor: null,
   ),
   online: online,
   chosen: chosen,

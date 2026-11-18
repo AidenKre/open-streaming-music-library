@@ -20,6 +20,8 @@ from app.services.ffmpeg_runner import (
     CaptureTimeout,
     FfmpegError,
     FfmpegProcessRegistry,
+    ToolOptions,
+    run_capture,
 )
 from app.services.fingerprinter import (
     FP_CURRENT,
@@ -208,6 +210,8 @@ def test_min_diversity_comes_from_the_parameters():
 
 # --- FpcalcFingerprinter: parsing (process boundary mocked) ------------------
 
+from tests.tool_call_capture import tool_call
+
 EXE = "/opt/tools/fpcalc"
 
 
@@ -221,7 +225,7 @@ class FakeRunner:
         self.calls: list[tuple[list[str], dict]] = []
 
     def __call__(self, cmd, **kwargs):
-        self.calls.append((list(cmd), kwargs))
+        self.calls.append((list(cmd), tool_call(run_capture, cmd, **kwargs)))
         if self.error is not None:
             raise self.error
         return self.result
@@ -301,7 +305,7 @@ def test_stdout_is_bounded_but_fits_a_maximal_print(runner, audio_file):
 def test_registry_job_and_priority_are_passed_through(runner, audio_file):
     registry = FfmpegProcessRegistry()
 
-    _fp().fingerprint(audio_file, registry=registry, job_id="identity-7", low_priority=True)
+    _fp().fingerprint(audio_file, options=ToolOptions(registry=registry, job_id="identity-7", low_priority=True))
 
     [(_, kwargs)] = runner.calls
     assert kwargs["registry"] is registry
@@ -787,6 +791,7 @@ def test_a_probe_that_fails_to_run_gives_none(clean_env, path_dir, version_runne
     assert detect_fingerprinter(_settings()) is None
 
 
+@pytest.mark.requires_chmod_denial
 def test_an_unreadable_fpcalc_path_directory_gives_none_instead_of_raising(
     clean_env, path_dir, version_runner, tmp_path, caplog
 ):
@@ -840,7 +845,8 @@ def test_a_tool_that_cannot_execute_is_tool_missing(runner, audio_file, returnco
     # itself only exits 0, 1 or 2.
     runner.result = CaptureResult(returncode, b"", "nice: fpcalc: No such file or directory\n")
 
-    assert _fp().fingerprint(audio_file, low_priority=True) == FingerprintFailure(REASON_TOOL_MISSING)
+    assert _fp().fingerprint(audio_file, options=ToolOptions(low_priority=True)) \
+        == FingerprintFailure(REASON_TOOL_MISSING)
 
 
 def test_the_algorithm_is_passed_explicitly_so_the_label_is_a_guarantee(runner, audio_file):

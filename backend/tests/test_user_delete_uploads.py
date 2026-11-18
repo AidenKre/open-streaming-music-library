@@ -9,11 +9,8 @@ import pytest
 from app.services import user_delete
 from app.services.user_delete import DeletePaths, DeleteRefused, run_user_delete
 from tests.cli_fixtures import cli_settings, sql
+from tests.crash import Crash
 from tests.user_delete_world import build_world
-
-
-class Crash(BaseException):
-    pass
 
 
 @pytest.fixture

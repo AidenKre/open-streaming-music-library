@@ -20,6 +20,7 @@ from anyio import to_thread
 from app.core.operator_log import operator_logger
 from app.core.bounded_body import BodyTooLarge, capped_chunks
 from app.core.durable_fs import fsync_dir
+from app.core.upload_states import ENDED_STATES, SOURCE_GIVEN_BACK_STATES
 from app.services import job_runtime
 from app.services.path_sanitize import assert_within
 from app.services.storage_ledger import (
@@ -59,7 +60,7 @@ job_runtime.register_job_table(
     "upload_items",
     key_columns=("owner_id", "item_uuid"),
     state_column="state",
-    terminal_states=("imported", "duplicate", "expanded", "expired", "cancelled"),
+    terminal_states=ENDED_STATES,
 )
 
 
@@ -166,6 +167,34 @@ def remove_verified(files: ReceiptFiles, path: Path) -> bool:
     except OSError:
         return False
     return False
+
+
+def remove_then_release(
+    files: ReceiptFiles, path: Path, release: Callable[[], Any], *,
+    within: Path | None = None, remove: Callable[[ReceiptFiles, Path], bool] | None = None,
+    between: Callable[[], None] | None = None,
+) -> Any:
+    """Give a staged file back, in this order: check that ``path`` lies inside
+    ``within`` (when given; ``ValueError`` otherwise: nothing removed, nothing
+    released), remove it verifiably, and only once it is gone call
+    ``release()``, the database write that forgets the path and its quota row.
+    A file that is still there is never released, so its bytes stay counted.
+
+    ``remove`` defaults to this module's ``remove_verified``, looked up at the
+    call; a caller passes its own module's name for it, so a test that replaces
+    that name there still reaches the call. ``between`` (a crash seam) runs after
+    the removal attempt, whatever its outcome, and before the release. Returns
+    ``None`` while the file is still there, else what ``release()`` returned.
+    Raises what the check, the seam or the release raise; each caller keeps its
+    own handling and log line."""
+    if within is not None:
+        assert_within(path, within)
+    gone = (remove or remove_verified)(files, path)
+    if between is not None:
+        between()
+    if not gone:
+        return None
+    return release()
 
 
 @dataclass
@@ -669,8 +698,6 @@ async def _receive_allocated(runtime, library, limits, item_uuid, stream, row, *
 
 # ── startup reconcile (spec §5 "On process restart reconcile receiving rows") ──
 
-_RECONCILE_DROPS_SOURCE = ("cancelled", "expired", "imported", "duplicate")
-
 
 def _file_matches(path: Path, expected_bytes: int, expected_sha256: str) -> bool:
     """True only for a regular file of exactly the allocated length and digest,
@@ -712,6 +739,16 @@ def reconcile_upload_receipts(
             return True
         return remove_verified(files, path)
 
+    def return_dead(owner, item) -> bool:
+        """Receiving -> allocated with ``upload_interrupted``; its in-flight quota
+        row goes. Only once nothing of the transfer is left on disk."""
+        error = upload_interrupted()
+        return database.return_dead_upload_receipt(
+            owner_id=owner, item_uuid=item, boot_id=boot_id,
+            receive_purpose=UPLOAD_RECEIVE, error_code=error.code,
+            error_message=error.message, now=now,
+        )
+
     for row in database.list_upload_receipts_to_reconcile(boot_id=boot_id):
         try:
             folder = _item_dir(uploads_root, row["owner_id"], row)
@@ -739,13 +776,9 @@ def reconcile_upload_receipts(
                     receive_purpose=UPLOAD_RECEIVE, settled_purpose=UPLOAD_SOURCE, now=now,
                     keep_part=not part_gone,
                 )
-            elif part_gone and remove_verified(files, source):
-                error = upload_interrupted()
-                returned += database.return_dead_upload_receipt(
-                    owner_id=owner, item_uuid=item, boot_id=boot_id,
-                    receive_purpose=UPLOAD_RECEIVE, error_code=error.code,
-                    error_message=error.message, now=now,
-                )
+            elif part_gone and (back := remove_then_release(
+                    files, source, lambda: return_dead(owner, item))) is not None:
+                returned += back
             else:
                 error = upload_cleanup_failed()
                 database.fail_dead_upload_receipt(
@@ -758,7 +791,7 @@ def reconcile_upload_receipts(
     for reservation in database.list_upload_source_reservations(purpose=UPLOAD_SOURCE):
         try:
             source_path = reservation["source_path"]
-            if reservation["state"] in _RECONCILE_DROPS_SOURCE and source_path is not None:
+            if reservation["state"] in SOURCE_GIVEN_BACK_STATES and source_path is not None:
                 # An ended item that still records its source (a removal failed):
                 # the bytes stay counted until the file is verifiably gone.
                 try:
@@ -771,7 +804,7 @@ def reconcile_upload_receipts(
             else:
                 keep = (
                     reservation["state"] is not None
-                    and reservation["state"] not in _RECONCILE_DROPS_SOURCE
+                    and reservation["state"] not in SOURCE_GIVEN_BACK_STATES
                     and source_path is not None
                 )
                 if keep:

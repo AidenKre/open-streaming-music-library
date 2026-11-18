@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
-import shutil
 import tarfile
 import threading
 import zipfile
@@ -29,7 +29,7 @@ def _completed(args, returncode, stdout, stderr):
 
 class TestDoesMusicPassQuickCheck:
     def test_does_music_pass_quick_check__audio_stream_present__returns_true(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -40,7 +40,7 @@ class TestDoesMusicPassQuickCheck:
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is True
 
     def test_does_music_pass_quick_check__ffprobe_nonzero_exit__returns_false(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=1,
@@ -51,7 +51,7 @@ class TestDoesMusicPassQuickCheck:
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
     def test_does_music_pass_quick_check__no_audio_streams__returns_false(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -69,7 +69,7 @@ class TestDoesMusicPassQuickCheck:
                 ingestion.does_music_pass_quick_check(Path("song.mp3"))
 
     def test_does_music_pass_quick_check__invalid_json__returns_false(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -80,7 +80,7 @@ class TestDoesMusicPassQuickCheck:
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
     def test_does_music_pass_quick_check__json_not_an_object__returns_false(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -91,7 +91,7 @@ class TestDoesMusicPassQuickCheck:
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
     def test_does_music_pass_quick_check__json_missing_streams_key__returns_false(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -102,7 +102,7 @@ class TestDoesMusicPassQuickCheck:
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
     def test_does_music_pass_quick_check__streams_is_none__returns_false(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -113,7 +113,7 @@ class TestDoesMusicPassQuickCheck:
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
     def test_does_music_pass_quick_check__streams_empty__returns_false(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -124,7 +124,7 @@ class TestDoesMusicPassQuickCheck:
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
     def test_does_music_pass_quick_check__non_dict_stream_entries_ignored__still_finds_audio(self):
-        with patch("app.services.ingestion.run_capture") as run:
+        with patch("app.services.ingestion.run_capture", autospec=True) as run:
             run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
@@ -145,7 +145,7 @@ class TestTheQuickCheckReadsExitsLikeTheSharedRule:
     def test_a_sigkill_is_unavailable_for_now(self):
         import signal
 
-        with patch("app.services.ingestion.run_capture",
+        with patch("app.services.ingestion.run_capture", autospec=True,
                    return_value=_completed([], -signal.SIGKILL, "", "")):
             with pytest.raises(ingestion.ProbeUnavailable):
                 ingestion.does_music_pass_quick_check(Path("song.mp3"))
@@ -154,14 +154,14 @@ class TestTheQuickCheckReadsExitsLikeTheSharedRule:
     def test_another_signal_is_the_files_own_answer(self, sig):
         import signal
 
-        with patch("app.services.ingestion.run_capture",
+        with patch("app.services.ingestion.run_capture", autospec=True,
                    return_value=_completed([], -getattr(signal, sig), "", "")):
             assert ingestion.does_music_pass_quick_check(Path("song.mp3")) is False
 
     def test_an_oserror_while_starting_is_unavailable_for_now(self):
         import errno
 
-        with patch("app.services.ingestion.run_capture",
+        with patch("app.services.ingestion.run_capture", autospec=True,
                    side_effect=OSError(errno.EMFILE, "Too many open files")):
             with pytest.raises(ingestion.ProbeUnavailable):
                 ingestion.does_music_pass_quick_check(Path("song.mp3"))
@@ -687,7 +687,7 @@ def test_two_same_named_archives_set_aside_at_once_are_both_kept(tmp_path: Path)
     # second set-aside cannot reach its move; a spy lock sees it fail to take
     # the lock and breaks the barrier at once, so nothing waits out a timeout.
     both_probed = threading.Barrier(2, timeout=5)  # guard only
-    real_move = shutil.move
+    real_rename = os.rename  # the set-aside's move (into the opened folder)
     real_lock = ingestion._imported_lock
 
     class SpyLock:
@@ -700,15 +700,15 @@ def test_two_same_named_archives_set_aside_at_once_are_both_kept(tmp_path: Path)
         def __exit__(self, *exc):
             real_lock.release()
 
-    def move_after_both_probed(src, dst):
+    def move_after_both_probed(src, dst, **kwargs):
         try:
             both_probed.wait()
         except threading.BrokenBarrierError:
             pass  # serialized: the other set-aside waits for this one
-        return real_move(src, dst)
+        return real_rename(src, dst, **kwargs)
 
     with patch.object(ingestion, "_imported_lock", SpyLock()), \
-            patch("app.services.ingestion.shutil.move", side_effect=move_after_both_probed):
+            patch("app.services.ingestion.os.rename", side_effect=move_after_both_probed):
         threads = [
             threading.Thread(target=ingestion.move_to_imported, args=(archive, imported))
             for archive in (first, second)

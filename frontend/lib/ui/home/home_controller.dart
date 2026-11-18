@@ -87,6 +87,7 @@ class HomeController extends ChangeNotifier implements HomeControls {
 
   List<FeedEntity>? _main;
   bool? _hasHistory; // the unfiltered probe; only used while the chip is ON
+  bool _probeFailed = false;
   bool _failed = false;
   HomeRecentsState _recents = const HomeRecentsLoading();
 
@@ -112,6 +113,7 @@ class HomeController extends ChangeNotifier implements HomeControls {
     final generation = ++_generation;
     _main = null;
     _hasHistory = null;
+    _probeFailed = false;
     _failed = false;
     final downloaded = filters.downloaded;
     final repo = _ref.read(recentlyPlayedRepositoryProvider);
@@ -141,12 +143,14 @@ class HomeController extends ChangeNotifier implements HomeControls {
             (has) {
               if (_stale(generation)) return;
               _hasHistory = has;
+              _probeFailed = false;
               _publish();
             },
-            // A failed probe is treated as "no history".
+            // A failed probe is unknown, never "no history": with nothing
+            // downloaded to show, the section shows its failed state.
             onError: (Object _) {
               if (_stale(generation)) return;
-              _hasHistory = false;
+              _probeFailed = true;
               _publish();
             },
           );
@@ -173,6 +177,8 @@ class HomeController extends ChangeNotifier implements HomeControls {
       next = HomeRecentsReady(main);
     } else if (!filters.downloaded) {
       next = const HomeRecentsEmpty(filtered: false);
+    } else if (_probeFailed) {
+      next = const HomeRecentsFailed();
     } else if (_hasHistory == null) {
       next = const HomeRecentsLoading();
     } else {

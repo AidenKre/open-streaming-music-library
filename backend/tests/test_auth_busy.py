@@ -4,23 +4,15 @@ register and login answer 503 ``auth_busy`` with ``retryable: true``.
 The test holds the two slots with a gate inside argon2 (no sleeps).
 """
 
-import sqlite3
 import threading
 
 import pytest
 from argon2 import PasswordHasher
 
 from app.auth.passwords import hash_password
+from tests.sqlite_helpers import table_count
 
 PASSWORD = "a long enough password"
-
-
-def _count(client, table):
-    conn = sqlite3.connect(client.app.state.database.context.database_path)
-    try:
-        return conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-    finally:
-        conn.close()
 
 
 @pytest.fixture
@@ -63,19 +55,19 @@ def _assert_busy(response):
 
 
 def test_register_answers_auth_busy_and_creates_nothing(client, both_slots_held):
-    users, sessions = _count(client, "users"), _count(client, "auth_sessions")
+    users, sessions = table_count(client, "users"), table_count(client, "auth_sessions")
 
     _assert_busy(client.post("/auth/register", json={"username": "Alex", "password": PASSWORD}))
 
-    assert (_count(client, "users"), _count(client, "auth_sessions")) == (users, sessions)
+    assert (table_count(client, "users"), table_count(client, "auth_sessions")) == (users, sessions)
 
 
 def test_login_answers_auth_busy_and_creates_no_session(client, both_slots_held):
-    sessions = _count(client, "auth_sessions")
+    sessions = table_count(client, "auth_sessions")
 
     _assert_busy(client.post("/auth/login", json={"username": "Sam", "password": PASSWORD}))
 
-    assert _count(client, "auth_sessions") == sessions
+    assert table_count(client, "auth_sessions") == sessions
 
 
 def test_login_works_again_once_a_slot_is_free(client):

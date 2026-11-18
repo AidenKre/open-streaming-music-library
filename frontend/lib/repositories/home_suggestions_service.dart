@@ -6,6 +6,7 @@ library;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/browse_filters.dart';
+import 'package:frontend/models/history_event.dart';
 import 'package:frontend/models/suggestions.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart';
@@ -90,7 +91,7 @@ class HomeSuggestionsService {
   }
 
   Stream<SnapshotStaleness> watch(SuggestionSnapshot snapshot) =>
-      _freshness.watch(snapshot.token, kinds: const {'play'});
+      _freshness.watch(snapshot.token, kinds: const {HistoryKind.play});
 
   SuggestionView pickNow(
     SuggestionSnapshot snapshot, {

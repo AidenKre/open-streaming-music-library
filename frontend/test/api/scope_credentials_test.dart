@@ -40,9 +40,17 @@ class _Transport extends http.BaseClient {
   final List<http.BaseRequest> wire = [];
   bool closed = false;
 
+  /// Thrown for every request when set (a lost connection); the request is
+  /// still recorded in [wire].
+  Object? failure;
+
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     if (closed) throw StateError('transport used after close');
+    if (failure != null) {
+      wire.add(request);
+      throw failure!;
+    }
     if (held.contains(request.url.path)) await release.future;
     wire.add(request);
     return http.StreamedResponse(
@@ -222,6 +230,37 @@ void main() {
     transport.release.complete();
     await expectLater(pending, throwsA(anything));
     expect(hookCalls, 0);
+  });
+
+  // U16-FE-API-A-07: the scope's token-free client (`withoutToken`, for
+  // public paths) has no 401 hook, and its lost connection is the scope's.
+  test("a 401 on the scope's token-free client doesn't call the scope's hook",
+      () async {
+    transport.status = 401;
+    var hookCalls = 0;
+    final a = scope(_alice, hook: () => hookCalls++);
+    addTearDown(a.dispose);
+    final bare = a.read(apiClientProvider).withoutToken();
+    await expectLater(bare.getJson(['app', 'info']), throwsA(anything));
+    expect(transport.wire, isNotEmpty);
+    expect(_auth(transport.wire.last), isNull);
+    expect(hookCalls, 0);
+  });
+
+  test("a lost connection on the scope's token-free client reaches the "
+      "scope client's network-failure listeners", () async {
+    transport.failure = const SocketException('unreachable');
+    final a = scope(_alice);
+    addTearDown(a.dispose);
+    final api = a.read(apiClientProvider);
+    var networkFailures = 0;
+    api.addNetworkFailureListener(() => networkFailures++);
+    await expectLater(
+      api.withoutToken().getJson(['app', 'info'], retry: false),
+      throwsA(anything),
+    );
+    expect(_auth(transport.wire.single), isNull);
+    expect(networkFailures, 1);
   });
 
   test('hasSessionProvider follows the stored credentials', () {

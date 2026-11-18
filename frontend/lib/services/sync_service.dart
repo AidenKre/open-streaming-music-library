@@ -11,7 +11,10 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+
+// Moved (B.13); re-exported so importers keep working.
+export 'package:frontend/repositories/sync_cursor_store.dart'
+    show ServerRegressedException;
 
 class SyncResult {
   final Set<int> affectedQueueSessionIds;
@@ -28,26 +31,10 @@ class SyncResult {
   });
 }
 
-/// The server answered with a `latestRevision` below the `after` this client
-/// requested: it was restored from an older backup (SC-01 rule 5). Nothing
-/// from that response was applied.
-class ServerRegressedException implements Exception {
-  ServerRegressedException({
-    required this.requestedAfter,
-    required this.latestRevision,
-  });
-  final int requestedAfter;
-  final int latestRevision;
-
-  @override
-  String toString() =>
-      'ServerRegressedException(requested after $requestedAfter, '
-      'server latest $latestRevision)';
-}
-
 /// Drives revision-based incremental sync: pages the `/changes` stream,
 /// applies the interleaved upsert/delete entries into the local database in
-/// revision order, advances the watermark, and rebuilds search indexes.
+/// revision order, advances the watermark, and updates the search entries of
+/// the tracks each page changed, in that page's transaction.
 ///
 /// Every local write is fenced (SC-01 rule 4) by [bindingToken], the
 /// `local_binding_id` captured when the sync task started: once a reset
@@ -57,7 +44,6 @@ class SyncService {
   final AppDatabase _db;
   final TracksApi _api;
   final QueueRepository _queueRepo;
-  final SharedPreferences _prefs;
   final String _bindingToken;
   final ServerBindingRepository _binding;
   final SyncCursorStore _cursors;
@@ -67,13 +53,11 @@ class SyncService {
     required AppDatabase db,
     required TracksApi api,
     required QueueRepository queueRepository,
-    required SharedPreferences prefs,
     required String bindingToken,
     OwnedFileCleanup? ownedFileCleanup,
   }) : _db = db,
        _api = api,
        _queueRepo = queueRepository,
-       _prefs = prefs,
        _bindingToken = bindingToken,
        _binding = ServerBindingRepository(db),
        _cursors = SyncCursorStore(db),
@@ -88,60 +72,32 @@ class SyncService {
   /// work sharing the run's critical section (the edit outbox flush).
   String get bindingToken => _bindingToken;
 
-  final _committedSessionIds = <int>{};
-  final _committedDeletedUuids = <String>{};
-  final _committedEndedSessionIds = <int>{};
+  final _committed = _SyncEffects();
 
   /// What this service's runs have changed and COMMITTED so far. Each page /
-  /// refetch collects into its own sets and merges here only after its fenced
-  /// transaction returned, so a refused or rolled-back page never leaks. A
-  /// caller reads this after a failure to publish what an earlier page did
-  /// change.
+  /// refetch collects into its own effects and merges here only after its
+  /// fenced transaction returned, so a refused or rolled-back page never
+  /// leaks. A caller reads this after a failure to publish what an earlier
+  /// page did change.
   SyncResult get committedChanges => SyncResult(
-        affectedQueueSessionIds: Set.unmodifiable(_committedSessionIds),
-        deletedTrackUuids: Set.unmodifiable(_committedDeletedUuids),
-        endedQueueSessionIds: Set.unmodifiable(_committedEndedSessionIds),
+        affectedQueueSessionIds:
+            Set.unmodifiable(_committed.affectedQueueSessionIds),
+        deletedTrackUuids: Set.unmodifiable(_committed.deletedTrackUuids),
+        endedQueueSessionIds: Set.unmodifiable(_committed.endedSessionIds),
       );
-
-  /// The pre-SC-02 SharedPreferences key of the catalog watermark, read once
-  /// and removed by [SyncCursorStore.migrateLegacyCatalogCursor].
-  static const lastRevisionKey = SyncCursorStore.legacyCatalogPrefKey;
 
   Future<SyncResult> syncChanges() async {
     // The catalog watermark (last monotonic revision applied) lives in
-    // `sync_cursors.catalog` (SC-02); a pre-SC-02 pref moves there once.
-    await _cursors.migrateLegacyCatalogCursor(
-      _prefs,
-      transaction: (body) => _binding.runFenced(_bindingToken, body),
-    );
-    var after = await _cursors.read(SyncStream.catalog);
-    var committedAnyChanges = false;
-    try {
-      await _applyPages(after, () => committedAnyChanges = true);
-    } catch (e) {
-      // Pages that committed changed the track table: bring search up to
-      // date before the failure propagates. Best effort; never masks [e].
-      // A fenced run means a reset is wiping the DB: nothing to rebuild.
-      if (committedAnyChanges && e is! BindingFencedException) {
-        try {
-          // One transaction, like the rebuild after a successful sync.
-          await _db.transaction(() => _db.rebuildFtsIndexes());
-        } on Object catch (ftsError) {
-          developer.log(
-            'FTS rebuild after a failed sync failed: $ftsError',
-            name: 'SyncService',
-          );
-        }
-      }
-      rethrow;
-    }
-    // One transaction: the rebuild empties the indexes and refills them, and
-    // a search in between must see the old index, not an empty one.
-    await _db.transaction(() => _db.rebuildFtsIndexes());
+    // `sync_cursors.catalog` (SC-02).
+    final after = await _cursors.read(SyncStream.catalog);
+    // Each page updates its own search entries in the transaction that saves
+    // it, so a sync that saved nothing touches no search table, and one that
+    // fails or is killed after a page leaves that page's tracks searchable.
+    await _applyPages(after);
     return committedChanges;
   }
 
-  Future<void> _applyPages(int after, void Function() onPageCommitted) async {
+  Future<void> _applyPages(int after) async {
 
     // Page through the revision-ordered change stream. Upserts and deletes
     // interleave by revision; apply them in order so a later delete of a
@@ -185,20 +141,11 @@ class SyncService {
       // (that row's delete carries a higher revision and arrives later).
       // Final page: the highest revision actually seen, if any.
       final newCursor = cursor ?? lastAppliedRevision;
-      final cleanupIds = <int>[];
-      final pageSessionIds = <int>{};
-      final pageDeletedUuids = <String>{};
-      final pageEndedSessionIds = <int>{};
-      final pageRelandedSessionIds = <int>{};
+      final page = _SyncEffects();
       await _binding.runFenced(_bindingToken, servedBy: response.servedBy, () async {
-        await _applyChanges(
-          response.changes,
-          affectedQueueSessionIds: pageSessionIds,
-          deletedTrackUuids: pageDeletedUuids,
-          endedSessionIds: pageEndedSessionIds,
-          relandedSessionIds: pageRelandedSessionIds,
-          cleanupIds: cleanupIds,
-        );
+        final searchBefore = await _readSearchBeforePage(response.changes);
+        await _applyChanges(response.changes, page);
+        await _updateSearchIndex(searchBefore, page);
         if (newCursor != null) {
           await _cursors.write(SyncStream.catalog, newCursor);
         }
@@ -209,14 +156,9 @@ class SyncService {
         }
       });
       // The page is committed: only now do its changes count.
-      _committedSessionIds.addAll(pageSessionIds);
-      _committedDeletedUuids.addAll(pageDeletedUuids);
-      _committedEndedSessionIds
-        ..removeAll(pageRelandedSessionIds)
-        ..addAll(pageEndedSessionIds);
-      if (response.changes.isNotEmpty) onPageCommitted();
+      _committed.addCommitted(page);
       // Only once the deletes are committed.
-      await _attemptOwnedCleanup(cleanupIds);
+      await _attemptOwnedCleanup(page.cleanupIds);
       if (cursor == null) break;
       after = cursor;
     }
@@ -236,10 +178,7 @@ class SyncService {
     String uuidId, {
     bool rebuildParentFts = true,
   }) async {
-    final affectedQueueSessionIds = <int>{};
-    final deletedTrackUuids = <String>{};
-    final endedSessionIds = <int>{};
-    final relandedSessionIds = <int>{};
+    final effects = _SyncEffects();
     ClientTrackDto? dto;
     try {
       dto = await _api.getTrack(uuidId);
@@ -247,20 +186,12 @@ class SyncService {
       // 404/410: gone on the server -> delete locally (dto stays null).
       if (e.statusCode != 404 && e.statusCode != 410) rethrow;
     }
-    final cleanupIds = <int>[];
     await _binding.runFenced(_bindingToken, () async {
       final before = await _db.readTrackFtsEntry(uuidId);
       if (dto != null) {
         await _upsertTracks([dto]);
       } else {
-        await _deleteTracks(
-          [uuidId],
-          affectedQueueSessionIds: affectedQueueSessionIds,
-          deletedTrackUuids: deletedTrackUuids,
-          endedSessionIds: endedSessionIds,
-          relandedSessionIds: relandedSessionIds,
-          cleanupIds: cleanupIds,
-        );
+        await _deleteTracks([uuidId], effects);
       }
       // Targeted FTS maintenance: exactly one track row changed, so apply a
       // per-row fts_tracks delta instead of the O(library) rebuild. The
@@ -269,30 +200,69 @@ class SyncService {
       await _db.applyTrackFtsDelta(uuidId, before);
       if (rebuildParentFts) await _db.rebuildParentFtsIndexes();
     });
-    _committedSessionIds.addAll(affectedQueueSessionIds);
-    _committedDeletedUuids.addAll(deletedTrackUuids);
-    _committedEndedSessionIds
-      ..removeAll(relandedSessionIds)
-      ..addAll(endedSessionIds);
-    await _attemptOwnedCleanup(cleanupIds);
+    _committed.addCommitted(effects);
+    await _attemptOwnedCleanup(effects.cleanupIds);
     return SyncResult(
-      affectedQueueSessionIds: affectedQueueSessionIds,
-      deletedTrackUuids: deletedTrackUuids,
-      endedQueueSessionIds: endedSessionIds,
+      affectedQueueSessionIds: effects.affectedQueueSessionIds,
+      deletedTrackUuids: effects.deletedTrackUuids,
+      endedQueueSessionIds: effects.endedSessionIds,
     );
+  }
+
+  /// The search state of what [changes] write: every entry's track, and the
+  /// artist and album ids its upserts carry.
+  Future<PageSearchBefore> _readSearchBeforePage(List<ChangeEntryDto> changes) {
+    final upserted = [
+      for (final e in changes)
+        if (e.track != null) e.track!.metadata,
+    ];
+    return _db.readSearchBeforePage(
+      trackIds: {for (final e in changes) e.uuidId},
+      artistIds: {
+        for (final m in upserted)
+          if (m.artistId != null) m.artistId!,
+      },
+      albumIds: {
+        for (final m in upserted)
+          if (m.albumId != null) m.albumId!,
+      },
+    );
+  }
+
+  /// The page's search update, run in the page's transaction after its
+  /// writes. If the index turns out not to hold what the tables say (FTS5
+  /// raises SQLITE_CORRUPT_VTAB, see [isSearchIndexMismatch]), the partial
+  /// update is undone (it ran in a savepoint) and the three search tables are
+  /// rebuilt in full from the rows just written, so the page is saved and the
+  /// sync goes on. Any other error fails the page as before.
+  Future<void> _updateSearchIndex(
+    PageSearchBefore before,
+    _SyncEffects page,
+  ) async {
+    try {
+      await _db.transaction(
+        () => _db.applySearchDeltaOfPage(
+          before,
+          parentsPruned: page.parentRowsPruned > 0,
+        ),
+      );
+    } on Object catch (e) {
+      if (!isSearchIndexMismatch(e)) rethrow;
+      developer.log(
+        'The search index did not match the library; rebuilt it in full',
+        name: 'SyncService',
+      );
+      await _db.rebuildFtsIndexes();
+    }
   }
 
   /// Applies an ordered change page, grouping consecutive runs of the same
   /// type so upserts and deletes are batched without reordering across a
   /// type boundary (preserving revision order between them).
   Future<void> _applyChanges(
-    List<ChangeEntryDto> changes, {
-    required Set<int> affectedQueueSessionIds,
-    required Set<String> deletedTrackUuids,
-    required Set<int> endedSessionIds,
-    required Set<int> relandedSessionIds,
-    required List<int> cleanupIds,
-  }) async {
+    List<ChangeEntryDto> changes,
+    _SyncEffects effects,
+  ) async {
     var i = 0;
     while (i < changes.length) {
       final type = changes[i].type;
@@ -303,23 +273,18 @@ class SyncService {
       final run = changes.sublist(i, j);
       switch (type) {
         case ChangeEntryType.upsert:
-          await _upsertTracks([for (final e in run) e.track!]);
+          effects.parentRowsPruned +=
+              await _upsertTracks([for (final e in run) e.track!]);
         case ChangeEntryType.delete:
-          await _deleteTracks(
-            [for (final e in run) e.uuidId],
-            affectedQueueSessionIds: affectedQueueSessionIds,
-            deletedTrackUuids: deletedTrackUuids,
-            endedSessionIds: endedSessionIds,
-            relandedSessionIds: relandedSessionIds,
-            cleanupIds: cleanupIds,
-          );
+          await _deleteTracks([for (final e in run) e.uuidId], effects);
       }
       i = j;
     }
   }
 
-  Future<void> _upsertTracks(List<ClientTrackDto> tracks) async {
-    await _db.transaction(() async {
+  /// Returns how many artist and album rows the orphan prune removed.
+  Future<int> _upsertTracks(List<ClientTrackDto> tracks) async {
+    return _db.transaction(() async {
       await _db.batch((batch) {
         // Upsert artists first (parent table)
         for (final dto in tracks) {
@@ -383,62 +348,59 @@ class SyncService {
           );
         }
       });
-      await _pruneOrphanParents();
+      return _pruneOrphanParents();
     });
   }
 
-  Future<void> _pruneOrphanParents() async {
+  /// Returns how many artist and album rows it removed.
+  Future<int> _pruneOrphanParents() async {
     // customUpdate (not customStatement) so the deletes notify the albums/
     // artists stream watchers directly — the reactive browse lists drop the
     // emptied cards without depending on a sibling write to trigger them.
-    await _db.customUpdate(
+    final albumsRemoved = await _db.customUpdate(
       'DELETE FROM albums WHERE NOT EXISTS ('
       'SELECT 1 FROM trackmetadata tm WHERE tm.album_id = albums.id'
       ')',
       updates: {_db.albums},
       updateKind: UpdateKind.delete,
     );
-    await _db.customUpdate(
+    final artistsRemoved = await _db.customUpdate(
       'DELETE FROM artists WHERE NOT EXISTS ('
       'SELECT 1 FROM trackmetadata tm WHERE tm.artist_id = artists.id'
       ')',
       updates: {_db.artists},
       updateKind: UpdateKind.delete,
     );
+    return albumsRemoved + artistsRemoved;
   }
 
   /// Must run inside the caller's fenced transaction. Adds the deleted
   /// tracks' downloaded files to the durable cleanup queue (same transaction,
-  /// before the references are lost) and adds the row ids to [cleanupIds];
-  /// the caller attempts them only after that transaction commits.
-  Future<void> _deleteTracks(
-    List<String> uuids, {
-    required Set<int> affectedQueueSessionIds,
-    required Set<String> deletedTrackUuids,
-    required Set<int> endedSessionIds,
-    required Set<int> relandedSessionIds,
-    required List<int> cleanupIds,
-  }) async {
-    // FKs on trackmetadata.uuid_id → tracks.uuid_id (and queue_session_items)
-    // force child-first deletes. We chunk to keep the IN list bounded — SQLite
-    // accepts thousands of bind vars but huge bursts of deletes are rare and
-    // worth fragmenting for predictability.
+  /// before the references are lost) and adds the row ids to the effects'
+  /// cleanup ids; the caller attempts them only after that transaction
+  /// commits.
+  Future<void> _deleteTracks(List<String> uuids, _SyncEffects effects) async {
+    // Child rows go first (trackmetadata before tracks). The schema declares
+    // those references, but the app never turns SQLite's foreign_keys on, so
+    // nothing enforces the order (see AppDatabase). We chunk to keep the IN
+    // list bounded — SQLite accepts thousands of bind vars but huge bursts of
+    // deletes are rare and worth fragmenting for predictability.
     const chunkSize = 200;
     for (var i = 0; i < uuids.length; i += chunkSize) {
       final chunk = uuids.sublist(
         i,
         i + chunkSize > uuids.length ? uuids.length : i + chunkSize,
       );
-      deletedTrackUuids.addAll(chunk);
+      effects.deletedTrackUuids.addAll(chunk);
       await _db.transaction(() async {
         final queueRemoval = await _queueRepo
             .removeTrackUuidsFromQueuesInTransaction(chunk);
-        affectedQueueSessionIds.addAll(queueRemoval.affectedSessionIds);
-        endedSessionIds
-          ..removeAll(queueRemoval.relandedSessionIds)
-          ..addAll(queueRemoval.endedSessionIds);
-        relandedSessionIds.addAll(queueRemoval.relandedSessionIds);
-        cleanupIds.addAll(
+        effects.affectedQueueSessionIds.addAll(queueRemoval.affectedSessionIds);
+        effects.land(
+          ended: queueRemoval.endedSessionIds,
+          relanded: queueRemoval.relandedSessionIds,
+        );
+        effects.cleanupIds.addAll(
           await _ownedCleanup.enqueueInTransaction(
             await _localFilePathsForTracks(chunk),
             localBindingId: _bindingToken,
@@ -449,30 +411,14 @@ class SyncService {
         )..where((t) => t.uuidId.isIn(chunk))).go();
         await (_db.delete(_db.tracks)..where((t) => t.uuidId.isIn(chunk))).go();
         await _db.rejectUnsentEditsOfDeletedTracks(chunk);
-        await _pruneOrphanParents();
+        effects.parentRowsPruned += await _pruneOrphanParents();
       });
     }
   }
 
   Future<List<String>> _localFilePathsForTracks(List<String> uuids) async {
-    if (uuids.isEmpty) return const [];
-
-    final placeholders = List.filled(uuids.length, '?').join(', ');
-    final rows = await _db
-        .customSelect(
-          'SELECT file_path, damaged_file_path FROM tracks '
-          'WHERE uuid_id IN ($placeholders) '
-          'AND (file_path IS NOT NULL OR damaged_file_path IS NOT NULL)',
-          variables: uuids.map(Variable.withString).toList(),
-        )
-        .get();
-
-    // A kept damaged copy (decision 6) is a local file of the track too.
-    return {
-      for (final row in rows)
-        for (final column in const ['file_path', 'damaged_file_path'])
-          ?row.readNullable<String>(column),
-    }.toList();
+    // Includes a kept damaged copy (decision 6).
+    return _db.ownedTrackFilePaths(uuids: uuids);
   }
 
   /// Best effort after the fenced commit: the rows are durable and the
@@ -487,5 +433,46 @@ class SyncService {
         name: 'SyncService',
       );
     }
+  }
+}
+
+/// What applying catalog changes did: the queue sessions touched, the
+/// deleted tracks, the sessions whose playback must stop or may go on, and
+/// the clean-up rows to attempt after the commit. A page or a refetch
+/// collects into its own; the service merges it into its committed effects
+/// only after the fenced transaction returned.
+class _SyncEffects {
+  final affectedQueueSessionIds = <int>{};
+  final deletedTrackUuids = <String>{};
+
+  /// Sessions whose removed current item was the end of the queue (no wrap).
+  final endedSessionIds = <int>{};
+
+  /// Sessions that landed on an item again after being ended.
+  final relandedSessionIds = <int>{};
+
+  final cleanupIds = <int>[];
+
+  /// Artist and album rows the orphan prune removed: the page's parent search
+  /// indexes must be rebuilt. Not merged into the committed effects.
+  var parentRowsPruned = 0;
+
+  /// The one rule for ended sessions: a session that re-landed is no longer
+  /// ended; one that ended (later) is.
+  void land({required Set<int> ended, required Set<int> relanded}) {
+    endedSessionIds
+      ..removeAll(relanded)
+      ..addAll(ended);
+    relandedSessionIds.addAll(relanded);
+  }
+
+  /// Merges [committed] (a page or a refetch whose transaction committed).
+  void addCommitted(_SyncEffects committed) {
+    affectedQueueSessionIds.addAll(committed.affectedQueueSessionIds);
+    deletedTrackUuids.addAll(committed.deletedTrackUuids);
+    land(
+      ended: committed.endedSessionIds,
+      relanded: committed.relandedSessionIds,
+    );
   }
 }

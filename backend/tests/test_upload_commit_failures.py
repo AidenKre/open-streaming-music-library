@@ -17,11 +17,12 @@ import errno
 
 import pytest
 
-from app.services.metadata import TagWriteError
+from app.services.metadata import TagWriteError, write_metadata_tags
+from tests.tool_call_capture import bound_to
 from app.services import upload_errors
 from app.services.upload_errors import probe_timeout, upload_invalid_audio
 from app.services.upload_validation import ValidationFailed
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_commit_fixtures import (
     FakeArt,
     FakeCoverArt,
@@ -37,11 +38,6 @@ from tests.upload_commit_fixtures import (
     sha,
 )
 from tests.upload_validation_fixtures import BOOT, DEAD_BOOT, detected, item_row
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -349,6 +345,7 @@ def test_a_step_killed_by_a_shutdown_says_so_and_not_that_it_failed(db, music, c
     commit = accept(db, _ready(db, music), edits={"title": "New"}, write_tags=True)
     worker = None
 
+    @bound_to(write_metadata_tags)
     def killed_tag_write(source, dest, tags, **kwargs):
         worker.request_stop()  # shutdown: stop first, then the registry kills the process
         raise TagWriteError("tag write failed")

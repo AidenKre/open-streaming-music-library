@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:frontend/services/session_service.dart'
-    show ServerBlockedReason, SignInNotSavedFailure;
+    show ResetIncompleteNotice, ServerBlockedReason, SignInNotSavedFailure;
 import 'package:flutter/foundation.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/logout_losses.dart';
@@ -23,7 +23,12 @@ class FakeSessionControls extends ChangeNotifier implements SessionControls {
   String? get signInNotSavedNotice =>
       SignInNotSavedFailure.noticeFor(resetFailure);
   @override
+  String? get resetIncompleteMessage =>
+      ResetIncompleteNotice.messageFor(resetFailure);
+  @override
   bool launchFailed = false;
+  @override
+  bool databaseRefused = false;
   @override
   String? pendingServerSwitch;
   List<String> lossSummaries = const [];
@@ -73,7 +78,14 @@ class FakeSessionControls extends ChangeNotifier implements SessionControls {
   }
 
   @override
-  Future<List<String>> pendingLossSummaries() async => lossSummaries;
+  Future<List<String>> pendingLossSummaries() async {
+    lossSummaryReads++;
+    return lossSummariesGate?.future ?? lossSummaries;
+  }
+
+  /// When set, the loss lines answer only once the test completes it.
+  Completer<List<String>>? lossSummariesGate;
+  int lossSummaryReads = 0;
 
   /// What a log-out would drop; nothing by default.
   LogoutLosses logoutLosses = const LogoutLosses(

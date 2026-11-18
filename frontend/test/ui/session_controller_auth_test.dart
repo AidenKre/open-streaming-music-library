@@ -4,33 +4,20 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/session_service.dart';
 import 'package:frontend/ui/session_controller.dart';
 
-class _FakeService extends SessionService {
-  _FakeService(super.ref);
-  SessionStart start = const SessionStart(SessionStartKind.serverAddress);
-  int starts = 0;
-  String? connectTo;
-  @override
-  Future<ConnectOutcome> connect(String url) async => ConnectSucceeded(url);
-  @override
-  Future<SessionStart> resumeSavedSession() async {
-    starts++;
-    return start;
-  }
-}
+import '../helpers/fake_session_service.dart';
 
 void main() {
-  late _FakeService service;
+  late FakeSessionService service;
   late ProviderContainer c;
 
   setUp(() {
     c = ProviderContainer(
       overrides: [
         sessionServiceProvider.overrideWith(
-          (ref) => service = _FakeService(ref),
+          (ref) => service = FakeSessionService(),
         ),
       ],
     );
@@ -66,7 +53,6 @@ void main() {
   });
 
   test('a successful connect opens Log in for the saved URL', () async {
-    service.connectTo = 'http://new';
     await session().start();
     await session().connect('http://new');
     expect(session().phase, SessionPhase.logIn);
@@ -83,77 +69,17 @@ void main() {
   signInGroup();
 }
 
-
-class _SignInService extends SessionService {
-  _SignInService(super.ref);
-  SignInOutcome outcome = const SignInSucceeded();
-  final calls = <String>[];
-  Completer<void>? resetGate;
-  LocalResetException? resetFailure;
-  @override
-  Future<SessionStart> resumeSavedSession() async =>
-      const SessionStart(SessionStartKind.logIn, serverUrl: 'http://s');
-  Completer<void>? signInGate;
-  Completer<void>? logoutGate;
-  @override
-  Future<SignInOutcome> login(String username, String password) async {
-    calls.add('login $username');
-    await signInGate?.future;
-    return outcome;
-  }
-
-  @override
-  Future<SignInOutcome> register(String username, String password) async {
-    calls.add('register $username');
-    return outcome;
-  }
-
-  @override
-  Future<LocalResetException?> confirmPendingSignIn() async {
-    calls.add('confirmPendingSignIn');
-    await resetGate?.future;
-    return resetFailure;
-  }
-
-  @override
-  Future<void> cancelPendingSignIn() async => calls.add('cancelPendingSignIn');
-
-  @override
-  Future<LocalResetException?> resetForNewServer(String url) async {
-    calls.add('resetForNewServer $url');
-    return null;
-  }
-
-  Object? logoutError;
-  @override
-  Future<void> logout({bool keepUnsent = false}) async {
-    calls.add(keepUnsent ? 'logout keep' : 'logout');
-    await logoutGate?.future;
-    if (logoutError != null) throw logoutError!;
-  }
-
-  @override
-  Future<void> reloadSession() async => calls.add('reloadSession');
-
-  @override
-  Future<void> forgetStoredSignIn() async => calls.add('forgetStoredSignIn');
-
-  @override
-  Future<LocalResetException?> resetLocalData() async {
-    calls.add('resetLocalData');
-    return null;
-  }
-}
-
 void signInGroup() {
   group('sign-in input (SessionControls over SessionService)', () {
-    late _SignInService service;
+    late FakeSessionService service;
     late ProviderContainer c;
 
     setUp(() async {
       c = ProviderContainer(overrides: [
         sessionServiceProvider
-            .overrideWith((ref) => service = _SignInService(ref)),
+            .overrideWith((ref) => service = FakeSessionService(
+                start: const SessionStart(SessionStartKind.logIn,
+                    serverUrl: 'http://s'))),
       ]);
       c.read(sessionServiceProvider);
       await c.read(sessionControlsProvider).start();
@@ -170,6 +96,26 @@ void signInGroup() {
       expect(session().authError, 'Wrong username or password.');
       expect(session().phase, SessionPhase.logIn);
     });
+
+    // Pre-merge review A5-03: a sign-in that throws ends the attempt with
+    // a sentence; the next attempt runs.
+    for (final register in [false, true]) {
+      test('a ${register ? 'register' : 'login'} that throws ends the attempt '
+          'with a sentence; the next attempt runs', () async {
+        if (register) session().showCreateAccount();
+        service.signInThrows = StateError('database is locked');
+        Future<void> attempt() => register
+            ? session().register('sam', '12345678', '12345678')
+            : session().login('sam', 'secret-pw');
+        await attempt();
+        expect(session().authError, 'Could not sign in.');
+        service.signInThrows = null;
+        service.outcome = const SignInFailed('Wrong username or password.');
+        await attempt();
+        expect(service.calls, hasLength(2));
+        expect(session().authError, 'Wrong username or password.');
+      });
+    }
 
     test('blank fields are refused before the model is asked', () async {
       await session().login('', 'secret-pw');

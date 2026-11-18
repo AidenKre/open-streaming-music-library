@@ -11,7 +11,8 @@ import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
+from tests.recovery_steps import capture_steps, named
 from tests.upload_commit_fixtures import journal
 from tests.upload_publish_fixtures import track_row
 from tests.upload_recovery_fixtures import World, art_ids
@@ -20,11 +21,6 @@ from tests.upload_validation_fixtures import item_row
 # Every boundary after which a prepared/moved journal exists and nothing is inserted.
 RESUME_POINTS = ["after_prepared_journal", "before_link", "after_link", "after_moved_journal",
                  "after_work_unlink", "before_insert_commit"]
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture
@@ -126,29 +122,17 @@ def test_the_step_skips_a_journal_of_another_state_and_survives_a_bad_row(world,
 
 # ---- the registry step (app level) ----
 
-def _capture_steps(main, monkeypatch):
-    captured = []
-    real = main.run_startup_recovery
-
-    def capture(steps):
-        captured.append(list(steps))
-        return real(steps)
-
-    monkeypatch.setattr(main, "run_startup_recovery", capture)
-    return captured
-
-
 def test_the_journal_step_is_non_fatal_after_the_identity_reconcile_and_before_job_reclaim(
     configure_app, monkeypatch
 ):
     main = configure_app()
-    captured = _capture_steps(main, monkeypatch)
+    captured = capture_steps(main, monkeypatch)
 
     with TestClient(main.app):
         pass
 
     [steps] = captured
-    names = [(s.name, s.fatal) for s in steps]
+    names = named(steps)
     at = names.index(("upload commit journal", False))
     assert names[at - 1] == ("audio identity", True)
     # 8A.3d: the deletion journal follows it, then the receipts.

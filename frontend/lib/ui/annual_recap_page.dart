@@ -7,6 +7,7 @@ import 'package:frontend/ui/annual_recap_controller.dart';
 import 'package:frontend/ui/annual_recap_export_image.dart';
 import 'package:frontend/ui/listening_stats/listening_stats_format.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 
 /// Year in music (spec §6): one UTC year's recap snapshot, reached from
 /// Listening stats.
@@ -190,16 +191,13 @@ class _AnnualRecapPageState extends ConsumerState<AnnualRecapPage> {
       _yearPicker(),
       if (_controls.loading)
         const Center(child: CircularProgressIndicator())
-      else if (_controls.failed) ...[
-        const Text('Could not load your Year in music'),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton(
-            onPressed: _controls.retry,
-            child: const Text('Retry'),
-          ),
-        ),
-      ] else if (recap != null)
+      else if (_controls.failed)
+        LoadFailureNotice(
+          message: 'Could not load your Year in music',
+          onRetry: _controls.retry,
+          padForChrome: false,
+        )
+      else if (recap != null)
         ..._recapBody(context, recap),
     ];
   }
@@ -260,7 +258,7 @@ class _AnnualRecapPageState extends ConsumerState<AnnualRecapPage> {
           _tile('recap.active_days', 'Active days', '${recap.totals.activeDays}'),
           _tile(
             'recap.unavailable',
-            'Unavailable history',
+            'Deleted or unknown tracks',
             formatListeningTime(recap.unavailable.listeningSeconds),
           ),
           if (busiest != null)

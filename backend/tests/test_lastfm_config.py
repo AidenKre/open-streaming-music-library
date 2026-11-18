@@ -439,6 +439,40 @@ def test_a_key_or_secret_that_is_not_utf8_names_the_setting(settings_from_env, n
     assert "UTF-8" in result.problem
 
 
+# Pre-merge C1-04: a key or secret with white space at either end could never
+# sign a request (every call would fail with error 13), so it is refused at
+# start-up, naming the setting, never the value; never stripped silently.
+_PADDED = {
+    "trailing-space": lambda v: v + " ",
+    "leading-tab": lambda v: "\t" + v,
+    "trailing-newline": lambda v: v + "\n",
+}
+
+
+@pytest.mark.parametrize("pad", list(_PADDED), ids=list(_PADDED))
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("LASTFM_API_SECRET", planted.API_SECRET), ("LASTFM_API_KEY", planted.API_KEY[:-1])],
+    ids=["secret", "key"],  # never print the values
+)
+def test_a_key_or_secret_with_white_space_at_either_end_names_the_setting(settings_from_env, pad, name, value):
+    padded = _PADDED[pad](value)
+    result = resolve_lastfm_config(settings_from_env(valid_env(**{name: padded})))
+    _assert_invalid(result, name, padded)
+    assert result.problem == "must not start or end with white space"
+
+
+@pytest.mark.parametrize("name", ["LASTFM_API_SECRET", "LASTFM_API_KEY"])
+def test_a_secret_file_with_white_space_after_its_line_names_the_file_setting(settings_from_env, tmp_path, name):
+    # one final newline is the file's own line ending; anything more is part of the value
+    path = _secret_file(tmp_path, name, (_SECRETS[name][:31 if name == "LASTFM_API_KEY" else None] + " \n").encode())
+    env = valid_env(**{f"{name}_FILE": str(path)})
+    del env[name]
+    result = resolve_lastfm_config(settings_from_env(env))
+    _assert_invalid(result, f"{name}_FILE", _SECRETS[name])
+    assert result.problem == "must not start or end with white space"
+
+
 # ── signoff-9-lastfm-app-name (DEV-9-06; spec §7.5): LASTFM_APP_NAME ────────
 # The name the operator registered on last.fm, for the consent screen. Optional
 # and not a secret: trimmed; blank or unset means "not provided" (None); more

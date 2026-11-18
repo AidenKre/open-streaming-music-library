@@ -8,7 +8,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/models/browse_filters.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -21,46 +20,8 @@ import 'package:frontend/ui/home/home_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 
+import '../../helpers/fake_home_controls.dart';
 import '../browse_harness.dart';
-
-class FakeHomeControls extends ChangeNotifier implements HomeControls {
-  FakeHomeControls(this._recents);
-
-  HomeRecentsState _recents;
-  BrowseFilters _filters = const BrowseFilters(
-    policy: OfflineFilterPolicy.manual,
-  );
-  final chipTaps = <bool>[];
-  final played = <String>[];
-  int retries = 0;
-
-  set recentsState(HomeRecentsState value) {
-    _recents = value;
-    notifyListeners();
-  }
-
-  @override
-  HomeRecentsState get recents => _recents;
-
-  @override
-  BrowseFilters get filters => _filters;
-
-  @override
-  void setDownloaded(bool value) {
-    chipTaps.add(value);
-    _filters = _filters.userSetDownloaded(value);
-    notifyListeners();
-  }
-
-  @override
-  void retryRecents() => retries++;
-
-  @override
-  Future<PlaybackOutcome> playTrack(TrackUI track) async {
-    played.add(track.uuidId);
-    return const Accepted(1);
-  }
-}
 
 TrackUI _track(String uuid) => TrackUI(
   uuidId: uuid,
@@ -101,13 +62,18 @@ void main() {
     await db.close();
   });
 
-  Future<void> pumpHome(WidgetTester tester, FakeHomeControls fake) async {
+  /// [inScaffold]: inside a Scaffold, as in the shell, so a notice shows.
+  Future<void> pumpHome(
+    WidgetTester tester,
+    FakeHomeControls fake, {
+    bool inScaffold = false,
+  }) async {
     tester.view.physicalSize = const Size(800, 1600);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     await tester.pumpWidget(
       harness.wrap(
-        const HomePage(),
+        inScaffold ? const Scaffold(body: HomePage()) : const HomePage(),
         overrides: [homeControlsProvider.overrideWithValue(fake)],
       ),
     );
@@ -206,6 +172,23 @@ void main() {
       await tester.tap(find.text('Song b'));
       await tester.pump();
       expect(fake.played, ['b']);
+      await teardownTree(tester);
+    });
+
+    // Owner decision 5 (2026-11-17), APP-OTHER-1 D5: a track tap whose
+    // playback does not start shows the playback message as a notice.
+    testWidgets('a track tap that does not start playback says so', (
+      tester,
+    ) async {
+      final fake = FakeHomeControls(HomeRecentsReady(_tracks(['a', 'b'])))
+        ..playOutcome = Failed(StateError('x'));
+      await pumpHome(tester, fake, inScaffold: true);
+      expect(find.text("Couldn't start playback."), findsNothing);
+      await tester.tap(find.text('Song b'));
+      await tester.pump();
+      await tester.pump();
+      expect(fake.played, ['b']);
+      expect(find.text("Couldn't start playback."), findsOneWidget);
       await teardownTree(tester);
     });
 

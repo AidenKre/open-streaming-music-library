@@ -13,6 +13,7 @@
 //    no menu; the page prompts a refresh.
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/repositories/history_snapshot.dart';
 import 'package:frontend/ui/listening_stats/listening_stats_controller.dart';
 
@@ -92,6 +93,21 @@ void main() {
     await teardownTree(tester);
   });
 
+  // Owner decision 5 (2026-11-17), APP-OTHER-1 D5: a track tap whose
+  // playback does not start shows the playback message as a notice.
+  testWidgets('a track tap that does not start playback says so', (
+    tester,
+  ) async {
+    h.fake.playOutcome = Failed(StateError('x'));
+    await h.open(tester, lists());
+    expect(find.text("Couldn't start playback."), findsNothing);
+    await tester.tap(inCard('track:t-b', 'Same'));
+    await tester.pumpAndSettle();
+    expect(h.fake.played, ['t-b']);
+    expect(find.text("Couldn't start playback."), findsOneWidget);
+    await teardownTree(tester);
+  });
+
   testWidgets('an album tap opens the album', (tester) async {
     await h.open(tester, lists());
     await tester.tap(inCard('album:10', 'One'));
@@ -158,7 +174,7 @@ void main() {
     await h.open(tester, lists(tAUnavailable: true));
     h.fake.show(h.fake.state, notice: SnapshotStaleness.historyChanged);
     await tester.pumpAndSettle();
-    expect(find.text('Listening history changed'), findsOneWidget);
+    expect(find.text('This page is out of date.'), findsOneWidget);
     expect(find.text('Some items are no longer available'), findsNothing);
     await teardownTree(tester);
   });

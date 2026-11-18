@@ -12,7 +12,7 @@ import zipfile
 
 import pytest
 
-from tests.identity_worker_fixtures import make_db, sql
+from tests.identity_worker_fixtures import sql
 from tests.upload_validation_fixtures import item_row, source_rows
 from tests.upload_zip_fixtures import (
     Entry, FailingFiles, children_of, corrupt_local_name, corrupt_member_data, files_under,
@@ -21,11 +21,6 @@ from tests.upload_zip_fixtures import (
 
 ONE, TWO = "one-secret.flac", "two-secret.flac"
 DATA = bytes(range(60))
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -25,6 +25,8 @@ class FakeDeletionReviewControls extends ChangeNotifier
   bool canConfirm = true;
   @override
   String? submittedOperation;
+  @override
+  bool nothingToReview = false;
 
   final calls = <String>[];
 
@@ -49,10 +51,6 @@ class FakeDeletionReviewControls extends ChangeNotifier
   @override
   Future<void> removeTarget(String uuid) async =>
       calls.add('removeTarget $uuid');
-
-  @override
-  bool typedCountAccepted(String typed) =>
-      preview != null && typedCountMatches(typed, preview!.count);
 
   @override
   Future<bool> confirm(
@@ -100,6 +98,8 @@ class FakeManageLibraryControls extends ChangeNotifier
   List<DeleteJobView> jobs = const [];
   @override
   ReceiptsLoad receiptsLoad = ReceiptsLoad.idle;
+  @override
+  String receiptsUnreachableText = 'Deletion history needs a connection.';
   @override
   List<ReceiptView> receipts = const [];
   @override

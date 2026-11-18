@@ -14,20 +14,23 @@ staged copy that is a regular file (F5).
 
 import errno
 import fcntl
-import os
 import sys
 from pathlib import Path
 
 import pytest
 
-import tests.test_conversion as conv
+import tests.conversion_fixtures as conv
 from app.core import durable_fs
 from app.services.track_edit import WriteMode
 from app.services.track_editor import MasterWriteError, reconcile_journal
-from tests.test_identity_editor import _editor, _world
-from tests.test_track_editor import _add_track, _db, _lib
+from tests.identity_editor_fixtures import _editor, _world
+from tests.track_editor_fixtures import _add_track, _db, _lib
 
-_WRITERS = ("app.services.track_editor", "app.services.conversion")
+# The modules that flush a staged copy: the two writers, and the recovery that
+# replays one (``journal_recovery.replay_staged_copy``).
+_WRITERS = (
+    "app.services.track_editor", "app.services.conversion", "app.services.journal_recovery",
+)
 
 
 def _spy(monkeypatch, probe, fail=False):

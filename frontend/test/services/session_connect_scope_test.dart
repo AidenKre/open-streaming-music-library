@@ -1,9 +1,9 @@
 // Phase M §7.2 (M-U19 scope): the scope's client is immutable, so calls for
 // a URL that is not the session's yet (connect's health check, the gate's
 // /app/info probe for it) go through a pre-session client for that URL, the
-// probe takes the URL explicitly, and a successful connect saves the URL and
-// then rebuilds the scope (`onSessionChanged`) so the new scope's client
-// carries it.
+// probe takes the URL explicitly, and a successful connect saves the URL
+// without rebuilding the scope: Log in follows in the same scope, and the
+// login's rebuild gives the new scope a client for that URL.
 import 'dart:async';
 
 import 'package:drift/native.dart';

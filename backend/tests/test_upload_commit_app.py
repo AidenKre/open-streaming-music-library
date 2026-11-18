@@ -17,17 +17,11 @@ from app.services import identity_worker as identity_worker_mod
 from app.services import upload_commit as upload_commit_mod
 from app.services.upload_commit import UploadCommitWorker
 from app.services.upload_limits import effective_upload_limits
-from tests.identity_worker_fixtures import make_db
-from tests.test_identity_worker_app import _lock_is_held
+from tests.worker_app_fixtures import _lock_is_held
 from tests.upload_commit_fixtures import accept, journal, make_commit_worker, ready_item
 
 WAIT_S = 10  # an upper bound only; every wait ends on an event
 ON = {"ENABLE_UPLOAD_COMMIT_WORKER": "true"}
-
-
-@pytest.fixture
-def db(tmp_path):
-    return make_db(tmp_path)
 
 
 @pytest.fixture

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:drift/drift.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:drift/native.dart';
@@ -21,6 +23,7 @@ import 'package:frontend/ui/widgets/track_tile.dart';
 
 import 'fake_player_controls.dart';
 import '../helpers/server_binding.dart';
+import '../helpers/test_offline.dart';
 
 void main() {
   late AppDatabase db;
@@ -72,6 +75,314 @@ void main() {
     expect(find.text('Track A'), findsOneWidget);
     expect(failingRepo.pageReads, 2);
     await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  // Other-issues row 69: a failed read with rows on screen said nothing.
+  testWidgets('a failed queue read with rows on screen shows the error and '
+      'Retry above the rows', (tester) async {
+    await _seedQueueTracks(db, ['a', 'b', 'c']);
+    final sessionId = await repo.createSessionFromExplicitList(
+      sourceType: 'test', trackUuids: const ['a', 'b', 'c'],
+    );
+    final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+    final failingRepo = _FailNextPageQueueRepository(db);
+    final notifier = _MutableTestQueuePlayer(_audioStateFor(
+      sessionId: sessionId,
+      currentItemId: snapshot.currentItem!.itemId,
+      currentPlayPosition: 0,
+      totalCount: 3,
+      currentTrack: _track('a'),
+    ));
+    final container = ProviderContainer(overrides: [
+      databaseProvider.overrideWithValue(db),
+      coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
+      queueRepositoryProvider.overrideWithValue(failingRepo),
+      playerControlsProvider.overrideWithValue(FakePlayerControls()),
+      queuePlayerProvider.overrideWith(() => notifier),
+    ]);
+    addTearDown(container.dispose);
+    await tester.pumpWidget(UncontrolledProviderScope(
+      container: container,
+      child: const MaterialApp(home: Scaffold(body: FullPlayer())),
+    ));
+    await tester.tap(find.text('Queue'));
+    await tester.pumpAndSettle();
+    expect(find.text('Track B'), findsOneWidget);
+    expect(find.text('Error loading queue'), findsNothing);
+
+    // A queue edit re-reads the visible rows; that read fails.
+    failingRepo.failNextPage = true;
+    notifier.setQueueState(notifier.state.queue
+        .copyWith(queueVersion: notifier.state.queue.queueVersion + 1));
+    await tester.pumpAndSettle();
+    expect(find.text('Error loading queue'), findsOneWidget);
+    expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('Track B'), findsOneWidget, reason: 'the rows stay');
+    expect(
+        tester.getTopLeft(find.text('Error loading queue')).dy,
+        lessThan(tester.getTopLeft(find.text('Track A')).dy),
+        reason: 'above the rows');
+
+    await tester.tap(find.text('Retry'));
+    await tester.pumpAndSettle();
+    expect(find.text('Error loading queue'), findsNothing);
+    expect(find.text('Track C'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  // Pre-merge R2-L-01 (second live run): the open Queue tab lost the playing
+  // track in a burst of skips. It scrolled to the playing track only when a
+  // load of new rows completed, and such a load starts when the playing track
+  // first leaves the loaded rows: in the middle of a burst, or never.
+  group('the open Queue tab keeps the playing row in view through a burst of '
+      'skips', () {
+    late _HeldPageQueueRepository pages;
+    late _MutableTestQueuePlayer notifier;
+    late List<QueuePlaybackEntry> entries;
+
+    /// Opens the Queue tab on 160 tracks, the first one playing: rows 1 to
+    /// 101 are loaded (the playing one and 60 after it; none before).
+    Future<ScrollPosition> openLongQueue(WidgetTester tester) async {
+      final uuids = [
+        for (var i = 0; i < 160; i++) 't${i.toString().padLeft(3, '0')}',
+      ];
+      await _seedQueueTracks(db, uuids);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'test', trackUuids: uuids,
+      );
+      entries = await repo.getPlaybackEntries(sessionId);
+      pages = _HeldPageQueueRepository(db);
+      notifier = _MutableTestQueuePlayer(_audioStateFor(
+        sessionId: sessionId,
+        currentItemId: entries[0].itemId,
+        currentPlayPosition: 0,
+        totalCount: 160,
+        currentTrack: _track('t000'),
+      ));
+      final container = ProviderContainer(overrides: [
+        databaseProvider.overrideWithValue(db),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
+        queueRepositoryProvider.overrideWithValue(pages),
+        playerControlsProvider.overrideWithValue(FakePlayerControls()),
+        queuePlayerProvider.overrideWith(() => notifier),
+      ]);
+      addTearDown(container.dispose);
+      await tester.pumpWidget(UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: Scaffold(body: FullPlayer())),
+      ));
+      await tester.tap(find.text('Queue'));
+      await tester.pumpAndSettle();
+      expect(playingRowShown(), isTrue, reason: 'precondition: at open');
+      return tester
+          .state<ScrollableState>(find.descendant(
+              of: find.byKey(const ValueKey('queue rows')),
+              matching: find.byType(Scrollable)))
+          .position;
+    }
+
+    /// One skip: the playing track becomes the one at [playPosition]; a frame
+    /// 40 ms later (the live driver's pace).
+    Future<void> skipTo(WidgetTester tester, int playPosition) async {
+      notifier.setQueueState(notifier.state.queue.copyWith(
+          currentItemId: entries[playPosition].itemId,
+          currentPlayPosition: playPosition));
+      await tester.pump(const Duration(milliseconds: 40));
+    }
+
+    testWidgets('70 skips inside the loaded rows: the playing row stays in '
+        'view, with no read at all', (tester) async {
+      await openLongQueue(tester);
+      final readsAtOpen = pages.pageReads;
+      for (var p = 1; p <= 70; p++) {
+        await skipTo(tester, p);
+      }
+      await tester.pumpAndSettle();
+      expect(playingRowShown(), isTrue,
+          reason: 'track 71 plays: its row is on screen');
+      expect(find.text('Track T070'), findsOneWidget);
+      expect(pages.pageReads - readsAtOpen, 0, reason: 'no read per skip');
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+
+    testWidgets('a burst of 65 skips past the rows loaded at open: the '
+        'playing row is in view when it settles, and the burst costs one '
+        'read, not one per skip', (tester) async {
+      await openLongQueue(tester);
+      for (var p = 1; p <= 70; p++) {
+        await skipTo(tester, p);
+      }
+      final readsBefore = pages.pageReads;
+      for (var p = 71; p <= 135; p++) {
+        await skipTo(tester, p);
+      }
+      await tester.pumpAndSettle();
+      expect(find.text('Track T135'), findsOneWidget,
+          reason: 'the rows around the playing track are loaded and built');
+      expect(playingRowShown(), isTrue,
+          reason: 'track 136 plays: its row is on screen');
+      expect(pages.pageReads - readsBefore, 1);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+
+    testWidgets('the same burst with a slow read: skips keep arriving while '
+        'it is in flight and after it completes; the playing row is in view '
+        'when the burst settles', (tester) async {
+      await openLongQueue(tester);
+      for (var p = 1; p <= 70; p++) {
+        await skipTo(tester, p);
+      }
+      final readsBefore = pages.pageReads;
+      // The next read is held while the playing track passes the last
+      // loaded row (the 101st) and nine more skips arrive; it completes in
+      // the middle of the burst.
+      final held = pages.hold = Completer<void>();
+      for (var p = 71; p <= 110; p++) {
+        await skipTo(tester, p);
+      }
+      expect(held.isCompleted, isFalse);
+      expect(pages.hold == null, isTrue,
+          reason: 'precondition: a read is in flight');
+      held.complete();
+      for (var p = 111; p <= 135; p++) {
+        await skipTo(tester, p);
+      }
+      await tester.pumpAndSettle();
+      expect(find.text('Track T135'), findsOneWidget,
+          reason: 'the rows around the playing track are loaded and built');
+      expect(playingRowShown(), isTrue,
+          reason: 'track 136 plays: its row is on screen');
+      expect(pages.pageReads - readsBefore, lessThanOrEqualTo(2),
+          reason: 'the held read and at most one load around the playing '
+              'track; never one per skip');
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+
+    // Review finding 2: the jump after rows were added above the list used
+    // the scroll offset from before the read, undoing a follow made since.
+    testWidgets('a burst of Previous towards the first loaded rows with a '
+        'slow read of the rows above: the playing row is in view when the '
+        'burst settles', (tester) async {
+      final position = await openLongQueue(tester);
+      // Far down first: rows 91 to 160 are loaded around track 131.
+      await skipTo(tester, 130);
+      await tester.pumpAndSettle();
+      expect(playingRowShown(), isTrue, reason: 'precondition');
+      final readsBefore = pages.pageReads;
+      final extentBefore = position.maxScrollExtent;
+      // The read of the rows above (started when the list nears its top) is
+      // held while more skips arrive, down to the first loaded row.
+      final held = pages.hold = Completer<void>();
+      for (var p = 129; p >= 90; p--) {
+        await skipTo(tester, p);
+      }
+      expect(pages.pageReads - readsBefore, 1,
+          reason: 'precondition: only the read of the rows above, in flight');
+      expect(playingRowShown(), isTrue, reason: 'followed up to here');
+      held.complete();
+      await tester.pumpAndSettle();
+      expect(playingRowShown(), isTrue,
+          reason: 'track 91 plays: its row is on screen');
+      expect(position.maxScrollExtent, greaterThan(extentBefore + 1000),
+          reason: 'with the rows read meanwhile above it');
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+
+    testWidgets('a person who scrolled the playing row out of view is left '
+        'where they are: skips inside the loaded rows move nothing',
+        (tester) async {
+      final position = await openLongQueue(tester);
+      position.jumpTo(2600); // reading rows around the 40th
+      await tester.pumpAndSettle();
+      expect(playingRowShown(), isFalse, reason: 'precondition');
+      final readsBefore = pages.pageReads;
+      for (var p = 1; p <= 20; p++) {
+        await skipTo(tester, p);
+      }
+      await tester.pumpAndSettle();
+      expect(position.pixels, 2600, reason: 'no jump while reading the list');
+      expect(pages.pageReads - readsBefore, 0);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+  });
+
+  // Pre-merge D4-01: one failed page read far down a long queue.
+  group('a failed read of later rows in a long queue', () {
+    /// How far the list scrolls with only the first window loaded.
+    late double firstWindowExtent;
+
+    /// Opens the Queue tab on 200 tracks (the first window is rows 0 to 60),
+    /// scrolls to its end with the next page read failing, and returns the
+    /// list's scroll position with the notice on screen.
+    Future<ScrollPosition> scrolledToFailedPage(WidgetTester tester) async {
+      final uuids = [
+        for (var i = 0; i < 200; i++) 't${i.toString().padLeft(3, '0')}',
+      ];
+      await _seedQueueTracks(db, uuids);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'test', trackUuids: uuids,
+      );
+      final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+      final failingRepo = _FailNextPageQueueRepository(db);
+      final container = ProviderContainer(overrides: [
+        databaseProvider.overrideWithValue(db),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
+        queueRepositoryProvider.overrideWithValue(failingRepo),
+        playerControlsProvider.overrideWithValue(FakePlayerControls()),
+        queuePlayerProvider.overrideWith(() => _TestQueuePlayer(_audioStateFor(
+          sessionId: sessionId,
+          currentItemId: snapshot.currentItem!.itemId,
+          currentPlayPosition: 0,
+          totalCount: 200,
+          currentTrack: _track('t000'),
+        ))),
+      ]);
+      addTearDown(container.dispose);
+      await tester.pumpWidget(UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: Scaffold(body: FullPlayer())),
+      ));
+      await tester.tap(find.text('Queue'));
+      await tester.pumpAndSettle();
+      final position = tester
+          .state<ScrollableState>(find.descendant(
+              of: find.byKey(const ValueKey('queue rows')),
+              matching: find.byType(Scrollable)))
+          .position;
+      firstWindowExtent = position.maxScrollExtent;
+      failingRepo.failNextPage = true;
+      position.jumpTo(position.maxScrollExtent);
+      await tester.pumpAndSettle();
+      expect(find.text('Error loading queue'), findsOneWidget);
+      return position;
+    }
+
+    testWidgets('scrolling on, the read succeeds: the rows load and the '
+        'error goes away', (tester) async {
+      final position = await scrolledToFailedPage(tester);
+      position.jumpTo(position.maxScrollExtent - 5);
+      await tester.pumpAndSettle();
+      expect(position.maxScrollExtent, greaterThan(firstWindowExtent + 1000),
+          reason: 'the next rows loaded');
+      expect(find.text('Error loading queue'), findsNothing);
+      expect(find.text('Retry'), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+
+    testWidgets('Retry reads the rows that failed and keeps the place in the '
+        'list', (tester) async {
+      final position = await scrolledToFailedPage(tester);
+      final place = position.pixels;
+      expect(place, greaterThan(1000), reason: 'precondition: far down');
+      await tester.tap(find.text('Retry'));
+      await tester.pumpAndSettle();
+      expect(find.text('Error loading queue'), findsNothing);
+      expect(position.maxScrollExtent, greaterThan(firstWindowExtent + 1000),
+          reason: 'the rows that failed are loaded');
+      expect(position.pixels, closeTo(place, 1),
+          reason: 'no jump back to the current track');
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
   });
 
   testWidgets(
@@ -256,7 +567,7 @@ void main() {
         overrides: [
           databaseProvider.overrideWithValue(db),
           coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
-          offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+          offlineModeProvider.overrideWith(() => TestOffline(offline)),
           queuePlayerProvider.overrideWith(
             () => _TestQueuePlayer(
               _audioStateFor(
@@ -578,18 +889,6 @@ TrackUI _track(String uuidId) {
   );
 }
 
-/// Forces [offlineModeProvider] to a fixed value without starting the real
-/// health-poll timer.
-class _StubOffline extends OfflineModeNotifier {
-  _StubOffline(this._value);
-  final bool _value;
-  @override
-  bool build() {
-    super.build();
-    return _value;
-  }
-}
-
 class _FailOnceQueueRepository extends QueueRepository {
   _FailOnceQueueRepository(super.db);
   int pageReads = 0;
@@ -600,6 +899,53 @@ class _FailOnceQueueRepository extends QueueRepository {
     required int limit,
   }) {
     if (++pageReads == 1) return Future.error(StateError('temporary read failure'));
+    return super.getSessionTracksPage(sessionId,
+        startPlayPosition: startPlayPosition, limit: limit);
+  }
+}
+
+class _FailNextPageQueueRepository extends QueueRepository {
+  _FailNextPageQueueRepository(super.db);
+  bool failNextPage = false;
+
+  @override
+  Future<List<QueueTrackEntry>> getSessionTracksPage(int sessionId, {
+    required int startPlayPosition,
+    required int limit,
+  }) {
+    if (failNextPage) {
+      failNextPage = false;
+      return Future.error(StateError('temporary read failure'));
+    }
+    return super.getSessionTracksPage(sessionId,
+        startPlayPosition: startPlayPosition, limit: limit);
+  }
+}
+
+/// Whether the playing track's row (the highlighted one) is on screen.
+bool playingRowShown() => find
+    .byWidgetPredicate((w) => w is TrackTile && w.isHighlighted)
+    .hitTestable()
+    .evaluate()
+    .isNotEmpty;
+
+/// Counts the page reads; with [hold] set, the next one waits for it.
+class _HeldPageQueueRepository extends QueueRepository {
+  _HeldPageQueueRepository(super.db);
+  int pageReads = 0;
+  Completer<void>? hold;
+
+  @override
+  Future<List<QueueTrackEntry>> getSessionTracksPage(int sessionId, {
+    required int startPlayPosition,
+    required int limit,
+  }) async {
+    pageReads++;
+    final held = hold;
+    if (held != null) {
+      hold = null;
+      await held.future;
+    }
     return super.getSessionTracksPage(sessionId,
         startPlayPosition: startPlayPosition, limit: limit);
   }

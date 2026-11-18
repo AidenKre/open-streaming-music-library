@@ -72,7 +72,7 @@ class _DeleteJobsPageState extends State<DeleteJobsPage> {
                 ),
               ],
               if (load == ReceiptsLoad.needsConnection) ...[
-                const Text('Deletion history needs a connection.'),
+                Text(controls.receiptsUnreachableText),
                 Align(
                   alignment: Alignment.centerLeft,
                   child: TextButton(

@@ -4,6 +4,7 @@ let it through. Injected clocks only; the fake Last.fm never opens a socket."""
 
 import pytest
 
+from tests.crash import Crash
 from tests.lastfm_fake import ok_scrobbles, scrobble_result
 from tests.lastfm_sender_rig import (
     NOW_S,
@@ -300,10 +301,6 @@ def test_a_stopped_server_sends_nothing(rig):
 
 
 # --- restart ----------------------------------------------------------------------------------
-
-
-class Crash(BaseException):
-    """The process dies after the request left and before its answer is recorded."""
 
 
 def test_a_crash_between_sending_and_recording_leaves_the_rows_pending_and_the_next_start_resends(rig):

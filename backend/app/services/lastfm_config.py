@@ -68,6 +68,8 @@ def _check_secret(name: str, value: str) -> str | None:
             value.encode("utf-8")
         except UnicodeEncodeError:
             return "is not valid UTF-8 text"
+        if value != value.strip():
+            return "must not start or end with white space"
     if name == "LASTFM_API_KEY":
         return None if len(value) == 32 else "must be 32 characters"
     if name == "LASTFM_API_SECRET":

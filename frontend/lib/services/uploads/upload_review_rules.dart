@@ -2,11 +2,16 @@
 // review advances, and when newly ready items are announced. No I/O; nothing
 // from ui/.
 import 'package:frontend/models/dto/upload_dtos.dart';
+import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/services/uploads/upload_duplicate_banners.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart'
+    show
+        isServerRefusedReview,
+        offersReview,
+        reviewableStates,
+        sentFromOtherDevice;
 import 'package:frontend/services/uploads/upload_status_text.dart';
-import 'package:frontend/services/uploads/uploads_overview.dart'
-    show isServerRefusedReview, offersReview;
 
 /// The order of reads of review items: the newest-started read of an item
 /// wins, whichever kind it is (a re-read or a snapshot). One counter serves
@@ -38,7 +43,7 @@ class ReviewReadOrder {
 }
 
 const _inFlight = {'review_submitted', 'committing'};
-const _done = {'imported', 'duplicate'};
+const _reviewResolved = {'imported', 'duplicate'};
 
 /// One item of the review as the page shows it. The local intent, when there
 /// is one, is the live mirror and wins for state and error code. "On submit
@@ -73,30 +78,45 @@ class ReviewItemView {
     UploadIntentRecord? intent,
     required bool online,
     Set<DuplicateGroup> chosen = const {},
+    Set<String> otherDeviceSending = const {},
+    bool transfersPaused = false,
   }) {
     final state = intent?.lastState ?? item.rawState;
     final code = intent != null ? intent.lastErrorCode : item.error?.code;
     final reviewable = state == 'review_ready';
-    final cancellable = (reviewable || state == 'duplicate_conflict') && online;
+    final cancellable = reviewableStates.contains(state) && online;
     final duplicates = DuplicateBanners.of(item, chosen: chosen);
     final conflict = state == 'duplicate_conflict'
         ? DuplicateConflictView.of(item)
         : null;
     final canAct = reviewable && online;
     final canConfirm = canAct && !isServerRefusedReview(state, code);
+    // The texts follow the Uploads page: the same other-device check, and
+    // nothing moves while transfers are paused.
+    final bytesHere = intent?.bytesOnThisDevice ?? false;
+    final moving = online && !transfersPaused;
+    final texts = uploadItemTexts(
+      state,
+      errorCode: code,
+      bytesHere: bytesHere,
+      paused: !moving,
+      fromArchive: item.parentItemUuid != null,
+      fromOtherDevice: sentFromOtherDevice(
+        state,
+        bytesHere: bytesHere,
+        online: moving,
+        batchSending: otherDeviceSending.contains(item.batchUuid),
+      ),
+    );
     return ReviewItemView._(
       itemUuid: item.itemUuid,
       reviewVersion: item.reviewVersion,
       displayName: item.filename,
-      statusText: uploadStatusText(state, errorCode: code),
-      errorText: uploadDetailText(
-        state,
-        errorCode: code,
-        bytesHere: intent?.bytesOnThisDevice ?? false,
-      ),
+      statusText: texts.status,
+      errorText: texts.detail,
       reviewable: reviewable,
       inFlight: _inFlight.contains(state),
-      done: _done.contains(state),
+      done: _reviewResolved.contains(state),
       canConfirm: canConfirm && !duplicates.needsChoice,
       canSkip: canConfirm && !duplicates.needsChoice,
       canCancel: cancellable,
@@ -111,8 +131,7 @@ class ReviewItemView {
           : (conflict != null && online ? conflict.useExistingTrackUuid : null),
       dontImportTrackUuid: canAct ? duplicates.dontImportTrackUuid : null,
       canBackToReview: state == 'duplicate_conflict' && online,
-      canPlayExisting:
-          online && (reviewable || state == 'duplicate_conflict'),
+      canPlayExisting: online && reviewableStates.contains(state),
     );
   }
 
@@ -144,7 +163,9 @@ class ReviewItemView {
 /// "Advance only after durable imported/duplicate result": true when [after]
 /// is such a result and [before] is known and was not one already.
 bool reviewAdvances({required String? before, required String after}) =>
-    _done.contains(after) && before != null && !_done.contains(before);
+    _reviewResolved.contains(after) &&
+    before != null &&
+    !_reviewResolved.contains(before);
 
 /// "New arriving ready items appear through More items ready - Refresh":
 /// some intent of [batchUuid] is ready and not in the [snapshot].
@@ -159,3 +180,8 @@ bool moreItemsReady({
       offersReview(i.lastState, i.lastErrorCode) &&
       !snapshot.contains(i.itemUuid),
 );
+
+/// Whether [source] is the preview playing now (or still loading, so it can
+/// be stopped): one rule for every Play / Pause toggle of the review.
+bool previewPlaying(PreviewState state, PreviewSource source) =>
+    state.source == source && previewIsActive(state.status);

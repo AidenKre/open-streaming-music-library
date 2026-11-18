@@ -211,6 +211,39 @@ def test_a_row_that_turns_14_days_old_while_the_sender_waits_is_not_sent(rig, an
     assert _status(rig, [aging]) == [("dropped", "too_old")]
 
 
+def test_a_row_sent_alone_that_turns_14_days_old_while_the_sender_waits_is_not_sent(rig, ana):
+    """F903-O-01: the same limit for a listen that goes out one at a time."""
+    aging = queue_row(rig, ana, listened_at_s=NOW_S - MAX_AGE_S + 100, alone=True)
+    rig.gate_clock.on_wait.append(lambda _timeout: rig.wall.advance_s(200))
+
+    rig.sender.run_pass()
+
+    assert rig.fake.requests == []
+    rig.gate_clock.on_wait.clear()
+    rig.sender.run_pass()
+    assert _status(rig, [aging]) == [("dropped", "too_old")]
+    assert rig.fake.requests == []
+
+
+def test_a_refused_listen_whose_write_fails_does_not_stop_the_send_beside_it(rig, ana, monkeypatch):
+    """F903-O-06: in one pass a row is refused (its write fails) and the next
+    row is sent and recorded; the refused outcome is written on the next pass,
+    and nothing is sent twice."""
+    refused = queue_row(rig, ana, listened_at_s=T1, extra={"mbid": "x"})
+    good = queue_row(rig, ana, listened_at_s=T2)
+    rig.fake.queue(ok_scrobbles(1, 0, [scrobble_result(T2)]))
+    failures = _lock_held(monkeypatch, rig, "settle_lastfm_rows", times=1)
+
+    rig.sender.run_pass()
+
+    assert failures["left"] == 0
+    assert [s.timestamps for s in sent(rig)] == [[T2]]
+    assert _status(rig, [refused, good]) == [("pending", None), ("sent", None)]
+    rig.sender.run_pass()
+    assert _status(rig, [refused, good]) == [("failed", "invalid_row"), ("sent", None)]
+    assert len(rig.fake.requests) == 1
+
+
 def test_a_kept_outcome_is_written_when_the_sender_stops(rig, ana, monkeypatch):
     """Review of 9-fix-r1-be #1: a clean stop (shutdown, restart) right after a
     failed settle write must not leave the accepted rows pending for the next

@@ -93,7 +93,7 @@ const _allowed = <String, Map<String, int>>{
   // The held sign-in's revoke: a session the login just issued, sent once
   // through the unhooked client to the server that issued it.
   'lib/api/auth_api.dart': {'bearerAuthHeader(': 1, 'mediaToken: argument': 1},
-  'lib/services/session_service.dart': {'credentials .token read': 1},
+  'lib/services/session/sign_in_flow.dart': {'credentials .token read': 1},
   // Stores and parses the sign-in.
   'lib/services/credential_store.dart': {
     'mediaToken read': 2,
@@ -108,7 +108,7 @@ const _allowed = <String, Map<String, int>>{
     'mediaToken read': 1,
   },
   // Media-token URL builders and log redaction.
-  'lib/playback/track_cache_manager.dart': {'access_token': 4},
+  'lib/playback/stream_uris.dart': {'access_token': 4},
   // The player: the one stream-URL build with the media token, after the
   // gate's permit (OPEN-M-11 step D); reads the token back for redaction.
   'lib/playback/just_audio_engine.dart': {

@@ -1,4 +1,5 @@
 import 'package:frontend/models/dto/client_track_dto.dart';
+import 'package:frontend/models/dto/json_fields.dart';
 
 enum ChangeEntryType { upsert, delete }
 
@@ -29,7 +30,7 @@ class ChangeEntryDto {
     };
 
     ClientTrackDto? track;
-    final uuidId = json['uuid_id'] as String;
+    final uuidId = jsonString(json, 'uuid_id');
     switch (type) {
       case ChangeEntryType.upsert:
         if (rawTrack is! Map) {
@@ -50,7 +51,7 @@ class ChangeEntryDto {
 
     return ChangeEntryDto(
       type: type,
-      revision: (json['revision'] as num).toInt(),
+      revision: jsonWholeInt(json, 'revision'),
       uuidId: uuidId,
       track: track,
     );

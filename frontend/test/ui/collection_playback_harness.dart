@@ -29,6 +29,8 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import '../helpers/fake_clock.dart';
 import '../helpers/no_server_api.dart';
 import 'browse_harness.dart';
+import '../helpers/stub_track_sync.dart';
+import '../helpers/test_offline.dart';
 
 /// The audio player, faked: an optional current queue that accepts
 /// enqueues, and an activation that always succeeds.

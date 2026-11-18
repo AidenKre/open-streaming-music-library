@@ -25,7 +25,7 @@ from typing import Protocol, runtime_checkable
 from app.config import Settings
 from app.core.operator_log import operator_logger
 from app.services.duplicate_detection import MatcherParams, coarse_diversity
-from app.services.ffmpeg_runner import run_capture
+from app.services.ffmpeg_runner import NO_OPTIONS, ToolOptions, run_capture
 from app.services.media_input import fpcalc_input_args
 from app.services.identity_reasons import (
     CaptureFailed,
@@ -118,9 +118,8 @@ class Fingerprinter(Protocol):
     algorithm: str
     tool_version: str
 
-    def fingerprint(self, path: Path, *, max_seconds: int = FINGERPRINT_SECONDS, registry=None, job_id=None,
-                    low_priority: bool = False,
-                    input_format: str | None = None) -> RawFingerprint | FingerprintFailure: ...
+    def fingerprint(self, path: Path, *, max_seconds: int = FINGERPRINT_SECONDS,
+                    options: ToolOptions = NO_OPTIONS) -> RawFingerprint | FingerprintFailure: ...
 
 
 # Widest JSON print: MAX_FINGERPRINT_ITEMS items of 10 digits plus ", ", and
@@ -191,8 +190,7 @@ class FpcalcFingerprinter:
         self.tool_version = tool_version
         self.timeout_s = timeout_s
 
-    def fingerprint(self, path, *, max_seconds=FINGERPRINT_SECONDS, registry=None, job_id=None, low_priority=False,
-                    input_format=None):
+    def fingerprint(self, path, *, max_seconds=FINGERPRINT_SECONDS, options=NO_OPTIONS):
         """Never raises; returns a RawFingerprint or a FingerprintFailure.
 
         Failure reasons: master_missing, tool_missing, timeout, killed,
@@ -211,14 +209,12 @@ class FpcalcFingerprinter:
             else:
                 # Absolute so a file named "-length.flac" is never read as an option.
                 cmd = [self.executable, "-raw", "-json", "-algorithm", str(FPCALC_ALGORITHM), "-length", str(max_seconds),
-                       *fpcalc_input_args(input_format), str(Path(path).absolute())]
+                       *fpcalc_input_args(options.input_format), str(Path(path).absolute())]
                 result = run_capture(
                     cmd,
                     timeout_s=self.timeout_s,
                     max_stdout_bytes=FPCALC_MAX_STDOUT_BYTES,
-                    registry=registry,
-                    job_id=job_id,
-                    low_priority=low_priority,
+                    options=options,
                 )
                 returncode = result.returncode
                 if returncode != 0:

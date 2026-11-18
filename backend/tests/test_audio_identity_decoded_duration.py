@@ -19,8 +19,9 @@ import pytest
 
 from app.services import audio_identity
 from app.services.audio_identity import measure_decoded_duration
-from app.services.ffmpeg_runner import CaptureResult, CaptureTimeout, FfmpegProcessRegistry
+from app.services.ffmpeg_runner import NO_OPTIONS, CaptureResult, CaptureTimeout, FfmpegProcessRegistry, ToolOptions, run_capture
 from app.services.identity_reasons import CaptureFailed
+from tests.tool_call_capture import tool_call
 
 
 def _block(out_time_us: str, progress: str) -> str:
@@ -38,7 +39,7 @@ class FakeRunner:
         self.calls: list[tuple[list[str], dict]] = []
 
     def __call__(self, cmd, **kwargs):
-        self.calls.append((list(cmd), kwargs))
+        self.calls.append((list(cmd), tool_call(run_capture, cmd, **kwargs)))
         if self.error is not None:
             raise self.error
         return self.result
@@ -124,7 +125,7 @@ def test_one_bounded_decode_of_the_first_audio_stream_with_the_callers_process_o
     registry = FfmpegProcessRegistry()
     job_id = object()
 
-    measure_decoded_duration(audio_file, registry=registry, job_id=job_id, low_priority=True)
+    measure_decoded_duration(audio_file, options=ToolOptions(registry=registry, job_id=job_id, low_priority=True))
 
     [(cmd, kwargs)] = fake.calls
     assert cmd[0] == "ffmpeg"
@@ -154,7 +155,7 @@ def _has_pair(options: list[str], key: str, value: str) -> bool:
 def test_a_forced_format_is_passed_to_the_decode_before_its_input(runner, audio_file):
     fake = runner(_block("30000000", "end"))
 
-    assert measure_decoded_duration(audio_file, input_format="flac") == 30.0
+    assert measure_decoded_duration(audio_file, options=ToolOptions(input_format="flac")) == 30.0
 
     [(cmd, _)] = fake.calls
     options = _input_options(cmd)
@@ -181,10 +182,10 @@ class _NoDurationFingerprinter:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def fingerprint(self, path, **kwargs):
+    def fingerprint(self, path, *, max_seconds=120, options=NO_OPTIONS):
         from app.services.fingerprinter import RawFingerprint
 
-        self.calls.append(kwargs)
+        self.calls.append({"max_seconds": max_seconds, "input_format": options.input_format})
         return RawFingerprint(tuple(i << 18 for i in range(200)), None)  # 200 distinct keys: current
 
 
@@ -194,10 +195,11 @@ def test_compute_fingerprint_forwards_the_format_to_the_tool_and_to_the_duration
     fake = runner(_block("187000000", "end"))
     tool = _NoDurationFingerprinter()
 
-    fp = audio_identity.compute_fingerprint(audio_file, tool, params=EXPLICIT, input_format="flac")
+    fp = audio_identity.compute_fingerprint(
+        audio_file, tool, params=EXPLICIT, options=ToolOptions(input_format="flac"))
 
     assert (fp.state, fp.duration_s) == ("current", 187.0)
-    assert [c.get("input_format") for c in tool.calls] == ["flac"]
+    assert [c["input_format"] for c in tool.calls] == ["flac"]
     [(cmd, _)] = fake.calls
     assert _has_pair(_input_options(cmd), "-f", "flac")
     assert _has_pair(_input_options(cmd), "-protocol_whitelist", "file")

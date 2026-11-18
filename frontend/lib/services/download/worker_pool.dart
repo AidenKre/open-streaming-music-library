@@ -44,6 +44,9 @@ class WorkerPool {
   int _resetGeneration = 0;
   final Map<String, Future<void> Function()> _activeCancellers = {};
   final Map<String, Future<void>> _activeWorkers = {};
+  // Per active job: marks it cancelled by the person (row 74). Its
+  // generation check then fails for that job alone.
+  final Map<String, void Function()> _cancelRequests = {};
   // Per-uuid tombstones held only for the duration of a [fenceUuid] call so
   // an in-flight worker that's already past its last generation check can
   // still observe the fence at the rename/DB-write boundaries (and clean up).
@@ -120,6 +123,31 @@ class WorkerPool {
     }
   }
 
+  /// The person cancelled the download of [uuidId] in progress (other-issues
+  /// row 74). The downloader stops at its next check up to the row swap, so
+  /// it records nothing and drops its partial file, and its response stream
+  /// is cancelled. The job's outcome decides the row: any outcome but success
+  /// removes it (as a cancelled queued row) and the slot goes to the next
+  /// job; a commit whose row swap had already happened wins (review F1), and
+  /// the row is Completed.
+  /// Completes when the worker has finished. No-op when [uuidId] is not
+  /// downloading.
+  Future<void> cancelActive(String uuidId) async {
+    final request = _cancelRequests[uuidId];
+    final worker = _activeWorkers[uuidId];
+    if (request == null || worker == null) return;
+    request();
+    final canceller = _activeCancellers[uuidId];
+    if (canceller != null) {
+      try {
+        await canceller();
+      } catch (_) {}
+    }
+    try {
+      await worker;
+    } catch (_) {}
+  }
+
   /// Bulk variant of [fenceUuid].
   Future<void> fenceUuids(Iterable<String> uuids) async {
     final list = uuids.toList(growable: false);
@@ -136,8 +164,9 @@ class WorkerPool {
   }
 
   /// Cancels in-flight downloads, bumps the generation, awaits active workers,
-  /// clears in-memory queue state, then asks the downloader to remove all
-  /// known files + the downloads directory.
+  /// clears in-memory queue state, then asks the downloader to remove the
+  /// recorded files (through the owned-file clean-up) and the downloads
+  /// directory; throws [DownloadsLeftByReset] when a recorded file was left.
   Future<void> reset() async {
     _resetGeneration++;
 
@@ -157,8 +186,7 @@ class WorkerPool {
     _activeCancellers.clear();
     _queue.clearAll();
 
-    await _downloader.deleteKnownDownloadedFiles();
-    await _downloader.deleteDownloadDirectory();
+    await _downloader.deleteDownloadsForReset();
   }
 
   /// Synchronous teardown path used by DownloadManager.dispose(). It invalidates
@@ -229,6 +257,8 @@ class WorkerPool {
   }
 
   Future<void> _runJob(String uuidId, int generation) async {
+    var cancelRequested = false;
+    void requestCancel() => cancelRequested = true;
     try {
       if (generation != _resetGeneration) return;
       final idx = _queue.state.jobs.indexWhere(
@@ -236,6 +266,7 @@ class WorkerPool {
       );
       if (idx < 0) return;
       final job = _queue.jobAt(idx);
+      _cancelRequests[uuidId] = requestCancel;
       Future<void> Function()? registered;
       // A fenced uuid means a delete is in-flight; the downloader treats
       // this exactly like a reset (skip rename, skip DB write, drop the
@@ -244,6 +275,7 @@ class WorkerPool {
         job: job,
         generationCheck: () =>
             generation == _resetGeneration && !_fencedUuids.contains(uuidId),
+        isCancelled: () => cancelRequested,
         onProgress: (progress) {
           _queue.markJobByUuid(
             job.uuidId,
@@ -265,6 +297,19 @@ class WorkerPool {
         },
       );
       if (generation != _resetGeneration) return;
+      if (cancelRequested && outcome.kind != DownloadOutcomeKind.success) {
+        // Cancelled by the person: the row goes whatever else happened (a
+        // network failure must not queue it again). A pause the outcome
+        // calls for still applies to the other jobs.
+        _queue.removeJob(uuidId);
+        if (outcome.kind == DownloadOutcomeKind.authRequired) {
+          _authPaused = true;
+        }
+        if (outcome.kind == DownloadOutcomeKind.notVerified) {
+          _verifyPaused = true;
+        }
+        return;
+      }
       switch (outcome.kind) {
         case DownloadOutcomeKind.success:
           _queue.markJobByUuid(
@@ -313,6 +358,10 @@ class WorkerPool {
           _verifyPaused = true;
       }
     } finally {
+      // Only this worker's own entry (a newer worker may hold the uuid).
+      if (identical(_cancelRequests[uuidId], requestCancel)) {
+        _cancelRequests.remove(uuidId);
+      }
       if (generation == _resetGeneration) {
         _activeCount--;
         pump();

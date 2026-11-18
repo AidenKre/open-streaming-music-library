@@ -1,6 +1,6 @@
 """Round 2 review fix: import-folder archive members are unpacked flat
 (``<unpack>/<position>/<file name>``) instead of at their path inside the
-archive (``<unpack>/Album/Disc 1/01.flac``, the layout at 458ca4a4). Pinned
+archive (``<unpack>/Album/Disc 1/01.flac``, the earlier layout). Pinned
 here: what a person ends up with does not depend on that layout. The
 organizer reads only the member's file name and its tags (``organizer.py``:
 ``sanitize_file_name(file_path.name)`` and ``get_track_metadata``; cover art is
@@ -114,8 +114,8 @@ def test_an_archive_imports_by_tags_and_file_names_only(tmp_path):
 
     assert outcome is ImportOutcome.IMPORTED
     assert sorted(seen) == ["01 Song.flac", "01 Song.flac", "x.mp3"]  # audio only, by name
-    # One album folder from the tags; the second disc's taken name is numbered
-    # (56c24c6f); covers, cue and lyrics files are never imported (before or after).
+    # One album folder from the tags; the second disc's taken name is numbered;
+    # covers, cue and lyrics files are never imported (before or after).
     tracks = db.get_tracks(owner_id=sam)
     assert len(tracks) == 2
     assert {Path(t.file_path).parent.name for t in tracks} == {"OK Computer"}

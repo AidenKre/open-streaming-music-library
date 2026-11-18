@@ -25,8 +25,12 @@ SETTLE_WINDOW_S = 30.0
 # Longest real wait between looks at the stop flag and at new entries.
 _POLL_S = 1.0
 # A refresh answers DEFER for a track that is pending deletion: its entry is
-# kept with the signature it was scheduled with and retried a window later.
+# kept with the signature it was scheduled with and retried later. A deletion
+# kept for recovery can stay pending for good, so each deferral in a row
+# doubles the wait (up to about an hour); the entry is never dropped for it.
 DEFER = "defer"
+# The gap after a deferral doubles each time, up to 2**7 windows: 64 minutes with the 30 s window.
+_MAX_DEFER_DOUBLINGS = 7
 
 
 class SettleCheck:
@@ -44,14 +48,14 @@ class SettleCheck:
         self._stop = stop_event if stop_event is not None else threading.Event()
         self._window = window
         self._lock = threading.Lock()
-        # uuid -> (owner_id, path, signature, due); insertion ordered.
-        self._entries: dict[str, tuple[int, Path, tuple[int, int] | None, float]] = {}
+        # uuid -> (owner_id, path, signature, due, deferrals in a row); insertion ordered.
+        self._entries: dict[str, tuple[int, Path, tuple[int, int] | None, float, int]] = {}
         self._thread: threading.Thread | None = None
 
     def schedule(self, uuid_id: str, owner_id: int, path: Path, signature) -> None:
         with self._lock:
             self._entries.pop(uuid_id, None)
-            self._entries[uuid_id] = (owner_id, Path(path), signature, self.clock() + self._window)
+            self._entries[uuid_id] = (owner_id, Path(path), signature, self.clock() + self._window, 0)
 
     def pending(self) -> list[str]:
         with self._lock:
@@ -61,7 +65,7 @@ class SettleCheck:
         now = self.clock()
         with self._lock:
             due = [(u, e) for u, e in self._entries.items() if e[3] <= now]
-        for uuid_id, (owner_id, path, signature, _) in due:
+        for uuid_id, (owner_id, path, signature, _, _) in due:
             if self._stop.is_set():
                 return
             current = file_signature(path)
@@ -81,9 +85,17 @@ class SettleCheck:
                 if keep == DEFER:
                     # Pending deletion: nothing was refreshed. Keep the entry
                     # with its scheduled signature so the change is seen again.
-                    self._entries[uuid_id] = (owner_id, path, signature, self.clock() + self._window)
+                    # A deletion kept for recovery can stay pending for good, so
+                    # each deferral doubles the wait (up to about an hour); the
+                    # entry is never dropped.
+                    deferrals = entry[4]
+                    self._entries[uuid_id] = (
+                        owner_id, path, signature,
+                        self.clock() + self._window * 2 ** min(deferrals, _MAX_DEFER_DOUBLINGS),
+                        deferrals + 1,
+                    )
                 elif keep:
-                    self._entries[uuid_id] = (owner_id, path, current, self.clock() + self._window)
+                    self._entries[uuid_id] = (owner_id, path, current, self.clock() + self._window, 0)
                 else:
                     del self._entries[uuid_id]
 
@@ -144,7 +156,8 @@ def make_settle_refresh(
             if database.is_pending_deletion(uuid_id, owner_id=owner_id):
                 # A deletion is in progress (its journal row is written under
                 # this lock): write nothing. A committed deletion evicts the
-                # caches itself; after a rollback DEFER retries it a window later.
+                # caches itself; after a rollback the deferred entry is retried
+                # (a window later at first, then with growing gaps).
                 return DEFER
             if Path(track.file_path).resolve() != Path(path).resolve():
                 return False
