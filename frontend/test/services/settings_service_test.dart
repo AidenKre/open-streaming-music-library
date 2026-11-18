@@ -3,51 +3,71 @@ import 'dart:convert';
 
 import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/settings_service.dart';
 
 import '../helpers/server_binding.dart';
+import '../helpers/test_credentials.dart';
+
+ApiClient api = testApiClient('', MockClient((_) async => fail('unexpected request')));
 
 /// A session scope: a bound database and a connection that verifies at
 /// once (the backend reconcile is a gated network runner, SC-01 rule 1).
 Future<ProviderContainer> _containerWith(
   SharedPreferences prefs, {
   ServerBindingGate? gate,
+  List<Override> extra = const [],
 }) async {
   final db = AppDatabase(NativeDatabase.memory());
   addTearDown(db.close);
   await seedTestBinding(db);
   return ProviderContainer(overrides: [
     sharedPreferencesProvider.overrideWith((_) async => prefs),
+    apiClientProvider.overrideWithValue(api),
+    // Signed in only when a server is configured ("no server" = signed out).
+    if (api.baseUrl.isNotEmpty) ...signedInOverrides,
     databaseProvider.overrideWithValue(db),
     if (gate != null)
       serverBindingGateProvider.overrideWithValue(gate)
     else
       autoVerifiedGateOverride(),
+    ...extra,
   ]);
+}
+
+/// The reset lifecycle with a generation the test moves (a reset started).
+class _Resets extends LocalResetService {
+  _Resets(super.ref);
+  int gen = 0;
+  @override
+  int get generation => gen;
 }
 
 void main() {
   setUp(() {
+    // Reset the client so cross-test state doesn't bleed.
+    api = testApiClient('', MockClient((_) async => fail('unexpected request')));
     SharedPreferences.setMockInitialValues({});
     // build() no longer awaits the backend sync, but the per-attempt
     // timeout still bounds the reconcile in flight — keep it tight in
     // tests so timeout cases run fast. Production default is 3s.
+    final originalSyncTimeout = SettingsNotifier.backendSyncTimeout;
+    addTearDown(
+      () => SettingsNotifier.backendSyncTimeout = originalSyncTimeout,
+    );
     SettingsNotifier.backendSyncTimeout = const Duration(milliseconds: 200);
-  });
-
-  tearDown(() {
-    // Reset ApiClient so cross-test state doesn't bleed.
-    ApiClient.init('');
   });
 
   test('build returns original/original on first launch', () async {
@@ -91,7 +111,7 @@ void main() {
   test('setStreamQualityFull persists and updates state', () async {
     final prefs = await SharedPreferences.getInstance();
     // Backend PUT must succeed for persistence to happen.
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://localhost:8000',
       MockClient((_) async => http.Response('{}', 200)),
     );
@@ -111,7 +131,7 @@ void main() {
 
   test('setStreamQualityFull clears any temporary override', () async {
     final prefs = await SharedPreferences.getInstance();
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://localhost:8000',
       MockClient((_) async => http.Response('{}', 200)),
     );
@@ -260,7 +280,7 @@ void main() {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
       // GET (build-time sync) returns 256; PUT 500s on every retry.
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           if (req.method == 'PUT') {
@@ -289,7 +309,7 @@ void main() {
     test('PUT success: prefs are written and state updates', () async {
       SharedPreferences.setMockInitialValues({});
       final prefs = await SharedPreferences.getInstance();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           if (req.method == 'PUT') return http.Response('{}', 200);
@@ -325,7 +345,7 @@ void main() {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
       final getCompleter = Completer<http.Response>();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) => getCompleter.future),
       );
@@ -354,7 +374,7 @@ void main() {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
       var requests = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) async {
           requests++;
@@ -368,6 +388,8 @@ void main() {
       addTearDown(controlled.dispose);
       final container = ProviderContainer(overrides: [
         sharedPreferencesProvider.overrideWith((_) async => prefs),
+        apiClientProvider.overrideWithValue(api),
+    ...signedInOverrides,
         databaseProvider.overrideWithValue(db),
         serverBindingGateProvider.overrideWithValue(controlled.gate),
       ]);
@@ -389,7 +411,7 @@ void main() {
     test('backend reconcile updates state to backend value', () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) async => qualityResponse('128')),
       );
@@ -410,7 +432,7 @@ void main() {
       // QueuePlayer would rebuild the whole playlist on startup.
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) async => qualityResponse('128')),
       );
@@ -434,7 +456,7 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       // MockClient hangs forever — the per-attempt timeout in the
       // RetryPolicy must kick in (the outer .timeout() is gone).
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) => Completer<http.Response>().future),
       );
@@ -455,7 +477,7 @@ void main() {
     test('backend network failure leaves cached pref in place', () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) async => throw Exception('network error')),
       );
@@ -472,7 +494,7 @@ void main() {
     test('backend returns invalid quality → local value kept', () async {
       SharedPreferences.setMockInitialValues({'settings.streamQuality': '256'});
       final prefs = await SharedPreferences.getInstance();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) async => http.Response(
               jsonEncode({'quality': '999'}),
@@ -495,7 +517,7 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
 
       var requestCount = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         '',
         MockClient((_) async {
           requestCount++;
@@ -521,7 +543,7 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
 
       final getCompleter = Completer<http.Response>();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           if (req.method == 'PUT') return http.Response('{}', 200);
@@ -551,6 +573,75 @@ void main() {
       expect(container.read(settingsProvider).value!.streamQuality, '128');
     });
 
+    // U22-FE-LIFECYCLE-A-01: the stored value is read at the next start, so
+    // a late answer must not overwrite it after the user chose, after a
+    // reset wiped the prefs, or once the notifier is gone.
+    group('a late backend answer writes nothing to the prefs', () {
+      late Completer<http.Response> getCompleter;
+
+      setUp(() {
+        getCompleter = Completer<http.Response>();
+        api = testApiClient(
+          'http://localhost:8000',
+          MockClient((req) async {
+            if (req.method == 'PUT') return http.Response('{}', 200);
+            return getCompleter.future;
+          }),
+        );
+        SettingsNotifier.backendSyncTimeout = const Duration(seconds: 5);
+      });
+
+      test('when the user chose meanwhile', () async {
+        SharedPreferences.setMockInitialValues(
+            {'settings.streamQuality': '256'});
+        final prefs = await SharedPreferences.getInstance();
+        final container = await _containerWith(prefs);
+        addTearDown(container.dispose);
+        await container.read(settingsProvider.future);
+        final notifier = container.read(settingsProvider.notifier);
+        await notifier.setStreamQualityFull('128');
+        expect(prefs.getString('settings.streamQuality'), '128');
+
+        getCompleter.complete(qualityResponse('256'));
+        await notifier.debugBackendSyncDone;
+        expect(prefs.getString('settings.streamQuality'), '128',
+            reason: "the next start must read the user's choice");
+      });
+
+      test('when a reset happened meanwhile', () async {
+        final prefs = await SharedPreferences.getInstance();
+        late _Resets resets;
+        final container = await _containerWith(prefs, extra: [
+          localResetServiceProvider.overrideWith((ref) => resets = _Resets(ref)),
+        ]);
+        addTearDown(container.dispose);
+        container.read(localResetServiceProvider);
+        await container.read(settingsProvider.future);
+        final notifier = container.read(settingsProvider.notifier);
+        await pumpEventQueue(); // the GET is in flight
+
+        resets.gen++; // a reset starts and wipes the prefs
+        await prefs.clear();
+        getCompleter.complete(qualityResponse('256'));
+        await notifier.debugBackendSyncDone;
+        expect(prefs.getString('settings.streamQuality'), isNull,
+            reason: "the old server's quality must not survive the reset");
+      });
+
+      test('when the notifier is gone', () async {
+        final prefs = await SharedPreferences.getInstance();
+        final container = await _containerWith(prefs);
+        await container.read(settingsProvider.future);
+        final done = container.read(settingsProvider.notifier).debugBackendSyncDone;
+        await pumpEventQueue(); // the GET is in flight
+        container.dispose();
+
+        getCompleter.complete(qualityResponse(originalQuality));
+        await done;
+        expect(prefs.getString('settings.streamQuality'), isNull);
+      });
+    });
+
     test('streamQualityProvider reflects local pref before backend resolves',
         () async {
       // Direct regression for issue #15: settings consumers must NOT see
@@ -561,7 +652,7 @@ void main() {
       });
       final prefs = await SharedPreferences.getInstance();
       final getCompleter = Completer<http.Response>();
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((_) => getCompleter.future),
       );

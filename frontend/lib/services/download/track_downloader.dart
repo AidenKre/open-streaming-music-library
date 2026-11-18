@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:drift/drift.dart' show Value, Variable;
@@ -7,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/playback/track_cache_manager.dart';
 import 'package:frontend/services/download/download_queue.dart';
@@ -18,6 +20,7 @@ import 'package:frontend/services/quality_presets.dart';
 ///
 /// On [success], [sizeBytes] holds the number of bytes received. On
 /// [otherFailure], [errorMessage] is the human-readable failure.
+/// [authRequired] (a 401) is a wait, not a failure: the job stays queued.
 class DownloadOutcome {
   final DownloadOutcomeKind kind;
   final int sizeBytes;
@@ -28,6 +31,12 @@ class DownloadOutcome {
   static const networkFailure = DownloadOutcome._(
     DownloadOutcomeKind.networkFailure,
   );
+  static const authRequired = DownloadOutcome._(
+    DownloadOutcomeKind.authRequired,
+  );
+  static const notVerified = DownloadOutcome._(
+    DownloadOutcomeKind.notVerified,
+  );
   static DownloadOutcome success(int sizeBytes) =>
       DownloadOutcome._(DownloadOutcomeKind.success, sizeBytes: sizeBytes);
   static DownloadOutcome otherFailure(String message) => DownloadOutcome._(
@@ -36,7 +45,19 @@ class DownloadOutcome {
   );
 }
 
-enum DownloadOutcomeKind { success, networkFailure, otherFailure, cancelled }
+enum DownloadOutcomeKind {
+  success,
+  networkFailure,
+
+  /// The server answered 401: signed out. No network-failure listener fires.
+  authRequired,
+  otherFailure,
+  cancelled,
+
+  /// The token client withheld the request because the server is not
+  /// verified (sign-off OPEN-M-11); nothing was sent. A wait, not a failure.
+  notVerified,
+}
 
 class _DownloadCancelled implements Exception {}
 
@@ -103,7 +124,13 @@ class TrackDownloader {
     required void Function(Future<void> Function() canceller) registerCanceller,
     required void Function() unregisterCanceller,
   }) async {
-    final dir = await _ensureDownloadDir();
+    // Guarded: an escaped exception would leave the job stuck `active`.
+    final Directory dir;
+    try {
+      dir = await _ensureDownloadDir();
+    } catch (e) {
+      return DownloadOutcome.otherFailure(e.toString());
+    }
     if (!generationCheck()) {
       return DownloadOutcome.cancelled;
     }
@@ -128,16 +155,19 @@ class TrackDownloader {
       response = await _apiClient.send(
         () => http.Request(
           'GET',
-          buildTrackStreamUri(job.uuidId, quality: job.quality),
+          buildTrackStreamUri(_apiClient.baseUrl, job.uuidId, quality: job.quality),
         ),
       );
     } on ApiException catch (e) {
+      if (e.statusCode == 401) return DownloadOutcome.authRequired;
       return DownloadOutcome.otherFailure('HTTP ${e.statusCode}');
     } on NetworkException {
       // ApiClient already fired its onNetworkFailure hook for the exhausted
       // handshake; report defensively too in case it wasn't wired.
       _onNetworkFailure?.call();
       return DownloadOutcome.networkFailure;
+    } on TokenWithheldException {
+      return DownloadOutcome.notVerified;
     } catch (e) {
       // Defensive fallback for unexpected exceptions that escape ApiClient's
       // typed exceptions — without this, the worker pool never marks the job
@@ -344,25 +374,38 @@ class TrackDownloader {
 
     // A damaged copy (decision 6) is superseded by this download: the
     // write clears its mark and the file is removed once the swap is in.
-    final damagedFilePath = (await (_db.select(_db.tracks)
-              ..where((t) => t.uuidId.equals(uuidId)))
-            .getSingleOrNull())
-        ?.damagedFilePath;
-    final updatedRows =
-        await (_db.update(
-          _db.tracks,
-        )..where((t) => t.uuidId.equals(uuidId))).write(
-          TracksCompanion(
-            damagedFilePath: const Value(null),
-            filePath: Value(destination.path),
-            downloadedBitrateKbps: Value(downloadedBitrate),
-            fileSizeBytes: Value(received),
-            downloadedQuality: Value(downloadedQuality),
-            downloadedAtRevision: Value(downloadedAtRevision),
-            downloadedCodec: Value(downloadedCodec),
-            staleDismissedAtRevision: const Value(null),
-          ),
-        );
+    final String? damagedFilePath;
+    final int updatedRows;
+    try {
+      damagedFilePath = (await (_db.select(_db.tracks)
+                ..where((t) => t.uuidId.equals(uuidId)))
+              .getSingleOrNull())
+          ?.damagedFilePath;
+      updatedRows =
+          await (_db.update(
+            _db.tracks,
+          )..where((t) => t.uuidId.equals(uuidId))).write(
+            TracksCompanion(
+              damagedFilePath: const Value(null),
+              filePath: Value(destination.path),
+              downloadedBitrateKbps: Value(downloadedBitrate),
+              fileSizeBytes: Value(received),
+              downloadedQuality: Value(downloadedQuality),
+              downloadedAtRevision: Value(downloadedAtRevision),
+              downloadedCodec: Value(downloadedCodec),
+              staleDismissedAtRevision: const Value(null),
+            ),
+          );
+    } catch (_) {
+      // The renamed file may be listed by no row; remove it unless a row
+      // names it (or that question itself fails: keep the file).
+      var named = true;
+      try {
+        named = await _rowNamesPath(destination.path);
+      } catch (_) {}
+      if (!named) await _deleteIfExists(destination);
+      rethrow;
+    }
     if (updatedRows == 0) {
       await _deleteIfExists(destination);
       return false;
@@ -473,13 +516,118 @@ class TrackDownloader {
     await _coverArtStore.download(coverArtId);
   }
 
-  Future<Directory> _ensureDownloadDir() async {
-    if (_downloadDir != null) return _downloadDir!;
+  /// Whether any track row names [path] as its file or damaged copy.
+  Future<bool> _rowNamesPath(String path) async {
+    final rows = await _db
+        .customSelect(
+          'SELECT 1 FROM tracks WHERE file_path = ? OR damaged_file_path = ? '
+          'LIMIT 1',
+          variables: [Variable.withString(path), Variable.withString(path)],
+          readsFrom: {_db.tracks},
+        )
+        .get();
+    return rows.isNotEmpty;
+  }
+
+  Future<Directory>? _dirPreparation;
+
+  /// Resolves and creates the downloads folder and sweeps it once, sharing one
+  /// in-flight future so the sweep never runs while this downloader's own job
+  /// is writing. A failed preparation is not kept: the next call retries.
+  Future<Directory> _ensureDownloadDir() {
+    final cached = _downloadDir;
+    if (cached != null) return Future.value(cached);
+    final current = _dirPreparation;
+    if (current != null) return current;
+    // A preparation that is no longer current (a reset dropped it) must not
+    // touch the shared state; its own caller still gets its result or error.
+    late final Future<Directory> preparation;
+    preparation = _prepareDownloadDir().then(
+      (dir) {
+        if (identical(_dirPreparation, preparation)) _downloadDir = dir;
+        return dir;
+      },
+      onError: (Object e, StackTrace st) {
+        if (identical(_dirPreparation, preparation)) _dirPreparation = null;
+        Error.throwWithStackTrace(e, st);
+      },
+    );
+    return _dirPreparation = preparation;
+  }
+
+  Future<Directory> _prepareDownloadDir() async {
     final base = await _directoryProvider();
     final dir = Directory(p.join(base.path, 'tracks'));
     await dir.create(recursive: true);
-    _downloadDir = dir;
+    await _sweepLeftovers(dir);
     return dir;
+  }
+
+  static const String _uuidPattern =
+      r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
+  static final RegExp _partialName = RegExp(
+    '^$_uuidPattern\\.(?:new-\\d+\\.)?[A-Za-z0-9]+\\.partial\$',
+  );
+  static final RegExp _unrecordedReplacementName = RegExp(
+    '^$_uuidPattern\\.new-\\d+\\.[A-Za-z0-9]+\$',
+  );
+
+  /// Removes this downloader's own leftovers (`<uuid>.<ext>.partial`,
+  /// `<uuid>.new-<n>.<ext>.partial`, `<uuid>.new-<n>.<ext>`) from [dir].
+  /// Deletes only when ALL hold: [dir] is a real directory (not a link); the
+  /// entry is a regular file (not a link) listed non-recursively; its basename
+  /// matches the patterns above; and no track row names it, by full path or
+  /// by basename (the documents folder can move). Rows are read once, first;
+  /// if that fails nothing is deleted. Never fails the download.
+  Future<void> _sweepLeftovers(Directory dir) async {
+    try {
+      if (FileSystemEntity.typeSync(dir.path, followLinks: false) !=
+          FileSystemEntityType.directory) {
+        return;
+      }
+      final rows = await _db
+          .customSelect(
+            'SELECT file_path, damaged_file_path FROM tracks '
+            'WHERE file_path IS NOT NULL OR damaged_file_path IS NOT NULL',
+            readsFrom: {_db.tracks},
+          )
+          .get();
+      final namedPaths = <String>{};
+      final namedBasenames = <String>{};
+      for (final row in rows) {
+        for (final column in const ['file_path', 'damaged_file_path']) {
+          final path = row.readNullable<String>(column);
+          if (path == null) continue;
+          namedPaths.add(path);
+          namedBasenames.add(p.basename(path));
+        }
+      }
+      final entries = await dir.list(followLinks: false).toList();
+      for (final entity in entries) {
+        try {
+          if (entity is! File) continue;
+          if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+              FileSystemEntityType.file) {
+            continue;
+          }
+          final name = p.basename(entity.path);
+          if (!_partialName.hasMatch(name) &&
+              !_unrecordedReplacementName.hasMatch(name)) {
+            continue;
+          }
+          if (namedPaths.contains(entity.path) ||
+              namedBasenames.contains(name)) {
+            continue;
+          }
+          await File(entity.path).delete();
+        } catch (_) {}
+      }
+    } catch (e) {
+      developer.log(
+        'download sweep skipped: ${e.runtimeType}',
+        name: 'TrackDownloader',
+      );
+    }
   }
 
   /// Deletes the file at every `tracks.file_path` recorded in the DB.
@@ -507,6 +655,7 @@ class TrackDownloader {
         _downloadDir ??
         Directory(p.join((await _directoryProvider()).path, 'tracks'));
     _downloadDir = null;
+    _dirPreparation = null;
     try {
       if (await dir.exists()) {
         await dir.delete(recursive: true);

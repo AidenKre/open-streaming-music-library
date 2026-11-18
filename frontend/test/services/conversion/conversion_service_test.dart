@@ -4,6 +4,7 @@
 // server advertises convert with an allowed target, a still-valid preset)
 // and maps enqueue/cancel failures to user text. The view only shows the
 // sheets and the messages it returns.
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:drift/drift.dart' show Value;
@@ -22,6 +23,9 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/conversion/conversion_service.dart';
+import 'package:frontend/services/server_binding_gate.dart';
+
+import '../../helpers/server_binding.dart';
 
 class _Sync extends TrackSyncNotifier {
   _Sync({this.result = true, this.onSync});
@@ -40,11 +44,26 @@ class _Sync extends TrackSyncNotifier {
   }
 }
 
+/// The real syncFresh's rule: it fails at once unless the connection is
+/// verified right now.
+class _FastFailSync extends _Sync {
+  _FastFailSync(this.gate);
+  final ServerBindingGate gate;
+  @override
+  Future<bool> syncFresh() async {
+    calls++;
+    return gate.state is BindingVerified;
+  }
+}
+
 class _Offline extends OfflineModeNotifier {
   _Offline(this.value);
   final bool value;
   @override
-  bool build() => value;
+  bool build() {
+    super.build();
+    return value;
+  }
 }
 
 class _Jobs extends ConversionJobsNotifier {
@@ -147,6 +166,9 @@ void main() {
     _Sync? sync,
     _Jobs? jobs,
     AppInfo caps = _caps,
+    Object? appInfoError,
+    AppInfo Function()? capsNow,
+    ServerBindingGate? gate,
   }) {
     final s = sync ?? _Sync();
     final j = jobs ?? _Jobs();
@@ -158,9 +180,13 @@ void main() {
         else
           currentTrackProvider.overrideWithValue(playing),
         trackSyncProvider.overrideWith(() => s),
-        appInfoProvider.overrideWith((ref) async => caps),
+        appInfoProvider.overrideWith((ref) async {
+          if (appInfoError != null) throw appInfoError;
+          return capsNow?.call() ?? caps;
+        }),
         conversionJobsProvider.overrideWith(() => j),
         offlineModeProvider.overrideWith(() => _Offline(offline)),
+        if (gate != null) serverBindingGateProvider.overrideWithValue(gate),
       ],
     );
     addTearDown(c.dispose);
@@ -182,6 +208,83 @@ void main() {
       expect(draft.allowedTargets.map((t) => t.codec), ['aac']);
       expect(draft.bitratePresets, [320, 256, 192, 128]);
       expect(s.sync.calls, 1, reason: 'a fresh sync first');
+    });
+
+    // U22-FE-LIFECYCLE-B-08: every app resume (each window refocus on the
+    // desktop) re-probes the server. Convert right after it waits for that
+    // check (bounded) instead of failing "Couldn't sync" at once.
+    test('right after an app resume, Convert waits for the pending check',
+        () async {
+      await seedTestBinding(db, baseUrl: 'http://s');
+      final controlled = ControlledGate(db);
+      addTearDown(controlled.dispose);
+      unawaited(controlled.gate.startConnection('http://s'));
+      await pumpEventQueue();
+      controlled.respond('inst-1');
+      await controlled.gate.awaitVerified();
+      unawaited(controlled.gate.startConnection('http://s')); // the resume
+      await pumpEventQueue();
+
+      final s = scope(
+          sync: _FastFailSync(controlled.gate), gate: controlled.gate);
+      final prep = service(s.c).prepare('u1');
+      await pumpEventQueue();
+      controlled.respond('inst-1');
+      expect(await prep, isA<ConversionNeedsTarget>());
+      expect(s.sync.calls, 1);
+    });
+
+    // U25-A-04: every provider is read before the first wait, so a rebuild
+    // of the service while the fresh sync runs (its ref disposed) still
+    // gets the verdict instead of a use-after-dispose error.
+    test('reads its providers before waiting: a rebuild during the sync '
+        'still answers', () async {
+      late ProviderContainer c;
+      final s = scope(
+        sync: _Sync(
+          onSync: () async {
+            c.invalidate(conversionServiceProvider);
+            c.read(conversionServiceProvider); // the old ref is disposed
+          },
+        ),
+      );
+      c = s.c;
+      final prep = await service(c).prepare('u1');
+      expect(prep, isA<ConversionNeedsTarget>());
+      expect(s.sync.calls, 1);
+    });
+
+    // Review r1 #2: capabilities refreshed while the sync runs (recovery's
+    // refetch, or the flush's 422 drift) are the ones checked, as before.
+    test('capabilities refreshed during the sync are the ones checked',
+        () async {
+      var current = const AppInfo(); // advertises no convert
+      late ProviderContainer c;
+      final s = scope(
+        capsNow: () => current,
+        sync: _Sync(
+          onSync: () async {
+            current = _caps;
+            c.invalidate(appInfoProvider);
+          },
+        ),
+      );
+      c = s.c;
+      expect(await service(c).prepare('u1'), isA<ConversionNeedsTarget>());
+    });
+
+    // The capabilities are read before the sync now: a refusal that never
+    // gets to them leaves no unhandled error behind (the test zone would
+    // report it).
+    test('a refusal before the capability check leaves no stray error',
+        () async {
+      final s = scope(
+        sync: _Sync(result: false),
+        appInfoError: StateError('capabilities unavailable'),
+      );
+      final prep = await service(s.c).prepare('u1');
+      expect(prep, isA<ConversionRefused>());
+      await pumpEventQueue();
     });
 
     test('the revision is read after the fresh sync', () async {

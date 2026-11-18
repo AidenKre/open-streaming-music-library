@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
+import 'package:http/testing.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/main.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
@@ -27,13 +29,16 @@ void main() {
   testWidgets('the app root binds OS media input for the scope lifetime',
       (tester) async {
     SharedPreferences.setMockInitialValues({}); // login screen, no session
-    ApiClient.init('http://localhost:8000');
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
     final bridge = AudioServiceBridge();
     final controls = FakePlayerControls();
     await tester.pumpWidget(ProviderScope(
       overrides: [
+        apiClientProvider.overrideWithValue(testApiClient(
+          'http://localhost:8000',
+          MockClient((_) async => fail('login screen makes no requests')),
+        )),
         databaseProvider.overrideWithValue(db),
         audioServiceProvider.overrideWithValue(bridge),
         playerControlsProvider.overrideWithValue(controls),

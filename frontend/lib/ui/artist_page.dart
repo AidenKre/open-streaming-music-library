@@ -132,7 +132,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
               .map((a) => a.coverArtId)
               .whereType<int>()
               .toList();
-          prefetchCoverArt(ids);
+          prefetchCoverArt(ref, ids);
         }
         return ArtistCard(
           artist: artist,

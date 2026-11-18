@@ -21,9 +21,11 @@ void main() {
 
   BrowseFilterControls create({
     OfflineFilterPolicy policy = OfflineFilterPolicy.autoApply,
+    bool? initial,
   }) {
     final controls = container.read(browseFilterControllerFactoryProvider)(
       policy: policy,
+      initial: initial,
     );
     addTearDown(controls.dispose);
     return controls;
@@ -49,6 +51,75 @@ void main() {
         create(policy: OfflineFilterPolicy.manual).filters,
         const BrowseFilters(policy: OfflineFilterPolicy.manual),
       );
+    });
+  });
+
+  // Phase 6 §3 / plan D12: See all starts from Home's current selection and
+  // then owns it. A given initial value is the user's own choice, never one
+  // applied by offline.
+  group('initial selection', () {
+    test('manual: starts from the given value, online or offline', () {
+      start(isOffline: true);
+      expect(
+        create(policy: OfflineFilterPolicy.manual, initial: true).filters,
+        const BrowseFilters(downloaded: true, policy: OfflineFilterPolicy.manual),
+      );
+      offline.set(false);
+      expect(
+        create(policy: OfflineFilterPolicy.manual, initial: true).filters,
+        const BrowseFilters(downloaded: true, policy: OfflineFilterPolicy.manual),
+      );
+      expect(
+        create(policy: OfflineFilterPolicy.manual, initial: false).filters,
+        const BrowseFilters(policy: OfflineFilterPolicy.manual),
+      );
+    });
+
+    test('manual: a given ON stays through connectivity flips', () {
+      start(isOffline: false);
+      final controls = create(policy: OfflineFilterPolicy.manual, initial: true);
+      var count = 0;
+      controls.addListener(() => count++);
+      offline.set(true);
+      offline.set(false);
+      expect(controls.filters.downloaded, isTrue);
+      expect(count, 0);
+    });
+
+    test('autoApply: a given OFF while offline is the user\'s choice', () {
+      start(isOffline: true);
+      final controls = create(initial: false);
+      expect(controls.filters, const BrowseFilters());
+      offline.set(false);
+      offline.set(true);
+      expect(
+        controls.filters,
+        const BrowseFilters(downloaded: true, downloadedByOffline: true),
+        reason: 'a later offline period still applies its default',
+      );
+    });
+
+    test('autoApply: a given ON is kept when coming back online', () {
+      start(isOffline: true);
+      final controls = create(initial: true);
+      expect(controls.filters, const BrowseFilters(downloaded: true));
+      offline.set(false);
+      expect(controls.filters.downloaded, isTrue);
+    });
+
+    test('changing one surface never changes the one it was seeded from', () {
+      start(isOffline: false);
+      final home = create(policy: OfflineFilterPolicy.manual);
+      home.setDownloaded(true);
+      final seeAll = create(
+        policy: OfflineFilterPolicy.manual,
+        initial: home.filters.downloaded,
+      );
+      seeAll.setDownloaded(false);
+      expect(home.filters.downloaded, isTrue);
+      home.setDownloaded(false);
+      home.setDownloaded(true);
+      expect(seeAll.filters.downloaded, isFalse);
     });
   });
 

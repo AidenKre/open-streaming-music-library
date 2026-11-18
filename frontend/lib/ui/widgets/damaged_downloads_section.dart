@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/services/damaged_downloads_provider.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/downloads_controller.dart';
@@ -17,7 +17,7 @@ class DamagedDownloadsSection extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final damaged = ref.watch(damagedDownloadsProvider).value ?? const [];
     if (damaged.isEmpty) return const SizedBox.shrink();
-    final offline = ref.watch(offlineModeProvider);
+    final offline = ref.watch(streamsUnavailableNowProvider);
     final downloads = ref.watch(downloadManagerListenableProvider).state;
     final redownloadable = [
       for (final t in damaged)

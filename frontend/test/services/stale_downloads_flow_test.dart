@@ -67,7 +67,7 @@ void main() {
     changes.clear();
     db = AppDatabase(NativeDatabase.memory());
     tempDir = await Directory.systemTemp.createTemp('stale-flow-test');
-    ApiClient.initForTest(
+    final api = testApiClient(
       'http://test:8080',
       MockClient((req) async {
         final segs = req.url.pathSegments;
@@ -104,15 +104,17 @@ void main() {
     );
     final coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: api,
     );
     manager = DownloadManager(
+      apiClient: api,
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
     );
     sync = SyncService(
       db: db,
-      api: TracksApi(),
+      api: TracksApi(api: api),
       queueRepository: QueueRepository(db),
       prefs: await SharedPreferences.getInstance(),
       bindingToken: await seedTestBinding(db),

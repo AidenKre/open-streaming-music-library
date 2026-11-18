@@ -147,8 +147,11 @@ class DownloadQueue extends ChangeNotifier {
   }
 
   /// Returns the index of the first queued job, or -1 if none. Used by the
-  /// worker pool to pick the next job to dispatch.
-  int findFirstQueuedIndex() => _state.jobs.indexWhere((j) => j.isQueued);
+  /// worker pool to pick the next job to dispatch. A disposed queue offers
+  /// none: it refuses the Queued → Active transition ([markJob] is a no-op),
+  /// so a job it offered would be dispatched again without end.
+  int findFirstQueuedIndex() =>
+      _disposed ? -1 : _state.jobs.indexWhere((j) => j.isQueued);
 
   /// Returns the job at [index]. Caller must check the index is valid.
   DownloadJob jobAt(int index) => _state.jobs[index];

@@ -9,6 +9,8 @@ import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
+import 'package:http/testing.dart';
 import 'package:frontend/api/server_identity_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
@@ -43,14 +45,18 @@ void main() {
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.init('http://a');
+    final api = testApiClient(
+      'http://a',
+      MockClient((_) async => fail('unexpected request')),
+    );
     db = AppDatabase(NativeDatabase.memory());
-    await ServerBindingRepository(db).ensureProvisional('http://a');
+    await ServerBindingRepository(db).ensureProvisional('http://a', userId: 1);
     probes = [];
     log = [];
     gate = ServerBindingGate(
       repository: ServerBindingRepository(db),
-      probe: ({required bool reportOffline}) {
+      signedInUserId: 1,
+      probe: ({required String baseUrl, required bool reportOffline}) {
         final p = Completer<ServerIdentity>();
         probes.add(p);
         return p.future;
@@ -60,6 +66,7 @@ void main() {
     );
     c = ProviderContainer(
       overrides: [
+        apiClientProvider.overrideWithValue(api),
         databaseProvider.overrideWithValue(db),
         serverBindingGateProvider.overrideWithValue(gate),
         recoverablesProvider.overrideWithValue([
@@ -91,6 +98,36 @@ void main() {
     await run;
     expect(log, ['local:coldStart', 'net:coldStart']);
   });
+
+  // Review s7-session-network F3 (sign-off OPEN-M-11): the verification from
+  // before an outage or a suspend must not stand while the app is back
+  // online. The edge clears it and starts the new probe in the same
+  // synchronous step as the trigger, so no token request can go in between.
+  for (final trigger in [
+    RecoveryTrigger.networkRecovered,
+    RecoveryTrigger.appResume,
+  ]) {
+    test('${trigger.name} clears the old verification synchronously; a '
+        'request in that moment waits for the new probe', () async {
+      unawaited(gate.startConnection('http://a'));
+      await pumpEventQueue();
+      probes.single.complete(const ServerIdentity('inst-1'));
+      await gate.awaitVerified();
+      expect(gate.allowsTokenTo(Uri.parse('http://a/tracks')), isTrue);
+
+      final run = recovery().runFor(trigger);
+      // No await between the edge and these reads.
+      expect(gate.allowsTokenTo(Uri.parse('http://a/tracks')), isFalse);
+      var settled = false;
+      unawaited(gate.verdictSettled().then((_) => settled = true));
+      await pumpEventQueue();
+      expect(settled, isFalse, reason: 'a request waits for the new probe');
+      probes[1].complete(const ServerIdentity('inst-1'));
+      await run;
+      expect(settled, isTrue);
+      expect(gate.allowsTokenTo(Uri.parse('http://a/tracks')), isTrue);
+    });
+  }
 
   for (final trigger in [
     RecoveryTrigger.networkRecovered,
@@ -175,6 +212,7 @@ void main() {
       RecoveryPriority.sync: true,
       RecoveryPriority.appInfo: true,
       RecoveryPriority.history: true,
+      RecoveryPriority.uploads: true,
       RecoveryPriority.resumeDownloads: true,
       RecoveryPriority.resumeConversions: true,
       RecoveryPriority.reconcileDownloads: false,

@@ -2,7 +2,9 @@ import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/shell/app_shell.dart';
+import 'package:frontend/ui/create_account_page.dart';
 import 'package:frontend/ui/login_page.dart';
+import 'package:frontend/ui/server_address_page.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/widgets/reset_confirm_sheet.dart';
@@ -11,9 +13,7 @@ import 'package:frontend/ui/widgets/reset_confirm_sheet.dart';
 /// screen, or the app. Every input goes to [SessionControls]; the rules live
 /// in the model `SessionService` (SC-26).
 class StartupGate extends ConsumerStatefulWidget {
-  final VoidCallback? onLocalResetComplete;
-
-  const StartupGate({super.key, this.onLocalResetComplete});
+  const StartupGate({super.key});
 
   @override
   ConsumerState<StartupGate> createState() => _StartupGateState();
@@ -23,6 +23,7 @@ class _StartupGateState extends ConsumerState<StartupGate> {
   late final SessionControls _session = ref.read(sessionControlsProvider);
   bool _finishingReset = false;
   bool _askingServerSwitch = false;
+  bool _askingUserSwitch = false;
 
   @override
   void initState() {
@@ -42,6 +43,7 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     setState(() {});
     if (_session.phase == SessionPhase.resetComplete) _finishReset();
     if (_session.pendingServerSwitch != null) _askServerSwitch();
+    if (_session.pendingUserSwitch != null) _askUserSwitch();
   }
 
   /// A login found a different server: confirm the reset, naming what it
@@ -75,6 +77,35 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     }
   }
 
+  /// A login found another user than this device's data belongs to: confirm
+  /// the reset (spec 7.5). One at a time; dismissing counts as Cancel.
+  Future<void> _askUserSwitch() async {
+    final username = _session.pendingUserSwitch;
+    if (_askingUserSwitch || username == null) return;
+    _askingUserSwitch = true;
+    try {
+      final losses = await _session.pendingLossSummaries();
+      if (!mounted) return;
+      final confirmed = await showResetConfirmSheet(
+        context,
+        title: 'Log in as $username?',
+        body:
+            "Signing in as $username removes the previous account's "
+            'downloads and unsent plays from this device.',
+        confirmLabel: 'Remove and log in',
+        losses: losses,
+      );
+      if (!mounted) return;
+      if (confirmed) {
+        await _session.confirmUserSwitch();
+      } else {
+        await _session.cancelUserSwitch();
+      }
+    } finally {
+      _askingUserSwitch = false;
+    }
+  }
+
   /// Show a partial reset honestly, then rebuild the provider scope (or, in
   /// tests without a rebuild hook, return to the login screen).
   Future<void> _finishReset() async {
@@ -88,11 +119,16 @@ class _StartupGateState extends ConsumerState<StartupGate> {
       developer.log('Reset completed; quiesce issues: $failure', name: 'StartupGate');
     }
     if (failure != null && failure.failures.any((f) => !f.quiesce)) {
+      final notSaved = _session.signInNotSavedNotice;
       await showDialog<void>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Reset incomplete'),
-          content: Text('Some local data could not be cleared:\n\n$failure'),
+          title: Text(
+            notSaved != null ? 'Sign-in not saved' : 'Reset incomplete',
+          ),
+          content: Text(
+            notSaved ?? 'Some local data could not be cleared:\n\n$failure',
+          ),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(ctx).pop(),
@@ -103,13 +139,10 @@ class _StartupGateState extends ConsumerState<StartupGate> {
       );
       if (!mounted) return;
     }
-    final onLocalResetComplete = widget.onLocalResetComplete;
-    if (onLocalResetComplete != null) {
-      onLocalResetComplete();
-      return;
-    }
+    // The model rebuilds the scope (which disposes this gate) or, without a
+    // rebuild hook, returns to the server-address screen.
+    await _session.acknowledgeReset();
     _finishingReset = false;
-    _session.acknowledgeReset();
   }
 
   @override
@@ -117,12 +150,58 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     switch (_session.phase) {
       case SessionPhase.starting:
       case SessionPhase.resetting:
+      case SessionPhase.signingOut:
       case SessionPhase.resetComplete:
         return const Scaffold(body: Center(child: CircularProgressIndicator()));
-      case SessionPhase.signedOut:
-        return LoginPage(
+      case SessionPhase.serverAddress:
+        return ServerAddressPage(
           onConnect: _session.connect,
           error: _session.connectError,
+        );
+      case SessionPhase.logIn:
+        return const LoginPage();
+      case SessionPhase.createAccount:
+        return const CreateAccountPage();
+      case SessionPhase.credentialsUnavailable:
+        return Scaffold(
+          body: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // A fault thrown at launch: whether a sign-in is stored is
+                  // not known, so only the saved session is named.
+                  if (_session.launchFailed)
+                    const Text(
+                      "This device's saved session could not be read.",
+                      textAlign: TextAlign.center,
+                    )
+                  else ...[
+                    const Text(
+                      'Your sign-in could not be read.',
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Your saved sign-in is still on this device. Try again, or log in again to '
+                      'replace it.',
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                  const SizedBox(height: 16),
+                  FilledButton(
+                    onPressed: _session.retryCredentials,
+                    child: const Text('Try again'),
+                  ),
+                  TextButton(
+                    onPressed: _session.logInAgain,
+                    child: const Text('Log in again'),
+                  ),
+                ],
+              ),
+            ),
+          ),
         );
       case SessionPhase.live:
         // Session destinations (Settings, Downloading, Conversions) and the

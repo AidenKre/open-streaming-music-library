@@ -1,6 +1,8 @@
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/ui/settings/credential_storage_diagnostics_view.dart';
 import 'package:frontend/ui/settings/history_diagnostics_view.dart';
+import 'package:frontend/ui/settings/upload_diagnostics_view.dart';
 import 'package:frontend/ui/settings/phase4_settings.dart';
 import 'package:frontend/ui/settings/settings_registry.dart';
 
@@ -30,7 +32,11 @@ class DiagnosticsRow {
 
 /// The contributed diagnostics rows, in display order.
 final diagnosticsRowsProvider = Provider<List<DiagnosticsRow>>(
-  (ref) => const [historyDiagnosticsRow],
+  (ref) => const [
+    historyDiagnosticsRow,
+    uploadDiagnosticsRow,
+    credentialStorageDiagnosticsRow,
+  ],
 );
 
 /// Each diagnostics row as a Settings row of "Sync & storage", offered only

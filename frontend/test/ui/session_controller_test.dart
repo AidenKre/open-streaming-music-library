@@ -7,7 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/services/session_service.dart';
-import 'package:frontend/ui/login_page.dart';
+import 'package:frontend/ui/server_address_page.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/startup_gate.dart';
 
@@ -15,15 +15,15 @@ import 'fake_session_controls.dart';
 
 class _FakeService extends SessionService {
   _FakeService(super.ref);
-  SessionStart start = const SessionStart(SessionStartKind.signedOut);
+  SessionStart start = const SessionStart(SessionStartKind.serverAddress);
   String? connectError;
   bool differentServer = false;
   List<String> losses = const [];
   final switchedTo = <String>[];
-  final blocked = ValueNotifier<bool>(false);
+  final blocked = ValueNotifier(ServerBlockedReason.none);
   int blockedResets = 0;
   @override
-  ValueListenable<bool> get serverBlocked => blocked;
+  ValueListenable<ServerBlockedReason> get serverBlocked => blocked;
   @override
   Future<LocalResetException?> resetForBlockedServer() async {
     blockedResets++;
@@ -36,16 +36,26 @@ class _FakeService extends SessionService {
   int resets = 0;
   int starts = 0;
   int syncs = 0;
+  int reloads = 0;
   @override
   Future<void> syncLibrary() async => syncs++;
   @override
+  Future<void> reloadSession() async => reloads++;
+  /// When set, the matching call throws it (a storage fault).
+  Object? startError;
+  Object? connectThrows;
+  Object? resetThrows;
+
+  @override
   Future<SessionStart> resumeSavedSession() async {
     starts++;
+    if (startError != null) throw startError!;
     return start;
   }
 
   @override
   Future<ConnectOutcome> connect(String url) async {
+    if (connectThrows != null) throw connectThrows!;
     if (differentServer) return ConnectDifferentServer(url);
     final error = connectError;
     return error == null ? const ConnectSucceeded() : ConnectFailed(error);
@@ -65,6 +75,7 @@ class _FakeService extends SessionService {
   Future<LocalResetException?> resetLocalData() async {
     resets++;
     await resetGate?.future;
+    if (resetThrows != null) throw resetThrows!;
     return resetFailure;
   }
 }
@@ -134,24 +145,24 @@ void main() {
 
     test('a rejected saved server signs out with its error', () async {
       service.start = const SessionStart(
-        SessionStartKind.signedOut,
+        SessionStartKind.serverAddress,
         error: 'rejected',
       );
       await session().start();
-      expect(session().phase, SessionPhase.signedOut);
+      expect(session().phase, SessionPhase.serverAddress);
       expect(session().connectError, 'rejected');
     });
 
-    test('connect: failure keeps the login screen with the error; success '
-        'enters the session', () async {
+    test('connect: failure keeps the server-address screen with the error; '
+        'success opens Log in (Phase M 7.1)', () async {
       await session().start();
       service.connectError = 'unreachable';
       await session().connect('http://typo');
-      expect(session().phase, SessionPhase.signedOut);
+      expect(session().phase, SessionPhase.serverAddress);
       expect(session().connectError, 'unreachable');
       service.connectError = null;
       await session().connect('http://ok');
-      expect(session().phase, SessionPhase.live);
+      expect(session().phase, SessionPhase.logIn);
       expect(session().connectError, isNull);
     });
 
@@ -171,8 +182,11 @@ void main() {
         expect(service.resets, 1);
         expect(session().phase, SessionPhase.resetComplete);
         expect(session().resetFailure, same(service.resetFailure));
-        session().acknowledgeReset();
-        expect(session().phase, SessionPhase.signedOut);
+        expect(service.reloads, 0, reason: 'the view shows the result first');
+        await session().acknowledgeReset();
+        // Review r1 m-R1-08: the model rebuilds the scope, never the view.
+        expect(service.reloads, 1);
+        expect(session().phase, SessionPhase.serverAddress);
         expect(session().resetFailure, isNull);
       },
     );
@@ -189,7 +203,7 @@ void main() {
 
       test('asks first: still signed out, nothing reset, no error', () async {
         final notified = await askSwitch();
-        expect(session().phase, SessionPhase.signedOut);
+        expect(session().phase, SessionPhase.serverAddress);
         expect(session().pendingServerSwitch, 'http://b');
         expect(session().connectError, isNull);
         expect(notified, greaterThan(0));
@@ -201,7 +215,7 @@ void main() {
         await askSwitch();
         session().cancelServerSwitch();
         expect(session().pendingServerSwitch, isNull);
-        expect(session().phase, SessionPhase.signedOut);
+        expect(session().phase, SessionPhase.serverAddress);
         expect(service.switchedTo, isEmpty);
       });
 
@@ -224,13 +238,16 @@ void main() {
         () async {
       var notified = 0;
       session().addListener(() => notified++);
-      expect(session().serverBlocked, isFalse);
-      service.blocked.value = true;
-      expect(session().serverBlocked, isTrue);
+      expect(session().serverBlocked, ServerBlockedReason.none);
+      service.blocked.value = ServerBlockedReason.differentServer;
+      expect(session().serverBlocked, ServerBlockedReason.differentServer);
       expect(notified, 1);
-      service.blocked.value = false;
-      expect(session().serverBlocked, isFalse);
+      service.blocked.value = ServerBlockedReason.signedOut;
+      expect(session().serverBlocked, ServerBlockedReason.signedOut);
       expect(notified, 2);
+      service.blocked.value = ServerBlockedReason.none;
+      expect(session().serverBlocked, ServerBlockedReason.none);
+      expect(notified, 3);
     });
 
     test('Reset on the blocked banner: resetting, then complete, through '
@@ -247,6 +264,113 @@ void main() {
       expect(session().phase, SessionPhase.resetComplete);
     });
 
+    // U21-FE-SESSION-A-03: a storage fault inside the model must not leave
+    // the splash or the reset spinner up until the app restarts.
+    group('a storage fault in the model', () {
+      test('at launch: the retry screen, not the splash', () async {
+        service.startError = StateError('prefs unreadable');
+        final error = await session()
+            .start()
+            .then<Object?>((_) => null, onError: (Object e) => e);
+        expect(session().phase, SessionPhase.credentialsUnavailable);
+        expect(error, isNull, reason: 'start never throws into the view');
+        // Sign-off s7-app-texts item 1: the retry screen names the saved
+        // session, not the stored sign-in.
+        expect(session().launchFailed, isTrue);
+      });
+
+      test('an unreadable stored sign-in is not a launch fault', () async {
+        service.start = const SessionStart(
+          SessionStartKind.credentialsUnavailable,
+          serverUrl: 'http://s',
+        );
+        await session().start();
+        expect(session().phase, SessionPhase.credentialsUnavailable);
+        expect(session().launchFailed, isFalse);
+      });
+
+      test('at connect: the server-address screen, and connect completes',
+          () async {
+        await session().start();
+        service.connectThrows = StateError('database is locked');
+        final error = await session()
+            .connect('http://x')
+            .then<Object?>((_) => null, onError: (Object e) => e);
+        expect(error, isNull, reason: 'connect never throws into the view');
+        expect(session().phase, SessionPhase.serverAddress);
+        // Sign-off s7-app-texts item 1.
+        expect(session().connectError,
+            'This device could not save the server address.');
+      });
+
+      test("at connect: an earlier attempt's error is not left on screen",
+          () async {
+        await session().start();
+        service.connectError = 'Could not reach the server.';
+        await session().connect('http://x');
+        expect(session().connectError, 'Could not reach the server.');
+        service.connectThrows = StateError('database is locked');
+        await session()
+            .connect('http://x')
+            .then<void>((_) {}, onError: (Object _) {});
+        expect(session().connectError,
+            'This device could not save the server address.',
+            reason: 'the old message would name the wrong cause');
+      });
+
+      test('in a reset: the reset still completes and its failure is shown',
+          () async {
+        service.resetThrows = StateError('disk I/O error');
+        await session().disconnect().then<void>((_) {}, onError: (Object _) {});
+        expect(session().phase, SessionPhase.resetComplete);
+        final failure = session().resetFailure;
+        expect(failure, isNotNull);
+        expect(failure!.failures.any((f) => !f.quiesce), isTrue,
+            reason: 'nothing may be assumed wiped: shown as incomplete');
+      });
+    });
+
+    // EX-75c (SC-26): whether the finished reset's dialog is the "sign-in
+    // not saved" sentence is the model's rule, read through the controller,
+    // so the view imports no service.
+    group('signInNotSavedNotice', () {
+      Future<String?> after(LocalResetException failure) async {
+        service.resetFailure = failure;
+        await session().disconnect();
+        return session().signInNotSavedNotice;
+      }
+
+      LocalResetFailure notSaved() =>
+          SignInNotSavedFailure(StateError('keychain'), StackTrace.empty);
+
+      test('only the sign-in was not saved: the sentence', () async {
+        expect(await after(LocalResetException([notSaved()])),
+            'Could not save the sign-in on this device.');
+      });
+
+      test('with a quiesce failure too: still the sentence', () async {
+        expect(
+          await after(LocalResetException([
+            LocalResetFailure(int, StateError('in flight'), StackTrace.empty,
+                quiesce: true),
+            notSaved(),
+          ])),
+          'Could not save the sign-in on this device.',
+        );
+      });
+
+      test('with a wipe failure too: none (the reset is incomplete)',
+          () async {
+        expect(
+          await after(LocalResetException([
+            LocalResetFailure(int, StateError('wipe failed'), StackTrace.empty),
+            notSaved(),
+          ])),
+          isNull,
+        );
+      });
+    });
+
     test('the loss summaries come from the model', () async {
       service.losses = ['2 unsent metadata edits'];
       expect(
@@ -260,15 +384,16 @@ void main() {
     Future<FakeSessionControls> pump(
       WidgetTester tester,
       SessionPhase phase, {
-      VoidCallback? onLocalResetComplete,
+      Future<void> Function()? onSessionChanged,
     }) async {
       final fake = FakeSessionControls(phase: phase);
       await tester.pumpWidget(
         ProviderScope(
-          overrides: [sessionControlsProvider.overrideWithValue(fake)],
-          child: MaterialApp(
-            home: StartupGate(onLocalResetComplete: onLocalResetComplete),
-          ),
+          overrides: [
+            sessionControlsProvider.overrideWithValue(fake),
+            onSessionChangedProvider.overrideWithValue(onSessionChanged),
+          ],
+          child: const MaterialApp(home: StartupGate()),
         ),
       );
       await tester.pump();
@@ -284,9 +409,9 @@ void main() {
     testWidgets('signed out: login screen with the error; connect is the '
         "controller's", (tester) async {
       final fake = await pump(tester, SessionPhase.starting);
-      fake.set(SessionPhase.signedOut, error: 'rejected');
+      fake.set(SessionPhase.serverAddress, error: 'rejected');
       await tester.pump();
-      final login = tester.widget<LoginPage>(find.byType(LoginPage));
+      final login = tester.widget<ServerAddressPage>(find.byType(ServerAddressPage));
       expect(login.error, 'rejected');
       await login.onConnect('http://x');
       expect(fake.calls, ['start', 'connect http://x']);
@@ -298,7 +423,7 @@ void main() {
       final fake = await pump(
         tester,
         SessionPhase.resetting,
-        onLocalResetComplete: () => rebuilt++,
+        onSessionChanged: () async => rebuilt++,
       );
       fake.set(SessionPhase.resetComplete, failure: LocalResetException([
         LocalResetFailure(int, TimeoutException('history pass in flight'),
@@ -307,7 +432,10 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
       expect(find.text('Reset incomplete'), findsNothing);
-      expect(rebuilt, 1);
+      // Review r1 m-R1-08: the view hands the finished reset to the
+      // controller; it never calls the model's rebuild hook itself.
+      expect(fake.calls, contains('acknowledgeReset'));
+      expect(rebuilt, 0);
     });
 
     testWidgets('a partial reset is shown, then the scope is rebuilt', (
@@ -317,7 +445,7 @@ void main() {
       final fake = await pump(
         tester,
         SessionPhase.resetting,
-        onLocalResetComplete: () => rebuilt++,
+        onSessionChanged: () async => rebuilt++,
       );
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
       fake.set(SessionPhase.resetComplete, failure: LocalResetException([
@@ -328,16 +456,82 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
       expect(find.text('Reset incomplete'), findsOneWidget);
-      expect(rebuilt, 0);
+      expect(fake.calls, isNot(contains('acknowledgeReset')));
       await tester.tap(find.text('OK'));
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
-      expect(rebuilt, 1);
+      expect(fake.calls, contains('acknowledgeReset'));
+      expect(rebuilt, 0, reason: 'review r1 m-R1-08: never the view');
+    });
+
+    // U21-FE-SESSION-B-02: the wipe worked, the held sign-in could not be
+    // saved. Shown as that, not as data left behind.
+    testWidgets('a sign-in not saved after a clean wipe is not shown as an '
+        'incomplete reset', (tester) async {
+      final fake = await pump(tester, SessionPhase.resetting);
+      fake.set(SessionPhase.resetComplete, failure: LocalResetException([
+        SignInNotSavedFailure(StateError('keychain'), StackTrace.empty),
+      ]));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(find.text('Reset incomplete'), findsNothing);
+      // Sign-off s7-app-texts item 1: the dialog has a title of its own.
+      expect(find.widgetWithText(AlertDialog, 'Sign-in not saved'),
+          findsOneWidget);
+      expect(find.text('Could not save the sign-in on this device.'),
+          findsOneWidget);
+      await tester.tap(find.text('OK'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(fake.calls, contains('acknowledgeReset'));
+    });
+
+    // Sign-off s7-app-texts item 1: a fault thrown at launch is not a stored
+    // sign-in that could not be read; the same retry screen names the saved
+    // session, and keeps both buttons and what they do.
+    group('the retry screen', () {
+      const sessionUnreadable = "This device's saved session could not be read.";
+      const signInUnreadable = 'Your sign-in could not be read.';
+      const signInKept = 'Your saved sign-in is still on this device. Try '
+          'again, or log in again to replace it.';
+
+      testWidgets('after a launch fault: the saved session, both buttons',
+          (tester) async {
+        final fake = FakeSessionControls(
+          phase: SessionPhase.credentialsUnavailable,
+        )..launchFailed = true;
+        await tester.pumpWidget(ProviderScope(
+          overrides: [sessionControlsProvider.overrideWithValue(fake)],
+          child: const MaterialApp(home: StartupGate()),
+        ));
+        await tester.pump();
+        expect(find.text(sessionUnreadable), findsOneWidget);
+        expect(find.text(signInUnreadable), findsNothing);
+        expect(find.text(signInKept), findsNothing,
+            reason: 'whether a sign-in is stored is not known here');
+        await tester.tap(find.text('Try again'));
+        await tester.tap(find.text('Log in again'));
+        await tester.pump();
+        expect(fake.calls, ['start', 'retryCredentials', 'logInAgain']);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+
+      testWidgets('an unreadable stored sign-in: the sign-in texts as before',
+          (tester) async {
+        final fake = await pump(tester, SessionPhase.credentialsUnavailable);
+        expect(find.text(signInUnreadable), findsOneWidget);
+        expect(find.text(signInKept), findsOneWidget);
+        expect(find.text(sessionUnreadable), findsNothing);
+        expect(find.text('Try again'), findsOneWidget);
+        expect(find.text('Log in again'), findsOneWidget);
+        expect(fake.launchFailed, isFalse);
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
     });
 
     group('a login finds a different server', () {
       Future<FakeSessionControls> ask(WidgetTester tester) async {
-        final fake = await pump(tester, SessionPhase.signedOut);
+        final fake = await pump(tester, SessionPhase.serverAddress);
         fake.lossSummaries = ['2 unsent metadata edits'];
         fake.askServerSwitch('http://b');
         await tester.pump();
@@ -362,7 +556,7 @@ void main() {
         await tester.pumpAndSettle();
         expect(fake.calls, contains('cancelServerSwitch'));
         expect(fake.calls, isNot(contains('confirmServerSwitch')));
-        expect(find.byType(LoginPage), findsOneWidget);
+        expect(find.byType(ServerAddressPage), findsOneWidget);
       });
 
       testWidgets('confirm resets and keeps the URL', (tester) async {

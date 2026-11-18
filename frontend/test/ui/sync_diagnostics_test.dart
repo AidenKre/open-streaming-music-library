@@ -17,10 +17,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'fake_session_controls.dart';
 import 'browse_harness.dart' show teardownTree;
+import '../helpers/test_credentials.dart';
 
 class _Online extends OfflineModeNotifier {
   @override
-  bool build() => false;
+  bool build() {
+    super.build();
+    return false;
+  }
 }
 
 class _FakeControls implements SyncDiagnosticsControls {
@@ -61,6 +65,7 @@ void main() {
     await tester.pumpWidget(ProviderScope(
       overrides: [
         sharedPreferencesProvider.overrideWith((_) async => prefs),
+        credentialStoreTestOverride(),
         offlineModeProvider.overrideWith(_Online.new),
         sessionControlsProvider.overrideWithValue(FakeSessionControls()),
         historyDiagnosticsProvider.overrideWith((ref) => Stream.value(diagnostics)),

@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -15,12 +16,18 @@ import 'package:frontend/services/session_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/server_binding.dart';
+import '../helpers/test_credentials.dart';
 
 class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    // Keep the product's dispose wiring (cancels the health-poll timer that
+    // the inherited enterOffline starts); the stub's value stays the state.
+    super.build();
+    return _value;
+  }
 }
 
 class _FakeReset extends LocalResetService {
@@ -34,23 +41,45 @@ class _FakeReset extends LocalResetService {
   }
 }
 
-http.Client _server(int status) =>
-    MockClient((_) async => http.Response(status == 200 ? '{"message":"Healthy"}' : '{"message":"nope"}', status));
+http.Client _server(int status) => MockClient((req) async =>
+    req.url.path.endsWith('/app/info')
+        ? http.Response('{"server":{"instance_id":"inst-1"},"auth":{"version":1,"signup_enabled":true}}', 200)
+        : http.Response(status == 200 ? '{"message":"Healthy"}' : '{"message":"nope"}', status));
 http.Client _unreachable() =>
     MockClient((_) async => throw const SocketException('down'));
+
+/// A transport whose delegate each test picks after the container exists.
+class _SwitchClient extends http.BaseClient {
+  http.Client inner = _unreachable();
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      inner.send(request);
+}
 
 /// The session rules that used to live inside StartupGate (SC-26: model).
 void main() {
   late ProviderContainer c;
   _FakeReset? reset;
+  var transport = _SwitchClient();
+  void useClient(http.Client client) => transport.inner = client;
 
-  ProviderContainer make({bool offline = false, LocalResetException? failure}) {
+  Future<ProviderContainer> make(
+      {bool offline = false, LocalResetException? failure}) async {
     // SC-01: a session writes its binding row and verifies the connection
     // through the binding gate (identity probe answered immediately).
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
+    transport = _SwitchClient();
     c = ProviderContainer(
       overrides: [
+        apiClientProvider.overrideWithValue(testApiClient('http://s', transport)),
+        unauthenticatedApiClientProvider.overrideWithValue(
+          (url) => testApiClient(url, transport),
+        ),
+        // A signed-in session (Phase M 7.1: a launch without credentials
+        // goes to Log in).
+        credentialsProvider.overrideWithValue(testCredentials),
+        credentialStoreTestOverride(),
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(startOnRead: false),
         offlineModeProvider.overrideWith(() => _StubOffline(offline)),
@@ -61,6 +90,9 @@ void main() {
     );
     addTearDown(c.dispose);
     c.read(offlineModeProvider);
+    // The signed-in user's binding row: stored credentials are used only
+    // with a row for their user (review r1 m-R1-18); login creates it.
+    await seedTestBinding(db, baseUrl: 'http://s', userId: testCredentials.userId);
     return c;
   }
 
@@ -69,15 +101,15 @@ void main() {
   group('resumeSavedSession', () {
     test('no saved URL: signed out', () async {
       SharedPreferences.setMockInitialValues({});
-      make();
+      await make();
       expect((await service().resumeSavedSession()).kind,
-          SessionStartKind.signedOut);
+          SessionStartKind.serverAddress);
     });
 
     test('healthy saved server: online', () async {
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      make();
-      ApiClient.initForTest('http://s', _server(200));
+      await make();
+      useClient(_server(200));
       final start = await service().resumeSavedSession();
       expect(start.kind, SessionStartKind.online);
       expect(c.read(offlineModeProvider), isFalse);
@@ -85,8 +117,8 @@ void main() {
 
     test('unreachable saved server: offline session, URL kept', () async {
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      make();
-      ApiClient.initForTest('http://s', _unreachable());
+      await make();
+      useClient(_unreachable());
       final start = await service().resumeSavedSession();
       expect(start.kind, SessionStartKind.offline);
       expect(c.read(offlineModeProvider), isTrue);
@@ -97,10 +129,11 @@ void main() {
     test('server rejects us: URL forgotten, error kept for the login screen',
         () async {
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      make();
-      ApiClient.initForTest('http://s', _server(500));
+      await make();
+      // Sign-off OPEN-A-04: a 4xx rejects; a 5xx is "unreachable".
+      useClient(_server(404));
       final start = await service().resumeSavedSession();
-      expect(start.kind, SessionStartKind.signedOut);
+      expect(start.kind, SessionStartKind.serverAddress);
       expect(start.error, isNotNull);
       expect((await SharedPreferences.getInstance()).getString('serverUrl'),
           isNull);
@@ -110,8 +143,8 @@ void main() {
   group('connect', () {
     test('a healthy server is saved and clears offline mode', () async {
       SharedPreferences.setMockInitialValues({});
-      make(offline: true);
-      ApiClient.initForTest('http://new', _server(200));
+      await make(offline: true);
+      useClient(_server(200));
       expect(await service().connect('http://new'), isA<ConnectSucceeded>());
       expect((await SharedPreferences.getInstance()).getString('serverUrl'),
           'http://new');
@@ -120,8 +153,8 @@ void main() {
 
     test('an unproven URL is not saved and does not enter offline', () async {
       SharedPreferences.setMockInitialValues({});
-      make();
-      ApiClient.initForTest('http://typo', _unreachable());
+      await make();
+      useClient(_unreachable());
       expect(await service().connect('http://typo'), isA<ConnectFailed>());
       expect((await SharedPreferences.getInstance()).getString('serverUrl'),
           isNull);
@@ -131,7 +164,7 @@ void main() {
 
   group('resetLocalData', () {
     test('a clean reset reports no failure', () async {
-      make();
+      await make();
       expect(await service().resetLocalData(), isNull);
       expect(reset!.resets, 1);
     });
@@ -140,12 +173,12 @@ void main() {
       final failure = LocalResetException([
         LocalResetFailure(String, StateError('disk'), StackTrace.empty),
       ]);
-      make(failure: failure);
+      await make(failure: failure);
       expect(await service().resetLocalData(), same(failure));
     });
 
     test('an unexpected error is reported as a reset failure', () async {
-      make();
+      await make();
       c.dispose();
       final c2 = ProviderContainer(
         overrides: [
@@ -163,35 +196,38 @@ void main() {
     test('online and offline resumes are ready; a rejected one is not',
         () async {
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      make();
-      ApiClient.initForTest('http://s', _server(200));
+      await make();
+      useClient(_server(200));
       await service().resumeSavedSession();
       await pumpEventQueue(); // online: ready on the binding gate's verdict
       expect(c.read(sessionReadinessProvider).isReady, isTrue,
           reason: 'online cold start must be ready');
 
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      make();
-      ApiClient.initForTest('http://s', _unreachable());
+      await make();
+      useClient(_unreachable());
       await service().resumeSavedSession();
       expect(c.read(sessionReadinessProvider).isReady, isTrue);
 
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      make();
-      ApiClient.initForTest('http://s', _server(500));
+      await make();
+      useClient(_server(404)); // a 4xx rejects (sign-off OPEN-A-04)
       await service().resumeSavedSession();
       expect(c.read(sessionReadinessProvider).isReady, isFalse);
     });
 
-    test('a successful connect is ready; a failed one is not', () async {
+    // Phase M 7.1: a successful connect goes to Log in; the session (and
+    // playback restore) starts only after login rebuilds the scope.
+    test('neither a failed nor a successful connect is ready (Log in next)',
+        () async {
       SharedPreferences.setMockInitialValues({});
-      make();
-      ApiClient.initForTest('http://typo', _unreachable());
+      await make();
+      useClient(_unreachable());
       await service().connect('http://typo');
       expect(c.read(sessionReadinessProvider).isReady, isFalse);
-      ApiClient.initForTest('http://ok', _server(200));
-      await service().connect('http://ok');
-      expect(c.read(sessionReadinessProvider).isReady, isTrue);
+      useClient(_server(200));
+      expect(await service().connect('http://ok'), isA<ConnectSucceeded>());
+      expect(c.read(sessionReadinessProvider).isReady, isFalse);
     });
   });
 

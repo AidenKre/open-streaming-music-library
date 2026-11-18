@@ -4,6 +4,8 @@ import 'dart:developer' as developer;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
+import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
@@ -38,10 +40,10 @@ class QueueWarmService {
 
   QueueWarmService({
     required QueueRepository queueRepo,
-    ApiClient? apiClient,
+    required ApiClient apiClient,
     bool Function()? isOfflineFn,
   })  : _queueRepo = queueRepo,
-        _apiClient = apiClient ?? ApiClient.instance,
+        _apiClient = apiClient,
         _isOfflineFn = isOfflineFn ?? (() => false);
 
   void scheduleWarm({
@@ -69,15 +71,16 @@ class QueueWarmService {
     if (sessionId == null) return;
     // Warming is advisory and pure overhead while the network is down.
     if (_isOfflineFn()) return;
-    final entries = await _queueRepo.getPlaybackEntries(
-      sessionId,
-      startPlayPosition: currentPlayPosition,
-      limit: _maxTrackUuids,
-    );
-    if (entries.isEmpty) return;
-
-    final trackUuids = entries.map((e) => e.uuidId).toList(growable: false);
+    // Advisory, fired from a timer: nothing here may escape it.
     try {
+      final entries = await _queueRepo.getPlaybackEntries(
+        sessionId,
+        startPlayPosition: currentPlayPosition,
+        limit: _maxTrackUuids,
+      );
+      if (entries.isEmpty) return;
+
+      final trackUuids = entries.map((e) => e.uuidId).toList(growable: false);
       await _apiClient.postJson(
         ['tracks', 'warm'],
         body: {
@@ -90,6 +93,10 @@ class QueueWarmService {
     } on ApiException catch (e) {
       developer.log('queue warm failed: $e', name: 'QueueWarm');
     } on NetworkException catch (e) {
+      developer.log('queue warm failed: $e', name: 'QueueWarm');
+    } on TokenWithheldException {
+      developer.log('queue warm skipped: the server is not verified', name: 'QueueWarm');
+    } catch (e) {
       developer.log('queue warm failed: $e', name: 'QueueWarm');
     }
   }
@@ -143,6 +150,8 @@ class QueueWarmService {
       developer.log('queue warm (uuids) failed: $e', name: 'QueueWarm');
     } on NetworkException catch (e) {
       developer.log('queue warm (uuids) failed: $e', name: 'QueueWarm');
+    } on TokenWithheldException {
+      developer.log('queue warm (uuids) skipped: the server is not verified', name: 'QueueWarm');
     }
   }
 
@@ -156,6 +165,7 @@ class QueueWarmService {
 final queueWarmServiceProvider = Provider<QueueWarmService>((ref) {
   final service = QueueWarmService(
     queueRepo: ref.read(queueRepositoryProvider),
+    apiClient: ref.read(apiClientProvider),
     isOfflineFn: () => ref.read(offlineModeProvider),
   );
   ref.onDispose(service.dispose);

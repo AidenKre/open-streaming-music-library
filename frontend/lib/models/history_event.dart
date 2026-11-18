@@ -78,9 +78,14 @@ class HistoryPage {
     required this.events,
     required this.nextCursor,
     required this.latestRevision,
+    this.servedBy,
   });
 
   final List<HistoryServerEvent> events;
   final int? nextCursor;
   final int latestRevision;
+
+  /// The server instance that served this page (SC-01 rule 6); null when
+  /// the response carried no stamp.
+  final String? servedBy;
 }

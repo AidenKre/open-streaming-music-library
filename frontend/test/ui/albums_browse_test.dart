@@ -1,9 +1,7 @@
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/browse/browse_pages.dart';
@@ -11,6 +9,7 @@ import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
+import 'package:frontend/ui/widgets/library_card.dart';
 import 'package:frontend/ui/widgets/search_status.dart';
 
 import 'browse_harness.dart';
@@ -22,8 +21,6 @@ void main() {
   late BrowseHarness h;
 
   setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
   });
 
   setUp(() async {
@@ -244,5 +241,41 @@ void main() {
       expect((d.albumId, d.artistId), (20, 2));
       await teardownTree(tester);
     });
+  });
+
+  // 6-R1-05 / DEV-6-05: the shared card's one availability rule applies in
+  // the browse grid too.
+  testWidgets('offline with the chip off: albums with nothing playable dim, '
+      'a partly downloaded one does not, and a dimmed one still opens', (
+    tester,
+  ) async {
+    await pump(tester, offline: true);
+    await tester.tap(find.byKey(FilterBar.downloadedChipKey)); // OFF
+    await tester.pumpAndSettle();
+    expect(shownIds(tester).toSet(), {10, 20, 21, 30});
+
+    Finder card(int id) => find.byWidgetPredicate(
+        (w) => w is AlbumCard && w.album.id == id);
+    bool dimmed(int id) => tester
+        .widget<LibraryCard>(
+            find.descendant(of: card(id), matching: find.byType(LibraryCard)))
+        .dimmed;
+    expect(dimmed(10), isFalse, reason: 'one of two tracks is downloaded');
+    expect(dimmed(20), isTrue);
+    expect(dimmed(21), isTrue);
+    expect(dimmed(30), isTrue);
+
+    await tester.tap(card(30));
+    await tester.pumpAndSettle();
+    expect(tester.widget<TracksPage>(find.byType(TracksPage)).albumId, 30);
+    await teardownTree(tester);
+  });
+
+  testWidgets('online, nothing dims', (tester) async {
+    await pump(tester);
+    for (final c in tester.widgetList<LibraryCard>(find.byType(LibraryCard))) {
+      expect(c.dimmed, isFalse);
+    }
+    await teardownTree(tester);
   });
 }

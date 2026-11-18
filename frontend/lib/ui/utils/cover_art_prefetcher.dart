@@ -1,5 +1,6 @@
-import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
 
-void prefetchCoverArt(List<int> coverArtIds) {
-  coverArtCache.prefetch(coverArtIds);
+void prefetchCoverArt(WidgetRef ref, List<int> coverArtIds) {
+  ref.read(coverArtCacheProvider).prefetch(coverArtIds);
 }

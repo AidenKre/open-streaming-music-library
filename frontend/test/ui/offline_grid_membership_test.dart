@@ -1,10 +1,8 @@
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/album_ui.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/library_actions.dart';
@@ -21,8 +19,6 @@ void main() {
   late BrowseHarness harness;
 
   setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
   });
 
   setUp(() async {

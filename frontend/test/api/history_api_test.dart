@@ -28,10 +28,11 @@ HistoryUploadBatch _batch(List<HistoryEventPayload> events) => HistoryUploadBatc
 
 void main() {
   late List<http.Request> requests;
+  late ApiClient client;
 
   void serve(http.Response Function(http.Request) handler) {
     requests = [];
-    ApiClient.initForTest(
+    client = testApiClient(
       'http://srv',
       MockClient((req) async {
         requests.add(req);
@@ -50,7 +51,7 @@ void main() {
     test('sends the batch body byte for byte and returns the raw ACK', () async {
       serve((_) => json({'acknowledged': ['a', 'b']}));
       final batch = _batch([_event('a', ref: 'é🎵"\\'), _event('b')]);
-      final ack = await HistoryApi().post(batch);
+      final ack = await HistoryApi(api: client).post(batch);
       expect(ack, ['a', 'b']);
       final req = requests.single;
       expect(req.method, 'POST');
@@ -61,7 +62,7 @@ void main() {
 
     test('a response without an ACK list returns it as-is (null)', () async {
       serve((_) => json({'unexpected': true}));
-      expect(await HistoryApi().post(_batch([_event('a')])), isNull);
+      expect(await HistoryApi(api: client).post(_batch([_event('a')])), isNull);
     });
 
     test('a 409 conflict is a typed ApiException', () async {
@@ -74,7 +75,7 @@ void main() {
         },
       }, 409));
       await expectLater(
-        HistoryApi().post(_batch([_event('a')])),
+        HistoryApi(api: client).post(_batch([_event('a')])),
         throwsA(isA<ApiException>()
             .having((e) => e.statusCode, 'status', 409)
             .having((e) => e.errorCode, 'code', 'history_event_conflict')
@@ -96,7 +97,7 @@ void main() {
         'nextCursor': 7,
         'latestRevision': 9,
       }));
-      final page = await HistoryApi().changes(after: 5, limit: 50);
+      final page = await HistoryApi(api: client).changes(after: 5, limit: 50);
       final req = requests.single;
       expect(req.url.path, '/history/changes');
       expect(req.url.queryParameters, {'after': '5', 'limit': '50'});
@@ -113,7 +114,7 @@ void main() {
 
     test('the default limit is 200; a null nextCursor parses', () async {
       serve((_) => json({'events': [], 'nextCursor': null, 'latestRevision': 0}));
-      final page = await HistoryApi().changes(after: 0);
+      final page = await HistoryApi(api: client).changes(after: 0);
       expect(requests.single.url.queryParameters['limit'], '200');
       expect(page.events, isEmpty);
       expect(page.nextCursor, isNull);
@@ -138,7 +139,7 @@ void main() {
       test('a malformed page ($label) is a FormatException', () async {
         serve((_) => json(body));
         await expectLater(
-          HistoryApi().changes(after: 0),
+          HistoryApi(api: client).changes(after: 0),
           throwsA(isA<FormatException>()),
         );
       });

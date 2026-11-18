@@ -1,17 +1,33 @@
+import functools
 import json
-import os
+import logging
 import sqlite3
+import threading
+import time
+from uuid import UUID, uuid4
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 
+from app.auth.passwords import prepare_dummy_hash
+from app.bootstrap import bootstrap_master_admin
 from app.config import settings
+from app.auth.middleware import AuthMiddleware
+from app.core.access_log import install_access_log_redaction
+from app.library import Library, current_library, library_root
 from app.core.instance_lock import acquire_instance_lock
+from app.core.internal_dirs import STAGING, UPLOADS, ensure_internal_dirs, is_or_inside as _is_or_inside
+from app.services.user_delete import (
+    RECORDED_ROOT_KEYS,
+    DeletePaths,
+    resume_user_deletes,
+)
 from app.database import (
+    ANY_OWNER,
     AlbumOrderParameter,
     AlbumRowFilterParameter,
     ArtistOrderParameter,
@@ -19,6 +35,7 @@ from app.database import (
     ConversionJobActive,
     Database,
     DatabaseContext,
+    server_database,
     EmptyTrackEdit,
     OrderParameter,
     RevisionConflict,
@@ -54,9 +71,27 @@ from app.models import (
 )
 from app.core.media_types import CODEC_MIME, MIME_EXTENSION, is_lossless
 from app.models.edit_fields import EDIT_FIELD_SPECS
-from app.models.api_return_models import HistoryCapabilities, ServerInfo
+from app.models.api_return_models import (
+    AuthCapabilities,
+    HistoryCapabilities,
+    ServerInfo,
+    UploadLimitsInfo,
+    UploadsCapabilities,
+)
+from app.services.upload_limits import effective_upload_limits
+from app.routers.auth import router as auth_router
 from app.routers.history import router as history_router
+from app.routers.uploads import router as uploads_router
+from app.core.api_errors import api_error
 from app.services.metadata import TagWriteError
+from app.services.job_runtime import CancelTokens
+from app.services.storage_ledger import StagedQuota, StorageLedger
+from app.services import upload_commit, upload_janitor, upload_publish, upload_recovery
+from app.services import upload_receipt as upload_receipts
+from app.services import upload_validation, upload_zip
+from app.services import filesystem_check
+from app.core.byte_range import parse_byte_range, ranged_file_response
+from app.services.upload_receipt import ReceiptRuntime, TransferSlots
 from app.services.track_edit import (
     TrackPatchRequest,
     WriteMode,
@@ -73,10 +108,19 @@ from app.services.conversion import (
     reconcile_conversion_jobs,
 )
 from app.services.track_editor import (
+    MasterSwapPending,
     MasterWriteError,
     TrackEditor,
+    finish_kept_journal_rows,
     reconcile_journal,
 )
+from app.services.import_folders import (
+    ImportDispatcher,
+    ensure_user_import_folders,
+)
+from app.services.import_archive import import_archive_limits, sweep_workspace, upload_only_settings_notice
+from app.services.ingestion import IMPORTED_DIR_NAME
+from app.services.pipeline import make_pipeline
 from app.services.track_locks import TrackLocks
 from app.services import (
     CoverArtContext,
@@ -85,10 +129,6 @@ from app.services import (
     EncodedCacheContext,
     EncoderCoordinator,
     FileWatcher,
-    Ingestor,
-    IngestorContext,
-    Organizer,
-    OrganizerContext,
     ORIGINAL_QUALITY,
     QUALITY_BITRATES_KBPS,
     normalize_quality,
@@ -99,8 +139,44 @@ from app.services.encoder_coordinator import (
     PrefetchOutcome,
     SourceUnavailable,
 )
+from app.services.ffmpeg_runner import FfmpegProcessRegistry, kill_orphaned_ffmpeg
+from app.services import audio_identity
+from app.services.fingerprinter import detect_fingerprinter
+from app.services.startup_recovery import StartupStep, run_startup_recovery
+from app.services.file_watcher import stop_watchers
+from app.services.identity_worker import (
+    JOIN_TIMEOUT_S as IDENTITY_JOIN_TIMEOUT_S,
+    AudioIdentityWorker,
+    default_matcher_version,
+    reconcile_audio_identity,
+)
+from app.services.duplicate_detection import MatcherParams
+from app.services.identity_wakeup import IdentityWakeup
+from app.services.settle_check import SettleCheck, make_settle_refresh
 from app.services.job_request import PostJobRequest
 from app.services.transcoder import SUPPORTED_TARGET_CODECS
+
+
+def resolve_default_quality(stored: Optional[str]) -> str:
+    """Fallback chain stored (user_settings) -> env -> original; logs skipped values."""
+    for candidate, source_label in (
+        (stored, "persisted"),
+        (settings.default_streaming_quality, "env/config"),
+    ):
+        if candidate is None:
+            continue
+        try:
+            return normalize_quality(candidate)
+        except ValueError:
+            print(
+                f"Invalid {source_label} default_streaming_quality "
+                f"{candidate!r}; falling back."
+            )
+    print(
+        f"No valid default_streaming_quality configured; using "
+        f"{ORIGINAL_QUALITY!r}."
+    )
+    return ORIGINAL_QUALITY
 
 
 @asynccontextmanager
@@ -115,94 +191,326 @@ async def lifespan(_app: FastAPI):
 # The POSIX instance lock guards startup before migrations; run with --workers 1.
 # TODO: Dependency inject depends on get_database into api endpoints (and make the new function needed for this)
 app = FastAPI(lifespan=lifespan)
+app.include_router(uploads_router)
 app.include_router(history_router)
+app.include_router(auth_router)
+# Spec §5.3: the auth boundary is the outermost user middleware. Starlette
+# wraps the last-added middleware outermost, so add any future middleware
+# before this line.
+app.add_middleware(AuthMiddleware)
 
 
 def _resolve_track_source_path(database: Database, uuid_id: str) -> Optional[Path]:
-    track = database.get_track_by_uuid(uuid_id)
+    track = database.get_track_by_uuid(uuid_id, owner_id=ANY_OWNER)
     return track.file_path if track is not None else None
 
 
-def _assert_dirs_non_overlapping(import_dir: Path, library_dir: Path) -> None:
-    """Fail startup if import_dir and music_library_dir are the same or one is
-    nested in the other — otherwise edit staging (under the library) could be
-    re-ingested by the import watcher."""
-    a = import_dir.resolve()
-    b = library_dir.resolve()
-    if a == b or a in b.parents or b in a.parents:
+def _resolve_track_owner(database: Database, uuid_id: str) -> Optional[int]:
+    track = database.get_track_by_uuid(uuid_id, owner_id=ANY_OWNER)
+    return track.owner_id if track is not None else None
+
+
+def _interrupted_conversion_uuids(database: Database) -> set[str]:
+    return {
+        e["uuid_id"]
+        for e in database.list_journal_entries(owner_id=ANY_OWNER)
+        if e["intent"] == "convert"
+    }
+
+
+def _startup_recovery_steps(
+    *,
+    database: Database,
+    staging_dir: Path,
+    identity_signal: IdentityWakeup,
+    encoded_cache: EncodedCache,
+    default_cache: EncodedCache,
+    matcher_version: str | None,
+    fingerprinter,
+    storage_ledger,
+    uploads_root: Path,
+    boot_id: str,
+    cover_art,
+) -> list[StartupStep]:
+    # A convert journal row outliving a crash means its commit may have landed
+    # without the encoded caches being evicted. Read the rows before journal
+    # recovery runs; the conversion step evicts for every row read, whether
+    # recovery finished it or kept it.
+    interrupted_conversion_uuids = _interrupted_conversion_uuids(database)
+
+    def edit_journal() -> None:
+        # Finish/revert any edit interrupted by a crash before serving requests.
+        reconcile_journal(
+            database, settings.music_library_dir, identity_signal=identity_signal
+        )
+
+    def conversion_jobs() -> None:
+        # Journal recovery keeps a convert row it cannot prove: evict for every
+        # convert row read before recovery ran, whether it finished or kept the
+        # row, even if the reconcile raises; otherwise a later start could never
+        # evict the rows it finished.
+        try:
+            # No worker thread survives a restart -- any conversion job still
+            # "running" is orphaned; independent of the journal pass above.
+            reconcile_conversion_jobs(database, staging_dir)
+        finally:
+            for uuid_id in interrupted_conversion_uuids:
+                evict_converted_track_caches(uuid_id, encoded_cache, default_cache)
+
+    def audio_identity_reconcile() -> None:
+        reconcile_audio_identity(
+            database,
+            matcher_version=matcher_version,
+            tool_versions=audio_identity.tool_versions(fingerprinter=fingerprinter),
+            fingerprinter_present=fingerprinter is not None,
+            fingerprint_algorithm=(
+                fingerprinter.algorithm if fingerprinter is not None else None
+            ),
+            classifier_params=MatcherParams.from_settings(settings),
+        )
+
+    def upload_commit_reconcile() -> None:
+        # Built here, not from the worker's wiring: recovery must run even with
+        # the commit worker off.
+        upload_recovery.reconcile_upload_commits(
+            database,
+            publisher=upload_publish.UploadPublisher(
+                database,
+                uploads_root=uploads_root,
+                music_library_dir=settings.music_library_dir.resolve(),
+                cover_art=cover_art,
+                identity_signal=identity_signal,
+                fingerprinter_present=fingerprinter is not None,
+                copy_floor_bytes=settings.storage_free_space_floor_bytes,
+            ),
+            uploads_root=uploads_root,
+            music_library_dir=settings.music_library_dir.resolve(),
+            cover_art=cover_art,
+        )
+
+    def upload_janitor_once() -> None:
+        # No worker runs yet, so a finished journal cannot be in use: no grace.
+        upload_janitor.UploadJanitor(
+            database,
+            uploads_root=uploads_root,
+            music_library_dir=settings.music_library_dir.resolve(),
+            cover_art=cover_art,
+            clock=time.time,
+            expiry_s=settings.upload_stage_expiry_s,
+            retention_s=settings.upload_retention_s,
+            journal_grace_s=0,
+        ).run_once()
+
+    def upload_receipt_reconcile() -> None:
+        upload_receipts.reconcile_upload_receipts(database, uploads_root, boot_id=boot_id)
+
+    def upload_validation_reconcile() -> None:
+        try:
+            upload_validation.reconcile_upload_validation(database, boot_id=boot_id)
+        finally:
+            upload_zip.reconcile_expanded_archives(database, uploads_root)
+
+    # Fatal: a failure escaping any of these aborted startup before the
+    # registry existed; kept.
+    return [
+        StartupStep("edit journal", edit_journal, fatal=True),
+        StartupStep("conversion jobs", conversion_jobs, fatal=True),
+        StartupStep("audio identity", audio_identity_reconcile, fatal=True),
+        # Prepared/moved commit journals resume before receipts and job reclaim.
+        # Non-fatal: the worker claims only committing journals, so a skipped
+        # journal is just left for the next start.
+        StartupStep("upload commit journal", upload_commit_reconcile),
+        # Receipts settle or release their rows first (non-fatal: a failure leaves
+        # rows as they were).
+        StartupStep("upload receipts", upload_receipt_reconcile),
+        # Then items a dead process was validating go back to the queue.
+        StartupStep("upload validation", upload_validation_reconcile),
+        # After job reclaim (the conversion step fails jobs left running), before
+        # any janitor. Non-fatal: a failure only leaves orphaned reservations
+        # counted, which makes admission more conservative, never less.
+        StartupStep("storage reservations", storage_ledger.reconcile),
+        # Last. Non-fatal: a skipped pass only leaves stages for the next pass.
+        StartupStep("upload janitor", upload_janitor_once),
+    ]
+
+
+def _assert_dirs_non_overlapping(
+    import_dir: Path,
+    user_import_dir: Path,
+    library_dir: Path,
+    app_data_dir: Path,
+) -> None:
+    """Fail startup if any two of import_dir, user_import_dir and
+    music_library_dir are the same or one is nested in the other — otherwise
+    edit staging (under the library) or another tree's files could be
+    re-ingested by an import watcher — or if app_data_dir is, or is inside,
+    one of them (its caches would be ingested, or adopted as a user folder).
+    Other trees inside the data dir are allowed."""
+    trees = [
+        ("import_dir", import_dir),
+        ("user_import_dir", user_import_dir),
+        ("music_library_dir", library_dir),
+    ]
+    pairs = [
+        (name_a, a, name_b, b)
+        for i, (name_a, a) in enumerate(trees)
+        for name_b, b in trees[i + 1:]
+        if _is_or_inside(a, b) or _is_or_inside(b, a)
+    ]
+    pairs += [
+        ("app_data_dir", app_data_dir, name, tree)
+        for name, tree in trees
+        if _is_or_inside(app_data_dir, tree)
+    ]
+    for name_a, a, name_b, b in pairs:
         raise RuntimeError(
-            f"import_dir ({a}) and music_library_dir ({b}) must not overlap"
+            f"{name_a} ({a.resolve()}) and {name_b} ({b.resolve()}) must not overlap"
         )
 
 
 def startup_event():
+    install_access_log_redaction()
     # Set app.state classes to be None
     app.state.database = None
+    app.state.server_instance_id = None
+    app.state.admin_user_id = None
+    app.state.admin_library = None
     app.state.cover_art_manager = None
     app.state.organizer = None
     app.state.ingestor = None
     app.state.file_watcher = None
+    app.state.user_file_watcher = None
     app.state.encoded_cache = None
     app.state.default_cache = None
     app.state.encoder_coordinator = None
+    app.state.identity_worker = None
+    app.state.upload_validation_worker = None
+    app.state.upload_commit_worker = None
+    app.state.upload_janitor_thread = None
+    app.state.upload_commit_registry = None
+    app.state.upload_validation_registry = None
+    app.state.fingerprinter = None
+    app.state.boot_id = None
+    app.state.storage_ledger = None
+    app.state.import_unpack_ledger = None
+    app.state.upload_cancel_tokens = None
+    app.state.upload_receipt = None
     # Per-uuid edit lock. Built once here so slice 4's master-file staging and
     # Phase 2's conversion worker share the identical instance.
     app.state.track_locks = TrackLocks()
+    app.state.settings = settings
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
     app.state.instance_lock = acquire_instance_lock(settings.app_data_dir)
+    # SC-16d: identifies this process's job leases; any other boot id on a lease
+    # is a dead process (the flock guarantees one process).
+    app.state.boot_id = str(uuid4())
     try:
         _startup_locked()
     except BaseException:
-        app.state.instance_lock.release()
+        workers = _background_workers(app.state)
+        try:
+            _request_stop(workers)
+            _join(workers)
+        finally:
+            _release_instance_lock(app.state.instance_lock, _still_running(workers))
         raise
+
+
+logger = logging.getLogger(__name__)
+
+# How long shutdown waits for running imports before keeping the instance lock.
+WATCHER_STOP_TIMEOUT_S = 30.0
 
 
 def _startup_locked():
     settings.music_library_dir.mkdir(parents=True, exist_ok=True)
     settings.import_dir.mkdir(parents=True, exist_ok=True)
 
-    # The watcher ingests anything dropped in import_dir; edit staging lives
-    # under music_library_dir. If those trees overlapped, a staged temp could be
-    # re-ingested as a new track. Fail fast rather than corrupt the library.
-    _assert_dirs_non_overlapping(settings.import_dir, settings.music_library_dir)
+    # The watchers ingest anything dropped in import_dir / user_import_dir; edit
+    # staging lives under music_library_dir. If any two of these trees
+    # overlapped, a staged temp could be re-ingested as a new track. Fail fast
+    # rather than corrupt the library.
+    _assert_dirs_non_overlapping(
+        settings.import_dir,
+        settings.user_import_dir,
+        settings.music_library_dir,
+        settings.app_data_dir,
+    )
+    internal_dirs = ensure_internal_dirs(
+        settings.music_library_dir,
+        import_trees=(
+            ("IMPORT_DIR", settings.import_dir),
+            ("USER_IMPORT_DIR", settings.user_import_dir),
+        ),
+    )
+    # No ffmpeg of this process exists yet, so any ffmpeg writing into an
+    # internal dir is an orphan. (reconcile_conversion_jobs keeps its own
+    # .staging kill, which its test pins before the sweep.)
+    for internal_dir in internal_dirs:
+        kill_orphaned_ffmpeg(internal_dir)
 
     print(f"app data dir: {settings.app_data_dir}")
 
     # Set up database
-    database_path = settings.app_data_dir / "database" / "database.db"
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    init_sql_path = Path(__file__).parent / "database" / "init.sql"
-    database_context = DatabaseContext(
-        database_path=database_path, init_sql_path=init_sql_path
+    database = server_database(settings.app_data_dir)
+    database.context.database_path.parent.mkdir(parents=True, exist_ok=True)
+    if database.initialize() is not True:
+        raise RuntimeError("Database initialization failed")
+    app.state.server_instance_id = database.get_server_instance_id()
+    app.state.admin_user_id = bootstrap_master_admin(
+        database, settings, env_file=Path(".env")
     )
-    database = Database(context=database_context)
-    db_intialized = database.initialize()
-    print(f"Database initialized: {db_intialized}")
+    for key in RECORDED_ROOT_KEYS:
+        database.set_setting(key, str(Path(getattr(settings, key)).resolve()))
+    resume_user_deletes(database, DeletePaths.from_settings(settings))
+    # Build the dummy hash now so the first unknown-user login is not slower.
+    prepare_dummy_hash(settings)
+    app.state.admin_library = Library(
+        database,
+        app.state.admin_user_id,
+        root=library_root(
+            settings.music_library_dir, database.get_user(app.state.admin_user_id)
+        ),
+    )
     app.state.database = database
+    # Post-commit wake-up for the audio-identity writers, and the registry that
+    # lets shutdown kill the ingest hashes.
+    app.state.identity_wakeup = IdentityWakeup()
+    app.state.identity_registry = FfmpegProcessRegistry()
 
     # Master-file edit orchestration. Staging lives under the library so a
     # staged temp is on the same filesystem as its destination (atomic
     # os.replace / rename) yet off the watched import tree.
-    staging_dir = settings.music_library_dir / ".staging"
+    staging_dir = settings.music_library_dir / STAGING
     staging_dir.mkdir(parents=True, exist_ok=True)
+    app.state.storage_ledger = StorageLedger(
+        database,
+        path=settings.music_library_dir,
+        floor_bytes=settings.storage_free_space_floor_bytes,
+        boot_id=app.state.boot_id,
+    )
+    # One token registry for the upload receipt and, later, DELETE.
+    app.state.upload_cancel_tokens = CancelTokens()
+    app.state.upload_receipt = ReceiptRuntime(
+        ledger=app.state.storage_ledger,
+        slots=TransferSlots(
+            total=effective_upload_limits(settings).receives,
+            per_user=effective_upload_limits(settings).receives_per_user,
+        ),
+        tokens=app.state.upload_cancel_tokens,
+        uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+        boot_id=app.state.boot_id,
+    )
     app.state.track_editor = TrackEditor(
-        database=database,
         music_library_dir=settings.music_library_dir,
         staging_dir=staging_dir,
+        identity_signal=app.state.identity_wakeup,
     )
-    # A convert journal row outliving a crash means its commit may have
-    # landed without the encoded caches being evicted -- evicted below, once
-    # the caches exist.
-    interrupted_conversion_uuids = {
-        e["uuid_id"] for e in database.list_journal_entries() if e["intent"] == "convert"
-    }
-    # Finish/revert any edit interrupted by a crash before serving requests.
-    reconcile_journal(database, settings.music_library_dir)
-    # No worker thread survives a restart -- any conversion job still
-    # "running" is orphaned; independent of the journal pass above (a crash
-    # before the journal was even written leaves no journal row at all).
-    reconcile_conversion_jobs(database, staging_dir)
+    # Independent of the worker flag; a missing tool gives None versions.
+    matcher_version = default_matcher_version()
+    # Detected once per startup (spec 4.1); the pipeline factory below reads it.
+    app.state.fingerprinter = fingerprinter = detect_fingerprinter(settings)
 
     # Set up cover art manager
     cover_art_dir = settings.app_data_dir / "cover_art"
@@ -212,9 +520,6 @@ def _startup_locked():
     )
     cover_art_manager = CoverArtManager(ctx=cover_art_context)
     app.state.cover_art_manager = cover_art_manager
-
-    # Backfill cover_art_id for tracks ingested before cover art support
-    cover_art_manager.backfill_cover_art()
 
     # Set up the encoded-track cache + coordinator used by the streaming endpoint.
     encoded_cache_dir = settings.app_data_dir / "encoded_cache"
@@ -236,41 +541,50 @@ def _startup_locked():
             max_size_bytes=0,  # unlimited
         )
     )
-    # Resolve the startup default quality. Bad persisted/env values must not
-    # leak into EncoderCoordinator — fall through persisted → env → ORIGINAL.
-    persisted_quality = database.get_setting("default_streaming_quality")
-    default_quality = ORIGINAL_QUALITY
-    for candidate, source_label in (
-        (persisted_quality, "persisted"),
-        (settings.default_streaming_quality, "env/config"),
-    ):
-        if candidate is None:
-            continue
-        try:
-            default_quality = normalize_quality(candidate)
-            break
-        except ValueError:
-            print(
-                f"Invalid {source_label} default_streaming_quality "
-                f"{candidate!r}; falling back."
-            )
-    else:
-        print(
-            f"No valid default_streaming_quality configured; using "
-            f"{ORIGINAL_QUALITY!r}."
-        )
+    default_quality = resolve_default_quality(
+        app.state.admin_library.get_user_setting("default_streaming_quality")
+    )
 
     app.state.encoded_cache = encoded_cache
     app.state.default_cache = default_cache
-    for uuid_id in interrupted_conversion_uuids:
-        evict_converted_track_caches(uuid_id, encoded_cache, default_cache)
+
+    # SC-16e: recovery runs before any worker starts.
+    run_startup_recovery(
+        _startup_recovery_steps(
+            database=database,
+            staging_dir=staging_dir,
+            identity_signal=app.state.identity_wakeup,
+            encoded_cache=encoded_cache,
+            default_cache=default_cache,
+            matcher_version=matcher_version,
+            fingerprinter=fingerprinter,
+            storage_ledger=app.state.storage_ledger,
+            uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+            boot_id=app.state.boot_id,
+            cover_art=app.state.cover_art_manager,
+        )
+    )
+
+    # Once per start: warn when a library root cannot take hard links (never fatal).
+    upload_publish.probe_library_links(
+        database,
+        uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+        music_library_dir=settings.music_library_dir,
+    )
+
+    # Backfill cover_art_id for tracks ingested before cover art support;
+    # after recovery, which may fix the track files it reads.
+    cover_art_manager.backfill_cover_art()
+
     encoder_coordinator = EncoderCoordinator(
         cache=encoded_cache,
         source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
         workers=max(1, settings.encoded_cache_prefetch_workers),
         default_cache=default_cache,
         default_quality=default_quality,
-        all_uuids_fn=lambda: database.get_all_track_uuids(),
+        all_uuids_fn=app.state.admin_library.get_all_track_uuids,
+        admin_owner_id=app.state.admin_user_id,
+        owner_lookup=lambda uuid_id: _resolve_track_owner(database, uuid_id),
     )
     app.state.encoder_coordinator = encoder_coordinator
     encoder_coordinator.startup()
@@ -292,56 +606,323 @@ def _startup_locked():
         cache=encoded_cache,
         default_cache=default_cache,
         available_encoders=app.state.available_encoders,
+        storage_ledger=app.state.storage_ledger,
+        identity_signal=app.state.identity_wakeup,
     )
     app.state.conversion_orchestrator.resume_queued()
 
-    if settings.enable_file_watcher:
-        organizer_context = OrganizerContext(
+    settings.user_import_dir.mkdir(parents=True, exist_ok=True)
+    ensure_user_import_folders(settings.user_import_dir, database.list_user_folders())
+    # With the hard-link probe's startup checks: warn when a folder is on
+    # another filesystem than the music library (never fatal).
+    try:
+        filesystem_check.warn_other_filesystems(
+            database,
             music_library_dir=settings.music_library_dir,
-            should_organize_files=True,
-            should_copy_files=False,
-            add_to_database=app.state.database.add_track,
-            add_cover_art=cover_art_manager.add_album_art_with_status,
-            remove_cover_art=cover_art_manager.remove_album_art,
+            import_dir=settings.import_dir,
+            user_import_dir=settings.user_import_dir,
         )
+    except Exception as e:
+        logger.warning("filesystem check failed: %s", type(e).__name__)
 
-        organizer = Organizer(ctx=organizer_context)
+    # Import-folder archives unpack here (sign-off DEV-7-14 point 1). After the
+    # recovery (the ledger reconcile released a dead run's reservations), before
+    # any import runs: remove the dead run's unpack folders. The path must exist,
+    # or the ledger reads its free space as unknown.
+    workspace_root = settings.app_data_dir / "workspace"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    sweep_workspace(workspace_root)
+    upload_only_settings_notice(settings)  # upload limits that no longer reach import folders
+    # The unpack folders live on the data disk, so admission reads that disk;
+    # reservations on the library disk are subtracted too (conservative).
+    app.state.import_unpack_ledger = StorageLedger(
+        database,
+        path=workspace_root,
+        floor_bytes=settings.storage_free_space_floor_bytes,
+        boot_id=app.state.boot_id,
+    )
+
+    if settings.enable_file_watcher:
+        # One flag stops both watchers' waits and every ingestor's next member.
+        import_stop = app.state.import_stop = threading.Event()
+        app.state.settle_check = settle_check = SettleCheck(
+            refresh=make_settle_refresh(
+                database=database,
+                track_locks=app.state.track_locks,
+                cache=encoded_cache,
+                default_cache=default_cache,
+                encoder_coordinator=encoder_coordinator,
+                identity_signal=app.state.identity_wakeup,
+            ),
+            stop_event=import_stop,
+        )
+        settle_check.start()
+        pipeline_factory = functools.partial(
+            make_pipeline,
+            database=database,
+            cover_art_manager=cover_art_manager,
+            music_library_dir=settings.music_library_dir,
+            workspace_root=workspace_root,
+            archive_ledger=app.state.import_unpack_ledger,
+            archive_limits=lambda: import_archive_limits(settings),
+            on_track_added=encoder_coordinator.warm_imported,
+            on_imported=settle_check.schedule,
+            stop_event=import_stop,
+            identity_signal=app.state.identity_wakeup,
+            identity_registry=app.state.identity_registry,
+            fingerprinter_present=app.state.fingerprinter is not None,
+        )
+        dispatcher = ImportDispatcher(
+            user_import_dir=settings.user_import_dir,
+            database=database,
+            make_pipeline=pipeline_factory,
+        )
+        # The dispatcher is the single place per-owner pipelines are built
+        # and cached; IMPORT_DIR feeds the master admin's.
+        organizer, ingestor = dispatcher.pipeline_for(
+            database.get_user(app.state.admin_user_id)
+        )
         app.state.organizer = organizer
-        workspace_dir = settings.app_data_dir / "workspace"
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-        ingestor_context = IngestorContext(
-            workspace_dir=workspace_dir,
-            organize_function=app.state.organizer.organize_file,
-        )
-
-        ingestor = Ingestor(ctx=ingestor_context)
         app.state.ingestor = ingestor
 
         file_watcher = FileWatcher(
-            import_dir=settings.import_dir, on_file=app.state.ingestor.ingest_file
+            import_dir=settings.import_dir,
+            on_file=functools.partial(
+                app.state.ingestor.ingest_file,
+                imported_dir=settings.import_dir / IMPORTED_DIR_NAME,
+            ),
+            stop_event=import_stop,
+        )
+        user_file_watcher = FileWatcher(
+            import_dir=settings.user_import_dir,
+            on_file=dispatcher.dispatch,
+            stop_event=import_stop,
         )
 
-        file_watcher.start_file_watcher()
+        # Watchers start first, then the scans (after the reconciles), so a
+        # file created in between is seen by one of them; _submit_new dedupes.
         app.state.file_watcher = file_watcher
+        app.state.user_file_watcher = user_file_watcher
+        file_watcher.start_file_watcher()
+        user_file_watcher.start_file_watcher()
+        file_watcher.scan_existing()
+        user_file_watcher.scan_existing()
+
+    # Own kill registry (never the identity one); assigned before start() so a
+    # failing start is cleaned up by startup_event.
+    if settings.enable_upload_validation_worker:
+        app.state.upload_validation_registry = FfmpegProcessRegistry()
+        validation = upload_validation.UploadValidationWorker(
+            database,
+            uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+            boot_id=app.state.boot_id,
+            tokens=app.state.upload_cancel_tokens,
+            registry=app.state.upload_validation_registry,
+            fingerprinter=app.state.fingerprinter,
+            zip_handler=upload_zip.ZipExpander(
+                database,
+                uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+                boot_id=app.state.boot_id,
+                ledger=app.state.storage_ledger,
+                limits=lambda: effective_upload_limits(settings),
+            ),
+        )
+        app.state.upload_validation_worker = validation
+        validation.start()
+
+    if settings.enable_upload_commit_worker:
+        limits = effective_upload_limits(settings)
+        app.state.upload_commit_registry = FfmpegProcessRegistry()
+        commit = upload_commit.UploadCommitWorker(
+            database,
+            uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+            music_library_dir=settings.music_library_dir.resolve(),
+            boot_id=app.state.boot_id,
+            ledger=app.state.storage_ledger,
+            quota=StagedQuota(
+                user_bytes=limits.user_staged_quota_bytes, total_bytes=limits.staged_quota_bytes),
+            cover_art=app.state.cover_art_manager,
+            registry=app.state.upload_commit_registry,
+            after_prepared=upload_publish.UploadPublisher(
+                database,
+                uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+                music_library_dir=settings.music_library_dir.resolve(),
+                cover_art=app.state.cover_art_manager,
+                identity_signal=app.state.identity_wakeup,
+                fingerprinter_present=app.state.fingerprinter is not None,
+                copy_floor_bytes=settings.storage_free_space_floor_bytes,
+            ),
+        )
+        app.state.upload_commit_worker = commit
+        commit.start()
+
+    if settings.enable_upload_janitor:
+        # Assigned before start() so a failing start is cleaned up by startup_event.
+        janitor_thread = upload_janitor.UploadJanitorThread(
+            upload_janitor.UploadJanitor(
+                database,
+                uploads_root=settings.music_library_dir.resolve() / UPLOADS,
+                music_library_dir=settings.music_library_dir.resolve(),
+                cover_art=app.state.cover_art_manager,
+                expiry_s=settings.upload_stage_expiry_s,
+                retention_s=settings.upload_retention_s,
+            ),
+            interval_s=settings.upload_janitor_interval_s,
+        )
+        app.state.upload_janitor_thread = janitor_thread
+        janitor_thread.start()
+
+    # Last, and outside the watcher block: it needs its own stop flag because
+    # import_stop does not exist when the watcher is off. Assigned before
+    # start() so a failing start is cleaned up by startup_event.
+    if settings.enable_identity_worker:
+        worker = AudioIdentityWorker(
+            database,
+            wakeup=app.state.identity_wakeup,
+            registry=app.state.identity_registry,
+            matcher_version=matcher_version,
+            fingerprinter=app.state.fingerprinter,
+            journal_finisher=functools.partial(
+                finish_kept_journal_rows,
+                database, settings.music_library_dir, app.state.track_locks,
+                identity_signal=app.state.identity_wakeup,
+                reported=set(),  # each failing row is logged once per process
+            ),
+        )
+        app.state.identity_worker = worker
+        worker.start()
+
+
+def _background_workers(state) -> list[tuple[object, object]]:
+    """The one list of background worker threads, in stop order, each with the
+    kill registry it owns (None when it owns none). Startup's failure path and
+    shutdown stop exactly these, and the instance lock is kept while any of them
+    is alive. A new worker (Phase 8's deletion worker, Phase 9's sender) adds
+    one line here."""
+    entries = (
+        (getattr(state, "upload_janitor_thread", None), None),
+        (getattr(state, "upload_commit_worker", None), getattr(state, "upload_commit_registry", None)),
+        (getattr(state, "upload_validation_worker", None), getattr(state, "upload_validation_registry", None)),
+        # Its registry is shared with imports: shutdown closes it with them.
+        (getattr(state, "identity_worker", None), None),
+    )
+    return [(worker, registry) for worker, registry in entries if worker is not None]
+
+
+def _request_stop(workers) -> None:
+    """Ask every worker to stop, then close its own kill registry (stop first, so
+    a killed process reads as a stop, not a failure)."""
+    for worker, registry in workers:
+        try:
+            worker.request_stop()
+        except Exception as e:
+            logger.warning("background worker stop request failed: %s", type(e).__name__)
+        if registry is not None:
+            try:
+                registry.close()
+            except Exception as e:
+                logger.warning("background worker stop request failed: %s", type(e).__name__)
+
+
+def _join(workers) -> None:
+    for worker, _ in workers:
+        try:
+            worker.join(timeout=IDENTITY_JOIN_TIMEOUT_S)
+        except Exception as e:
+            logger.warning("background worker join failed: %s", type(e).__name__)
+
+
+def _still_running(workers) -> set:
+    return {worker.done for worker, _ in workers if worker.is_alive()}
+
+
+def _release_instance_lock(instance_lock, not_done: set) -> None:
+    if not_done:
+        _release_lock_when_done(instance_lock, not_done)  # never while one lives
+    else:
+        instance_lock.release()
 
 
 def shutdown_event():
+    workers = _background_workers(app.state)
+    leftover_imports: set = set()
     try:
-        watcher = getattr(app.state, "file_watcher", None)
-        if watcher:
-            watcher.stop_file_watcher()
-        # Conversion ffmpeg runs in its own session (killpg-able), so it would
-        # outlive this process; the job itself is failed by the next startup.
+        # The encoder pool is asked to stop first (its stop markers sort ahead of
+        # the backlog, and the call does not wait), so nothing only queued starts
+        # while the server waits for the watchers and workers; a warm or prefetch
+        # resumes at the next start and a queued conversion stays queued. If it
+        # raises, the rest still runs and the error is raised at the end.
+        coordinator = getattr(app.state, "encoder_coordinator", None)
+        stop_error = None
+        if coordinator:
+            try:
+                coordinator.shutdown()
+            except Exception as e:  # the rest still stops; raised once it has
+                stop_error = e
+        watchers = [
+            w
+            for w in (
+                getattr(app.state, "file_watcher", None),
+                getattr(app.state, "user_file_watcher", None),
+            )
+            if w
+        ]
+        # Order matters: set the import stop flag, ask every worker to stop (each
+        # closes its own registry), then close the identity registry. Closing the
+        # registry kills every running hash (one that starts later is killed on
+        # arrival), so shutdown never waits out a long hash; an import's killed
+        # hash is stored pending and the import still lands. A worker is told to
+        # stop before the kill so its killed hash reads as a stop, not as a
+        # failed attempt.
+        import_stop = getattr(app.state, "import_stop", None)
+        if import_stop is not None:
+            import_stop.set()
+        _request_stop(workers)
+        identity_registry = getattr(app.state, "identity_registry", None)
+        if identity_registry is not None:
+            identity_registry.close()
+        leftover_imports = set(stop_watchers(watchers, WATCHER_STOP_TIMEOUT_S))
+        settle_check = getattr(app.state, "settle_check", None)
+        if settle_check is not None:
+            settle_check.join(timeout=2)  # the shared stop flag ended it
+        _join(workers)
+        # Closing the conversion registry kills a running conversion's ffmpeg (it
+        # runs in its own session and would outlive this process) and kills on
+        # arrival one that starts later; the job's own thread then marks that job
+        # failed (if the process ends first, the next startup fails the row left
+        # 'running'), and a job that was only queued stays queued for the next start.
         orchestrator = getattr(app.state, "conversion_orchestrator", None)
         if orchestrator:
             orchestrator.shutdown()
-        coordinator = getattr(app.state, "encoder_coordinator", None)
-        if coordinator:
-            coordinator.shutdown()
+        if stop_error is not None:
+            raise stop_error  # reported as before, after everything was asked to stop
     finally:
         instance_lock = getattr(app.state, "instance_lock", None)
         if instance_lock is not None:
+            # Kept while an import or any worker still runs; released after the last.
+            _release_instance_lock(instance_lock, leftover_imports | _still_running(workers))
+
+
+def _release_lock_when_done(instance_lock, futures: set) -> None:
+    """Keep the lock while imports or workers outlive the shutdown
+    bound; release it once the last of them ends."""
+    logger.warning(
+        "keeping the instance lock until %d task(s) still running finish",
+        len(futures),
+    )
+    remaining = len(futures)
+    guard = threading.Lock()
+
+    def one_done(_future) -> None:
+        nonlocal remaining
+        with guard:
+            remaining -= 1
+            last = remaining == 0
+        if last:
             instance_lock.release()
+
+    for future in futures:
+        future.add_done_callback(one_done)
 
 
 @app.get("/tracks", response_model=GetTracksResponse)
@@ -351,12 +932,12 @@ def get_tracks(
     offset: int = Query(0, ge=0),
     artist_id: Optional[int] = None,
     album_id: Optional[int] = None,
+    library: Library = Depends(current_library),
 ):
     """Browse tracks in display order (artist/album/disc/track), optionally
     scoped by artist/album, with keyset cursor pagination. Incremental sync
     lives on ``GET /changes`` — this endpoint no longer windows by timestamp
     or returns tombstones."""
-    database: Database = cast(Database, app.state.database)
 
     # ``album_id`` is only meaningful when paired with ``artist_id`` — the
     # query layer rejects album-only filters because album IDs are not
@@ -426,7 +1007,7 @@ def get_tracks(
         artist_id = cursor_dict["artist_id"]
         album_id = cursor_dict["album_id"]
 
-    remaining_track_count = database.get_tracks_count(
+    remaining_track_count = library.get_tracks_count(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
@@ -441,7 +1022,7 @@ def get_tracks(
     if remaining_track_count == 0 or offset >= remaining_track_count:
         return GetTracksResponse(data=[], nextCursor=None)
 
-    gotten_tracks = database.get_tracks(
+    gotten_tracks = library.get_tracks(
         search_parameters=search_parameters,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
@@ -492,15 +1073,14 @@ def get_tracks(
 def get_changes(
     after_revision: int = Query(0, ge=0),
     limit: int = Query(500, ge=1, le=1000),
+    library: Library = Depends(current_library),
 ):
     """Revision-based incremental sync. Returns ordered upsert/delete entries
     with ``revision > after_revision``; the client persists the last applied
     entry's revision and pages until ``nextCursor`` is null. ``after_revision=0``
     is a full resync."""
-    database: Database = cast(Database, app.state.database)
-
     try:
-        changes, latest_revision, next_cursor = database.get_changes(
+        changes, latest_revision, next_cursor = library.get_changes(
             after_revision=after_revision, limit=limit
         )
     except Exception as e:
@@ -541,98 +1121,38 @@ _IMAGE_MIME: dict[str, str] = {
 
 
 @app.get("/cover_art/{cover_art_id}")
-def get_cover_art(cover_art_id: int):
-    manager: CoverArtManager = app.state.cover_art_manager
-    path = manager.get_album_art(cover_art_id)
+def get_cover_art(cover_art_id: int, library: Library = Depends(current_library)):
+    # Busy is a retryable 503, as PATCH answers (Phase 10 replaces it with its typed busy answer).
+    try:
+        art = library.get_owned_cover_art(cover_art_id)
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            raise HTTPException(status_code=503, detail="Database busy, retry")
+        raise
+    path = None if art is None else art.file_path
     if path is None or not path.exists():
         raise HTTPException(status_code=404, detail="Cover art not found")
     media_type = _IMAGE_MIME.get(path.suffix.lower(), "image/jpeg")
     return FileResponse(
         path,
         media_type=media_type,
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
     )
 
 
 
-def _parse_byte_range(range_header: str, file_size: int) -> tuple[int, int]:
-    """Parse a single HTTP byte range and return ``(start, end)`` inclusive.
-
-    Supports the three single-range forms from RFC 7233:
-      ``bytes=start-end`` — explicit window
-      ``bytes=start-``    — from ``start`` to EOF
-      ``bytes=-N``        — the last ``N`` bytes (suffix range)
-
-    Anything else — multi-range requests, malformed values, ranges entirely
-    past EOF — raises 416. We treat 416 as the right answer for "could not
-    parse" too: returning a 200 with the whole file would silently mask a
-    bad client header.
-    """
-    if "," in range_header:
-        # Multi-range responses require multipart/byteranges; we only serve
-        # single ranges, so reject explicitly rather than serving the first.
-        raise HTTPException(
-            status_code=416,
-            detail=f"Multi-range requests are not supported: {range_header}",
-        )
-
-    if "=" not in range_header:
-        raise HTTPException(
-            status_code=416, detail=f"Invalid Range Header: {range_header}"
-        )
-
-    units, _, rng = range_header.partition("=")
-    if units.strip().lower() != "bytes":
-        raise HTTPException(
-            status_code=422,
-            detail=f"range must be in bytes. Instead {units} was used",
-        )
-
-    rng = rng.strip()
-    # Exactly one "-" separator; partition guarantees that. The earlier
-    # split("-") accepted "1-2-3" by silently dropping the tail.
-    if rng.count("-") != 1:
-        raise HTTPException(
-            status_code=416, detail=f"Invalid Range Header: {range_header}"
-        )
-    start_s, end_s = rng.split("-")
-
-    try:
-        if not start_s and not end_s:
-            # "bytes=-" — malformed.
-            raise ValueError("empty range")
-        if not start_s:
-            # Suffix range: last N bytes.
-            suffix_len = int(end_s)
-            if suffix_len <= 0:
-                raise ValueError("non-positive suffix length")
-            if suffix_len >= file_size:
-                start = 0
-            else:
-                start = file_size - suffix_len
-            end = file_size - 1
-        else:
-            start = int(start_s)
-            if start < 0:
-                raise ValueError("negative start")
-            end = int(end_s) if end_s else file_size - 1
-            if end < 0:
-                raise ValueError("negative end")
-    except ValueError:
-        raise HTTPException(
-            status_code=416, detail=f"Invalid Range Header: {range_header}"
-        )
-
-    if start >= file_size or end >= file_size or start > end:
-        raise HTTPException(
-            status_code=416, detail=f"Range not satisfiable: {range_header}"
-        )
-
-    return start, end
+# Kept under its old name: tests and callers import it from here.
+_parse_byte_range = parse_byte_range
 
 
-@app.get("/tracks/{uuid_id}/stream")
-def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
+@app.get("/tracks/{uuid_id:uuid}/stream")
+def stream_track(
+    uuid_id: UUID,
+    request: Request,
+    quality: Optional[str] = None,
+    library: Library = Depends(current_library),
+):
+    uuid_id = str(uuid_id)
     CHUNK_SIZE = 1024 * 1024
     try:
         quality_canonical = normalize_quality(quality)
@@ -643,7 +1163,7 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
         )
 
     search_parameters = [SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
-    track_list: List[Track] = app.state.database.get_tracks(
+    track_list: List[Track] = library.get_tracks(
         search_parameters=search_parameters
     )
     if len(track_list) <= 0:
@@ -664,6 +1184,7 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
             quality_canonical,
             source_bitrate_kbps=source_bitrate,
             source_path=track.file_path,
+            owner_id=track.owner_id,
         )
     except SourceUnavailable:
         # Track row exists but its source file is gone — 404 so clients drop it
@@ -722,67 +1243,18 @@ def stream_track(uuid_id: str, request: Request, quality: Optional[str] = None):
     try:
         f = file_path.open("rb")
     except FileNotFoundError:
+        logger.warning("track file is gone before open: %s", file_path)
         raise HTTPException(
-            status_code=404,
-            detail=f"file path for the track is now dead. Path: {file_path}",
+            status_code=404, detail="The track's file is no longer available"
         )
 
-    try:
-        file_size = os.fstat(f.fileno()).st_size
-        range_header = request.headers.get("range")
-
-        if not range_header:
-
-            def iterfile(handle):
-                try:
-                    while chunk := handle.read(CHUNK_SIZE):
-                        yield chunk
-                finally:
-                    handle.close()
-
-            response = StreamingResponse(
-                iterfile(f),
-                media_type=media_type,
-                headers={
-                    "Accept-ranges": "bytes",
-                    "Content-length": str(file_size),
-                    **extra_headers,
-                },
-            )
-            f = None  # ownership transferred to the generator
-            return response
-
-        start, end = _parse_byte_range(range_header, file_size)
-        content_length = end - start + 1
-        f.seek(start)
-
-        def iter_range(handle, remaining_bytes):
-            try:
-                while remaining_bytes:
-                    chunk = handle.read(min(CHUNK_SIZE, remaining_bytes))
-                    if not chunk:
-                        break
-                    remaining_bytes -= len(chunk)
-                    yield chunk
-            finally:
-                handle.close()
-
-        response = StreamingResponse(
-            iter_range(f, content_length),
-            status_code=206,
-            media_type=media_type,
-            headers={
-                "Accept-ranges": "bytes",
-                "Content-range": f"bytes {start}-{end}/{file_size}",
-                "Content-length": str(content_length),
-                **extra_headers,
-            },
-        )
-        f = None  # ownership transferred to the generator
-        return response
-    finally:
-        if f is not None:
-            f.close()
+    return ranged_file_response(
+        f,
+        media_type=media_type,
+        range_header=request.headers.get("range"),
+        headers=extra_headers,
+        chunk_size=CHUNK_SIZE,
+    )
 
 
 @app.get("/artists", response_model=GetArtistsResponse)
@@ -790,9 +1262,8 @@ def get_artists(
     cursor: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    library: Library = Depends(current_library),
 ):
-    database: Database = cast(Database, app.state.database)
-
     order_parameters: List[ArtistOrderParameter]
     row_filter_parameters: List[ArtistRowFilterParameter]
 
@@ -828,7 +1299,7 @@ def get_artists(
             for item in cursor_dict["row_filter_parameters"]
         ]
 
-    remaining_count = database.get_artists_count(
+    remaining_count = library.get_artists_count(
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
     )
@@ -840,7 +1311,7 @@ def get_artists(
     if remaining_count == 0 or offset >= remaining_count:
         return GetArtistsResponse(data=[], nextCursor=None)
 
-    returned_artists = database.get_artists(
+    returned_artists = library.get_artists(
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
         limit=limit,
@@ -878,9 +1349,8 @@ def get_albums(
     limit: int = Query(500, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     artist_id: Optional[int] = None,
+    library: Library = Depends(current_library),
 ):
-    database: Database = cast(Database, app.state.database)
-
     order_parameters: List[AlbumOrderParameter]
     row_filter_parameters: List[AlbumRowFilterParameter]
 
@@ -929,7 +1399,7 @@ def get_albums(
         ]
         artist_id = cursor_dict["artist_id"]
 
-    remaining_count = database.get_albums_count(
+    remaining_count = library.get_albums_count(
         artist_id=artist_id,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
@@ -940,7 +1410,7 @@ def get_albums(
     if remaining_count == 0 or offset >= remaining_count:
         return GetAlbumsResponse(data=[], nextCursor=None)
 
-    returned_albums: List[Album] | None = database.get_albums(
+    returned_albums: List[Album] | None = library.get_albums(
         artist_id=artist_id,
         order_parameters=order_parameters,
         row_filter_parameters=row_filter_parameters,
@@ -995,9 +1465,8 @@ def search(
     q: str = Query(..., min_length=1),
     types: str = Query("tracks,artists,albums"),
     limit: int = Query(10, ge=1, le=50),
+    library: Library = Depends(current_library),
 ):
-    database: Database = cast(Database, app.state.database)
-
     return_types = SearchEntityType(0)
     for t in types.split(","):
         t = t.strip().lower()
@@ -1011,7 +1480,7 @@ def search(
     if not return_types:
         raise HTTPException(status_code=400, detail="No valid types specified")
 
-    results = database.get_search_results(
+    results = library.get_search_results(
         query=q,
         return_types=return_types,
         limit_per_type=limit,
@@ -1028,7 +1497,9 @@ _WARM_MAX_UUIDS = 500
 
 
 @app.post("/tracks/warm", response_model=WarmResponse)
-def warm_tracks(request: WarmRequest):
+def warm_tracks(
+    request: WarmRequest, library: Library = Depends(current_library)
+):
     if len(request.track_uuids) > _WARM_MAX_UUIDS:
         raise HTTPException(
             status_code=422,
@@ -1048,10 +1519,12 @@ def warm_tracks(request: WarmRequest):
     end = min(start + window, len(request.track_uuids))
     queued = 0
     skipped = 0
-    for i in range(start, end):
-        outcome = coordinator.enqueue_prefetch(
-            request.track_uuids[i], quality_canonical
-        )
+    # Foreign and unknown uuids are dropped uncounted, so ALREADY_CACHED can't
+    # reveal another user's streaming.
+    for uuid_id in library.filter_owned_track_uuids(
+        request.track_uuids[start:end]
+    ):
+        outcome = coordinator.enqueue_prefetch(uuid_id, quality_canonical)
         if outcome == PrefetchOutcome.QUEUED:
             queued += 1
         elif outcome in (
@@ -1066,13 +1539,18 @@ def warm_tracks(request: WarmRequest):
 
 
 @app.get("/settings/quality", response_model=QualitySettingResponse)
-def get_quality_setting():
-    coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    return QualitySettingResponse(quality=coordinator.default_quality)
+def get_quality_setting(library: Library = Depends(current_library)):
+    return QualitySettingResponse(
+        quality=resolve_default_quality(
+            library.get_user_setting("default_streaming_quality")
+        )
+    )
 
 
 @app.put("/settings/quality", response_model=SetQualityResponse)
-def set_quality_setting(request: SetQualityRequest):
+def set_quality_setting(
+    request: SetQualityRequest, library: Library = Depends(current_library)
+):
     try:
         quality_canonical = normalize_quality(request.quality)
     except ValueError:
@@ -1081,14 +1559,21 @@ def set_quality_setting(request: SetQualityRequest):
             detail=f"Unsupported quality preset: {request.quality}",
         )
 
-    coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    database: Database = cast(Database, app.state.database)
+    # EncoderCoordinator.default_quality is the master admin's; any other
+    # caller only changes their own user_settings row (spec 6.1).
+    is_master_admin = library.owner_id == app.state.admin_user_id
 
     try:
-        _, warming = coordinator.persist_and_set_default_quality(
-            quality_canonical,
-            lambda q: database.set_setting("default_streaming_quality", q),
-        )
+        if is_master_admin:
+            coordinator: EncoderCoordinator = app.state.encoder_coordinator
+            _, warming = coordinator.persist_and_set_default_quality(
+                quality_canonical,
+                lambda q: library.set_user_setting("default_streaming_quality", q),
+                read_stored=lambda: library.get_user_setting("default_streaming_quality"),
+            )
+        else:
+            library.set_user_setting("default_streaming_quality", quality_canonical)
+            warming = False
     except Exception:
         raise HTTPException(
             status_code=500,
@@ -1123,6 +1608,12 @@ def get_app_info():
     return AppInfoResponse(
         server=ServerInfo(instance_id=database.get_server_instance_id()),
         history=HistoryCapabilities(),
+        auth=AuthCapabilities(signup_enabled=settings.osml_signup_enabled),
+        uploads=UploadsCapabilities(
+            limits=UploadLimitsInfo(
+                **asdict(effective_upload_limits(app.state.settings))
+            )
+        ),
         entities={
             "track": EntityInfo(
                 fields=track_fields, actions=["convert"] if targets else []
@@ -1137,33 +1628,39 @@ def get_app_info():
     )
 
 
-@app.get("/tracks/{uuid_id}", response_model=ClientTrack)
-def get_track(uuid_id: str):
+@app.get("/tracks/{uuid_id:uuid}", response_model=ClientTrack)
+def get_track(uuid_id: UUID, library: Library = Depends(current_library)):
     """Authoritative current state of a single track. Lets a client reconcile
     one track to server truth without a watermark-driven `/changes` pull — used
     by edit-conflict "take server" resolution, where the watermark may already
     have advanced past the conflicting revision. 404 if the track is gone."""
-    database: Database = cast(Database, app.state.database)
-    track = database.get_track_by_uuid(uuid_id)
+    uuid_id = str(uuid_id)
+    track = library.get_track_by_uuid(uuid_id)
     if track is None:
         raise HTTPException(status_code=404, detail="Track not found")
     return ClientTrack.from_track(track=track)
 
 
-@app.patch("/tracks/{uuid_id}", response_model=PatchTrackResponse)
-def patch_track(uuid_id: str, request: TrackPatchRequest):
+@app.patch("/tracks/{uuid_id:uuid}", response_model=PatchTrackResponse)
+def patch_track(
+    uuid_id: UUID,
+    request: TrackPatchRequest,
+    library: Library = Depends(current_library),
+):
     """Partial track metadata edit. Non-allowlisted fields + type/range are
     rejected by ``TrackPatchRequest`` (422). ``db_only`` writes the DB; the
     confirmation-gated ``db_and_master`` also rewrites the file tags and
     relocates the master when artist/album change (WAV / missing master degrade
     to DB-only with ``master_written=False``). Per-uuid serialized; the DB
     layer's typed conflicts map to HTTP status codes."""
+    uuid_id = str(uuid_id)
     track_editor: TrackEditor = app.state.track_editor
     track_locks: TrackLocks = app.state.track_locks
 
     try:
         with track_locks.lock(uuid_id):
             new_revision, master_written = track_editor.apply_edit(
+                library,
                 uuid_id=uuid_id,
                 fields=request.edit_fields(),
                 base_revision=request.base_revision,
@@ -1185,6 +1682,10 @@ def patch_track(uuid_id: str, request: TrackPatchRequest):
             detail="Edit would leave the track with no title, artist, "
             "album, or album artist",
         )
+    # The edit is committed and its kept journal row finishes the swap; 503 lets
+    # the client retry, and the retry with the old base gets the usual revision_conflict.
+    except MasterSwapPending as e:
+        raise HTTPException(status_code=503, detail=f"Master file write failed: {e}")
     except (TagWriteError, MasterWriteError) as e:
         raise HTTPException(status_code=500, detail=f"Master file write failed: {e}")
     except sqlite3.OperationalError as e:
@@ -1214,17 +1715,21 @@ def _job_to_response(job: dict) -> JobResponse:
 
 
 @app.post("/jobs", response_model=JobResponse)
-def post_job(request: PostJobRequest):
+def post_job(
+    request: PostJobRequest, library: Library = Depends(current_library)
+):
     """Create an async job. Only ``type="conversion"`` exists today (the
     generic ``/jobs`` resource is forward-looking per the doc so future
-    bulk/upload job types add zero endpoints). Non-idempotent (mints a job)
+    bulk job types add zero endpoints). Upload work is not a ``/jobs`` type:
+    since Phase 7 it lives under ``/tracks/uploads/...`` on the shared job
+    runtime. Non-idempotent (mints a job)
     -> single-attempt; an orphaned job from a timed-out-but-succeeded POST is
     recovered via ``GET /jobs``."""
     orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
-    database: Database = cast(Database, app.state.database)
 
     try:
         job_id = orchestrator.enqueue(
+            library,
             uuid_id=request.uuid_id,
             target_codec=request.params.target_codec,
             target_bitrate_kbps=request.params.target_bitrate_kbps,
@@ -1258,13 +1763,15 @@ def post_job(request: PostJobRequest):
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except InsufficientDiskSpace as e:
-        raise HTTPException(status_code=507, detail=str(e))
+        raise api_error(
+            507, e.code, e.message, retryable=True, needed=e.needed
+        )
     except sqlite3.OperationalError as e:
         if "locked" in str(e).lower():
             raise HTTPException(status_code=503, detail="Database busy, retry")
         raise
 
-    job = database.get_conversion_job(job_id)
+    job = library.get_conversion_job(job_id)
     return _job_to_response(job)
 
 
@@ -1276,6 +1783,7 @@ def get_jobs(
     batch_id: Optional[str] = None,
     cursor: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    library: Library = Depends(current_library),
 ):
     """Filtered, cursored job collection -- replaces both a global and a
     per-uuid conversion list (the per-uuid variant is just ``?uuid_id=``).
@@ -1283,7 +1791,8 @@ def get_jobs(
     ``GET /changes``' int-cursor convention. ``status`` takes one status or a
     comma-separated list (``queued,running``). ``type`` only accepts
     ``"conversion"`` today (the only job type that exists)."""
-    # TODO(bulk-jobs): a grouped-by-batch_id list shape for bulk progress.
+    # TODO(bulk-jobs): a grouped-by-batch_id list shape for bulk conversion
+    # progress. Uploads never appear here (they are /tracks/uploads, Phase 7).
     if type is not None and type != "conversion":
         raise HTTPException(status_code=422, detail=f"unsupported job type: {type}")
     statuses: Optional[List[str]] = None
@@ -1296,9 +1805,8 @@ def get_jobs(
                 status_code=422, detail=f"unsupported job status: {status}"
             )
 
-    database: Database = cast(Database, app.state.database)
     try:
-        jobs, next_cursor = database.list_conversion_jobs(
+        jobs, next_cursor = library.list_conversion_jobs(
             uuid_id=uuid_id, statuses=statuses, batch_id=batch_id,
             after_id=cursor, limit=limit,
         )
@@ -1312,12 +1820,12 @@ def get_jobs(
 
 
 @app.delete("/jobs/{job_id}", response_model=DeleteJobResponse)
-def delete_job(job_id: int):
+def delete_job(job_id: int, library: Library = Depends(current_library)):
     """Cancel a queued or running job. Idempotent: a no-op (``cancelled:
     false``) for an already-terminal or unknown job_id, never a 404 -- the
     doc frames DELETE as remove-pending-work, not resource deletion."""
     orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
-    cancelled = orchestrator.cancel(job_id)
+    cancelled = orchestrator.cancel(library, job_id)
     return DeleteJobResponse(cancelled=cancelled)
 
 

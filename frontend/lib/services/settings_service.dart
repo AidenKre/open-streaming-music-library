@@ -6,8 +6,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 
@@ -179,18 +181,21 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     AppSettings local,
     SharedPreferences prefs,
   ) async {
-    if (ApiClient.instance.baseUrl.isEmpty) return local;
+    if (!ref.read(hasSessionProvider)) return local;
     // Skip when offline — the request would just fail. The cached value in
     // SharedPreferences remains in effect; next online startup will refresh.
     if (ref.read(offlineModeProvider)) return local;
     try {
+      // A later user choice or a reset must win over this late answer.
+      final storedBefore = prefs.getString(_streamQualityKey);
+      final generation = ref.read(localResetServiceProvider).generation;
       await ref.read(serverBindingGateProvider).awaitVerified();
       if (!ref.mounted || ref.read(offlineModeProvider)) return local;
       // Single-attempt policy bounded by backendSyncTimeout: a slow or
       // unreachable backend must not strand the reconcile forever, and
       // exhaustion still goes through the offline hook so a real outage
       // flips the app into offline mode like any other GET would.
-      final data = await ApiClient.instance.getJson(
+      final data = await ref.read(apiClientProvider).getJson(
         ['settings', 'quality'],
         policy: RetryPolicy.noRetry.copyWith(
           perAttemptTimeout: backendSyncTimeout,
@@ -199,6 +204,11 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
       final quality = data['quality'];
       if (!isValidQuality(quality)) return local;
       // Cache locally so offline restarts use the last known backend value.
+      if (!ref.mounted ||
+          ref.read(localResetServiceProvider).generation != generation ||
+          prefs.getString(_streamQualityKey) != storedBefore) {
+        return local;
+      }
       await prefs.setString(_streamQualityKey, quality as String);
       if (local.persistedStreamQuality == quality) return local;
       // Intentionally do NOT set streamQualityChangeKind so the
@@ -236,7 +246,7 @@ class SettingsNotifier extends AsyncNotifier<AppSettings> {
     // ahead of the backend — that breaks cross-device sync.
     var backendOk = false;
     try {
-      await ApiClient.instance.putJson(
+      await ref.read(apiClientProvider).putJson(
         ['settings', 'quality'],
         body: {'quality': quality},
         retry: true,

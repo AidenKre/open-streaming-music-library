@@ -1,5 +1,6 @@
 import 'package:drift/drift.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/duration_text.dart';
 
 class TrackUI {
   final String uuidId;
@@ -177,16 +178,7 @@ class TrackUI {
   String get formattedDuration {
     final duration = this.duration;
     if (duration == null) return '—';
-    final totalSeconds = duration.truncate();
-    final seconds = totalSeconds % 60;
-    final minutes = (totalSeconds ~/ 60) % 60;
-    final hours = (totalSeconds ~/ 3600) % 24;
-    final days = totalSeconds ~/ 86400;
-
-    final ss = seconds.toString().padLeft(2, '0');
-    if (days > 0) return '$days:${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:$ss';
-    if (hours > 0) return '$hours:${minutes.toString().padLeft(2, '0')}:$ss';
-    return '$minutes:$ss';
+    return formatTrackDuration(duration);
   }
 
   factory TrackUI.fromQueryRow(QueryRow row) {

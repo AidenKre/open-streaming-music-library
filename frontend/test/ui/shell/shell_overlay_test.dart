@@ -1,9 +1,8 @@
+import 'package:frontend/services/session_service.dart' show ServerBlockedReason;
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/ui/browse/browse_pages.dart';
 import 'package:frontend/ui/home/home_page.dart';
@@ -26,10 +25,8 @@ void main() {
   late AppDatabase db;
   late BrowseHarness h;
 
-  setUpAll(() => ApiClient.init('http://localhost:8000'));
 
   setUp(() async {
-    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, const [
       SeedTrack(
@@ -181,7 +178,7 @@ void main() {
   // way out instead of the generic offline banner.
   testWidgets('a blocked session shows its banner instead of the offline one',
       (tester) async {
-    final session = FakeSessionControls()..serverBlocked = true;
+    final session = FakeSessionControls()..serverBlocked = ServerBlockedReason.differentServer;
     await pumpShell(tester, session: session);
     h.offline.set(true);
     await tester.pumpAndSettle();
@@ -193,10 +190,23 @@ void main() {
     expect(find.textContaining('Different server'), findsOneWidget);
     expect(find.byType(OfflineBanner), findsNothing);
 
-    session.setBlocked(false);
+    session.setBlocked(ServerBlockedReason.none);
     await tester.pumpAndSettle();
     expect(find.textContaining('Different server'), findsNothing);
     expect(find.byType(OfflineBanner), findsOneWidget);
+    await teardownTree(tester);
+  });
+
+  // Phase M §7.7: signed out behaves as offline too, with its own banner.
+  testWidgets('a signed-out session shows its banner instead of the offline '
+      'one', (tester) async {
+    final session = FakeSessionControls()
+      ..serverBlocked = ServerBlockedReason.signedOut;
+    await pumpShell(tester, session: session);
+    h.offline.set(true);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Signed out'), findsOneWidget);
+    expect(find.byType(OfflineBanner), findsNothing);
     await teardownTree(tester);
   });
 }

@@ -7,6 +7,7 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/app_info_service.dart';
 
@@ -14,7 +15,10 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 Map<String, dynamic> _appInfoJson(List<String> fieldKeys) => {
@@ -29,8 +33,11 @@ Map<String, dynamic> _appInfoJson(List<String> fieldKeys) => {
       },
     };
 
+ApiClient api = testApiClient('', MockClient((_) async => throw StateError('unset')));
+
 ProviderContainer _container({required bool offline}) {
   final c = ProviderContainer(overrides: [
+    apiClientProvider.overrideWithValue(api),
     offlineModeProvider.overrideWith(() => _StubOffline(offline)),
   ]);
   addTearDown(c.dispose);
@@ -40,7 +47,7 @@ ProviderContainer _container({required bool offline}) {
 void main() {
   test('online: refreshes from the server and caches the blob', () async {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://localhost:8000',
       MockClient((req) async {
         expect(req.url.path, '/app/info');
@@ -61,7 +68,7 @@ void main() {
     SharedPreferences.setMockInitialValues({
       'appInfo.cache': jsonEncode(_appInfoJson(['title'])),
     });
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://localhost:8000',
       MockClient((req) async => http.Response('boom', 500)),
     );
@@ -70,9 +77,38 @@ void main() {
     expect(info.entity('track')!.fields.map((f) => f.key), ['title']);
   });
 
+  // U22-FE-LIFECYCLE-B-02: one malformed answer must not replace the good
+  // cached copy (offline would then fall back to the built-in defaults).
+  test('a malformed answer keeps the good cache', () async {
+    final good = jsonEncode(_appInfoJson(['title']));
+    SharedPreferences.setMockInitialValues({'appInfo.cache': good});
+    api = testApiClient(
+      'http://localhost:8000',
+      MockClient((req) async => http.Response(
+            jsonEncode({
+              'entities': {
+                'track': {
+                  'fields': [
+                    {'key': 42, 'label': 'x', 'valueType': 'text'},
+                  ],
+                },
+              },
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          )),
+    );
+
+    final info = await _container(offline: false).read(appInfoProvider.future);
+    expect(info.entity('track')!.fields.map((f) => f.key), ['title'],
+        reason: 'falls back to the cached copy');
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('appInfo.cache'), good);
+  });
+
   test('cold offline with no cache: conservative built-in default', () async {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://localhost:8000',
       MockClient((req) async => http.Response('boom', 500)),
     );

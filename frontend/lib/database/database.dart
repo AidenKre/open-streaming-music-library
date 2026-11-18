@@ -294,6 +294,10 @@ class ServerBinding extends Table {
   BoolColumn get catalogReconciledAtBinding =>
       boolean().withDefault(const Constant(false))();
 
+  /// The bound user's server id. NULL = unknown user, so the next login
+  /// resets (SC-01 Phase M; unknown is never 0).
+  IntColumn get userId => integer().nullable()();
+
   @override
   Set<Column> get primaryKey => {id};
 }
@@ -374,6 +378,99 @@ class ActiveListens extends Table {
 
   @override
   Set<Column> get primaryKey => {listenUuid};
+}
+
+/// Client durable-submission rows (SC-14): persisted before sending so a
+/// crash or ambiguous response can be resolved by operation id. A raw-stream
+/// request has no frozen body (NULL `frozen_body_json`).
+@TableIndex(
+  name: 'idx_durable_submissions_unresolved',
+  columns: {#localBindingId, #kind, #state},
+)
+@DataClassName('DurableSubmissionRow')
+class DurableSubmissions extends Table {
+  TextColumn get operationUuid => text()();
+  TextColumn get kind => text()();
+  TextColumn get localBindingId => text()();
+
+  /// NULL for raw-stream requests (nothing to freeze).
+  TextColumn get frozenBodyJson => text().nullable()();
+
+  /// One of the SC-14 states. Raw constraint (not `.check`) so the fresh DDL
+  /// is byte-identical to the migration snapshot's.
+  TextColumn get state => text().customConstraint(
+    "NOT NULL CHECK (state IN ('prepared', 'sent', 'accepted', 'rejected', "
+    "'ambiguous'))",
+  )();
+
+  /// NULL until accepted.
+  TextColumn get receiptJson => text().nullable()();
+
+  /// NULL unless rejected.
+  TextColumn get errorCode => text().nullable()();
+
+  /// UTC milliseconds.
+  IntColumn get createdAt => integer()();
+
+  /// UTC milliseconds.
+  IntColumn get updatedAt => integer()();
+
+  @override
+  List<String> get customConstraints => const ['PRIMARY KEY(operation_uuid)'];
+}
+
+/// Local upload transfer intents (Phase 7 spec section 7), one row per
+/// selected file, keyed by the SC-01 `local_binding_id`.
+@TableIndex(
+  name: 'idx_upload_intents_batch',
+  columns: {#localBindingId, #batchUuid, #selectionIndex},
+)
+class UploadIntents extends Table {
+  TextColumn get itemUuid => text()();
+  TextColumn get batchUuid => text()();
+
+  /// The ZIP parent's item UUID for a server-expanded child (its review
+  /// draft and operation ids live here too); NULL for a selected file.
+  TextColumn get parentItemUuid => text().nullable()();
+  IntColumn get selectionIndex => integer()();
+  TextColumn get displayName => text()();
+
+  /// NULL = the source must be reselected.
+  TextColumn get sourceDescriptorJson => text().nullable()();
+
+  /// NULL = unknown (never 0).
+  TextColumn get expectedSha256 => text().nullable()();
+
+  /// NULL = unknown (never 0).
+  IntColumn get expectedLength => integer().nullable()();
+
+  /// State vocabulary is owned by the upload pipeline, so no CHECK here.
+  TextColumn get lastState => text()();
+  TextColumn get lastErrorCode => text().nullable()();
+  TextColumn get lastErrorMessage => text().nullable()();
+
+  /// The current review action's operation id. The allocation's operation
+  /// id is the `batch_uuid` itself (not stored here).
+  TextColumn get operationUuid => text().nullable()();
+
+  /// The local operation id of the current content transfer attempt (SC-14
+  /// PUT identity is item + digest/length); a fresh one per deliberate
+  /// re-send, e.g. after the server returns the item to `allocated`.
+  TextColumn get transferOperationUuid => text().nullable()();
+
+  /// The server review version the draft and operation belong to.
+  IntColumn get reviewGeneration => integer().nullable()();
+  TextColumn get draftJson => text().nullable()();
+  TextColumn get localBindingId => text()();
+
+  /// UTC milliseconds.
+  IntColumn get createdAt => integer()();
+
+  /// UTC milliseconds.
+  IntColumn get updatedAt => integer()();
+
+  @override
+  List<String> get customConstraints => const ['PRIMARY KEY(item_uuid)'];
 }
 
 const _historyContentTriggerV3 = '''
@@ -864,7 +961,7 @@ const staleDownloadPredicate =
 /// [owner] has a downloaded file. The one definition of "has downloads",
 /// shared by browse and search so the Downloaded filter means the same thing
 /// on every surface.
-String _hasDownloadedTrack(String column, String owner) =>
+String hasDownloadedTrack(String column, String owner) =>
     'EXISTS (SELECT 1 FROM trackmetadata tm '
     'INNER JOIN tracks t ON tm.uuid_id = t.uuid_id '
     'WHERE tm.$column = $owner AND $usableDownloadPredicate)';
@@ -888,6 +985,23 @@ String _coverArtSubquery(
     '${downloadedOnly ? 'AND $usableDownloadPredicate ' : ''}'
     'ORDER BY tm.track_number ASC, tm.uuid_id ASC '
     'LIMIT 1';
+
+/// SC-12: the one album display projection (browse, search, by-ID). Rows alias
+/// the album `a` and its artist `ar`. Uses the same cover rule everywhere, so a
+/// result shows the same art as its browse card (and, filtered, art that
+/// resolves offline).
+String _albumProjection({required bool downloadedOnly}) =>
+    'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
+    'a."year", a.is_single_grouping, '
+    '(${_coverArtSubquery('album_id', 'a.id', downloadedOnly: downloadedOnly)}) AS cover_art_id '
+    'FROM albums a '
+    'JOIN artists ar ON a.artist_id = ar.id';
+
+/// SC-12: the one artist display projection. Rows come from `artists`.
+String _artistProjection({required bool downloadedOnly}) =>
+    'SELECT id, name, '
+    '(${_coverArtSubquery('artist_id', 'artists.id', downloadedOnly: downloadedOnly)}) AS cover_art_id '
+    'FROM artists';
 
 /// Nulls every column that marks a track as downloaded. The single shared
 /// definition for every clear path (delete, reset fence, a commit undone by a
@@ -947,6 +1061,8 @@ String _quoteSqlIdentifier(String identifier) {
     HistorySyncFailures,
     HistoryConflictArchive,
     ActiveListens,
+    DurableSubmissions,
+    UploadIntents,
   ],
 )
 class AppDatabase extends _$AppDatabase implements LocalResettable {
@@ -982,7 +1098,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
   ///     [rebuildFtsIndexes] afterwards.
   @override
-  int get schemaVersion => 4;
+  int get schemaVersion => 6;
 
   @override
   StreamQueryUpdateRules get streamUpdateRules => StreamQueryUpdateRules([
@@ -1057,6 +1173,17 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     from3To4: (m, schema) async {
       // Decision 6: damaged downloads (nullable; existing rows read NULL).
       await m.addColumn(schema.tracks, schema.tracks.damagedFilePath);
+    },
+    from4To5: (m, schema) async {
+      // SC-01 Phase M: the bound user (NULL = unknown user; existing rows).
+      await m.addColumn(schema.serverBinding, schema.serverBinding.userId);
+    },
+    from5To6: (m, schema) async {
+      // SC-14 durable submissions + Phase 7 upload intents: created empty.
+      await m.createTable(schema.durableSubmissions);
+      await m.createTable(schema.uploadIntents);
+      await m.createIndex(schema.idxDurableSubmissionsUnresolved);
+      await m.createIndex(schema.idxUploadIntentsBatch);
     },
   );
 
@@ -1668,6 +1795,50 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     ).watch();
   }
 
+  /// SC-12 by-ID album resolver: one query over the shared album projection,
+  /// returned in the order of [ids] with missing ids dropped.
+  /// [downloadedArtOnly] picks the cover from usable downloads only (the
+  /// offline local-art variant, the same subquery the Downloaded grids use);
+  /// it does NOT filter membership.
+  Future<List<QueryRow>> getAlbumsByIds(
+    List<int> ids, {
+    bool downloadedArtOnly = false,
+  }) async {
+    if (ids.isEmpty) return [];
+    final placeholders = List.filled(ids.length, '?').join(', ');
+    final rows = await customSelect(
+      '${_albumProjection(downloadedOnly: downloadedArtOnly)} '
+      'WHERE a.id IN ($placeholders)',
+      variables: ids.map(Variable.withInt).toList(),
+      readsFrom: {albums, artists, trackmetadata, tracks},
+    ).get();
+    final byId = {for (final row in rows) row.read<int>('id'): row};
+    return [
+      for (final id in ids)
+        if (byId.containsKey(id)) byId[id]!,
+    ];
+  }
+
+  /// SC-12 by-ID artist resolver; same contract as [getAlbumsByIds].
+  Future<List<QueryRow>> getArtistsByIds(
+    List<int> ids, {
+    bool downloadedArtOnly = false,
+  }) async {
+    if (ids.isEmpty) return [];
+    final placeholders = List.filled(ids.length, '?').join(', ');
+    final rows = await customSelect(
+      '${_artistProjection(downloadedOnly: downloadedArtOnly)} '
+      'WHERE id IN ($placeholders)',
+      variables: ids.map(Variable.withInt).toList(),
+      readsFrom: {artists, trackmetadata, tracks},
+    ).get();
+    final byId = {for (final row in rows) row.read<int>('id'): row};
+    return [
+      for (final id in ids)
+        if (byId.containsKey(id)) byId[id]!,
+    ];
+  }
+
   Future<List<QueryRow>> getTracksByUuids(List<String> uuids) {
     if (uuids.isEmpty) return Future.value([]);
 
@@ -1804,23 +1975,14 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }) {
     final vars = <Variable>[];
 
-    final coverArtSubquery = _coverArtSubquery(
-      'artist_id',
-      'artists.id',
-      downloadedOnly: downloadedOnly,
-    );
-
-    var query =
-        'SELECT id, name, '
-        '($coverArtSubquery) AS cover_art_id '
-        'FROM artists';
+    var query = _artistProjection(downloadedOnly: downloadedOnly);
 
     final whereClauses = <String>[];
 
     if (downloadedOnly) {
       // Artist appears iff at least one of their tracks is downloaded. EXISTS
       // short-circuits on first hit, so this is cheaper than a COUNT.
-      whereClauses.add(_hasDownloadedTrack('artist_id', 'artists.id'));
+      whereClauses.add(hasDownloadedTrack('artist_id', 'artists.id'));
     }
 
     // Cursor filter
@@ -1941,18 +2103,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   }) {
     final vars = <Variable>[];
 
-    final coverArtSubquery = _coverArtSubquery(
-      'album_id',
-      'a.id',
-      downloadedOnly: downloadedOnly,
-    );
-
-    var sql =
-        'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
-        'a."year", a.is_single_grouping, '
-        '($coverArtSubquery) AS cover_art_id '
-        'FROM albums a '
-        'JOIN artists ar ON a.artist_id = ar.id';
+    var sql = _albumProjection(downloadedOnly: downloadedOnly);
 
     final whereClauses = <String>[];
 
@@ -1962,7 +2113,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     }
 
     if (downloadedOnly) {
-      whereClauses.add(_hasDownloadedTrack('album_id', 'a.id'));
+      whereClauses.add(hasDownloadedTrack('album_id', 'a.id'));
     }
 
     // Cursor filter
@@ -2075,26 +2226,14 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     // LIMIT — otherwise a downloaded match ranked below limitPerType would be
     // dropped before we ever see it.
     final trackDownloadedFilter = downloadedOnly
-        ? ' AND ${_hasDownloadedTrack('rowid', 'fts_tracks.rowid')}'
+        ? ' AND ${hasDownloadedTrack('rowid', 'fts_tracks.rowid')}'
         : '';
     final artistDownloadedFilter = downloadedOnly
-        ? ' AND ${_hasDownloadedTrack('artist_id', 'fts_artists.rowid')}'
+        ? ' AND ${hasDownloadedTrack('artist_id', 'fts_artists.rowid')}'
         : '';
     final albumDownloadedFilter = downloadedOnly
-        ? ' AND ${_hasDownloadedTrack('album_id', 'fts_albums.rowid')}'
+        ? ' AND ${hasDownloadedTrack('album_id', 'fts_albums.rowid')}'
         : '';
-    // Same cover rule as browse, so a result shows the same art as its
-    // browse card (and, filtered, art that resolves offline).
-    final artistCoverArt = _coverArtSubquery(
-      'artist_id',
-      'artists.id',
-      downloadedOnly: downloadedOnly,
-    );
-    final albumCoverArt = _coverArtSubquery(
-      'album_id',
-      'a.id',
-      downloadedOnly: downloadedOnly,
-    );
 
     if (searchTracks) {
       final ftsRows = await customSelect(
@@ -2143,25 +2282,9 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       ).get();
       if (ftsRows.isNotEmpty) {
         final artistIds = ftsRows.map((r) => r.read<int>('rowid')).toList();
-        final placeholders = List.filled(artistIds.length, '?').join(', ');
-        final vars = artistIds.map((id) => Variable.withInt(id)).toList();
-        final fullRows = await customSelect(
-          'SELECT id, name, '
-          '($artistCoverArt) AS cover_art_id '
-          'FROM artists WHERE id IN ($placeholders)',
-          variables: vars,
-          readsFrom: {artists, trackmetadata, tracks},
-        ).get();
-        final idOrder = {
-          for (var i = 0; i < artistIds.length; i++) artistIds[i]: i,
-        };
-        final sorted = List<QueryRow>.from(fullRows)
-          ..sort(
-            (a, b) => (idOrder[a.read<int>('id')] ?? 999).compareTo(
-              idOrder[b.read<int>('id')] ?? 999,
-            ),
-          );
-        resultArtists.addAll(sorted);
+        resultArtists.addAll(
+          await getArtistsByIds(artistIds, downloadedArtOnly: downloadedOnly),
+        );
       }
     }
 
@@ -2177,28 +2300,9 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       ).get();
       if (ftsRows.isNotEmpty) {
         final albumIds = ftsRows.map((r) => r.read<int>('rowid')).toList();
-        final placeholders = List.filled(albumIds.length, '?').join(', ');
-        final vars = albumIds.map((id) => Variable.withInt(id)).toList();
-        final fullRows = await customSelect(
-          'SELECT a.id, a.name, ar.name AS artist, a.artist_id, '
-          'a."year", a.is_single_grouping, '
-          '($albumCoverArt) AS cover_art_id '
-          'FROM albums a '
-          'JOIN artists ar ON a.artist_id = ar.id '
-          'WHERE a.id IN ($placeholders)',
-          variables: vars,
-          readsFrom: {albums, artists, trackmetadata, tracks},
-        ).get();
-        final idOrder = {
-          for (var i = 0; i < albumIds.length; i++) albumIds[i]: i,
-        };
-        final sorted = List<QueryRow>.from(fullRows)
-          ..sort(
-            (a, b) => (idOrder[a.read<int>('id')] ?? 999).compareTo(
-              idOrder[b.read<int>('id')] ?? 999,
-            ),
-          );
-        resultAlbums.addAll(sorted);
+        resultAlbums.addAll(
+          await getAlbumsByIds(albumIds, downloadedArtOnly: downloadedOnly),
+        );
       }
     }
 

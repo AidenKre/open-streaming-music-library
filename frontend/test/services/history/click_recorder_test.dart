@@ -22,6 +22,7 @@ class _Binding extends ServerBindingRepository {
         lastBaseUrl: 'http://x',
         boundAtMs: 0,
         catalogReconciled: false,
+        userId: null,
       );
 }
 

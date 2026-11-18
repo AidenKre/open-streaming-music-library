@@ -43,6 +43,7 @@ class ArtistCard extends ConsumerWidget {
       title: artist.name,
       semanticLabel: 'Artist, ${artist.name}',
       onTap: onTap,
+      dimmed: !availability.isUnknown && !availability.canPlay,
       availability: availability,
       menu: buildLibraryActionMenu(
         scope,

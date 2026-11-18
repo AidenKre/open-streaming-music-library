@@ -3,6 +3,9 @@ import 'dart:developer' as developer;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/playback/playback_engine.dart'
+    show EngineCommandFailure;
+
 /// Something the playback model found while deciding or playing (SC-27).
 /// Resolvers return issues; only appliers (the playback core and
 /// PlaybackRequests) publish them. Nothing is shown to the user yet: the
@@ -68,6 +71,17 @@ final class PlaybackTaskFailed extends PlaybackIssue {
 
   @override
   String toString() => 'PlaybackTaskFailed($task, $error)';
+}
+
+/// A native engine command did not take effect (SC-27 §6, 7P.1). Published
+/// by the playback core, which rebuilds from queue data when the engine
+/// diverged. Carries identities only (no URL, token or path).
+final class PlaybackEngineCommandFailed extends PlaybackIssue {
+  const PlaybackEngineCommandFailed(this.failure);
+  final EngineCommandFailure failure;
+
+  @override
+  String toString() => 'PlaybackEngineCommandFailed($failure)';
 }
 
 /// The playback issue stream and log (SC-27 `PlaybackIssueBus`).

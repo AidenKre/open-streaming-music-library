@@ -9,10 +9,11 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
-import 'package:frontend/ui/login_page.dart';
+import 'package:frontend/ui/server_address_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 
 import '../helpers/server_binding.dart';
@@ -24,13 +25,16 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
-/// Drives the real `StartupGate._onConnect` through `LoginPage`'s callback,
+/// Drives the real `StartupGate._onConnect` through `ServerAddressPage`'s callback,
 /// without pumping the post-connect frame — so `AppShell` (whose provider
 /// graph is irrelevant to these tests) is never built.
-Future<LoginPage> _pumpLoginPage(
+Future<ServerAddressPage> _pumpServerAddressPage(
   WidgetTester tester,
   ProviderContainer container,
 ) async {
@@ -41,8 +45,8 @@ Future<LoginPage> _pumpLoginPage(
     ),
   );
   await tester.pumpAndSettle();
-  expect(find.byType(LoginPage), findsOneWidget);
-  return tester.widget<LoginPage>(find.byType(LoginPage));
+  expect(find.byType(ServerAddressPage), findsOneWidget);
+  return tester.widget<ServerAddressPage>(find.byType(ServerAddressPage));
 }
 
 void main() {
@@ -50,16 +54,18 @@ void main() {
     tester,
   ) async {
     SharedPreferences.setMockInitialValues({}); // no saved serverUrl
-    ApiClient.initForTest(
-      'http://localhost:8000',
-      MockClient((_) async => http.Response('{"message": "Healthy"}', 200)),
-    );
+    final mock = MockClient((req) async => req.url.path.endsWith('/app/info')
+        ? http.Response('{"server":{"instance_id":"inst-1"},"auth":{"version":1,"signup_enabled":true}}', 200)
+        : http.Response('{"message": "Healthy"}', 200));
     // SC-01: connect writes the binding row and verifies the server's
     // identity through the binding gate (probe answered immediately).
     final db = AppDatabase(NativeDatabase.memory());
     addTearDown(db.close);
     final container = ProviderContainer(
       overrides: [
+        unauthenticatedApiClientProvider.overrideWithValue(
+          (url) => testApiClient(url, mock),
+        ),
         offlineModeProvider.overrideWith(() => _StubOffline(true)),
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(startOnRead: false),
@@ -67,7 +73,7 @@ void main() {
     );
     addTearDown(container.dispose);
 
-    final loginPage = await _pumpLoginPage(tester, container);
+    final loginPage = await _pumpServerAddressPage(tester, container);
     expect(container.read(offlineModeProvider), isTrue);
 
     await loginPage.onConnect('http://localhost:8000');
@@ -83,15 +89,19 @@ void main() {
     tester,
   ) async {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.initForTest(
-      'http://localhost:8000',
-      MockClient((_) async => throw const SocketException('unreachable')),
-    );
+    final mock =
+        MockClient((_) async => throw const SocketException('unreachable'));
     // Real notifier — starts online. The health check must not flip it.
-    final container = ProviderContainer();
+    final container = ProviderContainer(
+      overrides: [
+        unauthenticatedApiClientProvider.overrideWithValue(
+          (url) => testApiClient(url, mock),
+        ),
+      ],
+    );
     addTearDown(container.dispose);
 
-    final loginPage = await _pumpLoginPage(tester, container);
+    final loginPage = await _pumpServerAddressPage(tester, container);
     expect(container.read(offlineModeProvider), isFalse);
 
     await loginPage.onConnect('http://typo.invalid:9999');
@@ -106,7 +116,7 @@ void main() {
   test('a failed manual-connect health check uses a single attempt', () async {
     SharedPreferences.setMockInitialValues({});
     var attempts = 0;
-    ApiClient.initForTest(
+    final client = testApiClient(
       'http://hang.invalid:9999',
       MockClient((_) async {
         attempts++;
@@ -116,7 +126,7 @@ void main() {
     // Drive the health check directly so we don't have to stub the full
     // AppShell provider graph just to count attempts.
     final sw = Stopwatch()..start();
-    final result = await ApiClient.instance.healthCheck(retry: false);
+    final result = await client.healthCheck(retry: false);
     sw.stop();
 
     expect(result.status, HealthStatus.unreachable);

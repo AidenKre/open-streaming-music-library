@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:http/testing.dart';
+import 'package:http/http.dart' as http;
+import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
@@ -22,7 +25,10 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 Widget buildCard(
@@ -38,6 +44,14 @@ Widget buildCard(
       counts ?? (downloaded: downloaded ? 10 : 0, total: 10);
   return ProviderScope(
     overrides: [
+      coverArtCacheProvider.overrideWithValue(
+        CoverArtCacheManager.noop(
+          api: testApiClient(
+            'http://localhost:8000',
+            MockClient((_) async => http.Response('', 404)),
+          ),
+        ),
+      ),
       // Keep the card isolated — don't build the real download-manager graph.
       artistIsDownloadingProvider.overrideWith((ref, artistId) => false),
       artistDownloadCountsProvider.overrideWith(
@@ -72,11 +86,6 @@ Widget buildCard(
 }
 
 void main() {
-  setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
-  });
-
   group('ArtistCard cover art', () {
     testWidgets(
       'shows fallback person icon when no cover art',
@@ -235,7 +244,8 @@ void main() {
 
   group('ArtistCard offline mode', () {
     testWidgets(
-      'partially downloaded: queue actions disabled, delete available',
+      // Phase 6 (O2 / DEV-6-02): partial plays its downloads offline.
+      'partially downloaded: queue actions enabled, delete available',
       (tester) async {
         await tester.pumpWidget(buildCard(
           _artist,
@@ -255,8 +265,8 @@ void main() {
           of: find.text('Add to Queue'),
           matching: find.byType(ListTile),
         ));
-        expect(playNext.enabled, isFalse);
-        expect(addToQueue.enabled, isFalse);
+        expect(playNext.enabled, isTrue);
+        expect(addToQueue.enabled, isTrue);
         expect(find.text('Delete downloads'), findsOneWidget);
       },
     );

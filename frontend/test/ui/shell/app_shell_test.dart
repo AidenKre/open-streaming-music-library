@@ -4,9 +4,7 @@ import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/browse/browse_pages.dart';
 import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/feed/feed_header.dart';
@@ -50,11 +48,9 @@ void main() {
   late _CountingBrowse browse;
 
   setUpAll(() {
-    ApiClient.init('http://localhost:8000');
   });
 
   setUp(() async {
-    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, [
       const SeedTrack(

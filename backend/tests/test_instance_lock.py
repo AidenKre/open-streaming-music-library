@@ -9,9 +9,6 @@ flock locks belong to the open file description, so two independent opens in
 one test process conflict exactly like two processes would.
 """
 
-import importlib
-import sys
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -44,25 +41,12 @@ def test_release_is_idempotent(tmp_path):
     acquire_instance_lock(tmp_path).release()
 
 
-def _reload_main(tmp_path, monkeypatch):
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-    sys.modules.pop("app.main", None)
-    sys.modules.pop("app.config", None)
-    import app.main
-
-    importlib.reload(app.main)
-    return app.main
-
-
-def test_startup_refuses_while_another_instance_holds_the_lock(tmp_path, monkeypatch):
+def test_startup_refuses_while_another_instance_holds_the_lock(tmp_path, configure_app):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     other_instance = acquire_instance_lock(data_dir)
     try:
-        main = _reload_main(tmp_path, monkeypatch)
+        main = configure_app()
         with pytest.raises(InstanceLockHeld):
             with TestClient(main.app):
                 pass
@@ -72,8 +56,8 @@ def test_startup_refuses_while_another_instance_holds_the_lock(tmp_path, monkeyp
         other_instance.release()
 
 
-def test_running_instance_holds_the_lock_and_shutdown_releases_it(tmp_path, monkeypatch):
-    main = _reload_main(tmp_path, monkeypatch)
+def test_running_instance_holds_the_lock_and_shutdown_releases_it(tmp_path, configure_app):
+    main = configure_app()
     data_dir = tmp_path / "data"
     with TestClient(main.app):
         with pytest.raises(InstanceLockHeld):
@@ -82,9 +66,49 @@ def test_running_instance_holds_the_lock_and_shutdown_releases_it(tmp_path, monk
     acquire_instance_lock(data_dir).release()
 
 
-def test_restart_in_same_data_dir_succeeds(tmp_path, monkeypatch):
-    main = _reload_main(tmp_path, monkeypatch)
+def test_restart_in_same_data_dir_succeeds(tmp_path, configure_app):
+    main = configure_app()
     with TestClient(main.app) as c:
         assert c.get("/").status_code == 200
     with TestClient(main.app) as c:
         assert c.get("/").status_code == 200
+
+
+@pytest.mark.integration
+def test_the_lock_is_free_once_a_killed_holder_is_gone(tmp_path):
+    # Review r1 N08 (6.5-U00 "released after a crash"): the kernel drops the
+    # flock when the holder dies; nothing has to clean up after it. The child
+    # reports "locked" once it holds the lock, then blocks on stdin forever.
+    import signal
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from app.core.instance_lock import acquire_instance_lock\n"
+        "lock = acquire_instance_lock(Path(sys.argv[1]))\n"
+        "print('locked', flush=True)\n"
+        "sys.stdin.read()\n"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", code, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with pytest.raises(InstanceLockHeld):
+            acquire_instance_lock(tmp_path)
+
+        holder.send_signal(signal.SIGKILL)
+        assert holder.wait(timeout=30) == -signal.SIGKILL
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
+        holder.stdin.close()
+        holder.stdout.close()
+
+    acquire_instance_lock(tmp_path).release()  # no stale lock left behind

@@ -5,7 +5,9 @@ import 'package:frontend/models/conversion_job.dart';
 /// `type="conversion"` exists today -- the shape is forward-looking per the
 /// backend doc so future bulk/upload job types add zero endpoints.
 class JobsApi {
-  final ApiClient _apiClient = ApiClient.instance;
+  JobsApi({required ApiClient api}) : _apiClient = api;
+
+  final ApiClient _apiClient;
 
   /// Enqueues a conversion job. Non-idempotent (mints a job) -> single
   /// attempt; an orphaned job from a timed-out-but-succeeded POST is

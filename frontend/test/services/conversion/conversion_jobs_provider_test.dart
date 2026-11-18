@@ -8,12 +8,14 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
+import '../../helpers/test_credentials.dart';
 
 Map<String, dynamic> _jobJson({
   int jobId = 1,
@@ -43,6 +45,14 @@ class _FakeJobsServer {
 
   /// When set, the next GETs answer with this status code instead.
   final List<int> failNextGetsWith = [];
+
+  /// Job ids whose per-job settle lookup answers 500 (the active-set GET
+  /// is unaffected).
+  final Set<int> failSettleLookupsFor = {};
+
+  /// When true, every per-job settle lookup fails in transport (the server
+  /// stopped answering), as a dropped connection does.
+  bool dropSettleLookups = false;
 
   /// When set, GETs wait on this before answering (simulates in-flight).
   Completer<void>? holdGets;
@@ -87,6 +97,14 @@ class _FakeJobsServer {
         if (failNextGetsWith.isNotEmpty) {
           return http.Response('boom', failNextGetsWith.removeAt(0));
         }
+        final q = req.url.queryParameters;
+        if (dropSettleLookups && q['status'] == null) {
+          throw http.ClientException('connection refused', req.url);
+        }
+        final lookupOf = (int.tryParse(q['cursor'] ?? '') ?? -1) + 1;
+        if (q['status'] == null && failSettleLookupsFor.contains(lookupOf)) {
+          return http.Response('boom', 500);
+        }
         return http.Response(
           early ?? jsonEncode(_page(req.url.queryParameters)),
           200,
@@ -121,7 +139,10 @@ class _Offline extends OfflineModeNotifier {
   final bool initial;
 
   @override
-  bool build() => initial;
+  bool build() {
+    super.build();
+    return initial;
+  }
 
   void set(bool value) => state = value;
 }
@@ -143,7 +164,7 @@ class _CountingSync extends TrackSyncNotifier {
 }
 
 class _Harness {
-  _Harness(this.container, this.server, this.sync, this.offline) {
+  _Harness(this.container, this.server, this.sync, this.offline, this.api) {
     _originalDebugPrint = debugPrint;
     debugPrint = (String? message, {int? wrapWidth}) => printed.add('$message');
   }
@@ -151,6 +172,7 @@ class _Harness {
   final _FakeJobsServer server;
   final _CountingSync sync;
   final _Offline offline;
+  final ApiClient api;
 
   /// debugPrint output captured while the harness is open (the notifier
   /// logs caught poll failures through it).
@@ -184,13 +206,19 @@ class _Harness {
   );
 }
 
-_Harness _harness({bool offline = false, _FakeJobsServer? server}) {
+_Harness _harness({
+  bool offline = false,
+  _FakeJobsServer? server,
+  String baseUrl = 'http://localhost:8000',
+}) {
   final s = server ?? _FakeJobsServer();
-  ApiClient.initForTest('http://localhost:8000', s.client);
+  final api = testApiClient(baseUrl, s.client);
   final sync = _CountingSync();
   final off = _Offline(offline);
   final container = ProviderContainer(
     overrides: [
+      apiClientProvider.overrideWithValue(api),
+      if (baseUrl.isNotEmpty) ...signedInOverrides,
       trackSyncProvider.overrideWith(() => sync),
       offlineModeProvider.overrideWith(() => off),
     ],
@@ -198,7 +226,7 @@ _Harness _harness({bool offline = false, _FakeJobsServer? server}) {
   // Materialise the stubs so `sync`/`off` are the live instances.
   container.read(offlineModeProvider);
   container.read(trackSyncProvider);
-  return _Harness(container, s, sync, off);
+  return _Harness(container, s, sync, off, api);
 }
 
 const _interval = Duration(seconds: 1);
@@ -225,13 +253,16 @@ class _TimerTracker {
 
 void main() {
   setUp(() {
+    final originalPoll = ConversionJobsNotifier.pollInterval;
+    final originalBackoff = ConversionJobsNotifier.maxPollBackoff;
+    final originalPageSize = ConversionJobsNotifier.activePageSize;
+    addTearDown(() {
+      ConversionJobsNotifier.pollInterval = originalPoll;
+      ConversionJobsNotifier.maxPollBackoff = originalBackoff;
+      ConversionJobsNotifier.activePageSize = originalPageSize;
+    });
     ConversionJobsNotifier.pollInterval = _interval;
     ConversionJobsNotifier.maxPollBackoff = const Duration(seconds: 30);
-    ConversionJobsNotifier.activePageSize = 50;
-  });
-
-  tearDown(() {
-    ConversionJobsNotifier.pollInterval = const Duration(seconds: 3);
     ConversionJobsNotifier.activePageSize = 50;
   });
 
@@ -416,6 +447,69 @@ void main() {
     h.close();
   });
 
+  // U25-B-04: one job's failed settle lookup must not drop every other
+  // job's update; that job stays as it was and settles on a later poll.
+  testWidgets('a failed settle lookup skips only that job', (tester) async {
+    final server = _FakeJobsServer()
+      ..put(_jobJson(jobId: 1, uuidId: 'a', status: 'running'))
+      ..put(_jobJson(jobId: 2, uuidId: 'b', status: 'running'));
+    final h = _harness(server: server);
+    await h.notifier.refreshAll();
+    expect(h.jobs.where((j) => j.isRunning), hasLength(2));
+
+    server
+      ..failSettleLookupsFor.add(1)
+      ..setStatus(1, 'done')
+      ..setStatus(2, 'done')
+      ..put(_jobJson(jobId: 3, uuidId: 'c', status: 'queued'));
+    await tester.pump(_interval);
+    ConversionJob job(int id) => h.jobs.firstWhere((j) => j.jobId == id);
+    expect(job(1).isRunning, isTrue, reason: 'its lookup failed: unchanged');
+    expect(job(2).isDone, isTrue, reason: "job 1's failure does not drop it");
+    expect(h.jobs.map((j) => j.jobId), contains(3),
+        reason: 'the new active job is published');
+    expect(job(3).isQueued, isTrue);
+    expect(h.sync.syncFreshCalls, 1, reason: 'job 2 finished');
+
+    server.failSettleLookupsFor.clear();
+    await tester.pump(_interval);
+    expect(job(1).isRunning, isTrue,
+        reason: 'a poll with a failed lookup backs off (2 s, not 1 s)');
+    await tester.pump(_interval);
+    expect(job(1).isDone, isTrue, reason: 'settled once its lookup answers');
+    h.close();
+  });
+
+  // Review r1 #1: a transport failure (the server stopped answering) ends
+  // the settle loop: no further lookup goes out to an unreachable server,
+  // and what was fetched is still published.
+  testWidgets('a transport failure on a settle lookup stops the others',
+      (tester) async {
+    final server = _FakeJobsServer()
+      ..put(_jobJson(jobId: 1, uuidId: 'a', status: 'running'))
+      ..put(_jobJson(jobId: 2, uuidId: 'b', status: 'running'))
+      ..put(_jobJson(jobId: 3, uuidId: 'c', status: 'running'));
+    final h = _harness(server: server);
+    await h.notifier.refreshAll();
+    expect(h.jobs.where((j) => j.isRunning), hasLength(3));
+
+    server
+      ..dropSettleLookups = true
+      ..setStatus(1, 'done')
+      ..setStatus(2, 'done')
+      ..setStatus(3, 'done')
+      ..put(_jobJson(jobId: 4, uuidId: 'd', status: 'queued'));
+    final before = server.getRequests.length;
+    await tester.pump(_interval);
+    final lookups = server.getRequests
+        .skip(before)
+        .where((u) => u.queryParameters['status'] == null);
+    expect(lookups, hasLength(1), reason: 'the loop stops at the first');
+    expect(h.jobs.map((j) => j.jobId), contains(4),
+        reason: 'the active set is still published');
+    h.close();
+  });
+
   testWidgets('a failed or cancelled transition does not sync', (tester) async {
     final h = _harness();
     await h.enqueue();
@@ -535,12 +629,11 @@ void main() {
   testWidgets(
       'cold start with no server configured makes no request and does not '
       'trip offline mode', (tester) async {
-    final h = _harness();
-    ApiClient.initForTest('', h.server.client); // first install / Disconnect
+    final h = _harness(baseUrl: ''); // first install / Disconnect
     var networkFailures = 0;
     void onFailure() => networkFailures++;
-    ApiClient.addNetworkFailureListener(onFailure);
-    addTearDown(() => ApiClient.removeNetworkFailureListener(onFailure));
+    h.api.addNetworkFailureListener(onFailure);
+    addTearDown(() => h.api.removeNetworkFailureListener(onFailure));
     final timers = _TimerTracker();
 
     await timers.run(h.notifier.refreshAll);

@@ -6,6 +6,7 @@ import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/collection_ordering.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/settings_service.dart';
 
@@ -17,11 +18,20 @@ import 'package:frontend/services/settings_service.dart';
 /// shows it). Each method resolves membership through the model
 /// (`BrowseRepository.getTracksForScope`, passing only the observed offline
 /// state) and submits typed requests to `PlaybackRequests.submit`, whose
-/// outcome it returns.
+/// outcome it returns. Play and Shuffle replace the queue with an album or
+/// artist; Play Next and Add to Queue enqueue any scope.
 abstract interface class LibraryActionControls {
   Future<PlaybackOutcome> playNext(LibraryScope scope);
 
   Future<PlaybackOutcome> addToQueue(LibraryScope scope);
+
+  /// Replace the queue with an album or artist [collection], in its
+  /// canonical order (shuffle off for the new session).
+  Future<PlaybackOutcome> play(LibraryScope collection);
+
+  /// Replace the queue with [collection] from a random member, followed by a
+  /// random permutation of the rest.
+  Future<PlaybackOutcome> shuffle(LibraryScope collection);
 
   /// Play an explicit ordered list (e.g. search results) from
   /// [startIndex].
@@ -62,25 +72,62 @@ class LibraryActions implements LibraryActionControls {
       .read(browseRepositoryProvider)
       .getTracksForScope(scope, offline: _ref.read(offlineModeProvider));
 
-  @override
-  Future<PlaybackOutcome> playNext(LibraryScope scope) async {
-    final tracks = await _members(scope);
-    if (!_ref.mounted || tracks.isEmpty) return const RejectedEmpty();
-    return _ref.read(playbackRequestsProvider).submit(Enqueue(
-          [for (final t in tracks) t.uuidId],
-          EnqueuePosition.next,
-          intent: HistoryIntent.forScope(scope),
-        ));
-  }
+  // Download and Delete act on the whole collection, offline or not: Delete
+  // must reach damaged files and fence queued downloads of every member, and
+  // Download fetches the missing members.
+  Future<List<TrackUI>> _allMembers(LibraryScope scope) => _ref
+      .read(browseRepositoryProvider)
+      .getTracksForScope(scope, offline: false);
 
   @override
-  Future<PlaybackOutcome> addToQueue(LibraryScope scope) async {
-    final tracks = await _members(scope);
-    if (!_ref.mounted || tracks.isEmpty) return const RejectedEmpty();
-    return _ref.read(playbackRequestsProvider).submit(Enqueue(
+  Future<PlaybackOutcome> playNext(LibraryScope scope) =>
+      _enqueue(scope, EnqueuePosition.next);
+
+  @override
+  Future<PlaybackOutcome> addToQueue(LibraryScope scope) =>
+      _enqueue(scope, EnqueuePosition.end);
+
+  @override
+  Future<PlaybackOutcome> play(LibraryScope collection) => _submitMembers(
+        collection,
+        (uuids, intent) => PlayCollection(collection, uuids,
+            shuffle: ShuffleStart.canonical, intent: intent),
+      );
+
+  @override
+  Future<PlaybackOutcome> shuffle(LibraryScope collection) => _submitMembers(
+        collection,
+        (uuids, intent) => PlayCollection(collection, uuids,
+            shuffle: ShuffleStart.random, intent: intent),
+      );
+
+  Future<PlaybackOutcome> _enqueue(
+          LibraryScope scope, EnqueuePosition position) =>
+      _submitMembers(scope,
+          (uuids, intent) => Enqueue(uuids, position, intent: intent));
+
+  /// The shared pipeline: membership, then the server binding, then one
+  /// submit. An ended session or an empty membership is [RejectedEmpty]
+  /// without submitting (an empty request would still admit a revision and
+  /// supersede an in-flight one). A throw from the membership or binding
+  /// read is [Failed]; the submit reports its own outcomes.
+  Future<PlaybackOutcome> _submitMembers(
+    LibraryScope scope,
+    PlaybackRequest Function(List<String> uuids, HistoryIntent? intent) build,
+  ) async {
+    final List<TrackUI> tracks;
+    final ServerBindingRecord? binding;
+    try {
+      tracks = await _members(scope);
+      if (!_ref.mounted || tracks.isEmpty) return const RejectedEmpty();
+      binding = await _ref.read(serverBindingRepositoryProvider).current();
+    } catch (error) {
+      return Failed(error);
+    }
+    if (!_ref.mounted) return const RejectedEmpty();
+    return _ref.read(playbackRequestsProvider).submit(build(
           [for (final t in tracks) t.uuidId],
-          EnqueuePosition.end,
-          intent: HistoryIntent.forScope(scope),
+          HistoryIntent.forScope(scope, binding),
         ));
   }
 
@@ -98,7 +145,7 @@ class LibraryActions implements LibraryActionControls {
           [for (final t in tracks) t.uuidId],
           startIndex,
           ListSource(source),
-          intent: HistoryIntent.forScope(TrackScope(tracks[startIndex])),
+          intent: HistoryIntent.track(tracks[startIndex].uuidId),
         ));
   }
 
@@ -114,13 +161,13 @@ class LibraryActions implements LibraryActionControls {
           currentUuid: track.uuidId,
           order: CollectionOrdering.tracksFor(album),
           downloadedOnly: downloadedOnly,
-          intent: HistoryIntent.forScope(TrackScope(track)),
+          intent: HistoryIntent.track(track.uuidId),
         ));
   }
 
   @override
   Future<void> download(LibraryScope scope) async {
-    final tracks = await _members(scope);
+    final tracks = await _allMembers(scope);
     if (!_ref.mounted || tracks.isEmpty) return;
     await _ref
         .read(downloadManagerProvider)
@@ -129,7 +176,7 @@ class LibraryActions implements LibraryActionControls {
 
   @override
   Future<void> downloadAtQuality(LibraryScope scope, String quality) async {
-    final tracks = await _members(scope);
+    final tracks = await _allMembers(scope);
     if (!_ref.mounted || tracks.isEmpty) return;
     await _ref
         .read(downloadManagerProvider)
@@ -138,10 +185,62 @@ class LibraryActions implements LibraryActionControls {
 
   @override
   Future<void> deleteDownloads(LibraryScope scope) async {
-    final tracks = await _members(scope);
+    final tracks = await _allMembers(scope);
     if (!_ref.mounted || tracks.isEmpty) return;
     await _ref
         .read(downloadManagerProvider)
         .deleteDownloadsForUuids(tracks.map((t) => t.uuidId));
+  }
+}
+
+/// The queue source of a track tapped in the recents surfaces.
+const recentsQueueSource = 'recents';
+
+extension RecentTrackPlay on LibraryActionControls {
+  /// A recent track tap: a new single-track queue and one track click.
+  Future<PlaybackOutcome> playRecentTrack(TrackUI track) =>
+      playFromList([track], 0, source: recentsQueueSource);
+}
+
+/// Shown when nothing in a collection plays on this device offline (the
+/// collection header's disabled note and the menu actions' message).
+const nothingPlaysOfflineMessage = 'Nothing here plays offline.';
+
+/// The one outcome to user-facing text mapping for playback requests; null
+/// when there is nothing to say.
+String? playbackOutcomeMessage(PlaybackOutcome outcome) => switch (outcome) {
+      Accepted() || Superseded() => null,
+      RejectedEmpty() => 'Nothing to play here right now.',
+      RejectedUnplayableOffline() => nothingPlaysOfflineMessage,
+      Failed() => "Couldn't start playback.",
+    };
+
+/// Shown when a library menu's Download did not go through (U30-A-01). It
+/// fails only on a local fault of unknown cause, which a retry is not known
+/// to fix, so no "Try again." (sign-off s7-app-texts).
+String downloadFailedMessage(LibraryScope scope) => scope is TrackScope
+    ? "Couldn't queue the download."
+    : "Couldn't queue the downloads.";
+
+/// Shown when a damaged download's re-download did not go through.
+const redownloadFailedMessage = "Couldn't queue re-download.";
+
+/// Shown when a library menu's Delete download(s) did not finish
+/// (U30-A-01). New wording, awaiting the owner.
+String deleteDownloadsFailedMessage(LibraryScope scope) => scope is TrackScope
+    ? "Couldn't delete the download."
+    : "Couldn't delete the downloads.";
+
+/// Awaits a library menu's Download or Delete: null when it went through
+/// (downloads show their progress elsewhere), else [failure].
+Future<String?> downloadActionMessage(
+  Future<void> Function() action,
+  String failure,
+) async {
+  try {
+    await action();
+    return null;
+  } catch (_) {
+    return failure;
   }
 }

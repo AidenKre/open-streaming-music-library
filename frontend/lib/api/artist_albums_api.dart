@@ -6,13 +6,14 @@ import 'package:frontend/api/pagination.dart';
 import 'package:frontend/api/api_client.dart';
 
 class ArtistAlbumsApi extends IPaginatingListApi {
-  final ApiClient _apiClient = ApiClient.instance;
+  final ApiClient _apiClient;
   final String _endpoint = 'artists';
   String? _nextCursor;
   final String _artist;
   List<String> _albums = [];
 
-  ArtistAlbumsApi(this._artist);
+  ArtistAlbumsApi(this._artist, {required ApiClient api})
+      : _apiClient = api;
 
   @override
   Future<List<dynamic>> getInitialItems() async {

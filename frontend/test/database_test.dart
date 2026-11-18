@@ -2006,7 +2006,15 @@ void main() {
   });
 
   group('reactive browse', () {
-    Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
+    // Drift on an in-memory NativeDatabase needs real event-loop turns, not
+    // virtual time: yield turns until the condition holds (bounded). A
+    // stream that never re-emits leaves the condition false and the
+    // following expect fails.
+    Future<void> until(bool Function() condition) async {
+      for (var i = 0; i < 1000 && !condition(); i++) {
+        await pumpEventQueue(times: 5);
+      }
+    }
 
     test('watchTracks re-emits an optimistic edit without a refresh', () async {
       await db.customStatement(
@@ -2033,12 +2041,12 @@ void main() {
             titles.add(rows.isEmpty ? null : rows.first.read<String?>('title')),
       );
       addTearDown(sub.cancel);
-      await settle();
+      await until(() => titles.isNotEmpty);
       expect(titles.last, 'Old');
 
       // The real optimistic-write path (customUpdate) must notify watchers.
       await db.applyOptimisticTrackEdit('u1', {'title': 'New'});
-      await settle();
+      await until(() => titles.last == 'New');
       expect(titles.last, 'New');
     });
 
@@ -2050,13 +2058,13 @@ void main() {
       final sub =
           db.watchArtists(limit: 50).listen((rows) => counts.add(rows.length));
       addTearDown(sub.cancel);
-      await settle();
+      await until(() => counts.isNotEmpty);
       expect(counts.last, 2);
 
       // A typed delete (as the orphan sweep's sibling writes do) notifies the
       // artists stream so the removed card disappears with no manual refresh.
       await (db.delete(db.artists)..where((a) => a.id.equals(2))).go();
-      await settle();
+      await until(() => counts.last == 1);
       expect(counts.last, 1);
     });
   });

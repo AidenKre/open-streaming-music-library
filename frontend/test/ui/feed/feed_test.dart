@@ -1,12 +1,10 @@
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
@@ -38,8 +36,6 @@ void main() {
   late BrowseHarness harness;
 
   setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
   });
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
@@ -137,6 +133,23 @@ void main() {
       const EntityRailSection(id: 'e', title: 'Empty', entities: []),
     ]);
     expect(find.text('Empty'), findsNothing);
+    await teardownTree(tester);
+  });
+
+  // SC-07 / 6-R07: a rail empty because of a filter keeps its title and
+  // says so, instead of hiding.
+  testWidgets('an empty ready rail with a message keeps its title and says '
+      'why', (tester) async {
+    await pumpFeed(tester, [
+      const EntityRailSection(
+        id: 'f',
+        title: 'Recently played',
+        entities: [],
+        emptyMessage: 'No downloaded recents',
+      ),
+    ]);
+    expect(find.text('Recently played'), findsOneWidget);
+    expect(find.text('No downloaded recents'), findsOneWidget);
     await teardownTree(tester);
   });
 

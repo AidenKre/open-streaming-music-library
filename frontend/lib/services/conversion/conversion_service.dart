@@ -101,8 +101,13 @@ class ConversionService {
     if (_isLoadedInPlayer(uuidId)) {
       return const ConversionRefused(convertWhilePlayingMessage);
     }
+    // Also read before the first wait (U25-A-04), for when the ref is
+    // disposed by the time the capabilities are checked; while it is alive
+    // they are re-read there, so a refresh during the sync counts. Riverpod
+    // ignores an unawaited `.future`: an early refusal leaves no stray error.
+    final appInfoBeforeSync = _ref.read(appInfoProvider.future);
 
-    if (!await syncNotifier.syncFresh()) {
+    if (!await syncNotifier.syncFreshForUserAction()) {
       return const ConversionRefused(
         "Couldn't sync with the server. Try again.",
       );
@@ -121,7 +126,9 @@ class ConversionService {
       );
     }
 
-    final appInfo = await _ref.read(appInfoProvider.future);
+    final appInfo = await (_ref.mounted
+        ? _ref.read(appInfoProvider.future)
+        : appInfoBeforeSync);
     if (!_advertisesConvert(appInfo)) {
       return const ConversionRefused(
         "This server doesn't support conversion.",

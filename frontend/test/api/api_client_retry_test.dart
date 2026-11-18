@@ -8,11 +8,12 @@ import 'package:http/http.dart';
 import 'package:http/testing.dart';
 
 void main() {
+  late ApiClient api;
   group('ApiClient retry — retryable HTTP status codes', () {
     for (final code in [408, 429, 502, 503, 504]) {
       test('retries on $code and succeeds on third attempt', () async {
         var calls = 0;
-        ApiClient.initForTest(
+        api = testApiClient(
           'http://localhost:8000',
           MockClient((req) async {
             calls++;
@@ -21,7 +22,7 @@ void main() {
           }),
         );
 
-        final result = await ApiClient.instance.getJson(['tracks']);
+        final result = await api.getJson(['tracks']);
 
         expect(calls, 3);
         expect(result['ok'], true);
@@ -33,7 +34,7 @@ void main() {
     for (final code in [400, 404, 416, 422, 500, 501]) {
       test('does NOT retry on $code; throws ApiException immediately', () async {
         var calls = 0;
-        ApiClient.initForTest(
+        api = testApiClient(
           'http://localhost:8000',
           MockClient((req) async {
             calls++;
@@ -42,7 +43,7 @@ void main() {
         );
 
         await expectLater(
-          ApiClient.instance.getJson(['tracks']),
+          api.getJson(['tracks']),
           throwsA(isA<ApiException>().having(
             (e) => e.statusCode,
             'statusCode',
@@ -57,7 +58,7 @@ void main() {
   group('ApiClient retry — retryable network exceptions', () {
     test('retries on SocketException and succeeds', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -66,7 +67,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.getJson(['tracks']);
+      final result = await api.getJson(['tracks']);
 
       expect(calls, 3);
       expect(result['ok'], true);
@@ -74,7 +75,7 @@ void main() {
 
     test('retries on http.ClientException and succeeds', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -83,7 +84,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.getJson(['tracks']);
+      final result = await api.getJson(['tracks']);
 
       expect(calls, 2);
       expect(result['ok'], true);
@@ -92,7 +93,7 @@ void main() {
     test('retries on a bare OSError (connection reset during connect) and succeeds',
         () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -101,7 +102,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.getJson(['tracks']);
+      final result = await api.getJson(['tracks']);
 
       expect(calls, 2);
       expect(result['ok'], true);
@@ -110,16 +111,16 @@ void main() {
     test('persistent bare OSError -> NetworkException and the offline hook fires',
         () async {
       var hookCalls = 0;
-      ApiClient.addNetworkFailureListener(() => hookCalls++);
-      addTearDown(ApiClient.clearNetworkFailureListenersForTest);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async =>
             throw const OSError('Connection reset by peer', 54)),
       );
+      api.addNetworkFailureListener(() => hookCalls++);
+      addTearDown(api.clearNetworkFailureListenersForTest);
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()
             .having((e) => e.attemptsMade, 'attemptsMade', 3)
             .having((e) => e.cause, 'cause', isA<OSError>())),
@@ -129,7 +130,7 @@ void main() {
 
     test('exhausts retries on persistent SocketException; throws NetworkException with attemptsMade=3', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -138,7 +139,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()
             .having((e) => e.attemptsMade, 'attemptsMade', 3)
             .having((e) => e.cause, 'cause', isA<SocketException>())),
@@ -148,7 +149,7 @@ void main() {
 
     test('exhausts retries on persistent retryable status; throws ApiException with that code', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -157,7 +158,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<ApiException>()
             .having((e) => e.statusCode, 'statusCode', 503)
             .having((e) => e.message, 'message', 'upstream gone')),
@@ -170,7 +171,7 @@ void main() {
     test('honors Retry-After: <seconds> on 503', () async {
       var calls = 0;
       final delays = <Duration>[];
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -180,11 +181,11 @@ void main() {
           return Response(jsonEncode({'ok': true}), 200);
         }),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
-      final result = await ApiClient.instance.getJson(['tracks']);
+      final result = await api.getJson(['tracks']);
 
       expect(result['ok'], true);
       expect(calls, 2);
@@ -208,7 +209,7 @@ void main() {
             '${d.year} ${two(d.hour)}:${two(d.minute)}:${two(d.second)} GMT';
       }
 
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -218,11 +219,11 @@ void main() {
           return Response(jsonEncode({'ok': true}), 200);
         }),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
-      final result = await ApiClient.instance.getJson(['tracks']);
+      final result = await api.getJson(['tracks']);
 
       expect(result['ok'], true);
       expect(delays, hasLength(1));
@@ -234,7 +235,7 @@ void main() {
     test('clamps Retry-After to 10 seconds', () async {
       var calls = 0;
       final delays = <Duration>[];
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -244,11 +245,11 @@ void main() {
           return Response(jsonEncode({'ok': true}), 200);
         }),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
-      await ApiClient.instance.getJson(['tracks']);
+      await api.getJson(['tracks']);
 
       expect(delays.single, const Duration(seconds: 10));
     });
@@ -256,7 +257,7 @@ void main() {
     test('ignores malformed Retry-After and falls back to backoff', () async {
       var calls = 0;
       final delays = <Duration>[];
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -266,11 +267,11 @@ void main() {
           return Response(jsonEncode({'ok': true}), 200);
         }),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
-      await ApiClient.instance.getJson(['tracks']);
+      await api.getJson(['tracks']);
 
       // _random is seeded with Random(0) by initForTest, and the
       // attempt-1 window is 250ms → nextInt(251) returns 55 deterministically.
@@ -282,16 +283,16 @@ void main() {
     test('exponential backoff windows double across attempts (deterministic seed)',
         () async {
       final delays = <Duration>[];
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => Response('busy', 503)),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<ApiException>().having((e) => e.statusCode, 'statusCode', 503)),
       );
 
@@ -308,9 +309,11 @@ void main() {
   });
 
   group('ApiClient retry — per-attempt timeout', () {
-    test('hung request hits per-attempt timeout, retries, then throws NetworkException', () async {
+    // Virtual time (testWidgets): both the mock's Future.delayed and the
+    // client's .timeout() are Dart timers, so the fake clock drives them.
+    testWidgets('hung request hits per-attempt timeout, retries, then throws NetworkException', (tester) async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -324,56 +327,65 @@ void main() {
       // Shrink the per-attempt timeout to 100ms so this test runs in ms,
       // not seconds. The contract under test is unchanged: a per-attempt
       // hang triggers TimeoutException → retry → eventual NetworkException.
-      ApiClient.instance.setPerAttemptTimeoutForTest(
+      api.setPerAttemptTimeoutForTest(
         const Duration(milliseconds: 100),
       );
 
-      final sw = Stopwatch()..start();
-      await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+      var done = false;
+      final outcome = expectLater(
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()
             .having((e) => e.attemptsMade, 'attemptsMade', 3)
             .having((e) => e.cause, 'cause', isA<TimeoutException>())),
-      );
-      sw.stop();
-      expect(calls, 3);
+      ).whenComplete(() => done = true);
       // Three 100ms timeouts (sequential because of await) + no-op delay
-      // between attempts ≈ 300ms. Generous upper bound for CI variance.
-      // Crucially this also proves the timeout VALUE is honored — if the
-      // injection didn't take effect we'd take ~30s and this would fail.
-      expect(sw.elapsed.inMilliseconds, lessThan(2000));
+      // between attempts = exactly 300ms of virtual time. Not done a tick
+      // early, done by 300ms: this pins the timeout VALUE (a ~30s default
+      // would still be pending) with no wall-clock slack to hide behind.
+      await tester.pump(const Duration(milliseconds: 299));
+      expect(done, isFalse);
+      await tester.pump(const Duration(milliseconds: 1));
+      await outcome;
+      expect(calls, 3);
+      // Drain the mock's own 500ms timers so none is left pending.
+      await tester.pump(const Duration(milliseconds: 500));
     });
 
-    test('per-attempt timeout fires INDEPENDENTLY of the configured value', () async {
+    testWidgets('per-attempt timeout fires INDEPENDENTLY of the configured value', (tester) async {
       // Reinforces the previous test by using a different timeout value
       // and asserting elapsed time scales accordingly. Catches a regression
       // where the timeout becomes hardcoded.
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           await Future<void>.delayed(const Duration(seconds: 5));
           return Response('never', 200);
         }),
       );
-      ApiClient.instance.setPerAttemptTimeoutForTest(
+      api.setPerAttemptTimeoutForTest(
         const Duration(milliseconds: 50),
       );
 
-      final sw = Stopwatch()..start();
-      await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+      var done = false;
+      final outcome = expectLater(
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()),
-      );
-      sw.stop();
-      // 3 × 50ms = 150ms. Loose ceiling for CI.
-      expect(sw.elapsed.inMilliseconds, lessThan(1500));
+      ).whenComplete(() => done = true);
+      // 3 × 50ms = 150ms of virtual time, exactly: pending at 149ms, done at
+      // 150ms (a hardcoded timeout would not scale with the configured value).
+      await tester.pump(const Duration(milliseconds: 149));
+      expect(done, isFalse);
+      await tester.pump(const Duration(milliseconds: 1));
+      await outcome;
+      // Drain the mock's own 5s timers so none is left pending.
+      await tester.pump(const Duration(seconds: 5));
     });
   });
 
   group('ApiClient retry — applies to all request methods', () {
     test('putJson(retry: true) retries on 503', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -382,7 +394,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.putJson(
+      final result = await api.putJson(
         ['settings', 'quality'],
         body: {'quality': 'high'},
         retry: true,
@@ -394,7 +406,7 @@ void main() {
 
     test('postJson(retry: true) retries on 502', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -403,7 +415,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.postJson(
+      final result = await api.postJson(
         ['tracks', 'warm'],
         body: {'track_uuids': []},
         retry: true,
@@ -415,7 +427,7 @@ void main() {
 
     test('getBytes retries on 504 and returns bytes on success', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -424,7 +436,7 @@ void main() {
         }),
       );
 
-      final bytes = await ApiClient.instance.getBytes(['cover_art', '42']);
+      final bytes = await api.getBytes(['cover_art', '42']);
 
       expect(calls, 2);
       expect(bytes, [1, 2, 3, 4]);
@@ -432,7 +444,7 @@ void main() {
 
     test('getBytes throws ApiException on non-retryable 404', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -441,7 +453,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getBytes(['cover_art', '99']),
+        api.getBytes(['cover_art', '99']),
         throwsA(isA<ApiException>().having((e) => e.statusCode, 'statusCode', 404)),
       );
       expect(calls, 1);
@@ -451,7 +463,7 @@ void main() {
   group('ApiClient retry — send (streamed)', () {
     test('send retries on initial 503 and returns StreamedResponse on success', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient.streaming((req, body) async {
           calls++;
@@ -472,7 +484,7 @@ void main() {
         }),
       );
 
-      final response = await ApiClient.instance.send(
+      final response = await api.send(
         () => Request('GET', Uri.parse('http://localhost:8000/tracks/x/stream')),
       );
 
@@ -488,7 +500,7 @@ void main() {
     test('send invokes factory once per attempt (BaseRequest is one-shot)', () async {
       var factoryCalls = 0;
       var serverCalls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient.streaming((req, body) async {
           serverCalls++;
@@ -502,7 +514,7 @@ void main() {
         }),
       );
 
-      await ApiClient.instance.send(() {
+      await api.send(() {
         factoryCalls++;
         return Request('GET', Uri.parse('http://localhost:8000/tracks/x/stream'));
       });
@@ -519,7 +531,7 @@ void main() {
 
   group('ApiClient retry — G1: ClientException exhaustion', () {
     test('persistent ClientException exhausts to NetworkException with cause', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           throw ClientException('connection reset');
@@ -527,7 +539,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()
             .having((e) => e.attemptsMade, 'attemptsMade', 3)
             .having((e) => e.cause, 'cause', isA<ClientException>())),
@@ -538,7 +550,7 @@ void main() {
   group('ApiClient retry — G2: mixed exception sequence', () {
     test('SocketException then 503 exhausts to ApiException(503), not NetworkException', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -549,7 +561,7 @@ void main() {
 
       // Final exhausting failure is HTTP, so ApiException wins.
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<ApiException>()
             .having((e) => e.statusCode, 'statusCode', 503)
             .having((e) => e.message, 'message', 'upstream')),
@@ -559,7 +571,7 @@ void main() {
 
     test('503 then SocketException exhausts to NetworkException, NOT ApiException', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -571,7 +583,7 @@ void main() {
       // Final exhausting failure is network, so NetworkException wins —
       // earlier 503 status is intentionally NOT preserved (single-cause).
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()
             .having((e) => e.attemptsMade, 'attemptsMade', 3)
             .having((e) => e.cause, 'cause', isA<SocketException>())),
@@ -584,7 +596,7 @@ void main() {
     test('Retry-After is honored when set on attempt 2 (not just attempt 1)', () async {
       var calls = 0;
       final delays = <Duration>[];
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -596,11 +608,11 @@ void main() {
           return Response(jsonEncode({'ok': true}), 200);
         }),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
-      await ApiClient.instance.getJson(['tracks']);
+      await api.getJson(['tracks']);
 
       expect(calls, 3);
       expect(delays, hasLength(2));
@@ -613,7 +625,7 @@ void main() {
     test('Retry-After on 502 is honored (broad RFC interpretation)', () async {
       var calls = 0;
       final delays = <Duration>[];
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -623,11 +635,11 @@ void main() {
           return Response(jsonEncode({'ok': true}), 200);
         }),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
-      await ApiClient.instance.getJson(['tracks']);
+      await api.getJson(['tracks']);
 
       // Documents the contract: Retry-After is honored on ANY retryable
       // status, not just 429/503. Proxies emit it on 502/504 in practice.
@@ -639,7 +651,7 @@ void main() {
     test('canonical "Retry-After" (capitalized) header is honored', () async {
       var calls = 0;
       final delays = <Duration>[];
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -652,11 +664,11 @@ void main() {
           return Response(jsonEncode({'ok': true}), 200);
         }),
       );
-      ApiClient.instance.setDelayFnForTest((d) async {
+      api.setDelayFnForTest((d) async {
         delays.add(d);
       });
 
-      await ApiClient.instance.getJson(['tracks']);
+      await api.getJson(['tracks']);
       // http.Response normalizes header keys to lowercase, so our
       // `headers['retry-after']` lookup matches.
       expect(delays.single, const Duration(seconds: 2));
@@ -665,13 +677,13 @@ void main() {
 
   group('ApiClient retry — G5: empty body preserved', () {
     test('exhausted 503 with empty body throws ApiException(503, "")', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => Response('', 503)),
       );
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<ApiException>()
             .having((e) => e.statusCode, 'statusCode', 503)
             .having((e) => e.message, 'message', '')),
@@ -682,7 +694,7 @@ void main() {
   group('ApiClient retry — G7: send() mid-stream failure is NOT retried', () {
     test('a 200 StreamedResponse whose stream errors mid-flight escapes raw to caller', () async {
       var factoryCalls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient.streaming((req, body) async {
           return StreamedResponse(
@@ -694,7 +706,7 @@ void main() {
 
       // The initial handshake (status 200) succeeds — retry boundary closes.
       // Stream errors AFTER that point are the caller's problem.
-      final response = await ApiClient.instance.send(() {
+      final response = await api.send(() {
         factoryCalls++;
         return Request('GET', Uri.parse('http://localhost:8000/tracks/x/stream'));
       });
@@ -712,12 +724,12 @@ void main() {
 
   group('ApiClient retry — G8: NetworkException exhaustion for ALL methods', () {
     test('putJson(retry: true): persistent SocketException → NetworkException', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
       await expectLater(
-        ApiClient.instance.putJson(
+        api.putJson(
           ['settings', 'quality'],
           body: {'q': '320'},
           retry: true,
@@ -728,46 +740,50 @@ void main() {
       );
     });
 
-    test('postJson(retry: true): persistent TimeoutException → NetworkException', () async {
-      ApiClient.initForTest(
+    testWidgets('postJson(retry: true): persistent TimeoutException → NetworkException', (tester) async {
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           await Future<void>.delayed(const Duration(seconds: 5));
           return Response('', 200);
         }),
       );
-      ApiClient.instance.setPerAttemptTimeoutForTest(
+      api.setPerAttemptTimeoutForTest(
         const Duration(milliseconds: 50),
       );
-      await expectLater(
-        ApiClient.instance.postJson(['tracks', 'warm'], body: {}, retry: true),
+      final outcome = expectLater(
+        api.postJson(['tracks', 'warm'], body: {}, retry: true),
         throwsA(isA<NetworkException>()
             .having((e) => e.attemptsMade, 'attemptsMade', 3)
             .having((e) => e.cause, 'cause', isA<TimeoutException>())),
       );
+      await tester.pump(const Duration(milliseconds: 150)); // 3 × 50ms
+      await outcome;
+      // Drain the mock's own 5s timers so none is left pending.
+      await tester.pump(const Duration(seconds: 5));
     });
 
     test('getBytes: persistent ClientException → NetworkException', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw ClientException('reset')),
       );
       await expectLater(
-        ApiClient.instance.getBytes(['cover_art', '1']),
+        api.getBytes(['cover_art', '1']),
         throwsA(isA<NetworkException>()
             .having((e) => e.cause, 'cause', isA<ClientException>())),
       );
     });
 
     test('send: persistent SocketException → NetworkException', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient.streaming((req, body) async {
           throw const SocketException('down');
         }),
       );
       await expectLater(
-        ApiClient.instance.send(
+        api.send(
           () => Request('GET', Uri.parse('http://localhost:8000/tracks/x/stream')),
         ),
         throwsA(isA<NetworkException>()
@@ -778,24 +794,24 @@ void main() {
 
   group('ApiClient retry — G9: healthCheck on unreachable server', () {
     test('healthCheck returns unreachable HealthResult after retries exhausted', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('no route')),
       );
 
-      final result = await ApiClient.instance.healthCheck();
+      final result = await api.healthCheck();
 
       expect(result.status, HealthStatus.unreachable);
       expect(result.message, startsWith('Could not reach server:'));
     });
 
     test('healthCheck returns serverError HealthResult when backend is up but failing', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => Response('boom', 500)),
       );
 
-      final result = await ApiClient.instance.healthCheck();
+      final result = await api.healthCheck();
 
       expect(result.status, HealthStatus.serverError);
       expect(result.message, 'Server error: 500');
@@ -810,7 +826,7 @@ void main() {
       // so we simulate the same error directly. The contract under test:
       // ArgumentError must not escape raw — it must surface as
       // NetworkException after retries exhaust.
-      ApiClient.initForTest(
+      api = testApiClient(
         '',
         MockClient((req) async {
           throw ArgumentError('No host specified in URI');
@@ -818,7 +834,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()
             .having((e) => e.attemptsMade, 'attemptsMade', 3)
             .having((e) => e.cause, 'cause', isA<ArgumentError>())),
@@ -827,7 +843,7 @@ void main() {
 
     test('transient ArgumentError followed by success recovers', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -836,7 +852,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.getJson(['tracks']);
+      final result = await api.getJson(['tracks']);
 
       expect(calls, 2);
       expect(result['ok'], true);
@@ -845,13 +861,13 @@ void main() {
 
   group('ApiClient retry — malformed JSON on 2xx', () {
     test('2xx with non-JSON body throws ApiException, not raw FormatException', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => Response('this is not json {{{', 200)),
       );
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<ApiException>()
             .having((e) => e.statusCode, 'statusCode', 200)
             .having((e) => e.message, 'message', contains('Malformed JSON'))),
@@ -859,13 +875,13 @@ void main() {
     });
 
     test('2xx with JSON array (wrong shape) throws ApiException', () async {
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => Response('[1, 2, 3]', 200)),
       );
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<ApiException>()
             .having((e) => e.statusCode, 'statusCode', 200)),
       );
@@ -875,7 +891,7 @@ void main() {
   group('ApiClient — postJson/putJson default to no retry', () {
     test('postJson without retry makes exactly one attempt on 503', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -884,7 +900,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.postJson(['tracks', 'warm'], body: {}),
+        api.postJson(['tracks', 'warm'], body: {}),
         throwsA(isA<ApiException>()
             .having((e) => e.statusCode, 'statusCode', 503)),
       );
@@ -894,7 +910,7 @@ void main() {
     test('putJson without retry makes exactly one attempt on SocketException',
         () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -903,7 +919,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.putJson(
+        api.putJson(
           ['settings', 'quality'],
           body: {'quality': 'high'},
         ),
@@ -919,7 +935,7 @@ void main() {
       // Covers the opt-in retry path for a transport-layer (non-HTTP) failure,
       // complementing the existing 502/503 status-code retry coverage.
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -928,7 +944,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.postJson(
+      final result = await api.postJson(
         ['tracks', 'warm'],
         body: {'track_uuids': []},
         retry: true,
@@ -940,17 +956,17 @@ void main() {
   });
 
   group('ApiClient — healthCheck does not flip global offline mode', () {
-    tearDown(ApiClient.clearNetworkFailureListenersForTest);
+    tearDown(() => api.clearNetworkFailureListenersForTest());
 
     test('healthCheck transport failure does NOT invoke network-failure listeners', () async {
       var hookCalls = 0;
-      ApiClient.addNetworkFailureListener(() => hookCalls++);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
+      api.addNetworkFailureListener(() => hookCalls++);
 
-      final result = await ApiClient.instance.healthCheck();
+      final result = await api.healthCheck();
 
       expect(result.status, HealthStatus.unreachable);
       expect(hookCalls, 0,
@@ -960,13 +976,13 @@ void main() {
     test('healthCheck(retry: false) transport failure does NOT invoke network-failure listeners',
         () async {
       var hookCalls = 0;
-      ApiClient.addNetworkFailureListener(() => hookCalls++);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
+      api.addNetworkFailureListener(() => hookCalls++);
 
-      await ApiClient.instance.healthCheck(retry: false);
+      await api.healthCheck(retry: false);
 
       expect(hookCalls, 0);
     });
@@ -974,14 +990,14 @@ void main() {
     test('a normal getJson transport failure DOES invoke network-failure listeners',
         () async {
       var hookCalls = 0;
-      ApiClient.addNetworkFailureListener(() => hookCalls++);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
+      api.addNetworkFailureListener(() => hookCalls++);
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()),
       );
       expect(hookCalls, 1,
@@ -990,11 +1006,11 @@ void main() {
   });
 
   group('ApiClient.getBytes — retry / triggerOfflineHook opt-out', () {
-    tearDown(ApiClient.clearNetworkFailureListenersForTest);
+    tearDown(() => api.clearNetworkFailureListenersForTest());
 
     test('getBytes(retry: false) makes exactly one attempt on a retryable 504', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -1003,7 +1019,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getBytes(
+        api.getBytes(
           ['cover_art', '7'],
           retry: false,
         ),
@@ -1015,7 +1031,7 @@ void main() {
 
     test('getBytes(retry: false) makes exactly one attempt on a SocketException', () async {
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -1024,7 +1040,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getBytes(
+        api.getBytes(
           ['cover_art', '8'],
           retry: false,
         ),
@@ -1038,14 +1054,14 @@ void main() {
     test('getBytes(triggerOfflineHook: false) does NOT fire listeners on SocketException exhaustion',
         () async {
       var hookCalls = 0;
-      ApiClient.addNetworkFailureListener(() => hookCalls++);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
+      api.addNetworkFailureListener(() => hookCalls++);
 
       await expectLater(
-        ApiClient.instance.getBytes(
+        api.getBytes(
           ['cover_art', '9'],
           triggerOfflineHook: false,
         ),
@@ -1059,17 +1075,17 @@ void main() {
         () async {
       var hookCalls = 0;
       var calls = 0;
-      ApiClient.addNetworkFailureListener(() => hookCalls++);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
           throw const SocketException('down');
         }),
       );
+      api.addNetworkFailureListener(() => hookCalls++);
 
       await expectLater(
-        ApiClient.instance.getBytes(
+        api.getBytes(
           ['cover_art', '10'],
           retry: false,
           triggerOfflineHook: false,
@@ -1082,20 +1098,20 @@ void main() {
   });
 
   group('ApiClient.addNetworkFailureListener — multi-listener API', () {
-    tearDown(ApiClient.clearNetworkFailureListenersForTest);
+    tearDown(() => api.clearNetworkFailureListenersForTest());
 
     test('two listeners both fire when a network failure exhausts retries', () async {
       var aCalls = 0;
       var bCalls = 0;
-      ApiClient.addNetworkFailureListener(() => aCalls++);
-      ApiClient.addNetworkFailureListener(() => bCalls++);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
+      api.addNetworkFailureListener(() => aCalls++);
+      api.addNetworkFailureListener(() => bCalls++);
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()),
       );
 
@@ -1107,28 +1123,28 @@ void main() {
       var calls = 0;
       void listener() => calls++;
 
-      ApiClient.addNetworkFailureListener(listener);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
+      api.addNetworkFailureListener(listener);
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()),
       );
       expect(calls, 1);
 
-      ApiClient.removeNetworkFailureListener(listener);
+      api.removeNetworkFailureListener(listener);
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()),
       );
       expect(calls, 1, reason: 'removed listener must not fire');
 
-      ApiClient.addNetworkFailureListener(listener);
+      api.addNetworkFailureListener(listener);
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()),
       );
       expect(calls, 2, reason: 'listener re-added → fires again');
@@ -1138,15 +1154,15 @@ void main() {
       var calls = 0;
       void listener() => calls++;
 
-      ApiClient.addNetworkFailureListener(listener);
-      ApiClient.addNetworkFailureListener(listener);
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async => throw const SocketException('down')),
       );
+      api.addNetworkFailureListener(listener);
+      api.addNetworkFailureListener(listener);
 
       await expectLater(
-        ApiClient.instance.getJson(['tracks']),
+        api.getJson(['tracks']),
         throwsA(isA<NetworkException>()),
       );
 
@@ -1168,7 +1184,7 @@ void main() {
       // _request<T> all the way to the retry loop. Five attempts each
       // returning a retryable 503; succeeds on attempt 5.
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -1177,7 +1193,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.getJson(
+      final result = await api.getJson(
         ['tracks'],
         policy: const RetryPolicy(maxAttempts: 5),
       );
@@ -1191,7 +1207,7 @@ void main() {
       // Same idea but on the transport-error path: the NetworkException's
       // attemptsMade must reflect the policy, not the legacy _maxAttempts=3.
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -1200,7 +1216,7 @@ void main() {
       );
 
       await expectLater(
-        ApiClient.instance.getJson(
+        api.getJson(
           ['tracks'],
           policy: const RetryPolicy(maxAttempts: 5),
         ),
@@ -1217,7 +1233,7 @@ void main() {
       // postJson defaults to noRetry, but passing an explicit policy with
       // maxAttempts > 1 wins. Confirms _resolvePolicy precedence.
       var calls = 0;
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -1226,7 +1242,7 @@ void main() {
         }),
       );
 
-      final result = await ApiClient.instance.postJson(
+      final result = await api.postJson(
         ['warm'],
         body: const {'session': '1'},
         policy: const RetryPolicy(maxAttempts: 2),
@@ -1241,18 +1257,17 @@ void main() {
       // suppression — the boolean wins on this single field via copyWith.
       var fired = 0;
       void listener() => fired++;
-      ApiClient.addNetworkFailureListener(listener);
-      addTearDown(() => ApiClient.removeNetworkFailureListener(listener));
-
-      ApiClient.initForTest(
+      api = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           throw const SocketException('down');
         }),
       );
+      api.addNetworkFailureListener(listener);
+      addTearDown(() => api.removeNetworkFailureListener(listener));
 
       await expectLater(
-        ApiClient.instance.getJson(
+        api.getJson(
           ['tracks'],
           triggerOfflineHook: false,
           policy: const RetryPolicy(maxAttempts: 2),

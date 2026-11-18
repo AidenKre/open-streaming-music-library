@@ -8,6 +8,7 @@ import 'package:frontend/models/dto/client_track_dto.dart';
 
 import 'package:frontend/playback/playback_issue_bus.dart';
 import 'package:frontend/playback/source_failure_classifier.dart';
+import '../helpers/no_server_api.dart';
 
 void main() {
   final files = <String>{};
@@ -91,6 +92,14 @@ void main() {
         reason: 'identity was not settled: nothing is confirmed');
   });
 
+  // Phase M §7.7 / SC-27 Phase M (M-U24): a 401 keeps the failure
+  // non-skipping; the session is already signed out.
+  test('a 401 from the bounded track check is unknown: never gone or '
+      'skipped', () async {
+    statuses['t'] = 401;
+    expect(await classify(), SourceFailureKind.unknown);
+  });
+
   group('the bounded track check (production mapping)', () {
     test('an answer maps to 200, an HTTP rejection to its status', () async {
       expect(await trackStatusVia(_Api(() async => _dto()), 't'), 200);
@@ -120,7 +129,7 @@ ClientTrackDto _dto() => ClientTrackDto.fromJson({
     });
 
 class _Api extends TracksApi {
-  _Api(this._get);
+  _Api(this._get) : super(api: noServerApi());
   final Future<ClientTrackDto> Function() _get;
   @override
   Future<ClientTrackDto> getTrack(String uuidId) => _get();

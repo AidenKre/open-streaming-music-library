@@ -9,6 +9,7 @@ import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -22,7 +23,10 @@ import '../helpers/server_binding.dart';
 
 class _Online extends OfflineModeNotifier {
   @override
-  bool build() => false;
+  bool build() {
+    super.build();
+    return false;
+  }
 }
 
 void main() {
@@ -30,6 +34,7 @@ void main() {
   late ControlledGate controlled;
   late ProviderContainer c;
   late int changeRequests;
+  late ApiClient api;
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
@@ -37,7 +42,7 @@ void main() {
     await seedTestBinding(db, baseUrl: 'http://s');
     controlled = ControlledGate(db);
     changeRequests = 0;
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://s',
       MockClient((req) async {
         changeRequests++;
@@ -51,7 +56,8 @@ void main() {
     c = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
-        tracksApiProvider.overrideWithValue(TracksApi()),
+        apiClientProvider.overrideWithValue(api),
+        tracksApiProvider.overrideWithValue(TracksApi(api: api)),
         offlineModeProvider.overrideWith(_Online.new),
         serverBindingGateProvider.overrideWithValue(controlled.gate),
       ],
@@ -117,6 +123,55 @@ void main() {
     unawaited(c.read(trackSyncProvider.notifier).sync());
     await pumpEventQueue();
     expect(changeRequests, 1);
+  });
+
+  // U22-FE-LIFECYCLE-B-08: every app resume (each window refocus on the
+  // desktop) re-probes the gate. A user's own fresh sync (Convert) waits out
+  // that pending verdict instead of failing "not connected" at once; the
+  // background syncFresh keeps failing fast.
+  group('a re-probe in flight (app resume)', () {
+    Future<void> verifyThenReprobe() async {
+      unawaited(controlled.gate.startConnection('http://s'));
+      await pumpEventQueue();
+      controlled.respond('inst-1');
+      await controlled.gate.awaitVerified();
+      unawaited(controlled.gate.startConnection('http://s'));
+      await pumpEventQueue();
+      expect(controlled.gate.state, isA<BindingVerifying>());
+    }
+
+    test("a user's fresh sync waits for the verdict, then runs", () async {
+      await verifyThenReprobe();
+      var done = false;
+      final fresh = c
+          .read(trackSyncProvider.notifier)
+          .syncFreshForUserAction()
+          .whenComplete(() => done = true);
+      await pumpEventQueue();
+      expect(done, isFalse, reason: 'waits for the pending verdict');
+      controlled.respond('inst-1');
+      expect(await fresh, isTrue);
+      expect(changeRequests, 1);
+    });
+
+    test("a user's fresh sync fails when the verdict is a different server",
+        () async {
+      await verifyThenReprobe();
+      final fresh =
+          c.read(trackSyncProvider.notifier).syncFreshForUserAction();
+      await pumpEventQueue();
+      controlled.respond('inst-2');
+      expect(await fresh, isFalse);
+      expect(changeRequests, 0);
+    });
+
+    test('the background fresh sync still fails at once', () async {
+      await verifyThenReprobe();
+      expect(await c.read(trackSyncProvider.notifier).syncFresh(), isFalse);
+      expect(changeRequests, 0);
+      controlled.respond('inst-1');
+      await pumpEventQueue();
+    });
   });
 
   test('syncFresh runs once the connection is verified', () async {

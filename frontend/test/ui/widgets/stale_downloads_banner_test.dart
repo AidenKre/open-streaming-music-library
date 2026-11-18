@@ -71,16 +71,18 @@ void main() {
   late AppDatabase db;
   late Directory tempDir;
   late LocalCoverArtStore coverStore;
+  late ApiClient api;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     tempDir = await Directory.systemTemp.createTemp('stale-banner-test');
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://test:8080',
       MockClient((_) async => http.Response.bytes([1], 200)),
     );
     coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: api,
     );
   });
 
@@ -99,6 +101,7 @@ void main() {
   }) {
     manager = _FlakyDownloadManager(
       failingQualities,
+      apiClient: api,
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
@@ -695,6 +698,7 @@ void main() {
 class _FlakyDownloadManager extends DownloadManager {
   _FlakyDownloadManager(
     this._failing, {
+    required super.apiClient,
     required super.db,
     required super.coverArtStore,
     required super.directoryProvider,

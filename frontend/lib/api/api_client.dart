@@ -3,10 +3,14 @@ import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'package:frontend/models/instance_stamp.dart';
+
+import 'authenticated_client.dart';
 import 'retry_policy.dart';
 
 export 'retry_policy.dart';
@@ -36,6 +40,23 @@ class ApiException implements Exception {
   bool? get retryable {
     final value = details?['retryable'];
     return value is bool ? value : null;
+  }
+
+  /// A 4xx the server will answer the same way again (not auth, timeout,
+  /// rate limit, or an explicitly retryable answer).
+  bool get isDefinitiveRefusal =>
+      statusCode >= 400 &&
+      statusCode < 500 &&
+      statusCode != 401 &&
+      statusCode != 408 &&
+      statusCode != 429 &&
+      retryable != true;
+
+  /// How long the server asked to wait (`retry_after_s`, a positive whole
+  /// number of seconds); null when absent or malformed (unknown).
+  Duration? get retryAfter {
+    final seconds = details?['retry_after_s'];
+    return seconds is int && seconds > 0 ? Duration(seconds: seconds) : null;
   }
 
   Map<String, dynamic>? get details {
@@ -89,31 +110,72 @@ class NetworkException implements Exception {
   String toString() => 'NetworkException($attemptsMade attempts): $message';
 }
 
+/// Thrown by [ApiClient.putStream] when its abort trigger completed: the
+/// caller stopped the transfer. Not a network failure (no offline signal);
+/// whether the server kept anything is for the caller to ask.
+class UploadTransferAborted implements Exception {
+  const UploadTransferAborted();
+
+  @override
+  String toString() => 'UploadTransferAborted';
+}
+
 typedef DelayFn = Future<void> Function(Duration);
 
 /// Result of a health check. `unreachable` means the network call itself
 /// failed (transport-level) — eligible for offline mode. `serverError` means
 /// the server answered with a non-2xx (e.g. 500) or an unexpected body — the
 /// server is up but misbehaving, so the user should see an inline error
-/// rather than enter offline mode.
+/// rather than enter offline mode. At app launch only, an HTTP 5xx or 429
+/// answer is treated like `unreachable` (sign-off OPEN-A-04, 2026-11-17); see
+/// [HealthResult.statusCode] and `SessionService.resumeSavedSession`.
 enum HealthStatus { ok, serverError, unreachable }
 
 class HealthResult {
   final HealthStatus status;
   final String? message;
-  const HealthResult(this.status, [this.message]);
+
+  /// The status of an `ApiException` answer: the HTTP status of a non-2xx
+  /// answer, and 200 for a 2xx body that is not valid JSON. Null for a
+  /// well-formed JSON 2xx that is not OSML's, and for transport failures.
+  final int? statusCode;
+  const HealthResult(this.status, [this.message, this.statusCode]);
   bool get isOk => status == HealthStatus.ok;
 }
 
+/// A fresh [ApiClient] with the usual test seams
+/// applied (no-op delay, seeded jitter, no per-attempt timeout override).
+@visibleForTesting
+ApiClient testApiClient(String url, http.Client client) =>
+    ApiClient(url, client).._applyTestSeams();
+
 enum _HttpVerb { get, put, post, patch, delete }
 
+/// Checks a response's server instance stamp (SC-01 rule 6); throws to
+/// reject the response.
+typedef InstanceStampCheck = Future<void> Function(String servedBy);
+
 class ApiClient {
-  static final ApiClient instance = ApiClient._();
-  ApiClient._() : _http = http.Client(), baseUrl = '';
+  ApiClient(this.baseUrl, http.Client inner) : _http = inner;
+
+  bool _disposed = false;
+
+  /// Ends this client's scope: clears its network-failure listeners and
+  /// ignores any added afterwards, so a request that outlives its scope
+  /// cannot flip the new scope offline (spec 7.2: "Network-failure listeners
+  /// become per instance, so a request that outlives its scope can't flip
+  /// the new scope offline").
+  ///
+  /// Deliberately never closes the inner [http.Client]: it is shared, and
+  /// old-scope requests must be allowed to finish.
+  void dispose() {
+    _disposed = true;
+    _networkFailureListeners.clear();
+  }
 
   /// Listeners invoked when a normal request exhausts retries on a
-  /// transport-level failure. Static so they're reachable from the singleton
-  /// without threading an extra dependency through every service. Probe
+  /// transport-level failure. Per instance, so each provider scope's client
+  /// notifies only its own observers. Probe
   /// calls opt out via `triggerOfflineHook: false` (see [healthCheck]).
   ///
   /// Multiple observers can register independently (e.g. offline-mode
@@ -123,30 +185,122 @@ class ApiClient {
   /// There is deliberately no success counterpart: a received HTTP response
   /// (even a 2xx) does not prove the backend is healthy enough to resume
   /// normal work. Offline mode is exited only by a passing health check.
-  static final Set<void Function()> _networkFailureListeners = {};
+  final Set<void Function()> _networkFailureListeners = {};
 
-  static void addNetworkFailureListener(void Function() listener) {
+  void addNetworkFailureListener(void Function() listener) {
+    if (_disposed) return;
     _networkFailureListeners.add(listener);
   }
 
-  static void removeNetworkFailureListener(void Function() listener) {
+  void removeNetworkFailureListener(void Function() listener) {
     _networkFailureListeners.remove(listener);
   }
 
   @visibleForTesting
-  static void clearNetworkFailureListenersForTest() {
+  void clearNetworkFailureListenersForTest() {
     _networkFailureListeners.clear();
   }
 
-  static void _fireNetworkFailure() {
+  void _fireNetworkFailure() {
     // Snapshot to tolerate listeners that remove themselves during dispatch.
     for (final listener in _networkFailureListeners.toList()) {
       listener();
     }
   }
 
-  String baseUrl;
-  http.Client _http;
+  final String baseUrl;
+  final http.Client _http;
+
+  /// A client on the same URL and transport that never carries the token (an
+  /// [AuthenticatedClient]'s shared inner client is used bare) and has no 401
+  /// hook, for public paths. Its network failures reach THIS client's
+  /// listeners, so there is one offline path. Holds nothing to dispose.
+  ApiClient withoutToken() {
+    final transport = _http;
+    final bare = ApiClient(
+      baseUrl,
+      transport is AuthenticatedClient ? transport.withoutToken() : transport,
+    );
+    bare._delay = _delay;
+    bare._random = _random;
+    bare._perAttemptTimeoutOverride = _perAttemptTimeoutOverride;
+    bare._logSink = _logSink;
+    bare.addNetworkFailureListener(_fireNetworkFailure);
+    return bare;
+  }
+
+  /// A sibling client (same URL, same transport, token kept) that runs
+  /// [check] on the `X-Server-Instance-Id` stamp of every response before the
+  /// caller sees it (SC-01 rule 6, extended from pages to writes). Its network
+  /// failures reach THIS client's listeners.
+  ///
+  /// Pass the binding repository's `checkServedBy` (in practice: use
+  /// `boundApiClientProvider`).
+  ///
+  /// On a mismatch the call throws `ServerInstanceChangedException` (from the
+  /// check) instead of returning the body or throwing [ApiException]. It is
+  /// not retried, so this client sends nothing further for that call.
+  ///
+  /// The caller must then leave its local row (pending edit, listen batch,
+  /// upload operation) exactly as it was before the send, treating the request
+  /// as not delivered; send nothing further in that pass; and report through
+  /// `ServerBindingGate.reportDifferentInstance(connection, e)` with the
+  /// connection captured together with its token (`awaitVerified()` then
+  /// `verifiedConnection` in the same synchronous segment).
+  ///
+  /// No stamp (a pre-Phase-7 server) means no check; an unbound row or no row
+  /// means no check either.
+  ///
+  /// Residual: the check runs on the RESPONSE, so a server that replaced the
+  /// bound one between the connection check and the pass still receives the
+  /// first state-changing request of that pass; the check limits it to one
+  /// request per pass. Preventing that would need a stamped pre-flight request
+  /// before every write, which was decided against (an extra round trip on
+  /// every pass for a case that needs the server replaced in the seconds
+  /// between the connection check and the pass).
+  ///
+  /// Any new transport method added to [ApiClient] (e.g. a streamed PUT) must
+  /// run [_checkStamp] too.
+  ApiClient withInstanceCheck(InstanceStampCheck check) {
+    final sibling = ApiClient(baseUrl, _http);
+    sibling._delay = _delay;
+    sibling._random = _random;
+    sibling._perAttemptTimeoutOverride = _perAttemptTimeoutOverride;
+    sibling._logSink = _logSink;
+    sibling._instanceCheck = check;
+    sibling.addNetworkFailureListener(_fireNetworkFailure);
+    return sibling;
+  }
+
+  InstanceStampCheck? _instanceCheck;
+
+  /// The log-out/Disconnect revoke exemption (sign-off OPEN-M-11): a client
+  /// whose transport sends exactly one request, the `POST auth/logout`, with
+  /// the scope's token regardless of the binding gate. Null when this client
+  /// carries no token. Take it while the revoke rule holds, use it once.
+  ApiClient? revokeOnceClient() {
+    final transport = _http;
+    if (transport is! AuthenticatedClient) return null;
+    final once = ApiClient(
+      baseUrl,
+      transport.revokeExemption(_buildUri(['auth', 'logout'])),
+    );
+    once._delay = _delay;
+    once._random = _random;
+    once._perAttemptTimeoutOverride = _perAttemptTimeoutOverride;
+    once._logSink = _logSink;
+    once.addNetworkFailureListener(_fireNetworkFailure);
+    return once;
+  }
+
+  /// The one place the stamp rule runs: no check or no stamp, nothing happens;
+  /// otherwise the check's exception propagates unchanged.
+  Future<void> _checkStamp(Map<String, String> responseHeaders) async {
+    final check = _instanceCheck;
+    if (check == null) return;
+    final stamp = instanceStampFrom(responseHeaders);
+    if (stamp != null) await check(stamp);
+  }
 
   // Test seams. Tests inject a no-op delay + short timeout to run in
   // milliseconds; production uses Future.delayed and the policy's own
@@ -160,17 +314,21 @@ class ApiClient {
   // call site to pass a custom policy.
   Duration? _perAttemptTimeoutOverride;
 
-  static void init(String url) {
-    instance.baseUrl = url;
+  void _applyTestSeams() {
+    _delay = (_) async {};
+    _random = math.Random(0);
+    _perAttemptTimeoutOverride = null;
   }
 
+  void Function(String message) _logSink = (m) =>
+      developer.log(m, name: 'ApiClient');
+
+  void _log(String message) => _logSink(message);
+
   @visibleForTesting
-  static void initForTest(String url, http.Client httpClient) {
-    instance.baseUrl = url;
-    instance._http = httpClient;
-    instance._delay = (_) async {};
-    instance._random = math.Random(0);
-    instance._perAttemptTimeoutOverride = null;
+  // ignore: use_setters_to_change_properties
+  void setLogSinkForTest(void Function(String message) sink) {
+    _logSink = sink;
   }
 
   @visibleForTesting
@@ -219,6 +377,32 @@ class ApiClient {
         explicit: policy,
         retry: retry,
         triggerOfflineHook: triggerOfflineHook,
+        defaultRetry: true,
+      ),
+    );
+  }
+
+  /// Like [getJson], but also returns the response headers (SC-01 rule 6:
+  /// the page fetchers read the server's instance stamp).
+  Future<({Map<String, dynamic> body, Map<String, String> headers})>
+  getJsonResponse(
+    List<String> pathSegments, {
+    Map<String, String>? query,
+    Map<String, String>? headers,
+    RetryPolicy? policy,
+  }) {
+    return _request<({Map<String, dynamic> body, Map<String, String> headers})>(
+      verb: _HttpVerb.get,
+      pathSegments: pathSegments,
+      query: query,
+      headers: headers,
+      decode: (response) =>
+          (body: _handleJsonResponse(response), headers: response.headers),
+      acceptJson: true,
+      policy: _resolvePolicy(
+        explicit: policy,
+        retry: true,
+        triggerOfflineHook: true,
         defaultRetry: true,
       ),
     );
@@ -408,10 +592,16 @@ class ApiClient {
       () async {
         final request = requestFactory();
         final response = await _http.send(request);
-        developer.log(
-          '${response.statusCode} (streamed) ${request.url}',
-          name: 'ApiClient',
-        );
+        try {
+          await _checkStamp(response.headers);
+        } catch (_) {
+          try {
+            await response.stream.drain<void>();
+          } catch (_) {}
+          rethrow;
+        }
+        // Method and path only: query strings may carry a token (spec 7.2).
+        _log('${response.statusCode} (streamed) ${request.method} ${request.url.path}');
         if (_isSuccess(response.statusCode)) {
           return response;
         }
@@ -423,6 +613,165 @@ class ApiClient {
       label: 'SEND',
       policy: RetryPolicy.standard,
     );
+  }
+
+  /// Streamed PUT of a request body that is never held in memory (Phase 7
+  /// D25: the upload content PUT). [body] is read only as the transport
+  /// sends it (its backpressure paces the reads); [length] is sent as
+  /// Content-Length; [onProgress] gets the bytes handed to the transport so
+  /// far (monotonic, ending at [length]).
+  ///
+  /// One attempt and no per-attempt timeout: a transfer retry restarts the
+  /// file, which is the caller's decision (SC-14). A caller that wants a
+  /// stall bound completes [abortTrigger]; the call then stops reading
+  /// [body], cancels it, and throws [UploadTransferAborted].
+  ///
+  /// The answer goes through the instance-stamp check like every response;
+  /// a 2xx JSON body is returned, a non-2xx is an [ApiException] (the SC-22
+  /// envelope intact), a transport failure a [NetworkException]. An error
+  /// from [body] itself is rethrown unchanged. The response is read up to a
+  /// bounded size.
+  Future<Map<String, dynamic>> putStream(
+    List<String> pathSegments, {
+    required Stream<List<int>> body,
+    required int length,
+    void Function(int sentBytes)? onProgress,
+    Future<void>? abortTrigger,
+    Map<String, String>? headers,
+  }) {
+    final uri = _buildUri(pathSegments);
+    final aborted = Completer<void>();
+    var wasAborted = false;
+    Object? bodyError;
+    StreamSubscription<List<int>>? inner;
+    var sent = 0;
+
+    // The transport pulls from this controller, so its backpressure paces
+    // the reads of [body] (no sink.add, which has none).
+    late final StreamController<List<int>> wrapper;
+    wrapper = StreamController<List<int>>(
+      onListen: () {
+        if (wasAborted) return;
+        inner = body.listen(
+          (chunk) {
+            sent += chunk.length;
+            onProgress?.call(sent);
+            wrapper.add(chunk);
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            bodyError ??= error;
+            inner?.cancel();
+            wrapper.addError(error, stackTrace);
+            wrapper.close();
+          },
+          onDone: wrapper.close,
+          cancelOnError: true,
+        );
+      },
+      onPause: () => inner?.pause(),
+      onResume: () => inner?.resume(),
+      onCancel: () => inner?.cancel(),
+    );
+
+    // The trigger completing, with a value or an error, is an abort.
+    void abort() {
+      if (wasAborted) return;
+      wasAborted = true;
+      inner?.cancel();
+      if (!wrapper.isClosed) wrapper.close();
+      aborted.complete();
+    }
+
+    abortTrigger?.then((_) => abort(), onError: (Object _) => abort());
+
+    final request = _StreamedPut(
+      uri,
+      wrapper.stream,
+      aborted.future,
+      length,
+    )..headers.addAll({
+        'Content-Type': 'application/octet-stream',
+        'Accept': 'application/json',
+        ...?headers,
+      });
+
+    Future<Map<String, dynamic>> attempt() async {
+      final http.StreamedResponse response;
+      try {
+        response = await Future.any<http.StreamedResponse>([
+          _http.send(request),
+          aborted.future.then<http.StreamedResponse>(
+            (_) => throw const UploadTransferAborted(),
+          ),
+        ]);
+      } on UploadTransferAborted {
+        rethrow;
+      } catch (_) {
+        if (wasAborted) throw const UploadTransferAborted();
+        final failure = bodyError;
+        if (failure != null) throw failure;
+        rethrow;
+      }
+      try {
+        await _checkStamp(response.headers);
+      } catch (_) {
+        try {
+          unawaited(response.stream.listen((_) {}).cancel());
+        } catch (_) {}
+        rethrow;
+      }
+      final bytes = await _readBounded(
+        response.stream,
+        1 << 20,
+        abort: aborted.future,
+      );
+      _log('${response.statusCode} ${bytes.length}B');
+      return _handleJsonResponse(
+        http.Response.bytes(bytes, response.statusCode, headers: response.headers),
+      );
+    }
+
+    return _runWithPolicy<Map<String, dynamic>>(
+      attempt,
+      label: 'PUT(stream) ${uri.path}',
+      policy: RetryPolicy.noRetry,
+      noTimeout: true,
+    );
+  }
+
+  /// Reads [stream] up to [limit] bytes, then cancels it. When [abort]
+  /// completes first the read is cancelled and [UploadTransferAborted] thrown.
+  Future<Uint8List> _readBounded(
+    Stream<List<int>> stream,
+    int limit, {
+    Future<void>? abort,
+  }) {
+    final done = Completer<Uint8List>();
+    final out = BytesBuilder(copy: false);
+    late StreamSubscription<List<int>> sub;
+    sub = stream.listen(
+      (chunk) {
+        final room = limit - out.length;
+        out.add(chunk.length <= room ? chunk : chunk.sublist(0, room));
+        if (out.length >= limit && !done.isCompleted) {
+          sub.cancel();
+          done.complete(out.takeBytes());
+        }
+      },
+      onError: (Object e, StackTrace st) {
+        if (!done.isCompleted) done.completeError(e, st);
+      },
+      onDone: () {
+        if (!done.isCompleted) done.complete(out.takeBytes());
+      },
+      cancelOnError: true,
+    );
+    abort?.then((_) {
+      if (done.isCompleted) return;
+      sub.cancel();
+      done.completeError(const UploadTransferAborted());
+    });
+    return done.future;
   }
 
   /// Central request method. All four verb wrappers funnel through here so
@@ -476,16 +825,14 @@ class ApiClient {
       // JSON-decoding callers see character-length; getBytes overrides the
       // log via its decode callback if it needs byte-length. Keeping
       // body.length here matches the pre-refactor log format exactly.
-      developer.log(
-        '${response.statusCode} ${response.body.length}B',
-        name: 'ApiClient',
-      );
+      _log('${response.statusCode} ${response.body.length}B');
+      await _checkStamp(response.headers);
       return decode(response);
     }
 
     return _runWithPolicy<T>(
       attempt,
-      label: '${_verbLabel(verb)} $uri',
+      label: '${_verbLabel(verb)} ${uri.path}',
       policy: policy,
     );
   }
@@ -576,7 +923,11 @@ class ApiClient {
       if (data['message'] == 'Healthy') return const HealthResult(HealthStatus.ok);
       return const HealthResult(HealthStatus.serverError, 'Unexpected response from server');
     } on ApiException catch (e) {
-      return HealthResult(HealthStatus.serverError, 'Server error: ${e.statusCode}');
+      return HealthResult(
+        HealthStatus.serverError,
+        'Server error: ${e.statusCode}',
+        e.statusCode,
+      );
     } on NetworkException catch (e) {
       return HealthResult(HealthStatus.unreachable, 'Could not reach server: ${e.message}');
     } catch (e) {
@@ -585,10 +936,6 @@ class ApiClient {
   }
 
   String coverArtUrl(int coverArtId) => '$baseUrl/cover_art/$coverArtId';
-
-  void close() {
-    _http.close();
-  }
 
   /// Runs [attempt] exactly once, wrapped in the per-attempt timeout. Logs
   /// the attempt and rethrows the raw classification signals
@@ -610,11 +957,10 @@ class ApiClient {
     required int attemptNumber,
     required int totalAttempts,
     required Duration perAttemptTimeout,
+    bool noTimeout = false,
   }) async {
-    developer.log(
-      '$label (attempt $attemptNumber/$totalAttempts)',
-      name: 'ApiClient',
-    );
+    _log('$label (attempt $attemptNumber/$totalAttempts)');
+    if (noTimeout) return await attempt();
     return await attempt().timeout(perAttemptTimeout);
   }
 
@@ -636,7 +982,12 @@ class ApiClient {
     Future<T> Function() attempt, {
     required String label,
     required RetryPolicy policy,
+    bool noTimeout = false,
   }) async {
+    // Waits once, outside the per-attempt timeout, for a verdict that is
+    // already pending; the token decision itself is made at send time.
+    final transport = _http;
+    if (transport is AuthenticatedClient) await transport.verdictSettled();
     final maxAttempts = policy.maxAttempts;
     final perAttemptTimeout =
         _perAttemptTimeoutOverride ?? policy.perAttemptTimeout;
@@ -649,6 +1000,7 @@ class ApiClient {
           attemptNumber: attemptNumber,
           totalAttempts: maxAttempts,
           perAttemptTimeout: perAttemptTimeout,
+          noTimeout: noTimeout,
         );
       } on _HttpFailureSignal catch (status) {
         if (!policy.retryableStatusCodes.contains(status.statusCode)) {
@@ -658,17 +1010,14 @@ class ApiClient {
           throw ApiException(status.statusCode, status.body);
         }
         final delay = _delayForRetry(attemptNumber, status.headers, policy);
-        developer.log(
-          '$label HTTP ${status.statusCode} — retrying in ${delay.inMilliseconds}ms',
-          name: 'ApiClient',
-        );
+        _log('$label HTTP ${status.statusCode} — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
       } on SocketException catch (e) {
         lastNetworkCause = e;
         if (attemptNumber >= maxAttempts) break;
         final delay = _delayForRetry(attemptNumber, const {}, policy);
-        developer.log('$label socket error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
+        _log('$label socket error — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
       } on OSError catch (e) {
@@ -678,21 +1027,21 @@ class ApiClient {
         lastNetworkCause = e;
         if (attemptNumber >= maxAttempts) break;
         final delay = _delayForRetry(attemptNumber, const {}, policy);
-        developer.log('$label OS error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
+        _log('$label OS error — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
       } on TimeoutException catch (e) {
         lastNetworkCause = e;
         if (attemptNumber >= maxAttempts) break;
         final delay = _delayForRetry(attemptNumber, const {}, policy);
-        developer.log('$label timeout — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
+        _log('$label timeout — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
       } on http.ClientException catch (e) {
         lastNetworkCause = e;
         if (attemptNumber >= maxAttempts) break;
         final delay = _delayForRetry(attemptNumber, const {}, policy);
-        developer.log('$label client error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
+        _log('$label client error — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
       } on ArgumentError catch (e) {
@@ -702,7 +1051,7 @@ class ApiClient {
         lastNetworkCause = e;
         if (attemptNumber >= maxAttempts) break;
         final delay = _delayForRetry(attemptNumber, const {}, policy);
-        developer.log('$label argument error — retrying in ${delay.inMilliseconds}ms', name: 'ApiClient');
+        _log('$label argument error — retrying in ${delay.inMilliseconds}ms');
         await _delay(delay);
         continue;
       }
@@ -777,4 +1126,24 @@ class _HttpFailureSignal implements Exception {
   final Map<String, String> headers;
 
   _HttpFailureSignal(this.statusCode, this.body, this.headers);
+}
+
+/// The streamed content PUT: the transport pulls [finalize]'s stream itself.
+class _StreamedPut extends http.BaseRequest implements http.Abortable {
+  _StreamedPut(Uri url, this._body, this._abortTrigger, int length)
+    : super('PUT', url) {
+    contentLength = length;
+  }
+
+  final Stream<List<int>> _body;
+  final Future<void> _abortTrigger;
+
+  @override
+  Future<void> get abortTrigger => _abortTrigger;
+
+  @override
+  http.ByteStream finalize() {
+    super.finalize();
+    return http.ByteStream(_body);
+  }
 }

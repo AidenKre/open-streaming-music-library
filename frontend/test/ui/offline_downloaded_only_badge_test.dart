@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:frontend/playback/audio_dependencies.dart';
 
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
@@ -17,6 +18,7 @@ import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
+import '../helpers/no_server_api.dart';
 
 /// Pins [offlineModeProvider] to a fixed value without running the real
 /// health-poll timer.
@@ -24,7 +26,10 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 void main() {
@@ -37,8 +42,8 @@ void main() {
     await _seedSearchData(db);
     tempDir = await Directory.systemTemp.createTemp('badge-test');
     coverStore =
-        await LocalCoverArtStore.create(directoryProvider: () async => tempDir);
-    initCoverArtCache(CoverArtCacheManager.noop());
+        await LocalCoverArtStore.create(
+            directoryProvider: () async => tempDir, apiClient: noServerApi());
   });
 
   tearDown(() async {
@@ -50,6 +55,7 @@ void main() {
     return ProviderScope(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         localCoverArtStoreProvider.overrideWithValue(coverStore),
         offlineModeProvider.overrideWith(() => _StubOffline(offline)),
       ],

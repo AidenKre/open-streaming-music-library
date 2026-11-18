@@ -39,7 +39,7 @@ void main() {
     final c = ProviderContainer();
     addTearDown(c.dispose);
     expect(c.read(localQuiescablesProvider).map((q) => q.quiesceName),
-        ['playback', 'listens', 'history']);
+        ['playback', 'listens', 'preview', 'history', 'uploads', 'submissions']);
   });
 
   test('the listens participant quiesces a built recorder and never builds '

@@ -5,9 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/shell/app_shell.dart';
@@ -22,10 +20,8 @@ void main() {
   late AppDatabase db;
   late BrowseHarness h;
 
-  setUpAll(() => ApiClient.init('http://localhost:8000'));
 
   setUp(() async {
-    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     h = await BrowseHarness.create(db);
   });

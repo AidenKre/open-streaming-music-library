@@ -50,7 +50,7 @@ void main() {
     addTearDown(db.close);
     expect(
       (await _rows(db, 'PRAGMA user_version')).single.values.single,
-      4,
+      db.schemaVersion, // the full chain runs to the current version
     );
     expect(
       await _rows(

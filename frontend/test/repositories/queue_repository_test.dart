@@ -750,6 +750,257 @@ void main() {
       expect((await active())?.id, current);
     });
   });
+
+  group('6A.1b: the explicit-list prepare takes a permutation (D2)', () {
+    test('the permutation is the play order from position zero; the first '
+        'entry is current', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+      for (var run = 0; run < 5; run++) {
+        final sessionId = await repo.createSessionFromExplicitList(
+          sourceType: 'album',
+          sourceArtistId: 7,
+          sourceAlbumId: 9,
+          trackUuids: const ['a', 'b', 'c', 'd', 'e'],
+          playOrder: const [4, 0, 3, 1, 2],
+          shuffleEnabled: true,
+          repeatMode: 'all',
+          activate: false,
+        );
+
+        expect(await _orderRows(db, sessionId), [
+          (0, 4, 'e'),
+          (1, 0, 'a'),
+          (2, 3, 'd'),
+          (3, 1, 'b'),
+          (4, 2, 'c'),
+        ], reason: 'run $run: written as given, never reshuffled');
+        final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+        expect(snapshot.currentItem?.uuidId, 'e');
+        expect(snapshot.currentItem?.playPosition, 0);
+        // 6-R1-10: resume_main_item_id is never written.
+        expect(snapshot.session.resumeMainItemId, isNull);
+        expect(snapshot.session.shuffleEnabled, isTrue);
+        expect(snapshot.session.repeatMode, 'all');
+        expect(snapshot.session.isActive, isFalse);
+        expect(snapshot.session.sourceType, 'album');
+        expect(snapshot.session.sourceArtistId, 7);
+        expect(snapshot.session.sourceAlbumId, 9);
+      }
+    });
+
+    test('duplicate tracks keep one entry per canonical position', () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'album',
+        trackUuids: const ['a', 'b', 'a', 'c'],
+        playOrder: const [2, 0, 3, 1],
+        shuffleEnabled: true,
+      );
+      expect(await _orderRows(db, sessionId), [
+        (0, 2, 'a'),
+        (1, 0, 'a'),
+        (2, 3, 'c'),
+        (3, 1, 'b'),
+      ]);
+      expect((await repo.getSessionSnapshot(sessionId))!.currentItem
+          ?.canonicalPosition, 2);
+    });
+
+    test('an invalid permutation is refused and writes nothing', () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      for (final bad in const [
+        [0, 0, 1],
+        [0, 1],
+        [0, 1, 2, 2],
+        [0, 1, 3],
+        [-1, 0, 1],
+        <int>[],
+      ]) {
+        await expectLater(
+          repo.createSessionFromExplicitList(
+            sourceType: 'album',
+            trackUuids: const ['a', 'b', 'c'],
+            playOrder: bad,
+            shuffleEnabled: true,
+          ),
+          throwsArgumentError,
+          reason: '$bad',
+        );
+      }
+      expect(await db.select(db.queueSessions).get(), isEmpty);
+      expect(await db.select(db.queueSessionItems).get(), isEmpty);
+      expect(await db.select(db.queueSessionPlayOrder).get(), isEmpty);
+    });
+
+    test('without a permutation the list keeps its canonical order',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'album',
+        trackUuids: const ['a', 'b', 'c'],
+      );
+      expect(await _orderRows(db, sessionId),
+          [(0, 0, 'a'), (1, 1, 'b'), (2, 2, 'c')]);
+    });
+  });
+
+  group('6A.1b: a prepared session activates only while its current item '
+      'is still queued (spec §5 disappearance)', () {
+    test('its current item removed: refused, nothing changes', () async {
+      await fixture.insertSingles(['x', 'a', 'b']);
+      final active = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['x']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'album', trackUuids: const ['a', 'b'], activate: false);
+      await repo.removeTrackUuidsFromQueues(const ['a']);
+
+      await expectLater(repo.activateSession(prepared), throwsStateError);
+      expect((await repo.getActiveSession())?.id, active);
+    });
+
+    test('emptied by removal: refused', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'album', trackUuids: const ['a', 'b'], activate: false);
+      await repo.removeTrackUuidsFromQueues(const ['a', 'b']);
+      await expectLater(repo.activateSession(prepared), throwsStateError);
+      expect(await repo.getActiveSession(), isNull);
+    });
+
+    test('another member removed: activates', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final prepared = await repo.createSessionFromExplicitList(
+          sourceType: 'album', trackUuids: const ['a', 'b'], activate: false);
+      await repo.removeTrackUuidsFromQueues(const ['b']);
+      await repo.activateSession(prepared);
+      expect((await repo.getActiveSession())?.id, prepared);
+    });
+
+    test('review r1 #3: the prepared target is never written to a session '
+        'that is not prepared', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final active = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['a', 'b']);
+      final second = (await repo.getSessionTracksInPlayOrder(active))[1];
+      await expectLater(
+          repo.setPreparedCurrentItem(active, second.itemId, 1),
+          throwsStateError);
+      expect((await repo.getSessionSnapshot(active))!.currentItem?.uuidId,
+          'a');
+    });
+
+    test('a session that was active before is reactivated as today, even '
+        'without a current item', () async {
+      await fixture.insertSingles(['a', 'b', 'y']);
+      final previous = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['a', 'b']);
+      final next = await repo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['y'], activate: false);
+      await repo.activateSession(next);
+      await repo.removeTrackUuidsFromQueues(const ['a']); // previous's current
+      await repo.activateSession(previous);
+      expect((await repo.getActiveSession())?.id, previous);
+    });
+  });
+
+  test('U20-FE-QUEUE-B-03: rebuilding the future binds no variable per '
+      'played item (a long played part stays under SQLite\'s variable limit)',
+      () async {
+    // The bundled SQLite's limit (32,766 since 3.32; 999 before) is not the
+    // test host's, so the bound variables are counted instead.
+    final recorder = _VariableCountRecorder();
+    final counted = AppDatabase(NativeDatabase.memory().interceptWith(recorder));
+    addTearDown(counted.close);
+    await seedTestBinding(counted);
+    final countedRepo = QueueRepository(counted);
+    await _LibraryFixture(counted).insertSingles(['a', 'x']);
+    final sessionId = await countedRepo.createSessionFromExplicitList(
+        sourceType: 'search', trackUuids: const ['a']);
+    // 2,000 more main items, played in order.
+    const extra = 2000;
+    await counted.customStatement(
+        'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n '
+        'WHERE i < $extra) '
+        'INSERT INTO queue_session_items (session_id, queue_type, position, '
+        "uuid_id) SELECT $sessionId, 'main', i, 'a' FROM n");
+    await counted.customStatement(
+        'INSERT INTO queue_session_play_order (session_id, play_position, '
+        'item_id) SELECT session_id, position, item_id FROM '
+        "queue_session_items WHERE session_id = $sessionId AND position > 0 "
+        "AND queue_type = 'main'");
+    final last = (await countedRepo.getPlaybackEntries(sessionId,
+            startPlayPosition: extra, limit: 1))
+        .single;
+    await countedRepo.prependManualItems(sessionId, const ['x']);
+
+    recorder.maxArgs = 0;
+    await countedRepo.rebuildFutureSuffix(sessionId,
+        currentItemId: last.itemId, mainFutureItemIds: const []);
+
+    expect(recorder.maxArgs, lessThan(100),
+        reason: 'no statement binds the played part item by item');
+    expect(await _playOrderCount(counted, sessionId), extra + 2);
+    final tail = await countedRepo.getPlaybackEntries(sessionId,
+        startPlayPosition: extra, limit: 5);
+    expect(tail, hasLength(2));
+    expect(tail.first.itemId, last.itemId);
+    expect(tail.last.uuidId, 'x', reason: 'the queued item follows the '
+        'current track');
+    expect(tail.last.queueType, 'manual');
+  });
+}
+
+/// Records the largest number of variables any one statement binds.
+class _VariableCountRecorder extends QueryInterceptor {
+  int maxArgs = 0;
+
+  void _note(List<Object?> args) {
+    if (args.length > maxArgs) maxArgs = args.length;
+  }
+
+  @override
+  Future<List<Map<String, Object?>>> runSelect(
+      QueryExecutor executor, String statement, List<Object?> args) {
+    _note(args);
+    return super.runSelect(executor, statement, args);
+  }
+
+  @override
+  Future<int> runInsert(
+      QueryExecutor executor, String statement, List<Object?> args) {
+    _note(args);
+    return super.runInsert(executor, statement, args);
+  }
+
+  @override
+  Future<int> runUpdate(
+      QueryExecutor executor, String statement, List<Object?> args) {
+    _note(args);
+    return super.runUpdate(executor, statement, args);
+  }
+
+  @override
+  Future<int> runDelete(
+      QueryExecutor executor, String statement, List<Object?> args) {
+    _note(args);
+    return super.runDelete(executor, statement, args);
+  }
+
+  @override
+  Future<void> runCustom(
+      QueryExecutor executor, String statement, List<Object?> args) {
+    _note(args);
+    return super.runCustom(executor, statement, args);
+  }
+
+  @override
+  Future<void> runBatched(
+      QueryExecutor executor, BatchedStatements statements) {
+    for (final args in statements.arguments) {
+      _note(args.arguments);
+    }
+    return super.runBatched(executor, statements);
+  }
 }
 
 Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
@@ -872,4 +1123,21 @@ class _LibraryFixture {
     await db.into(db.tracks).insert(tracksCompanionFromDto(dto));
     await db.into(db.trackmetadata).insert(trackmetadataCompanionFromDto(dto));
   }
+}
+
+/// Every play-order row of a session: (play position, canonical position,
+/// uuid), straight from the tables.
+Future<List<(int, int, String)>> _orderRows(AppDatabase db, int sessionId) async {
+  final rows = await db.customSelect(
+    'SELECT po.play_position, qsi.position, qsi.uuid_id '
+    'FROM queue_session_play_order AS po '
+    'JOIN queue_session_items AS qsi ON qsi.item_id = po.item_id '
+    'WHERE po.session_id = ? ORDER BY po.play_position',
+    variables: [Variable.withInt(sessionId)],
+  ).get();
+  return [
+    for (final r in rows)
+      (r.read<int>('play_position'), r.read<int>('position'),
+          r.read<String>('uuid_id')),
+  ];
 }

@@ -7,7 +7,9 @@ import 'package:frontend/api/pagination.dart';
 import './api_client.dart';
 
 class ArtistApi implements IPaginatingListApi {
-  final ApiClient _apiClient = ApiClient.instance;
+  ArtistApi({required ApiClient api}) : _apiClient = api;
+
+  final ApiClient _apiClient;
   final String _endpoint = 'artists';
   String? _nextCursor;
   List<String> _artists = [];

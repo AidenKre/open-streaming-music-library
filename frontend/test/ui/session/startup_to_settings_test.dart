@@ -6,19 +6,22 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
+import 'package:http/testing.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/main.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/session_service.dart';
 import 'package:frontend/ui/home/home_page.dart';
-import 'package:frontend/ui/login_page.dart';
+import 'package:frontend/ui/server_address_page.dart';
 import 'package:frontend/ui/settings_page.dart';
 import 'package:frontend/ui/startup_gate.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../browse_harness.dart';
+import '../../helpers/test_credentials.dart';
 
 class _Service extends SessionService {
   _Service(super.ref);
@@ -40,11 +43,13 @@ void main() {
   late AppDatabase db;
   late BrowseHarness harness;
   late _Service service;
+  late Override noSessionApi;
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.init('');
-    initCoverArtCache(CoverArtCacheManager.noop());
+    noSessionApi = apiClientProvider.overrideWithValue(
+      testApiClient('', MockClient((_) async => fail('no session: no requests'))),
+    );
     db = AppDatabase(NativeDatabase.memory());
     harness = await BrowseHarness.create(db);
   });
@@ -59,6 +64,8 @@ void main() {
       harness.wrap(
         const StartupGate(),
         overrides: [
+          noSessionApi,
+          credentialStoreTestOverride(),
           sessionServiceProvider.overrideWith((ref) => service = _Service(ref)),
         ],
       ),
@@ -88,7 +95,7 @@ void main() {
     await pumpLiveApp(tester);
     await openSettingsAndConfirmDisconnect(tester);
     expect(service.resets, 1);
-    expect(find.byType(LoginPage), findsOneWidget);
+    expect(find.byType(ServerAddressPage), findsOneWidget);
     expect(find.byType(SettingsPage), findsNothing);
     expect(find.byType(AppShell), findsNothing);
     await teardownTree(tester);
@@ -109,7 +116,7 @@ void main() {
     await tester.tap(find.text('OK'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
-    expect(find.byType(LoginPage), findsOneWidget);
+    expect(find.byType(ServerAddressPage), findsOneWidget);
     await teardownTree(tester);
   });
 
@@ -140,7 +147,7 @@ void main() {
     unawaited(container.read(sessionControlsProvider).disconnect());
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
-    expect(find.byType(LoginPage), findsOneWidget);
+    expect(find.byType(ServerAddressPage), findsOneWidget);
     expect(find.text('Play Next'), findsNothing);
     expect(service.resets, 1);
     await teardownTree(tester);

@@ -129,33 +129,40 @@ class BrowseRepository {
   /// Play next / Add to queue / Download / Delete on [scope] acts on, in the
   /// same [CollectionOrdering] the scope's page shows.
   ///
-  /// [offline] is the caller's observed connectivity; the model maps it to
-  /// membership. Phase 4 keeps today's rule (offline does not narrow the
-  /// membership; queue actions on a collection are only enabled offline when
-  /// it is fully downloaded, see `PlaybackAvailability`). Phase 6 narrows an
-  /// offline collection to its downloaded members here.
+  /// [offline] is the caller's observed connectivity. Online, an album or
+  /// artist scope is its full collection; offline it narrows to the members
+  /// with a usable local file (file path recorded, not damaged), in the same
+  /// order. The query does not stat files. An explicit track list narrows the
+  /// same way, in list order; a single track is never narrowed.
   Future<List<TrackUI>> getTracksForScope(
     LibraryScope scope, {
     required bool offline,
   }) async {
     switch (scope) {
       case AlbumScope(:final artistId, :final albumId):
-        return _tracksForAlbum(artistId, albumId);
+        return _tracksForAlbum(artistId, albumId, downloadedOnly: offline);
       case ArtistScope(:final artistId):
-        return _tracksForArtist(artistId);
+        return _tracksForArtist(artistId, downloadedOnly: offline);
       case TrackScope(:final track):
         return [track];
       case TracksScope(:final tracks):
-        return tracks;
+        return offline
+            ? tracks.where((t) => t.isDownloaded).toList(growable: false)
+            : tracks;
     }
   }
 
   /// An album's tracks in [CollectionOrdering.albumTracks].
-  Future<List<TrackUI>> _tracksForAlbum(int artistId, int albumId) async {
+  Future<List<TrackUI>> _tracksForAlbum(
+    int artistId,
+    int albumId, {
+    required bool downloadedOnly,
+  }) async {
     final rows = await _db.getTracks(
       orderBy: CollectionOrdering.albumTracks,
       artistId: artistId,
       albumId: albumId,
+      downloadedOnly: downloadedOnly,
     );
     return rows.map(TrackUI.fromQueryRow).toList(growable: false);
   }
@@ -164,7 +171,7 @@ class BrowseRepository {
   /// ([CollectionOrdering.artistAlbums]), each album's tracks in
   /// [CollectionOrdering.albumTracks]. Both orders are SQL; this only groups
   /// the ordered track rows by album, so neither is re-implemented in Dart.
-  Future<List<TrackUI>> _tracksForArtist(int artistId) {
+  Future<List<TrackUI>> _tracksForArtist(int artistId, {required bool downloadedOnly}) {
     return _db.transaction(() async {
       final albumRows = await _db.getAlbums(
         artistId: artistId,
@@ -173,6 +180,7 @@ class BrowseRepository {
       final trackRows = await _db.getTracks(
         orderBy: CollectionOrdering.albumTracks,
         artistId: artistId,
+        downloadedOnly: downloadedOnly,
       );
       final byAlbum = <int?, List<TrackUI>>{};
       for (final row in trackRows) {
@@ -214,6 +222,40 @@ class BrowseRepository {
         damagedFilePath: s.damagedFilePath,
       );
     }).toList(growable: false);
+  }
+
+  // ── By-ID resolvers (SC-12) ─────────────────────────────────────────────
+
+  /// SC-12: albums for [ids] in one query, in the order requested; ids with
+  /// no row are dropped. [downloadedArtOnly] only changes which cover is
+  /// picked (usable downloads), never which albums come back.
+  Future<List<AlbumUI>> getAlbumsByIds(
+    List<int> ids, {
+    bool downloadedArtOnly = false,
+  }) async {
+    final rows = await _db.getAlbumsByIds(
+      ids,
+      downloadedArtOnly: downloadedArtOnly,
+    );
+    return rows.map(AlbumUI.fromQueryRow).toList(growable: false);
+  }
+
+  /// SC-12: artists for [ids]; same contract as [getAlbumsByIds].
+  Future<List<ArtistUI>> getArtistsByIds(
+    List<int> ids, {
+    bool downloadedArtOnly = false,
+  }) async {
+    final rows = await _db.getArtistsByIds(
+      ids,
+      downloadedArtOnly: downloadedArtOnly,
+    );
+    return rows.map(ArtistUI.fromQueryRow).toList(growable: false);
+  }
+
+  /// SC-12: tracks for [uuids], order preserved, missing dropped.
+  Future<List<TrackUI>> getTracksByUuids(List<String> uuids) async {
+    final rows = await _db.getTracksByUuids(uuids);
+    return rows.map(TrackUI.fromQueryRow).toList(growable: false);
   }
 
   // ── Search ──────────────────────────────────────────────────────────────

@@ -1,30 +1,41 @@
 import 'package:flutter/material.dart';
+import 'package:http/testing.dart';
+import 'package:http/http.dart' as http;
+import 'package:frontend/playback/audio_dependencies.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/widgets/cover_art_image.dart';
 
 void main() {
-  setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
-  });
-
   Widget buildSizedWidget({
     required bool hasAlbumArt,
     required int? coverArtId,
     required double width,
     required double height,
   }) {
-    return MaterialApp(
-      home: Scaffold(
-        body: CoverArtImage(
-          hasAlbumArt: hasAlbumArt,
-          coverArtId: coverArtId,
-          width: width,
-          height: height,
-          borderRadius: BorderRadius.circular(4),
-          fallback: const Icon(Icons.music_note),
+    return ProviderScope(
+      overrides: [
+        coverArtCacheProvider.overrideWithValue(
+        CoverArtCacheManager.noop(
+          api: testApiClient(
+            'http://localhost:8000',
+            MockClient((_) async => http.Response('', 404)),
+          ),
+        ),
+      ),
+      ],
+      child: MaterialApp(
+        home: Scaffold(
+          body: CoverArtImage(
+            hasAlbumArt: hasAlbumArt,
+            coverArtId: coverArtId,
+            width: width,
+            height: height,
+            borderRadius: BorderRadius.circular(4),
+            fallback: const Icon(Icons.music_note),
+          ),
         ),
       ),
     );

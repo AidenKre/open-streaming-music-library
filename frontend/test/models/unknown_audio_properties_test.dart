@@ -2,6 +2,9 @@
 // end (wire DTO -> Drift -> TrackUI -> views / OS media item). Unknown is
 // shown as "—", never as 0.
 import 'package:drift/drift.dart' show Value;
+import 'package:http/testing.dart';
+import 'package:http/http.dart' as http;
+import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -66,7 +69,10 @@ TrackUI _unknownTrack() => TrackUI.fromDrift(
 
 class _StubOffline extends OfflineModeNotifier {
   @override
-  bool build() => true;
+  bool build() {
+    super.build();
+    return true;
+  }
 }
 
 void main() {
@@ -206,11 +212,21 @@ void main() {
   });
 
   testWidgets('TrackTile shows an unknown duration as —', (tester) async {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
     await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(body: TrackTile(track: _unknownTrack())),
+      ProviderScope(
+        overrides: [
+          coverArtCacheProvider.overrideWithValue(
+        CoverArtCacheManager.noop(
+          api: testApiClient(
+            'http://localhost:8000',
+            MockClient((_) async => http.Response('', 404)),
+          ),
+        ),
+      ),
+        ],
+        child: MaterialApp(
+          home: Scaffold(body: TrackTile(track: _unknownTrack())),
+        ),
       ),
     );
     expect(find.text('—'), findsOneWidget);

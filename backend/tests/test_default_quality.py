@@ -1,35 +1,59 @@
 """Tests for default streaming quality persistence and two-tier cache."""
 
-import importlib
-import sys
+import sqlite3
+import threading
 import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.database.database import Database
 from app.models import Track, TrackMetaData
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator
 from app.services.transcoder import ORIGINAL_QUALITY
+from tests.owned_database import add_test_user
+
+# The master admin's id: only its tracks are routed to default_cache (M.2a).
+ADMIN_OWNER = 1
+
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
+def client(app_client):
+    return app_client
 
-    sys.modules.pop("app.main", None)
-    sys.modules.pop("app.config", None)
-    import app.main
-    importlib.reload(app.main)
 
-    with TestClient(app.main.app) as c:
-        yield c
+def _stored_quality(client, user_id=None):
+    """The quality stored in ``user_settings`` (the admin's by default)."""
+    user_id = client.app.state.admin_user_id if user_id is None else user_id
+    conn = sqlite3.connect(client.app.state.database.context.database_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM user_settings WHERE user_id = ? "
+            "AND key = 'default_streaming_quality'",
+            (user_id,),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _store_quality(client, value, user_id=None):
+    user_id = client.app.state.admin_user_id if user_id is None else user_id
+    conn = sqlite3.connect(client.app.state.database.context.database_path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_settings (user_id, key, value) "
+            "VALUES (?, 'default_streaming_quality', ?)",
+            (user_id, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _add_track(client, tmp_path: Path, name: str = "track.mp3") -> Track:
@@ -37,7 +61,7 @@ def _add_track(client, tmp_path: Path, name: str = "track.mp3") -> Track:
     track_path.write_bytes(b"audio-source" * 100)
     metadata = TrackMetaData(title=name, duration=1.0, codec="mp3", bitrate_kbps=320.0)
     track = Track(file_path=track_path, metadata=metadata)
-    assert client.app.state.database.add_track(track=track)
+    assert client.app.state.admin_library.add_track(track=track)
     return track
 
 
@@ -65,7 +89,9 @@ def _install_fake_coordinator(client, payload=b"encoded" * 10):
         transcode_fn=fake_transcode,
         default_cache=new_default_cache,
         default_quality=client.app.state.encoder_coordinator.default_quality,
-        all_uuids_fn=lambda: database.get_all_track_uuids(),
+        all_uuids_fn=client.app.state.encoder_coordinator.all_uuids_fn,
+        admin_owner_id=client.app.state.encoder_coordinator.admin_owner_id,
+        owner_lookup=client.app.state.encoder_coordinator.owner_lookup,
     )
     client.app.state.encoded_cache = new_stream_cache
     client.app.state.default_cache = new_default_cache
@@ -101,6 +127,7 @@ class TestTwoTierCache:
             return True
 
         coordinator = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -115,7 +142,7 @@ class TestTwoTierCache:
         source.write_bytes(b"audio" * 100)
         c, calls = self._make_coordinator(tmp_path, source, default_quality="192")
 
-        result = c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
+        result = c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
 
         assert result is not None
         assert result.transcoded is True
@@ -127,7 +154,7 @@ class TestTwoTierCache:
         source.write_bytes(b"audio" * 100)
         c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
 
-        result = c.encode_for_stream("uuid-a", "320", source_bitrate_kbps=500)
+        result = c.encode_for_stream("uuid-a", "320", source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
 
         assert result is not None
         assert c.cache.has("uuid-a", "320")
@@ -140,11 +167,11 @@ class TestTwoTierCache:
         c, calls = self._make_coordinator(tmp_path, source, default_quality="192")
 
         # Prime default cache.
-        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
         assert calls == [192]
 
         # Second call should be a cache hit — no additional transcode.
-        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
         assert calls == [192]
 
     def test_stream_cache_fallback_for_default_quality(self, tmp_path):
@@ -159,7 +186,7 @@ class TestTwoTierCache:
         c.cache.insert("uuid-a", "192", scratch)
 
         # Should find it in stream_cache without transcoding.
-        result = c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
+        result = c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
         assert result is not None
         assert calls == []
 
@@ -169,7 +196,7 @@ class TestTwoTierCache:
         c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
 
         # Encode at the old default quality (goes to default_cache).
-        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
         assert c.default_cache.has("uuid-a", "192")
         assert not c.cache.has("uuid-a", "192")
 
@@ -207,6 +234,7 @@ class TestTwoTierCache:
             )
         )
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -222,25 +250,59 @@ class TestTwoTierCache:
 
         assert encode_calls == []
 
-    def test_delete_default_cache_files__deletes_old_quality_only(self, tmp_path):
-        """_delete_default_cache_files removes files for old_quality and leaves others."""
+    def test_quality_change_keeps_only_the_new_default_files(self, tmp_path):
+        """U06-B-02: a default change leaves only the new default's files in
+        the never-pruned default cache. An older default's encode (stranded by
+        an encode that landed after an earlier cleanup, or by a crash before
+        it ran) goes too, so old defaults do not pile up across changes."""
         source = tmp_path / "t.mp3"
         source.write_bytes(b"audio" * 100)
         c, _ = self._make_coordinator(tmp_path, source, default_quality="192")
 
         # Encode at the current default quality (goes to default_cache).
-        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320)
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
         assert c.default_cache.has("uuid-a", "192")
+        cache_dir = c.default_cache.ctx.cache_dir
+        stranded = cache_dir / "uuid-b__q256.m4a"  # an earlier default's encode
+        stranded.write_bytes(b"encoded" * 10)
+        new_default = cache_dir / "uuid-c__q320.m4a"  # already at the new default
+        new_default.write_bytes(b"encoded" * 10)
 
-        # Manually place a file with a different quality suffix in the same dir
-        # to verify _delete_default_cache_files only removes the target quality.
-        other_file = c.default_cache.ctx.cache_dir / "uuid-b__q320.m4a"
-        other_file.write_bytes(b"encoded" * 10)
-
-        c._delete_default_cache_files(c.default_cache, "192")
+        c.set_default_quality("320")
+        c._executor.shutdown(wait=True)
 
         assert not c.default_cache.has("uuid-a", "192")
-        assert other_file.exists()
+        assert not stranded.exists()
+        assert new_default.exists()
+
+    def test_quality_change_and_back_keeps_the_warmed_files(self, tmp_path):
+        """U06-A-01: 192 -> 320 -> 192 before the background work runs. The
+        cleanup queued by the first change must not delete the files of the
+        default the admin went back to."""
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        c, calls = self._make_coordinator(tmp_path, source, default_quality="192")
+        c.all_uuids_fn = lambda: ["uuid-a"]
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
+        assert calls == [192]
+
+        # Hold both workers so the two changes land before any queued task runs.
+        release = threading.Event()
+        started = [threading.Event(), threading.Event()]
+        for event in started:
+            c._executor.submit(
+                lambda e=event: (e.set(), release.wait(timeout=10)), priority=0
+            )
+        for event in started:
+            assert event.wait(timeout=10)
+
+        c.set_default_quality("320")
+        c.set_default_quality("192")
+        release.set()
+        c._executor.shutdown(wait=True)
+
+        assert c.default_cache.has("uuid-a", "192")
+        assert calls == [192]  # the warmed file was kept, never re-encoded
 
     def test_set_default_quality__same_quality__returns_false_no_warm(self, tmp_path):
         source = tmp_path / "t.mp3"
@@ -290,6 +352,7 @@ class TestTwoTierCache:
             return True
 
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=4,
@@ -326,6 +389,7 @@ class TestTwoTierCache:
             return True
 
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -356,6 +420,7 @@ class TestTwoTierCache:
             ctx=EncodedCacheContext(cache_dir=tmp_path / "default", max_size_bytes=0)
         )
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=1,
@@ -394,6 +459,7 @@ class TestTwoTierCache:
             return True
 
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -404,7 +470,7 @@ class TestTwoTierCache:
         )
 
         # Pre-warm uuid-0 so it's already in default_cache
-        c.encode_for_stream("uuid-0", "192", source_bitrate_kbps=320)
+        c.encode_for_stream("uuid-0", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
         assert default_cache.has("uuid-0", "192")
 
         # Track encodes via side-channel: count cache insertions after startup
@@ -439,6 +505,7 @@ class TestTwoTierCache:
             return True
 
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -450,7 +517,7 @@ class TestTwoTierCache:
 
         # Pre-warm all tracks
         for uid in uuids:
-            c.encode_for_stream(uid, "192", source_bitrate_kbps=320)
+            c.encode_for_stream(uid, "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
         encode_calls.clear()
 
         c.startup()
@@ -477,6 +544,7 @@ class TestTwoTierCache:
             return True
 
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -490,6 +558,25 @@ class TestTwoTierCache:
         c._executor.shutdown(wait=True)
 
         assert encode_calls == []
+
+    def test_startup__removes_other_qualities_from_the_default_cache(self, tmp_path):
+        """U06-B-02 (review r1): a cleanup still queued at a stop (dropped
+        with the rest of the backlog) or lost in a crash is redone at the next
+        start, so an old default's files never stay for good."""
+        source = tmp_path / "t.mp3"
+        source.write_bytes(b"audio" * 100)
+        c, calls = self._make_coordinator(tmp_path, source, default_quality="192")
+        c.all_uuids_fn = lambda: ["uuid-a"]
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
+        stranded = c.default_cache.ctx.cache_dir / "uuid-a__q256.m4a"
+        stranded.write_bytes(b"encoded" * 10)
+
+        c.startup()
+        c._executor.shutdown(wait=True)
+
+        assert not stranded.exists()
+        assert c.default_cache.has("uuid-a", "192")
+        assert calls == [192]
 
     def test_warm_all_tracks_encodes_at_new_default(self, tmp_path):
         source = tmp_path / "t.mp3"
@@ -514,6 +601,7 @@ class TestTwoTierCache:
             )
         )
         c = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=stream_cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -550,13 +638,29 @@ class TestQualitySettingsAPI:
         r2 = client.get("/settings/quality")
         assert r2.json()["quality"] == "256"
 
-    def test_put_quality__persists_to_db(self, client, tmp_path):
+    def test_put_quality__persists_to_the_admins_user_settings(self, client, tmp_path):
         _install_fake_coordinator(client)
 
         client.put("/settings/quality", json={"quality": "128"})
 
-        stored = client.app.state.database.get_setting("default_streaming_quality")
-        assert stored == "128"
+        assert _stored_quality(client) == "128"
+        # One mechanism: the server-wide app_settings key is no longer used.
+        assert client.app.state.database.get_setting("default_streaming_quality") is None
+
+    def test_get_quality__reads_the_callers_user_settings(self, client):
+        _store_quality(client, "192")
+
+        assert client.get("/settings/quality").json()["quality"] == "192"
+
+    def test_get_quality__invalid_stored_value_falls_back_to_env_then_original(
+        self, open_app_client
+    ):
+        with open_app_client(env={"DEFAULT_STREAMING_QUALITY": "192"}) as c:
+            _store_quality(c, "lossless-MQA")
+            assert c.get("/settings/quality").json()["quality"] == "192"
+        with open_app_client(env={"DEFAULT_STREAMING_QUALITY": "also-bogus"}) as c:
+            _store_quality(c, "lossless-MQA")
+            assert c.get("/settings/quality").json()["quality"] == "original"
 
     def test_put_quality__invalid_rejected(self, client):
         r = client.put("/settings/quality", json={"quality": "lossless-MQA"})
@@ -597,41 +701,54 @@ class TestQualitySettingsAPI:
         assert r.status_code == 200
         assert r.json()["warming"] is False
 
-    def test_put_quality__same_quality__no_db_write(self, client):
+    def test_put_quality__same_quality__no_db_write(self, client, monkeypatch):
         """PUT with the current quality must not write to the database."""
-        # At startup, no quality has been persisted — get_setting returns None.
-        db = client.app.state.database
-        assert db.get_setting("default_streaming_quality") is None
-
-        # PUT the same quality that the coordinator already has in memory.
+        writes = []
+        monkeypatch.setattr(
+            Database, "set_user_setting", lambda self, *a, **kw: writes.append((a, kw))
+        )
         current = client.app.state.encoder_coordinator.default_quality
+
         r = client.put("/settings/quality", json={"quality": current})
 
         assert r.status_code == 200
         assert r.json()["warming"] is False
-        # DB must remain untouched.
-        assert db.get_setting("default_streaming_quality") is None
+        assert writes == []
 
-    def test_put_quality__db_write_failure__leaves_state_unchanged(self, client):
-        """If set_setting raises, the coordinator's default_quality must not
-        change and the response must surface an error."""
+    def test_put_quality__repairs_an_invalid_stored_value_equal_to_the_live_default(
+        self, open_app_client
+    ):
+        """U06-B-09: the PUT compares with the stored value, not the live one: an
+        invalid stored value (live default from the env) is replaced by the PUT."""
+        env = {"DEFAULT_STREAMING_QUALITY": "192"}
+        with open_app_client(env=env) as c:
+            _store_quality(c, "lossless-MQA")
+        with open_app_client(env=env) as c:
+            assert c.app.state.encoder_coordinator.default_quality == "192"
+
+            r = c.put("/settings/quality", json={"quality": "192"})
+
+            assert r.status_code == 200
+            assert r.json()["warming"] is False
+            assert _stored_quality(c) == "192"
+
+    def test_put_quality__db_write_failure__leaves_state_unchanged(self, client, monkeypatch):
+        """If persisting raises, the coordinator's default_quality and the stored
+        value must not change, and the response must surface an error."""
         _install_fake_coordinator(client)
         coordinator = client.app.state.encoder_coordinator
-        db = client.app.state.database
         original_quality = coordinator.default_quality
+        stored = _stored_quality(client)
 
-        def boom(_key, _value):
+        def boom(self, *args, **kwargs):
             raise RuntimeError("simulated db failure")
 
-        original_set = db.set_setting
-        db.set_setting = boom
-        try:
-            r = client.put("/settings/quality", json={"quality": "256"})
-        finally:
-            db.set_setting = original_set
+        monkeypatch.setattr(Database, "set_user_setting", boom)
+        r = client.put("/settings/quality", json={"quality": "256"})
 
         assert r.status_code == 500
         assert coordinator.default_quality == original_quality
+        assert _stored_quality(client) == stored
 
     def test_put_quality__concurrent_puts__live_matches_persisted(self, client):
         """Concurrent PUTs must leave the persisted setting equal to the
@@ -639,7 +756,6 @@ class TestQualitySettingsAPI:
         import threading
 
         _install_fake_coordinator(client)
-        db = client.app.state.database
         coordinator = client.app.state.encoder_coordinator
         qualities = ["96", "128", "192", "256", "320"]
         barrier = threading.Barrier(len(qualities))
@@ -654,70 +770,59 @@ class TestQualitySettingsAPI:
         for t in threads:
             t.join()
 
-        assert db.get_setting("default_streaming_quality") == coordinator.default_quality
+        assert _stored_quality(client) == coordinator.default_quality
         assert coordinator.default_quality in qualities
 
 
 class TestStartupQualityValidation:
-    def _boot_app(self, tmp_path, monkeypatch, env_quality=None):
-        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-        if env_quality is not None:
-            monkeypatch.setenv("DEFAULT_STREAMING_QUALITY", env_quality)
+    """The coordinator's startup default is the master admin's stored quality,
+    falling back to the env setting and then to original (spec §4.3)."""
 
-        sys.modules.pop("app.main", None)
-        sys.modules.pop("app.config", None)
-        import app.main
-        importlib.reload(app.main)
-        return app.main
+    def _boot_app(self, configure_app, env_quality=None):
+        return configure_app(
+            env={"DEFAULT_STREAMING_QUALITY": env_quality} if env_quality is not None else None
+        )
 
-    def _seed_persisted_quality(self, tmp_path, value):
-        # Boot once to create the database schema, persist the bad value, shutdown.
-        import importlib as _il
-        sys.modules.pop("app.main", None)
-        sys.modules.pop("app.config", None)
-        import app.main as bootstrap_main
-        _il.reload(bootstrap_main)
+    def _seed_persisted_quality(self, configure_app, value, env=None):
+        # Boot once to create the database and the admin, store the value, shutdown.
+        bootstrap_main = configure_app(env=env)
         with TestClient(bootstrap_main.app) as c:
-            c.app.state.database.set_setting("default_streaming_quality", value)
+            _store_quality(c, value)
 
-    def test_startup__invalid_persisted_falls_back_to_env(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-        monkeypatch.setenv("DEFAULT_STREAMING_QUALITY", "192")
-        self._seed_persisted_quality(tmp_path, "lossless-MQA")
+    def test_startup__invalid_persisted_falls_back_to_env(self, configure_app, capsys):
+        self._seed_persisted_quality(
+            configure_app, "lossless-MQA", env={"DEFAULT_STREAMING_QUALITY": "192"}
+        )
 
-        app_main = self._boot_app(tmp_path, monkeypatch, env_quality="192")
+        app_main = self._boot_app(configure_app, env_quality="192")
         with TestClient(app_main.app) as c:
             assert c.app.state.encoder_coordinator.default_quality == "192"
+        assert "lossless-MQA" in capsys.readouterr().out  # the fallback is logged
 
-    def test_startup__invalid_persisted_and_env_falls_back_to_original(
-        self, tmp_path, monkeypatch
-    ):
+    def test_startup__invalid_persisted_and_env_falls_back_to_original(self, configure_app):
         from app.services.transcoder import ORIGINAL_QUALITY as _ORIG
 
-        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-        monkeypatch.setenv("DEFAULT_STREAMING_QUALITY", "also-bogus")
-        self._seed_persisted_quality(tmp_path, "lossless-MQA")
+        self._seed_persisted_quality(
+            configure_app, "lossless-MQA", env={"DEFAULT_STREAMING_QUALITY": "also-bogus"}
+        )
 
-        app_main = self._boot_app(tmp_path, monkeypatch, env_quality="also-bogus")
+        app_main = self._boot_app(configure_app, env_quality="also-bogus")
         with TestClient(app_main.app) as c:
             assert c.app.state.encoder_coordinator.default_quality == _ORIG
 
-    def test_startup__valid_persisted_used(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-        monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-        monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-        monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-        self._seed_persisted_quality(tmp_path, "320")
+    def test_startup__valid_persisted_used(self, configure_app):
+        self._seed_persisted_quality(configure_app, "320")
 
-        app_main = self._boot_app(tmp_path, monkeypatch)
+        app_main = self._boot_app(configure_app)
         with TestClient(app_main.app) as c:
             assert c.app.state.encoder_coordinator.default_quality == "320"
+
+    def test_startup__the_admins_value_wins_over_another_users(self, configure_app):
+        bootstrap_main = configure_app()
+        with TestClient(bootstrap_main.app) as c:
+            _store_quality(c, "128")
+            other = add_test_user(c.app.state.database, "sam")
+            _store_quality(c, "320", user_id=other)
+
+        with TestClient(self._boot_app(configure_app).app) as c:
+            assert c.app.state.encoder_coordinator.default_quality == "128"

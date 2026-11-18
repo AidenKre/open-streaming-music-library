@@ -14,6 +14,7 @@ import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/downloads_controller.dart';
+import '../helpers/no_server_api.dart';
 
 void main() {
   late AppDatabase db;
@@ -27,7 +28,8 @@ void main() {
     manager = DownloadManager(
       db: db,
       coverArtStore: await LocalCoverArtStore.create(
-          directoryProvider: () async => tempDir),
+          directoryProvider: () async => tempDir, apiClient: noServerApi()),
+      apiClient: noServerApi(),
       directoryProvider: () async => tempDir,
       isOfflineFn: () => true, // jobs stay queued, observable
     );

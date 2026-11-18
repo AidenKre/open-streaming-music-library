@@ -6,6 +6,7 @@ import 'package:drift/drift.dart' show Value, Variable;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/metadata_edit.dart';
@@ -27,13 +28,22 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../helpers/server_binding.dart';
 
+class _SwapClient extends BaseClient {
+  Client inner = MockClient((_) async => throw StateError('no client installed'));
+  @override
+  Future<StreamedResponse> send(BaseRequest request) => inner.send(request);
+}
+
 class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
 
   final bool _value;
 
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
@@ -180,8 +190,19 @@ void main() {
   late AppDatabase db;
   late ProviderContainer container;
   late Directory tempDir;
+  late ApiClient api;
+  late _SwapClient swap;
+
+  // Tests reinstall their mock mid-test (after the container exists), so one
+  // client delegates to a mutable inner mock.
+  void installClient(String url, Client mock) {
+    expect(url, 'http://localhost:8000');
+    swap.inner = mock;
+  }
 
   setUp(() async {
+    swap = _SwapClient();
+    api = testApiClient('http://localhost:8000', swap);
     db = AppDatabase(NativeDatabase.memory());
     await seedTestBinding(db);
     tempDir = Directory.systemTemp.createTempSync('track_sync_notifier_test_');
@@ -203,9 +224,10 @@ void main() {
   }) {
     container = ProviderContainer(
       overrides: [
+        apiClientProvider.overrideWithValue(api),
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(),
-        tracksApiProvider.overrideWithValue(TracksApi()),
+        tracksApiProvider.overrideWithValue(TracksApi(api: api)),
         offlineModeProvider.overrideWith(() => _StubOffline(offline)),
         if (localCoverArtStore != null)
           localCoverArtStoreProvider.overrideWithValue(localCoverArtStore),
@@ -226,11 +248,75 @@ void main() {
   }
 
   group('TrackSyncNotifier', () {
+    // Phase M §7.7 (M-U24): a 401 is a wait, not a failure. The session is
+    // already signed out (the gate closed); sync and refreshTrack publish no
+    // error, keep the cursor and the track, and the next run waits at the
+    // gate.
+    group('a 401 waits', () {
+      Response unauthorized() => Response(
+        '{"detail":{"code":"invalid_token","message":"Sign in again."}}',
+        401,
+        headers: {'content-type': 'application/json'},
+      );
+
+      test('sync: no error, cursor unchanged, not syncing', () async {
+        installClient('http://localhost:8000',
+            MockClient((req) async => unauthorized()));
+        final c = createContainer();
+        await waitForBuild(c);
+        await c.read(trackSyncProvider.notifier).sync();
+        final state = c.read(trackSyncProvider).value!;
+        expect(state.error, isNull);
+        expect(state.libraryError, isNull);
+        expect(state.isSyncing, isFalse);
+        expect(state.librarySyncing, isFalse);
+        expect(await SyncCursorStore(db).read(SyncStream.catalog), 0);
+      });
+
+      test('sync: an earlier library error is kept, not replaced', () async {
+        installClient('http://localhost:8000',
+            MockClient((req) async => Response('server error', 500)));
+        final c = createContainer();
+        await waitForBuild(c);
+        final notifier = c.read(trackSyncProvider.notifier);
+        await notifier.sync();
+        final before = c.read(trackSyncProvider).value!.libraryError;
+        expect(before, isNotNull);
+        installClient('http://localhost:8000',
+            MockClient((req) async => unauthorized()));
+        await notifier.sync();
+        expect(c.read(trackSyncProvider).value!.libraryError, before);
+      });
+
+      test('refreshTrack: the track stays and no error is published',
+          () async {
+        installClient(
+          'http://localhost:8000',
+          MockClient(
+            (req) async => _changesResponse([_upsert(1, _trackJson('uuid-1'))]),
+          ),
+        );
+        final c = createContainer();
+        await waitForBuild(c);
+        final notifier = c.read(trackSyncProvider.notifier);
+        await notifier.sync();
+        installClient('http://localhost:8000',
+            MockClient((req) async => unauthorized()));
+        final refreshed = await notifier.refreshTrack('uuid-1');
+        expect(refreshed, isFalse);
+        expect(c.read(trackSyncProvider).value!.error, isNull);
+        expect(
+          (await db.select(db.tracks).get()).map((t) => t.uuidId),
+          ['uuid-1'],
+        );
+      });
+    });
+
     test(
       'first sync requests after_revision=0, upserts, saves lastRevision',
       () async {
         final requestUrls = <Uri>[];
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             requestUrls.add(req.url);
@@ -261,7 +347,7 @@ void main() {
     test('upsert stores the per-track revision from the payload, and a later '
         'upsert overwrites it', () async {
       var call = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           call++;
@@ -313,7 +399,7 @@ void main() {
             );
 
         Uri? captured;
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             captured = req.url;
@@ -336,7 +422,7 @@ void main() {
       () async {
         final afterParams = <String?>[];
         var call = 0;
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             afterParams.add(req.url.queryParameters['after_revision']);
@@ -370,7 +456,7 @@ void main() {
     test(
       're-upserting the same uuid updates rather than duplicating',
       () async {
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([_upsert(1, _trackJson('uuid-1'))]),
@@ -384,7 +470,7 @@ void main() {
         expect((await db.select(db.tracks).get()).length, 1);
 
         // Server re-emits the same uuid at a higher revision.
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([_upsert(2, _trackJson('uuid-1'))]),
@@ -397,7 +483,7 @@ void main() {
 
     test('FTS tables are populated after a multi-page sync', () async {
       var call = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           call++;
@@ -422,7 +508,7 @@ void main() {
 
     test('concurrent sync call is a no-op', () async {
       var callCount = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           callCount++;
@@ -450,7 +536,7 @@ void main() {
         // version is <= the last one it saw, so two concurrent operations
         // publishing the SAME version silently lose one reconciliation.
         // refreshTrack must serialize with sync via the isSyncing guard.
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([
@@ -474,7 +560,7 @@ void main() {
         });
 
         // Slow /changes carrying a delete; single-track GET reports gone.
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             if (req.url.path.endsWith('/changes')) {
@@ -511,7 +597,7 @@ void main() {
       'libraryError: set by a failed library sync, untouched by a '
       'single-track refresh, cleared by the next good library sync',
       () async {
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([_upsert(1, _trackJson('uuid-1'))]),
@@ -523,7 +609,7 @@ void main() {
         await notifier.sync();
         expect(c.read(trackSyncProvider).value!.libraryError, isNull);
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async => Response('server error', 500)),
         );
@@ -544,7 +630,7 @@ void main() {
           reason: 'a refresh failure is not a library failure',
         );
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             // Caught up at revision 1 (a lower latestRevision would be a
@@ -567,7 +653,7 @@ void main() {
 
     test('offline sync skip makes no API request', () async {
       var callCount = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           callCount++;
@@ -589,7 +675,7 @@ void main() {
       () async {
         final afterParams = <String?>[];
         var call = 0;
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             afterParams.add(req.url.queryParameters['after_revision']);
@@ -615,7 +701,7 @@ void main() {
         expect(await SyncCursorStore(db).read(SyncStream.catalog), 1);
         expect(c.read(trackSyncProvider).value!.error, isNotNull);
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             expect(req.url.queryParameters['after_revision'], '1');
@@ -639,7 +725,7 @@ void main() {
         SharedPreferences.setMockInitialValues({
           SyncService.lastRevisionKey: 5,
         });
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             expect(req.url.queryParameters['after_revision'], '5');
@@ -675,7 +761,7 @@ void main() {
     );
 
     test('non-advancing nextCursor fails without changing watermark', () async {
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async => _changesResponse(const [], nextCursor: 0)),
       );
@@ -697,7 +783,7 @@ void main() {
         SharedPreferences.setMockInitialValues({
           SyncService.lastRevisionKey: 5,
         });
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             expect(req.url.queryParameters['after_revision'], '5');
@@ -733,7 +819,7 @@ void main() {
     );
 
     test('a second sync adds newly-changed tracks to FTS', () async {
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async => _changesResponse([
@@ -764,7 +850,7 @@ void main() {
           .get();
       expect(ftsRows.length, 1);
 
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async => _changesResponse([
@@ -794,7 +880,7 @@ void main() {
     });
 
     test('a delete entry removes the track from the DB and FTS', () async {
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async => _changesResponse([
@@ -852,7 +938,7 @@ void main() {
       );
 
       // Next sync streams the deletion.
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async => _changesResponse([_delete(3, 'uuid-drop')])),
       );
@@ -902,7 +988,7 @@ void main() {
       var deleteMode = false;
       final downloadStream = StreamController<List<int>>();
       final streamStarted = Completer<void>();
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient.streaming((req, _) async {
           if (req.url.path.endsWith('/changes')) {
@@ -945,6 +1031,7 @@ void main() {
       });
 
       final coverStore = await LocalCoverArtStore.create(
+        apiClient: api,
         directoryProvider: () async => tempDir,
       );
       final c = createContainer(
@@ -977,7 +1064,7 @@ void main() {
     test(
       'delete preserves artists and albums still used by other tracks',
       () async {
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([
@@ -1012,7 +1099,7 @@ void main() {
         final notifier = c.read(trackSyncProvider.notifier);
         await notifier.sync();
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async => _changesResponse([_delete(3, 'uuid-one')])),
         );
@@ -1046,7 +1133,7 @@ void main() {
     );
 
     test('upsert move prunes old artist and album parents from FTS', () async {
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async => _changesResponse([
@@ -1070,7 +1157,7 @@ void main() {
       final notifier = c.read(trackSyncProvider.notifier);
       await notifier.sync();
 
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async => _changesResponse([
@@ -1136,7 +1223,7 @@ void main() {
     test('upserts and deletes in one page apply in revision order', () async {
       // uuid-x is upserted then deleted within the same page → ends deleted.
       // uuid-y is deleted then re-upserted → ends present.
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async => _changesResponse([
@@ -1163,7 +1250,7 @@ void main() {
       // limit-1 style pagination: the delete lands on its own later page and
       // must not be missed (the old design only carried deletes on page 1).
       var call = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           call++;
@@ -1197,7 +1284,7 @@ void main() {
       // after_revision.
       final afterParams = <String?>[];
       var call = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           afterParams.add(req.url.queryParameters['after_revision']);
@@ -1221,7 +1308,7 @@ void main() {
     test('resuming from a saved watermark is idempotent', () async {
       // Simulate a prior partial sync that applied up to revision 1.
       SharedPreferences.setMockInitialValues({SyncService.lastRevisionKey: 1});
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           expect(req.url.queryParameters['after_revision'], '1');
@@ -1255,7 +1342,7 @@ void main() {
             ),
           );
 
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async =>
@@ -1282,7 +1369,7 @@ void main() {
         "VALUES ('uuid-downloaded', 1, 1, '/tmp/downloaded.m4a', 128, 4567, '128')",
       );
 
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient(
           (req) async =>
@@ -1313,7 +1400,7 @@ void main() {
           "VALUES ('uuid-cover', 1, 1, '/tmp/cover.m4a', 256, 8901, '256')",
         );
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([
@@ -1345,7 +1432,7 @@ void main() {
         expect(meta.hasAlbumArt, isTrue);
         expect(meta.coverArtId, 77);
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([
@@ -1384,7 +1471,7 @@ void main() {
     test(
       'delete entry repairs queue sessions pointing at the deleted track',
       () async {
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([
@@ -1432,11 +1519,9 @@ void main() {
           sessionId: sessionId,
           currentItemId: before.currentItem!.itemId,
           positionMs: 12345,
-          resumeMainItemId: before.currentItem!.itemId,
-          updateResumeMainItemId: true,
         );
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([_delete(3, 'uuid-drop')]),
@@ -1450,6 +1535,7 @@ void main() {
         )..where((s) => s.id.equals(sessionId))).getSingle();
         expect(sessionRow.currentItemId, isNull);
         expect(sessionRow.currentPositionMs, 0);
+        // 6-R1-10: resume_main_item_id is never written (the column stays).
         expect(sessionRow.resumeMainItemId, isNull);
 
         final after = await queueRepo.getSessionSnapshot(sessionId);
@@ -1461,7 +1547,7 @@ void main() {
     test(
       'delete entry compacts queue positions after removing a non-tail track',
       () async {
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient(
             (req) async => _changesResponse([
@@ -1516,7 +1602,7 @@ void main() {
         expect(await _playPositions(db, sessionId), [0, 1, 2]);
         expect(await _canonicalPositions(db, sessionId), [0, 1, 2]);
 
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async => _changesResponse([_delete(4, 'uuid-a')])),
         );
@@ -1548,7 +1634,7 @@ void main() {
       final firstHeld = Completer<void>();
       final firstArrived = Completer<void>();
       var call = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           final n = ++call;
@@ -1598,7 +1684,7 @@ void main() {
       'with nothing in flight runs exactly one pull and returns true',
       () async {
         var call = 0;
-        ApiClient.initForTest(
+        installClient(
           'http://localhost:8000',
           MockClient((req) async {
             call++;
@@ -1615,7 +1701,7 @@ void main() {
 
     test('offline returns false without a request', () async {
       var call = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           call++;
@@ -1630,7 +1716,7 @@ void main() {
     });
 
     test('a failed pull returns false and publishes the error', () async {
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async => Response('boom', 500)),
       );
@@ -1647,7 +1733,7 @@ void main() {
       var inFlight = 0;
       var maxInFlight = 0;
       var call = 0;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           call++;
@@ -1686,7 +1772,7 @@ void main() {
       // Establish Artist "Old" (id 31) locally exactly like a freshly
       // synced library: one track, one artist, one album.
       var patched = false;
-      ApiClient.initForTest(
+      installClient(
         'http://localhost:8000',
         MockClient((req) async {
           if (req.method == 'PATCH') {

@@ -8,3 +8,12 @@ The whole ecosystem should be easy to use for non power users, and also allow fo
 
 Evidently, this repo is a huge WIP... with lofty goals. As such the scope has been narrowed significantly, and some compromises have been made. We are putting ease of use first.
 
+
+## Building the app
+
+- **Linux:** the app stores your sign-in in the system keyring through `flutter_secure_storage`, so building it needs the libsecret development package (`libsecret-1-dev` on Debian/Ubuntu) and a running Secret Service (for example GNOME Keyring). When no Secret Service is installed at all, the app uses an owner-only file in its app-support folder instead (also when saving to the keyring fails) and says so under Settings → Sync & storage. Any other keyring problem when reading (for example a locked keyring or a timeout) is treated as temporary: the app shows "Your sign-in could not be read." with **Try again** and **Log in again** instead of signing you out.
+- **iOS:** the sign-in goes into the Keychain (`keychain-access-groups` entitlement in `ios/Runner/Runner.entitlements`; iOS builds are team-signed).
+- **macOS:** the project signs ad-hoc and carries no keychain entitlement, so the app stores the sign-in in an owner-only fallback file in its app-support folder (inside the sandbox container) and says so under Settings → Sync & storage.
+  - To turn the macOS Keychain on for a team-signed build, set a development team for the Runner target in Xcode (Signing & Capabilities) and add the entitlement back to both `macos/Runner/DebugProfile.entitlements` and `macos/Runner/Release.entitlements`, for example `<key>keychain-access-groups</key><array><string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string></array>`.
+  - `test/architecture/macos_signing_test.dart` rejects that entitlement while the project has no development team.
+- **Server address:** on Android, iOS and macOS the app accepts an `http://` server address as well as `https://`, and an `http://` connection is not encrypted on the network.

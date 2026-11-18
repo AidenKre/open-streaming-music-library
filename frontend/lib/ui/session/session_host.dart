@@ -6,6 +6,7 @@ import 'package:frontend/ui/downloading_page.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/settings_page.dart';
 import 'package:frontend/ui/settings/sync_diagnostics_page.dart';
+import 'package:frontend/ui/uploads/uploads_page.dart';
 
 /// Session-level destinations (SC-08): pushed above the whole shell by the
 /// session host, inside the live-session provider scope, so every one of
@@ -23,6 +24,10 @@ enum SessionDestination {
 
   /// Reached from Settings -> Sync & storage (SC-21).
   syncDiagnostics,
+
+  /// The Uploads page (Phase 7): a top-bar action, shown with the server's
+  /// `uploads` feature block.
+  uploads,
 }
 
 /// The page for a [SessionDestination].
@@ -32,6 +37,7 @@ Widget sessionDestinationPage(SessionDestination destination) =>
       SessionDestination.downloadProgress => const DownloadingPage(),
       SessionDestination.conversions => const ConversionsPage(),
       SessionDestination.syncDiagnostics => const SyncDiagnosticsPage(),
+      SessionDestination.uploads => const UploadsPage(),
     };
 
 /// The session route host (SC-08): a navigator above the shell (its root

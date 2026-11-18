@@ -12,15 +12,16 @@ void main() {
   group('PlaybackAvailability.of: online/offline x remote/partial/downloaded',
       () {
     // (offline, downloaded, total) -> coverage, canPlay, canDownload,
-    // hasAnyDownloaded, isFullyDownloaded. Phase 4 keeps today's offline rule:
-    // play/queue only when the whole scope is downloaded (Phase 6 makes
-    // partial playable).
+    // hasAnyDownloaded, isFullyDownloaded. Phase 6 (O2 / DEV-6-02): offline a
+    // scope plays when at least one member is downloaded, so partial plays;
+    // the fully-downloaded badge still needs every member.
     final table = <(bool, int, int), (LocalCoverage, bool, bool, bool, bool)>{
       (false, 0, 4): (LocalCoverage.remote, true, true, false, false),
       (false, 2, 4): (LocalCoverage.partial, true, true, true, false),
       (false, 4, 4): (LocalCoverage.downloaded, true, false, true, true),
       (true, 0, 4): (LocalCoverage.remote, false, false, false, false),
-      (true, 2, 4): (LocalCoverage.partial, false, false, true, false),
+      (true, 2, 4): (LocalCoverage.partial, true, false, true, false),
+      (true, 1, 4): (LocalCoverage.partial, true, false, true, false),
       (true, 4, 4): (LocalCoverage.downloaded, true, false, true, true),
       // An empty scope is never "fully downloaded".
       (false, 0, 0): (LocalCoverage.remote, true, true, false, false),
@@ -87,5 +88,16 @@ void main() {
     expect(PlaybackAvailability.of(offline: false, downloaded: 1, total: 1, undecodable: 1).canPlay,
         isTrue, reason: 'online it streams transcoded');
     expect(offline == PlaybackAvailability.of(offline: true, downloaded: 1, total: 1), isFalse);
+  });
+
+  // Review R1-4: the undecodable flag can't say whether *every* download is
+  // undecodable, so a partial scope with one stays conservative offline.
+  // Album/artist counts never carry it (O2: the resolver rejects instead).
+  test('offline partial with an undecodable download does not play', () {
+    final a = PlaybackAvailability.of(
+        offline: true, downloaded: 2, total: 4, undecodable: 1);
+    expect(a.coverage, LocalCoverage.partial);
+    expect(a.canPlay, isFalse);
+    expect(a.hasAnyDownloaded, isTrue);
   });
 }

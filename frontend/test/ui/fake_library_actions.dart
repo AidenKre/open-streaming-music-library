@@ -29,6 +29,18 @@ class FakeLibraryActions implements LibraryActionControls {
   }
 
   @override
+  Future<PlaybackOutcome> play(LibraryScope collection) async {
+    calls.add('play ${describe(collection)}');
+    return const Accepted(1);
+  }
+
+  @override
+  Future<PlaybackOutcome> shuffle(LibraryScope collection) async {
+    calls.add('shuffle ${describe(collection)}');
+    return const Accepted(1);
+  }
+
+  @override
   Future<PlaybackOutcome> playFromList(
     List<TrackUI> tracks,
     int startIndex, {

@@ -1,4 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:http/testing.dart';
+import 'package:http/http.dart' as http;
+import 'package:frontend/playback/audio_dependencies.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/conversion_job.dart';
@@ -35,11 +39,6 @@ TrackUI _track({
 }
 
 void main() {
-  setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
-  });
-
   /// The tile with the menu the real builder makes for it (Get info and the
   /// conversion rows included), acting through [actions].
   Widget buildTile(
@@ -52,7 +51,18 @@ void main() {
     VoidCallback? onCancelConvert,
     ConversionJob? conversionJob,
   }) {
-    return MaterialApp(
+    return ProviderScope(
+      overrides: [
+        coverArtCacheProvider.overrideWithValue(
+        CoverArtCacheManager.noop(
+          api: testApiClient(
+            'http://localhost:8000',
+            MockClient((_) async => http.Response('', 404)),
+          ),
+        ),
+      ),
+      ],
+      child: MaterialApp(
       home: Scaffold(
         body: TrackTile(
           track: track,
@@ -74,6 +84,7 @@ void main() {
             ),
           ),
         ),
+      ),
       ),
     );
   }

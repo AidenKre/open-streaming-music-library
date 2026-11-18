@@ -26,7 +26,7 @@ void main() {
   group('JobsApi.postConversionJob', () {
     test('POSTs the expected body to /jobs', () async {
       Map<String, dynamic>? capturedBody;
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
@@ -34,7 +34,7 @@ void main() {
         }),
       );
 
-      final job = await JobsApi().postConversionJob(
+      final job = await JobsApi(api: client).postConversionJob(
         uuidId: 'abc',
         targetCodec: 'aac',
         targetBitrateKbps: 192,
@@ -53,7 +53,7 @@ void main() {
 
     test('sends a null target_bitrate_kbps for lossless targets', () async {
       Map<String, dynamic>? capturedBody;
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
@@ -61,7 +61,7 @@ void main() {
         }),
       );
 
-      await JobsApi().postConversionJob(
+      await JobsApi(api: client).postConversionJob(
         uuidId: 'abc',
         targetCodec: 'flac',
         targetBitrateKbps: null,
@@ -75,7 +75,7 @@ void main() {
     });
 
     test('throws ApiException on 409 revision conflict', () async {
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient(
           (req) async => Response(
@@ -88,7 +88,7 @@ void main() {
       );
 
       expect(
-        () => JobsApi().postConversionJob(
+        () => JobsApi(api: client).postConversionJob(
           uuidId: 'abc',
           targetCodec: 'aac',
           targetBitrateKbps: 192,
@@ -101,7 +101,7 @@ void main() {
 
   group('JobsApi.getJobs', () {
     test('parses the data list into ConversionJobs', () async {
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient(
           (req) async => Response(
@@ -114,7 +114,7 @@ void main() {
         ),
       );
 
-      final jobs = await JobsApi().getJobs();
+      final jobs = await JobsApi(api: client).getJobs();
 
       expect(jobs.map((j) => j.jobId), [1, 2]);
       expect(jobs[1].isDone, isTrue);
@@ -122,7 +122,7 @@ void main() {
 
     test('passes uuid_id/status/cursor/limit as query params', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -130,7 +130,7 @@ void main() {
         }),
       );
 
-      await JobsApi().getJobs(
+      await JobsApi(api: client).getJobs(
         uuidId: 'abc', status: 'queued', cursor: 7, limit: 10,
       );
 
@@ -142,7 +142,7 @@ void main() {
 
     test('omits optional query params when not given', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -150,7 +150,7 @@ void main() {
         }),
       );
 
-      await JobsApi().getJobs();
+      await JobsApi(api: client).getJobs();
 
       expect(captured?.queryParameters.containsKey('uuid_id'), isFalse);
       expect(captured?.queryParameters.containsKey('status'), isFalse);
@@ -160,7 +160,7 @@ void main() {
     test('getJobsPage returns nextCursor and sends a comma status list',
         () async {
       Uri? captured;
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -171,7 +171,7 @@ void main() {
         }),
       );
 
-      final page = await JobsApi().getJobsPage(status: 'queued,running');
+      final page = await JobsApi(api: client).getJobsPage(status: 'queued,running');
 
       expect(captured?.queryParameters['status'], 'queued,running');
       expect(page.jobs.single.jobId, 3);
@@ -181,7 +181,7 @@ void main() {
     test('retry: false makes a single attempt on a retryable status',
         () async {
       var calls = 0;
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           calls++;
@@ -190,7 +190,7 @@ void main() {
       );
 
       await expectLater(
-        JobsApi().getJobs(retry: false),
+        JobsApi(api: client).getJobs(retry: false),
         throwsA(isA<ApiException>()),
       );
       expect(calls, 1);
@@ -201,7 +201,7 @@ void main() {
     test('sends DELETE /jobs/{id} and returns cancelled flag', () async {
       String? method;
       Uri? captured;
-      ApiClient.initForTest(
+      final client = testApiClient(
         'http://localhost:8000',
         MockClient((req) async {
           method = req.method;
@@ -210,7 +210,7 @@ void main() {
         }),
       );
 
-      final cancelled = await JobsApi().cancelJob(42);
+      final cancelled = await JobsApi(api: client).cancelJob(42);
 
       expect(method, 'DELETE');
       expect(captured?.pathSegments, ['jobs', '42']);

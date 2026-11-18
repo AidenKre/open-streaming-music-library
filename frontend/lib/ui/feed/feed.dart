@@ -3,6 +3,8 @@ import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/ui/feed/new_activity_notice.dart';
+import 'package:frontend/ui/feed/rail_anchor.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 import 'package:frontend/ui/widgets/track_card.dart';
@@ -52,6 +54,15 @@ final class TrackEntity extends FeedEntity {
   @override
   LibraryScope get scope => TrackScope(track);
 }
+
+/// The feed entity for a read model (`TrackUI` / `AlbumUI` / `ArtistUI`);
+/// null for anything else.
+FeedEntity? feedEntityOf(Object entity) => switch (entity) {
+  TrackUI t => TrackEntity(t),
+  AlbumUI a => AlbumEntity(a),
+  ArtistUI a => ArtistEntity(a),
+  _ => null,
+};
 
 /// The surface's primary tap for an entity (open detail / play this list /
 /// play one track). Cards never decide it.
@@ -135,7 +146,21 @@ class EntityRailSection extends FeedSection {
     this.errorText = 'Couldn’t load.',
     this.footer,
     this.resetToken,
+    this.newActivityLabel,
+    this.emptyMessage,
+    this.trailing,
   });
+
+  /// A header action drawn at the end of the title row (e.g. See all).
+  final Widget? trailing;
+
+  /// Shown under the title when the ready rail is empty (e.g. emptied by a
+  /// filter); null hides an empty rail entirely.
+  final String? emptyMessage;
+
+  /// Copy of the notice that returns a scrolled rail to its start when newer
+  /// entities arrived before the kept anchor; null shows none.
+  final String? newActivityLabel;
 
   @override
   final String id;
@@ -156,60 +181,259 @@ class EntityRailSection extends FeedSection {
   @override
   Widget buildSliver(BuildContext context) {
     if (state == RailState.ready && entities.isEmpty) {
-      return const SliverToBoxAdapter(child: SizedBox.shrink());
+      final message = emptyMessage;
+      if (message == null) {
+        return const SliverToBoxAdapter(child: SizedBox.shrink());
+      }
+      // Empty because of the filter: say why, without reserving a card row.
+      final theme = Theme.of(context);
+      return SliverToBoxAdapter(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: _titleRow(
+                Text(title, style: theme.textTheme.titleMedium),
+                trailing,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text(message, style: theme.textTheme.bodyMedium),
+            ),
+          ],
+        ),
+      );
     }
+    return SliverToBoxAdapter(child: _EntityRail(section: this));
+  }
+}
+
+/// A rail's title, with its optional header action at the end of the row.
+Widget _titleRow(Widget title, Widget? trailing) => trailing == null
+    ? title
+    : Row(
+        children: [
+          Expanded(
+            child: Align(alignment: Alignment.centerLeft, child: title),
+          ),
+          trailing,
+        ],
+      );
+
+class _RailController extends ScrollController {
+  @override
+  ScrollPosition createScrollPosition(
+    ScrollPhysics physics,
+    ScrollContext context,
+    ScrollPosition? oldPosition,
+  ) => _RailPosition(
+    physics: physics,
+    context: context,
+    initialPixels: initialScrollOffset,
+    keepScrollOffset: keepScrollOffset,
+    oldPosition: oldPosition,
+    debugLabel: debugLabel,
+  );
+}
+
+class _RailPosition extends ScrollPositionWithSingleContext {
+  _RailPosition({
+    required super.physics,
+    required super.context,
+    super.initialPixels,
+    super.keepScrollOffset,
+    super.oldPosition,
+    super.debugLabel,
+  });
+
+  /// Moves to [offset] without a visible jump or notification: the list
+  /// relayouts with its new children this frame. A running fling's simulation
+  /// would overwrite the correction on its next tick, so it restarts from the
+  /// corrected position once the frame is built (starting an activity
+  /// notifies, which is not allowed during build).
+  void reanchor(double offset) {
+    final current = activity;
+    final velocity = current is BallisticScrollActivity ? current.velocity : 0.0;
+    correctBy(offset - pixels);
+    if (velocity == 0) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (hasPixels) goBallistic(velocity);
+    });
+  }
+}
+
+/// The rail's live body. Owns the horizontal controller so that, when the
+/// entities change while scrolled, the first visible entity stays at the same
+/// pixel ([RailAnchor]); a kept anchor that hides newer activity raises the
+/// optional [NewActivityNotice].
+class _EntityRail extends StatefulWidget {
+  const _EntityRail({required this.section});
+
+  final EntityRailSection section;
+
+  @override
+  State<_EntityRail> createState() => _EntityRailState();
+}
+
+class _EntityRailState extends State<_EntityRail> {
+  static const _padding = 8.0;
+
+  final _controller = _RailController();
+  bool _newActivity = false;
+
+  /// Bumped when the rail leaves `ready`, so the next ready list does not
+  /// restore a stored offset meant for the previous result set.
+  int _epoch = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_onScroll);
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_onScroll);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (_newActivity && _controller.offset <= 0 && mounted) {
+      setState(() => _newActivity = false);
+    }
+  }
+
+  @override
+  void didUpdateWidget(_EntityRail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final old = oldWidget.section;
+    final next = widget.section;
+    if (old.resetToken != next.resetToken || next.state != RailState.ready) {
+      _newActivity = false;
+      // A new result set after loading/error starts at the start.
+      if (next.state != RailState.ready) _epoch++;
+      return;
+    }
+    if (old.state != RailState.ready ||
+        identical(old.entities, next.entities) ||
+        !_controller.hasClients) {
+      return;
+    }
+    final position = _controller.position as _RailPosition;
+    final extent = FeedCardExtent.of(context).width;
+    final oldKeys = [for (final e in old.entities) e.key];
+    final newKeys = [for (final e in next.entities) e.key];
+    final anchor = RailAnchor.capture(
+      keys: oldKeys,
+      offset: position.pixels,
+      itemExtent: extent,
+      padding: _padding,
+    );
+    if (anchor == null) return;
+    final restored = anchor.restore(
+      oldKeys: oldKeys,
+      newKeys: newKeys,
+      itemExtent: extent,
+      padding: _padding,
+      viewportExtent: position.viewportDimension,
+    );
+    position.reanchor(restored.offset);
+    if (restored.newBefore && restored.offset > 0) _newActivity = true;
+  }
+
+  void _backToStart() {
+    setState(() => _newActivity = false);
+    if (!_controller.hasClients) return;
+    _controller.animateTo(
+      0,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOut,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final section = widget.section;
     final extent = FeedCardExtent.of(context);
-    final Widget body = switch (state) {
+    final onTap = section.onTap;
+    final entities = section.entities;
+    final Widget body = switch (section.state) {
       RailState.loading => const Center(child: CircularProgressIndicator()),
       RailState.error => Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(errorText),
-            if (onRetry != null)
-              TextButton(onPressed: onRetry, child: const Text('Retry')),
+            Text(section.errorText),
+            if (section.onRetry != null)
+              TextButton(
+                onPressed: section.onRetry,
+                child: const Text('Retry'),
+              ),
           ],
         ),
       ),
       RailState.ready => KeyedSubtree(
         // Part of the stored position's identity: a new token, a new start.
-        key: PageStorageKey<Object?>(('feed.rail.reset', resetToken)),
+        key: PageStorageKey<Object?>(('feed.rail.reset', section.resetToken, _epoch)),
         child: ListView.builder(
-          key: PageStorageKey<String>('feed.rail.$id'),
+          key: PageStorageKey<String>('feed.rail.${section.id}'),
+          controller: _controller,
           scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.symmetric(horizontal: 8),
+          padding: const EdgeInsets.symmetric(horizontal: _padding),
           itemExtent: extent.width,
           itemCount: entities.length,
           itemBuilder: (context, index) {
             final entity = entities[index];
-            final tap = onTap;
             return KeyedSubtree(
               key: entity.key,
               child: cardFor(
                 entity,
-                onTap: tap == null ? null : () => tap(entity, index),
+                onTap: onTap == null ? null : () => onTap(entity, index),
               ),
             );
           },
         ),
       ),
     };
-    return SliverToBoxAdapter(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text(title, style: Theme.of(context).textTheme.titleMedium),
+    final label = section.newActivityLabel;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          child: _titleRow(
+            Text(
+              section.title,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            section.trailing,
           ),
-          SizedBox(
-            key: ValueKey('feed.rail.$id.body'),
-            height: extent.height,
-            child: body,
+        ),
+        SizedBox(
+          key: ValueKey('feed.rail.${section.id}.body'),
+          height: extent.height,
+          // The notice floats over the rail's top-end corner and takes no
+          // layout space, so showing it moves nothing.
+          child: Stack(
+            children: [
+              Positioned.fill(child: body),
+              if (_newActivity && label != null)
+                Positioned(
+                  top: 8,
+                  right: 16,
+                  child: NewActivityNotice(
+                    message: label,
+                    onRefresh: _backToStart,
+                  ),
+                ),
+            ],
           ),
-          ?footer,
-        ],
-      ),
+        ),
+        ?section.footer,
+      ],
     );
   }
 }

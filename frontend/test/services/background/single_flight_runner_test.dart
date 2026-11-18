@@ -234,4 +234,32 @@ void main() {
     await runner.quiesce();
     expect(timers.scheduled.single.active(), isFalse);
   });
+
+  // Phase M §7.7 / SC-13 Phase M (M-U24): a pass that hit a 401 parks the
+  // runner until the scope rebuild (a new runner): no backoff retry, and
+  // later requests start no pass, instead of retrying every 30 s.
+  test('a parked pass schedules no retry and later requests run nothing',
+      () async {
+    runner.request('timer');
+    await settle();
+    pending[0].complete(const PassParked());
+    await settle();
+    expect(timers.scheduled, isEmpty, reason: 'no backoff retry');
+    expect(runner.isRunning, isFalse);
+    runner.request('localInsert');
+    runner.request('networkRecovered', bypassBackoff: true);
+    await settle();
+    expect(passes, hasLength(1));
+    await runner.quiesce(); // still quiesces cleanly
+  });
+
+  test('a rerun queued during the parked pass is dropped too', () async {
+    runner.request('timer');
+    await settle();
+    runner.request('queued', bypassBackoff: true);
+    pending[0].complete(const PassParked());
+    await settle();
+    expect(passes, hasLength(1));
+    expect(timers.scheduled, isEmpty);
+  });
 }

@@ -10,14 +10,28 @@ that passes ``registry``/``job_id`` can cancel a running invocation from
 another thread — this is what Phase 2's conversion cancellation is built on.
 Every other caller (the tag writer, the streaming transcoder) omits those
 two arguments and sees identical externally-observable behavior to before.
+
+``run_capture`` is the sibling for commands whose stdout IS the result
+(``-f hash -``, ``fpcalc -json``): bounded stdout capture, a hard timeout and
+the same process-group kill/registry semantics.
 """
 
 import os
+import re
+import selectors
+import shutil
 import signal
 import subprocess
+import sys
 import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+
+# Exit codes `nice` returns when it cannot exec the tool: 126 not executable, 127 not found.
+TOOL_CANNOT_RUN_EXITS = frozenset({126, 127})
 
 
 class FfmpegError(Exception):
@@ -27,6 +41,21 @@ class FfmpegError(Exception):
     def __init__(self, message: str, stderr: str = ""):
         self.stderr = stderr
         super().__init__(message)
+
+
+def _kill_group(proc: subprocess.Popen) -> bool:
+    # A process already reaped (whose pid may have been reused) is never
+    # signalled. pgid == pid because the child is started with
+    # start_new_session=True.
+    if proc.poll() is not None:
+        return False
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # PermissionError: on macOS a group whose only member is an unreaped
+        # zombie refuses the signal.
+        return False
+    return True
 
 
 class FfmpegProcessRegistry:
@@ -43,11 +72,16 @@ class FfmpegProcessRegistry:
         # for them later is killed on arrival. Cleared via forget().
         self._killed: set[Any] = set()
         self._guard = threading.Lock()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def register(self, job_id: Any, proc: subprocess.Popen) -> None:
         with self._guard:
             self._procs[job_id] = proc
-            if job_id in self._killed:
+            if self._closed or job_id in self._killed:
                 self._kill_locked(proc)
 
     def discard(self, job_id: Any) -> None:
@@ -73,22 +107,22 @@ class FfmpegProcessRegistry:
 
     def kill_all(self) -> None:
         with self._guard:
-            for job_id, proc in self._procs.items():
-                self._killed.add(job_id)
-                self._kill_locked(proc)
+            self._kill_all_locked()
+
+    def close(self) -> None:
+        """Kill everything registered and any process registered afterwards."""
+        with self._guard:
+            self._closed = True
+            self._kill_all_locked()
+
+    def _kill_all_locked(self) -> None:
+        for job_id, proc in self._procs.items():
+            self._killed.add(job_id)
+            self._kill_locked(proc)
 
     @staticmethod
     def _kill_locked(proc: subprocess.Popen) -> bool:
-        # Checked under the guard so a process already reaped (whose pid may
-        # have been reused) is never signalled. pgid == pid because the
-        # child is started with start_new_session=True.
-        if proc.poll() is not None:
-            return False
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return False
-        return True
+        return _kill_group(proc)
 
 
 def kill_orphaned_ffmpeg(work_dir: Path) -> list[int]:
@@ -103,12 +137,18 @@ def kill_orphaned_ffmpeg(work_dir: Path) -> list[int]:
     touched. Must run before this server starts any ffmpeg of its own there.
     Best-effort: returns [] where processes can't be listed.
     """
-    prefixes = {str(work_dir) + os.sep, str(work_dir.resolve()) + os.sep}
+    # Absolute prefixes only, and only at the start of the command line or an
+    # argument (after whitespace, "=" or a "file:"-style colon), so another
+    # server's path that merely contains ours never matches.
+    prefixes = {str(work_dir.absolute()) + os.sep, str(work_dir.resolve()) + os.sep}
+    matcher = re.compile(
+        r"(?:^|(?<=[\s=:]))(?:" + "|".join(re.escape(p) for p in prefixes) + ")"
+    )
     killed = []
     for pid, argv0, cmdline in _list_processes():
         if pid == os.getpid() or not os.path.basename(argv0).startswith("ffmpeg"):
             continue
-        if not any(prefix in cmdline for prefix in prefixes):
+        if not matcher.search(cmdline):
             continue
         try:
             # Our ffmpegs lead their own process group (start_new_session).
@@ -225,3 +265,154 @@ def run_ffmpeg(
         output_path.unlink(missing_ok=True)
         stderr = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
         raise FfmpegError(f"ffmpeg exited {proc.returncode}: {stderr}", stderr)
+
+
+@dataclass(frozen=True)
+class CaptureResult:
+    """A finished ``run_capture`` process: exit status (negative = killed by
+    that signal), captured stdout bytes and (bounded) stderr text."""
+
+    returncode: int
+    stdout: bytes
+    stderr: str
+
+
+class CaptureTimeout(FfmpegError):
+    """``run_capture``: the process outlived ``timeout_s`` and was killed."""
+
+
+class CaptureOverflow(FfmpegError):
+    """``run_capture``: stdout exceeded ``max_stdout_bytes``; the process was killed."""
+
+
+_STDERR_KEEP_BYTES = 64 * 1024
+_READ_CHUNK = 64 * 1024
+
+
+def _low_priority_prefix() -> list[str]:
+    """``nice -n 10`` (plus ``ionice -c3`` on Linux) for whichever tools
+    exist. A command prefix, never ``preexec_fn`` (unsafe in a multithreaded
+    server)."""
+    prefix: list[str] = []
+    nice = shutil.which("nice")
+    if nice:
+        prefix += [nice, "-n", "10"]
+    if sys.platform.startswith("linux"):
+        ionice = shutil.which("ionice")
+        if ionice:
+            prefix += [ionice, "-c3"]
+    return prefix
+
+
+def run_capture(
+    cmd: list[str],
+    *,
+    timeout_s: float,
+    registry: Optional[FfmpegProcessRegistry] = None,
+    job_id: Optional[Any] = None,
+    max_stdout_bytes: int,
+    low_priority: bool = False,
+) -> CaptureResult:
+    """Run ``cmd`` and capture its stdout (bounded) and stderr (first 64 KiB).
+
+    stdout and stderr are drained concurrently on one thread, so a child that
+    floods either pipe cannot deadlock. Raises ``CaptureOverflow`` if stdout
+    exceeds ``max_stdout_bytes`` and ``CaptureTimeout`` if the process outlives
+    ``timeout_s``; in both cases (and on any other exception) the process
+    group is SIGKILLed and reaped and both pipes are closed. A non-zero or
+    signal exit is RETURNED in ``CaptureResult.returncode``, not raised.
+
+    ``registry``/``job_id`` behave as in ``run_ffmpeg``: ``registry.kill`` from
+    another thread kills the group and the run returns with ``-SIGKILL``.
+
+    ``low_priority`` prefixes the command with ``nice -n 10`` (and ``ionice
+    -c3`` on Linux) when those tools exist. The target tool is resolved first,
+    so a missing tool is reported as "not found" rather than as ``nice``
+    exiting 127.
+    """
+    argv = cmd
+    if low_priority:
+        prefix = _low_priority_prefix()
+        if prefix:
+            if shutil.which(cmd[0]) is None:
+                raise FfmpegError(f"{os.path.basename(cmd[0])} not found")
+            argv = prefix + cmd
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except FileNotFoundError as e:
+        raise FfmpegError(f"{os.path.basename(cmd[0])} not found") from e
+    except OSError as e:
+        raise FfmpegError(f"{os.path.basename(cmd[0])} failed to start: {e.strerror or type(e).__name__}") from e
+
+    deadline = time.monotonic() + timeout_s
+    use_registry = registry is not None and job_id is not None
+    out_chunks: list[bytes] = []
+    out_total = 0
+    err_chunks: list[bytes] = []
+    err_kept = 0
+    sel = selectors.DefaultSelector()
+    finished = False
+    try:
+        if use_registry:
+            registry.register(job_id, proc)
+        for pipe in (proc.stdout, proc.stderr):
+            os.set_blocking(pipe.fileno(), False)
+            sel.register(pipe, selectors.EVENT_READ)
+        while sel.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CaptureTimeout(f"{os.path.basename(cmd[0])} timed out after {timeout_s}s")
+            for key, _ in sel.select(remaining):
+                try:
+                    data = os.read(key.fd, _READ_CHUNK)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    sel.unregister(key.fileobj)
+                    continue
+                if key.fileobj is proc.stdout:
+                    out_total += len(data)
+                    if out_total > max_stdout_bytes:
+                        raise CaptureOverflow(
+                            f"{os.path.basename(cmd[0])} stdout exceeded {max_stdout_bytes} bytes"
+                        )
+                    out_chunks.append(data)
+                elif err_kept < _STDERR_KEEP_BYTES:
+                    keep = data[: _STDERR_KEEP_BYTES - err_kept]
+                    err_chunks.append(keep)
+                    err_kept += len(keep)
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as e:
+            raise CaptureTimeout(f"{os.path.basename(cmd[0])} timed out after {timeout_s}s") from e
+        finished = True
+        return CaptureResult(
+            returncode=proc.returncode,
+            stdout=b"".join(out_chunks),
+            stderr=b"".join(err_chunks).decode("utf-8", errors="replace"),
+        )
+    finally:
+        try:
+            if not finished:
+                # Abnormal exit: also kill any grandchild still holding the
+                # group (even if the leader already exited and was reaped;
+                # the pgid cannot be reused while a member exists).
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            _kill_group(proc)
+            proc.wait()
+        finally:
+            sel.close()
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+            if use_registry:
+                registry.discard(job_id)

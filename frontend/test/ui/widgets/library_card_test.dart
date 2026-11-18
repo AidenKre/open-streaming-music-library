@@ -17,7 +17,10 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 Widget _harness({required Widget child, bool offline = false}) {
@@ -242,7 +245,8 @@ void main() {
       expect(find.text('Delete downloads'), findsNothing);
     });
 
-    testWidgets('offline + partially downloaded: queue actions disabled', (
+    // Phase 6 (O2 / DEV-6-02): partial plays its downloads offline.
+    testWidgets('offline + partially downloaded: queue actions enabled', (
       tester,
     ) async {
       await tester.pumpWidget(
@@ -262,7 +266,7 @@ void main() {
           matching: find.byType(ListTile),
         ),
       );
-      expect(playNext.enabled, isFalse);
+      expect(playNext.enabled, isTrue);
     });
 
     testWidgets('an entry acts on the card scope via the controller', (

@@ -5,7 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/playback/codec_support.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/ui/widgets/mini_player.dart';
 import 'package:frontend/ui/player_controller.dart';
 import 'package:frontend/ui/widgets/queue_list_controller.dart';
@@ -115,9 +115,13 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
   Duration? _scrubPosition;
   Duration? _pendingSeekPosition;
 
+  /// The item the pending seek was made on.
+  int? _pendingSeekItemId;
+
   @override
   Widget build(BuildContext context) {
     final track = ref.watch(currentTrackProvider);
+    final currentItemId = ref.watch(queueCurrentItemIdProvider);
     final playWhenReady = ref.watch(audioPlayWhenReadyProvider);
     final position = ref.watch(audioPositionProvider);
     final duration = ref.watch(audioDurationProvider);
@@ -131,12 +135,16 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
     final unsupportedCodec =
         ref.watch(codecSupportProvider).unsupportedCodecOf(track);
 
-    _clearPendingSeekIfApplied(position);
+    // A pending seek made on another item no longer applies: show the
+    // live position.
+    final pendingSeekStale = _pendingSeekPosition != null &&
+        _pendingSeekItemId != currentItemId;
+    _clearPendingSeekIfApplied(position, stale: pendingSeekStale);
 
     final displayedPosition = _clampPosition(
       _isScrubbing
           ? (_scrubPosition ?? position)
-          : (_pendingSeekPosition ?? position),
+          : (pendingSeekStale ? position : (_pendingSeekPosition ?? position)),
       duration,
     );
     // Unknown (or zero-length) duration: nothing to scrub against.
@@ -354,9 +362,15 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
       _isScrubbing = false;
       _scrubPosition = target;
       _pendingSeekPosition = target;
+      _pendingSeekItemId = ref.read(queueCurrentItemIdProvider);
     });
 
-    unawaited(ref.read(playerControlsProvider).seek(target));
+    // A failed seek never lands: stop holding the slider on its target.
+    unawaited(ref.read(playerControlsProvider).seek(target).catchError((_) {
+      if (mounted && _pendingSeekPosition == target) {
+        setState(() => _pendingSeekPosition = null);
+      }
+    }));
   }
 
   /// Display bound only (the seek command is clamped by the model). An
@@ -369,12 +383,13 @@ class _NowPlayingViewState extends ConsumerState<_NowPlayingView> {
     return position;
   }
 
-  void _clearPendingSeekIfApplied(Duration livePosition) {
+  void _clearPendingSeekIfApplied(Duration livePosition, {bool stale = false}) {
     final pendingSeekPosition = _pendingSeekPosition;
     if (_isScrubbing || pendingSeekPosition == null) {
       return;
     }
-    if ((livePosition - pendingSeekPosition).inMilliseconds.abs() > 1500) {
+    if (!stale &&
+        (livePosition - pendingSeekPosition).inMilliseconds.abs() > 1500) {
       return;
     }
 
@@ -541,7 +556,7 @@ class _QueueViewState extends ConsumerState<_QueueView> {
       queuePlayerProvider.select((s) => s.queue.totalCount),
     );
     // Observed only so rows re-derive their model availability on a flip.
-    ref.watch(offlineModeProvider);
+    ref.watch(streamsUnavailableNowProvider);
     final colors = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
 

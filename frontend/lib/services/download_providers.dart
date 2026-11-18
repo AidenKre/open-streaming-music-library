@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/playback_availability.dart';
 import 'package:frontend/playback/codec_support.dart';
@@ -15,14 +16,26 @@ import 'package:frontend/services/download/download_reconciliation_service.dart'
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/queue_warm_service.dart';
+import 'package:frontend/playback/media_token_binding.dart';
+import 'package:frontend/services/server_binding_gate.dart';
+import 'package:frontend/services/session_service.dart';
 import 'package:frontend/services/settings_service.dart';
 
-/// Initialised once at startup. The store is async because it touches the
-/// filesystem to ensure the cover-art directory exists.
+/// Built per scope over the scope's client and the startup-resolved directory.
 final localCoverArtStoreProvider = Provider<LocalCoverArtStore>((ref) {
-  throw UnimplementedError(
-    'localCoverArtStoreProvider must be overridden at app startup',
+  return LocalCoverArtStore(
+    ref.read(coverArtDirectoryProvider),
+    ref.read(apiClientProvider),
+    isSignedOut: () =>
+        ref.read(sessionServiceProvider).serverBlocked.value ==
+        ServerBlockedReason.signedOut,
   );
+});
+
+/// The directory where locally stored cover art lives, resolved once at
+/// startup and overridden there.
+final coverArtDirectoryProvider = Provider<Directory>((ref) {
+  throw UnimplementedError('coverArtDirectoryProvider must be overridden');
 });
 
 final downloadDirectoryProvider = Provider<Future<Directory> Function()>((ref) {
@@ -33,6 +46,7 @@ final downloadManagerProvider = Provider<DownloadManager>((ref) {
   var providerDisposed = false;
   final manager = DownloadManager(
     db: ref.read(databaseProvider),
+    apiClient: ref.read(apiClientProvider),
     coverArtStore: ref.read(localCoverArtStoreProvider),
     directoryProvider: ref.read(downloadDirectoryProvider),
     warmService: ref.read(queueWarmServiceProvider),
@@ -66,8 +80,15 @@ final downloadManagerProvider = Provider<DownloadManager>((ref) {
       }),
     );
   });
+  // The next verification resumes downloads withheld while the server was not
+  // verified (sign-off OPEN-M-11), including a verification reached by the
+  // gate's own retry, which fires no recovery edge.
+  final verifiedSub = ref.read(serverBindingGateProvider).states.listen((s) {
+    if (!providerDisposed && s is BindingVerified) manager.resumeIfPaused();
+  });
   ref.onDispose(() {
     providerDisposed = true;
+    unawaited(verifiedSub.cancel());
     manager.dispose();
   });
   return manager;
@@ -194,7 +215,9 @@ final playbackAvailabilityProvider =
       ref,
       scope,
     ) {
-      final offline = ref.watch(offlineModeProvider);
+      // Under a failed server check a track that is not downloaded shows what
+      // it shows offline (sign-off OPEN-M-11 Part N).
+      final offline = ref.watch(streamsUnavailableNowProvider);
       ({int total, int downloaded})? counts;
       var undecodable = 0;
       switch (scope) {

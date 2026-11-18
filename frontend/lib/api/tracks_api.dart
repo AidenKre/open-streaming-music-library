@@ -2,9 +2,12 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/dto/get_changes_response_dto.dart';
 import 'package:frontend/models/dto/get_tracks_response_dto.dart';
+import 'package:frontend/models/instance_stamp.dart';
 
 class TracksApi {
-  final ApiClient _apiClient = ApiClient.instance;
+  TracksApi({required ApiClient api}) : _apiClient = api;
+
+  final ApiClient _apiClient;
 
   /// Fetches the authoritative current state of a single track. Used to
   /// reconcile one track to server truth (e.g. conflict "take server") without
@@ -27,8 +30,11 @@ class TracksApi {
       'limit': limit.toString(),
     };
 
-    final json = await _apiClient.getJson(['changes'], query: query);
-    return GetChangesResponseDto.fromJson(json);
+    final response = await _apiClient.getJsonResponse(['changes'], query: query);
+    return GetChangesResponseDto.fromJson(
+      response.body,
+      servedBy: instanceStampFrom(response.headers),
+    );
   }
 
   /// Fetches one page of tracks in display order for browsing.

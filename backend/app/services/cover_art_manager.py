@@ -8,6 +8,7 @@ from threading import Lock
 import imagehash
 from PIL import Image, UnidentifiedImageError
 
+from app.database import ANY_OWNER
 from app.database.database import Database
 from app.services.metadata import extract_cover_art_bytes
 
@@ -56,7 +57,7 @@ class CoverArtManager:
         try:
             img = Image.open(BytesIO(image_bytes))
             img.load()
-        except (UnidentifiedImageError, OSError, SyntaxError) as e:
+        except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError) as e:
             raise ValueError(f"Invalid image bytes: {e}")
 
         ext = _FORMAT_TO_EXT.get(img.format or "", ".jpg")
@@ -128,26 +129,26 @@ class CoverArtManager:
             return None
         return row.file_path
 
-    def remove_album_art(self, cover_art_id: int) -> bool:
-        """Remove cover art by ID. Raises ValueError if ID doesn't exist."""
-        row = self.ctx.database.get_cover_art_by_id(cover_art_id)
-        if row is None:
-            raise ValueError(f"Cover art with id {cover_art_id} does not exist")
-
-        # Clear references from tracks before deleting
-        self.ctx.database.clear_cover_art_references(cover_art_id)
-
-        # Delete file from disk
-        file_path = row.file_path
-        if file_path.exists():
-            file_path.unlink()
-
-        # Delete database row
-        return self.ctx.database.delete_cover_art(cover_art_id)
+    def release_if_unreferenced(self, cover_art_id: int) -> bool:
+        """Remove the row and file only when no track references them. The file
+        is removed inside the row's delete transaction, before the commit: a
+        failed removal raises and keeps the row, so a later call can finish."""
+        with self._lock:
+            row = self.ctx.database.get_cover_art_by_id(cover_art_id)
+            if row is None:
+                return False
+            return self.ctx.database.delete_cover_art(
+                cover_art_id, owner_id=ANY_OWNER,
+                remove_file=lambda: row.file_path.unlink(missing_ok=True),
+            )
 
     def backfill_cover_art(self) -> None:
         """Backfill cover_art_id for tracks that have album art but no cover_art_id."""
-        tracks = self.ctx.database.get_tracks_missing_cover_art()
+        tracks = self.ctx.database.get_tracks_missing_cover_art(
+            owner_id=ANY_OWNER
+        )
+        deleting = self.ctx.database.get_deleting_user_ids()
+        tracks = [t for t in tracks if t.owner_id not in deleting]
         if not tracks:
             return
 
@@ -165,14 +166,21 @@ class CoverArtManager:
                 continue
 
             try:
-                cover_art_id = self.add_album_art(art_bytes)
+                result = self.add_album_art_with_status(art_bytes)
+                cover_art_id = result.cover_art_id
                 updated = self.ctx.database.update_track_cover_art_id(
-                    track.uuid_id, cover_art_id
+                    track.uuid_id, cover_art_id, owner_id=track.owner_id
                 )
                 if updated:
                     print(f"  [{i}/{total}] Updated {track.uuid_id} -> cover_art_id={cover_art_id}")
                 else:
                     print(f"  [{i}/{total}] Failed to update DB for {track.uuid_id}")
+                    if result.was_created:
+                        # Art created for this track only: release it, not an orphan.
+                        try:
+                            self.release_if_unreferenced(cover_art_id)
+                        except (ValueError, OSError) as e:
+                            print(f"  [{i}/{total}] Could not release cover_art_id={cover_art_id}: {type(e).__name__}")
             except ValueError as e:
                 print(f"  [{i}/{total}] Invalid art in {track.file_path}: {e}")
 

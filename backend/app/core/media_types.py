@@ -7,6 +7,14 @@ AUDIO_EXTENSIONS: FrozenSet[str] = frozenset({
     ".m4a",
 })
 
+# Audio the server does not import yet; an import-folder archive holding any is never deleted.
+OTHER_AUDIO_EXTENSIONS: FrozenSet[str] = frozenset({
+    ".ogg", ".oga", ".opus", ".aiff", ".aif", ".aifc", ".aac", ".wma", ".alac", ".ape", ".wv",
+    ".mka", ".dsf", ".dff", ".mpc", ".m4b", ".mp2", ".caf", ".amr", ".au", ".tta",
+    ".mp4", ".m4r", ".webm", ".ac3", ".dts", ".spx", ".mid", ".midi", ".shn", ".aax",
+    ".mod", ".xm", ".it", ".s3m",
+})
+
 ARCHIVE_EXTENSIONS: FrozenSet[str] = frozenset({
     ".zip",
     ".rar",

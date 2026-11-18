@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/painting.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -14,20 +15,42 @@ import 'package:frontend/services/local_resettable.dart';
 /// The store is content-agnostic — bytes are written verbatim from the server
 /// response, and consumers read them back as raw bytes for decoding.
 class LocalCoverArtStore implements LocalResettable {
+  static int _tmpCounter = 0;
+
+  /// Bumped by every reset. A download that started before a reset (its
+  /// response may land long after) must not store the old library's cover.
+  int _resetEpoch = 0;
+
   final Directory _directory;
   final ApiClient _apiClient;
 
-  LocalCoverArtStore._(this._directory, this._apiClient);
+  /// Signed out (a 401 closed the binding gate): [download] sends nothing.
+  final bool Function() _isSignedOut;
 
-  static Future<LocalCoverArtStore> create({
+  LocalCoverArtStore(
+    this._directory,
+    this._apiClient, {
+    bool Function()? isSignedOut,
+  }) : _isSignedOut = isSignedOut ?? (() => false);
+
+  /// Resolves and creates `<base>/cover_art`.
+  static Future<Directory> ensureDirectory({
     Future<Directory> Function()? directoryProvider,
-    ApiClient? apiClient,
   }) async {
     final base =
         await (directoryProvider ?? getApplicationDocumentsDirectory)();
     final dir = Directory(p.join(base.path, 'cover_art'));
     await dir.create(recursive: true);
-    return LocalCoverArtStore._(dir, apiClient ?? ApiClient.instance);
+    return dir;
+  }
+
+  static Future<LocalCoverArtStore> create({
+    Future<Directory> Function()? directoryProvider,
+    required ApiClient apiClient,
+    bool Function()? isSignedOut,
+  }) async {
+    final dir = await ensureDirectory(directoryProvider: directoryProvider);
+    return LocalCoverArtStore(dir, apiClient, isSignedOut: isSignedOut);
   }
 
   @visibleForTesting
@@ -40,7 +63,8 @@ class LocalCoverArtStore implements LocalResettable {
 
   /// Downloads cover art bytes from the server and stores them locally.
   /// No-ops when the file already exists. Returns true on success (or already
-  /// present), false on any failure (network, HTTP, or filesystem).
+  /// present), false on any failure (network, HTTP, or filesystem), and
+  /// without a request while signed out (a 401 closed the gate).
   /// Cover art is best-effort — callers (e.g. DownloadManager) must not let
   /// a failure here fail the parent operation. The request is intentionally
   /// single-attempt and does NOT flip global offline mode: cover art is a
@@ -50,8 +74,12 @@ class LocalCoverArtStore implements LocalResettable {
   Future<bool> download(int coverArtId) async {
     final target = fileFor(coverArtId);
     if (target.existsSync()) return true;
+    if (_isSignedOut()) return false;
 
-    final tmp = File('${target.path}.partial');
+    // Unique per call: concurrent downloads of one id must not share a temp
+    // file (static counter, as store instances can share the folder).
+    final tmp = File('${target.path}.partial-${_tmpCounter++}');
+    final epoch = _resetEpoch;
     try {
       final bytes = await _apiClient.getBytes(
         ['cover_art', coverArtId.toString()],
@@ -60,7 +88,16 @@ class LocalCoverArtStore implements LocalResettable {
       );
       // Write to a temp file then rename so partial bytes are never visible.
       await tmp.writeAsBytes(bytes, flush: true);
+      if (epoch != _resetEpoch) {
+        await tmp.delete();
+        return false;
+      }
       await tmp.rename(target.path);
+      if (epoch != _resetEpoch) {
+        // A reset started during the rename: it may have missed this file.
+        await target.delete();
+        return false;
+      }
       return true;
     } catch (_) {
       // Any failure (ApiException, NetworkException, FileSystemException,
@@ -94,5 +131,17 @@ class LocalCoverArtStore implements LocalResettable {
   int get resetPriority => ResetPriority.deleteFiles;
 
   @override
-  Future<void> resetLocalState() => clear();
+  Future<void> resetLocalState() async {
+    _resetEpoch++;
+    await clear();
+    // Decoded FileImages are keyed by path; a reused cover id in the next
+    // library would otherwise show the previous library's picture.
+    try {
+      PaintingBinding.instance.imageCache
+        ..clear()
+        ..clearLiveImages();
+    } on FlutterError {
+      // No binding means no decoded images to evict.
+    }
+  }
 }

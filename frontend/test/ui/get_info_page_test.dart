@@ -19,7 +19,10 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._v);
   final bool _v;
   @override
-  bool build() => _v;
+  bool build() {
+    super.build();
+    return _v;
+  }
 }
 
 const _track = TrackUI(

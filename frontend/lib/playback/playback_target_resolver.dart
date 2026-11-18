@@ -93,16 +93,49 @@ class PlaybackTargetResolver {
     return PlaybackTargetResolution(target, issues: List.unmodifiable(issues));
   }
 
+  /// Offline: the members of [uuids] that play from a local file (the rule
+  /// of a landing target, [_localFile]), in order and with duplicates, and
+  /// the issues found on the way. Uuids the library doesn't know are
+  /// dropped.
+  Future<({List<String> playable, List<PlaybackIssue> issues})>
+      filterPlayableOffline(List<String> uuids) async {
+    final sources = await _repository.getLocalSourcesForUuids(uuids);
+    final issues = <PlaybackIssue>[];
+    final local = <String, bool>{};
+    for (final uuid in sources.keys) {
+      final source = sources[uuid]!;
+      local[uuid] = await _localFile(
+              uuid, source.filePath, source.downloadedCodec, issues) !=
+          null;
+    }
+    return (
+      playable: [
+        for (final uuid in uuids)
+          if (local[uuid] ?? false) uuid
+      ],
+      issues: List<PlaybackIssue>.unmodifiable(issues),
+    );
+  }
+
+  /// The one local-playability rule: the path [uuid] plays from when the
+  /// download is usable, decodable, not suspected and on disk; a recorded
+  /// path missing on disk adds a [LocalFileMissing] issue.
+  Future<String?> _localFile(String uuid, String? filePath,
+      String? downloadedCodec, List<PlaybackIssue> issues) async {
+    final path = _localSources.localPathOf(
+        uuid: uuid, filePath: filePath, downloadedCodec: downloadedCodec);
+    if (path == null) return null;
+    if (await _fileExists(path)) return path;
+    issues.add(LocalFileMissing(uuid, path));
+    return null;
+  }
+
   Future<PlaybackTarget> _target(
       QueuePlaybackEntry entry, List<PlaybackIssue> issues) async {
-    final path = _localSources.localPathFor(entry);
-    if (path != null) {
-      if (await _fileExists(path)) {
-        return PlaybackTarget(entry, PlaybackSourceKind.local);
-      }
-      issues.add(LocalFileMissing(entry.uuidId, path));
-    }
-    return PlaybackTarget(entry, PlaybackSourceKind.remote);
+    final path = await _localFile(
+        entry.uuidId, entry.filePath, entry.downloadedCodec, issues);
+    return PlaybackTarget(
+        entry, path != null ? PlaybackSourceKind.local : PlaybackSourceKind.remote);
   }
 
   Future<PlaybackTarget?> _walk(int sessionId, int from, PlayOrderDirection direction,

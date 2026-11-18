@@ -11,8 +11,10 @@ import 'dart:io';
 
 import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -27,12 +29,29 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/server_binding.dart';
+import '../helpers/test_credentials.dart';
 
 http.Client _health(int status) => MockClient(
   (_) async => http.Response('{"message":"Healthy"}', status),
 );
+
+/// A healthy Phase M server (health and /app/info) of [instanceId].
+http.Client _server(String instanceId) => MockClient((req) async =>
+    req.url.path.endsWith('/app/info')
+        ? http.Response(
+            '{"server":{"instance_id":"$instanceId"},'
+            '"auth":{"version":1,"signup_enabled":true}}', 200)
+        : http.Response('{"message":"Healthy"}', 200));
 http.Client _unreachable() =>
     MockClient((_) async => throw const SocketException('down'));
+
+/// A transport whose delegate each test picks after the container exists.
+class _SwitchClient extends http.BaseClient {
+  http.Client inner = _unreachable();
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      inner.send(request);
+}
 
 /// The prefs wipe step, standing in for the real wipe bands.
 class _ClearPrefs implements LocalResettable {
@@ -63,13 +82,29 @@ void main() {
   late AppDatabase db;
   late ControlledGate controlled;
   late ProviderContainer c;
+  var transport = _SwitchClient();
+  void useClient(http.Client client) => transport.inner = client;
+  List<Override> clientOverrides() => [
+    apiClientProvider.overrideWithValue(testApiClient('http://s', transport)),
+    unauthenticatedApiClientProvider.overrideWithValue(
+      (url) => testApiClient(url, transport),
+    ),
+  ];
 
   setUp(() {
+    transport = _SwitchClient();
     db = AppDatabase(NativeDatabase.memory());
     controlled = ControlledGate(db);
+    final originalPoll = OfflineModeNotifier.pollInterval;
+    addTearDown(() => OfflineModeNotifier.pollInterval = originalPoll);
     OfflineModeNotifier.pollInterval = const Duration(milliseconds: 1);
     c = ProviderContainer(
       overrides: [
+        ...clientOverrides(),
+        // A signed-in session (Phase M 7.1: a launch without credentials
+        // goes to Log in).
+        credentialsProvider.overrideWithValue(testCredentials),
+        credentialStoreTestOverride(),
         databaseProvider.overrideWithValue(db),
         serverBindingGateProvider.overrideWithValue(controlled.gate),
       ],
@@ -77,7 +112,6 @@ void main() {
   });
 
   tearDown(() async {
-    OfflineModeNotifier.pollInterval = const Duration(seconds: 5);
     controlled.dispose();
     c.dispose();
     await db.close();
@@ -88,10 +122,13 @@ void main() {
   bool ready() => c.read(sessionReadinessProvider).isReady;
 
   group('resumeSavedSession', () {
-    test('online: provisional row, verification started, ready after verdict',
-        () async {
+    // Launch no longer creates the row (review r1 m-R1-18: login does); the
+    // signed-in user's provisional row is verified and filled in.
+    test("online: the user's provisional row is verified, ready after the "
+        'verdict', () async {
+      await seedTestBinding(db, baseUrl: 'http://s');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(200));
+      useClient(_health(200));
       final start = await service().resumeSavedSession();
       expect(start.kind, SessionStartKind.online);
       final row = (await repo().current())!;
@@ -110,7 +147,7 @@ void main() {
     test('an existing row is reused (same token), not replaced', () async {
       final token = await seedTestBinding(db, baseUrl: 'http://old');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(200));
+      useClient(_health(200));
       await service().resumeSavedSession();
       await pumpEventQueue();
       controlled.respond(null); // legacy server
@@ -125,7 +162,7 @@ void main() {
         () async {
       await seedTestBinding(db, baseUrl: 'http://s', instanceId: 'inst-1');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(200));
+      useClient(_health(200));
       final start = await service().resumeSavedSession();
       expect(start.kind, SessionStartKind.online);
       await pumpEventQueue();
@@ -139,7 +176,8 @@ void main() {
       expect(c.read(offlineModeProvider), isTrue);
       // Nothing changed in the binding: the reset is the user's choice.
       expect((await repo().current())!.instanceId, 'inst-1');
-      expect(service().serverBlocked.value, isTrue);
+      expect(service().serverBlocked.value,
+          ServerBlockedReason.differentServer);
     });
 
     // Audit 5A.0(a) #2: an online start whose probe fails is ready once the
@@ -147,8 +185,9 @@ void main() {
     // that answers but can't be verified keeps network playback waiting.
     test('a probe failure that takes the session offline makes it ready',
         () async {
+      await seedTestBinding(db, baseUrl: 'http://s');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(200));
+      useClient(_health(200));
       await service().resumeSavedSession();
       await pumpEventQueue();
       c.read(offlineModeProvider.notifier).enterOffline(); // the probe's hook
@@ -158,8 +197,9 @@ void main() {
     });
 
     test('an online, unverifiable server keeps readiness waiting', () async {
+      await seedTestBinding(db, baseUrl: 'http://s');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(200));
+      useClient(_health(200));
       await service().resumeSavedSession();
       await pumpEventQueue();
       controlled.fail(ApiException(500, 'app/info broke'));
@@ -169,16 +209,18 @@ void main() {
     });
 
     test('a launch probe may report the outage (offline hook on)', () async {
+      await seedTestBinding(db, baseUrl: 'http://s');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(200));
+      useClient(_health(200));
       await service().resumeSavedSession();
       await pumpEventQueue();
       expect(controlled.reportOfflineFlags, [true]);
     });
 
     test('unreachable: offline session, row kept, no probe, ready', () async {
+      await seedTestBinding(db, baseUrl: 'http://s');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _unreachable());
+      useClient(_unreachable());
       final start = await service().resumeSavedSession();
       expect(start.kind, SessionStartKind.offline);
       await pumpEventQueue();
@@ -187,68 +229,58 @@ void main() {
       expect(ready(), isTrue);
     });
 
+    // Sign-off OPEN-A-04: only a 4xx (or a non-OSML answer) forgets the URL;
+    // a 5xx is "unreachable" (session_launch_test).
     test('server error: URL forgotten but the binding kept (rule 3)', () async {
       await seedTestBinding(db, baseUrl: 'http://s', instanceId: 'inst-1');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(500));
+      useClient(_health(404));
       final start = await service().resumeSavedSession();
-      expect(start.kind, SessionStartKind.signedOut);
+      expect(start.kind, SessionStartKind.serverAddress);
       expect(controlled.pendingProbes, 0);
       expect((await repo().current())!.instanceId, 'inst-1');
     });
   });
 
   group('connect', () {
-    test('verified: URL saved, row bound, ready', () async {
+    // Phase M 7.4: connect no longer runs the gate; login binds the row.
+    test('URL saved, no row, not ready (Log in comes next)', () async {
       SharedPreferences.setMockInitialValues({});
-      ApiClient.initForTest('http://new', _health(200));
-      final result = service().connect('http://new');
-      await pumpEventQueue();
-      expect(controlled.pendingProbes, 1);
-      controlled.respond('inst-9');
-      expect(await result, isA<ConnectSucceeded>());
+      useClient(_server('inst-9'));
+      expect(await service().connect('http://new'), isA<ConnectSucceeded>());
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString('serverUrl'), 'http://new');
-      final row = (await repo().current())!;
-      expect(row.instanceId, 'inst-9');
-      expect(row.lastBaseUrl, 'http://new');
-      expect(ready(), isTrue);
+      expect(await repo().current(), isNull);
+      expect(ready(), isFalse);
     });
 
-    test('verification fails: URL not saved, the attempt leaves no row',
-        () async {
+    test('identity check fails: URL not saved, no row', () async {
       SharedPreferences.setMockInitialValues({});
-      ApiClient.initForTest('http://new', _health(200));
-      final result = service().connect('http://new');
-      await pumpEventQueue();
-      controlled.fail(ApiException(500, 'app/info broke'));
-      expect(await result, isA<ConnectFailed>());
+      useClient(_health(200)); // /app/info has no server block
+      expect(await service().connect('http://new'), isA<ConnectFailed>());
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString('serverUrl'), isNull);
       expect(await repo().current(), isNull);
       expect(ready(), isFalse);
     });
 
-    // Audit 5A.0(a) #4: a login probe never flips the app offline, and a
-    // failed login stops verifying the URL the user typed (never saved).
-    test('the login probe never reports offline', () async {
+    // Audit 5A.0(a) #4: a connect never flips the app offline; with Phase M
+    // it does not start the gate at all (so it never reports offline).
+    test('connect never starts the gate', () async {
       SharedPreferences.setMockInitialValues({});
-      ApiClient.initForTest('http://new', _health(200));
-      final result = service().connect('http://new');
+      useClient(_server('inst-9'));
+      await service().connect('http://new');
       await pumpEventQueue();
-      expect(controlled.reportOfflineFlags, [false]);
-      controlled.respond('inst-9');
-      await result;
+      expect(controlled.reportOfflineFlags, isEmpty);
+      expect(c.read(offlineModeProvider), isFalse);
     });
 
     test('a failed login stops verifying the unsaved URL', () async {
       await seedTestBinding(db, baseUrl: 'http://a', instanceId: 'inst-1');
       SharedPreferences.setMockInitialValues({});
-      ApiClient.initForTest('http://typo', _health(200));
-      final result = service().connect('http://typo');
-      await pumpEventQueue();
-      controlled.fail(ApiException(500, 'app/info broke'));
-      expect(await result, isA<ConnectFailed>());
+      useClient(_health(200));
+      useClient(_health(500));
+      expect(await service().connect('http://typo'), isA<ConnectFailed>());
       expect(controlled.gate.state, isA<BindingIdle>());
       expect((await repo().current())!.lastBaseUrl, 'http://a');
     });
@@ -257,11 +289,9 @@ void main() {
         () async {
       await seedTestBinding(db, baseUrl: 'http://a', instanceId: 'inst-1');
       SharedPreferences.setMockInitialValues({});
-      ApiClient.initForTest('http://b', _health(200));
-      final result = service().connect('http://b');
-      await pumpEventQueue();
-      controlled.respond('inst-2');
-      final outcome = await result;
+      useClient(_health(200));
+      useClient(_server('inst-2'));
+      final outcome = await service().connect('http://b');
       expect(outcome, isA<ConnectDifferentServer>());
       expect((outcome as ConnectDifferentServer).url, 'http://b');
       final prefs = await SharedPreferences.getInstance();
@@ -278,7 +308,7 @@ void main() {
     Future<void> liveOn(String instanceId) async {
       await seedTestBinding(db, baseUrl: 'http://s', instanceId: 'inst-1');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _health(200));
+      useClient(_health(200));
       await service().resumeSavedSession();
       await pumpEventQueue();
       controlled.respond(instanceId);
@@ -296,9 +326,10 @@ void main() {
 
     test('found on a later connection edge, not only at launch', () async {
       await liveOn('inst-1');
-      expect(service().serverBlocked.value, isFalse);
+      expect(service().serverBlocked.value, ServerBlockedReason.none);
       await connectionEdge('inst-2');
-      expect(service().serverBlocked.value, isTrue);
+      expect(service().serverBlocked.value,
+          ServerBlockedReason.differentServer);
       expect(c.read(offlineModeProvider), isTrue);
       expect(c.read(offlineModeProvider.notifier).isPolling, isFalse,
           reason: 'no polling');
@@ -309,17 +340,19 @@ void main() {
         () async {
       await seedTestBinding(db, baseUrl: 'http://s', instanceId: 'inst-1');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
-      ApiClient.initForTest('http://s', _unreachable());
+      useClient(_unreachable());
       await service().resumeSavedSession();
       await connectionEdge('inst-2');
-      expect(service().serverBlocked.value, isTrue);
+      expect(service().serverBlocked.value,
+          ServerBlockedReason.differentServer);
     });
 
     test('the bound server answering again clears the block (D14)', () async {
       await liveOn('inst-2');
-      expect(service().serverBlocked.value, isTrue);
+      expect(service().serverBlocked.value,
+          ServerBlockedReason.differentServer);
       await connectionEdge('inst-1');
-      expect(service().serverBlocked.value, isFalse);
+      expect(service().serverBlocked.value, ServerBlockedReason.none);
       expect(c.read(offlineModeProvider), isFalse);
     });
 
@@ -327,12 +360,10 @@ void main() {
         () async {
       await seedTestBinding(db, baseUrl: 'http://a', instanceId: 'inst-1');
       SharedPreferences.setMockInitialValues({});
-      ApiClient.initForTest('http://b', _health(200));
-      final result = service().connect('http://b');
-      await pumpEventQueue();
-      controlled.respond('inst-2');
-      expect(await result, isA<ConnectDifferentServer>());
-      expect(service().serverBlocked.value, isFalse);
+      useClient(_health(200));
+      useClient(_server('inst-2'));
+      expect(await service().connect('http://b'), isA<ConnectDifferentServer>());
+      expect(service().serverBlocked.value, ServerBlockedReason.none);
       expect(c.read(offlineModeProvider), isFalse);
     });
   });
@@ -344,7 +375,8 @@ void main() {
     ProviderContainer scopeWith(List<LocalResettable> wipe) {
       final scope = ProviderContainer(
         overrides: [
-          databaseProvider.overrideWithValue(db),
+          ...clientOverrides(),
+        databaseProvider.overrideWithValue(db),
           serverBindingGateProvider.overrideWithValue(controlled.gate),
           localQuiescablesProvider.overrideWithValue(const []),
           localResettablesProvider.overrideWithValue(wipe),
@@ -363,7 +395,7 @@ void main() {
         }
         SharedPreferences.setMockInitialValues(
             {'serverUrl': 'http://a', 'resetPending': true});
-        ApiClient.initForTest('http://a', _health(200));
+        useClient(_health(200));
         final scope = scopeWith([_ClearPrefs()]);
         final start =
             await scope.read(sessionServiceProvider).resumeSavedSession();
@@ -382,13 +414,13 @@ void main() {
         'nothing', () async {
       SharedPreferences.setMockInitialValues(
           {'serverUrl': 'http://a', 'resetPending': true});
-      ApiClient.initForTest('http://a', _health(200));
+      useClient(_health(200));
       final failingDb = _FailingDbWipe();
       addTearDown(failingDb.close);
       final scope = scopeWith([failingDb]);
       final start =
           await scope.read(sessionServiceProvider).resumeSavedSession();
-      expect(start.kind, SessionStartKind.signedOut);
+      expect(start.kind, SessionStartKind.serverAddress);
       expect(start.error, contains('earlier reset'));
       expect(await repo().current(), isNull);
       expect((await SharedPreferences.getInstance()).getBool('resetPending'),
@@ -397,7 +429,7 @@ void main() {
 
     test('a login is refused until the wipe succeeds', () async {
       SharedPreferences.setMockInitialValues({'resetPending': true});
-      ApiClient.initForTest('http://b', _health(200));
+      useClient(_health(200));
       final failingDb = _FailingDbWipe();
       addTearDown(failingDb.close);
       final scope = scopeWith([failingDb]);
@@ -410,13 +442,13 @@ void main() {
 
     test('a login after a successful finish connects as usual', () async {
       SharedPreferences.setMockInitialValues({'resetPending': true});
-      ApiClient.initForTest('http://b', _health(200));
+      useClient(_health(200));
       final scope = scopeWith([_ClearPrefs()]);
-      final outcome = scope.read(sessionServiceProvider).connect('http://b');
-      await pumpEventQueue();
-      controlled.respond('inst-2');
-      expect(await outcome, isA<ConnectSucceeded>());
-      expect((await repo().current())!.instanceId, 'inst-2');
+      useClient(_server('inst-2'));
+      final outcome =
+          await scope.read(sessionServiceProvider).connect('http://b');
+      expect(outcome, isA<ConnectSucceeded>());
+      expect(await repo().current(), isNull, reason: 'login binds the row');
       expect((await SharedPreferences.getInstance()).getBool('resetPending'),
           isNull);
     });
@@ -429,7 +461,8 @@ void main() {
     }) {
       final scope = ProviderContainer(
         overrides: [
-          databaseProvider.overrideWithValue(db),
+          ...clientOverrides(),
+        databaseProvider.overrideWithValue(db),
           if (binding != null)
             serverBindingRepositoryProvider.overrideWithValue(binding),
           localQuiescablesProvider.overrideWithValue(const []),
@@ -496,7 +529,8 @@ void main() {
       addTearDown(failingDb.close);
       final scope = ProviderContainer(
         overrides: [
-          databaseProvider.overrideWithValue(db),
+          ...clientOverrides(),
+        databaseProvider.overrideWithValue(db),
           localQuiescablesProvider.overrideWithValue(const []),
           localResettablesProvider.overrideWithValue([_ClearPrefs(), failingDb]),
         ],

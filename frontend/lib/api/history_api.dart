@@ -2,11 +2,12 @@ import 'dart:convert';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/models/history_event.dart';
+import 'package:frontend/models/instance_stamp.dart';
 import 'package:frontend/repositories/history_repository.dart';
 
 /// The /history transport (Phase 5 §4).
 class HistoryApi {
-  HistoryApi({ApiClient? api}) : _api = api ?? ApiClient.instance;
+  HistoryApi({required ApiClient api}) : _api = api;
 
   final ApiClient _api;
 
@@ -27,10 +28,11 @@ class HistoryApi {
   /// GET /history/changes. A response of the wrong shape is a
   /// [FormatException].
   Future<HistoryPage> changes({required int after, int limit = 200}) async {
-    final json = await _api.getJson(
+    final response = await _api.getJsonResponse(
       ['history', 'changes'],
       query: {'after': '$after', 'limit': '$limit'},
     );
+    final json = response.body;
     final events = json['events'];
     if (events is! List) throw const FormatException('events is not a list');
     final nextCursor = json['nextCursor'];
@@ -41,6 +43,7 @@ class HistoryApi {
       events: [for (final e in events) _event(e)],
       nextCursor: nextCursor as int?,
       latestRevision: _int(json, 'latestRevision'),
+      servedBy: instanceStampFrom(response.headers),
     );
   }
 

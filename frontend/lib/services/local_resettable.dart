@@ -18,9 +18,7 @@ abstract class LocalResettable {
 /// Priority slots that encode the dependency order between reset steps.
 ///
 /// The ordering matters: background work must stop before its inputs are
-/// deleted; files must be removed before the DB rows that reference them;
-/// the transport URL is cleared last so any in-flight retry sees the
-/// already-cleared state instead of racing it.
+/// deleted; files must be removed before the DB rows that reference them.
 class ResetPriority {
   static const stopBackgroundWork = 100; // audio playback, polling
   static const cancelInFlight = 80; // download workers
@@ -28,7 +26,6 @@ class ResetPriority {
   static const clearCaches = 40;
   static const wipeDatabase = 20;
   static const clearPreferences = 10;
-  static const clearTransport = 0;
 }
 
 /// SC-15 step 2 participant: stops timers, cancels network work and settles

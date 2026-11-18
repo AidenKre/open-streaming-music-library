@@ -10,6 +10,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/download_manager.dart';
@@ -19,12 +20,16 @@ import 'package:frontend/ui/downloads_controller.dart';
 import 'package:frontend/ui/widgets/damaged_downloads_section.dart';
 
 import '../fake_downloads_controls.dart';
+import '../../helpers/no_server_api.dart';
 
 class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 Future<void> _insertTrack(AppDatabase db, String uuid,
@@ -66,6 +71,7 @@ void main() {
     tempDir = await Directory.systemTemp.createTemp('damaged-section-test');
     coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: noServerApi(),
     );
     controls = FakeDownloadsControls();
   });
@@ -75,12 +81,13 @@ void main() {
     if (await tempDir.exists()) await tempDir.delete(recursive: true);
   });
 
-  Widget wrap({bool offline = false}) {
+  Widget wrap({bool offline = false, bool serverCheckFailed = false}) {
     final manager = DownloadManager(
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
       isOfflineFn: () => true,
+      apiClient: noServerApi(),
     );
     addTearDown(manager.dispose);
     return ProviderScope(
@@ -89,6 +96,8 @@ void main() {
         downloadManagerProvider.overrideWithValue(manager),
         downloadsControlsProvider.overrideWithValue(controls),
         offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+        if (serverCheckFailed)
+          streamsUnavailableNowProvider.overrideWithValue(true),
       ],
       // Like the Downloaded page: the section above an Expanded list.
       child: const MaterialApp(
@@ -110,8 +119,7 @@ void main() {
   }
 
   Future<void> settle(WidgetTester tester) async {
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 20)));
+    await tester.runAsync(() => pumpEventQueue(times: 50));
     await tester.pump();
   }
 
@@ -194,6 +202,23 @@ void main() {
     await tester.tap(find.byTooltip('Delete damaged file'));
     await tester.pump();
     expect(controls.calls, ['deleteDamaged a']);
+    await flushDispose(tester);
+  });
+
+  // Sign-off OPEN-M-11 Part N review F2: under a failed server check the
+  // damaged downloads are skipped too (streams are unavailable): the banner
+  // says what it says offline, never "They stream until you re-download
+  // them.", and re-downloading is off.
+  testWidgets('the server check failed: the offline words and state',
+      (tester) async {
+    await _insertTrack(db, 'a', damagedFilePath: '/dl/a');
+    await tester.pumpWidget(wrap(serverCheckFailed: true));
+    await settle(tester);
+    expect(find.textContaining('skipped while offline'), findsOneWidget);
+    expect(find.textContaining('They stream until'), findsNothing);
+    await tester.tap(find.text('Re-download all'));
+    await tester.pump();
+    expect(controls.calls, isEmpty);
     await flushDispose(tester);
   });
 }

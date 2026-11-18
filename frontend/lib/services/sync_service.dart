@@ -100,7 +100,10 @@ class SyncService {
       // the cursor after applying.
       if (response.latestRevision < requestedAfter) {
         try {
-          await _binding.clearCatalogReconciled(_bindingToken);
+          await _binding.clearCatalogReconciled(
+            _bindingToken,
+            servedBy: response.servedBy,
+          );
         } on BindingFencedException {
           // a reset is under way: nothing to clear
         }
@@ -128,7 +131,7 @@ class SyncService {
       // Final page: the highest revision actually seen, if any.
       final newCursor = cursor ?? lastAppliedRevision;
       final localFilePaths = <String>[];
-      await _binding.runFenced(_bindingToken, () async {
+      await _binding.runFenced(_bindingToken, servedBy: response.servedBy, () async {
         await _applyChanges(
           response.changes,
           affectedQueueSessionIds: affectedQueueSessionIds,
@@ -150,7 +153,9 @@ class SyncService {
       after = cursor;
     }
 
-    await _db.rebuildFtsIndexes();
+    // One transaction: the rebuild empties the indexes and refills them, and
+    // a search in between must see the old index, not an empty one.
+    await _db.transaction(() => _db.rebuildFtsIndexes());
     return SyncResult(
       affectedQueueSessionIds: affectedQueueSessionIds,
       deletedTrackUuids: deletedTrackUuids,

@@ -137,7 +137,10 @@ class _Offline extends OfflineModeNotifier {
   _Offline(this.value);
   final bool value;
   @override
-  bool build() => value;
+  bool build() {
+    super.build();
+    return value;
+  }
 }
 
 /// The real outbox with flush() counted (no network).

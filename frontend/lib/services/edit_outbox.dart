@@ -41,6 +41,11 @@ enum EditSavePlan { noChanges, confirmMasterWrite, ready }
 /// uses the token of the verified connection it was sent on, and the write
 /// runs in a transaction that asserts the binding row still carries it. An
 /// answer or edit that outlives a reset (or a re-bind) changes nothing.
+///
+/// Every flush response is checked against the bound server instance (SC-01
+/// rule 6, through the bound API client): a response from another instance
+/// leaves its row untouched, stops the flush, and runs the different-server
+/// flow.
 class EditOutbox implements LossReporter {
   EditOutbox({
     required this.db,
@@ -166,9 +171,13 @@ class EditOutbox implements LossReporter {
       // coalescing. This is what lets take-server/discard revert locally.
       // Preserving it across a take_server marker matters too: the columns
       // still hold the discarded batch's optimistic values, so re-reading
-      // them here would poison a later revert.
-      final original = existing?.originalValuesJson ??
-          jsonEncode(await db.readEditableColumns(uuidId));
+      // them here would poison a later revert. A rejected row is the
+      // opposite: it was already reverted locally (and a `/changes` pull may
+      // have landed since), so the current columns are the true "before".
+      final original = existing != null && existing.status != 'rejected'
+          ? existing.originalValuesJson ??
+              jsonEncode(await db.readEditableColumns(uuidId))
+          : jsonEncode(await db.readEditableColumns(uuidId));
 
       await db.applyOptimisticTrackEdit(uuidId, edit.toPayload());
 
@@ -220,21 +229,31 @@ class EditOutbox implements LossReporter {
   /// pull cannot interleave (and clobber an in-flight edit).
   Future<void> flush() async {
     if (ref.read(offlineModeProvider)) return;
+    final gate = ref.read(serverBindingGateProvider);
     final String token;
+    final int? connection;
     try {
-      token = await ref.read(serverBindingGateProvider).awaitVerified();
+      token = await gate.awaitVerified();
+      // Same synchronous segment as the token: the connection the flush runs on.
+      connection = gate.verifiedConnection;
     } on BindingGateClosedException {
       return;
     }
-    await mutex.run(() => flushLocked(bindingToken: token));
+    try {
+      await mutex.run(() => flushLocked(bindingToken: token));
+    } on ServerInstanceChangedException catch (e) {
+      if (connection != null) gate.reportDifferentInstance(connection, e);
+    }
   }
 
   /// Flush variant for callers that already hold the mutex (the sync pull path,
   /// which flushes-then-pulls in one critical section). Every write a
   /// response causes is fenced by [bindingToken], the verified connection's
-  /// binding token.
-  Future<void> flushLocked({required String bindingToken}) async {
-    if (ref.read(offlineModeProvider)) return;
+  /// binding token. Returns false when the flush stopped because the gate no
+  /// longer carries that token (a different-server report, a new connection or
+  /// a sign-out): the caller must send nothing further, e.g. skip its pull.
+  Future<bool> flushLocked({required String bindingToken}) async {
+    if (ref.read(offlineModeProvider)) return true;
     // The token may predate a reset fence (the flush waited on the mutex
     // meanwhile): read the rows only while the binding still carries it, so
     // edits the reset sheet said will be lost are never sent (review
@@ -247,20 +266,35 @@ class EditOutbox implements LossReporter {
                 ..where((t) => t.status.equals('pending')))
               .get());
     } on BindingFencedException {
-      return;
+      return true;
     }
-    // Each row is an independent per-uuid PATCH with no shared mutable state
-    // or ordering dependency between tracks, so flush them concurrently
-    // rather than paying one round trip per row sequentially.
-    await Future.wait(rows.map((row) async {
+    // Sequential on purpose: the stamp check (SC-01 rule 6) must be able to
+    // stop the flush at the first response from another server instance, which
+    // concurrent PATCHes would already have sent. Cost: one round trip per
+    // pending row.
+    for (final row in rows) {
+      // A different-server report, a new connection or a sign-out since the
+      // token was captured stops the flush: nothing further is sent.
+      final gateState = ref.read(serverBindingGateProvider).state;
+      if (gateState is! BindingVerified || gateState.token != bindingToken) {
+        return false;
+      }
       try {
         await _flushOne(row, bindingToken);
+      } on ServerInstanceChangedException {
+        rethrow; // not delivered: the row stays as it was, nothing more is sent
+      } on NetworkException catch (e) {
+        // The server is unreachable: the rest would only repeat the retries
+        // while holding the mutex. Leave every remaining row pending.
+        developer.log('flush stopped at ${row.uuidId}: $e', name: 'EditOutbox');
+        return true;
       } catch (e) {
-        // Network error / unexpected 5xx after retries: leave this row pending
-        // and move on, so one stuck track can't block the rest of the outbox.
+        // Unexpected 5xx after retries: leave this row pending and move on,
+        // so one stuck track can't block the rest of the outbox.
         developer.log('flush skipped ${row.uuidId}: $e', name: 'EditOutbox');
       }
-    }));
+    }
+    return true;
   }
 
   Future<void> _flushOne(PendingEdit row, String bindingToken) async {
@@ -357,6 +391,8 @@ class EditOutbox implements LossReporter {
     final ClientTrackDto dto;
     try {
       dto = await api.getTrack(row.uuidId);
+    } on ServerInstanceChangedException {
+      rethrow;
     } catch (_) {
       return false;
     }
@@ -591,7 +627,18 @@ class EditOutbox implements LossReporter {
   /// Dismiss a rejected edit from the banner/sheet.
   Future<void> dismissRejected(String uuidId) async {
     final token = await _captureToken();
-    await binding.runFenced(token, () => _delete(uuidId));
+    // Under the outbox lock and only while the row is still `rejected`: a
+    // save made since the sheet opened turned it into a fresh pending batch,
+    // which a stale Dismiss must not delete.
+    await mutex.run(
+      () => binding.runFenced(
+        token,
+        () => (db.delete(db.pendingEdits)
+              ..where((t) => t.uuidId.equals(uuidId))
+              ..where((t) => t.status.equals('rejected')))
+            .go(),
+      ),
+    );
   }
 
   Stream<List<PendingEdit>> watchConflicts() {

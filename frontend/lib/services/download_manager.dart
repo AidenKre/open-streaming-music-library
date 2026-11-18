@@ -130,7 +130,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     Future<Directory> Function()? directoryProvider,
     QueueWarmService? warmService,
     String Function()? streamQualityFn,
-    ApiClient? apiClient,
+    required ApiClient apiClient,
     bool Function()? isOfflineFn,
     void Function()? onNetworkFailure,
     CodecSupport Function()? codecSupportFn,
@@ -145,7 +145,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       db: db,
       coverArtStore: coverArtStore,
       directoryProvider: directoryProvider ?? getApplicationDocumentsDirectory,
-      apiClient: apiClient ?? ApiClient.instance,
+      apiClient: apiClient,
       onNetworkFailure: onNetworkFailure,
     );
     _pool = WorkerPool(
@@ -496,9 +496,11 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     _status.bumpVersion();
   }
 
-  /// Called by OfflineModeNotifier when the network returns. Re-dispatches
-  /// any jobs that were left queued while offline.
-  void resumeIfPaused() => _pool.pump();
+  /// Called by recovery after the binding gate verified the server (and by
+  /// the download provider on every verification). Re-dispatches jobs left
+  /// queued while offline or withheld because the server was not verified
+  /// (sign-off OPEN-M-11); it does not clear the signed-out (401) pause.
+  void resumeIfPaused() => _pool.resumeAfterVerified();
 
   /// Returns the set of uuid_ids that have a non-null `file_path` (and the
   /// file actually exists on disk). Used by aggregate "fully downloaded"

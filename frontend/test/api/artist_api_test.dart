@@ -10,16 +10,15 @@ Response _artistsResponse(List<String> artists, {String? nextCursor}) => Respons
       200,
     );
 
+ArtistApi _artistApi(String url, Client client) =>
+    ArtistApi(api: testApiClient(url, client));
+
 void main() {
   group('ArtistApi', () {
     late ArtistApi api;
 
-    setUp(() {
-      api = ArtistApi();
-    });
-
     test('getInitialItems returns artists from response', () async {
-      ApiClient.initForTest(
+      api = _artistApi(
         'http://localhost:8000',
         MockClient((req) async => _artistsResponse(['Artist A', 'Artist B'])),
       );
@@ -30,20 +29,19 @@ void main() {
     });
 
     test('getInitialItems stores nextCursor for subsequent page request', () async {
-      ApiClient.initForTest(
+      late Future<Response> Function(Request) handler;
+      api = _artistApi(
         'http://localhost:8000',
-        MockClient((req) async => _artistsResponse(['Artist A'], nextCursor: 'cursor-abc')),
+        MockClient((req) => handler(req)),
       );
+      handler = (req) async => _artistsResponse(['Artist A'], nextCursor: 'cursor-abc');
       await api.getInitialItems();
 
       Uri? captured;
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async {
-          captured = req.url;
-          return _artistsResponse([]);
-        }),
-      );
+      handler = (req) async {
+        captured = req.url;
+        return _artistsResponse([]);
+      };
       await api.getNextItems();
 
       expect(captured?.queryParameters['cursor'], 'cursor-abc');
@@ -55,44 +53,37 @@ void main() {
     });
 
     test('getNextItems deduplicates artists already in the list', () async {
-      ApiClient.initForTest(
+      late Future<Response> Function(Request) handler;
+      api = _artistApi(
         'http://localhost:8000',
-        MockClient(
-          (req) async => _artistsResponse(['Artist A', 'Artist B'], nextCursor: 'c1'),
-        ),
+        MockClient((req) => handler(req)),
       );
+      handler = (req) async => _artistsResponse(['Artist A', 'Artist B'], nextCursor: 'c1');
       await api.getInitialItems();
 
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient(
-          (req) async => _artistsResponse(['Artist A', 'Artist C']),
-        ),
-      );
+      handler = (req) async => _artistsResponse(['Artist A', 'Artist C']);
       final newItems = await api.getNextItems();
 
       expect(newItems, ['Artist C']);
     });
 
     test('getGottenItems accumulates items across pages', () async {
-      ApiClient.initForTest(
+      late Future<Response> Function(Request) handler;
+      api = _artistApi(
         'http://localhost:8000',
-        MockClient(
-          (req) async => _artistsResponse(['Artist A', 'Artist B'], nextCursor: 'c1'),
-        ),
+        MockClient((req) => handler(req)),
       );
+      handler = (req) async => _artistsResponse(['Artist A', 'Artist B'], nextCursor: 'c1');
       await api.getInitialItems();
 
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async => _artistsResponse(['Artist C'])),
-      );
+      handler = (req) async => _artistsResponse(['Artist C']);
       await api.getNextItems();
 
       expect(api.getGottenItems(), ['Artist A', 'Artist B', 'Artist C']);
     });
 
     test('getGottenItems returns empty list before any fetch', () {
+      api = _artistApi('http://localhost:8000', MockClient((req) async => Response('', 500)));
       expect(api.getGottenItems(), isEmpty);
     });
   });

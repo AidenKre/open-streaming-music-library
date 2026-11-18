@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -21,11 +22,18 @@ import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/library_actions.dart';
 
 import 'browse_harness.dart';
+import '../helpers/no_server_api.dart';
+import '../helpers/server_binding.dart';
 
 /// Records the manager calls instead of downloading.
 class _RecordingDownloads extends DownloadManager {
   _RecordingDownloads(AppDatabase db, LocalCoverArtStore store, Directory dir)
-    : super(db: db, coverArtStore: store, directoryProvider: () async => dir);
+    : super(
+        db: db,
+        coverArtStore: store,
+        directoryProvider: () async => dir,
+        apiClient: noServerApi(),
+      );
 
   /// `kind:uuid,uuid:quality` (records holding lists aren't deep-equal).
   final calls = <String>[];
@@ -89,6 +97,7 @@ void main() {
     dir = await Directory.systemTemp.createTemp('library-actions');
     final store = await LocalCoverArtStore.create(
       directoryProvider: () async => dir,
+      apiClient: noServerApi(),
     );
     downloads = _RecordingDownloads(db, store, dir);
     repo = _SpyRepository(db);
@@ -172,6 +181,43 @@ void main() {
     offline.set(false);
     await actions().download(const AlbumScope(artistId: 1, albumId: 2));
     expect(repo.offlineArgs, [true, false]);
+  });
+
+  test('offline, Play next on an album queues only its downloads (6A.1a)',
+      () async {
+    await markDownloaded(db, 'n2');
+    container.read(offlineModeProvider);
+    offline.set(true);
+    await actions().playNext(const AlbumScope(artistId: 1, albumId: 2));
+    await actions().addToQueue(const ArtistScope(artistId: 1));
+    expect(audio.calls, [
+      {'method': 'playNext', 'uuids': ['n2']},
+      {'method': 'addToQueue', 'uuids': ['n2']},
+    ]);
+  });
+
+  // A guard for the offline narrowing above: Delete must still reach every
+  // member's file (a damaged download included) and fence every member's
+  // queued download, and Download every missing member.
+  test('offline, Download and Delete act on the whole collection (6A.1a)',
+      () async {
+    await markDownloaded(db, 'n1');
+    await (db.update(db.tracks)..where((t) => t.uuidId.equals('n2'))).write(
+      const TracksCompanion(
+        filePath: Value('/downloads/n2.flac'),
+        damagedFilePath: Value('/downloads/n2.bad'),
+      ),
+    );
+    container.read(offlineModeProvider);
+    offline.set(true);
+    await actions().deleteDownloads(const ArtistScope(artistId: 1));
+    await actions().download(const AlbumScope(artistId: 1, albumId: 2));
+    await actions().downloadAtQuality(const ArtistScope(artistId: 1), '128');
+    expect(downloads.calls, [
+      'delete:n1,n2,a1',
+      'enqueue:n1,n2:320',
+      'atQuality:n1,n2,a1:128',
+    ]);
   });
 
   test('Play from a list starts the explicit list at the chosen track',
@@ -270,6 +316,103 @@ void main() {
     ]);
   });
 
+  group('6A.2: collection Play and Shuffle', () {
+    const album = AlbumScope(artistId: 1, albumId: 2);
+    const artist = ArtistScope(artistId: 1);
+
+    test('Play submits the album in album order, canonically', () async {
+      expect(await actions().play(album), isA<Accepted>());
+      expect(audio.calls, [
+        {
+          'method': 'playCollection',
+          'collection': album,
+          'uuids': ['n1', 'n2'],
+          'shuffle': ShuffleStart.canonical,
+        },
+      ]);
+    });
+
+    test('Shuffle submits the artist in grid order, from a random start',
+        () async {
+      expect(await actions().shuffle(artist), isA<Accepted>());
+      expect(audio.calls, [
+        {
+          'method': 'playCollection',
+          'collection': artist,
+          'uuids': ['n1', 'n2', 'a1'],
+          'shuffle': ShuffleStart.random,
+        },
+      ]);
+    });
+
+    test('offline, Play and Shuffle submit only the downloaded members',
+        () async {
+      await markDownloaded(db, 'a1');
+      await markDownloaded(db, 'n2');
+      container.read(offlineModeProvider);
+      offline.set(true);
+      await actions().play(artist);
+      await actions().shuffle(album);
+      expect(repo.offlineArgs, [true, true]);
+      expect([for (final c in audio.calls) c['uuids']], [
+        ['n2', 'a1'],
+        ['n2'],
+      ]);
+    });
+
+    test('a collection with no members submits nothing', () async {
+      expect(await actions().play(const AlbumScope(artistId: 1, albumId: 99)),
+          isA<RejectedEmpty>());
+      expect(await actions().shuffle(const ArtistScope(artistId: 42)),
+          isA<RejectedEmpty>());
+      expect(audio.calls, isEmpty);
+    });
+
+    test('offline with nothing downloaded, Play submits nothing', () async {
+      container.read(offlineModeProvider);
+      offline.set(true);
+      expect(await actions().play(album), isA<RejectedEmpty>());
+      expect(audio.calls, isEmpty);
+    });
+
+    test('Play and Shuffle carry no click before readiness', () async {
+      await seedTestBinding(db, instanceId: 'srv-1'); // not reconciled
+      await actions().play(album);
+      await actions().shuffle(artist);
+      expect(audio.intents, [null, null]);
+    });
+
+    test('under readiness, Play and Shuffle carry one collection intent '
+        '(never a member track)', () async {
+      await seedTestBinding(db, instanceId: 'srv-1', reconciled: true);
+      await actions().play(album);
+      await actions().shuffle(artist);
+      expect(audio.intents, const [
+        HistoryIntent('album', 'srv-1:2'),
+        HistoryIntent('artist', 'srv-1:1'),
+      ]);
+    });
+
+    for (final (label, command) in <(String,
+        Future<PlaybackOutcome> Function(LibraryActionControls))>[
+      ('Play', (a) => a.play(album)),
+      ('Shuffle', (a) => a.shuffle(artist)),
+    ]) {
+      test('$label stops if its session ends during the membership read',
+          () async {
+        final tracks = await tracksByUuid();
+        repo.pendingMembers = Completer<List<TrackUI>>();
+        final pending = command(actions());
+        container.dispose();
+        container = ProviderContainer();
+        final completion = expectLater(pending, completes);
+        repo.pendingMembers!.complete(tracks.values.toList());
+        await completion;
+        expect(audio.calls, isEmpty);
+      });
+    }
+  });
+
   group('5B.1: accepted intents and outcomes', () {
     Future<TrackUI> trackOf(String uuid) async =>
         (await repo.getTracksForScope(const ArtistScope(artistId: 1), offline: false))
@@ -285,12 +428,27 @@ void main() {
       ]);
     });
 
-    test('album and artist scopes carry no click until Phase 6', () async {
+    test('album and artist scopes carry no click before readiness (6A.1a)',
+        () async {
+      await seedTestBinding(db, instanceId: 'srv-1'); // not reconciled
       await container
           .read(libraryActionsProvider)
           .addToQueue(const AlbumScope(artistId: 1, albumId: 2));
       await container.read(libraryActionsProvider).playNext(const ArtistScope(artistId: 1));
       expect(audio.intents, [null, null]);
+    });
+
+    test('under readiness, album and artist scopes carry one collection '
+        'intent (6A.1a)', () async {
+      await seedTestBinding(db, instanceId: 'srv-1', reconciled: true);
+      await container
+          .read(libraryActionsProvider)
+          .addToQueue(const AlbumScope(artistId: 1, albumId: 2));
+      await container.read(libraryActionsProvider).playNext(const ArtistScope(artistId: 1));
+      expect(audio.intents, const [
+        HistoryIntent('album', 'srv-1:2'),
+        HistoryIntent('artist', 'srv-1:1'),
+      ]);
     });
 
     test('row taps click the tapped track and surface the outcome', () async {

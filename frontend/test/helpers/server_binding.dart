@@ -8,17 +8,26 @@ import 'package:frontend/services/background/backoff_schedule.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 
+/// The signed-in user of test sessions: `testCredentials.userId`. Seeded
+/// rows and test gates use it, so the gate's local user check (Phase M
+/// 7.4) passes as in a real signed-in session.
+const testUserId = 1;
+
 /// A live session's binding row (SC-01). Every fenced writer (catalog sync,
 /// edit outbox, queue writes) is a no-op without one, exactly as after a
 /// reset, so tests that exercise those writers outside the real session flow
-/// seed it first. Returns the binding token.
+/// seed it first. Returns the binding token. With [reconciled] the row also
+/// carries `catalog_reconciled_at_binding` (SC-04 readiness), as after the
+/// first full catalog sync.
 Future<String> seedTestBinding(
   AppDatabase db, {
   String baseUrl = 'http://test',
   String? instanceId,
+  int? userId = testUserId,
+  bool reconciled = false,
 }) async {
   final repo = ServerBindingRepository(db);
-  final binding = await repo.ensureProvisional(baseUrl);
+  final binding = await repo.ensureProvisional(baseUrl, userId: userId);
   if (instanceId != null) {
     await repo.recordVerified(
       binding.localBindingId,
@@ -26,15 +35,20 @@ Future<String> seedTestBinding(
       baseUrl: baseUrl,
     );
   }
+  if (reconciled) {
+    await repo.runFenced(
+        binding.localBindingId, repo.markCatalogReconciledInTransaction);
+  }
   return binding.localBindingId;
 }
 
 /// A binding gate whose probe the test controls; [respond] completes the
 /// oldest pending probe.
 class ControlledGate {
-  ControlledGate(AppDatabase db) {
+  ControlledGate(AppDatabase db, {int? signedInUserId = testUserId}) {
     gate = ServerBindingGate(
       repository: ServerBindingRepository(db),
+      signedInUserId: signedInUserId,
       probe: _probe,
       backoff: BackoffSchedule(jitter: 0),
       timer: (d, f) => Timer(const Duration(days: 1), f),
@@ -47,7 +61,14 @@ class ControlledGate {
   /// The `reportOffline` flag of each probe, in order.
   final reportOfflineFlags = <bool>[];
 
-  Future<ServerIdentity> _probe({required bool reportOffline}) {
+  /// The base URL each probe was asked to read, in order.
+  final probedUrls = <String>[];
+
+  Future<ServerIdentity> _probe({
+    required String baseUrl,
+    required bool reportOffline,
+  }) {
+    probedUrls.add(baseUrl);
     reportOfflineFlags.add(reportOffline);
     final c = Completer<ServerIdentity>();
     _pending.add(c);
@@ -77,7 +98,8 @@ Override autoVerifiedGateOverride({
 }) => serverBindingGateProvider.overrideWith((ref) {
   final gate = ServerBindingGate(
     repository: ref.read(serverBindingRepositoryProvider),
-    probe: ({required bool reportOffline}) async => ServerIdentity(instanceId),
+    signedInUserId: testUserId,
+    probe: ({required String baseUrl, required bool reportOffline}) async => ServerIdentity(instanceId),
     backoff: BackoffSchedule(jitter: 0),
   );
   if (startOnRead) unawaited(gate.startConnection(baseUrl));

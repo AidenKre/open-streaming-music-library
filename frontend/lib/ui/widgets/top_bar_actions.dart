@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart' show ProviderListenable;
+import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/ui/session/session_host.dart';
 
 /// One top-bar button (SC-08): opens a session destination. [isAvailable]
@@ -21,17 +22,23 @@ class TopBarAction {
   final ProviderListenable<bool>? isAvailable;
 }
 
-/// The top-bar actions, in order. Phase 4: the Downloading page and
-/// Settings (Conversions is reached from Settings -> Library tools). Phase 7
-/// registers Uploads here, gated on the `uploads` capability.
+/// The top-bar actions, in order: the Downloading page, Uploads (only when
+/// the server advertises `uploads`) and Settings (Conversions is reached from
+/// Settings -> Library tools).
 final topBarActionsProvider = Provider<List<TopBarAction>>(
-  (ref) => const [
-    TopBarAction(
+  (ref) => [
+    const TopBarAction(
       destination: SessionDestination.downloadProgress,
       icon: Icons.download,
       tooltip: 'Downloads',
     ),
     TopBarAction(
+      destination: SessionDestination.uploads,
+      icon: Icons.upload,
+      tooltip: 'Uploads',
+      isAvailable: uploadsAdvertisedProvider,
+    ),
+    const TopBarAction(
       destination: SessionDestination.settings,
       icon: Icons.settings,
       tooltip: 'Settings',

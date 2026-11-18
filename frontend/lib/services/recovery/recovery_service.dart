@@ -3,7 +3,7 @@ import 'dart:developer' as developer;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
@@ -11,6 +11,7 @@ import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/server_binding_gate.dart';
+import 'package:frontend/services/uploads/upload_manager.dart';
 
 /// Drives best-effort "catch up after a gap" work across the app.
 ///
@@ -90,7 +91,7 @@ class RecoveryService {
     if (gate != null &&
         (trigger == RecoveryTrigger.networkRecovered ||
             trigger == RecoveryTrigger.appResume)) {
-      unawaited(gate.startConnection(ApiClient.instance.baseUrl));
+      unawaited(gate.startConnection(_ref.read(apiClientProvider).baseUrl));
     }
 
     await _runAll(trigger, members.where((m) => !m.requiresBinding));
@@ -191,6 +192,7 @@ final recoverablesProvider = Provider<List<RecoverableService>>((ref) {
     _ResumeConversionsRecoverable(ref),
     _ReconcileDownloadsRecoverable(ref),
     _HistoryRecoverable(ref),
+    _UploadsRecoverable(ref),
   ];
 });
 
@@ -342,6 +344,33 @@ class _HistoryRecoverable implements RecoverableService {
   Future<void> recover(RecoveryTrigger trigger) async {
     _ref
         .read(historyRunnerProvider)
+        .request(
+          trigger.name,
+          bypassBackoff: trigger != RecoveryTrigger.coldStart,
+        );
+  }
+}
+
+/// Requests an upload pass on every recovery edge; recovery edges (not cold
+/// start) bypass a pending backoff. Building the manager here is the startup
+/// wiring that resumes unfinished uploads.
+class _UploadsRecoverable implements RecoverableService {
+  _UploadsRecoverable(this._ref);
+  final Ref _ref;
+
+  @override
+  bool get requiresBinding => true;
+
+  @override
+  int get recoveryPriority => RecoveryPriority.uploads;
+
+  @override
+  Set<RecoveryTrigger> get triggers => RecoveryTrigger.values.toSet();
+
+  @override
+  Future<void> recover(RecoveryTrigger trigger) async {
+    _ref
+        .read(uploadManagerProvider)
         .request(
           trigger.name,
           bypassBackoff: trigger != RecoveryTrigger.coldStart,

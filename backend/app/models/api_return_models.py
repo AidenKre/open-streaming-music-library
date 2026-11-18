@@ -124,6 +124,34 @@ class HistoryCapabilities(BaseModel):
     version: Literal[1] = 1
 
 
+class AuthCapabilities(BaseModel):
+    version: Literal[1] = 1
+    signup_enabled: bool
+
+
+class UploadLimitsInfo(BaseModel):
+    """Effective upload limits (SC-03); mirrors services.upload_limits.UploadLimits."""
+
+    max_files_per_batch: int
+    max_file_bytes: int
+    max_batch_bytes: int
+    max_expanded_bytes_per_batch: int
+    max_expanded_member_bytes: int
+    max_audio_items_per_batch: int
+    max_archive_members: int
+    max_compression_ratio: int
+    receives: int
+    staged_quota_bytes: int
+    # O4 / DEV-7-02 per-user fairness.
+    receives_per_user: int
+    user_staged_quota_bytes: int
+
+
+class UploadsCapabilities(BaseModel):
+    version: int = 1
+    limits: UploadLimitsInfo
+
+
 class AppInfoResponse(BaseModel):
     """App-level bootstrap blob. The home for app-global facts so later phases
     extend it (Phase 2 adds a ``conversion`` block) rather than add endpoints.
@@ -133,6 +161,8 @@ class AppInfoResponse(BaseModel):
     conversion: ConversionCapabilities
     server: ServerInfo
     history: HistoryCapabilities
+    auth: AuthCapabilities
+    uploads: UploadsCapabilities
 
 
 class JobResponse(BaseModel):

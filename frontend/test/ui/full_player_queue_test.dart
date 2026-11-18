@@ -1,10 +1,10 @@
 import 'package:drift/drift.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -46,6 +46,7 @@ void main() {
     final failingRepo = _FailOnceQueueRepository(db);
     final container = ProviderContainer(overrides: [
       databaseProvider.overrideWithValue(db),
+      coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
       queueRepositoryProvider.overrideWithValue(failingRepo),
       playerControlsProvider.overrideWithValue(FakePlayerControls()),
       queuePlayerProvider.overrideWith(() => _TestQueuePlayer(_audioStateFor(
@@ -100,6 +101,7 @@ void main() {
       final atStartContainer = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           queuePlayerProvider.overrideWith(
             () => _TestQueuePlayer(
               _audioStateFor(
@@ -135,6 +137,7 @@ void main() {
       final afterManualContainer = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           queuePlayerProvider.overrideWith(
             () => _TestQueuePlayer(
               _audioStateFor(
@@ -192,6 +195,7 @@ void main() {
       final container = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           queuePlayerProvider.overrideWith(() => notifier),
         ],
       );
@@ -251,6 +255,7 @@ void main() {
       final container = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           offlineModeProvider.overrideWith(() => _StubOffline(offline)),
           queuePlayerProvider.overrideWith(
             () => _TestQueuePlayer(
@@ -305,8 +310,6 @@ void main() {
 
   group('cover art', () {
     setUpAll(() {
-      ApiClient.init('http://localhost:8000');
-      initCoverArtCache(CoverArtCacheManager.noop());
     });
 
     Future<void> pumpFullPlayer(
@@ -324,6 +327,7 @@ void main() {
       final container = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           queuePlayerProvider.overrideWith(
             () => _TestQueuePlayer(
               _audioStateFor(
@@ -399,6 +403,7 @@ void main() {
     final container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         playerControlsProvider.overrideWithValue(controls),
         queuePlayerProvider.overrideWith(
           () => _TestQueuePlayer(
@@ -439,6 +444,7 @@ void main() {
     final container = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         queuePlayerProvider.overrideWith(
           () => _TestQueuePlayer(
             _audioStateFor(
@@ -578,7 +584,10 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 class _FailOnceQueueRepository extends QueueRepository {

@@ -23,28 +23,37 @@ abstract interface class BrowseFilterControls implements Listenable {
   void dispose();
 }
 
+/// [initial], when non-null, is the starting Downloaded selection (see
+/// [BrowseFilterController]); null keeps the offline-derived default.
 typedef BrowseFilterFactory =
-    BrowseFilterControls Function({OfflineFilterPolicy policy});
+    BrowseFilterControls Function({OfflineFilterPolicy policy, bool? initial});
 
 /// Creates a surface's [BrowseFilterControls]. Override in tests to
 /// substitute a fake.
 final browseFilterControllerFactoryProvider = Provider<BrowseFilterFactory>(
   (ref) =>
-      ({policy = OfflineFilterPolicy.autoApply}) =>
-          BrowseFilterController(ref, policy: policy),
+      ({policy = OfflineFilterPolicy.autoApply, initial}) =>
+          BrowseFilterController(ref, policy: policy, initial: initial),
 );
 
 class BrowseFilterController extends ChangeNotifier
     implements BrowseFilterControls {
   /// Starts from [BrowseFilters.initial] for the offline state right now and
   /// follows later offline flips until [dispose].
+  ///
+  /// A non-null [initial] is the user's own Downloaded choice instead (Phase 6
+  /// See all seeds its manual filter from Home's current value, then owns it):
+  /// it is never marked as set by offline, so a reconnect does not undo it.
   BrowseFilterController(
     Ref ref, {
     OfflineFilterPolicy policy = OfflineFilterPolicy.autoApply,
-  }) : _filters = BrowseFilters.initial(
-         isOffline: ref.read(offlineModeProvider),
-         policy: policy,
-       ) {
+    bool? initial,
+  }) : _filters = initial == null
+           ? BrowseFilters.initial(
+               isOffline: ref.read(offlineModeProvider),
+               policy: policy,
+             )
+           : BrowseFilters(policy: policy).userSetDownloaded(initial) {
     _offline = ref.listen<bool>(offlineModeProvider, (prev, next) {
       if (prev == next) return;
       _set(next ? _filters.wentOffline() : _filters.cameOnline());

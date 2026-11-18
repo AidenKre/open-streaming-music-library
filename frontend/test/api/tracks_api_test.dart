@@ -60,16 +60,15 @@ Response _rawChangesResponse(List<Map<String, dynamic>> changes) => Response(
   200,
 );
 
+TracksApi _tracksApi(String url, Client client) =>
+    TracksApi(api: testApiClient(url, client));
+
 void main() {
   group('TracksApi.getChangesPage', () {
     late TracksApi api;
 
-    setUp(() {
-      api = TracksApi();
-    });
-
     test('parses changes, nextCursor and latestRevision', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient(
           (req) async =>
@@ -88,7 +87,7 @@ void main() {
     });
 
     test('parses delete changes', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient(
           (req) async => _rawChangesResponse([
@@ -111,7 +110,7 @@ void main() {
     });
 
     test('throws on unknown change type', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient(
           (req) async => _rawChangesResponse([
@@ -129,7 +128,7 @@ void main() {
     });
 
     test('throws when upsert omits track payload', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient(
           (req) async => _rawChangesResponse([
@@ -147,7 +146,7 @@ void main() {
     });
 
     test('throws when delete includes track payload', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient(
           (req) async => _rawChangesResponse([
@@ -165,7 +164,7 @@ void main() {
     });
 
     test('throws when upsert change uuid differs from track uuid', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient(
           (req) async => _rawChangesResponse([
@@ -184,7 +183,7 @@ void main() {
 
     test('sends after_revision and limit as query params', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -200,7 +199,7 @@ void main() {
 
     test('defaults to after_revision=0 and limit=500', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -218,12 +217,8 @@ void main() {
   group('TracksApi.getTracksPage (browse)', () {
     late TracksApi api;
 
-    setUp(() {
-      api = TracksApi();
-    });
-
     test('getTracksPage returns parsed response', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient(
           (req) async =>
@@ -241,7 +236,7 @@ void main() {
 
     test('sends cursor and limit as query params', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -257,7 +252,7 @@ void main() {
 
     test('sends only limit when no optional params provided', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -275,7 +270,7 @@ void main() {
 
     test('sends artist_id and album_id as query params', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -291,7 +286,7 @@ void main() {
 
     test('sends artist_id without album_id as query param', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -306,7 +301,7 @@ void main() {
     });
 
     test('returns null nextCursor when not present in response', () async {
-      ApiClient.initForTest(
+      api = _tracksApi(
         'http://localhost:8000',
         MockClient((req) async => _tracksResponse(['uuid-1'])),
       );

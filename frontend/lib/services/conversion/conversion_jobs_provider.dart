@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -173,12 +174,11 @@ class ConversionJobsNotifier extends Notifier<List<ConversionJob>> {
   Future<void> _poll() async {
     if (_disposed || _pollInFlight) return;
     if (ref.read(offlineModeProvider)) return;
-    if (ApiClient.instance.baseUrl.isEmpty) return;
+    if (!ref.read(hasSessionProvider)) return;
     _pollInFlight = true;
     var ok = false;
     try {
-      await _pollOnce(_discoveryGeneration);
-      ok = true;
+      ok = await _pollOnce(_discoveryGeneration);
     } catch (e, st) {
       debugPrint('Conversion job poll failed: $e\n$st');
     } finally {
@@ -191,7 +191,11 @@ class ConversionJobsNotifier extends Notifier<List<ConversionJob>> {
     }
   }
 
-  Future<void> _pollOnce(int generation) async {
+  /// One poll's fetches and merge. False when a tracked job's settle lookup
+  /// failed: that job is left as it was (looked up again on the next poll,
+  /// after the failure backoff) while every other job's update is still
+  /// published (U25-B-04).
+  Future<bool> _pollOnce(int generation) async {
     final api = ref.read(jobsApiProvider);
 
     // 1. The full active set in one (paged) call -- covers every active job
@@ -205,7 +209,7 @@ class ConversionJobsNotifier extends Notifier<List<ConversionJob>> {
         limit: activePageSize,
         retry: false,
       );
-      if (_disposed) return;
+      if (_disposed) return true;
       active.addAll(result.jobs);
       final next = result.nextCursor;
       if (next == null || (cursor != null && next <= cursor)) break;
@@ -222,14 +226,26 @@ class ConversionJobsNotifier extends Notifier<List<ConversionJob>> {
         .toList();
     final settled = <ConversionJob>[];
     final vanished = <int>{};
+    var allSettled = true;
     for (final job in departed) {
-      final found = await api.getJobs(
-        uuidId: job.uuidId,
-        cursor: job.jobId - 1,
-        limit: 1,
-        retry: false,
-      );
-      if (_disposed) return;
+      final List<ConversionJob> found;
+      try {
+        found = await api.getJobs(
+          uuidId: job.uuidId,
+          cursor: job.jobId - 1,
+          limit: 1,
+          retry: false,
+        );
+      } catch (e) {
+        debugPrint('Conversion job settle lookup failed: $e');
+        allSettled = false;
+        if (_disposed) return true;
+        // The server is unreachable (or the app went offline): the other
+        // lookups would fail the same way, so stop sending them.
+        if (e is NetworkException || ref.read(offlineModeProvider)) break;
+        continue;
+      }
+      if (_disposed) return true;
       final match = found.where((j) => j.jobId == job.jobId);
       if (match.isEmpty) {
         // Gone server-side (pruned); drop it rather than poll it forever.
@@ -264,5 +280,6 @@ class ConversionJobsNotifier extends Notifier<List<ConversionJob>> {
         }),
       );
     }
+    return allSettled;
   }
 }

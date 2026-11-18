@@ -133,4 +133,34 @@ void main() {
     expect(await db.select(db.historyEvents).get(), isEmpty);
     expect((await repo.drafts()).single.listenUuid, u);
   });
+
+  // U26-A-07: one frozen draft whose stored payload cannot be read made
+  // drafts() throw, so recovery settled none of the others.
+  test('a draft whose payload cannot be read is skipped, the rest are listed',
+      () async {
+    const good = '44444444-4444-4444-8444-444444444444';
+    const notJson = '55555555-5555-4555-8555-555555555555';
+    const wrongShape = '66666666-6666-4666-8666-666666666666';
+    const accumulating = '77777777-7777-4777-8777-777777777777';
+    // At most one draft accumulates: freeze each before the next starts.
+    for (final uuid in [good, notJson, wrongShape]) {
+      await repo.checkpointDraft(token, _draft(uuid));
+      await repo.freezeDraft(token, uuid, _play(uuid));
+    }
+    await repo.checkpointDraft(token, _draft(accumulating));
+    await db.customStatement(
+        "UPDATE active_listens SET final_payload_json = '{not json' "
+        "WHERE listen_uuid = '$notJson'");
+    await db.customStatement(
+        "UPDATE active_listens SET final_payload_json = '{\"kind\":\"play\"}' "
+        "WHERE listen_uuid = '$wrongShape'");
+
+    final drafts = await repo.drafts();
+
+    expect({for (final d in drafts) d.listenUuid}, {good, accumulating});
+    final frozen = drafts.singleWhere((d) => d.listenUuid == good);
+    expect(frozen.finalPayload?.eventUuid, good);
+    // The unreadable rows are kept, not deleted.
+    expect(await db.select(db.activeListens).get(), hasLength(4));
+  });
 }

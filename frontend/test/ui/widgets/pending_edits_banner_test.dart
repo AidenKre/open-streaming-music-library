@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/ui/widgets/pending_edits_banner.dart';
@@ -18,7 +19,7 @@ import '../../helpers/server_binding.dart';
 void main() {
   testWidgets('rejected edit is visible with its reason and dismissible',
       (tester) async {
-    ApiClient.initForTest(
+    final api = testApiClient(
       'http://localhost:8000',
       MockClient((_) async => http.Response('', 404)),
     );
@@ -34,7 +35,10 @@ void main() {
 
     await tester.pumpWidget(
       ProviderScope(
-        overrides: [databaseProvider.overrideWithValue(db)],
+        overrides: [
+          apiClientProvider.overrideWithValue(api),
+          databaseProvider.overrideWithValue(db),
+        ],
         child: const MaterialApp(home: Scaffold(body: PendingEditsBanner())),
       ),
     );

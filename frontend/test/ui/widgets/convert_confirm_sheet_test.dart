@@ -10,8 +10,10 @@ Widget _harness(
   String targetCodec = 'aac',
   bool targetIsLossless = false,
   int? targetBitrateKbps = 192,
+  ThemeData? theme,
 }) {
   return MaterialApp(
+    theme: theme,
     home: Scaffold(
       body: Builder(
         builder: (context) => ElevatedButton(
@@ -85,6 +87,40 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(result, isFalse);
+  });
+
+  // U25-A-04: a rebuild of the sheet's route (here a theme change, which
+  // re-runs the sheet's builder) must not untick the box the user ticked.
+  testWidgets('the ticked box survives a rebuild of the sheet', (tester) async {
+    final dark = ValueNotifier(false);
+    addTearDown(dark.dispose);
+    bool? result;
+    await tester.pumpWidget(
+      ValueListenableBuilder<bool>(
+        valueListenable: dark,
+        builder: (context, isDark, _) => _harness(
+          (c) => result = c,
+          theme: ThemeData(
+            brightness: isDark ? Brightness.dark : Brightness.light,
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Open'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byType(CheckboxListTile));
+    await tester.pumpAndSettle();
+
+    dark.value = true;
+    await tester.pumpAndSettle();
+
+    expect(
+      tester.widget<CheckboxListTile>(find.byType(CheckboxListTile)).value,
+      isTrue,
+    );
+    await tester.tap(find.byType(FilledButton));
+    await tester.pumpAndSettle();
+    expect(result, isTrue, reason: 'Convert stays enabled after the rebuild');
   });
 
   testWidgets('shows the target codec and bitrate in the description', (tester) async {

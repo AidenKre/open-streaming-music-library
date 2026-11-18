@@ -89,7 +89,10 @@ class _StubSync extends TrackSyncNotifier {
 
 class _Online extends OfflineModeNotifier {
   @override
-  bool build() => false;
+  bool build() {
+    super.build();
+    return false;
+  }
 }
 
 const _capabilities = AppInfo(

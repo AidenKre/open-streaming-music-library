@@ -51,6 +51,12 @@ final phase4SettingsRows = <SettingsRowContribution>[
     sectionId: 'connection',
     order: 0,
     isAvailable: sessionIsLiveProvider,
+    build: (_) => const _LogOutRow(),
+  ),
+  SettingsRowContribution(
+    sectionId: 'connection',
+    order: 1,
+    isAvailable: sessionIsLiveProvider,
     build: (_) => const _DisconnectRow(),
   ),
 ];
@@ -285,6 +291,24 @@ class _ConversionsRow extends StatelessWidget {
   }
 }
 
+/// Signs out but keeps every local store (spec 7.6), so it needs no
+/// confirmation.
+class _LogOutRow extends ConsumerWidget {
+  const _LogOutRow();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return ListTile(
+      leading: const Icon(Icons.person_off_outlined),
+      title: const Text('Log out'),
+      subtitle: const Text(
+        'Sign out of this account; downloads and library stay on this device',
+      ),
+      onTap: () => unawaited(ref.read(sessionControlsProvider).logout()),
+    );
+  }
+}
+
 class _DisconnectRow extends ConsumerWidget {
   const _DisconnectRow();
 
@@ -293,7 +317,7 @@ class _DisconnectRow extends ConsumerWidget {
     return ListTile(
       leading: const Icon(Icons.logout),
       title: const Text('Disconnect'),
-      subtitle: const Text('Reset this device and return to the login screen'),
+      subtitle: const Text('Reset this device and return to the server address screen'),
       onTap: () async {
         final session = ref.read(sessionControlsProvider);
         final losses = await session.pendingLossSummaries();

@@ -2,7 +2,10 @@ import 'package:audio_service/audio_service.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
+import 'package:http/testing.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_service_bridge.dart';
 import 'package:frontend/playback/audio_state.dart';
@@ -22,18 +25,23 @@ import 'fake_player_controls.dart';
 /// model; before binding they are no-ops.
 void main() {
   late AudioServiceBridge bridge;
+  late Override apiOverride;
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.init('http://localhost:8080');
-    initCoverArtCache(CoverArtCacheManager.noop());
+    apiOverride = apiClientProvider.overrideWithValue(testApiClient(
+      'http://localhost:8080',
+      MockClient((_) async => fail('wiring tests make no requests')),
+    ));
     bridge = AudioServiceBridge();
   });
 
   ProviderContainer scope(FakePlayerControls controls) {
     final c = ProviderContainer(
       overrides: [
+        apiOverride,
         audioServiceProvider.overrideWithValue(bridge),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         playerControlsProvider.overrideWithValue(controls),
       ],
     );
@@ -74,7 +82,9 @@ void main() {
     var warmers = 0;
     final readiness = SessionReadiness();
     final c = ProviderContainer(overrides: [
+      apiOverride,
       audioServiceProvider.overrideWithValue(bridge),
+      coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
       playerControlsProvider.overrideWithValue(FakePlayerControls()),
       sessionReadinessProvider.overrideWithValue(readiness),
       nowPlayingPublisherProvider.overrideWith((ref) {
@@ -103,7 +113,9 @@ void main() {
     var builds = 0;
     final readiness = SessionReadiness();
     final c = ProviderContainer(overrides: [
+      apiOverride,
       audioServiceProvider.overrideWithValue(bridge),
+      coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
       playerControlsProvider.overrideWithValue(FakePlayerControls()),
       sessionReadinessProvider.overrideWithValue(readiness),
       nowPlayingPublisherProvider.overrideWith(
@@ -129,7 +141,9 @@ void main() {
     final fresh = FakePlayerControls();
     final oldScope = ProviderContainer(
       overrides: [
+        apiOverride,
         audioServiceProvider.overrideWithValue(bridge),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         playerControlsProvider.overrideWithValue(old),
       ],
     )..listen(playbackWiringProvider, (_, _) {});

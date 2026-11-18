@@ -3,9 +3,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:drift/native.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
+import 'package:http/testing.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/ui/conversions_page.dart';
@@ -23,11 +25,13 @@ import '../fake_session_controls.dart';
 void main() {
   late AppDatabase db;
   late BrowseHarness harness;
+  late Override noSessionApi;
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
-    ApiClient.init('');
-    initCoverArtCache(CoverArtCacheManager.noop());
+    noSessionApi = apiClientProvider.overrideWithValue(
+      testApiClient('', MockClient((_) async => fail('no session: no requests'))),
+    );
     db = AppDatabase(NativeDatabase.memory());
     harness = await BrowseHarness.create(db);
   });
@@ -52,6 +56,7 @@ void main() {
             ),
           ),
         ),
+        overrides: [noSessionApi],
       ),
     );
     return nested;
@@ -208,7 +213,7 @@ void main() {
     await tester.pumpWidget(
       harness.wrap(
         const SessionHost(root: Text('shell')),
-        overrides: [sessionControlsProvider.overrideWithValue(fake)],
+        overrides: [noSessionApi, sessionControlsProvider.overrideWithValue(fake)],
       ),
     );
     await tester.pump();
@@ -216,7 +221,7 @@ void main() {
     await tester.pumpWidget(
       harness.wrap(
         const SessionHost(root: Text('shell again')),
-        overrides: [sessionControlsProvider.overrideWithValue(fake)],
+        overrides: [noSessionApi, sessionControlsProvider.overrideWithValue(fake)],
       ),
     );
     await tester.pump();

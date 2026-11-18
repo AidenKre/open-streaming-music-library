@@ -1,0 +1,325 @@
+-- The whole script is one transaction: a crash mid-init leaves no schema.
+-- The user_version below must equal Database.LATEST_SCHEMA_VERSION.
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS users (
+    "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "username" TEXT NOT NULL,
+    "username_key" TEXT NOT NULL UNIQUE,
+    "password_hash" TEXT NOT NULL,
+    "is_admin" INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0,1)),
+    "is_master_admin" INTEGER NOT NULL DEFAULT 0 CHECK (is_master_admin IN (0,1)),
+    "library_folder" TEXT NOT NULL UNIQUE,
+    "created_at" INTEGER NOT NULL,
+    "disabled_at" INTEGER,
+    "deleting_at" INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_master_admin ON users(is_master_admin) WHERE is_master_admin = 1;
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    "user_id" INTEGER NOT NULL REFERENCES users("id"),
+    "key" TEXT NOT NULL,
+    "value" TEXT NOT NULL,
+    PRIMARY KEY (user_id, key)
+);
+
+-- Used from M.1.
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    "token_hash" TEXT NOT NULL PRIMARY KEY,
+    "media_hash" TEXT NOT NULL UNIQUE,
+    "user_id" INTEGER NOT NULL REFERENCES users("id"),
+    "created_at" INTEGER NOT NULL,
+    "revoked_at" INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+
+-- Used by the offline `users delete` (M.2b) to remember which cover art the
+-- deleted user referenced. Deliberately no FK to cover_arts, so a captured id
+-- survives the art row's removal on a resumed delete.
+CREATE TABLE IF NOT EXISTS user_delete_art_capture (
+    "user_id" INTEGER NOT NULL REFERENCES users("id"),
+    "cover_art_id" INTEGER NOT NULL,
+    PRIMARY KEY ("user_id", "cover_art_id")
+);
+
+CREATE TABLE IF NOT EXISTS artists (
+    "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "name" TEXT NOT NULL,
+    "name_lower" TEXT NOT NULL GENERATED ALWAYS AS (LOWER("name")) STORED,
+    "owner_id" INTEGER NOT NULL REFERENCES users("id"),
+    UNIQUE ("owner_id", "name_lower")
+);
+
+CREATE INDEX IF NOT EXISTS idx_artists_name_lower ON artists("name_lower");
+
+CREATE TABLE IF NOT EXISTS albums (
+    "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "name" TEXT,
+    "name_lower" TEXT GENERATED ALWAYS AS (LOWER("name")) STORED,
+    "artist_id" INTEGER NOT NULL,
+    "year" INTEGER,
+    "is_single_grouping" INTEGER NOT NULL DEFAULT 0 CHECK ("is_single_grouping" IN (0,1)),
+    FOREIGN KEY ("artist_id") REFERENCES artists("id")
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_regular
+    ON albums("name_lower", "artist_id") WHERE "is_single_grouping" = 0;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_singles
+    ON albums("artist_id", COALESCE("year", -1)) WHERE "is_single_grouping" = 1;
+
+CREATE INDEX IF NOT EXISTS idx_albums_name_lower ON albums("name_lower");
+CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums("artist_id");
+
+CREATE TABLE IF NOT EXISTS tracks (
+    "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "uuid_id" TEXT UNIQUE NOT NULL,
+    "file_path" TEXT NOT NULL,
+    "created_at" INTEGER NOT NULL DEFAULT (unixepoch()),
+    "last_updated" INTEGER NOT NULL DEFAULT (unixepoch()),
+    -- Monotonic sync watermark, assigned from revision_counter on add/update.
+    "revision" INTEGER NOT NULL DEFAULT 0,
+    "owner_id" INTEGER NOT NULL REFERENCES users("id")
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracks_revision ON tracks("revision");
+CREATE INDEX IF NOT EXISTS idx_tracks_owner_revision ON tracks("owner_id", "revision");
+
+CREATE TABLE IF NOT EXISTS cover_arts (
+    "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "sha256" TEXT UNIQUE NOT NULL,
+    "phash" TEXT NOT NULL,
+    "phash_prefix" TEXT NOT NULL,
+    "file_path" TEXT UNIQUE NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cover_arts_phash_prefix ON cover_arts("phash_prefix");
+
+CREATE TABLE IF NOT EXISTS trackmetadata (
+    "track_id" INTEGER UNIQUE NOT NULL,
+    "uuid_id" TEXT UNIQUE NOT NULL,
+    "title" TEXT,
+    "artist" TEXT,
+    "album" TEXT,
+    "album_artist" TEXT,
+    "artist_id" INTEGER,
+    "album_id" INTEGER,
+    "year" INTEGER,
+    "date" TEXT,
+    "genre" TEXT,
+    "track_number" INTEGER,
+    "disc_number" INTEGER,
+    "codec" TEXT,
+    "duration" FLOAT,
+    "bitrate_kbps" FLOAT,
+    "sample_rate_hz" INTEGER,
+    "channels" INTEGER,
+    "has_album_art" INTEGER NOT NULL CHECK ("has_album_art" IN (0,1)),
+    "cover_art_id" INTEGER,
+    FOREIGN KEY ("track_id") REFERENCES tracks("id"),
+    FOREIGN KEY ("uuid_id") REFERENCES tracks("uuid_id"),
+    FOREIGN KEY ("artist_id") REFERENCES artists("id"),
+    FOREIGN KEY ("album_id") REFERENCES albums("id"),
+    FOREIGN KEY ("cover_art_id") REFERENCES cover_arts("id") ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_title ON trackmetadata("title");
+CREATE INDEX IF NOT EXISTS idx_artist ON trackmetadata("artist");
+CREATE INDEX IF NOT EXISTS idx_album ON trackmetadata("album");
+CREATE INDEX IF NOT EXISTS idx_album_artist ON trackmetadata("album_artist");
+CREATE INDEX IF NOT EXISTS idx_tm_artist_id ON trackmetadata("artist_id");
+CREATE INDEX IF NOT EXISTS idx_tm_album_id ON trackmetadata("album_id");
+CREATE INDEX IF NOT EXISTS idx_year ON trackmetadata("year");
+CREATE INDEX IF NOT EXISTS idx_date ON trackmetadata("date");
+CREATE INDEX IF NOT EXISTS idx_genre ON trackmetadata("genre");
+CREATE INDEX IF NOT EXISTS idx_track_number ON trackmetadata("track_number");
+CREATE INDEX IF NOT EXISTS idx_disc_number ON trackmetadata("disc_number");
+CREATE INDEX IF NOT EXISTS idx_codec ON trackmetadata("codec");
+CREATE INDEX IF NOT EXISTS idx_duration ON trackmetadata("duration");
+CREATE INDEX IF NOT EXISTS idx_bitrate_kbps ON trackmetadata("bitrate_kbps");
+CREATE INDEX IF NOT EXISTS idx_sample_rate_hz ON trackmetadata("sample_rate_hz");
+CREATE INDEX IF NOT EXISTS idx_channels ON trackmetadata("channels");
+CREATE INDEX IF NOT EXISTS idx_has_album_art ON trackmetadata("has_album_art");
+CREATE INDEX IF NOT EXISTS idx_tm_cover_art_id ON trackmetadata("cover_art_id");
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_tracks USING fts5(
+    title, artist_name, album_name,
+    content='', content_rowid='id', tokenize='unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_artists USING fts5(
+    name,
+    content='', content_rowid='id', tokenize='unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_albums USING fts5(
+    name, artist_name,
+    content='', content_rowid='id', tokenize='unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Tombstones for tracks deleted from the server. The frontend's incremental
+-- sync only sees rows currently in `tracks`/`trackmetadata` (hard deletes leave
+-- no trace), so without a record of removed uuids the client cannot tell that
+-- something disappeared and stale rows linger until a full local reset.
+CREATE TABLE IF NOT EXISTS track_tombstones (
+    "uuid_id"    TEXT PRIMARY KEY,
+    "deleted_at" INTEGER NOT NULL,
+    -- Monotonic sync watermark, assigned from revision_counter on delete.
+    "revision"   INTEGER NOT NULL DEFAULT 0,
+    "owner_id"   INTEGER NOT NULL REFERENCES users("id")
+);
+
+CREATE INDEX IF NOT EXISTS idx_track_tombstones_deleted_at
+    ON track_tombstones("deleted_at");
+
+CREATE INDEX IF NOT EXISTS idx_track_tombstones_revision
+    ON track_tombstones("revision");
+
+CREATE INDEX IF NOT EXISTS idx_track_tombstones_owner_revision
+    ON track_tombstones("owner_id", "revision");
+
+-- Single-row monotonic counter (id pinned to 0). Every add/update/delete
+-- allocates the next value inside its write transaction, giving incremental
+-- sync a gap-free, clock-independent ordering for tracks and tombstones.
+CREATE TABLE IF NOT EXISTS revision_counter (
+    "id"    INTEGER PRIMARY KEY CHECK ("id" = 0),
+    "value" INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO revision_counter ("id", "value") VALUES (0, 0);
+
+-- Crash-safety journal for master-file edits. A row is written *before* the
+-- destructive filesystem step (a relocate move, or an in-place tag overwrite)
+-- so a crash in the move<->commit window is finished or reverted by an
+-- idempotent reconcile pass at startup. `intent` dispatches the recovery;
+-- Phase 2 adds an "intent='convert'" branch on this same table.
+CREATE TABLE IF NOT EXISTS edit_journal (
+    "id"         INTEGER PRIMARY KEY,
+    "intent"     TEXT NOT NULL,
+    "uuid_id"    TEXT NOT NULL,
+    "old_path"   TEXT,
+    "new_path"   TEXT,
+    "temp_path"  TEXT,
+    "created_at" INTEGER NOT NULL,
+    "owner_id"   INTEGER NOT NULL REFERENCES users("id")
+);
+
+-- Durable master-type conversion jobs (Phase 2). `status` is one of
+-- queued/running/done/failed/cancelled; the actual FS/DB commit for a
+-- conversion is guarded by an "intent='convert'" edit_journal row, not this
+-- table -- this table is job lifecycle/visibility, not crash-safety.
+-- `batch_id` is a nullable hook for a future bulk-conversion feature.
+CREATE TABLE IF NOT EXISTS conversion_jobs (
+    "id"               INTEGER PRIMARY KEY AUTOINCREMENT,
+    "uuid_id"          TEXT NOT NULL,
+    "target_codec"     TEXT NOT NULL,
+    "target_container" TEXT NOT NULL,
+    "target_bitrate"   INTEGER,
+    "status"           TEXT NOT NULL DEFAULT 'queued',
+    "error_text"       TEXT,
+    "batch_id"         TEXT, -- TODO(bulk-jobs): set by a future bulk enqueue
+    "created_at"       INTEGER NOT NULL DEFAULT (unixepoch()),
+    "updated_at"       INTEGER NOT NULL DEFAULT (unixepoch()),
+    "base_revision"    INTEGER,
+    "owner_id"         INTEGER NOT NULL REFERENCES users("id")
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversion_jobs_uuid ON conversion_jobs("uuid_id");
+CREATE INDEX IF NOT EXISTS idx_conversion_jobs_status ON conversion_jobs("status");
+CREATE INDEX IF NOT EXISTS idx_conversion_jobs_owner_id ON conversion_jobs("owner_id", "id");
+
+CREATE TABLE IF NOT EXISTS history_events (
+    "event_uuid" TEXT NOT NULL PRIMARY KEY,
+    "revision" INTEGER NOT NULL UNIQUE CHECK (revision > 0),
+    "kind" TEXT NOT NULL CHECK (length(kind) BETWEEN 1 AND 64),
+    "entity_type" TEXT NOT NULL CHECK (length(entity_type) BETWEEN 1 AND 64),
+    "entity_ref" TEXT NOT NULL CHECK (length(entity_ref) BETWEEN 1 AND 256),
+    "occurred_at" INTEGER NOT NULL CHECK (occurred_at BETWEEN 0 AND 253402300799999),
+    "seconds_played" REAL CHECK (seconds_played IS NULL OR seconds_played >= 0),
+    "track_length" REAL CHECK (track_length IS NULL OR track_length > 0),
+    "received_at" INTEGER NOT NULL,
+    "owner_id" INTEGER NOT NULL REFERENCES users("id")
+);
+
+CREATE INDEX IF NOT EXISTS idx_history_events_owner_revision
+    ON history_events("owner_id", "revision");
+
+CREATE TABLE IF NOT EXISTS history_hook_failures (
+    "id" INTEGER PRIMARY KEY,
+    "subscriber" TEXT NOT NULL,
+    "event_uuid" TEXT NOT NULL,
+    "error" TEXT NOT NULL,
+    "created_at" INTEGER NOT NULL
+);
+
+-- Audio identity (Phase 6.5): one row per track; see the 6.5 spec section 6.1.
+CREATE TABLE IF NOT EXISTS track_audio_identity (
+  uuid_id         TEXT PRIMARY KEY REFERENCES tracks(uuid_id) ON DELETE CASCADE,
+  generation      INTEGER NOT NULL DEFAULT 0,
+  exact_state     TEXT NOT NULL CHECK (exact_state IN ('pending','current','failed','unsupported')),
+  exact_kind      TEXT CHECK (exact_kind IN ('pcm_sha256','pcm_float_sha256','packets_sha256')),
+  exact_digest    TEXT,
+  sample_rate_hz  INTEGER, channels INTEGER, bits_per_sample INTEGER,
+  fp_state        TEXT NOT NULL CHECK (fp_state IN
+                    ('pending','current','unavailable','too_short','low_information','failed')),
+  fp_algorithm    TEXT,
+  match_state     TEXT NOT NULL DEFAULT 'pending' CHECK (match_state IN ('pending','current')),
+  matcher_version TEXT,
+  failure_reason  TEXT,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
+  priority        INTEGER NOT NULL DEFAULT 1,
+  stat_size       INTEGER, stat_mtime_ns INTEGER, stat_inode INTEGER,
+  computed_at     INTEGER,
+  tool_versions   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tai_exact ON track_audio_identity(exact_kind, exact_digest)
+  WHERE exact_digest IS NOT NULL AND exact_state IN ('current','pending');
+CREATE INDEX IF NOT EXISTS idx_tai_work  ON track_audio_identity(priority, next_attempt_at)
+  WHERE exact_state = 'pending' OR fp_state = 'pending' OR match_state = 'pending';
+
+-- Separate table: ~3.8 KB blobs stay out of identity scans.
+-- data = raw little-endian uint32 items, first 120 s.
+CREATE TABLE IF NOT EXISTS track_audio_fingerprint (
+  uuid_id     TEXT PRIMARY KEY REFERENCES track_audio_identity(uuid_id) ON DELETE CASCADE,
+  backend     TEXT NOT NULL, algorithm TEXT NOT NULL,
+  duration_s  REAL NOT NULL CHECK (duration_s > 0), item_count INTEGER NOT NULL,
+  data        BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_taf_duration ON track_audio_fingerprint(duration_s);
+
+-- The composite FKs below need a UNIQUE parent key, so this index comes first.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_uuid_owner ON tracks(uuid_id, owner_id);
+
+-- band_rank: 0 exact / 1 strong / 2 possible. sort_score is 1.0 for exact and never NULL (keyset-safe).
+-- The composite FKs back the per-owner rule (SC-28): both partners are that owner's tracks.
+CREATE TABLE IF NOT EXISTS track_duplicate_candidates (
+  owner_id   INTEGER NOT NULL REFERENCES users(id),
+  uuid_a     TEXT NOT NULL,
+  uuid_b     TEXT NOT NULL,
+  kind       TEXT NOT NULL CHECK (kind IN ('exact','fingerprint')),
+  band_rank  INTEGER NOT NULL CHECK (band_rank IN (0,1,2)),
+  sort_score REAL NOT NULL,
+  matcher_version TEXT NOT NULL,
+  detected_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','dismissed')),
+  status_changed_at INTEGER,
+  PRIMARY KEY (uuid_a, uuid_b),
+  CHECK (uuid_a < uuid_b),
+  FOREIGN KEY (uuid_a, owner_id) REFERENCES tracks(uuid_id, owner_id) ON DELETE CASCADE,
+  FOREIGN KEY (uuid_b, owner_id) REFERENCES tracks(uuid_id, owner_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_tdc_b    ON track_duplicate_candidates(uuid_b);
+-- idx_tdc_list serves Phase 8's per-owner keyset list.
+CREATE INDEX IF NOT EXISTS idx_tdc_list ON track_duplicate_candidates(owner_id, status, band_rank, sort_score DESC, uuid_a, uuid_b);
+
+-- One liveness definition (SC-25): the finder, the candidate refresh and Phase 8's list join through this view; Phase 8 adds its pending-deletion marker here, and no consumer writes its own predicate.
+CREATE VIEW IF NOT EXISTS live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks;
+
+PRAGMA user_version = 14;
+COMMIT;

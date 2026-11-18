@@ -241,4 +241,107 @@ void main() {
       expect((await repo.current())!.catalogReconciled, isFalse);
     });
   });
+
+  // Phase M §7.4 / SC-01 Phase M amendment (M-U21): the library identity is
+  // (instance_id, user_id). Login (M.3c) creates the row with both IDs; a
+  // row without a user (NULL) is an unknown user, never user 0.
+  group('Phase M: the binding carries the user', () {
+    test('ensureProvisional with both ids stores them in the row', () async {
+      final b = await repo.ensureProvisional(
+        'http://a:8000',
+        userId: 7,
+        instanceId: 'inst-1',
+      );
+      expect(b.userId, 7);
+      expect(b.instanceId, 'inst-1');
+      expect(b.localBindingId, 'binding-1');
+      final row = (await rows()).single;
+      expect(row['user_id'], 7);
+      expect(row['instance_id'], 'inst-1');
+    });
+
+    test('without a user the row holds NULL (unknown), not 0', () async {
+      final b = await repo.ensureProvisional('http://a:8000');
+      expect(b.userId, isNull);
+      expect((await rows()).single['user_id'], isNull);
+    });
+
+    test('an existing row is returned unchanged: its user is never '
+        'overwritten', () async {
+      await repo.ensureProvisional('http://a', userId: 7, instanceId: 'i1');
+      final again = await repo.ensureProvisional(
+        'http://b',
+        userId: 8,
+        instanceId: 'i2',
+      );
+      expect(again.userId, 7);
+      expect(again.instanceId, 'i1');
+      expect(again.localBindingId, 'binding-1');
+      expect((await rows()).single['user_id'], 7);
+    });
+
+    test('current() reads the user back', () async {
+      await repo.ensureProvisional('http://a', userId: 7, instanceId: 'i1');
+      expect((await repo.current())!.userId, 7);
+    });
+
+    test('recordVerified keeps the user', () async {
+      final b = await repo.ensureProvisional('http://a', userId: 7);
+      await repo.recordVerified(
+        b.localBindingId,
+        instanceId: 'i1',
+        baseUrl: 'http://a2',
+      );
+      final after = (await repo.current())!;
+      expect(after.userId, 7);
+      expect(after.instanceId, 'i1');
+    });
+  });
+
+  // Phase M §7.6 / SC-15 amendment: logout is not a reset. rotate() mints a
+  // new local_binding_id and keeps the identity and the reconciled flag, so
+  // a late durable write from the old scope is a no-op while every local
+  // store stays.
+  group('rotate (logout fence)', () {
+    test('mints a new token and keeps instance, user, URL and reconciled',
+        () async {
+      final b = await repo.ensureProvisional('http://a',
+          userId: 7, instanceId: 'i1');
+      await repo.runFenced(
+          b.localBindingId, repo.markCatalogReconciledInTransaction);
+      final rotated = await repo.rotate();
+      expect(rotated, isNotNull);
+      expect(rotated!.localBindingId, isNot(b.localBindingId));
+      final row = (await repo.current())!;
+      expect(row.localBindingId, rotated.localBindingId);
+      expect(row.instanceId, 'i1');
+      expect(row.userId, 7);
+      expect(row.lastBaseUrl, 'http://a');
+      expect(row.catalogReconciled, isTrue);
+      expect(await rows(), hasLength(1));
+    });
+
+    test("a fenced write with the old scope's token is dropped", () async {
+      final b = await repo.ensureProvisional('http://a',
+          userId: 7, instanceId: 'i1');
+      await repo.rotate();
+      var ran = false;
+      await expectLater(
+        repo.runFenced(b.localBindingId, () async => ran = true),
+        throwsA(isA<BindingFencedException>()),
+      );
+      expect(ran, isFalse);
+    });
+
+    test('the new token is accepted by fenced writes', () async {
+      await repo.ensureProvisional('http://a', userId: 7, instanceId: 'i1');
+      final rotated = (await repo.rotate())!;
+      expect(await repo.runFenced(rotated.localBindingId, () async => 42), 42);
+    });
+
+    test('without a row it creates none', () async {
+      expect(await repo.rotate(), isNull);
+      expect(await rows(), isEmpty);
+    });
+  });
 }

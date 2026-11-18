@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -44,8 +45,8 @@ List<FieldDescriptor> editableFieldsFor(AppInfo info, String entity) {
 }
 
 class AppInfoService {
-  AppInfoService(this._ref, this._prefs, {ApiClient? api})
-      : _api = api ?? ApiClient.instance;
+  AppInfoService(this._ref, this._prefs, {required ApiClient api})
+      : _api = api;
 
   final Ref _ref;
   final SharedPreferences _prefs;
@@ -62,8 +63,9 @@ class AppInfoService {
           ['app', 'info'],
           policy: RetryPolicy.noRetry,
         );
+        final info = AppInfo.fromJson(data);
         await _prefs.setString(_cacheKey, jsonEncode(data));
-        return AppInfo.fromJson(data);
+        return info;
       } catch (e) {
         developer.log('app/info refresh failed: $e', name: 'AppInfoService');
         // fall through to the cache
@@ -76,12 +78,13 @@ class AppInfoService {
     final raw = _prefs.getString(_cacheKey);
     if (raw != null) {
       try {
-        return AppInfo.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+        return AppInfo.fromJson(jsonDecode(raw) as Map<String, dynamic>)
+            .asCached();
       } catch (e) {
         developer.log('app/info cache parse failed: $e', name: 'AppInfoService');
       }
     }
-    return defaultAppInfo();
+    return defaultAppInfo().asCached();
   }
 }
 
@@ -89,5 +92,10 @@ class AppInfoService {
 /// the Get Info page watches it.
 final appInfoProvider = FutureProvider<AppInfo>((ref) async {
   final prefs = await ref.read(sharedPreferencesProvider.future);
-  return AppInfoService(ref, prefs).load();
+  return AppInfoService(
+    ref,
+    prefs,
+    // A public, user-independent path: never send the token (m-R3-11).
+    api: ref.read(publicApiClientProvider),
+  ).load();
 });

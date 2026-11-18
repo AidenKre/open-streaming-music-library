@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:drift/drift.dart' show Value;
@@ -261,19 +262,25 @@ void main() {
 
   test('concurrent reconcile calls dedupe onto a single run', () async {
     int callCount = 0;
+    final gate = Completer<void>();
     final svc = DownloadReconciliationService(
       db: db,
       statusReader: reader,
       fileExists: (path) async {
         callCount++;
-        await Future<void>.delayed(const Duration(milliseconds: 10));
+        await gate.future;
         return false;
       },
     );
     await _insertTrack(db, 'a', filePath: p.join(tmp.path, 'a.m4a'));
     await _insertTrack(db, 'b', filePath: p.join(tmp.path, 'b.m4a'));
 
-    final results = await Future.wait([svc.reconcile(), svc.reconcile()]);
+    // Both calls start while the first run is still parked on the gate, so
+    // the second one can only dedupe onto it.
+    final both = Future.wait([svc.reconcile(), svc.reconcile()]);
+    await pumpEventQueue();
+    gate.complete();
+    final results = await both;
 
     expect(results, [true, true]);
     expect(callCount, 2); // one per row, not two per row.

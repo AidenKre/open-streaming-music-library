@@ -12,7 +12,9 @@ import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/queue_player.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/playback/audio_state.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
@@ -23,6 +25,7 @@ import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import '../helpers/no_server_api.dart';
 
 /// Shared fixtures for the root browse-page (filter chip + in-page search)
 /// widget tests. Everything runs against a real in-memory drift DB with FTS
@@ -135,7 +138,12 @@ class TestOffline extends OfflineModeNotifier {
   final bool initial;
 
   @override
-  bool build() => initial;
+  bool build() {
+    // Keep the product's dispose wiring (cancels the health-poll timer that
+    // the inherited enterOffline starts); the stub's value stays the state.
+    super.build();
+    return initial;
+  }
 
   void set(bool value) => state = value;
 }
@@ -206,6 +214,12 @@ class RecordingRequests extends PlaybackRequests {
               : 'addToQueue',
           'uuids': request.uuids,
         },
+      PlayCollection() => {
+          'method': 'playCollection',
+          'collection': request.collection,
+          'uuids': request.uuids,
+          'shuffle': request.shuffle,
+        },
     });
     return const Accepted(1);
   }
@@ -228,11 +242,13 @@ class BrowseHarness {
     final tempDir = await Directory.systemTemp.createTemp('browse-harness');
     final coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: noServerApi(),
     );
     final manager = DownloadManager(
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
+      apiClient: noServerApi(),
     );
     return BrowseHarness._(db, tempDir, coverStore, manager);
   }
@@ -253,6 +269,7 @@ class BrowseHarness {
     return ProviderScope(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         localCoverArtStoreProvider.overrideWithValue(coverStore),
         downloadManagerProvider.overrideWithValue(manager),
         offlineModeProvider.overrideWith(() => this.offline),

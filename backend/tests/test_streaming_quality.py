@@ -1,15 +1,16 @@
-import importlib
-import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.models import Track, TrackMetaData
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator, EncodeResult
+
+# The master admin's id: only its tracks are routed to default_cache (M.2a).
+ADMIN_OWNER = 1
+
 
 
 def _fake_transcode_factory(payload_for_quality):
@@ -36,6 +37,8 @@ def _install_fake_coordinator(client, payload_for_quality, max_size_bytes=10 * 1
         ctx=EncodedCacheContext(cache_dir=cache_dir, max_size_bytes=max_size_bytes)
     )
     coordinator = EncoderCoordinator(
+        admin_owner_id=client.app.state.encoder_coordinator.admin_owner_id,
+        owner_lookup=client.app.state.encoder_coordinator.owner_lookup,
         cache=new_cache,
         source_lookup=client.app.state.encoder_coordinator.source_lookup,
         workers=2,
@@ -48,20 +51,8 @@ def _install_fake_coordinator(client, payload_for_quality, max_size_bytes=10 * 1
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-
-    sys.modules.pop("app.main", None)
-    sys.modules.pop("app.config", None)
-    import app.main
-
-    importlib.reload(app.main)
-
-    with TestClient(app.main.app) as c:
-        yield c
+def client(app_client):
+    return app_client
 
 
 def _add_track_with_file(
@@ -75,7 +66,7 @@ def _add_track_with_file(
     track_path.write_bytes(b"original-source-bytes" * 100)
     metadata = TrackMetaData(title=name, duration=1.0, codec=codec, bitrate_kbps=bitrate_kbps)
     track = Track(file_path=track_path, metadata=metadata)
-    assert client.app.state.database.add_track(track=track)
+    assert client.app.state.admin_library.add_track(track=track)
     return track
 
 
@@ -352,6 +343,32 @@ class TestStreamQuality:
         # transcoding (since it can't confirm source_bitrate <= requested).
         assert transcode_calls["n"] == 1
 
+    @pytest.mark.integration
+    def test_stream__unknown_bitrate__a_hung_probe_still_answers(
+        self, client, tmp_path, monkeypatch
+    ):
+        """U05-A-06: with no stored bitrate the coordinator probes the source
+        inside the (uuid, quality) lock. A probe that never answers ends at the
+        bound: the bitrate is unknown, the request transcodes and answers."""
+        from tests import hanging_ffprobe
+
+        hanging_ffprobe.install(monkeypatch, tmp_path)
+        hanging_ffprobe.shorten_bound(monkeypatch)
+        track = _add_track_with_file(
+            client, tmp_path, name="hung_probe.mp3", bitrate_kbps=None
+        )
+        _install_fake_coordinator(client, payload_for_quality=lambda br: b"TRANSCODED" * 20)
+
+        with hanging_ffprobe.timed() as elapsed:
+            with client.stream(
+                "GET", f"/tracks/{track.uuid_id}/stream?quality=320"
+            ) as resp:
+                assert resp.status_code == 200
+                body = b"".join(resp.iter_bytes())
+
+        assert elapsed() < hanging_ffprobe.WITHIN_S
+        assert body == b"TRANSCODED" * 20
+
     def test_original_quality_unknown_bitrate__header_omitted(self, client, tmp_path):
         """A master whose bitrate is unknown (NULL) must not be reported as
         "0" -- the client would record a fabricated 0 kbps download."""
@@ -389,7 +406,7 @@ class TestStreamCodecRevisionHeaders:
     def test_passthrough__master_codec_and_revision(self, client, tmp_path, codec, name, quality):
         track = _add_track_with_file(client, tmp_path, name=name, codec=codec)
         _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
-        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+        revision = client.app.state.admin_library.get_track_by_uuid(track.uuid_id).revision
 
         headers = self._get_headers(client, track.uuid_id, quality)
 
@@ -399,7 +416,7 @@ class TestStreamCodecRevisionHeaders:
     def test_transcoded__aac_and_revision(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path, name="t.flac", codec="flac")
         _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
-        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+        revision = client.app.state.admin_library.get_track_by_uuid(track.uuid_id).revision
 
         headers = self._get_headers(client, track.uuid_id, "192")
 
@@ -410,8 +427,8 @@ class TestStreamCodecRevisionHeaders:
         track = _add_track_with_file(client, tmp_path, name="t.mp3", codec="mp3")
         _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
         db = client.app.state.database
-        before = db.get_track_by_uuid(track.uuid_id).revision
-        new_revision = db.apply_track_metadata_edit(track.uuid_id, {"title": "New"}, before)
+        before = client.app.state.admin_library.get_track_by_uuid(track.uuid_id).revision
+        new_revision = client.app.state.admin_library.apply_track_metadata_edit(track.uuid_id, {"title": "New"}, before)
         assert new_revision > before
 
         headers = self._get_headers(client, track.uuid_id)
@@ -421,7 +438,7 @@ class TestStreamCodecRevisionHeaders:
     def test_range_request__also_carries_codec_and_revision(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path, name="t.mp3", codec="mp3")
         _install_fake_coordinator(client, payload_for_quality=lambda br: b"FAKE" * 20)
-        revision = client.app.state.database.get_track_by_uuid(track.uuid_id).revision
+        revision = client.app.state.admin_library.get_track_by_uuid(track.uuid_id).revision
 
         with client.stream(
             "GET", f"/tracks/{track.uuid_id}/stream", headers={"Range": "bytes=0-9"}
@@ -938,6 +955,7 @@ class TestBitratePassthrough:
             return True
 
         coordinator = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -950,7 +968,7 @@ class TestBitratePassthrough:
         source.write_bytes(b"original" * 100)
         coordinator, calls = self._make_coordinator(tmp_path, source)
 
-        result = coordinator.encode_for_stream("uuid-a", "320", source_bitrate_kbps=96)
+        result = coordinator.encode_for_stream("uuid-a", "320", source_bitrate_kbps=96, owner_id=ADMIN_OWNER)
 
         assert result is not None
         assert result.transcoded is False
@@ -963,7 +981,7 @@ class TestBitratePassthrough:
         source.write_bytes(b"original" * 100)
         coordinator, calls = self._make_coordinator(tmp_path, source)
 
-        result = coordinator.encode_for_stream("uuid-a", "192", source_bitrate_kbps=192)
+        result = coordinator.encode_for_stream("uuid-a", "192", source_bitrate_kbps=192, owner_id=ADMIN_OWNER)
 
         assert result is not None
         assert result.transcoded is False
@@ -974,7 +992,7 @@ class TestBitratePassthrough:
         source.write_bytes(b"original" * 100)
         coordinator, calls = self._make_coordinator(tmp_path, source)
 
-        result = coordinator.encode_for_stream("uuid-a", "128", source_bitrate_kbps=320)
+        result = coordinator.encode_for_stream("uuid-a", "128", source_bitrate_kbps=320, owner_id=ADMIN_OWNER)
 
         assert result is not None
         assert result.transcoded is True
@@ -987,7 +1005,7 @@ class TestBitratePassthrough:
         source.write_bytes(b"not-real-audio")  # ffprobe will fail on this
         coordinator, calls = self._make_coordinator(tmp_path, source)
 
-        result = coordinator.encode_for_stream("uuid-a", "192", source_bitrate_kbps=None)
+        result = coordinator.encode_for_stream("uuid-a", "192", source_bitrate_kbps=None, owner_id=ADMIN_OWNER)
 
         # ffprobe returns None → no passthrough → transcode runs
         assert result is not None
@@ -999,7 +1017,7 @@ class TestBitratePassthrough:
         source.write_bytes(b"original" * 100)
         coordinator, calls = self._make_coordinator(tmp_path, source)
 
-        result = coordinator.encode_for_stream("uuid-a", "original", source_bitrate_kbps=256)
+        result = coordinator.encode_for_stream("uuid-a", "original", source_bitrate_kbps=256, owner_id=ADMIN_OWNER)
 
         assert result is not None
         assert result.transcoded is False
@@ -1019,13 +1037,13 @@ class TestBitratePassthrough:
         coordinator, _ = self._make_coordinator(tmp_path, source)
 
         first = coordinator.encode_for_stream(
-            "uuid-a", "320", source_bitrate_kbps=64
+            "uuid-a", "320", source_bitrate_kbps=64, owner_id=ADMIN_OWNER
         )
         assert first is not None and first.transcoded is False
 
         # If the passthrough return path left the lock held, this would hang.
         second = coordinator.encode_for_stream(
-            "uuid-a", "320", source_bitrate_kbps=64
+            "uuid-a", "320", source_bitrate_kbps=64, owner_id=ADMIN_OWNER
         )
         assert second is not None and second.transcoded is False
 
@@ -1054,6 +1072,7 @@ class TestEncoderCoordinatorLocks:
             return True
 
         return EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=cache,
             source_lookup=lambda _: source,
             workers=4,
@@ -1069,7 +1088,7 @@ class TestEncoderCoordinatorLocks:
         source.write_bytes(b"audio")
         coordinator = self._make_coordinator(tmp_path, source)
 
-        coordinator.encode_for_stream("uuid-a", "192")
+        coordinator.encode_for_stream("uuid-a", "192", owner_id=ADMIN_OWNER)
 
         assert ("uuid-a", "192") in coordinator._key_locks
 
@@ -1083,7 +1102,7 @@ class TestEncoderCoordinatorLocks:
 
         for i in range(10):
             for q in ("128", "192", "256", "320"):
-                coordinator.encode_for_stream(f"uuid-{i}", q)
+                coordinator.encode_for_stream(f"uuid-{i}", q, owner_id=ADMIN_OWNER)
 
         assert len(coordinator._key_locks) == 10 * 4
 
@@ -1113,6 +1132,7 @@ class TestEncoderCoordinatorLocks:
             return True
 
         coordinator = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=cache,
             source_lookup=lambda _: source,
             workers=8,
@@ -1123,7 +1143,7 @@ class TestEncoderCoordinatorLocks:
         lock = threading.Lock()
 
         def call():
-            r = coordinator.encode_for_stream("uuid-x", "192")
+            r = coordinator.encode_for_stream("uuid-x", "192", owner_id=ADMIN_OWNER)
             with lock:
                 results.append(r)
 
@@ -1164,6 +1184,7 @@ class TestEncoderCoordinatorLocks:
             return True
 
         coordinator = EncoderCoordinator(
+            admin_owner_id=ADMIN_OWNER,
             cache=cache,
             source_lookup=lambda _: source,
             workers=2,
@@ -1174,12 +1195,12 @@ class TestEncoderCoordinatorLocks:
         result2 = [None]
 
         def first():
-            result1[0] = coordinator.encode_for_stream("uuid-y", "192")
+            result1[0] = coordinator.encode_for_stream("uuid-y", "192", owner_id=ADMIN_OWNER)
 
         def second():
             ready.wait()   # Wait until first thread is inside transcode.
             proceed.set()  # Let first thread finish encoding.
-            result2[0] = coordinator.encode_for_stream("uuid-y", "192")
+            result2[0] = coordinator.encode_for_stream("uuid-y", "192", owner_id=ADMIN_OWNER)
 
         t1 = threading.Thread(target=first)
         t2 = threading.Thread(target=second)
@@ -1192,3 +1213,80 @@ class TestEncoderCoordinatorLocks:
         assert result1[0] is not None
         assert result2[0] is not None
         assert result1[0] == result2[0]
+
+
+class TestStream416ContentRange:
+    """RFC 9110 §15.5.17: a 416 carries ``Content-Range: bytes */<size>`` (7-fix-r0 F0-5)."""
+
+    @pytest.mark.parametrize("header", ["bytes=5000-", "bytes=9-3", "bytes=0-1,3-4", "bytes=abc"])
+    def test_a_416_names_the_served_files_size(self, client, tmp_path, header):
+        track = _add_track_with_file(client, tmp_path)
+        size = track.file_path.stat().st_size
+
+        r = client.get(
+            f"/tracks/{track.uuid_id}/stream?quality=original", headers={"Range": header}
+        )
+
+        assert r.status_code == 416, r.text
+        assert r.headers.get("content-range") == f"bytes */{size}"
+
+
+class TestStreamRangeEdges:
+    """Review r1 7-R1-15: RFC 9110 §14.1.2 clamps a last position at or past the
+    end; §14.2 ignores a Range in a unit the server does not understand."""
+
+    @pytest.mark.parametrize("extra", [0, 1, 10_000_000])
+    def test_a_last_position_at_or_past_the_end_is_clamped(self, client, tmp_path, extra):
+        track = _add_track_with_file(client, tmp_path)
+        size = track.file_path.stat().st_size
+
+        r = client.get(
+            f"/tracks/{track.uuid_id}/stream?quality=original",
+            headers={"Range": f"bytes=1-{size - 1 + extra}"},
+        )
+
+        assert r.status_code == 206, r.text
+        assert r.headers["content-range"] == f"bytes 1-{size - 1}/{size}"
+        assert r.content == track.file_path.read_bytes()[1:]
+
+    def test_a_range_in_another_unit_is_ignored(self, client, tmp_path):
+        track = _add_track_with_file(client, tmp_path)
+
+        r = client.get(
+            f"/tracks/{track.uuid_id}/stream?quality=original", headers={"Range": "items=0-1"}
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.content == track.file_path.read_bytes()
+        assert "content-range" not in r.headers
+
+    def test_the_parser_clamps_and_still_refuses_a_start_past_the_end(self):
+        from app.core.byte_range import parse_byte_range
+
+        assert parse_byte_range("bytes=0-1000", 1000) == (0, 999)
+        assert parse_byte_range("bytes=990-5000", 1000) == (990, 999)
+        with pytest.raises(Exception) as exc:
+            parse_byte_range("bytes=1000-1005", 1000)
+        assert getattr(exc.value, "status_code", None) == 416
+
+
+class TestStreamErrorsCarryNoPaths:
+    """SC-22: an error answer never names a server path (7-fix-r0 F0-1a)."""
+
+    def test_a_vanished_encoded_file_answers_404_without_its_path(
+        self, client, tmp_path, monkeypatch
+    ):
+        track = _add_track_with_file(client, tmp_path)
+        dead = tmp_path / "cache-dir" / "gone-encoded.m4a"
+        coordinator = client.app.state.encoder_coordinator
+        monkeypatch.setattr(
+            coordinator,
+            "encode_for_stream",
+            lambda *a, **k: EncodeResult(path=dead, bitrate_kbps=128, transcoded=True),
+        )
+
+        r = client.get(f"/tracks/{track.uuid_id}/stream?quality=original")
+
+        assert r.status_code == 404, r.text
+        assert str(tmp_path) not in r.text
+        assert "gone-encoded" not in r.text

@@ -233,6 +233,7 @@ def _wait_for(predicate, timeout=5.0):
 _SLEEP = ["sleep", "30"]
 
 
+@pytest.mark.integration
 class TestFfmpegProcessRegistryRealProcesses:
     """Real child processes (``sleep``/``sh``) through run_ffmpeg: the
     command is never inspected, only run, validated and registered."""
@@ -354,6 +355,7 @@ def _wait_dead(proc: subprocess.Popen, timeout: float = 5.0) -> bool:
         return False
 
 
+@pytest.mark.integration
 class TestKillOrphanedFfmpeg:
     @pytest.fixture
     def fake_ffmpeg(self, tmp_path):
@@ -396,3 +398,47 @@ class TestKillOrphanedFfmpeg:
             for p in procs:
                 p.kill()
                 p.wait()
+
+
+# ── 7A.1a review R1: match the dir only as a path argument, never a substring ──
+
+class TestKillOrphanedFfmpegMatching:
+    """Stubbed process list: the matcher must name a pid only when an argument
+    *starts* with the work dir's absolute path, so another server's library
+    whose path merely ends the same way is never touched."""
+
+    def _killed(self, monkeypatch, work_dir, cmdlines):
+        import app.services.ffmpeg_runner as runner
+
+        procs = [(800000 + i, "/usr/bin/ffmpeg", c) for i, c in enumerate(cmdlines)]
+        sent = []
+        monkeypatch.setattr(runner, "_list_processes", lambda: procs)
+        monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: sent.append(pid))
+        monkeypatch.setattr(runner.os, "kill", lambda pid, sig: sent.append(pid))
+        return runner.kill_orphaned_ffmpeg(work_dir), sent
+
+    def test_a_relative_work_dir_never_matches_another_library(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "music" / ".uploads").mkdir(parents=True)
+        ours = tmp_path / "music" / ".uploads" / "b" / "work.flac"
+
+        killed, sent = self._killed(monkeypatch, Path("music/.uploads"), [
+            "ffmpeg -i x -y /srv/other/music/.uploads/a.flac",
+            f"ffmpeg -i x -y {ours}",
+        ])
+
+        assert killed == [800001] and sent == [800001]
+
+    def test_an_absolute_work_dir_never_matches_a_longer_path(self, tmp_path, monkeypatch):
+        uploads = tmp_path / "music dir" / ".uploads"  # space: real libraries have them
+        uploads.mkdir(parents=True)
+
+        killed, _ = self._killed(monkeypatch, uploads, [
+            f"ffmpeg -i x -y /srv{uploads}/a.flac",        # another root ending the same way
+            f"ffmpeg -i x -y {uploads}-old/a.flac",         # sibling sharing the prefix
+            f"ffmpeg -i {uploads}/in.flac -y out.flac",     # ours (input side)
+            f"ffmpeg -i x -f flac file:{uploads}/o.flac",   # ours (protocol prefix)
+        ])
+
+        assert killed == [800002, 800003]

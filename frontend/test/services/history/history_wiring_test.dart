@@ -11,8 +11,10 @@ import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/models/history_event.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -52,7 +54,10 @@ class _Offline extends OfflineModeNotifier {
   _Offline(this.initial);
   final bool initial;
   @override
-  bool build() => initial;
+  bool build() {
+    super.build();
+    return initial;
+  }
   void set(bool v) => state = v;
 }
 
@@ -71,6 +76,8 @@ HistoryEventPayload _event(String uuid) => HistoryEventPayload(
   occurredAt: 1000,
 );
 
+ApiClient api = testApiClient('', MockClient((_) async => throw StateError('no client installed')));
+
 void main() {
   late AppDatabase db;
   late String token;
@@ -85,11 +92,12 @@ void main() {
   ProviderContainer scope({SingleFlightRunner? runner, _Offline? offline}) {
     final c = ProviderContainer(
       overrides: [
+        apiClientProvider.overrideWithValue(api),
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(),
         if (runner != null) historyRunnerProvider.overrideWithValue(runner),
         if (offline != null) offlineModeProvider.overrideWith(() => offline),
-        appInfoProvider.overrideWith((ref) async => const AppInfo(historyVersion: 1)),
+        appInfoProvider.overrideWith((ref) async => const AppInfo(features: FeatureBlocks(history: HistoryFeature(version: 1)))),
       ],
     );
     addTearDown(c.dispose);
@@ -122,7 +130,7 @@ void main() {
     final c = scope(runner: runner);
     final participants = c.read(localQuiescablesProvider);
     expect(participants.map((p) => p.quiesceName),
-        ['playback', 'listens', 'history']);
+        ['playback', 'listens', 'preview', 'history', 'uploads', 'submissions']);
     final history = participants.singleWhere((p) => p.quiesceName == 'history');
     await history.quiesce();
     expect(runner.quiesced, 0, reason: 'nothing built: nothing to stop (branch audit 5A N1)');
@@ -169,7 +177,7 @@ void main() {
   test('end to end: a requested pass uploads a local event and clears it',
       () async {
     final posted = <List<String>>[];
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://test',
       MockClient((req) async {
         if (req.method == 'POST' && req.url.path == '/history') {

@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
 
 /// Displays cover art from the backend when [hasAlbumArt] is true and
 /// [coverArtId] is non-null. Falls back to [fallback] while loading, on error,
 /// or when either condition is not met.
-class CoverArtImage extends StatelessWidget {
+class CoverArtImage extends ConsumerWidget {
   static const int _maxDecodeDimension = 2048;
 
   final bool hasAlbumArt;
@@ -25,7 +26,7 @@ class CoverArtImage extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     if (!hasAlbumArt || coverArtId == null) return fallback;
 
     return LayoutBuilder(
@@ -44,7 +45,7 @@ class CoverArtImage extends StatelessWidget {
         return ClipRRect(
           borderRadius: borderRadius,
           child: Image(
-            image: coverArtCache.imageProvider(
+            image: ref.watch(coverArtCacheProvider).imageProvider(
               coverArtId!,
               cacheWidth: cacheWidth,
               cacheHeight: cacheHeight,

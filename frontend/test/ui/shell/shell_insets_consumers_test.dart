@@ -1,9 +1,7 @@
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/ui/browse/browse_pages.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
@@ -26,10 +24,8 @@ void main() {
   late AppDatabase db;
   late BrowseHarness h;
 
-  setUpAll(() => ApiClient.init('http://localhost:8000'));
 
   setUp(() async {
-    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, [
       // Artist 1: 20 single-track albums (artist detail grid).
@@ -112,7 +108,8 @@ void main() {
   }
 
   Future<void> openEntry(WidgetTester tester, String label) async {
-    await tester.tap(find.text(label));
+    // The entry card ('Downloaded' is also the Home chip's label).
+    await tester.tap(find.byKey(ValueKey('entry.${label.toLowerCase()}')));
     await tester.pumpAndSettle();
   }
 

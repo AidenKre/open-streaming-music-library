@@ -16,6 +16,7 @@ import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/queue_warm_service.dart';
+import '../helpers/no_server_api.dart';
 
 TrackUI _track(
   String uuid, {
@@ -112,21 +113,30 @@ class _StreamingClient extends http.BaseClient {
   }
 }
 
+/// A transport whose delegate each test swaps after the shared client exists.
+class _SwapClient extends http.BaseClient {
+  http.Client inner = MockClient((_) async => http.Response.bytes([7], 200));
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      inner.send(request);
+}
+
 void main() {
   late AppDatabase db;
   late Directory tempDir;
   late LocalCoverArtStore coverStore;
+  late _SwapClient transport;
+  late ApiClient api;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     tempDir = await Directory.systemTemp.createTemp('download-manager-test');
     // Default mock — overridden per-test via buildManager(client: ...).
-    ApiClient.initForTest(
-      'http://test:8080',
-      MockClient((_) async => http.Response.bytes([7], 200)),
-    );
+    transport = _SwapClient();
+    api = testApiClient('http://test:8080', transport);
     coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: api,
     );
   });
 
@@ -144,8 +154,9 @@ void main() {
     bool Function()? isOfflineFn,
     void Function()? onNetworkFailure,
   }) {
-    ApiClient.initForTest('http://test:8080', client);
+    transport.inner = client;
     return DownloadManager(
+      apiClient: api,
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
@@ -1861,21 +1872,19 @@ void main() {
         },
       );
 
-      ApiClient.initForTest(
-        'http://test:8080',
-        MockClient(
-          (_) async => http.Response.bytes(
-            [1, 2, 3],
-            200,
-            headers: {
-              'content-type': 'audio/mp4',
-              'x-audio-extension': 'm4a',
-              'x-audio-bitrate-kbps': '128',
-            },
-          ),
+      transport.inner = MockClient(
+        (_) async => http.Response.bytes(
+          [1, 2, 3],
+          200,
+          headers: {
+            'content-type': 'audio/mp4',
+            'x-audio-extension': 'm4a',
+            'x-audio-bitrate-kbps': '128',
+          },
         ),
       );
       final manager = DownloadManager(
+        apiClient: api,
         db: db,
         coverArtStore: coverStore,
         directoryProvider: () async => tempDir,
@@ -1902,7 +1911,7 @@ class _RecordingWarmService extends QueueWarmService {
   final void Function(List<String> uuids, String quality) onWarmUuids;
 
   _RecordingWarmService({required this.onWarmUuids})
-    : super(queueRepo: _NoopQueueRepo());
+    : super(queueRepo: _NoopQueueRepo(), apiClient: noServerApi());
 
   @override
   void scheduleWarmUuids(List<String> trackUuids, {required String quality}) {

@@ -1,55 +1,28 @@
 import contextlib
-import importlib
-import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 
-_HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
-requires_ffmpeg = pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg/ffprobe not available")
+# Registered marker (plan D16): tests/conftest.py skips without ffmpeg/ffprobe.
+requires_ffmpeg = pytest.mark.requires_ffmpeg
 
 _ALL_CODECS = frozenset({"aac", "alac", "flac", "mp3"})
 
 
-def _start_client(tmp_path, monkeypatch, stack: contextlib.ExitStack, encoders=None) -> TestClient:
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-    if encoders is not None:
-        # Patched where app.main imports it from (the app.services package
-        # re-export) before the reload below, so startup's one-time probe --
-        # feeding both /app/info and the orchestrator's enqueue guard -- sees
-        # this set.
-        fake_probe = lambda: frozenset(encoders)  # noqa: E731
-        monkeypatch.setattr("app.services.probe_available_encoders", fake_probe)
-        monkeypatch.setattr("app.services.transcoder.probe_available_encoders", fake_probe)
-
-    sys.modules.pop("app.main", None)
-    sys.modules.pop("app.config", None)
-    import app.main
-
-    importlib.reload(app.main)
-    return stack.enter_context(TestClient(app.main.app))
+@pytest.fixture
+def client(app_client):
+    return app_client
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def make_client(open_app_client):
     with contextlib.ExitStack() as stack:
-        yield _start_client(tmp_path, monkeypatch, stack)
-
-
-@pytest.fixture
-def make_client(tmp_path, monkeypatch):
-    with contextlib.ExitStack() as stack:
-        yield lambda encoders=None: _start_client(tmp_path, monkeypatch, stack, encoders)
+        yield lambda encoders=None: stack.enter_context(open_app_client(encoders=encoders))
 
 
 class _HeldCoordinator:
@@ -87,7 +60,7 @@ def _add_track_with_file(
     client, tmp_path: Path, codec: str = "flac", bitrate_kbps: float = 1000.0,
     filename: str = "song.flac", real_audio: bool = False,
 ) -> Track:
-    music_dir = tmp_path / "music"
+    music_dir = tmp_path / "music" / "admin"
     music_dir.mkdir(parents=True, exist_ok=True)
     file_path = music_dir / filename
     if real_audio:
@@ -99,12 +72,12 @@ def _add_track_with_file(
         channels=2, title="T", artist="Art",
     )
     track = Track(file_path=file_path, metadata=metadata)
-    assert client.app.state.database.add_track(track)
-    return client.app.state.database.get_track_by_uuid(track.uuid_id)
+    assert client.app.state.admin_library.add_track(track)
+    return client.app.state.admin_library.get_track_by_uuid(track.uuid_id)
 
 
 def _add_track_without_file(client, tmp_path: Path, codec: str = "flac") -> Track:
-    music_dir = tmp_path / "music"
+    music_dir = tmp_path / "music" / "admin"
     music_dir.mkdir(parents=True, exist_ok=True)
     file_path = music_dir / "missing.flac"  # never written
     metadata = TrackMetaData(
@@ -112,8 +85,8 @@ def _add_track_without_file(client, tmp_path: Path, codec: str = "flac") -> Trac
         channels=2, title="T", artist="Art",
     )
     track = Track(file_path=file_path, metadata=metadata)
-    assert client.app.state.database.add_track(track)
-    return client.app.state.database.get_track_by_uuid(track.uuid_id)
+    assert client.app.state.admin_library.add_track(track)
+    return client.app.state.admin_library.get_track_by_uuid(track.uuid_id)
 
 
 def _make_audio(path: Path, codec: str = "flac") -> None:
@@ -266,7 +239,7 @@ class TestPostJobsConflicts:
         assert r.json() == {"detail": {"error": "job_active", "job_id": first_id}}
 
         # Also while it's running.
-        client.app.state.database.mark_conversion_job_running(first_id)
+        client.app.state.admin_library.mark_conversion_job_running(first_id)
         r = _post_job(client, track.uuid_id, "mp3", track.revision, 320)
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["job_id"] == first_id
@@ -275,7 +248,7 @@ class TestPostJobsConflicts:
     def test_post_jobs__journal_row_outstanding__409_pending_recovery(self, held_client, tmp_path):
         client = held_client
         track = _add_track_with_file(client, tmp_path, codec="flac")
-        client.app.state.database.insert_journal_entry(
+        client.app.state.admin_library.insert_journal_entry(
             "convert", track.uuid_id, old_path=str(track.file_path),
             temp_path=str(tmp_path / "pending.tagged.flac"),
         )
@@ -307,8 +280,8 @@ class TestPostJobsConflicts:
 
         client.held.run_last()
         db = client.app.state.database
-        assert db.get_conversion_job(first_id)["status"] == "done"
-        converted = db.get_track_by_uuid(track.uuid_id)
+        assert client.app.state.admin_library.get_conversion_job(first_id)["status"] == "done"
+        converted = client.app.state.admin_library.get_track_by_uuid(track.uuid_id)
         assert converted.revision > track.revision
 
         stale = _post_job(client, track.uuid_id, "mp3", track.revision, 320)
@@ -325,7 +298,7 @@ class TestPostJobsConflicts:
     ):
         client = held_client
         track = _add_track_with_file(client, tmp_path, codec="mp3", filename="Song.mp3")
-        squatter = tmp_path / "music" / "Song.m4a"
+        squatter = tmp_path / "music" / "admin" / "Song.m4a"
         squatter.write_bytes(b"another track")
 
         r = _post_job(client, track.uuid_id, "aac", track.revision, 192)
@@ -347,8 +320,8 @@ class TestGetJobs:
         track_a = _add_track_with_file(client, tmp_path, filename="a.flac")
         track_b = _add_track_with_file(client, tmp_path, filename="b.flac")
         db = client.app.state.database
-        db.insert_conversion_job(track_a.uuid_id, "aac", "m4a", 192)
-        db.insert_conversion_job(track_b.uuid_id, "mp3", "mp3", 320)
+        client.app.state.admin_library.insert_conversion_job(track_a.uuid_id, "aac", "m4a", 192)
+        client.app.state.admin_library.insert_conversion_job(track_b.uuid_id, "mp3", "mp3", 320)
 
         r = client.get("/jobs", params={"uuid_id": track_a.uuid_id})
         assert r.status_code == 200, r.text
@@ -365,11 +338,11 @@ class TestGetJobs:
     def test_get_jobs__comma_separated_statuses__returns_each(self, client, tmp_path):
         db = client.app.state.database
         tracks = [_add_track_with_file(client, tmp_path, filename=f"{n}.flac") for n in "abc"]
-        queued = db.insert_conversion_job(tracks[0].uuid_id, "aac", "m4a", 192)
-        running = db.insert_conversion_job(tracks[1].uuid_id, "aac", "m4a", 192)
-        cancelled = db.insert_conversion_job(tracks[2].uuid_id, "aac", "m4a", 192)
-        db.mark_conversion_job_running(running)
-        db.mark_conversion_job_cancelled(cancelled)
+        queued = client.app.state.admin_library.insert_conversion_job(tracks[0].uuid_id, "aac", "m4a", 192)
+        running = client.app.state.admin_library.insert_conversion_job(tracks[1].uuid_id, "aac", "m4a", 192)
+        cancelled = client.app.state.admin_library.insert_conversion_job(tracks[2].uuid_id, "aac", "m4a", 192)
+        client.app.state.admin_library.mark_conversion_job_running(running)
+        client.app.state.admin_library.mark_conversion_job_cancelled(cancelled)
 
         r = client.get("/jobs", params={"status": "queued,running"})
         assert r.status_code == 200, r.text
@@ -397,7 +370,7 @@ class TestGetJobs:
         job_ids = []
         for n in range(5):
             track = _add_track_with_file(client, tmp_path, filename=f"{n}.flac")
-            job_ids.append(db.insert_conversion_job(track.uuid_id, "aac", "m4a", 192))
+            job_ids.append(client.app.state.admin_library.insert_conversion_job(track.uuid_id, "aac", "m4a", 192))
 
         r = client.get("/jobs", params={"limit": 2})
         body = r.json()
@@ -413,8 +386,8 @@ class TestGetJobs:
         track = _add_track_with_file(client, tmp_path)
         job_ids = []
         for _ in range(7):
-            job_id = db.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
-            db.mark_conversion_job_cancelled(job_id)  # frees the uuid for the next one
+            job_id = client.app.state.admin_library.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+            client.app.state.admin_library.mark_conversion_job_cancelled(job_id)  # frees the uuid for the next one
             job_ids.append(job_id)
 
         seen, cursor, pages = [], 0, 0
@@ -444,8 +417,8 @@ class TestDeleteJobs:
 
     def test_delete_jobs__queued_job__cancelled_true(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
-        job_id = client.app.state.database.insert_conversion_job(
-            track.uuid_id, "aac", "m4a", 192, base_revision=track.revision
+        job_id = client.app.state.admin_library.insert_conversion_job(
+            track.uuid_id, "aac", "m4a", 192, base_revision=track.revision,
         )
 
         r = client.delete(f"/jobs/{job_id}")
@@ -458,17 +431,17 @@ class TestDeleteJobs:
     def test_delete_jobs__running_job__cancelled_true(self, client, tmp_path):
         db = client.app.state.database
         track = _add_track_with_file(client, tmp_path)
-        job_id = db.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
-        db.mark_conversion_job_running(job_id)
+        job_id = client.app.state.admin_library.insert_conversion_job(track.uuid_id, "aac", "m4a", 192)
+        client.app.state.admin_library.mark_conversion_job_running(job_id)
 
         r = client.delete(f"/jobs/{job_id}")
         assert r.json()["cancelled"] is True
-        assert db.get_conversion_job(job_id)["status"] == "cancelled"
+        assert client.app.state.admin_library.get_conversion_job(job_id)["status"] == "cancelled"
 
     def test_delete_jobs__already_cancelled__idempotent_false(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
-        job_id = client.app.state.database.insert_conversion_job(
-            track.uuid_id, "aac", "m4a", 192, base_revision=track.revision
+        job_id = client.app.state.admin_library.insert_conversion_job(
+            track.uuid_id, "aac", "m4a", 192, base_revision=track.revision,
         )
         client.delete(f"/jobs/{job_id}")
 
@@ -529,11 +502,11 @@ class TestAppInfoConversionBlock:
 @requires_ffmpeg
 class TestStartupRecovery:
     def test_restart__fails_running_resumes_queued_sweeps_temps_evicts(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, open_app_client
     ):
         evicted = []
         with contextlib.ExitStack() as stack:
-            client = _start_client(tmp_path, monkeypatch, stack)
+            client = stack.enter_context(open_app_client())
             _hold_worker(client)  # nothing runs before the "crash"
             db = client.app.state.database
             queued_track = _add_track_with_file(
@@ -542,13 +515,13 @@ class TestStartupRecovery:
             running_track = _add_track_with_file(client, tmp_path, filename="r.flac")
             queued = _post_job(client, queued_track.uuid_id, "aac", queued_track.revision, 192)
             queued_id = queued.json()["job_id"]
-            running_id = db.insert_conversion_job(running_track.uuid_id, "aac", "m4a", 192)
-            db.mark_conversion_job_running(running_id)
+            running_id = client.app.state.admin_library.insert_conversion_job(running_track.uuid_id, "aac", "m4a", 192)
+            client.app.state.admin_library.mark_conversion_job_running(running_id)
             staging = tmp_path / "music" / ".staging"
             orphan = staging / f"{running_track.uuid_id}.tagged.m4a"
             orphan.write_bytes(b"left by the crash")
             # An unfinished same-path convert whose temp is already gone.
-            db.insert_journal_entry(
+            client.app.state.admin_library.insert_journal_entry(
                 "convert", running_track.uuid_id,
                 old_path=str(running_track.file_path),
                 temp_path=str(staging / f"{running_track.uuid_id}.tagged.flac"),
@@ -565,24 +538,24 @@ class TestStartupRecovery:
         monkeypatch.setattr(conversion_module, "evict_converted_track_caches", recording_evict)
 
         with contextlib.ExitStack() as stack:
-            client = _start_client(tmp_path, monkeypatch, stack)
+            client = stack.enter_context(open_app_client())
             db = client.app.state.database
 
-            running = db.get_conversion_job(running_id)
+            running = client.app.state.admin_library.get_conversion_job(running_id)
             assert running["status"] == "failed"
             assert running["error_text"] == "interrupted by restart"
             assert not orphan.exists()
-            assert db.list_journal_entries() == []
+            assert client.app.state.admin_library.list_journal_entries() == []
             assert running_track.uuid_id in evicted
 
             job = None
             for _ in range(100):  # the resumed job runs on the real pool
-                job = db.get_conversion_job(queued_id)
+                job = client.app.state.admin_library.get_conversion_job(queued_id)
                 if job["status"] in ("done", "failed", "cancelled"):
                     break
                 time.sleep(0.05)
             assert job["status"] == "done", job
-            assert db.get_track_by_uuid(queued_track.uuid_id).metadata.codec == "aac"
+            assert client.app.state.admin_library.get_track_by_uuid(queued_track.uuid_id).metadata.codec == "aac"
 
 
 @requires_ffmpeg
@@ -609,6 +582,6 @@ class TestJobsEndToEnd:
 
         # file_path is server-local and deliberately not exposed on
         # ClientTrack -- check it directly via the DB.
-        db_track = client.app.state.database.get_track_by_uuid(track.uuid_id)
+        db_track = client.app.state.admin_library.get_track_by_uuid(track.uuid_id)
         assert str(db_track.file_path).endswith(".m4a")
         assert Path(db_track.file_path).exists()

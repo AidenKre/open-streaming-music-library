@@ -6,6 +6,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import '../helpers/no_server_api.dart';
 
 TrackUI _t(String uuid, String? quality) => TrackUI(
   uuidId: uuid,
@@ -22,7 +23,12 @@ TrackUI _t(String uuid, String? quality) => TrackUI(
 
 class _Recording extends DownloadManager {
   _Recording(AppDatabase db, LocalCoverArtStore store, Directory dir, this.failing)
-    : super(db: db, coverArtStore: store, directoryProvider: () async => dir);
+    : super(
+        db: db,
+        coverArtStore: store,
+        directoryProvider: () async => dir,
+        apiClient: noServerApi(),
+      );
   final Set<String> failing;
   final calls = <String>[];
   @override
@@ -45,7 +51,10 @@ void main() {
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     dir = await Directory.systemTemp.createTemp('redownload');
-    store = await LocalCoverArtStore.create(directoryProvider: () async => dir);
+    store = await LocalCoverArtStore.create(
+      directoryProvider: () async => dir,
+      apiClient: noServerApi(),
+    );
   });
   tearDown(() async {
     await db.close();

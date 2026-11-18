@@ -15,12 +15,11 @@ void main() {
     late ArtistAlbumsApi api;
     const artist = 'Pink Floyd';
 
-    setUp(() {
-      api = ArtistAlbumsApi(artist);
-    });
+    ArtistAlbumsApi albumsApi(String url, Client client) =>
+        ArtistAlbumsApi(artist, api: testApiClient(url, client));
 
     test('getInitialItems returns albums for the artist', () async {
-      ApiClient.initForTest(
+      api = albumsApi(
         'http://localhost:8000',
         MockClient((req) async => _albumsResponse(['The Wall', 'Animals'])),
       );
@@ -32,7 +31,7 @@ void main() {
 
     test('getInitialItems sends request with artist name and albums in path', () async {
       Uri? captured;
-      ApiClient.initForTest(
+      api = albumsApi(
         'http://localhost:8000',
         MockClient((req) async {
           captured = req.url;
@@ -52,64 +51,56 @@ void main() {
     });
 
     test('getNextItems sends cursor in query', () async {
-      ApiClient.initForTest(
+      late Future<Response> Function(Request) handler;
+      api = albumsApi(
         'http://localhost:8000',
-        MockClient(
-          (req) async => _albumsResponse(['The Wall'], nextCursor: 'album-cursor'),
-        ),
+        MockClient((req) => handler(req)),
       );
+      handler = (req) async => _albumsResponse(['The Wall'], nextCursor: 'album-cursor');
       await api.getInitialItems();
 
       Uri? captured;
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async {
+      handler = (req) async {
           captured = req.url;
           return _albumsResponse([]);
-        }),
-      );
+        };
       await api.getNextItems();
 
       expect(captured?.queryParameters['cursor'], 'album-cursor');
     });
 
     test('getNextItems deduplicates albums already in the list', () async {
-      ApiClient.initForTest(
+      late Future<Response> Function(Request) handler;
+      api = albumsApi(
         'http://localhost:8000',
-        MockClient(
-          (req) async => _albumsResponse(['The Wall', 'Animals'], nextCursor: 'c1'),
-        ),
+        MockClient((req) => handler(req)),
       );
+      handler = (req) async => _albumsResponse(['The Wall', 'Animals'], nextCursor: 'c1');
       await api.getInitialItems();
 
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async => _albumsResponse(['The Wall', 'Meddle'])),
-      );
+      handler = (req) async => _albumsResponse(['The Wall', 'Meddle']);
       final newItems = await api.getNextItems();
 
       expect(newItems, ['Meddle']);
     });
 
     test('getGottenItems accumulates albums across pages', () async {
-      ApiClient.initForTest(
+      late Future<Response> Function(Request) handler;
+      api = albumsApi(
         'http://localhost:8000',
-        MockClient(
-          (req) async => _albumsResponse(['The Wall'], nextCursor: 'c1'),
-        ),
+        MockClient((req) => handler(req)),
       );
+      handler = (req) async => _albumsResponse(['The Wall'], nextCursor: 'c1');
       await api.getInitialItems();
 
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async => _albumsResponse(['Animals'])),
-      );
+      handler = (req) async => _albumsResponse(['Animals']);
       await api.getNextItems();
 
       expect(api.getGottenItems(), ['The Wall', 'Animals']);
     });
 
     test('getGottenItems returns empty list before any fetch', () {
+      api = albumsApi('http://localhost:8000', MockClient((req) async => Response('', 500)));
       expect(api.getGottenItems(), isEmpty);
     });
   });

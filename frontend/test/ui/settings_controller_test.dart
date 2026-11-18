@@ -10,7 +10,10 @@ class _Offline extends OfflineModeNotifier {
   _Offline(this.initial);
   final bool initial;
   @override
-  bool build() => initial;
+  bool build() {
+    super.build();
+    return initial;
+  }
   void set(bool value) => state = value;
 }
 

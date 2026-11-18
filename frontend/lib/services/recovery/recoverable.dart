@@ -64,6 +64,11 @@ class RecoveryPriority {
   /// (after [appInfo]); the pass itself runs on its SingleFlightRunner.
   static const history = 85;
 
+  /// Resume unfinished uploads (after history and app-info): the manager's
+  /// pass reconstructs server work from the local intents, so it needs no
+  /// page visit.
+  static const uploads = 84;
+
   /// Re-dispatch downloads that were left queued while offline.
   static const resumeDownloads = 80;
 

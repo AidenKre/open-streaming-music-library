@@ -6,6 +6,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:http/testing.dart';
+
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/playback/queue_player.dart';
@@ -21,6 +23,11 @@ import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/local_reset_service.dart';
+import 'package:frontend/services/credential_store.dart';
+import 'package:frontend/services/session_event_log.dart';
+
+import '../helpers/fake_secure_backend.dart';
+import '../helpers/test_credentials.dart';
 
 class _ResetQueuePlayer extends QueuePlayer {
   int stopCalls = 0;
@@ -45,7 +52,10 @@ class _StubOffline extends OfflineModeNotifier {
   final bool _value;
 
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
 
 /// Records the order in which it was reset. Used to verify the
@@ -92,6 +102,9 @@ void main() {
     late SharedPreferences prefs;
     late _ResetQueuePlayer audio;
     late ProviderContainer container;
+    late FakeSecureBackend secure;
+    late CredentialStore credentials;
+    late SessionEventLogFile sessionLog;
 
     setUp(() async {
       SharedPreferences.setMockInitialValues({
@@ -103,19 +116,36 @@ void main() {
         'future.key': 'also removed',
       });
       prefs = await SharedPreferences.getInstance();
-      ApiClient.init('http://localhost:8000');
 
       db = AppDatabase(NativeDatabase.memory());
       tempDir = await Directory.systemTemp.createTemp('local-reset-service-test');
+      final api = testApiClient(
+        'http://localhost:8000',
+        MockClient((_) async => fail('the reset test makes no requests')),
+      );
       coverStore = await LocalCoverArtStore.create(
         directoryProvider: () async => tempDir,
+        apiClient: api,
       );
       downloadManager = DownloadManager(
+        apiClient: api,
         db: db,
         coverArtStore: coverStore,
         directoryProvider: () async => tempDir,
       );
       audio = _ResetQueuePlayer();
+      secure = FakeSecureBackend();
+      credentials = CredentialStore(
+        secure: secure,
+        directory: Directory(p.join(tempDir.path, 'app-support')),
+      );
+      await credentials.save(testCredentials);
+      // Sign-off s7-app-texts item 2: the session log lives next to the
+      // credential fallback file, in the app's support folder.
+      sessionLog = SessionEventLogFile(
+        Directory(p.join(tempDir.path, 'app-support')),
+      );
+      await sessionLog.append('Stored sign-in dropped at launch: reason=x');
 
       container = ProviderContainer(
         overrides: [
@@ -126,6 +156,8 @@ void main() {
           coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           queuePlayerProvider.overrideWith(() => audio),
           offlineModeProvider.overrideWith(() => _StubOffline(true)),
+          credentialStoreProvider.overrideWithValue(credentials),
+          sessionEventLogFileProvider.overrideWithValue(sessionLog),
         ],
       );
     });
@@ -182,13 +214,14 @@ void main() {
       // resume downloads) against state mid-wipe. The notifier itself is
       // disposed when the ProviderScope is rebuilt after a successful reset.
       expect(container.read(offlineModeProvider), isTrue);
-      expect(ApiClient.instance.baseUrl, isEmpty);
       expect(prefs.getKeys(), isEmpty);
       expect(downloadManager.snapshot(), isEmpty);
       expect(downloadFile.existsSync(), isFalse);
       expect(partialFile.existsSync(), isFalse);
       expect(tracksDir.existsSync(), isFalse);
       expect(coverStore.has(77), isFalse);
+      expect(sessionLog.file.existsSync(), isFalse,
+          reason: 'the session log is local state too');
       expect(await db.select(db.tracks).get(), isEmpty);
       expect(await db.select(db.trackmetadata).get(), isEmpty);
       expect(await db.select(db.artists).get(), isEmpty);
@@ -236,14 +269,59 @@ void main() {
       expect(registered, contains(same(downloadManager)));
       expect(registered, contains(same(coverStore)));
       expect(registered, contains(same(db)));
+      expect(registered, contains(same(credentials)));
+      expect(registered, contains(same(sessionLog)));
       // CoverArtCacheManager(noop) is registered via the provider override.
       expect(
         registered.any((r) => r is CoverArtCacheManager),
         isTrue,
       );
-      // 4 direct + 3 adapters = 7 reset steps total (playback is a quiesce
-      // participant, not a wipe step).
-      expect(registered.length, 7);
+      // 5 direct + 2 adapters = 7 reset steps total (playback is a quiesce
+      // participant, not a wipe step; the transport URL is no longer a step:
+      // the scope rebuild after the reset replaces the client, Phase M §7.2;
+      // the credential store is a wipe participant, SC-15 Phase M; the
+      // session log file is one when the app gives it, s7-app-texts).
+      expect(registered.length, 8);
+    });
+
+    // SC-15 Phase M amendment (M-U19 store): the credential store is a wipe
+    // participant: a reset deletes the stored credentials, secure storage
+    // and fallback file alike.
+    test('reset deletes the stored credentials', () async {
+      expect(await credentials.read(), testCredentials);
+      await container.read(localResetServiceProvider).reset();
+      expect(secure.values, isEmpty);
+      expect(await credentials.read(), isNull);
+    });
+
+    test('a credential wipe that fails is reported, and the other steps '
+        'still run', () async {
+      // Neither the secure delete nor the signed-out marker can be written
+      // (review r1 finding 1: a failed secure delete alone is covered by the
+      // marker file).
+      secure.deleteError = StateError('keychain locked');
+      final blocker = File(p.join(tempDir.path, 'not-a-directory'));
+      await blocker.writeAsString('x');
+      credentials = CredentialStore(secure: secure, directory: Directory(blocker.path));
+      final c = ProviderContainer(overrides: [
+        databaseProvider.overrideWithValue(db),
+        sharedPreferencesProvider.overrideWith((_) async => prefs),
+        localCoverArtStoreProvider.overrideWithValue(coverStore),
+        downloadManagerProvider.overrideWithValue(downloadManager),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
+        queuePlayerProvider.overrideWith(() => audio),
+        offlineModeProvider.overrideWith(() => _StubOffline(true)),
+        credentialStoreProvider.overrideWithValue(credentials),
+      ]);
+      addTearDown(c.dispose);
+      final error = await c
+          .read(localResetServiceProvider)
+          .reset()
+          .then<Object?>((_) => null, onError: (Object e) => e);
+      expect(error, isA<LocalResetException>());
+      final failures = (error! as LocalResetException).failures;
+      expect(failures.map((f) => f.participant), [same(credentials)]);
+      expect(await db.select(db.tracks).get(), isEmpty);
     });
   });
 
@@ -346,7 +424,7 @@ void main() {
         final registry = <LocalResettable>[
           _Recording('caches', ResetPriority.clearCaches, log),
           _Recording('audio', ResetPriority.stopBackgroundWork, log),
-          _Recording('transport', ResetPriority.clearTransport, log),
+          _Recording('transport', 0, log),
           _Recording('files', ResetPriority.deleteFiles, log),
           _Recording('downloads', ResetPriority.cancelInFlight, log),
           _Recording('prefs', ResetPriority.clearPreferences, log),

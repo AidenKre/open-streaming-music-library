@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:drift/drift.dart' show Value;
@@ -5,13 +6,17 @@ import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:path/path.dart' as p;
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/authenticated_client.dart';
+import 'package:frontend/services/credential_store.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/track_downloader.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/api/token_permit.dart';
 
 Future<void> _insertTrack(
   AppDatabase db,
@@ -54,20 +59,29 @@ DownloadJob _job(String uuidId, {String quality = '320'}) => DownloadJob(
 Future<Track> _row(AppDatabase db, String uuid) =>
     (db.select(db.tracks)..where((t) => t.uuidId.equals(uuid))).getSingle();
 
+/// A transport whose delegate each test swaps after the shared client exists.
+class _SwapClient extends http.BaseClient {
+  http.Client inner = MockClient((_) async => http.Response.bytes([1], 200));
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      inner.send(request);
+}
+
 void main() {
   late AppDatabase db;
   late Directory tempDir;
   late LocalCoverArtStore coverStore;
+  late _SwapClient transport;
+  late ApiClient api;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     tempDir = await Directory.systemTemp.createTemp('track_downloader_test_');
-    ApiClient.initForTest(
-      'http://test:8080',
-      MockClient((_) async => http.Response.bytes([1], 200)),
-    );
+    transport = _SwapClient();
+    api = testApiClient('http://test:8080', transport);
     coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: api,
     );
   });
 
@@ -79,12 +93,12 @@ void main() {
   });
 
   TrackDownloader buildDownloader(http.Client client) {
-    ApiClient.initForTest('http://test:8080', client);
+    transport.inner = client;
     return TrackDownloader(
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
-      apiClient: ApiClient.instance,
+      apiClient: api,
     );
   }
 
@@ -628,6 +642,279 @@ void main() {
     expect(destFiles, isEmpty);
   });
 
+  // U24-FE-DL-B-03: the downloads folder could not be created (disk full,
+  // no permission). The error escaped download(), so the worker pool never
+  // recorded an outcome and the job stayed active for good.
+  test('a downloads folder that cannot be created is an otherFailure',
+      () async {
+    await _insertTrack(db, 'abc');
+    transport.inner = MockClient((_) async => http.Response.bytes([1], 200));
+    final downloader = TrackDownloader(
+      db: db,
+      coverArtStore: coverStore,
+      directoryProvider: () async =>
+          throw const FileSystemException('Creation failed', '/no/such'),
+      apiClient: api,
+    );
+
+    final outcome = await run(downloader, _job('abc'));
+
+    expect(outcome.kind, DownloadOutcomeKind.otherFailure);
+    expect((await _row(db, 'abc')).filePath, isNull);
+  });
+
+  // U24-FE-DL-A-03: a crash or a failure between writing a download and
+  // recording it leaves files no track row lists. The downloader sweeps them
+  // once, before its first job writes: only its own temporary names, directly
+  // in <documents>/tracks, never a file a track row names, never through a
+  // link.
+  group('the leftover sweep at the downloader\'s start', () {
+    const u1 = '11111111-1111-4111-8111-111111111111';
+    const u2 = '22222222-2222-4222-8222-222222222222';
+    const u3 = '33333333-3333-4333-8333-333333333333';
+    const job1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const job2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    late Directory tracks;
+
+    setUp(() async {
+      tracks = Directory(p.join(tempDir.path, 'tracks'));
+      await tracks.create();
+    });
+
+    Future<File> put(String name, {Directory? into}) async {
+      final f = File(p.join((into ?? tracks).path, name));
+      await f.writeAsBytes([1]);
+      return f;
+    }
+
+    http.Response audio() => http.Response.bytes([1, 2], 200,
+        headers: {'x-audio-extension': 'm4a'});
+
+    Future<void> firstDownload() async {
+      await _insertTrack(db, job1);
+      final outcome = await run(
+          buildDownloader(MockClient((_) async => audio())), _job(job1));
+      expect(outcome.kind, DownloadOutcomeKind.success);
+    }
+
+    test('removes the downloader\'s own temporary files', () async {
+      final leftovers = [
+        await put('$u1.m4a.partial'),
+        await put('$u2.new-1700000000000000.flac.partial'),
+        await put('$u3.new-1700000000000000.m4a'),
+      ];
+      await firstDownload();
+      for (final f in leftovers) {
+        expect(f.existsSync(), isFalse, reason: p.basename(f.path));
+      }
+    });
+
+    test('keeps finished downloads and every name it does not create',
+        () async {
+      final kept = [
+        await put('$u1.m4a'),
+        await put('notes.txt'),
+        await put('x$u1.m4a.partial'),
+        await put('$u1.m4a.partial.keep'),
+        await put('$u1.new-12.m4a.bak'),
+        await put('x$u1.new-12.m4a'),
+        // Wider than the names the downloader writes.
+        await put('$u1.m4a.PARTIAL'),
+        await put('$u1.NEW-12.m4a'),
+        await put('$u1.new-.m4a'),
+        await put('not-a-uuid.m4a.partial'),
+      ];
+      await firstDownload();
+      for (final f in kept) {
+        expect(f.existsSync(), isTrue, reason: p.basename(f.path));
+      }
+    });
+
+    test('keeps a file a track row names', () async {
+      final named = await put('$u1.new-5.m4a');
+      final damaged = await put('$u2.new-6.m4a');
+      await _insertTrack(db, u1);
+      await _insertTrack(db, u2);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(u1)))
+          .write(TracksCompanion(filePath: Value(named.path)));
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(u2)))
+          .write(TracksCompanion(damagedFilePath: Value(damaged.path)));
+      await firstDownload();
+      expect(named.existsSync(), isTrue, reason: 'a row\'s file_path');
+      expect(damaged.existsSync(), isTrue,
+          reason: 'a row\'s damaged_file_path');
+    });
+
+    test('keeps a file whose name a track row gives in another folder',
+        () async {
+      // The documents folder can move (a new app container); a row may
+      // still give the old absolute path of this very file.
+      final named = await put('$u1.new-5.m4a');
+      await _insertTrack(db, u1);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(u1))).write(
+          TracksCompanion(
+              filePath: Value('/old/container/tracks/$u1.new-5.m4a')));
+      await firstDownload();
+      expect(named.existsSync(), isTrue);
+    });
+
+    test('looks only directly inside the downloads folder', () async {
+      final outside = await put('$u1.m4a.partial', into: tempDir);
+      final sub = Directory(p.join(tracks.path, 'sub'));
+      await sub.create();
+      final nested = await put('$u2.m4a.partial', into: sub);
+      await firstDownload();
+      expect(outside.existsSync(), isTrue, reason: 'outside the folder');
+      expect(nested.existsSync(), isTrue, reason: 'in a subfolder');
+    });
+
+    test('leaves a link with a temporary name alone', () async {
+      final elsewhere = await Directory.systemTemp.createTemp('sweep_target_');
+      addTearDown(() => elsewhere.delete(recursive: true));
+      final victim = File(p.join(elsewhere.path, 'victim'));
+      await victim.writeAsBytes([1]);
+      final link = Link(p.join(tracks.path, '$u1.m4a.partial'));
+      await link.create(victim.path);
+      await firstDownload();
+      expect(victim.existsSync(), isTrue);
+      expect(link.existsSync(), isTrue, reason: 'links are never removed');
+    });
+
+    test('sweeps nothing when the downloads folder is a link', () async {
+      await tracks.delete();
+      final elsewhere = await Directory.systemTemp.createTemp('sweep_target_');
+      addTearDown(() => elsewhere.delete(recursive: true));
+      final victim = File(p.join(elsewhere.path, '$u1.m4a.partial'));
+      await victim.writeAsBytes([1]);
+      await Link(tracks.path).create(elsewhere.path);
+      await firstDownload();
+      expect(victim.existsSync(), isTrue);
+    });
+
+    test('sweeps nothing when the track rows cannot be read', () async {
+      final leftover = await put('$u1.m4a.partial');
+      await db.customStatement('ALTER TABLE tracks RENAME TO tracks_moved');
+      await run(buildDownloader(MockClient((_) async => audio())), _job(job1));
+      expect(leftover.existsSync(), isTrue);
+    });
+
+    test('runs once: a job\'s own temporary file survives later jobs',
+        () async {
+      await _insertTrack(db, job1);
+      await _insertTrack(db, job2);
+      final body = StreamController<List<int>>();
+      final downloader = buildDownloader(MockClient.streaming((req, _) async {
+        if (req.url.path.contains(job1)) {
+          return http.StreamedResponse(body.stream, 200,
+              contentLength: 2, headers: {'x-audio-extension': 'm4a'});
+        }
+        return http.StreamedResponse(Stream.value([3]), 200,
+            contentLength: 1, headers: {'x-audio-extension': 'm4a'});
+      }));
+      final first = run(downloader, _job(job1));
+      body.add([1]);
+      final partial = File(p.join(tracks.path, '$job1.m4a.partial'));
+      for (var i = 0; i < 1000 && !partial.existsSync(); i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(partial.existsSync(), isTrue, reason: 'first job is writing');
+
+      final second = await run(downloader, _job(job2));
+      expect(second.kind, DownloadOutcomeKind.success);
+
+      body.add([2]);
+      await body.close();
+      expect((await first).kind, DownloadOutcomeKind.success);
+    });
+  });
+
+  // U24-FE-DL-A-03, second half: the record step failed after the rename.
+  group('a record step that throws', () {
+    Future<void> failRecordWrites() => db.customStatement(
+        'CREATE TRIGGER fail_record BEFORE UPDATE ON tracks '
+        "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END");
+
+    test('removes the renamed file', () async {
+      await _insertTrack(db, 'abc');
+      final downloader = buildDownloader(MockClient((_) async =>
+          http.Response.bytes([1, 2], 200,
+              headers: {'x-audio-extension': 'm4a'})));
+      downloader.testHookBeforeDbWrite = (_) => failRecordWrites();
+
+      final outcome = await run(downloader, _job('abc'));
+
+      expect(outcome.kind, DownloadOutcomeKind.otherFailure);
+      expect((await _row(db, 'abc')).filePath, isNull);
+      expect(Directory(p.join(tempDir.path, 'tracks')).listSync(), isEmpty,
+          reason: 'a file no row lists is left behind');
+    });
+
+    test('keeps the file when a track row names its path', () async {
+      await _insertTrack(db, 'abc');
+      final tracks = Directory(p.join(tempDir.path, 'tracks'));
+      await tracks.create();
+      // A kept damaged copy (decision 6) sits at the destination's name.
+      final dest = File(p.join(tracks.path, 'abc.m4a'));
+      await dest.writeAsBytes([9]);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
+          .write(TracksCompanion(damagedFilePath: Value(dest.path)));
+      final downloader = buildDownloader(MockClient((_) async =>
+          http.Response.bytes([1, 2], 200,
+              headers: {'x-audio-extension': 'm4a'})));
+      downloader.testHookBeforeDbWrite = (_) => failRecordWrites();
+
+      final outcome = await run(downloader, _job('abc'));
+
+      expect(outcome.kind, DownloadOutcomeKind.otherFailure);
+      expect(dest.existsSync(), isTrue, reason: 'a row names this path');
+    });
+  });
+
+  // Review #3: a reset (deleteDownloadDirectory) lands while the folder is
+  // being prepared, and that stale preparation then fails. It must not drop
+  // the newer preparation, or the next job would start a second sweep while
+  // the second job is already writing.
+  test('a stale failing preparation does not start a second sweep',
+      () async {
+    for (final u in ['j1', 'j2', 'j3']) {
+      await _insertTrack(db, u);
+    }
+    transport.inner = MockClient((_) async => http.Response.bytes([1], 200,
+        headers: {'x-audio-extension': 'm4a'}));
+    var calls = 0;
+    final gate1 = Completer<void>();
+    final gate3 = Completer<void>();
+    final downloader = TrackDownloader(
+      db: db,
+      coverArtStore: coverStore,
+      apiClient: api,
+      directoryProvider: () async {
+        final n = ++calls;
+        if (n == 1) {
+          await gate1.future;
+          throw const FileSystemException('Creation failed', '/gone');
+        }
+        if (n == 3) await gate3.future;
+        return tempDir;
+      },
+    );
+
+    final first = run(downloader, _job('j1')); // preparation 1 waits
+    await pumpEventQueue();
+    await downloader.deleteDownloadDirectory(); // the reset
+    final second = run(downloader, _job('j2')); // preparation 2 waits
+    await pumpEventQueue();
+    gate1.complete(); // the stale preparation fails
+    expect((await first).kind, DownloadOutcomeKind.otherFailure);
+    final third = run(downloader, _job('j3')); // shares preparation 2
+    await pumpEventQueue();
+    gate3.complete();
+
+    expect((await second).kind, DownloadOutcomeKind.success);
+    expect((await third).kind, DownloadOutcomeKind.success);
+    expect(calls, 3, reason: 'a second preparation (and sweep) started');
+  });
+
   test('non-2xx HTTP becomes otherFailure', () async {
     final downloader = buildDownloader(
       MockClient((req) async => http.Response('not found', 404)),
@@ -643,4 +930,79 @@ void main() {
     expect(outcome.kind, DownloadOutcomeKind.otherFailure);
     expect(outcome.errorMessage, contains('404'));
   });
+
+  // Phase M §7.2/§7.3, M-U20: the stream URI is built from the downloader's
+  // own (scope-bound) client's base URL, never a process-wide one.
+  test('requests the stream from its own client\'s base URL', () async {
+    await _insertTrack(db, 'abc');
+    final seen = <Uri>[];
+    final downloader = TrackDownloader(
+      db: db,
+      coverArtStore: coverStore,
+      directoryProvider: () async => tempDir,
+      apiClient: testApiClient(
+        'http://scope:9/base',
+        MockClient((req) async {
+          seen.add(req.url);
+          return http.Response.bytes([1, 2, 3], 200);
+        }),
+      ),
+    );
+
+    final outcome = await run(downloader, _job('abc', quality: '256'));
+
+    expect(outcome.kind, DownloadOutcomeKind.success);
+    expect(
+      seen.map((u) => u.toString()),
+      ['http://scope:9/base/tracks/abc/stream?quality=256'],
+    );
+  });
+
+  // Phase M §7.3 (M-U20): downloads authenticate with the header that the
+  // scope's AuthenticatedClient adds; the media token never appears in the
+  // download URI (only JustAudioEngine puts a token in a URL).
+  test('downloads carry the bearer header and no token in the URL', () async {
+    await _insertTrack(db, 'abc');
+    final seen = <http.BaseRequest>[];
+    final downloader = TrackDownloader(
+      db: db,
+      coverArtStore: coverStore,
+      directoryProvider: () async => tempDir,
+      apiClient: testApiClient(
+        'http://scope:9',
+        AuthenticatedClient(
+          MockClient((req) async {
+            seen.add(req);
+            return http.Response.bytes([1, 2, 3], 200);
+          }),
+          const Credentials(
+            token: 'api-token-A',
+            mediaToken: 'media-token-A',
+            userId: 7,
+            username: 'alice',
+          ),
+          permit: const _AllowAllPermit(),
+        ),
+      ),
+    );
+
+    final outcome = await run(downloader, _job('abc', quality: '256'));
+
+    expect(outcome.kind, DownloadOutcomeKind.success);
+    expect(seen.single.headers['Authorization'], 'Bearer api-token-A');
+    expect(
+      seen.single.url.toString(),
+      'http://scope:9/tracks/abc/stream?quality=256',
+    );
+  });
+}
+
+/// Fixture: the subject here is the download request, not the permit
+/// (sign-off OPEN-M-11 has its own tests).
+class _AllowAllPermit implements TokenPermit {
+  const _AllowAllPermit();
+  @override
+  bool allowsTokenTo(Uri url) => true;
+  @override
+  Future<void> verdictSettled() async {}
 }

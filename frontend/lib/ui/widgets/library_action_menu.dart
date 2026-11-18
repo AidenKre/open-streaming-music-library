@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/models/library_scope.dart';
@@ -11,28 +13,42 @@ sealed class LibraryMenuEntry {
 }
 
 /// A plain menu row. A null [onSelected] renders it disabled (shown, not
-/// tappable).
+/// tappable); a row given only [onSubmit] is enabled and its [onSelected]
+/// runs [onSubmit], dropping the message.
 final class LibraryMenuAction extends LibraryMenuEntry {
   const LibraryMenuAction({
     required this.icon,
     required this.label,
-    required this.onSelected,
-  });
+    VoidCallback? onSelected,
+    this.onSubmit,
+  }) : _onSelected = onSelected;
 
   final IconData icon;
   final String label;
-  final VoidCallback? onSelected;
+  final VoidCallback? _onSelected;
+
+  VoidCallback? get onSelected {
+    final submit = onSubmit;
+    return _onSelected ?? (submit == null ? null : () => submit());
+  }
+
+  /// When set, the renderer awaits this instead of [onSelected] and shows
+  /// the text it returns, if any, in a SnackBar. The text comes from the
+  /// controller layer; the view only displays it.
+  final Future<String?> Function()? onSubmit;
 }
 
-/// The split Download row: default quality, or pick one.
+/// The split Download row: default quality, or pick one. Like
+/// [LibraryMenuAction.onSubmit], the renderer awaits each and shows the
+/// text it returns, if any.
 final class LibraryMenuDownload extends LibraryMenuEntry {
   const LibraryMenuDownload({
     required this.onDownload,
     required this.onDownloadAtQuality,
   });
 
-  final VoidCallback onDownload;
-  final void Function(String quality) onDownloadAtQuality;
+  final Future<String?> Function() onDownload;
+  final Future<String?> Function(String quality) onDownloadAtQuality;
 }
 
 /// The one library action menu (SC-06), used by TrackTile, LibraryCard and
@@ -57,6 +73,15 @@ List<LibraryMenuEntry> buildLibraryActionMenu(
   // re-download and offers the Delete of the kept file.
   final damaged = scope is TrackScope && scope.track.isDownloadDamaged;
   final canPlay = availability.canPlay;
+  // U30-A-01: awaited, and a failure is reported (not silent).
+  Future<String?> download() => downloadActionMessage(
+    () => actions.download(scope),
+    damaged ? redownloadFailedMessage : downloadFailedMessage(scope),
+  );
+  Future<String?> deleteDownloads() => downloadActionMessage(
+    () => actions.deleteDownloads(scope),
+    deleteDownloadsFailedMessage(scope),
+  );
   return [
     if (onOpenDetail != null)
       LibraryMenuAction(
@@ -73,12 +98,16 @@ List<LibraryMenuEntry> buildLibraryActionMenu(
     LibraryMenuAction(
       icon: Icons.playlist_play,
       label: 'Play Next',
-      onSelected: canPlay ? () => actions.playNext(scope) : null,
+      onSubmit: canPlay
+          ? () async => playbackOutcomeMessage(await actions.playNext(scope))
+          : null,
     ),
     LibraryMenuAction(
       icon: Icons.queue_music,
       label: 'Add to Queue',
-      onSelected: canPlay ? () => actions.addToQueue(scope) : null,
+      onSubmit: canPlay
+          ? () async => playbackOutcomeMessage(await actions.addToQueue(scope))
+          : null,
     ),
     // Download (the missing tracks) and Delete are independent: a partially
     // downloaded collection shows both.
@@ -86,25 +115,27 @@ List<LibraryMenuEntry> buildLibraryActionMenu(
       LibraryMenuAction(
         icon: Icons.report_problem_outlined,
         label: 'Damaged download: re-download',
-        onSelected:
-            availability.canDownload ? () => actions.download(scope) : null,
+        onSubmit: availability.canDownload ? download : null,
       ),
       LibraryMenuAction(
         icon: Icons.delete_outline,
         label: 'Delete damaged file',
-        onSelected: () => actions.deleteDownloads(scope),
+        onSubmit: deleteDownloads,
       ),
     ] else if (availability.canDownload)
       LibraryMenuDownload(
-        onDownload: () => actions.download(scope),
-        onDownloadAtQuality: (q) => actions.downloadAtQuality(scope, q),
+        onDownload: download,
+        onDownloadAtQuality: (q) => downloadActionMessage(
+          () => actions.downloadAtQuality(scope, q),
+          downloadFailedMessage(scope),
+        ),
       ),
     if (availability.hasAnyDownloaded)
       LibraryMenuAction(
         icon: Icons.delete_outline,
         // Local downloads only; never anything on the server.
         label: isTrack ? 'Delete download' : 'Delete downloads',
-        onSelected: () => actions.deleteDownloads(scope),
+        onSubmit: deleteDownloads,
       ),
     ...extraActions,
   ];
@@ -116,6 +147,15 @@ Future<void> showLibraryActionMenu(
   BuildContext context,
   List<LibraryMenuEntry> entries,
 ) {
+  // The caller's messenger, captured before the sheet closes.
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  Future<void> report(Future<String?> pending) async {
+    final message = await pending;
+    if (message != null && messenger != null && messenger.mounted) {
+      messenger.showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
   return showModalBottomSheet<void>(
     context: SessionHost.sheetContext(context),
     builder: (ctx) => SafeArea(
@@ -129,6 +169,7 @@ Future<void> showLibraryActionMenu(
                   :final icon,
                   :final label,
                   :final onSelected,
+                  :final onSubmit,
                 ) =>
                   ListTile(
                     leading: Icon(icon),
@@ -136,9 +177,13 @@ Future<void> showLibraryActionMenu(
                     enabled: onSelected != null,
                     onTap: onSelected == null
                         ? null
-                        : () {
+                        : () async {
                             Navigator.pop(ctx);
-                            onSelected();
+                            if (onSubmit != null) {
+                              await report(onSubmit());
+                            } else {
+                              onSelected();
+                            }
                           },
                   ),
                 LibraryMenuDownload(
@@ -148,11 +193,11 @@ Future<void> showLibraryActionMenu(
                   SplitDownloadTile(
                     onDownload: () {
                       Navigator.pop(ctx);
-                      onDownload();
+                      unawaited(report(onDownload()));
                     },
                     onDownloadAtQuality: (quality) {
                       Navigator.pop(ctx);
-                      onDownloadAtQuality(quality);
+                      unawaited(report(onDownloadAtQuality(quality)));
                     },
                   ),
               },

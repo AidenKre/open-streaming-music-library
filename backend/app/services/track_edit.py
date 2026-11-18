@@ -25,22 +25,10 @@ class WriteMode(str, Enum):
     db_and_master = "db_and_master"
 
 
-class TrackPatchRequest(BaseModel):
-    """Partial track metadata edit. Only the fields present in the request body
-    are changed; an explicit ``null`` clears that field. ``extra='forbid'`` makes
-    a non-allowlisted field a 422 (advertised set == accepted set), so the edit
-    allowlist is enforced by the schema itself."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    # Required but NULLABLE: a client with an unknown local base (Option A)
-    # sends an explicit null, which must reach the DB layer's
-    # `base_revision is None -> RevisionConflict` branch and come back as a
-    # 409 conflict prompt — NOT a 422, which the client outbox treats as a
-    # permanent rejection and silently discards. A *missing* field is still a
-    # 422 (malformed request, not an unknown base).
-    base_revision: Optional[int] = Field(...)
-    write_mode: WriteMode = WriteMode.db_only
+class EditableFields(BaseModel):
+    """The editable metadata columns with their shared field rules. Present
+    fields are changed; an explicit ``null`` clears; a missing field is
+    untouched."""
 
     title: Optional[str] = None
     artist: Optional[str] = None
@@ -68,13 +56,31 @@ class TrackPatchRequest(BaseModel):
 
     def edit_fields(self) -> dict:
         """The present subset of editable columns (preserving an explicit
-        ``None`` so 'clear' is distinguishable from 'untouched'). ``base_revision``
-        and ``write_mode`` are control fields, not columns, so they are excluded."""
+        ``None`` so 'clear' is distinguishable from 'untouched'). Control fields
+        of subclasses are not columns, so they are excluded."""
         return {
             col: getattr(self, col)
             for col in EDITABLE_METADATA_COLUMNS
             if col in self.model_fields_set
         }
+
+
+class TrackPatchRequest(EditableFields):
+    """Partial track metadata edit. Only the fields present in the request body
+    are changed; an explicit ``null`` clears that field. ``extra='forbid'`` makes
+    a non-allowlisted field a 422 (advertised set == accepted set), so the edit
+    allowlist is enforced by the schema itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Required but NULLABLE: a client with an unknown local base (Option A)
+    # sends an explicit null, which must reach the DB layer's
+    # `base_revision is None -> RevisionConflict` branch and come back as a
+    # 409 conflict prompt — NOT a 422, which the client outbox treats as a
+    # permanent rejection and silently discards. A *missing* field is still a
+    # 422 (malformed request, not an unknown base).
+    base_revision: Optional[int] = Field(...)
+    write_mode: WriteMode = WriteMode.db_only
 
 
 # The request model's typed fields must exactly mirror the field-spec table:

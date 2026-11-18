@@ -18,12 +18,20 @@ class WorkerPool {
     required TrackDownloader downloader,
     required bool Function() isOffline,
     required void Function() onCompleted,
+    Duration resetWorkerWait = resetWorkerWaitBound,
   }) : _queue = queue,
        _downloader = downloader,
        _isOffline = isOffline,
-       _onCompleted = onCompleted;
+       _onCompleted = onCompleted,
+       _resetWorkerWait = resetWorkerWait;
 
   static const int maxConcurrent = 4;
+
+  /// How long [reset] waits for cancelled workers before abandoning the ones
+  /// that have not finished (a hung disk or DB write must not hold a log-out
+  /// or server switch forever). Delete fences are not bounded.
+  static const Duration resetWorkerWaitBound = Duration(seconds: 5);
+  final Duration _resetWorkerWait;
 
   final DownloadQueue _queue;
   final TrackDownloader _downloader;
@@ -43,6 +51,25 @@ class WorkerPool {
   // immediate re-enqueue that callers like enqueueTracksAtQuality rely on.
   final Set<String> _fencedUuids = {};
 
+  /// Set by a 401 (signed out): [pump] schedules nothing. Not the offline
+  /// flag; nothing clears it, the scope rebuild after the next login drops
+  /// the pool.
+  bool get authPaused => _authPaused;
+
+  bool _authPaused = false;
+
+  /// Set when a request was withheld because the server is not verified
+  /// (sign-off OPEN-M-11): [pump] schedules nothing until [resumeAfterVerified].
+  bool get verifyPaused => _verifyPaused;
+  bool _verifyPaused = false;
+
+  /// The next verification arrived: schedules the withheld jobs again. Does
+  /// not clear the 401 pause.
+  void resumeAfterVerified() {
+    _verifyPaused = false;
+    pump();
+  }
+
   /// True iff [uuidId] is currently being fenced by [fenceUuid]. Workers
   /// poll this at every commit checkpoint to bail out cleanly when their
   /// download is being deleted out from under them.
@@ -52,7 +79,7 @@ class WorkerPool {
   void pump() {
     // Paused while offline. Jobs sit in `queued` and get picked up by [pump]
     // again on recovery.
-    if (_isOffline()) return;
+    if (_isOffline() || _authPaused || _verifyPaused) return;
     while (_activeCount < maxConcurrent) {
       final idx = _queue.findFirstQueuedIndex();
       if (idx < 0) return;
@@ -64,7 +91,15 @@ class WorkerPool {
       final uuidId = _queue.jobAt(idx).uuidId;
       final worker = _runJob(uuidId, generation);
       _activeWorkers[uuidId] = worker;
-      unawaited(worker.whenComplete(() => _activeWorkers.remove(uuidId)));
+      unawaited(
+        worker.whenComplete(() {
+          // Only this worker's own entry: an abandoned worker finishing late
+          // must not drop a newer worker's.
+          if (identical(_activeWorkers[uuidId], worker)) {
+            _activeWorkers.remove(uuidId);
+          }
+        }),
+      );
     }
   }
 
@@ -106,7 +141,17 @@ class WorkerPool {
   Future<void> reset() async {
     _resetGeneration++;
 
-    await _cancelAndAwait(_activeWorkers.keys.toList(growable: false));
+    final waitedFor = Map<String, Future<void>>.of(_activeWorkers);
+    await _cancelAndAwait(
+      waitedFor.keys.toList(growable: false),
+      bound: _resetWorkerWait,
+    );
+    // Forget any worker that did not finish: its generation is already bumped,
+    // so a late commit is refused, and a later fence must not wait on it.
+    // Only those waited for: a worker started during the wait stays tracked.
+    waitedFor.forEach((uuid, worker) {
+      if (identical(_activeWorkers[uuid], worker)) _activeWorkers.remove(uuid);
+    });
 
     _activeCount = 0;
     _activeCancellers.clear();
@@ -137,7 +182,13 @@ class WorkerPool {
   /// awaiting any is the load-bearing ordering: awaiting one worker before
   /// cancelling the rest would serialise the teardown. Workers are snapshotted
   /// up front because a worker completing mid-call mutates [_activeWorkers].
-  Future<void> _cancelAndAwait(Iterable<String> uuids) async {
+  ///
+  /// With a [bound] (reset only) the wait for the workers gives up after that
+  /// long; without one (the delete fences) it waits for as long as it takes.
+  Future<void> _cancelAndAwait(
+    Iterable<String> uuids, {
+    Duration? bound,
+  }) async {
     final list = uuids.toList(growable: false);
     if (list.isEmpty) return;
     final workers = [
@@ -152,9 +203,29 @@ class WorkerPool {
         } catch (_) {}
       }
     }
-    if (workers.isNotEmpty) {
+    if (workers.isEmpty) return;
+    if (bound == null) {
       await Future.wait(workers);
+      return;
     }
+    // Bounded: stop waiting after [bound]; the timer is cancelled as soon as
+    // the workers finish first so none outlives the call.
+    final done = Completer<void>();
+    final timer = Timer(bound, () {
+      if (!done.isCompleted) done.complete();
+    });
+    unawaited(
+      Future.wait(workers).then<void>(
+        (_) {
+          if (!done.isCompleted) done.complete();
+        },
+        onError: (Object _) {
+          if (!done.isCompleted) done.complete();
+        },
+      ),
+    );
+    await done.future;
+    timer.cancel();
   }
 
   Future<void> _runJob(String uuidId, int generation) async {
@@ -165,6 +236,7 @@ class WorkerPool {
       );
       if (idx < 0) return;
       final job = _queue.jobAt(idx);
+      Future<void> Function()? registered;
       // A fenced uuid means a delete is in-flight; the downloader treats
       // this exactly like a reset (skip rename, skip DB write, drop the
       // partial file) so the deletion can't be undone by a late commit.
@@ -180,10 +252,16 @@ class WorkerPool {
           );
         },
         registerCanceller: (canceller) {
+          // A worker from before a reset must not register over a newer one.
+          if (generation != _resetGeneration) return;
+          registered = canceller;
           _activeCancellers[job.uuidId] = canceller;
         },
         unregisterCanceller: () {
-          _activeCancellers.remove(job.uuidId);
+          if (registered != null &&
+              identical(_activeCancellers[job.uuidId], registered)) {
+            _activeCancellers.remove(job.uuidId);
+          }
         },
       );
       if (generation != _resetGeneration) return;
@@ -204,6 +282,15 @@ class WorkerPool {
             (j) => j.withStatus(const Queued()),
             where: (j) => j.isActive,
           );
+        case DownloadOutcomeKind.authRequired:
+          // Signed out: back to queued, and stop scheduling so the job
+          // can't hot-loop on 401s.
+          _queue.markJobByUuid(
+            uuidId,
+            (j) => j.withStatus(const Queued()),
+            where: (j) => j.isActive,
+          );
+          _authPaused = true;
         case DownloadOutcomeKind.otherFailure:
           _queue.markJobByUuid(
             uuidId,
@@ -215,6 +302,15 @@ class WorkerPool {
         case DownloadOutcomeKind.cancelled:
           _queue.removeJob(uuidId);
           return;
+        case DownloadOutcomeKind.notVerified:
+          // Nothing was sent: back to a fresh Queued and stop scheduling
+          // until the next verification, so the job can't hot-loop.
+          _queue.markJobByUuid(
+            uuidId,
+            (j) => j.withStatus(const Queued()),
+            where: (j) => j.isActive,
+          );
+          _verifyPaused = true;
       }
     } finally {
       if (generation == _resetGeneration) {

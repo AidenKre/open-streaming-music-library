@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 
 /// Global "local-only mode" flag.
 ///
@@ -29,6 +30,10 @@ class OfflineModeNotifier extends Notifier<bool> {
 
   Timer? _pollTimer;
   bool _pollInFlight = false;
+
+  /// Bumped when polling is cancelled or offline mode is left: a health
+  /// check already in flight is then dropped instead of flipping the state.
+  int _pollGeneration = 0;
 
   /// Whether health polling is scheduled (tests assert a blocked session
   /// never polls).
@@ -60,6 +65,7 @@ class OfflineModeNotifier extends Notifier<bool> {
   /// exit, this is an explicit lifecycle call: used on disconnect, when there
   /// is no trusted server URL left to poll. Safe to call when already online.
   void exitOffline() {
+    _pollGeneration++;
     _pollTimer?.cancel();
     _pollTimer = null;
     if (state) state = false;
@@ -74,6 +80,7 @@ class OfflineModeNotifier extends Notifier<bool> {
   /// reset still nukes the underlying notifier when the provider scope is
   /// rebuilt, so we only need to stop polling here.
   void cancelOfflinePolling() {
+    _pollGeneration++;
     _pollTimer?.cancel();
     _pollTimer = null;
   }
@@ -87,17 +94,23 @@ class OfflineModeNotifier extends Notifier<bool> {
   /// this one finishes, so polls can never overlap or stack up. The
   /// [_pollInFlight] guard is belt-and-suspenders against re-entrancy.
   Future<void> _poll() async {
-    if (_disposed || !state || _pollInFlight) return;
+    if (_disposed || !state) return;
+    if (_pollInFlight) {
+      // An older check still hangs: keep this generation's chain going.
+      _scheduleNextPoll();
+      return;
+    }
     _pollInFlight = true;
+    final generation = _pollGeneration;
     var recovered = false;
     try {
       // Single attempt — polling is itself the retry loop.
-      final result = await ApiClient.instance.healthCheck(retry: false);
+      final result = await ref.read(publicApiClientProvider).healthCheck(retry: false);
       recovered = result.isOk;
     } finally {
       _pollInFlight = false;
     }
-    if (_disposed) return;
+    if (_disposed || generation != _pollGeneration) return;
     if (recovered) {
       state = false;
       _pollTimer?.cancel();

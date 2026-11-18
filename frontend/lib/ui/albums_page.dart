@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
+import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/album_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -11,6 +12,7 @@ import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/utils/cover_art_prefetcher.dart';
 import 'package:frontend/ui/widgets/album_card.dart';
+import 'package:frontend/ui/widgets/collection_action_header.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
 
 class AlbumsPage extends ConsumerStatefulWidget {
@@ -70,6 +72,11 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
     final isOffline = ref.watch(offlineModeProvider);
     return Column(
       children: [
+        if (!hasBrowseControls && widget.artistId != null)
+          CollectionActionHeader(
+            scope: ArtistScope(artistId: widget.artistId!),
+            empty: !hasMore && paginatedItems.isEmpty,
+          ),
         if (hasBrowseControls)
           buildBrowseHeader(hintText: 'Search albums')
         else if (isOffline)
@@ -125,7 +132,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
               .map((a) => a.coverArtId)
               .whereType<int>()
               .toList();
-          prefetchCoverArt(ids);
+          prefetchCoverArt(ref, ids);
         }
         return AlbumCard(
           album: album,

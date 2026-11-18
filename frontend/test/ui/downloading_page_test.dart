@@ -53,20 +53,29 @@ Future<void> _insertTrack(AppDatabase db, String uuid) async {
       );
 }
 
+/// A transport whose delegate each test swaps after the shared client exists.
+class _SwapClient extends http.BaseClient {
+  http.Client inner = MockClient((_) async => http.Response.bytes([1], 200));
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      inner.send(request);
+}
+
 void main() {
   late AppDatabase db;
   late Directory tempDir;
   late LocalCoverArtStore coverStore;
+  late _SwapClient transport;
+  late ApiClient api;
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
     tempDir = await Directory.systemTemp.createTemp('downloading-page-test');
-    ApiClient.initForTest(
-      'http://test:8080',
-      MockClient((_) async => http.Response.bytes([1], 200)),
-    );
+    transport = _SwapClient();
+    api = testApiClient('http://test:8080', transport);
     coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: api,
     );
   });
 
@@ -78,8 +87,9 @@ void main() {
   });
 
   DownloadManager buildManager({required http.Client client}) {
-    ApiClient.initForTest('http://test:8080', client);
+    transport.inner = client;
     return DownloadManager(
+      apiClient: api,
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,
@@ -164,6 +174,7 @@ void main() {
       await _waitForDownloads(manager);
     });
     final offlineManager = DownloadManager(
+      apiClient: api,
       db: db,
       coverArtStore: coverStore,
       directoryProvider: () async => tempDir,

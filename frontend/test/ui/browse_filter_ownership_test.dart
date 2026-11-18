@@ -36,9 +36,9 @@ void main() {
     Scaffold(body: page),
     overrides: [
       browseFilterControllerFactoryProvider.overrideWith(
-        (ref) => ({policy = OfflineFilterPolicy.autoApply}) {
+        (ref) => ({policy = OfflineFilterPolicy.autoApply, initial}) {
           final controls = _RecordingFilterControls(
-            BrowseFilterController(ref, policy: policy),
+            BrowseFilterController(ref, policy: policy, initial: initial),
           );
           created.add(controls);
           return controls;

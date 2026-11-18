@@ -1,23 +1,18 @@
+import 'dart:io' show File;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/local_resettable.dart';
 
-/// Global instance shared by all consumers. Initialised once at app startup
-/// via [initCoverArtCache] and read by the Riverpod provider, widgets, and
-/// the prefetch helper.
-late CoverArtCacheManager coverArtCache;
-
-/// Call once during app startup (e.g. in `main()`).
-/// An optional [manager] can be passed for testing.
-void initCoverArtCache([CoverArtCacheManager? manager]) {
-  coverArtCache = manager ?? CoverArtCacheManager();
-}
+/// The process-wide disk cache, overridden at startup; null means no disk
+/// cache.
+final coverArtDiskCacheProvider = Provider<BaseCacheManager?>((ref) => null);
 
 /// Encapsulates all cover-art caching logic.
 ///
@@ -26,20 +21,63 @@ void initCoverArtCache([CoverArtCacheManager? manager]) {
 /// system media notification (audio service).
 class CoverArtCacheManager implements LocalResettable {
   CoverArtCacheManager({
+    required ApiClient api,
     BaseCacheManager? cache,
     LocalCoverArtStore? localStore,
-  }) : _cache = cache ?? DefaultCacheManager(),
-       _localStore = localStore;
+    Map<String, String>? authHeaders,
+    Future<bool> Function()? mayAttachToken,
+  }) : _api = api,
+       _cache = cache,
+       _localStore = localStore,
+       _authHeaders = authHeaders,
+       _mayAttachToken = mayAttachToken;
 
   /// Creates a [CoverArtCacheManager] without a backing cache.
   /// Only for use in tests where the cache is not exercised.
   @visibleForTesting
-  CoverArtCacheManager.noop() : _cache = null, _localStore = null;
+  CoverArtCacheManager.noop({ApiClient? api})
+    : _api = api,
+      _cache = null,
+      _localStore = null,
+      _authHeaders = null,
+      _mayAttachToken = null;
 
+  final ApiClient? _api;
   final BaseCacheManager? _cache;
   final LocalCoverArtStore? _localStore;
 
-  String _url(int coverArtId) => ApiClient.instance.coverArtUrl(coverArtId);
+  /// This scope's auth header, passed per call (spec 7.2). It is never stored
+  /// in the cache database, and cache keys stay token-free.
+  final Map<String, String>? _authHeaders;
+
+  /// Asked per request before the token is attached (the binding gate's
+  /// permit). Null with a token present means no: fail closed.
+  final Future<bool> Function()? _mayAttachToken;
+
+  /// Fetches [url] through [cache]. Without an auth header: a plain fetch.
+  /// With one: the disk cache is checked first and a still-valid hit is
+  /// served without asking the permit (no fetch, so no token). Only when a
+  /// fetch is needed does the token go out, and only when the permit says yes
+  /// right now; otherwise nothing touches the network -- a stale file on disk
+  /// is served, else this throws (callers already treat a failure as "no art").
+  Future<File> _fetch(BaseCacheManager cache, String url) async {
+    final headers = _authHeaders;
+    if (headers == null || headers.isEmpty) return cache.getSingleFile(url);
+    final cached = await cache.getFileFromCache(url);
+    if (cached != null && cached.validTill.isAfter(DateTime.now())) {
+      return cached.file;
+    }
+    var may = false;
+    try {
+      may = await (_mayAttachToken?.call() ?? Future.value(false));
+    } catch (_) {}
+    if (may) return cache.getSingleFile(url, headers: headers);
+    if (cached != null) return cached.file;
+    throw StateError('cover art not available without the token');
+  }
+
+  String _url(int coverArtId) =>
+      _api?.coverArtUrl(coverArtId) ?? '/cover_art/$coverArtId';
 
   /// Returns an [ImageProvider] backed by the disk cache.
   ///
@@ -66,7 +104,7 @@ class CoverArtCacheManager implements LocalResettable {
     final cache = _cache;
     final ImageProvider provider = cache == null
         ? NetworkImage(url)
-        : CoverArtImageProvider(url, cache);
+        : CoverArtImageProvider(url, cache, () => _fetch(cache, url));
     return ResizeImage.resizeIfNeeded(cacheWidth, cacheHeight, provider);
   }
 
@@ -85,7 +123,7 @@ class CoverArtCacheManager implements LocalResettable {
     final local = _localStore;
     for (final id in coverArtIds.toSet()) {
       if (local != null && local.has(id)) continue;
-      cache.getSingleFile(_url(id)).ignore();
+      _fetch(cache, _url(id)).ignore();
     }
   }
 
@@ -111,9 +149,10 @@ class CoverArtCacheManager implements LocalResettable {
 
   /// Resolves the best available [Uri] for [MediaItem.artUri].
   ///
-  /// Returns a `file://` URI when the image is available locally (either via
-  /// [LocalCoverArtStore] or the network cache), a network URL when it is not,
-  /// or `null` when the track has no cover art.
+  /// Returns a `file://` URI when the image is stored locally, cached, or can
+  /// be fetched into the cache with the auth header. Never a network URL (the
+  /// OS cannot send the header): `null` when the track has no cover art, there
+  /// is no cache, or the fetch fails (spec 7.3).
   Future<Uri?> resolveArtUri({
     required bool hasAlbumArt,
     required int? coverArtId,
@@ -128,8 +167,14 @@ class CoverArtCacheManager implements LocalResettable {
     if (cache != null) {
       final fileInfo = await cache.getFileFromCache(url);
       if (fileInfo != null) return Uri.file(fileInfo.file.path);
+      try {
+        final file = await _fetch(cache, url);
+        return Uri.file(file.path);
+      } catch (_) {
+        return null;
+      }
     }
-    return Uri.parse(url);
+    return null;
   }
 }
 
@@ -142,7 +187,12 @@ class CoverArtImageProvider extends ImageProvider<CoverArtImageProvider> {
   final String url;
   final BaseCacheManager cache;
 
-  const CoverArtImageProvider(this.url, this.cache);
+  /// Loads the file (decides per call whether the token may be sent). Not
+  /// part of identity ([==], [hashCode]), so the image cache key stays
+  /// token-free.
+  final Future<File> Function() load;
+
+  const CoverArtImageProvider(this.url, this.cache, this.load);
 
   @override
   ImageStreamCompleter loadImage(
@@ -156,7 +206,7 @@ class CoverArtImageProvider extends ImageProvider<CoverArtImageProvider> {
   }
 
   Future<ui.Codec> _loadAsync(ImageDecoderCallback decode) async {
-    final file = await cache.getSingleFile(url);
+    final file = await load();
     final bytes = await file.readAsBytes();
     final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
     return decode(buffer);
@@ -173,4 +223,7 @@ class CoverArtImageProvider extends ImageProvider<CoverArtImageProvider> {
 
   @override
   int get hashCode => url.hashCode;
+
+  @override
+  String toString() => 'CoverArtImageProvider($url)';
 }

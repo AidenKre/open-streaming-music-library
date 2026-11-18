@@ -48,7 +48,7 @@ HistoryServerEvent _server(String uuid, int revision, {double seconds = 30.5}) =
 
 /// Scripted /history server.
 class _FakeApi extends HistoryApi {
-  _FakeApi() : super(api: null);
+  _FakeApi(ApiClient client) : super(api: client);
   final posted = <List<String>>[];
   final pulledAfter = <int>[];
   Object? Function(HistoryUploadBatch batch) onPost = (b) => b.eventUuids;
@@ -83,14 +83,14 @@ void main() {
 
   setUp(() async {
     // The fake API never uses the client; any request would be a test bug.
-    ApiClient.initForTest(
+    final client = testApiClient(
       'http://srv',
       MockClient((_) async => throw StateError('no real requests')),
     );
     db = AppDatabase(NativeDatabase.memory());
     token = await seedTestBinding(db);
     repo = HistoryRepository(db);
-    api = _FakeApi();
+    api = _FakeApi(client);
     cursors = SyncCursorStore(db);
     offline = false;
     verified = true;
@@ -597,6 +597,32 @@ void main() {
     final out = await service().runPass({'timer'});
     expect(out, isA<PassDone>());
     expect(api.posted, isEmpty, reason: 'the fenced batch read stops it first');
+  });
+
+  // Phase M §7.7 (M-U24): a 401 parks the history runner (the session is
+  // signed out, the gate closed) instead of a transient retry; nothing is
+  // quarantined or marked failed, every event stays pending.
+  group('a 401 parks', () {
+    ApiException unauthorized() => _http(401, {
+      'code': 'invalid_token', 'message': 'Sign in again.',
+    });
+
+    test('on upload: parked, the events stay pending, no pull', () async {
+      await repo.insertLocal(token, _event('a'));
+      api.onPost = (_) => throw unauthorized();
+      final out = await service().runPass({'timer'});
+      expect(out, isA<PassParked>());
+      expect(await pending(), {'a': 1});
+      expect(await failures(), isEmpty);
+      expect(api.pulledAfter, isEmpty, reason: 'no request after the 401');
+    });
+
+    test('on pull: parked, the cursor unchanged', () async {
+      api.onChanges = (_) => throw unauthorized();
+      final out = await service().runPass({'timer'});
+      expect(out, isA<PassParked>());
+      expect(await cursors.read(SyncStream.history), 0);
+    });
   });
 }
 

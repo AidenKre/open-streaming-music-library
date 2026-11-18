@@ -6,6 +6,9 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/authenticated_client.dart';
+import 'package:frontend/api/token_permit.dart';
+import 'package:frontend/services/credential_store.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/queue_warm_service.dart';
 
@@ -14,6 +17,7 @@ class _FakeQueueRepo implements QueueRepository {
   int callCount = 0;
   int? lastStartPlayPosition;
   int? lastLimit;
+  Object? readError;
   _FakeQueueRepo(this.entries);
 
   @override
@@ -23,6 +27,8 @@ class _FakeQueueRepo implements QueueRepository {
     int? limit,
   }) async {
     callCount++;
+    final error = readError;
+    if (error != null) throw error;
     lastStartPlayPosition = startPlayPosition;
     lastLimit = limit;
     return entries
@@ -44,12 +50,112 @@ QueuePlaybackEntry _entry(String uuid, int itemId) => QueuePlaybackEntry(
       uuidId: uuid,
     );
 
+ApiClient _api = testApiClient(
+  'http://test:8080',
+  MockClient((_) async => throw StateError('no client installed')),
+);
+
 void _installMockClient(http.Client client) {
-  ApiClient.initForTest('http://test:8080', client);
+  _api = testApiClient('http://test:8080', client);
+}
+
+/// Runs [body] in testWidgets' FakeAsync zone so the service's 500 ms debounce
+/// timers fire in virtual time via tester.pump(duration). Uncaught async
+/// errors still fail the test.
+void _fakeTest(String name, Future<void> Function(WidgetTester tester) body) {
+  testWidgets(name, body);
+}
+
+/// Refuses the token: the server is not verified (sign-off OPEN-M-11).
+class _Refuse implements TokenPermit {
+  @override
+  bool allowsTokenTo(Uri url) => false;
+  @override
+  Future<void> verdictSettled() async {}
 }
 
 void main() {
-  test('scheduleWarm POSTs to /tracks/warm after the debounce', () async {
+  // Sign-off OPEN-M-11: while the server is not verified the token client
+  // withholds the warm-up. It is advisory: one log line, no retry, and no
+  // unhandled error (testWidgets fails on one).
+  group('while the server is not verified', () {
+    late int requests;
+    setUp(() {
+      requests = 0;
+      _api = testApiClient(
+        'http://test:8080',
+        AuthenticatedClient(
+          MockClient((req) async {
+            requests++;
+            return http.Response('', 204);
+          }),
+          const Credentials(
+              token: 't', mediaToken: 'm', userId: 1, username: 'u'),
+          permit: _Refuse(),
+        ),
+      );
+    });
+
+    _fakeTest('scheduleWarm sends nothing and raises no error',
+        (tester) async {
+      final service = QueueWarmService(
+        apiClient: _api,
+        queueRepo: _FakeQueueRepo([_entry('a', 0), _entry('b', 1)]),
+      );
+      addTearDown(service.dispose);
+      service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
+      await tester.pump(const Duration(milliseconds: 700));
+      expect(requests, 0);
+    });
+
+    _fakeTest('scheduleWarmUuids sends nothing and raises no error',
+        (tester) async {
+      final service = QueueWarmService(
+        apiClient: _api,
+        queueRepo: _FakeQueueRepo(const []),
+      );
+      addTearDown(service.dispose);
+      service.scheduleWarmUuids(['a', 'b'], quality: '256');
+      await tester.pump(const Duration(milliseconds: 700));
+      expect(requests, 0);
+    });
+  });
+
+  // U20-FE-QUEUE-B-10: warming is advisory; nothing in it may raise an
+  // unhandled error from its timer (testWidgets fails on one).
+  _fakeTest('U20-FE-QUEUE-B-10: a failing queue read is logged, not raised',
+      (tester) async {
+    var requests = 0;
+    _installMockClient(MockClient((req) async {
+      requests++;
+      return http.Response('', 204);
+    }));
+    final repo = _FakeQueueRepo([_entry('a', 0)])
+      ..readError = StateError('database closed');
+    final service = QueueWarmService(apiClient: _api, queueRepo: repo);
+    addTearDown(service.dispose);
+
+    service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
+    await tester.pump(const Duration(milliseconds: 700));
+
+    expect(repo.callCount, 1);
+    expect(requests, 0);
+  });
+
+  _fakeTest('U20-FE-QUEUE-B-10: an unexpected error from the request is '
+      'logged, not raised', (tester) async {
+    _installMockClient(MockClient((req) async => throw StateError('boom')));
+    final service = QueueWarmService(
+      apiClient: _api,
+      queueRepo: _FakeQueueRepo([_entry('a', 0)]),
+    );
+    addTearDown(service.dispose);
+
+    service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
+    await tester.pump(const Duration(milliseconds: 700));
+  });
+
+  _fakeTest('scheduleWarm POSTs to /tracks/warm after the debounce', (tester) async {
     Uri? capturedUrl;
     Map<String, dynamic>? capturedBody;
     _installMockClient(MockClient((req) async {
@@ -58,13 +164,14 @@ void main() {
       return http.Response('', 204);
     }));
     final service = QueueWarmService(
+      apiClient: _api,
       queueRepo: _FakeQueueRepo([_entry('a', 0), _entry('b', 1)]),
     );
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
 
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    await tester.pump(const Duration(milliseconds: 700));
 
     expect(capturedUrl?.path, '/tracks/warm');
     expect(capturedBody?['session_id'], '7');
@@ -73,7 +180,29 @@ void main() {
     expect(capturedBody?['track_uuids'], ['a', 'b']);
   });
 
-  test('respects currentPlayPosition when fetching entries', () async {
+  // Review r1 m-R1-30: the queue-path warm also waits while offline or
+  // signed out (the 401 signed-out reason turns offline on); with a queue
+  // that has entries, only the guard stops the POST.
+  _fakeTest('scheduleWarm sends nothing while offline or signed out', (tester) async {
+    var requests = 0;
+    _installMockClient(MockClient((req) async {
+      requests++;
+      return http.Response('', 204);
+    }));
+    final service = QueueWarmService(
+      apiClient: _api,
+      queueRepo: _FakeQueueRepo([_entry('a', 0), _entry('b', 1)]),
+      isOfflineFn: () => true,
+    );
+    addTearDown(service.dispose);
+
+    service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '256');
+    await tester.pump(const Duration(milliseconds: 700));
+
+    expect(requests, 0);
+  });
+
+  _fakeTest('respects currentPlayPosition when fetching entries', (tester) async {
     final repo = _FakeQueueRepo([
       _entry('a', 0),
       _entry('b', 1),
@@ -84,23 +213,24 @@ void main() {
       capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
       return http.Response('', 204);
     }));
-    final service = QueueWarmService(queueRepo: repo);
+    final service = QueueWarmService(apiClient: _api, queueRepo: repo);
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 1, quality: '192');
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    await tester.pump(const Duration(milliseconds: 700));
 
     expect(repo.lastStartPlayPosition, 1);
     expect(capturedBody?['track_uuids'], ['b', 'c']);
   });
 
-  test('debounces rapid calls into a single POST', () async {
+  _fakeTest('debounces rapid calls into a single POST', (tester) async {
     var postCount = 0;
     _installMockClient(MockClient((req) async {
       postCount++;
       return http.Response('', 204);
     }));
     final service = QueueWarmService(
+      apiClient: _api,
       queueRepo: _FakeQueueRepo([_entry('a', 0)]),
     );
     addTearDown(service.dispose);
@@ -109,42 +239,42 @@ void main() {
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
 
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    await tester.pump(const Duration(milliseconds: 700));
     expect(postCount, 1);
   });
 
-  test('does nothing when sessionId is null', () async {
+  _fakeTest('does nothing when sessionId is null', (tester) async {
     var postCount = 0;
     final repo = _FakeQueueRepo([_entry('a', 0)]);
     _installMockClient(MockClient((_) async {
       postCount++;
       return http.Response('', 204);
     }));
-    final service = QueueWarmService(queueRepo: repo);
+    final service = QueueWarmService(apiClient: _api, queueRepo: repo);
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: null, currentPlayPosition: 0, quality: '320');
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    await tester.pump(const Duration(milliseconds: 700));
 
     expect(postCount, 0);
     expect(repo.callCount, 0);
   });
 
-  test('does not POST when the queue is empty', () async {
+  _fakeTest('does not POST when the queue is empty', (tester) async {
     var postCount = 0;
     _installMockClient(MockClient((_) async {
       postCount++;
       return http.Response('', 204);
     }));
-    final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+    final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    await tester.pump(const Duration(milliseconds: 700));
     expect(postCount, 0);
   });
 
-  test('caps the request body at 50 track UUIDs', () async {
+  _fakeTest('caps the request body at 50 track UUIDs', (tester) async {
     Map<String, dynamic>? capturedBody;
     final repo = _FakeQueueRepo([
       for (var i = 0; i < 100; i++) _entry('uuid-$i', i),
@@ -153,20 +283,21 @@ void main() {
       capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
       return http.Response('', 204);
     }));
-    final service = QueueWarmService(queueRepo: repo);
+    final service = QueueWarmService(apiClient: _api, queueRepo: repo);
     addTearDown(service.dispose);
 
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    await tester.pump(const Duration(milliseconds: 700));
 
     expect((capturedBody!['track_uuids'] as List).length, 50);
   });
 
-  test('swallows POST errors so callers never see them', () async {
+  _fakeTest('swallows POST errors so callers never see them', (tester) async {
     _installMockClient(MockClient((_) async {
       throw const SocketException('simulated network failure');
     }));
     final service = QueueWarmService(
+      apiClient: _api,
       queueRepo: _FakeQueueRepo([_entry('a', 0)]),
     );
     addTearDown(service.dispose);
@@ -174,12 +305,12 @@ void main() {
     service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
     // Retries run instantly (delay mocked to no-op via initForTest), then the
     // NetworkException is caught and swallowed inside the service.
-    await Future<void>.delayed(const Duration(milliseconds: 700));
+    await tester.pump(const Duration(milliseconds: 700));
   });
 
   group('scheduleWarmUuids', () {
-    test('POSTs to /tracks/warm with null session_id after debounce',
-        () async {
+    _fakeTest('POSTs to /tracks/warm with null session_id after debounce',
+        (tester) async {
       Uri? capturedUrl;
       Map<String, dynamic>? capturedBody;
       _installMockClient(MockClient((req) async {
@@ -187,12 +318,12 @@ void main() {
         capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
         return http.Response('', 204);
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1', 'uuid-2'], quality: '256');
 
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
 
       expect(capturedUrl?.path, '/tracks/warm');
       // The download-driven path must NOT send a magic string here; the
@@ -207,25 +338,25 @@ void main() {
       expect(capturedBody?['count'], 2);
     });
 
-    test('respects the 50-UUID cap', () async {
+    _fakeTest('respects the 50-UUID cap', (tester) async {
       Map<String, dynamic>? capturedBody;
       _installMockClient(MockClient((req) async {
         capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
         return http.Response('', 204);
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       final sixtyUuids = List.generate(60, (i) => 'uuid-$i');
       service.scheduleWarmUuids(sixtyUuids, quality: '128');
 
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
 
       expect((capturedBody!['track_uuids'] as List).length, 50);
     });
 
-    test('debounces rapid calls into one POST that accumulates all uuids',
-        () async {
+    _fakeTest('debounces rapid calls into one POST that accumulates all uuids',
+        (tester) async {
       var postCount = 0;
       Map<String, dynamic>? capturedBody;
       _installMockClient(MockClient((req) async {
@@ -233,50 +364,50 @@ void main() {
         capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
         return http.Response('', 204);
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['a'], quality: '128');
       service.scheduleWarmUuids(['b'], quality: '128');
       service.scheduleWarmUuids(['c'], quality: '128');
 
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
       expect(postCount, 1);
       // Earlier batches must NOT be dropped — all three uuids are warmed.
       expect(capturedBody?['track_uuids'], ['a', 'b', 'c']);
       expect(capturedBody?['count'], 3);
     });
 
-    test('dedupes repeated uuids across rapid calls', () async {
+    _fakeTest('dedupes repeated uuids across rapid calls', (tester) async {
       Map<String, dynamic>? capturedBody;
       _installMockClient(MockClient((req) async {
         capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
         return http.Response('', 204);
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['a', 'b'], quality: '128');
       service.scheduleWarmUuids(['b', 'c'], quality: '128');
 
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
       expect(capturedBody?['track_uuids'], ['a', 'b', 'c']);
     });
 
-    test('accumulated uuids at different qualities fire one POST each',
-        () async {
+    _fakeTest('accumulated uuids at different qualities fire one POST each',
+        (tester) async {
       final captured = <Map<String, dynamic>>[];
       _installMockClient(MockClient((req) async {
         captured.add(jsonDecode(req.body) as Map<String, dynamic>);
         return http.Response('', 204);
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['a'], quality: '128');
       service.scheduleWarmUuids(['b'], quality: '256');
 
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
       expect(captured.length, 2);
       final lo = captured.firstWhere((b) => b['quality'] == '128');
       final hi = captured.firstWhere((b) => b['quality'] == '256');
@@ -284,43 +415,43 @@ void main() {
       expect(hi['track_uuids'], ['b']);
     });
 
-    test('swallows POST errors', () async {
+    _fakeTest('swallows POST errors', (tester) async {
       _installMockClient(MockClient((_) async {
         throw const SocketException('simulated network failure');
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1'], quality: '128');
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
     });
 
-    test('does nothing when list is empty', () async {
+    _fakeTest('does nothing when list is empty', (tester) async {
       var postCount = 0;
       _installMockClient(MockClient((_) async {
         postCount++;
         return http.Response('', 204);
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids([], quality: '128');
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
       expect(postCount, 0);
     });
 
-    test('does not retry on a transient 503 (warm is single-shot, advisory)',
-        () async {
+    _fakeTest('does not retry on a transient 503 (warm is single-shot, advisory)',
+        (tester) async {
       var calls = 0;
       _installMockClient(MockClient((_) async {
         calls++;
         return http.Response('try again', 503);
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1'], quality: '128');
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
 
       // Warm POSTs do NOT opt into retry — a transient 503 surfaces once,
       // is logged and swallowed by the service. The server may still warm
@@ -328,14 +459,15 @@ void main() {
       expect(calls, 1);
     });
 
-    test('queue warm scheduled first does not cancel a later uuids warm; both fire',
-        () async {
+    _fakeTest('queue warm scheduled first does not cancel a later uuids warm; both fire',
+        (tester) async {
       final captured = <Map<String, dynamic>>[];
       _installMockClient(MockClient((req) async {
         captured.add(jsonDecode(req.body) as Map<String, dynamic>);
         return http.Response('', 204);
       }));
       final service = QueueWarmService(
+        apiClient: _api,
         queueRepo: _FakeQueueRepo([_entry('a', 0)]),
       );
       addTearDown(service.dispose);
@@ -343,10 +475,10 @@ void main() {
       // Schedule a queue warm, then within the debounce window schedule a
       // uuids warm. Both must fire — they use independent timers now.
       service.scheduleWarm(sessionId: 7, currentPlayPosition: 0, quality: '320');
-      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await tester.pump(const Duration(milliseconds: 100));
       service.scheduleWarmUuids(['dl-1', 'dl-2'], quality: '320');
 
-      await Future<void>.delayed(const Duration(milliseconds: 800));
+      await tester.pump(const Duration(milliseconds: 800));
 
       expect(captured.length, 2);
       // Identify each by session_id: queue path stringifies its int, the
@@ -357,23 +489,24 @@ void main() {
       expect(uuidsBody['track_uuids'], ['dl-1', 'dl-2']);
     });
 
-    test('uuids warm scheduled first does not cancel a later queue warm; both fire',
-        () async {
+    _fakeTest('uuids warm scheduled first does not cancel a later queue warm; both fire',
+        (tester) async {
       final captured = <Map<String, dynamic>>[];
       _installMockClient(MockClient((req) async {
         captured.add(jsonDecode(req.body) as Map<String, dynamic>);
         return http.Response('', 204);
       }));
       final service = QueueWarmService(
+        apiClient: _api,
         queueRepo: _FakeQueueRepo([_entry('a', 0)]),
       );
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['dl-1'], quality: '320');
-      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await tester.pump(const Duration(milliseconds: 100));
       service.scheduleWarm(sessionId: 9, currentPlayPosition: 0, quality: '320');
 
-      await Future<void>.delayed(const Duration(milliseconds: 800));
+      await tester.pump(const Duration(milliseconds: 800));
 
       expect(captured.length, 2);
       final queueBody = captured.firstWhere((b) => b['session_id'] == '9');
@@ -382,14 +515,15 @@ void main() {
       expect(uuidsBody['track_uuids'], ['dl-1']);
     });
 
-    test('back-to-back queue warms still coalesce to one POST (debounce intact)',
-        () async {
+    _fakeTest('back-to-back queue warms still coalesce to one POST (debounce intact)',
+        (tester) async {
       var postCount = 0;
       _installMockClient(MockClient((_) async {
         postCount++;
         return http.Response('', 204);
       }));
       final service = QueueWarmService(
+        apiClient: _api,
         queueRepo: _FakeQueueRepo([_entry('a', 0)]),
       );
       addTearDown(service.dispose);
@@ -398,39 +532,40 @@ void main() {
       service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
       service.scheduleWarm(sessionId: 1, currentPlayPosition: 0, quality: '320');
 
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
       expect(postCount, 1);
     });
 
-    test('queue warm sends session_id as a stringified int (no magic source)',
-        () async {
+    _fakeTest('queue warm sends session_id as a stringified int (no magic source)',
+        (tester) async {
       Map<String, dynamic>? capturedBody;
       _installMockClient(MockClient((req) async {
         capturedBody = jsonDecode(req.body) as Map<String, dynamic>;
         return http.Response('', 204);
       }));
       final service = QueueWarmService(
+        apiClient: _api,
         queueRepo: _FakeQueueRepo([_entry('a', 0)]),
       );
       addTearDown(service.dispose);
 
       service.scheduleWarm(sessionId: 42, currentPlayPosition: 0, quality: '320');
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
 
       expect(capturedBody?['session_id'], '42');
     });
 
-    test('does not retry on SocketException; failure is swallowed', () async {
+    _fakeTest('does not retry on SocketException; failure is swallowed', (tester) async {
       var calls = 0;
       _installMockClient(MockClient((_) async {
         calls++;
         throw const SocketException('simulated network failure');
       }));
-      final service = QueueWarmService(queueRepo: _FakeQueueRepo([]));
+      final service = QueueWarmService(apiClient: _api, queueRepo: _FakeQueueRepo([]));
       addTearDown(service.dispose);
 
       service.scheduleWarmUuids(['uuid-1'], quality: '128');
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(milliseconds: 700));
 
       // No retry on the warm path. NetworkException (attemptsMade: 1) is
       // caught and swallowed inside the service's timer callback.

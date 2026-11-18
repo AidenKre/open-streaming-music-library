@@ -34,12 +34,12 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       final db = AppDatabase(NativeDatabase.memory());
       addTearDown(db.close);
-      initCoverArtCache(CoverArtCacheManager.noop());
       final player = _HeldVolumePlayer();
       final bridge = AudioServiceBridge();
       final c = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           sharedPreferencesProvider.overrideWith((ref) async => prefs),
           streamQualityProvider.overrideWithValue('original'),
           playbackEngineProvider.overrideWithValue(player),

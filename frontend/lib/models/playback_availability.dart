@@ -71,11 +71,13 @@ final class PlaybackAvailability {
   bool get hasAnyDownloaded =>
       coverage == LocalCoverage.partial || coverage == LocalCoverage.downloaded;
 
-  /// Play / Play next / Add to queue. Online everything streams. Offline only
-  /// a fully downloaded scope may play, so a queue action never enqueues
-  /// streaming-only tracks (Phase 6 deliberately makes `partial` playable).
-  /// A download this device can't decode doesn't play offline either.
-  bool get canPlay => !offline || (isFullyDownloaded && !hasUndecodable);
+  /// Play / Play next / Add to queue. Online everything streams. Offline a
+  /// scope plays when at least one member is downloaded (the offline
+  /// membership query then narrows the request to those members). A single
+  /// track whose download this device can't decode doesn't play offline;
+  /// collection counts carry no undecodable count, so a collection whose
+  /// downloads are all undecodable ends `RejectedUnplayableOffline` (O2).
+  bool get canPlay => !offline || (hasAnyDownloaded && !hasUndecodable);
 
   /// Download (the missing tracks) needs the server and something missing.
   bool get canDownload => !offline && !isFullyDownloaded;

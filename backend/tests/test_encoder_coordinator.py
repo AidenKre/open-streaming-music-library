@@ -22,6 +22,10 @@ from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator, SourceUnavailable
 from app.services.transcoder import ORIGINAL_QUALITY
 
+# The master admin's id: only its tracks are routed to default_cache (M.2a).
+ADMIN_OWNER = 1
+
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -53,6 +57,7 @@ def _make_coordinator(
             return True
 
     return EncoderCoordinator(
+        admin_owner_id=ADMIN_OWNER,
         cache=stream_cache,
         source_lookup=lambda _: source,
         workers=workers,
@@ -128,7 +133,7 @@ class TestDefaultStateLocking:
         def encoder(i: int) -> None:
             barrier.wait()
             c.encode_for_stream(uuids[i], qualities[i % len(qualities)],
-                                source_bitrate_kbps=500)
+                                source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
 
         def flipper(target: str) -> None:
             barrier.wait()
@@ -268,7 +273,7 @@ class TestKeyLockDedup:
         previous "remove after use" strategy was the source of the bug.
         """
         c = _make_coordinator(tmp_path, default_quality="192")
-        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=500)
+        c.encode_for_stream("uuid-a", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
         assert ("uuid-a", "192") in c._key_locks
 
     def test_concurrent_first_encode__transcode_runs_exactly_once(self, tmp_path):
@@ -297,7 +302,7 @@ class TestKeyLockDedup:
 
         def worker(idx: int) -> None:
             results[idx] = c.encode_for_stream(
-                "uuid-a", "192", source_bitrate_kbps=500
+                "uuid-a", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER
             )
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
@@ -324,7 +329,7 @@ class TestKeyLockDedup:
         works; nothing else to assert about lock map state.
         """
         c = _make_coordinator(tmp_path, default_quality="192")
-        r = c.encode_for_stream("uuid-pass", "128", source_bitrate_kbps=64)
+        r = c.encode_for_stream("uuid-pass", "128", source_bitrate_kbps=64, owner_id=ADMIN_OWNER)
         assert r is not None
         assert r.transcoded is False
 
@@ -335,19 +340,19 @@ class TestKeyLockDedup:
         c = _make_coordinator(
             tmp_path, default_quality="192", transcode_fn=failing_transcode
         )
-        assert c.encode_for_stream("uuid-fail", "192", source_bitrate_kbps=500) is None
+        assert c.encode_for_stream("uuid-fail", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER) is None
 
     def test_missing_source_raises_source_unavailable(self, tmp_path):
         c = _make_coordinator(tmp_path, default_quality="192")
         c.source_lookup = lambda _: None
         with pytest.raises(SourceUnavailable):
-            c.encode_for_stream("uuid-missing", "192", source_bitrate_kbps=500)
+            c.encode_for_stream("uuid-missing", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
 
     def test_original_quality_missing_source_raises(self, tmp_path):
         c = _make_coordinator(tmp_path, default_quality="192")
         c.source_lookup = lambda _: None
         with pytest.raises(SourceUnavailable):
-            c.encode_for_stream("uuid-missing", ORIGINAL_QUALITY)
+            c.encode_for_stream("uuid-missing", ORIGINAL_QUALITY, owner_id=ADMIN_OWNER)
 
     def test_source_path_skips_source_lookup(self, tmp_path):
         """When the caller supplies source_path, the redundant source_lookup DB
@@ -362,7 +367,7 @@ class TestKeyLockDedup:
         c.source_lookup = _lookup
         src = tmp_path / "source.mp3"
         r = c.encode_for_stream(
-            "uuid-direct", "128", source_bitrate_kbps=64, source_path=src
+            "uuid-direct", "128", source_bitrate_kbps=64, source_path=src, owner_id=ADMIN_OWNER
         )
         assert r is not None
         assert r.transcoded is False
@@ -386,11 +391,11 @@ class TestKeyLockDedup:
             tmp_path, default_quality="192", transcode_fn=maybe_raise
         )
         with pytest.raises(RuntimeError):
-            c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500)
+            c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
 
         # If the lock were stuck held, this second call would hang. The test
         # framework will time out; if it returns, the lock was released.
-        result = c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500)
+        result = c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
         assert result is not None
 
 
@@ -421,6 +426,37 @@ class TestPersistAndSetDefaultQuality:
 
         assert changed is False
         assert warming is False
+        assert persisted == []
+        c._executor.shutdown(wait=True)
+
+    def test_live_matches_but_stored_differs__persists_without_warming(self, tmp_path):
+        """U06-B-09: an invalid stored value (the live default came from the
+        env fallback) is repaired by sending the effective quality again."""
+        c = _make_coordinator(tmp_path, default_quality="192")
+        c.all_uuids_fn = lambda: ["uuid-a"]
+        generation = c._warm_generation
+        persisted: list[str] = []
+
+        changed, warming = c.persist_and_set_default_quality(
+            "192", persisted.append, read_stored=lambda: "lossless-MQA"
+        )
+
+        assert persisted == ["192"]
+        assert (changed, warming) == (False, False)
+        assert c.default_quality == "192"
+        assert c._warm_generation == generation  # no warm, no cache delete
+        c._executor.shutdown(wait=True)
+
+    def test_live_and_stored_match__skips_persist(self, tmp_path):
+        c = _make_coordinator(tmp_path, default_quality="192")
+        c.all_uuids_fn = lambda: []
+        persisted: list[str] = []
+
+        changed, warming = c.persist_and_set_default_quality(
+            "192", persisted.append, read_stored=lambda: "192"
+        )
+
+        assert (changed, warming) == (False, False)
         assert persisted == []
         c._executor.shutdown(wait=True)
 
@@ -484,12 +520,12 @@ class TestEvictionDuringEncode:
         c._default_cache_for_test = default_cache
         holder["c"] = c
 
-        assert c.encode_for_stream("u1", quality, source_bitrate_kbps=1000) is None
+        assert c.encode_for_stream("u1", quality, source_bitrate_kbps=1000, owner_id=ADMIN_OWNER) is None
         assert not c.cache.has("u1", quality)
         assert not default_cache.has("u1", quality)
         assert list((c._scratch_dir).glob("*.m4a")) == []
 
-        result = c.encode_for_stream("u1", quality, source_bitrate_kbps=1000)
+        result = c.encode_for_stream("u1", quality, source_bitrate_kbps=1000, owner_id=ADMIN_OWNER)
         assert result is not None and result.transcoded
         target = default_cache if quality == "192" else c.cache
         assert target.has("u1", quality)
@@ -544,3 +580,107 @@ class TestSubmitConversion:
         c._executor.submit.assert_called_once_with(
             convert_fn, 7, priority=_PriorityPool.PRIORITY_CONVERSION, extra="x"
         )
+
+
+class TestSourceChangedDuringEncode:
+    """Live gate m-L-08: a loose file imported while its copy was paused kept
+    growing after the import. A pre-warm (or any encode) that read the source
+    while it was changing must not keep that encoding: the source's size and
+    modification time are compared before and after the transcode."""
+
+    @pytest.mark.parametrize("quality", ["192", "320"])  # default cache, LRU cache
+    @pytest.mark.parametrize("change", ["grows", "mtime_only"])
+    def test_an_encode_of_a_source_that_changed_meanwhile_is_not_kept(self, tmp_path, quality, change):
+        import os
+
+        source = tmp_path / "source.mp3"
+
+        def transcode_fn(src: Path, dst: Path, bitrate: int) -> bool:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded-from-partial")
+            if not holder.get("changed"):
+                holder["changed"] = True
+                if change == "grows":
+                    with open(src, "ab") as f:
+                        f.write(b"the rest of the copy")
+                else:
+                    st = os.stat(src)
+                    os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+            return True
+
+        holder: dict = {}
+        c = _make_coordinator(tmp_path, transcode_fn=transcode_fn)
+        _, default_cache, _ = c._snapshot_default_state()
+
+        assert c.encode_for_stream("u1", quality, source_bitrate_kbps=1000, owner_id=ADMIN_OWNER) is None
+        assert not c.cache.has("u1", quality)
+        assert not default_cache.has("u1", quality)
+        assert list(c._scratch_dir.glob("*.m4a")) == []
+
+        # The source is quiet now: the next encode is kept.
+        result = c.encode_for_stream("u1", quality, source_bitrate_kbps=1000, owner_id=ADMIN_OWNER)
+        assert result is not None and result.transcoded
+        target = default_cache if quality == "192" else c.cache
+        assert target.has("u1", quality)
+        assert source.read_bytes().endswith(b"the rest of the copy") == (change == "grows")
+        c._executor.shutdown(wait=True)
+
+    def test_a_warm_of_a_source_that_changed_meanwhile_leaves_no_cache_entry(self, tmp_path):
+        def transcode_fn(src: Path, dst: Path, bitrate: int) -> bool:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded-from-partial")
+            with open(src, "ab") as f:
+                f.write(b"more")
+            return True
+
+        c = _make_coordinator(tmp_path, transcode_fn=transcode_fn, workers=1)
+        _, default_cache, gen = c._snapshot_default_state()
+
+        c._warm_one("u1", "192", gen)
+
+        assert not default_cache.has("u1", "192")
+        assert not c.cache.has("u1", "192")
+        c._executor.shutdown(wait=True)
+
+
+class TestShutdown:
+    """U06-B-01: the stop request goes ahead of the waiting backlog. An encode
+    already running finishes; nothing that was only queued starts after it."""
+
+    def test_shutdown__no_queued_encode_starts_after_the_stop_request(self, tmp_path):
+        release = threading.Event()
+        first_started = threading.Event()
+        encoded: list[Path] = []
+
+        def gated_transcode(src: Path, dst: Path, bitrate: int) -> bool:
+            encoded.append(dst)
+            first_started.set()
+            assert release.wait(timeout=10)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"encoded" * 10)
+            return True
+
+        c = _make_coordinator(
+            tmp_path, workers=1, transcode_fn=gated_transcode,
+            all_uuids_fn=lambda: ["w1", "w2"],
+        )
+        c.owner_lookup = lambda _uuid: ADMIN_OWNER
+        conversions: list[int] = []
+
+        c.enqueue_prefetch("running", "320", source_bitrate_kbps=1000)
+        assert first_started.wait(timeout=10)
+        # The backlog: prefetches, the warm of a default change and a conversion.
+        c.enqueue_prefetch("queued-1", "320", source_bitrate_kbps=1000)
+        c.enqueue_prefetch("queued-2", "256", source_bitrate_kbps=1000)
+        c.set_default_quality("128")
+        c.submit_conversion(conversions.append, 7)
+
+        c.shutdown()
+        c.submit_conversion(conversions.append, 8)  # arrives after the stop
+        release.set()
+        for t in c._executor._threads:
+            t.join(timeout=10)
+
+        assert not any(t.is_alive() for t in c._executor._threads)
+        assert len(encoded) == 1  # only the encode that was already running
+        assert conversions == []

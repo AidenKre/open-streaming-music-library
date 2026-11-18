@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
@@ -7,6 +8,8 @@ import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+
+import '../ui/browse_harness.dart' show SeedTrack, seedLibrary;
 
 QueuePlaybackEntry entry(int id, {String? path}) => QueuePlaybackEntry(
   itemId: id, queueType: QueueItemTypes.main, canonicalPosition: id - 1,
@@ -193,5 +196,92 @@ void main() {
         preferredItemId: 1, totalCount: 3, offline: true);
     expect(result.target?.entry.itemId, 3);
     expect(result.issues, isEmpty, reason: 'neither file is missing');
+  });
+  // 6A.2 (R1-1, amends DEV-6-02): offline, an Enqueue into an active queue
+  // keeps only the members that play from a local file, by the same rule a
+  // landing target uses (usable download, decodable codec, the file on disk).
+  group('filterPlayableOffline', () {
+    late AppDatabase library;
+    late PlaybackTargetResolver filter;
+    final onDisk = <String>{};
+
+    Future<void> download(String uuid, String codec,
+        {bool damaged = false}) async {
+      final path = '/dl/$uuid.$codec';
+      await (library.update(library.tracks)
+            ..where((t) => t.uuidId.equals(uuid)))
+          .write(TracksCompanion(
+        filePath: Value(path),
+        downloadedAtRevision: const Value(1),
+        downloadedCodec: Value(codec),
+        damagedFilePath: Value(damaged ? path : null),
+      ));
+    }
+
+    setUp(() async {
+      library = AppDatabase(NativeDatabase.memory());
+      await seedLibrary(library, [
+        for (final u in ['p1', 'p2', 'x1', 'm1', 'r1', 'd1', 'n1'])
+          SeedTrack(uuid: u, title: u, artistId: 1, artist: 'Ann',
+              albumId: 1, album: 'A'),
+      ]);
+      onDisk.clear();
+      filter = PlaybackTargetResolver(QueueRepository(library),
+          fileExists: (path) async => onDisk.contains(path),
+          localSources: LocalSourcePolicy(
+              codecs: const CodecSupport({AudioCodecFamily.mp3})));
+    });
+    tearDown(() => library.close());
+
+    test('keeps decodable downloads on disk, in order, and drops the rest',
+        () async {
+      await download('p1', 'mp3');
+      await download('p2', 'mp3');
+      await download('x1', 'flac'); // undecodable on this device
+      await download('m1', 'mp3'); // recorded, missing on disk
+      await download('d1', 'mp3', damaged: true);
+      // r1: never downloaded.
+      onDisk.addAll(['/dl/p1.mp3', '/dl/p2.mp3', '/dl/x1.flac', '/dl/d1.mp3']);
+      final result = await filter
+          .filterPlayableOffline(['p2', 'x1', 'm1', 'r1', 'd1', 'p1']);
+      expect(result.playable, ['p2', 'p1']);
+      expect(result.issues, hasLength(1));
+      final issue = result.issues.single as LocalFileMissing;
+      expect(issue.trackUuid, 'm1');
+      expect(issue.path, '/dl/m1.mp3');
+    });
+
+    test('a duplicate member stays duplicated', () async {
+      await download('p1', 'mp3');
+      onDisk.add('/dl/p1.mp3');
+      final result = await filter.filterPlayableOffline(['p1', 'p1']);
+      expect(result.playable, ['p1', 'p1']);
+    });
+
+    test('nothing playable gives an empty list', () async {
+      await download('x1', 'flac');
+      onDisk.add('/dl/x1.flac');
+      final result = await filter.filterPlayableOffline(['x1', 'r1', 'n1']);
+      expect(result.playable, isEmpty);
+      expect(result.issues, isEmpty);
+    });
+
+    test('a uuid unknown to the library is dropped', () async {
+      final result = await filter.filterPlayableOffline(['gone']);
+      expect(result.playable, isEmpty);
+    });
+
+    test('a suspected download is not played from its file', () async {
+      final policy = LocalSourcePolicy();
+      final suspicious = PlaybackTargetResolver(QueueRepository(library),
+          fileExists: (path) async => onDisk.contains(path),
+          localSources: policy);
+      await download('p1', 'mp3');
+      await download('p2', 'mp3');
+      onDisk.addAll(['/dl/p1.mp3', '/dl/p2.mp3']);
+      policy.suspect('p1', '/dl/p1.mp3');
+      final result = await suspicious.filterPlayableOffline(['p1', 'p2']);
+      expect(result.playable, ['p2']);
+    });
   });
 }

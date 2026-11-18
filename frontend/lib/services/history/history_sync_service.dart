@@ -39,13 +39,19 @@ class HistorySyncStatus {
 /// One server-scoped history pass: upload, then pull (Phase 5 §5). The body
 /// of the history [SingleFlightRunner].
 ///
+/// A 401 (signed out) parks the runner without quarantining or recording
+/// anything; the events stay pending until a login rebuilds the scope.
+///
 /// Never blocks on the binding gate (it would hold a quiesce): without a
 /// verified connection the pass fails with the offline wait and the next
 /// connection edge requests it again. Upload failures don't stop the pull;
 /// a 409 or 413/422 quarantines the affected events (retained, never
 /// rewritten) and the healthy ones continue; a refusal that names no event
 /// halves the batch until the refused event stands alone. A fenced write (a reset) ends
-/// the pass quietly.
+/// the pass quietly. A page or an upload response stamped by another server
+/// instance (SC-01 rule 6) is not applied: the pass reports it through
+/// `onServerInstanceChanged`, sends nothing further (no next batch, no pull)
+/// and fails with the offline wait.
 class HistorySyncService {
   HistorySyncService({
     required HistoryRepository repository,
@@ -55,6 +61,9 @@ class HistorySyncService {
     required bool Function() isOffline,
     required Future<bool?> Function() supportsHistory,
     Future<void> Function()? refreshCapabilities,
+    void Function(ServerInstanceChangedException, int? connection)?
+    onServerInstanceChanged,
+    int? Function()? verifiedConnection,
     this.maxBatchesPerPass = 10,
     this.maxPagesPerPass = 10,
     this.pageSize = 200,
@@ -64,7 +73,9 @@ class HistorySyncService {
        _verifiedToken = verifiedToken,
        _isOffline = isOffline,
        _supportsHistory = supportsHistory,
-       _refreshCapabilities = refreshCapabilities;
+       _refreshCapabilities = refreshCapabilities,
+       _onServerInstanceChanged = onServerInstanceChanged,
+       _verifiedConnection = verifiedConnection;
 
   final HistoryRepository _repository;
   final HistoryApi _api;
@@ -73,6 +84,9 @@ class HistorySyncService {
   final bool Function() _isOffline;
   final Future<bool?> Function() _supportsHistory;
   final Future<void> Function()? _refreshCapabilities;
+  final void Function(ServerInstanceChangedException, int? connection)?
+  _onServerInstanceChanged;
+  final int? Function()? _verifiedConnection;
 
   final int maxBatchesPerPass;
   final int maxPagesPerPass;
@@ -115,6 +129,7 @@ class HistorySyncService {
     if (_isOffline()) return const PassFailed(BackoffReason.offline);
     final token = _verifiedToken();
     if (token == null) return const PassFailed(BackoffReason.offline);
+    final connection = _verifiedConnection?.call();
     // A server found without support is rechecked through its capabilities
     // (/app/info), never by calling the history endpoints again (Phase 5
     // §5); a cached "supported" may predate the 404 that set this.
@@ -138,12 +153,18 @@ class HistorySyncService {
 
     _quarantinedThisPass = false;
     try {
-      final upload = await _upload(token);
+      final upload = await _upload(token, connection);
+      if (upload is PassParked) return upload;
       if (upload is PassFailed &&
           upload.reason == BackoffReason.capabilityMissing) {
         return upload;
       }
-      final pull = await _pull(token);
+      // Another server answered: nothing further is sent this pass.
+      if (upload is PassFailed && upload.reason == BackoffReason.offline) {
+        return upload;
+      }
+      final pull = await _pull(token, connection);
+      if (pull is PassParked) return pull;
       if (pull is PassFailed) return pull;
       if (upload is PassFailed) return upload;
       if (_status.value.blockedConflicts.isNotEmpty ||
@@ -181,7 +202,7 @@ class HistorySyncService {
   /// Up to [maxBatchesPerPass] batches. [PassDone] when nothing is left,
   /// [PassMoreWork] when the budget ran out, [PassFailed] when uploading
   /// stopped (the pull still runs, except for a missing endpoint).
-  Future<PassOutcome> _upload(String token) async {
+  Future<PassOutcome> _upload(String token, int? connection) async {
     for (var i = 0; i < maxBatchesPerPass; i++) {
       final batch =
           await _repository.nextUploadBatch(token, maxEvents: _batchEvents);
@@ -200,6 +221,7 @@ class HistorySyncService {
           return const PassFailed(BackoffReason.transient);
         }
       } on ApiException catch (e) {
+        if (e.statusCode == 401) return const PassParked();
         _update(lastError: e.detailMessage ?? e.toString());
         switch (e.statusCode) {
           case 409:
@@ -239,6 +261,11 @@ class HistorySyncService {
           default:
             return const PassFailed(BackoffReason.transient);
         }
+      } on ServerInstanceChangedException catch (e) {
+        // Thrown before applyAck: nothing was written. No lastError (ids must
+        // not appear); wait for the next verified connection.
+        _onServerInstanceChanged?.call(e, connection);
+        return const PassFailed(BackoffReason.offline);
       } on HistoryProtocolException catch (e) {
         _update(lastError: e.message);
         return const PassFailed(BackoffReason.transient);
@@ -268,7 +295,7 @@ class HistorySyncService {
   }
 
   /// Up to [maxPagesPerPass] pages from the `history` cursor.
-  Future<PassOutcome> _pull(String token) async {
+  Future<PassOutcome> _pull(String token, int? connection) async {
     try {
       for (var i = 0; i < maxPagesPerPass; i++) {
         final after = await _cursors.read(SyncStream.history);
@@ -281,6 +308,12 @@ class HistorySyncService {
         }
       }
       return const PassMoreWork();
+    } on ServerInstanceChangedException catch (e) {
+      // SC-01 rule 6: another server answered; the page was not committed.
+      // Report it and wait for the next verified connection (no lastError:
+      // its text must not carry instance ids).
+      _onServerInstanceChanged?.call(e, connection);
+      return const PassFailed(BackoffReason.offline);
     } on HistoryPayloadConflict catch (e) {
       _update(lastError: e.toString(), blockedConflicts: e.events);
       return const PassDone();
@@ -294,6 +327,7 @@ class HistorySyncService {
       _update(lastError: e.message);
       return const PassFailed(BackoffReason.transient);
     } on ApiException catch (e) {
+      if (e.statusCode == 401) return const PassParked();
       _update(lastError: e.detailMessage ?? e.toString());
       // A missing endpoint is a server without history support, like a
       // missing upload endpoint: wait for the capability, don't retry.

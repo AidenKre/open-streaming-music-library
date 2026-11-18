@@ -12,32 +12,19 @@ its own SAVEPOINT; commit before ACK. ACK = unique UUIDs of every batch event
 now present (retries included). A database error is a retriable server error.
 """
 
-import importlib
 import json
 import sqlite3
-import sys
 import uuid
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.database.database import Database
 from app.services.history_hooks import register_history_hook, unregister_history_hook
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-    sys.modules.pop("app.main", None)
-    sys.modules.pop("app.config", None)
-    import app.main
-
-    importlib.reload(app.main)
-    with TestClient(app.main.app) as c:
-        yield c
+def client(app_client):
+    return app_client
 
 
 def _db_path(client):
@@ -88,7 +75,7 @@ def test_new_events_are_stored_with_revisions_and_acknowledged(client):
     assert len(ack) == len(set(ack))
     rows = _q(client, "SELECT event_uuid, revision, received_at, owner_id FROM history_events ORDER BY revision")
     assert [r[1] for r in rows] == [before + 1, before + 2]
-    assert all(r[2] > 0 and r[3] is None for r in rows)
+    assert all(r[2] > 0 and r[3] == client.app.state.admin_user_id for r in rows)
     assert _counter(client) == before + 2
 
 

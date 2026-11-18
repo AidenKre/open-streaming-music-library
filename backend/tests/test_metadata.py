@@ -8,6 +8,13 @@ from unittest.mock import patch
 import pytest
 
 import app.services.metadata as metadata
+from app.services.ffmpeg_runner import CaptureResult
+
+
+def _completed(args, returncode, stdout, stderr):
+    """What ``run_capture`` returns for a finished probe (U05-A-06: the probes
+    run through it, bounded)."""
+    return CaptureResult(returncode=returncode, stdout=stdout.encode("utf-8"), stderr=stderr)
 
 
 class TestGetTrackMetadata:
@@ -99,19 +106,19 @@ class TestGetTrackMetadata:
 class TestFfprobeForMetadata:
     def test_ffprobe_for_metadata__ffprobe_missing__returns_none(self):
         with patch(
-            "app.services.metadata.subprocess.run", side_effect=FileNotFoundError
+            "app.services.ffmpeg_runner.subprocess.Popen", side_effect=FileNotFoundError
         ):
             assert metadata.ffprobe_for_metadata(Path("song.mp3")) is None
 
     def test_ffprobe_for_metadata__oserror__returns_none(self):
-        with patch("app.services.metadata.subprocess.run", side_effect=OSError):
+        with patch("app.services.ffmpeg_runner.subprocess.Popen", side_effect=OSError):
             assert metadata.ffprobe_for_metadata(Path("song.mp3")) is None
 
     def test_ffprobe_for_metadata__nonzero_exit_code__returns_none(
         self, tmp_path: Path
     ):
-        with patch("app.services.metadata.subprocess.run") as subprocess_run:
-            subprocess_run.return_value = subprocess.CompletedProcess(
+        with patch("app.services.metadata.run_capture") as subprocess_run:
+            subprocess_run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=1,
                 stdout="",
@@ -121,7 +128,7 @@ class TestFfprobeForMetadata:
             assert json_data is None
 
     def test_ffprobe_for_metadata__valid_file__returns_output_json(self):
-        with patch("app.services.metadata.subprocess.run") as subprocess_run:
+        with patch("app.services.metadata.run_capture") as subprocess_run:
             fake_output_json = {
                 "streams": [],
                 "format": {
@@ -131,7 +138,7 @@ class TestFfprobeForMetadata:
                     }
                 },
             }
-            subprocess_run.return_value = subprocess.CompletedProcess(
+            subprocess_run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
                 stdout=json.dumps(fake_output_json),
@@ -143,8 +150,8 @@ class TestFfprobeForMetadata:
             assert json_data == fake_output_json
 
     def test_ffprobe_for_metadata__invalid_json__returns_none(self):
-        with patch("app.services.metadata.subprocess.run") as subprocess_run:
-            subprocess_run.return_value = subprocess.CompletedProcess(
+        with patch("app.services.metadata.run_capture") as subprocess_run:
+            subprocess_run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
                 stdout="invalid json",
@@ -154,14 +161,48 @@ class TestFfprobeForMetadata:
             assert json_data is None
 
     def test_ffprobe_for_metadata__empty_stdout__returns_empty_dict(self):
-        with patch("app.services.metadata.subprocess.run") as subprocess_run:
-            subprocess_run.return_value = subprocess.CompletedProcess(
+        with patch("app.services.metadata.run_capture") as subprocess_run:
+            subprocess_run.return_value = _completed(
                 args=["ffprobe"],
                 returncode=0,
                 stdout="",
                 stderr="",
             )
             assert metadata.ffprobe_for_metadata(Path("test.mp3")) == {}
+
+
+class TestTheMetadataProbesReadExitsLikeTheSharedRule:
+    """Review of U05-A-06 (findings 1 and 4): only a SIGKILL is "unreadable
+    for now"; another signal is the file's own answer (None, never raised);
+    an OSError while starting is "cannot run now"."""
+
+    def test_a_sigkill_is_unavailable_for_now_when_asked(self):
+        import signal
+
+        with patch("app.services.metadata.run_capture",
+                   return_value=_completed([], -signal.SIGKILL, "", "")):
+            assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
+            with metadata.probe_unavailable_raises(), pytest.raises(metadata.ProbeUnavailable):
+                metadata.ffprobe_for_metadata(Path("a.flac"))
+
+    @pytest.mark.parametrize("sig", ["SIGSEGV", "SIGABRT", "SIGTERM"])
+    def test_another_signal_is_the_files_own_answer(self, sig):
+        import signal
+
+        with patch("app.services.metadata.run_capture",
+                   return_value=_completed([], -getattr(signal, sig), "", "")):
+            with metadata.probe_unavailable_raises():
+                assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
+
+    def test_an_oserror_while_starting_is_unavailable_for_now(self):
+        import errno
+
+        error = OSError(errno.EMFILE, "Too many open files")
+        with patch("app.services.metadata.run_capture", side_effect=error):
+            assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
+            assert metadata.get_audio_bitrate_kbps(Path("a.flac")) is None
+            with metadata.probe_unavailable_raises(), pytest.raises(metadata.ProbeUnavailable):
+                metadata.ffprobe_for_metadata(Path("a.flac"))
 
 
 class TestBuildTrackMetadata:
@@ -462,3 +503,50 @@ class TestExtractCoverArtBytes:
             result = metadata.extract_cover_art_bytes(Path("/fake/file.mp3"))
 
         assert result == b"\x89PNG fake image data"
+
+
+# --- U05-A-06: every probe here is bounded ---------------------------------------
+# A fake ffprobe that never answers stands in for a hung tool (a stalled disk, a
+# crafted file). Each probe must come back within the bound
+# (audio_identity.PROBE_TIMEOUT_S, shortened for the test): "unreadable for now",
+# never a hang, and never reported as a missing tool.
+
+
+@pytest.mark.integration
+class TestProbesAreBounded:
+    @pytest.fixture(autouse=True)
+    def _hanging(self, monkeypatch, tmp_path):
+        from tests import hanging_ffprobe
+
+        hanging_ffprobe.install(monkeypatch, tmp_path)
+        hanging_ffprobe.shorten_bound(monkeypatch)
+        self.audio = tmp_path / "song.flac"
+        self.audio.write_bytes(b"not read: the fake never looks at it")
+
+    def test_a_hung_metadata_probe_answers_none_within_the_bound(self):
+        from tests.hanging_ffprobe import WITHIN_S, timed
+
+        with timed() as elapsed:
+            result = metadata.ffprobe_for_metadata(self.audio)
+
+        assert elapsed() < WITHIN_S
+        assert result is None
+
+    def test_a_hung_metadata_probe_is_unavailable_for_now_when_asked(self):
+        from tests.hanging_ffprobe import WITHIN_S, timed
+
+        with timed() as elapsed:
+            with metadata.probe_unavailable_raises(), pytest.raises(metadata.ProbeUnavailable) as raised:
+                metadata.get_track_metadata(self.audio)
+
+        assert elapsed() < WITHIN_S
+        assert "not found" not in str(raised.value)
+
+    def test_a_hung_bitrate_probe_answers_unknown_within_the_bound(self):
+        from tests.hanging_ffprobe import WITHIN_S, timed
+
+        with timed() as elapsed:
+            result = metadata.get_audio_bitrate_kbps(self.audio)
+
+        assert elapsed() < WITHIN_S
+        assert result is None

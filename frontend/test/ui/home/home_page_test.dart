@@ -2,9 +2,7 @@ import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
@@ -20,8 +18,6 @@ void main() {
   late BrowseHarness harness;
 
   setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
   });
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());
@@ -32,7 +28,17 @@ void main() {
     await db.close();
   });
 
-  double dy(WidgetTester t, String text) => t.getTopLeft(find.text(text)).dy;
+  // 'Downloaded' is both an entry point and (Phase 6) the Home chip: find
+  // the entry points by their card.
+  double dy(WidgetTester t, String text) {
+    final inEntry = find.descendant(
+      of: find.byKey(ValueKey('entry.${text.toLowerCase()}')),
+      matching: find.text(text),
+    );
+    return t
+        .getTopLeft(inEntry.evaluate().isEmpty ? find.text(text) : inEntry)
+        .dy;
+  }
 
   testWidgets('search header, then Artists, Albums, Tracks, Downloaded', (
     tester,
@@ -49,7 +55,7 @@ void main() {
     ];
     final ys = [for (final t in order) dy(tester, t)];
     expect([...ys]..sort(), ys);
-    // Nothing for unimplemented features (no empty Recently played rail).
+    // No history: no Recently played title (the chip section still shows).
     expect(find.textContaining('Recent'), findsNothing);
     await teardownTree(tester);
   });
@@ -115,14 +121,15 @@ void main() {
     testWidgets('$label opens its browse page (offline too)', (tester) async {
       await tester.pumpWidget(harness.wrap(const HomePage(), offline: true));
       await tester.pump();
-      await tester.tap(find.text(label));
+      // The entry card ('Downloaded' is also the Home chip's label).
+      await tester.tap(find.byKey(ValueKey('entry.${label.toLowerCase()}')));
       await tester.pumpAndSettle();
       expect(find.byType(page), findsOneWidget);
       await teardownTree(tester);
     });
   }
 
-  test('home.recents is reserved after the entry points, not registered', () {
+  test('home.recents is registered after the entry points', () {
     expect(
       HomeSectionIds.order.indexOf('home.recents'),
       greaterThan(HomeSectionIds.order.indexOf(HomeSectionIds.entryPoints)),

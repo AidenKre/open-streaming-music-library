@@ -1,9 +1,7 @@
 """SC-16l: unknown audio properties are NULL, never 0.
 
 ``trackmetadata.duration``, ``sample_rate_hz`` and ``channels`` store NULL for
-unknown. The upgrade converts the old ingest default (0) to NULL WITHOUT
-bumping revisions (a bump would flag every download stale, as with the v9
-bitrate fix). Ingest writes NULL when ffprobe has no value; the API returns
+unknown. Ingest writes NULL when ffprobe has no value; the API returns
 null.
 """
 
@@ -13,12 +11,7 @@ import uuid
 from app.models import Track, TrackMetaData
 from app.services.metadata import build_track_metadata
 
-from tests.schema_fixtures import (
-    insert_v9_track,
-    make_v9_database,
-    open_database,
-    user_version,
-)
+from tests.schema_fixtures import open_database
 
 
 def _probe(audio_stream: dict, fmt: dict | None = None) -> dict:
@@ -105,85 +98,23 @@ def test_add_track_stores_null_and_reads_back_none(tmp_path):
     assert track.metadata.channels is None
 
 
-def test_upgrade_converts_stored_zeros_to_null_without_bumping_revisions(tmp_path):
-    path = tmp_path / "db.sqlite"
-    make_v9_database(path)
-    conn = sqlite3.connect(path)
-    conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')")
-    conn.execute("INSERT INTO albums (id, name, artist_id) VALUES (1, 'Album', 1)")
-    unknown, known = _uuid(), _uuid()
-    insert_v9_track(
-        conn, track_id=1, uuid_id=unknown, artist_id=1, album_id=1, revision=5,
-        duration=0.0, sample_rate_hz=0, channels=0,
-    )
-    insert_v9_track(
-        conn, track_id=2, uuid_id=known, artist_id=1, album_id=1, revision=6,
-        duration=200.0, sample_rate_hz=44100, channels=2,
-    )
-    conn.execute("UPDATE revision_counter SET value = 6")
-    conn.commit()
-    conn.close()
-
-    open_database(path)
-
-    assert user_version(path) >= 10
-    conn = sqlite3.connect(path)
-    try:
-        rows = dict(
-            (r[0], r[1:])
-            for r in conn.execute(
-                "SELECT uuid_id, duration, sample_rate_hz, channels FROM trackmetadata"
-            )
+def test_api_returns_null_for_unknown_audio_properties(tmp_path, app_client):
+    client = app_client
+    uid = _uuid()
+    client.app.state.admin_library.add_track(
+        Track(
+            uuid_id=uid,
+            file_path=tmp_path / "a.flac",
+            metadata=TrackMetaData(title="t", artist="a", codec="flac"),
         )
-        assert rows[unknown] == (None, None, None)
-        assert rows[known] == (200.0, 44100, 2)
-        revisions = dict(conn.execute("SELECT uuid_id, revision FROM tracks").fetchall())
-        assert revisions == {unknown: 5, known: 6}
-        assert conn.execute("SELECT value FROM revision_counter").fetchone()[0] == 6
-    finally:
-        conn.close()
-
-
-def test_upgrade_is_idempotent_on_second_open(tmp_path):
-    path = tmp_path / "db.sqlite"
-    make_v9_database(path)
-    open_database(path)
-    first = user_version(path)
-    open_database(path)
-    assert user_version(path) == first
-
-
-def test_api_returns_null_for_unknown_audio_properties(tmp_path, monkeypatch):
-    import importlib
-    import sys
-
-    from fastapi.testclient import TestClient
-
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-    sys.modules.pop("app.main", None)
-    sys.modules.pop("app.config", None)
-    import app.main
-
-    importlib.reload(app.main)
-    with TestClient(app.main.app) as client:
-        uid = _uuid()
-        client.app.state.database.add_track(
-            Track(
-                uuid_id=uid,
-                file_path=tmp_path / "a.flac",
-                metadata=TrackMetaData(title="t", artist="a", codec="flac"),
-            )
-        )
-        body = client.get(f"/tracks/{uid}").json()
-        assert body["metadata"]["duration"] is None
-        assert body["metadata"]["sample_rate_hz"] is None
-        assert body["metadata"]["channels"] is None
-        changes = client.get("/changes", params={"after_revision": 0}).json()
-        meta = next(c for c in changes["changes"] if c["uuid_id"] == uid)["track"]["metadata"]
-        assert meta["duration"] is None
+    )
+    body = client.get(f"/tracks/{uid}").json()
+    assert body["metadata"]["duration"] is None
+    assert body["metadata"]["sample_rate_hz"] is None
+    assert body["metadata"]["channels"] is None
+    changes = client.get("/changes", params={"after_revision": 0}).json()
+    meta = next(c for c in changes["changes"] if c["uuid_id"] == uid)["track"]["metadata"]
+    assert meta["duration"] is None
 
 
 def test_ingest_treats_non_finite_duration_as_unknown():

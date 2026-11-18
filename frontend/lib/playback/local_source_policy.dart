@@ -5,9 +5,10 @@ import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/services/quality_presets.dart';
 
 /// Decides whether a queue entry plays from its download (SC-27 §2; Phase 5
-/// decision 6 and review major 1). The one rule shared by the engine (which
-/// source it builds), the target resolver (what is playable offline) and the
-/// queue player (what a seed loads), so they can never disagree. Decide-only.
+/// decision 6 and review major 1). The rule the target resolver decides with
+/// (plus its file check). The engine uses it only as the plan for sources
+/// nobody landed on and to tell whether a rebuild has new evidence; the queue
+/// player no longer computes a seed's source from it. Decide-only.
 ///
 /// An entry's `filePath` is already only a usable download (a download
 /// marked damaged reads null). A download in a codec this device cannot
@@ -27,12 +28,21 @@ class LocalSourcePolicy {
   final Map<String, String> _suspects = {};
 
   /// The local file [entry] plays from, or null when it streams.
-  String? localPathFor(QueuePlaybackEntry entry) {
-    final path = entry.filePath;
-    if (path == null || path.isEmpty) return null;
-    if (!codecs.canDecode(entry.downloadedCodec)) return null;
-    if (_suspects[entry.uuidId] == path) return null;
-    return path;
+  String? localPathFor(QueuePlaybackEntry entry) => localPathOf(
+      uuid: entry.uuidId,
+      filePath: entry.filePath,
+      downloadedCodec: entry.downloadedCodec);
+
+  /// [localPathFor] from the fields it reads.
+  String? localPathOf({
+    required String uuid,
+    required String? filePath,
+    required String? downloadedCodec,
+  }) {
+    if (filePath == null || filePath.isEmpty) return null;
+    if (!codecs.canDecode(downloadedCodec)) return null;
+    if (_suspects[uuid] == filePath) return null;
+    return filePath;
   }
 
   /// The quality [entry] streams at when [preferred] is the chosen one: an
@@ -40,9 +50,14 @@ class LocalSourcePolicy {
   /// device cannot decode is streamed at the best transcoded quality (AAC)
   /// instead. Lossless sources (the only codecs a device may lack) are
   /// always above every preset's bitrate, so the server does transcode.
-  String streamQualityFor(QueuePlaybackEntry entry, String preferred) {
+  String streamQualityFor(QueuePlaybackEntry entry, String preferred) =>
+      streamQualityForCodec(entry.sourceCodec, preferred);
+
+  /// The same rule from a source codec alone (a preview has no queue entry).
+  /// An unknown codec (null) streams as chosen.
+  String streamQualityForCodec(String? sourceCodec, String preferred) {
     if (preferred != originalQuality) return preferred;
-    if (codecs.canDecode(entry.sourceCodec)) return preferred;
+    if (codecs.canDecode(sourceCodec)) return preferred;
     if (!codecs.canDecode(AudioCodecFamily.aac.name)) return preferred;
     return transcodedFallbackQuality;
   }

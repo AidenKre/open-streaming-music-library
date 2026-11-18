@@ -6,7 +6,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/ui/track_ui.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/tracks_page.dart';
@@ -22,7 +21,6 @@ void main() {
   late BrowseHarness h;
 
   setUp(() async {
-    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     // One album holding a downloaded and a streaming-only track, so the same
     // seed serves both the root tab and the album-detail sub-route.

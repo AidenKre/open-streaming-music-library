@@ -8,6 +8,7 @@ import 'package:frontend/repositories/history_repository.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/background/backoff_schedule.dart';
+import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/background/single_flight_runner.dart';
 import 'package:frontend/services/history/history_sync_service.dart';
 import 'package:frontend/services/history/history_sync_triggers.dart';
@@ -33,7 +34,11 @@ final Provider<HistoryRepository> historyRepositoryProvider = Provider<HistoryRe
   ),
 );
 
-final historyApiProvider = Provider<HistoryApi>((ref) => HistoryApi());
+/// History uploads and pulls go through the bound client: a response from
+/// another server instance is never applied (SC-01 rule 6).
+final historyApiProvider = Provider<HistoryApi>(
+  (ref) => HistoryApi(api: ref.read(boundApiClientProvider)),
+);
 
 /// The history pass, wired to the binding gate (verified token), offline
 /// mode and the `history` capability.
@@ -47,11 +52,19 @@ final historySyncServiceProvider = Provider<HistorySyncService>((ref) {
       BindingVerified(:final token) => token,
       _ => null,
     },
+    verifiedConnection: () => gate.verifiedConnection,
+    onServerInstanceChanged: (e, connection) {
+      // The gate drops the report unless that connection is still the
+      // verified one.
+      if (connection != null) gate.reportDifferentInstance(connection, e);
+    },
     isOffline: () => ref.read(offlineModeProvider),
     supportsHistory: () async {
       try {
-        return (await ref.read(appInfoProvider.future)
-            .timeout(const Duration(seconds: 10))).supportsHistory;
+        // Not requiring !fromCache: the pass already needs a verified token
+        // (read live from /app/info on this connection) and being online.
+        return (await ref.read(historyFeatureProvider.future)
+            .timeout(const Duration(seconds: 10))) != null;
       } catch (_) {
         return null;
       }

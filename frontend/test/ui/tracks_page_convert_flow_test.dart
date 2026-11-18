@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:frontend/playback/audio_dependencies.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -12,6 +13,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/conversion_job.dart';
@@ -32,6 +34,7 @@ import 'package:frontend/ui/tracks_page.dart';
 import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
+import '../helpers/test_credentials.dart';
 
 /// Stands in for the real flush + `/changes` pull. [bumpRevisionTo] writes a
 /// newer server revision during the "pull", the way a real sync would, so a
@@ -76,7 +79,10 @@ class _Offline extends OfflineModeNotifier {
   final bool value;
 
   @override
-  bool build() => value;
+  bool build() {
+    super.build();
+    return value;
+  }
 }
 
 class _RecordingConversionJobs extends ConversionJobsNotifier {
@@ -193,6 +199,16 @@ TrackUI _loadedTrack(String uuid) => TrackUI(
 ApiException _apiError(int status, Object detail) =>
     ApiException(status, jsonEncode({'detail': detail}));
 
+/// A transport whose delegate each test swaps after the scope exists. The
+/// default models an unreachable server.
+class _SwapClient extends http.BaseClient {
+  http.Client inner =
+      MockClient((_) async => throw const SocketException('down'));
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      inner.send(request);
+}
+
 void main() {
   late AppDatabase db;
 
@@ -217,6 +233,7 @@ void main() {
     return ProviderScope(
       overrides: [
         databaseProvider.overrideWithValue(db),
+        coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
         currentTrackProvider.overrideWithValue(playing),
         trackSyncProvider.overrideWith(() => sync ?? _StubTrackSync()),
         appInfoProvider.overrideWith((ref) async => capabilities),
@@ -669,16 +686,16 @@ void main() {
   group('TracksPage Convert… entry', () {
     late Directory tempDir;
     late LocalCoverArtStore coverStore;
-
-    setUpAll(() {
-      initCoverArtCache(CoverArtCacheManager.noop());
-    });
+    late _SwapClient transport;
+    late ApiClient api;
 
     setUp(() async {
-      ApiClient.init('http://localhost:8000');
+      transport = _SwapClient();
+      api = testApiClient('http://localhost:8000', transport);
       tempDir = await Directory.systemTemp.createTemp('convert-entry-test');
       coverStore = await LocalCoverArtStore.create(
         directoryProvider: () async => tempDir,
+        apiClient: api,
       );
     });
 
@@ -694,13 +711,17 @@ void main() {
       // Downloaded, so the row stays interactive while offline.
       await _insertTrack(db, uuid: 'abc', codec: 'flac', filePath: '/x/abc.flac');
       final manager = DownloadManager(
+        apiClient: api,
         db: db,
         coverArtStore: coverStore,
         directoryProvider: () async => tempDir,
       );
       await tester.pumpWidget(ProviderScope(
         overrides: [
+          apiClientProvider.overrideWithValue(api),
+          ...signedInOverrides,
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           currentTrackProvider.overrideWithValue(null),
           downloadManagerProvider.overrideWithValue(manager),
           trackSyncProvider.overrideWith(() => _StubTrackSync()),
@@ -753,9 +774,7 @@ void main() {
         'even when the row is scrolled away (unmounted) during the sync',
         (tester) async {
       final posts = <Map<String, dynamic>>[];
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async {
+      transport.inner = MockClient((req) async {
           if (req.method == 'POST' && req.url.path == '/jobs') {
             posts.add(jsonDecode(req.body) as Map<String, dynamic>);
             return http.Response(
@@ -778,8 +797,7 @@ void main() {
             200,
             headers: {'content-type': 'application/json'},
           );
-        }),
-      );
+        });
       // 'aaa' sorts first (equal artist/album/disc/track; uuid tiebreak).
       await _insertTrack(db, uuid: 'aaa', title: 'Target', revision: 4);
       for (var i = 0; i < 40; i++) {
@@ -790,6 +808,7 @@ void main() {
         );
       }
       final manager = DownloadManager(
+        apiClient: api,
         db: db,
         coverArtStore: coverStore,
         directoryProvider: () async => tempDir,
@@ -797,7 +816,10 @@ void main() {
       final gate = Completer<void>();
       await tester.pumpWidget(ProviderScope(
         overrides: [
+          apiClientProvider.overrideWithValue(api),
+          ...signedInOverrides,
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           currentTrackProvider.overrideWithValue(null),
           downloadManagerProvider.overrideWithValue(manager),
           trackSyncProvider.overrideWith(() => _StubTrackSync(gate: gate)),
@@ -850,9 +872,7 @@ void main() {
         pumpWithRunningJob(WidgetTester tester, {int deleteStatus = 200}) async {
       var status = 'running';
       final deletes = <String>[];
-      ApiClient.initForTest(
-        'http://localhost:8000',
-        MockClient((req) async {
+      transport.inner = MockClient((req) async {
           if (req.method == 'DELETE') {
             deletes.add(req.url.path);
             if (deleteStatus != 200) return http.Response('boom', deleteStatus);
@@ -880,17 +900,20 @@ void main() {
             200,
             headers: {'content-type': 'application/json'},
           );
-        }),
-      );
+        });
       await _insertTrack(db, uuid: 'abc', codec: 'flac', title: 'Song');
       final manager = DownloadManager(
+        apiClient: api,
         db: db,
         coverArtStore: coverStore,
         directoryProvider: () async => tempDir,
       );
       await tester.pumpWidget(ProviderScope(
         overrides: [
+          apiClientProvider.overrideWithValue(api),
+          ...signedInOverrides,
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
           currentTrackProvider.overrideWithValue(null),
           downloadManagerProvider.overrideWithValue(manager),
           trackSyncProvider.overrideWith(() => _StubTrackSync()),
@@ -986,6 +1009,7 @@ void main() {
         ProviderScope(
           overrides: [
             databaseProvider.overrideWithValue(db),
+            coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
             currentTrackProvider.overrideWithValue(null),
             conversionJobsProvider.overrideWith(_RecordingConversionJobs.new),
           ],

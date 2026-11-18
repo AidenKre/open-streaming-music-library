@@ -13,9 +13,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/history_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/models/history_event.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/history_repository.dart';
@@ -55,9 +57,11 @@ class _GatedPayloadRepository extends HistoryRepository {
   }
 }
 
+ApiClient api = testApiClient('', MockClient((_) async => throw StateError('no client installed')));
+
 class _StatusService extends HistorySyncService {
   _StatusService(AppDatabase db) : super(
-    repository: HistoryRepository(db), api: HistoryApi(),
+    repository: HistoryRepository(db), api: HistoryApi(api: api),
     cursors: SyncCursorStore(db), verifiedToken: () => null,
     isOffline: () => true, supportsHistory: () async => false,
   );
@@ -93,11 +97,12 @@ void main() {
   }) {
     final c = ProviderContainer(
       overrides: [
+        apiClientProvider.overrideWithValue(api),
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(),
         if (runner != null) historyRunnerProvider.overrideWithValue(runner),
         appInfoProvider.overrideWith(
-          (ref) async => AppInfo(historyVersion: supported ? 1 : null),
+          (ref) async => AppInfo(features: FeatureBlocks(history: supported ? const HistoryFeature(version: 1) : null)),
         ),
       ],
     );
@@ -198,7 +203,7 @@ void main() {
   });
 
   test('a blocked conflict pairs the local and server payloads', () async {
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://test',
       MockClient((req) async {
         if (req.method == 'POST') {

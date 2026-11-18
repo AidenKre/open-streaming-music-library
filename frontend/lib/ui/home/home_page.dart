@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/feed_header.dart';
+import 'package:frontend/ui/home/home_controller.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
+import 'package:frontend/ui/widgets/filter_bar.dart';
 import 'package:frontend/ui/widgets/library_sync_status_view.dart';
 
 /// One Home entry point (SC-07). Phase 9 appends `listening_stats`.
@@ -96,8 +98,104 @@ final homeSectionsProvider = Provider<List<HomeSectionSpec>>(
     homeSearchSectionSpec,
     homeSyncStatusSectionSpec,
     homeEntryPointsSectionSpec,
+    homeFiltersSectionSpec,
+    homeRecentsSectionSpec,
   ],
 );
+
+/// The Downloaded chip, in its own section above the rails (SC-07, O6):
+/// shown whenever recents is registered, even with no history.
+final homeFiltersSectionSpec = HomeSectionSpec(
+  id: HomeSectionIds.filters,
+  build: (context, ref) =>
+      _HomeControlsSection(HomeSectionIds.filters, ref.watch(homeControlsProvider), (
+        context,
+        controls,
+      ) {
+        return SliverToBoxAdapter(
+          child: FilterBar(
+            filters: controls.filters,
+            onDownloadedChanged: controls.setDownloaded,
+          ),
+        );
+      }),
+);
+
+/// Recently played: a live rail over [HomeControls.recents].
+final homeRecentsSectionSpec = HomeSectionSpec(
+  id: HomeSectionIds.recents,
+  build: (context, ref) => _HomeControlsSection(
+    HomeSectionIds.recents,
+    ref.watch(homeControlsProvider),
+    (context, controls) => _recentsRail(context, controls).buildSliver(context),
+  ),
+);
+
+EntityRailSection _recentsRail(BuildContext context, HomeControls controls) {
+  const id = HomeSectionIds.recents;
+  const title = 'Recently played';
+  const label = 'New activity';
+  final seeAll = TextButton(
+    onPressed: () => openSeeAllRecents(
+      context,
+      initialDownloaded: controls.filters.downloaded,
+    ),
+    child: const Text('See all'),
+  );
+  return switch (controls.recents) {
+    HomeRecentsLoading() => const EntityRailSection(
+      id: id,
+      title: title,
+      entities: [],
+      state: RailState.loading,
+      newActivityLabel: label,
+    ),
+    HomeRecentsFailed() => EntityRailSection(
+      id: id,
+      title: title,
+      entities: const [],
+      state: RailState.error,
+      onRetry: controls.retryRecents,
+      newActivityLabel: label,
+    ),
+    HomeRecentsReady(:final entities) => EntityRailSection(
+      id: id,
+      title: title,
+      entities: entities,
+      newActivityLabel: label,
+      trailing: seeAll,
+      onTap: (entity, _) => switch (entity) {
+        TrackEntity(:final track) => controls.playTrack(track),
+        AlbumEntity(:final album) => openAlbumDetail(context, album),
+        ArtistEntity(:final artist) => openArtistDetail(context, artist),
+      },
+    ),
+    HomeRecentsEmpty(:final filtered) => EntityRailSection(
+      id: id,
+      title: title,
+      entities: const [],
+      newActivityLabel: label,
+      emptyMessage: filtered ? 'No downloaded recents' : null,
+      trailing: filtered ? seeAll : null,
+    ),
+  };
+}
+
+/// A section whose sliver rebuilds when [controls] notifies.
+class _HomeControlsSection extends FeedSection {
+  const _HomeControlsSection(this.id, this.controls, this.builder);
+
+  @override
+  final String id;
+  final HomeControls controls;
+  final Widget Function(BuildContext context, HomeControls controls) builder;
+
+  @override
+  Widget buildSliver(BuildContext context) => ListenableBuilder(
+    listenable: controls,
+    builder: (context, _) => builder(context, controls),
+  );
+}
 
 /// The library sync's bounded loading/error/Retry feedback (phase-4 §4).
 final homeSyncStatusSectionSpec = HomeSectionSpec(

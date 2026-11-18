@@ -5,7 +5,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/artist_ui.dart';
 import 'package:frontend/repositories/browse_repository.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/ui/artist_page.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/widgets/downloaded_only_badge.dart';
@@ -20,7 +19,6 @@ void main() {
   late BrowseHarness h;
 
   setUp(() async {
-    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, const [
       SeedTrack(

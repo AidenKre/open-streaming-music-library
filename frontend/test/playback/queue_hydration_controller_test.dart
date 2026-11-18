@@ -4,7 +4,6 @@ import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/playback/queue_window.dart';
@@ -17,10 +16,6 @@ void main() {
   late _FakePlayer fakePlayer;
   late QueueWindow hydration;
   late _LibraryFixture fixture;
-
-  setUpAll(() {
-    ApiClient.init('http://localhost:8080');
-  });
 
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());

@@ -8,6 +8,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mocktail/mocktail.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 
 class MockCacheManager extends Mock implements BaseCacheManager {}
@@ -29,9 +31,14 @@ void main() {
   late CoverArtCacheManager manager;
 
   setUp(() {
-    ApiClient.init('http://localhost:8000');
     mockCache = MockCacheManager();
-    manager = CoverArtCacheManager(cache: mockCache);
+    manager = CoverArtCacheManager(
+      api: testApiClient(
+        'http://localhost:8000',
+        MockClient((_) async => http.Response('', 500)),
+      ),
+      cache: mockCache,
+    );
   });
 
   group('resolveArtUri', () {
@@ -69,17 +76,39 @@ void main() {
       ).called(1);
     });
 
-    test('returns network URL when image is not cached', () async {
+    // Phase M §7.3 (M-U20): never a network URL; uncached art is fetched
+    // into the cache and handed over as file://, or null on failure.
+    test('fetches uncached art into the cache and returns its file URI',
+        () async {
       when(
         () => mockCache.getFileFromCache(any()),
       ).thenAnswer((_) async => null);
+      when(
+        () => mockCache.getSingleFile(any(), headers: any(named: 'headers')),
+      ).thenAnswer((_) async => FakeFileInfo('/tmp/fetched.jpg').file);
 
       final uri = await manager.resolveArtUri(
         hasAlbumArt: true,
         coverArtId: 42,
       );
 
-      expect(uri, Uri.parse('http://localhost:8000/cover_art/42'));
+      expect(uri, Uri.file('/tmp/fetched.jpg'));
+    });
+
+    test('returns null when uncached art cannot be fetched', () async {
+      when(
+        () => mockCache.getFileFromCache(any()),
+      ).thenAnswer((_) async => null);
+      when(
+        () => mockCache.getSingleFile(any(), headers: any(named: 'headers')),
+      ).thenAnswer((_) => Future.error(const SocketException('offline')));
+
+      final uri = await manager.resolveArtUri(
+        hasAlbumArt: true,
+        coverArtId: 42,
+      );
+
+      expect(uri, isNull);
     });
   });
 
@@ -176,10 +205,16 @@ void main() {
       expect(provider, isA<NetworkImage>());
     });
 
-    test('resolveArtUri returns network URL without cache lookup', () async {
-      final noop = CoverArtCacheManager.noop();
+    test('resolveArtUri returns null without a cache (never a network URL)',
+        () async {
+      final noop = CoverArtCacheManager.noop(
+        api: testApiClient(
+          'http://localhost:8000',
+          MockClient((_) async => http.Response('', 500)),
+        ),
+      );
       final uri = await noop.resolveArtUri(hasAlbumArt: true, coverArtId: 42);
-      expect(uri, Uri.parse('http://localhost:8000/cover_art/42'));
+      expect(uri, isNull);
     });
 
     test('prefetch is a no-op', () {

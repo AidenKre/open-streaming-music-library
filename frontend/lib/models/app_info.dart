@@ -2,6 +2,8 @@
 // app-global facts (editable fields now; later phases add e.g. conversion
 // actions), cached client-side and consulted to decide what a user may edit.
 
+import 'package:frontend/models/feature_blocks.dart';
+
 class FieldDescriptor {
   final String key;
   final String label;
@@ -139,35 +141,40 @@ class AppInfo {
   final Map<String, EntityInfo> entities;
   final ConversionCapabilities conversion;
 
-  /// The server's `history` feature block version (SC-03), null when the
-  /// server doesn't advertise history sync (an older server, or a malformed
-  /// block): local recording continues, the endpoints are not called.
-  ///
-  /// TODO(SC-03): this is the only feature block today, so it is parsed ad
-  /// hoc. When the second one arrives (`uploads` in Phase 7, or
-  /// `library_tools` in Phase 8, whichever lands first), build SC-03's typed
-  /// feature-block parser (`HistoryFeature?`, `UploadsFeature?`, ...;
-  /// unknown blocks absent, unknown fields tolerated) and one provider per
-  /// feature, and move `history` onto it. Do not add a second ad-hoc field
-  /// like this one (user decision 2026-11-07).
-  final int? historyVersion;
-
   const AppInfo({
     this.entities = const {},
     this.conversion = const ConversionCapabilities(),
-    this.historyVersion,
+    this.features = const FeatureBlocks(),
+    this.fromCache = false,
   });
+
+  /// True when this came from the prefs-cached blob or the built-in default,
+  /// false when parsed from a server response on this read. Shows features in
+  /// the UI; never enables a network action by itself.
+  final bool fromCache;
+
+  /// This blob marked as cache-sourced.
+  AppInfo asCached() => AppInfo(
+    entities: entities,
+    conversion: conversion,
+    features: features,
+    fromCache: true,
+  );
+
+  /// The typed SC-03 feature blocks; an absent block means unsupported.
+  final FeatureBlocks features;
 
   EntityInfo? entity(String name) => entities[name];
 
   /// Whether the server supports history sync (version 1 or later).
-  bool get supportsHistory => (historyVersion ?? 0) >= 1;
+  bool get supportsHistory => features.history != null;
+
+  /// The `history` block's version, null when the server doesn't advertise it.
+  int? get historyVersion => features.history?.version;
 
   factory AppInfo.fromJson(Map<String, dynamic> json) {
     final rawEntities = (json['entities'] as Map<dynamic, dynamic>? ?? const {});
     final rawConversion = json['conversion'] as Map<dynamic, dynamic>?;
-    final rawHistory = json['history'];
-    final historyVersion = rawHistory is Map ? rawHistory['version'] : null;
     return AppInfo(
       entities: rawEntities.map(
         (key, value) => MapEntry(
@@ -178,13 +185,13 @@ class AppInfo {
       conversion: rawConversion != null
           ? ConversionCapabilities.fromJson(Map<String, dynamic>.from(rawConversion))
           : const ConversionCapabilities(),
-      historyVersion: historyVersion is int ? historyVersion : null,
+      features: FeatureBlocks.fromJson(json),
     );
   }
 
   Map<String, dynamic> toJson() => {
     'entities': entities.map((k, v) => MapEntry(k, v.toJson())),
     'conversion': conversion.toJson(),
-    if (historyVersion != null) 'history': {'version': historyVersion},
+    ...features.toJson(),
   };
 }

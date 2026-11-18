@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:math' show min;
 
 import 'package:drift/drift.dart';
@@ -161,8 +162,23 @@ class HistoryRepository {
     final rows = await (_db.select(_db.activeListens)
           ..orderBy([(l) => OrderingTerm(expression: l.startedAt)]))
         .get();
-    return [
-      for (final row in rows)
+    final drafts = <ListenDraft>[];
+    for (final row in rows) {
+      // One unreadable payload must not stop recovery of the other drafts.
+      // The row itself is left in the database.
+      HistoryEventPayload? finalPayload;
+      try {
+        finalPayload = row.finalPayloadJson == null
+            ? null
+            : _payloadFromJson(jsonDecode(row.finalPayloadJson!));
+      } catch (e) {
+        developer.log(
+          'listen draft skipped: unreadable final payload (${e.runtimeType})',
+          name: 'HistoryRepository',
+        );
+        continue;
+      }
+      drafts.add(
         ListenDraft(
           listenUuid: row.listenUuid,
           queueSessionId: row.queueSessionId,
@@ -172,11 +188,11 @@ class HistoryRepository {
           durationSeconds: row.durationSeconds,
           accumulatedMicros: row.accumulatedMicros,
           lastCheckpointAt: row.lastCheckpointAt,
-          finalPayload: row.finalPayloadJson == null
-              ? null
-              : _payloadFromJson(jsonDecode(row.finalPayloadJson!)),
+          finalPayload: finalPayload,
         ),
-    ];
+      );
+    }
+    return drafts;
   }
 
   Future<ActiveListen?> _draftRow(String listenUuid) =>
@@ -305,7 +321,7 @@ class HistoryRepository {
     String bindingToken, {
     required int requestedAfter,
     required HistoryPage page,
-  }) => _binding.runFenced(bindingToken, () async {
+  }) => _binding.runFenced(bindingToken, servedBy: page.servedBy, () async {
     _validatePage(requestedAfter, page);
     final existing = {
       for (final row in await (_db.select(_db.historyEvents)

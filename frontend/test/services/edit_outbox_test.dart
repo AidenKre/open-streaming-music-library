@@ -10,6 +10,7 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/metadata_edit.dart';
@@ -25,7 +26,10 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._v);
   final bool _v;
   @override
-  bool build() => _v;
+  bool build() {
+    super.build();
+    return _v;
+  }
 }
 
 /// Counts calls to the (small, cheap, but redundant-when-batched)
@@ -91,7 +95,7 @@ ProviderContainer _container(
   ServerBindingGate? gate,
 }) {
   _patchCalls.clear();
-  ApiClient.initForTest(
+  final api = testApiClient(
     'http://localhost:8000',
     MockClient((req) async {
       if (req.method == 'PATCH') {
@@ -113,12 +117,13 @@ ProviderContainer _container(
     }),
   );
   final c = ProviderContainer(overrides: [
+    apiClientProvider.overrideWithValue(api),
     databaseProvider.overrideWithValue(db),
     if (gate != null)
       serverBindingGateProvider.overrideWithValue(gate)
     else
       autoVerifiedGateOverride(),
-    tracksApiProvider.overrideWithValue(TracksApi()),
+    tracksApiProvider.overrideWithValue(TracksApi(api: api)),
     offlineModeProvider.overrideWith(() => _StubOffline(offline)),
   ]);
   addTearDown(c.dispose);
@@ -267,6 +272,39 @@ void main() {
 
     await outbox.dismissRejected('u1');
     expect(await db.select(db.pendingEdits).get(), isEmpty);
+  });
+
+  // Phase M §7.7 (M-U24): "Edit outbox: already rethrows; unchanged." A 401
+  // fails no edit: the row stays pending (not rejected) and
+  // goes out at the next same-user login.
+  test('flush 401 keeps the row pending, not rejected', () async {
+    final db = await _boundDb();
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    final outbox = _container(
+      db,
+      onPatch: (_) async => http.Response(
+        '{"detail":{"code":"invalid_token","message":"Sign in again."}}',
+        401,
+        headers: {'content-type': 'application/json'},
+      ),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'A'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    try {
+      await outbox.flush();
+    } catch (_) {
+      // a rethrown 401 is the outbox's "retry later"
+    }
+
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'pending');
+    expect(row.rejectionReason, isNull);
   });
 
   test('keep-mine rebases onto the server revision and re-flushes', () async {
@@ -713,6 +751,104 @@ void main() {
 
     await outbox.dismissRejected('u1');
     expect(await db.select(db.pendingEdits).get(), isEmpty);
+  });
+
+  // U23-FE-SYNC-B-09: the person saves a new edit on a track whose earlier
+  // edit was rejected, and a Dismiss of that rejection (tapped in a sheet
+  // opened before the save) lands after the save. The Dismiss deleted the
+  // row whatever its state, so the new edit was lost without a word.
+  test('a Dismiss landing after a new save keeps the edit, which is sent',
+      () async {
+    final db = await _boundDb();
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', revision: 5);
+    var patches = 0;
+    final outbox = _container(
+      db,
+      onPatch: (_) async => ++patches == 1
+          ? http.Response(jsonEncode({'detail': 'locked field'}), 422,
+              headers: {'content-type': 'application/json'})
+          : _ok(),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Refused'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush(); // -> 422: rejected, shown with Dismiss
+    expect((await db.select(db.pendingEdits).getSingle()).status, 'rejected');
+
+    // Both run together: the save, then the Dismiss.
+    final save = outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Second'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    final dismiss = outbox.dismissRejected('u1');
+    await Future.wait([save, dismiss]);
+    // A Dismiss arriving once the save is in changes nothing either.
+    await outbox.dismissRejected('u1');
+
+    final rows = await db.select(db.pendingEdits).get();
+    expect(rows, hasLength(1), reason: 'the Dismiss deleted the new edit');
+    expect(rows.single.status, 'pending');
+    expect(jsonDecode(rows.single.valuesJson), {'title': 'Second'});
+
+    await outbox.flush();
+    expect(_patchCalls.last.body['title'], 'Second',
+        reason: 'the new edit reaches the server');
+    expect(await db.select(db.pendingEdits).get(), isEmpty);
+  });
+
+  // U23-FE-SYNC-B-08: a new edit joining a rejected row kept that row's old
+  // "before" snapshot. A pull that landed between the first edit and its
+  // rejection made it stale, so rejecting the new edit reverted the field
+  // to a value the server no longer has.
+  test('a rejected re-edit reverts to the values from before it, not older',
+      () async {
+    final db = await _boundDb();
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', revision: 5);
+    final outbox = _container(
+      db,
+      onPatch: (_) async => http.Response(
+          jsonEncode({'detail': 'locked field'}), 422,
+          headers: {'content-type': 'application/json'}),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Mine'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    // A `/changes` pull lands while the edit waits: server truth moves on.
+    await db.customStatement(
+        "UPDATE trackmetadata SET title = 'ServerNew' WHERE uuid_id = 'u1'");
+    await db.customStatement(
+        "UPDATE tracks SET revision = 9 WHERE uuid_id = 'u1'");
+    await outbox.flush(); // -> 422: rejected; 'ServerNew' stays
+
+    Future<String> title() async => (await db
+            .customSelect("SELECT title FROM trackmetadata WHERE uuid_id = 'u1'")
+            .getSingle())
+        .read<String>('title');
+    expect(await title(), 'ServerNew');
+
+    // A new edit of the same field, refused again.
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Second'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 9,
+    );
+    await outbox.flush(); // -> 422
+
+    expect(await title(), 'ServerNew',
+        reason: 'the revert used the stale snapshot from before the pull');
   });
 
   test('flush 422 with a validation-list detail shows the generic reason',

@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/home/home_page.dart';
 import 'package:frontend/ui/search_page.dart';
+import 'package:frontend/models/server_blocked_reason.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/shell/glass.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
@@ -213,7 +214,7 @@ class AppShellState extends ConsumerState<AppShell> {
                         banners: [
                           const PendingEditsBanner(),
                           const StaleDownloadsBanner(),
-                          if (session.serverBlocked)
+                          if (session.serverBlocked != ServerBlockedReason.none)
                             const ServerBlockedBanner()
                           else if (isOffline)
                             const OfflineBanner(),

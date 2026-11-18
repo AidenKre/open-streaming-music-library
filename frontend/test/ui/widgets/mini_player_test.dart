@@ -1,8 +1,8 @@
 import 'package:drift/native.dart';
+import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -71,6 +71,7 @@ Future<void> _pumpMiniPlayer(
   final container = ProviderContainer(
     overrides: [
       databaseProvider.overrideWithValue(db),
+      coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
       queuePlayerProvider.overrideWith(
         () => _TestQueuePlayer(_audioStateWith(track,
             status: status, playWhenReady: playWhenReady)),
@@ -100,8 +101,6 @@ Future<void> _pumpMiniPlayer(
 
 void main() {
   setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
   });
 
   group('MiniPlayer cover art', () {

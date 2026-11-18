@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:math' show Random;
 
 import 'package:audio_service/audio_service.dart';
 import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -12,8 +14,10 @@ import 'package:just_audio/just_audio.dart' as ja;
 import 'package:mocktail/mocktail.dart';
 
 import 'package:frontend/models/history_intent.dart';
+import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/playback/playback_target_resolver.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -28,6 +32,10 @@ import 'package:frontend/playback/local_source_policy.dart';
 import 'package:frontend/playback/playback_engine.dart';
 
 import 'audio_focus_test.dart' show FakeAudioSessionPort;
+import 'audio_focus_test.dart' show FakeTimers, RelinquishingOwner;
+import 'preview_player_test.dart' show FakePreviewEngine;
+import 'package:frontend/playback/preview_player.dart';
+import 'package:frontend/services/history/click_recorder.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
@@ -43,8 +51,11 @@ import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:frontend/ui/player_controller.dart';
+import 'package:frontend/ui/preview_controller.dart';
 import '../helpers/fake_clock.dart';
 import '../helpers/playback_submit.dart';
+import 'package:frontend/playback/media_token_binding.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import '../helpers/server_binding.dart';
 import 'package:frontend/services/clock.dart';
 import 'package:frontend/services/queue_warm_service.dart';
@@ -54,6 +65,7 @@ import 'package:frontend/playback/playback_issue_bus.dart';
 import 'package:frontend/playback/playback_requests.dart';
 import 'package:frontend/playback/source_failure_classifier.dart';
 import 'package:frontend/playback/queue_warm_listener.dart';
+import '../helpers/no_server_api.dart';
 
 void main() {
   late AppDatabase db;
@@ -68,17 +80,22 @@ void main() {
   late FakeClock testClock;
   final trackStatuses = <String, int?>{};
   Completer<void>? probeGate;
+  // Holds the failure classifier's file check (U17-FE-PB-CORE-B-04).
+  Completer<void>? classifyGate;
 
   final Set<String> existingFiles = <String>{};
   Completer<void>? fileGate;
   late StreamController<int> downloadStatusController;
+
+  var coverArt = CoverArtCacheManager.noop();
+  late ApiClient audioApi;
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     // The real settings and warm services are built by QueuePlayer.
     // Keep their incidental requests in memory: localhost might be a real
     // server, and connection failures/retry timing are not audio fixtures.
-    ApiClient.initForTest('http://audio.test', MockClient((request) async {
+    audioApi = testApiClient('http://audio.test', MockClient((request) async {
       if (request.url.path == '/settings/quality') {
         return http.Response('{"quality":"original"}', 200);
       }
@@ -87,7 +104,7 @@ void main() {
       }
       throw StateError('Unexpected audio-test request: ${request.url}');
     }));
-    initCoverArtCache(CoverArtCacheManager.noop());
+    coverArt = CoverArtCacheManager.noop();
     db = AppDatabase(NativeDatabase.memory());
     await seedTestBinding(db); // SC-01: queue/outbox writes are fenced
     existingFiles.clear();
@@ -101,6 +118,7 @@ void main() {
     testClock = FakeClock();
     trackStatuses.clear();
     probeGate = null;
+    classifyGate = null;
     downloadStatusController = StreamController<int>.broadcast();
   });
 
@@ -123,9 +141,15 @@ void main() {
     bool controllableQuality = false,
     bool failingReconcile = false,
     _ScriptedSync? sync,
+    Random? random,
+    List<Override> extraOverrides = const [],
   }) {
     container = ProviderContainer(
       overrides: [
+        ...extraOverrides,
+        if (random != null) queueRandomProvider.overrideWithValue(random),
+        apiClientProvider.overrideWithValue(audioApi),
+        coverArtCacheProvider.overrideWithValue(coverArt),
         if (sync != null) trackSyncProvider.overrideWith(() => sync),
         // Most tests run inside an active session; B8 tests pass their own.
         sessionReadinessProvider.overrideWithValue(
@@ -154,7 +178,10 @@ void main() {
             )),
         sourceFailureClassifierProvider.overrideWith((ref) =>
             SourceFailureClassifier(
-              fileExists: (path) async => existingFiles.contains(path),
+              fileExists: (path) async {
+                await classifyGate?.future;
+                return existingFiles.contains(path);
+              },
               trackKnownLocally: (uuid) async =>
                   (await db.getTrackByUuid(uuid)).isNotEmpty,
               fetchTrackStatus: (uuid) async {
@@ -305,7 +332,7 @@ void main() {
                 hasAlbumArt: const Value(true), coverArtId: Value(7 + i)));
       }
       final art = _GatedCoverArt(local: local);
-      initCoverArtCache(art);
+      coverArt = art;
       return art;
     }
 
@@ -595,7 +622,7 @@ void main() {
           .write(const TrackmetadataCompanion(
               hasAlbumArt: Value(true), coverArtId: Value(7)));
       final art = _GatedCoverArt();
-      initCoverArtCache(art);
+      coverArt = art;
       final c = createContainer();
       await repo.startupRead.future;
       final notifier = c.read(queuePlayerProvider.notifier);
@@ -623,7 +650,7 @@ void main() {
           .write(const TrackmetadataCompanion(
               hasAlbumArt: Value(true), coverArtId: Value(7)));
       final art = _GatedCoverArt();
-      initCoverArtCache(art);
+      coverArt = art;
       final c = createContainer();
       await repo.startupRead.future;
       final notifier = c.read(queuePlayerProvider.notifier);
@@ -1391,6 +1418,25 @@ void main() {
       expect(await repo.pruneInactiveSessions(), 0);
     });
 
+    test('U17-FE-PB-CORE-A-04: an empty request does not cancel a valid one '
+        'still in flight', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final c = createContainer();
+      final requests = requestsOf(c);
+      final first =
+          requests.submit(const PlayList(['a', 'b'], 0, ListSource('search')));
+      final emptyList =
+          requests.submit(const PlayList([], 0, ListSource('search')));
+      final emptyCollection = requests.submit(const PlayCollection(
+          AlbumScope(artistId: 1, albumId: 1), [],
+          shuffle: ShuffleStart.canonical));
+      expect(await emptyList, isA<RejectedEmpty>());
+      expect(await emptyCollection, isA<RejectedEmpty>());
+      expect(await first, isA<Accepted>(),
+          reason: 'nothing was admitted by the empty requests');
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+    });
+
     test('stop supersedes a request that has not activated yet', () async {
       await fixture.insertSingles(['a']);
       final c = createContainer();
@@ -1771,7 +1817,8 @@ void main() {
       final stale = notifier.admitReplacement();
       notifier.admitReplacement(); // a newer request was admitted
       final seeds = fakePlayer.seedCalls.length;
-      final result = await notifier.activatePreparedSession(s2, entry,
+      final result = await notifier.activatePreparedSession(
+          s2, PlaybackTarget(entry, PlaybackSourceKind.remote),
           autoPlay: true, requestRevision: stale);
       expect(result, ActivationResult.superseded);
       expect(fakePlayer.seedCalls, hasLength(seeds));
@@ -1785,7 +1832,8 @@ void main() {
       final (s2, entry) = await prepared(['c']);
       await repo.discardSession(s2);
       final seeds = fakePlayer.seedCalls.length;
-      final result = await notifier.activatePreparedSession(s2, entry,
+      final result = await notifier.activatePreparedSession(
+          s2, PlaybackTarget(entry, PlaybackSourceKind.remote),
           autoPlay: true, requestRevision: notifier.admitReplacement());
       expect(result, ActivationResult.stale);
       expect(fakePlayer.seedCalls, hasLength(seeds));
@@ -2990,6 +3038,9 @@ void main() {
   );
 
   test(
+    // Sign-off DEV-6-01 (owner, 2026-11-17): back to the Phase 5 rule (6A.1b
+    // had changed it to "keeps the played prefix"). The two shuffled plays
+    // stay, so the whole order is proven restored, behind and ahead.
     'toggleShuffle off restores canonical order without reseeding',
     () async {
       await fixture.insertAlbum(
@@ -2999,7 +3050,7 @@ void main() {
       );
       final startTrack = await fixture.track('d');
 
-      final c = createContainer();
+      final c = createContainer(random: Random(1));
       final notifier = c.read(queuePlayerProvider.notifier);
       await playFromQueue(c, track: startTrack,
         sourceType: 'album',
@@ -3014,6 +3065,17 @@ void main() {
 
       await notifier.toggleShuffle();
       await Future<void>.delayed(Duration.zero);
+      // Two shuffled plays after d: the prefix is no longer canonical.
+      await notifier.skipNext();
+      await pumpEventQueue();
+      await notifier.skipNext();
+      await pumpEventQueue();
+      final shuffled = (await sessionTracksOf(c)).map((entry) => entry.uuidId).toList(growable: false);
+      final played = shuffled.take(6).toList(growable: false);
+      expect(played.take(4), ['a', 'b', 'c', 'd']);
+      expect(played.skip(4), isNot(['e', 'f']),
+          reason: 'seeded so the shuffled plays are not the canonical ones');
+      final playedItemId = c.read(queuePlayerProvider).queue.currentItemId;
       await notifier.toggleShuffle();
       await Future<void>.delayed(Duration.zero);
 
@@ -3021,8 +3083,12 @@ void main() {
 
       expect(fakePlayer.seedCalls, hasLength(1));
       expect(fakePlayer.rebuildCalls, hasLength(2));
-      expect(c.read(queuePlayerProvider).queue.currentItemId, currentItemId);
+      expect(currentItemId, isNotNull);
+      expect(c.read(queuePlayerProvider).queue.currentItemId, playedItemId);
       expect(restoredOrder, canonicalOrder);
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition,
+          canonicalOrder.indexOf(played.last),
+          reason: 'the current track sits at its album position');
       expect(
         await _playOrderCount(db, c.read(queuePlayerProvider).queue.sessionId!),
         canonicalOrder.length,
@@ -3217,8 +3283,6 @@ void main() {
         sessionId: sessionId,
         currentItemId: idsByUuid['e']!,
         positionMs: 0,
-        resumeMainItemId: idsByUuid['e']!,
-        updateResumeMainItemId: true,
       );
 
       final queued = await fixture.track('x');
@@ -3249,7 +3313,11 @@ void main() {
   );
 
   test(
-    'toggleShuffle off restores the current main track to its canonical position',
+    // Sign-off DEV-6-01 (owner, 2026-11-17): back to the Phase 5 rule (6A.1b
+    // had changed it to "keeps the current main track where it was played",
+    // a, c, b, d, e at 1).
+    'toggleShuffle off restores the current main track to its canonical '
+    'position',
     () async {
       await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
 
@@ -3320,10 +3388,8 @@ void main() {
       final snapshotBeforeShuffle = await repo.getSessionSnapshot(
         c.read(queuePlayerProvider).queue.sessionId!,
       );
-      expect(
-        snapshotBeforeShuffle?.session.resumeMainItemId,
-        afterInsert[1].itemId,
-      );
+      // 6-R1-10: resume_main_item_id is no longer written (nothing reads it).
+      expect(snapshotBeforeShuffle?.session.resumeMainItemId, isNull);
 
       await notifier.toggleShuffle();
       await Future<void>.delayed(Duration.zero);
@@ -3734,6 +3800,7 @@ void main() {
       final cB = ProviderContainer(
         overrides: [
           databaseProvider.overrideWithValue(db),
+          coverArtCacheProvider.overrideWithValue(coverArt),
           playbackEngineProvider.overrideWithValue(
             FakePlaybackEngine(),
           ),
@@ -4245,6 +4312,3411 @@ void main() {
       expect(fakePlayer.seedCalls.last.autoPlay, isTrue);
     },
   );
+
+  group('6A.1b (SC-27, D3): the queue order uses the injected generator', () {
+    test('toggling shuffle on draws from the overridden generator', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd', 'e', 'f']);
+      final random = _RecordingRandom(Random(3));
+      final c = createContainer(random: random);
+      await c.read(playbackRequestsProvider).submit(const PlayList(
+          ['a', 'b', 'c', 'd', 'e', 'f'], 0, ListSource('search')));
+      expect(random.draws, 0, reason: 'nothing shuffled yet');
+
+      await c.read(queuePlayerProvider.notifier).toggleShuffle();
+
+      expect(random.draws, greaterThan(0));
+      final order = (await sessionTracksOf(c)).map((e) => e.uuidId).toList();
+      expect(order.first, 'a');
+      expect(order.toSet(), {'a', 'b', 'c', 'd', 'e', 'f'});
+      expect(order, hasLength(6));
+    });
+
+    test('the same seed gives the same shuffled order', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']);
+      Future<List<String>> shuffledWith(int seed) async {
+        final c = createContainer(random: Random(seed));
+        await c.read(playbackRequestsProvider).submit(const PlayList(
+            ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], 0, ListSource('search')));
+        await c.read(queuePlayerProvider.notifier).toggleShuffle();
+        final order =
+            (await sessionTracksOf(c)).map((e) => e.uuidId).toList();
+        c.dispose();
+        container = null;
+        return order;
+      }
+
+      final first = await shuffledWith(11);
+      final second = await shuffledWith(11);
+      expect(second, first);
+      // Fixed expectation for seed 11 is not pinned: the generator, not the
+      // test, decides the order; equality across runs proves injection.
+    });
+  });
+
+  group('6A.1b (SC-05, spec §5 Play): PlayCollection', () {
+    const albumIntent = HistoryIntent('album', 'inst-1:1');
+    const albumScope = AlbumScope(artistId: 1, albumId: 1);
+
+    Future<List<HistoryEvent>> clicks() => (db.select(db.historyEvents)
+          ..where((e) => e.kind.equals('clicked'))
+          ..orderBy([(e) => OrderingTerm(expression: e.localId)]))
+        .get();
+
+    /// A playing list queue with sticky shuffle on and repeat all.
+    Future<ProviderContainer> playingShuffledRepeatAll(
+        {bool offline = false}) async {
+      final c = createContainer(offline: offline);
+      await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['x', 'y'], 0, ListSource('search')));
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.toggleShuffle();
+      await notifier.cycleQueueRepeatMode(); // off -> all
+      expect(c.read(shuffleProvider), isTrue);
+      expect(c.read(repeatModeProvider), QueueRepeatMode.all);
+      return c;
+    }
+
+    test('Play is canonical whatever the sticky shuffle, keeps repeat, '
+        'names the album and records one album click', () async {
+      await fixture.insertSingles(['x', 'y']);
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: ['a', 'b', 'c', 'd', 'e']);
+      final c = await playingShuffledRepeatAll();
+      final albumScope = AlbumScope(
+          artistId: (await fixture.track('a')).artistId!,
+          albumId: (await fixture.track('a')).albumId!);
+
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(albumScope, const ['a', 'b', 'c', 'd', 'e'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+
+      expect(outcome, isA<Accepted>());
+      final sessionId = (outcome as Accepted).sessionId;
+      expect(c.read(queuePlayerProvider).queue.sessionId, sessionId);
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(shuffleProvider), isFalse);
+      expect(c.read(repeatModeProvider), QueueRepeatMode.all);
+      final session = (await repo.getSessionSnapshot(sessionId))!.session;
+      expect(session.shuffleEnabled, isFalse);
+      expect(session.repeatMode, 'all');
+      expect(session.sourceType, 'album');
+      expect(session.sourceArtistId, albumScope.artistId);
+      expect(session.sourceAlbumId, albumScope.albumId);
+      expect((await repo.getSessionTracksInPlayOrder(sessionId))
+          .map((e) => e.uuidId), ['a', 'b', 'c', 'd', 'e']);
+      expect(fakePlayer.seedCalls.last.autoPlay, isTrue);
+      await pumpEventQueue();
+      final rows = await clicks();
+      expect(rows, hasLength(1));
+      expect((rows.single.entityType, rows.single.entityRef),
+          ('album', 'inst-1:1'));
+    });
+
+    test('an artist collection names the artist only', () async {
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: ['a', 'b']);
+      final artistId = (await fixture.track('a')).artistId!;
+      final c = createContainer();
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(ArtistScope(artistId: artistId), const ['b', 'a'],
+              shuffle: ShuffleStart.canonical));
+      final session = (await repo
+              .getSessionSnapshot((outcome as Accepted).sessionId))!
+          .session;
+      expect(session.sourceType, 'artist');
+      expect(session.sourceArtistId, artistId);
+      expect(session.sourceAlbumId, isNull);
+      expect(c.read(currentTrackProvider)?.uuidId, 'b',
+          reason: 'the given (canonical) order is the queue order');
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty, reason: 'no intent, no click');
+    });
+
+    test('an empty collection is rejected: queue untouched, no click',
+        () async {
+      await fixture.insertSingles(['x', 'y']);
+      final c = await playingShuffledRepeatAll();
+      final before = c.read(queuePlayerProvider);
+      final seeds = fakePlayer.seedCalls.length;
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          const PlayCollection(albumScope, [],
+              shuffle: ShuffleStart.random, intent: albumIntent));
+      expect(outcome, isA<RejectedEmpty>());
+      expect(c.read(queuePlayerProvider).queue.sessionId,
+          before.queue.sessionId);
+      expect(c.read(shuffleProvider), isTrue, reason: 'state untouched');
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+
+    test('a scope that is not an album or artist fails without a click',
+        () async {
+      await fixture.insertSingles(['a']);
+      final c = createContainer();
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          const PlayCollection(TracksScope([]), ['a'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<Failed>());
+      expect(fakePlayer.seedCalls, isEmpty);
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+
+    test('offline with nothing playable: rejected, queue untouched, no click',
+        () async {
+      await fixture.insertSingles(['x', 'y']);
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: ['a', 'b']);
+      await markDownloaded('x', '/dl/x');
+      await markDownloaded('y', '/dl/y');
+      final c = await playingShuffledRepeatAll(offline: true);
+      final before = c.read(queuePlayerProvider);
+      final activeBefore = (await repo.getActiveSession())?.id;
+      final seeds = fakePlayer.seedCalls.length;
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          const PlayCollection(albumScope, ['a', 'b'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<RejectedUnplayableOffline>());
+      expect((await repo.getActiveSession())?.id, activeBefore);
+      expect(c.read(queuePlayerProvider).queue.sessionId,
+          before.queue.sessionId);
+      expect(c.read(currentTrackProvider)?.uuidId,
+          before.playback.currentTrack?.uuidId);
+      expect(c.read(shuffleProvider), isTrue);
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      expect(await repo.pruneInactiveSessions(), 0,
+          reason: 'the prepared session was discarded');
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+
+    test('a superseded collection request never reaches the queue or the '
+        'engine and records nothing', () async {
+      await fixture.insertSingles(['x', 'y']);
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: ['a', 'b']);
+      final c = createContainer();
+      final requests = c.read(playbackRequestsProvider);
+      final collection = requests.submit(const PlayCollection(
+          albumScope, ['a', 'b'],
+          shuffle: ShuffleStart.random, intent: albumIntent));
+      final list =
+          requests.submit(const PlayList(['x', 'y'], 0, ListSource('search')));
+      expect(await collection, isA<Superseded>());
+      expect(await list, isA<Accepted>());
+      expect(fakePlayer.seedCalls, hasLength(1));
+      expect(c.read(currentTrackProvider)?.uuidId, 'x');
+      expect(await repo.pruneInactiveSessions(), 0);
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+
+    test('a collection with a missing download publishes LocalFileMissing '
+        'and falls back', () async {
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: ['a', 'b', 'c']);
+      await markDownloaded('a', '/dl/a');
+      existingFiles.remove('/dl/a'); // recorded, but gone from disk
+      await markDownloaded('b', '/dl/b');
+      final c = createContainer(offline: true);
+      final issues = <PlaybackIssue>[];
+      c.read(playbackIssueBusProvider).issues.listen(issues.add);
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          const PlayCollection(albumScope, ['a', 'b'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      await pumpEventQueue();
+      expect(outcome, isA<Accepted>());
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(issues, const [LocalFileMissing('a', '/dl/a')]);
+      expect((await clicks()).map((e) => e.entityType), ['album'],
+          reason: 'one collection click, never a member track click');
+    });
+  });
+
+  group('6A.1b (spec §5 Shuffle, SC-27): PlayCollection random start', () {
+    const albumIntent = HistoryIntent('album', 'inst-1:1');
+
+    Future<AlbumScope> album(List<String> uuids) async {
+      await fixture.insertAlbum(artist: 'Artist', album: 'Album', uuids: uuids);
+      final first = await fixture.track(uuids.first);
+      return AlbumScope(artistId: first.artistId!, albumId: first.albumId!);
+    }
+
+    test('the full permutation is persisted before audio; the scripted first '
+        'pick starts the last canonical member', () async {
+      final scope = await album(['a', 'b', 'c', 'd', 'e', 'f']);
+      // Two members share a title (spec: duplicate titles included).
+      await (db.update(db.trackmetadata)
+            ..where((t) => t.uuidId.isIn(['b', 'd'])))
+          .write(const TrackmetadataCompanion(title: Value('Same')));
+      final c = createContainer(
+          random: _FirstPickRandom((max) => max - 1, Random(4)));
+      List<(int, int, String)>? rowsAtFirstSeed;
+      int? playsAtFirstSeed;
+      fakePlayer.beforeSeed = (sessionId) async {
+        if (rowsAtFirstSeed != null || sessionId == null) return;
+        playsAtFirstSeed = fakePlayer.playCalls;
+        rowsAtFirstSeed = await _orderRows(db, sessionId);
+      };
+
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c', 'd', 'e', 'f'],
+              shuffle: ShuffleStart.random, intent: albumIntent));
+
+      expect(outcome, isA<Accepted>());
+      final sessionId = (outcome as Accepted).sessionId;
+      expect(playsAtFirstSeed, 0, reason: 'no audio before the order row');
+      final rows = rowsAtFirstSeed!;
+      expect(rows.map((r) => r.$1), [0, 1, 2, 3, 4, 5]);
+      expect(rows.first, (0, 5, 'f'), reason: 'forced first = last canonical');
+      expect(rows.map((r) => r.$2).toSet(), {0, 1, 2, 3, 4, 5});
+      expect(rows.map((r) => r.$3).toList()..sort(),
+          ['a', 'b', 'c', 'd', 'e', 'f'], reason: 'no duplicates, none missing');
+      expect(await _orderRows(db, sessionId), rows,
+          reason: 'activation and start never reorder it');
+      expect(fakePlayer.seedCalls.single.autoPlay, isTrue);
+      expect(c.read(currentTrackProvider)?.uuidId, 'f',
+          reason: 'the first audible item is the persisted first');
+      expect(c.read(shuffleProvider), isTrue);
+      expect((await repo.getSessionSnapshot(sessionId))!.session.shuffleEnabled,
+          isTrue);
+      await pumpEventQueue();
+      final clickRows = await (db.select(db.historyEvents)
+            ..where((e) => e.kind.equals('clicked')))
+          .get();
+      expect(clickRows.map((e) => (e.entityType, e.entityRef)),
+          [('album', 'inst-1:1')]);
+    });
+
+    test('seeded: the session is the permutation of exactly the members',
+        () async {
+      final uuids = List.generate(15, (i) => 't$i');
+      final scope = await album(uuids);
+      final c = createContainer(random: Random(99));
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, uuids, shuffle: ShuffleStart.random));
+      final rows = await _orderRows(db, (outcome as Accepted).sessionId);
+      expect(rows.map((r) => r.$1), List.generate(15, (i) => i));
+      expect(rows.map((r) => r.$2).toList()..sort(), List.generate(15, (i) => i));
+      expect(rows.map((r) => r.$3).toSet(), uuids.toSet());
+      expect(rows.map((r) => r.$3), isNot(orderedEquals(uuids)));
+      expect(c.read(currentTrackProvider)?.uuidId, rows.first.$3);
+    });
+
+    test('Shuffle keeps the repeat mode and turns shuffle on even when sticky '
+        'shuffle was off', () async {
+      await fixture.insertSingles(['x']);
+      final scope = await album(['a', 'b', 'c']);
+      final c = createContainer(random: Random(1));
+      await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['x'], 0, ListSource('search')));
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // all
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // one
+      expect(c.read(shuffleProvider), isFalse);
+      await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c'],
+              shuffle: ShuffleStart.random));
+      expect(c.read(shuffleProvider), isTrue);
+      expect(c.read(repeatModeProvider), QueueRepeatMode.one);
+    });
+  });
+
+  group('Sign-off DEV-6-01 (owner, 2026-11-17): shuffle off restores the '
+      'whole original order, on every queue', () {
+    // Replaces the 6A.1b group "shuffle toggles keep the played prefix".
+    const canonical = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+
+    Future<List<String>> orderOf(ProviderContainer c) async =>
+        (await sessionTracksOf(c)).map((e) => e.uuidId).toList();
+
+    String? current(ProviderContainer c) =>
+        c.read(currentTrackProvider)?.uuidId;
+
+    Future<void> skip(ProviderContainer c, int times) async {
+      for (var i = 0; i < times; i++) {
+        await c.read(queuePlayerProvider.notifier).skipNext();
+        await pumpEventQueue();
+      }
+    }
+
+    /// A shuffled collection queue over [canonical] after [plays] skips.
+    Future<(ProviderContainer, List<String>)> shuffledAlbum(int plays) async {
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: canonical);
+      final first = await fixture.track('a');
+      final c = createContainer(random: Random(5));
+      await c.read(playbackRequestsProvider).submit(PlayCollection(
+          AlbumScope(artistId: first.artistId!, albumId: first.albumId!),
+          canonical,
+          shuffle: ShuffleStart.random));
+      final initial = await orderOf(c);
+      await skip(c, plays);
+      expect(current(c), initial[plays]);
+      expect(initial.take(plays + 1),
+          isNot(canonical.take(plays + 1)),
+          reason: 'precondition: the heard tracks are not the album start');
+      return (c, initial);
+    }
+
+    test('collection Shuffle, several plays: OFF puts the whole queue in '
+        'album order with the current track at its album position; Previous '
+        'walks back through the album', () async {
+      final (c, initial) = await shuffledAlbum(3);
+      final playing = initial[3];
+      final notifier = c.read(queuePlayerProvider.notifier);
+
+      await notifier.toggleShuffle(); // off
+      expect(await orderOf(c), canonical);
+      expect(current(c), playing);
+      final at = canonical.indexOf(playing);
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, at);
+      expect(c.read(shuffleProvider), isFalse);
+
+      for (var i = at - 1; i >= 0; i--) {
+        await notifier.skipPrevious();
+        await pumpEventQueue();
+        expect(current(c), canonical[i]);
+      }
+    });
+
+    test('ON in the middle of the album shuffles only what is ahead: the '
+        'tracks before the current one stay behind (Phase 5)', () async {
+      final (c, initial) = await shuffledAlbum(3);
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.toggleShuffle(); // off: album order
+      final at = c.read(queuePlayerProvider).queue.currentPlayPosition;
+
+      await notifier.toggleShuffle(); // on
+      final on = await orderOf(c);
+      expect(on.take(at + 1), canonical.take(at + 1),
+          reason: 'behind and current stay in album order');
+      expect(on.skip(at + 1).toSet(), canonical.skip(at + 1).toSet());
+      expect(current(c), initial[3]);
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, at);
+      expect(c.read(shuffleProvider), isTrue);
+    });
+
+    test('a list queue follows the same rule (every queue)', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd', 'e', 'f']);
+      final c = createContainer(random: Random(2));
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await c.read(playbackRequestsProvider).submit(const PlayList(
+          ['a', 'b', 'c', 'd', 'e', 'f'], 2, ListSource('search')));
+      await notifier.toggleShuffle(); // on: a, b, c, then shuffled d e f
+      final on = await orderOf(c);
+      expect(on.take(3), ['a', 'b', 'c']);
+      await skip(c, 1);
+      await notifier.toggleShuffle(); // off
+      expect(await orderOf(c), ['a', 'b', 'c', 'd', 'e', 'f']);
+      expect(current(c), on[3]);
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition,
+          ['a', 'b', 'c', 'd', 'e', 'f'].indexOf(on[3]));
+    });
+
+    test('the playing track keeps playing: no seed, seek, play or pause, '
+        'and its position is kept', () async {
+      final (c, _) = await shuffledAlbum(2);
+      final notifier = c.read(queuePlayerProvider.notifier);
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.ready));
+      await notifier.seek(const Duration(seconds: 42));
+      await pumpEventQueue();
+      final seeds = fakePlayer.seedCalls.length;
+      final seeks = fakePlayer.seekedItems.length;
+      final plays = fakePlayer.playCalls;
+      final pauses = fakePlayer.pauseCalls;
+      final rebuilds = fakePlayer.rebuildCalls.length;
+      final item = c.read(queuePlayerProvider).queue.currentItemId;
+
+      await notifier.toggleShuffle(); // off
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      expect(fakePlayer.seekedItems, hasLength(seeks));
+      expect(fakePlayer.playCalls, plays);
+      expect(fakePlayer.pauseCalls, pauses);
+      expect(fakePlayer.rebuildCalls, hasLength(rebuilds + 1),
+          reason: 'the engine is reordered around the playing source');
+      expect(fakePlayer.rebuildCalls.last.map((e) => e.uuidId),
+          canonical.take(fakePlayer.rebuildCalls.last.length));
+      expect(c.read(queuePlayerProvider).queue.currentItemId, item);
+      expect(c.read(audioPositionProvider), const Duration(seconds: 42));
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+    });
+
+    test('a queued track heard in the shuffled pass comes back right after '
+        'the track it followed', () async {
+      final (c, initial) = await shuffledAlbum(1);
+      await fixture.insertSingles(['x']);
+      await playNext(c, [await fixture.track('x')]);
+      await skip(c, 2); // x, then the next shuffled track
+      final playing = initial[2];
+      expect(current(c), playing);
+      await c.read(queuePlayerProvider.notifier).toggleShuffle(); // off
+      final expected = [
+        for (final u in canonical) ...[u, if (u == initial[1]) 'x'],
+      ];
+      expect(await orderOf(c), expected);
+      expect(current(c), playing);
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition,
+          expected.indexOf(playing));
+    });
+
+    test('repeat-all: right after shuffle off the engine loops natively over '
+        'the album order', () async {
+      final (c, _) = await shuffledAlbum(2);
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.cycleQueueRepeatMode(); // all
+      expect(c.read(repeatModeProvider), QueueRepeatMode.all);
+      await notifier.toggleShuffle(); // off
+      expect(await orderOf(c), canonical);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+    });
+
+    test('after a relaunch, shuffle off restores the album order the same '
+        'way', () async {
+      final (c, initial) = await shuffledAlbum(2);
+      await c.read(queuePlayerProvider.notifier).pause(); // saves the cursor
+      final sessionId = c.read(queuePlayerProvider).queue.sessionId;
+      c.dispose();
+      fakePlayer = FakePlaybackEngine();
+      final r = createContainer(random: Random(5));
+      for (var i = 0;
+          i < 50 && r.read(queuePlayerProvider).queue.sessionId == null;
+          i++) {
+        await pumpEventQueue();
+      }
+      expect(r.read(queuePlayerProvider).queue.sessionId, sessionId);
+      expect(r.read(shuffleProvider), isTrue);
+      expect(await orderOf(r), initial, reason: 'restored as stored');
+
+      await r.read(queuePlayerProvider.notifier).toggleShuffle(); // off
+      expect(await orderOf(r), canonical);
+      expect(current(r), initial[2]);
+      expect(r.read(queuePlayerProvider).queue.currentPlayPosition,
+          canonical.indexOf(initial[2]));
+    });
+  });
+
+  // Sign-off DEV-6-01 (owner, 2026-11-17) replaces 6-R1-01/6-R2-*: shuffle
+  // off restores the album order at once, so the repeat-all wrap needs no
+  // canonical rewrite of its own. The tests that built a "kept shuffled
+  // prefix" by turning shuffle off (a state the toggle no longer makes)
+  // were removed with that machinery; the rest are kept or rewritten here.
+  group('Repeat-all and repeat-one with the shuffle toggle (DEV-6-01; was '
+      '6-R1-01)', () {
+    const canonical = ['a', 'b', 'c', 'd', 'e'];
+
+    /// A shuffled collection queue under repeat-all, at its first track.
+    Future<(ProviderContainer, List<String>)> shuffledRepeatAll() async {
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: canonical);
+      final first = await fixture.track('a');
+      final c = createContainer(random: Random(5));
+      await c.read(playbackRequestsProvider).submit(PlayCollection(
+          AlbumScope(artistId: first.artistId!, albumId: first.albumId!),
+          canonical,
+          shuffle: ShuffleStart.random));
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode();
+      expect(c.read(repeatModeProvider), QueueRepeatMode.all);
+      final shuffled =
+          (await sessionTracksOf(c)).map((e) => e.uuidId).toList();
+      expect(shuffled, isNot(canonical),
+          reason: 'precondition: the seed shuffles the queue');
+      return (c, shuffled);
+    }
+
+    Future<List<String>> orderOf(ProviderContainer c) async =>
+        (await sessionTracksOf(c)).map((e) => e.uuidId).toList();
+
+    String? current(ProviderContainer c) =>
+        c.read(currentTrackProvider)?.uuidId;
+
+    Future<void> skip(ProviderContainer c, int times) async {
+      for (var i = 0; i < times; i++) {
+        await c.read(queuePlayerProvider.notifier).skipNext();
+        await pumpEventQueue();
+      }
+    }
+
+    test('turned off at the last shuffled track: album order at once, the '
+        'track at its album position; the rest of the album, then the wrap '
+        'to a with no rewrite', () async {
+      final (c, shuffled) = await shuffledRepeatAll();
+      await skip(c, 4);
+      expect(current(c), shuffled.last);
+      await c.read(queuePlayerProvider.notifier).toggleShuffle(); // off
+      expect(await orderOf(c), canonical);
+      final at = canonical.indexOf(shuffled.last);
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, at);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+
+      await skip(c, canonical.length - 1 - at);
+      expect(current(c), 'e');
+      final rebuilds = fakePlayer.rebuildCalls.length;
+      await skip(c, 1); // the wrap
+      expect(current(c), 'a');
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 0);
+      expect(await orderOf(c), canonical);
+      expect(fakePlayer.rebuildCalls, hasLength(rebuilds),
+          reason: 'the wrap rewrites nothing');
+    });
+
+    test('with shuffle on the wrap replays the same shuffled order '
+        '(Phase 5)', () async {
+      final (c, shuffled) = await shuffledRepeatAll();
+      await skip(c, 4);
+      await skip(c, 1); // the wrap
+      expect(c.read(shuffleProvider), isTrue);
+      expect(await orderOf(c), shuffled);
+      expect(current(c), shuffled.first);
+    });
+
+    test('repeat-all chosen after shuffle was turned off loops natively',
+        () async {
+      final (c, _) = await shuffledRepeatAll();
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // one
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // off
+      await skip(c, 2);
+      await c.read(queuePlayerProvider.notifier).toggleShuffle(); // off
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // all
+      expect(c.read(repeatModeProvider), QueueRepeatMode.all);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+    });
+
+    test('repeat-one: shuffle off reorders the queue; Next still restarts '
+        'the current track and changes no order', () async {
+      final (c, shuffled) = await shuffledRepeatAll();
+      await skip(c, 4);
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // one
+      await c.read(queuePlayerProvider.notifier).toggleShuffle(); // off
+      expect(await orderOf(c), canonical);
+      await skip(c, 1);
+      expect(current(c), shuffled.last);
+      expect(await orderOf(c), canonical);
+    });
+
+    /// Quit and relaunch: a new player and engine over the same database.
+    Future<ProviderContainer> relaunch(ProviderContainer c) async {
+      await c.read(queuePlayerProvider.notifier).pause(); // saves the cursor
+      final sessionId = c.read(queuePlayerProvider).queue.sessionId;
+      c.dispose();
+      fakePlayer = FakePlaybackEngine();
+      final next = createContainer(random: Random(5));
+      for (var i = 0;
+          i < 50 && next.read(queuePlayerProvider).queue.sessionId == null;
+          i++) {
+        await pumpEventQueue();
+      }
+      expect(next.read(queuePlayerProvider).queue.sessionId, sessionId,
+          reason: 'precondition: the queue was restored');
+      return next;
+    }
+
+    test('6-R2-01: after a relaunch, a shuffled repeat-all queue still loops '
+        'natively (Phase 5)', () async {
+      final (c, _) = await shuffledRepeatAll();
+      await skip(c, 2);
+      final r = await relaunch(c);
+      expect(r.read(shuffleProvider), isTrue);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+    });
+
+    test('6-R2-01: after a relaunch, a canonical repeat-all queue still loops '
+        'natively (Phase 5)', () async {
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: canonical);
+      final first = await fixture.track('a');
+      final c = createContainer(random: Random(5));
+      await c.read(playbackRequestsProvider).submit(PlayCollection(
+          AlbumScope(artistId: first.artistId!, albumId: first.albumId!),
+          canonical,
+          shuffle: ShuffleStart.canonical));
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // all
+      await skip(c, 2);
+      final r = await relaunch(c);
+      expect(r.read(shuffleProvider), isFalse);
+      expect(await orderOf(r), canonical);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+    });
+
+    /// An album-order repeat-all queue at its last track.
+    Future<ProviderContainer> canonicalAtLast() async {
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: canonical);
+      final first = await fixture.track('a');
+      final c = createContainer();
+      await c.read(playbackRequestsProvider).submit(PlayCollection(
+          AlbumScope(artistId: first.artistId!, albumId: first.albumId!),
+          canonical,
+          shuffle: ShuffleStart.canonical));
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // all
+      await skip(c, 4);
+      expect(current(c), 'e');
+      return c;
+    }
+
+    test('6-R2-03 (review C-2): a completed report repeated after the wrap '
+        'has moved the engine to the first track does not advance again',
+        () async {
+      final c = await canonicalAtLast();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'a');
+      final seeks = fakePlayer.seekedItems.length;
+      // The wrap's native seek settles while the plugin still reports the
+      // old end.
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.buffering));
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'a');
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 0);
+      expect(fakePlayer.seekedItems, hasLength(seeks));
+    });
+
+    test('6-R2-03: after the wrap, the next genuine end is still handled',
+        () async {
+      final c = await canonicalAtLast();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'a');
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      await skip(c, 4); // the end of the next cycle
+      expect(current(c), 'e');
+      final seeks = fakePlayer.seekedItems.length;
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'a');
+      expect(fakePlayer.seekedItems.length, seeks + 1);
+    });
+
+    // Coordinator Q2 (2026-11-17): a queue stored with shuffle off and an
+    // order that is not the original one (reachable when the toggle's order
+    // write fails after its shuffle-flag write) is played as stored until
+    // the next toggle: no normalising pass, native looping as for any order.
+    test('a stored shuffle-off queue whose order is not the original one is '
+        'played as stored, wraps natively, and the next toggle off restores '
+        'the original order', () async {
+      await fixture.insertSingles(canonical);
+      final sessionId = await repo.createSessionFromExplicitList(
+          sourceType: 'album', trackUuids: canonical, repeatMode: 'all');
+      final ids = {
+        for (final e in await repo.getSessionTracksInPlayOrder(sessionId))
+          e.uuidId: e.itemId,
+      };
+      const stored = ['d', 'b', 'e', 'a', 'c'];
+      await repo.replacePlayOrder(sessionId, [for (final u in stored) ids[u]!]);
+      await repo.updatePlaybackCursor(
+          sessionId: sessionId, currentItemId: ids['c']!, positionMs: 0);
+
+      final c = createContainer();
+      for (var i = 0;
+          i < 50 && c.read(queuePlayerProvider).queue.sessionId == null;
+          i++) {
+        await pumpEventQueue();
+      }
+      expect(c.read(queuePlayerProvider).queue.sessionId, sessionId);
+      expect(c.read(shuffleProvider), isFalse);
+      expect(current(c), 'c');
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all,
+          reason: 'the stored order is replayed as it is');
+
+      await skip(c, 1); // the wrap
+      expect(current(c), 'd');
+      expect(await orderOf(c), stored, reason: 'nothing is rewritten');
+
+      await c.read(queuePlayerProvider.notifier).toggleShuffle(); // on
+      await c.read(queuePlayerProvider.notifier).toggleShuffle(); // off
+      expect(await orderOf(c), canonical);
+      expect(current(c), 'd');
+    });
+
+    test('6-R2-04: offline, an unavailable advance at the last position '
+        'wraps to the first local track', () async {
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: canonical);
+      for (final u in canonical) {
+        await markDownloaded(u, '/dl/$u');
+      }
+      final first = await fixture.track('a');
+      final c = createContainer(offline: true);
+      await c.read(playbackRequestsProvider).submit(PlayCollection(
+          AlbumScope(artistId: first.artistId!, albumId: first.albumId!),
+          canonical,
+          shuffle: ShuffleStart.canonical));
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // all
+      await skip(c, 4);
+      expect(current(c), 'e');
+      await markDeleted('a', '/dl/a'); // the first file is gone too
+      await markDeleted('e', '/dl/e'); // the current file is gone
+      fakePlayer.emitUnavailableAdvance(UnavailableAdvance(
+          itemId: c.read(queuePlayerProvider).queue.currentItemId!,
+          playPosition: 4));
+      await pumpEventQueue();
+      expect(current(c), 'b');
+      expect(await orderOf(c), canonical);
+    });
+
+    test('6-R2-04: a one-track repeat-all queue wraps onto itself with no '
+        'rewrite and keeps native looping', () async {
+      await fixture.insertSingles(['x']);
+      final c = createContainer();
+      await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['x'], 0, ListSource('search')));
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // all
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+      final rebuilds = fakePlayer.rebuildCalls.length;
+      await skip(c, 1);
+      expect(current(c), 'x');
+      expect(fakePlayer.rebuildCalls, hasLength(rebuilds));
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+    });
+  });
+
+  group('Sign-off OPEN-6-04 (owner, 2026-11-17): a track added after the '
+      'queue has ended', () {
+    String? current(ProviderContainer c) =>
+        c.read(currentTrackProvider)?.uuidId;
+
+    Future<int> itemOf(ProviderContainer c, String uuid) async =>
+        (await sessionTracksOf(c)).firstWhere((e) => e.uuidId == uuid).itemId;
+
+    /// A list queue a b c that played its last track to the end (repeat
+    /// off): the engine reported completed and nothing follows.
+    Future<ProviderContainer> ended({bool offline = false}) async {
+      await fixture.insertSingles(['a', 'b', 'c', 'y', 'z']);
+      if (offline) {
+        for (final u in ['a', 'b', 'c', 'y', 'z']) {
+          await markDownloaded(u, '/dl/$u');
+        }
+      }
+      final c = createContainer(offline: offline);
+      await playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('c'), sourceType: 'search');
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'c', reason: 'precondition: the queue ended on c');
+      expect(c.read(queuePlayerProvider).playback.processing,
+          EngineProcessingState.completed);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+      return c;
+    }
+
+    /// Well after the end: outside any grace window.
+    void later() => testClock.advance(const Duration(seconds: 5));
+
+    Future<void> expectRestingOn(ProviderContainer c, String uuid,
+        {required int plays}) async {
+      final item = await itemOf(c, uuid);
+      expect(current(c), uuid);
+      expect(c.read(queuePlayerProvider).queue.currentItemId, item);
+      expect(fakePlayer.currentItemId, item,
+          reason: 'the engine is on the added track');
+      expect(fakePlayer.position, Duration.zero);
+      expect(fakePlayer.playCalls, plays, reason: 'nothing starts');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+      expect(c.read(audioPositionProvider), Duration.zero);
+      final session = await repo.getActiveSession();
+      expect(session?.currentItemId, item, reason: 'the cursor is saved');
+      expect(session?.currentPositionMs, 0);
+    }
+
+    test('Play next after the end: the added track is current at 0:00, '
+        'paused', () async {
+      final c = await ended();
+      later();
+      final plays = fakePlayer.playCalls;
+      await playNext(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId),
+          ['a', 'b', 'c', 'z']);
+      await expectRestingOn(c, 'z', plays: plays);
+    });
+
+    test('Add to queue after the end, several tracks: the first added is '
+        'current at 0:00, paused; the rest follow', () async {
+      final c = await ended();
+      later();
+      final plays = fakePlayer.playCalls;
+      await addToQueue(c, [await fixture.track('z'), await fixture.track('y')]);
+      await pumpEventQueue();
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId),
+          ['a', 'b', 'c', 'z', 'y']);
+      await expectRestingOn(c, 'z', plays: plays);
+    });
+
+    test('offline, after the end: the same', () async {
+      final c = await ended(offline: true);
+      later();
+      final plays = fakePlayer.playCalls;
+      await playNext(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      await expectRestingOn(c, 'z', plays: plays);
+    });
+
+    test('the engine insert failing after the end (Phase 7 rebuild) rests '
+        'paused on the added track too', () async {
+      final c = await ended();
+      later();
+      final plays = fakePlayer.playCalls;
+      await playNext(c, [await fixture.track('z')]);
+      fakePlayer.emitCommandFailure(EngineCommandFailure(
+        runtimeId: fakePlayer.runtimeId,
+        seedRevision: fakePlayer.seedRevision,
+        playlistRevision: fakePlayer.playlistRevision,
+        command: EngineCommand.insert,
+        reason: EngineCommandFailureReason.failed,
+        diverged: true,
+      ));
+      await pumpEventQueue();
+      // The rebuilt plugin settles and re-reports where it stands.
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.ready));
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      final z = await itemOf(c, 'z');
+      expect(fakePlayer.seedCalls.last.currentItemId, z, reason: 'rebuilt');
+      expect(current(c), 'z');
+      expect(fakePlayer.playCalls, plays, reason: 'nothing starts');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+    });
+
+    test('a track added before the end continues into it (unchanged)',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'z']);
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('c'), sourceType: 'search');
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      await addToQueue(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      expect(current(c), 'c', reason: 'the playing track is not interrupted');
+      final plays = fakePlayer.playCalls;
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'z');
+      expect(fakePlayer.playCalls, plays + 1);
+    });
+
+    test('after the end, seeking back into the last track makes it a paused '
+        'queue again: an add only queues', () async {
+      final c = await ended();
+      later();
+      await c.read(queuePlayerProvider.notifier)
+          .seek(const Duration(seconds: 10));
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      final seeks = fakePlayer.seekedItems.length;
+      final plays = fakePlayer.playCalls;
+      await playNext(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      expect(current(c), 'c');
+      expect(fakePlayer.seekedItems, hasLength(seeks));
+      expect(fakePlayer.playCalls, plays);
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId),
+          ['a', 'b', 'c', 'z']);
+    });
+
+    test('repeat-all never ends: an add at the last track only queues',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'z']);
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('c'), sourceType: 'search');
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode(); // all
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'a', reason: 'the wrap');
+      later();
+      final seeks = fakePlayer.seekedItems.length;
+      await playNext(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      expect(current(c), 'a');
+      expect(fakePlayer.seekedItems, hasLength(seeks));
+    });
+
+    // The grace window (owner: "If you add a track to your queue within X
+    // milliseconds of the queue finishing, then it should start playback.
+    // For now, 250ms is a good buffer, but it shouldn't be hardcoded.").
+
+    test('review #1: an old end of the same track never decides a later '
+        'add; an add made before the track ends again continues', () async {
+      final c = await ended();
+      later();
+      // The listener scrubs back into c and plays it again.
+      await c.read(queuePlayerProvider.notifier)
+          .seek(const Duration(seconds: 10));
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      final plays = fakePlayer.playCalls;
+      // Near c's end two adds are in the lane; c ends while the first one
+      // edits the queue, before the end's own task runs.
+      final gate = Completer<void>();
+      repo.afterReplacePlayOrder = (_) async {
+        repo.afterReplacePlayOrder = null;
+        await gate.future;
+      };
+      final first = addToQueue(c, [await fixture.track('y')]);
+      await pumpEventQueue();
+      final second = addToQueue(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      gate.complete();
+      await first;
+      await second;
+      await pumpEventQueue();
+      expect(current(c), 'y');
+      expect(fakePlayer.playCalls, plays + 1,
+          reason: 'both adds were made before c ended: the queue keeps going');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+    });
+
+    test('review #5: after a paused landing, the old end re-reported (no '
+        'ready since) does not advance again', () async {
+      final c = await ended();
+      later();
+      await addToQueue(c, [await fixture.track('z'), await fixture.track('y')]);
+      await pumpEventQueue();
+      expect(current(c), 'z');
+      final seeks = fakePlayer.seekedItems.length;
+      final plays = fakePlayer.playCalls;
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.buffering));
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'z');
+      expect(fakePlayer.seekedItems, hasLength(seeks));
+      expect(fakePlayer.playCalls, plays);
+    });
+
+    test('the grace window is one named value, 250 ms by default', () {
+      expect(QueuePlayer.queueEndResumeGrace,
+          const Duration(milliseconds: 250));
+    });
+
+    test('an add at the edge of the grace window after the end plays the '
+        'added track from 0:00', () async {
+      final c = await ended();
+      testClock.advance(QueuePlayer.queueEndResumeGrace);
+      final plays = fakePlayer.playCalls;
+      await playNext(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      expect(current(c), 'z');
+      expect(fakePlayer.currentItemId, await itemOf(c, 'z'));
+      expect(fakePlayer.position, Duration.zero);
+      expect(fakePlayer.playCalls, plays + 1);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+    });
+
+    test('an add 1 ms past the grace window rests paused at 0:00', () async {
+      final c = await ended();
+      testClock.advance(
+          QueuePlayer.queueEndResumeGrace + const Duration(milliseconds: 1));
+      final plays = fakePlayer.playCalls;
+      await addToQueue(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      await expectRestingOn(c, 'z', plays: plays);
+    });
+
+    test('measured from the tap: an add submitted before the end but applied '
+        'well after it continues playing', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'z']);
+      for (final u in ['a', 'b', 'c', 'z']) {
+        await markDownloaded(u, '/dl/$u');
+      }
+      final c = createContainer(offline: true);
+      await playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('c'), sourceType: 'search');
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      final plays = fakePlayer.playCalls;
+      // The offline file check holds the add between its tap and the lane.
+      final gate = fileGate = Completer<void>();
+      final adding = playNext(c, [await fixture.track('z')]);
+      await pumpEventQueue();
+      testClock.advance(const Duration(milliseconds: 100));
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'c', reason: 'precondition: the queue ended first');
+      testClock.advance(QueuePlayer.queueEndResumeGrace * 2);
+      fileGate = null;
+      gate.complete();
+      await adding;
+      await pumpEventQueue();
+      expect(current(c), 'z');
+      expect(fakePlayer.playCalls, plays + 1,
+          reason: 'tapped 100 ms before the end: the queue keeps going');
+    });
+
+    test('the engine insert failing inside the grace window: the rebuild '
+        'plays the added track', () async {
+      final c = await ended();
+      testClock.advance(const Duration(milliseconds: 100));
+      await playNext(c, [await fixture.track('z')]);
+      fakePlayer.emitCommandFailure(EngineCommandFailure(
+        runtimeId: fakePlayer.runtimeId,
+        seedRevision: fakePlayer.seedRevision,
+        playlistRevision: fakePlayer.playlistRevision,
+        command: EngineCommand.insert,
+        reason: EngineCommandFailureReason.failed,
+        diverged: true,
+      ));
+      await pumpEventQueue();
+      final z = await itemOf(c, 'z');
+      expect(fakePlayer.seedCalls.last.currentItemId, z, reason: 'rebuilt');
+      expect(current(c), 'z');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+    });
+  });
+
+  group('6-R3-01: an end masked by a pending native insert is a real end',
+      () {
+    String? current(ProviderContainer c) =>
+        c.read(currentTrackProvider)?.uuidId;
+
+    /// A list queue playing its last track.
+    Future<ProviderContainer> atLastOf(List<String> uuids) async {
+      await fixture.insertSingles([...uuids, 'z']);
+      final c = createContainer();
+      await playFromTrackList(c, uuids, await fixture.track(uuids.last),
+          sourceType: 'test');
+      await pumpEventQueue();
+      expect(current(c), uuids.last, reason: 'precondition');
+      return c;
+    }
+
+    /// A 100-track list queue; the seed window holds positions 0..60.
+    Future<ProviderContainer> playing100({int start = 0}) async {
+      final uuids = List.generate(100, (i) => 't$i');
+      await fixture.insertSingles([...uuids, 'z']);
+      final c = createContainer();
+      await repo.startupRead.future;
+      await playFromTrackList(c, uuids, await fixture.track('t$start'),
+          sourceType: 'test');
+      await pumpEventQueue();
+      return c;
+    }
+
+    /// The last track ends while the held insert is still pending, then
+    /// the insert settles (the engine re-reports completed).
+    Future<void> endDuringPendingInsert() async {
+      expect(fakePlayer.editPending, isTrue,
+          reason: 'precondition: the insert has not applied natively');
+      fakePlayer.completeNatively(); // masked as buffering
+      await pumpEventQueue();
+      fakePlayer.settleEdit(); // completed, the ended item still current
+      await pumpEventQueue();
+    }
+
+    test('(a) Play next, repeat off: the added track plays', () async {
+      final c = await atLastOf(['a', 'b', 'c']);
+      fakePlayer.holdNextEdit = true;
+      await playNext(c, [await fixture.track('z')]);
+      final plays = fakePlayer.playCalls;
+      await endDuringPendingInsert();
+      expect(current(c), 'z');
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 3);
+      expect(fakePlayer.playCalls, plays + 1);
+    });
+
+    test('(b) Add to queue, repeat off: the added track plays', () async {
+      final c = await atLastOf(['a', 'b', 'c']);
+      fakePlayer.holdNextEdit = true;
+      await addToQueue(c, [await fixture.track('z')]);
+      final plays = fakePlayer.playCalls;
+      await endDuringPendingInsert();
+      expect(current(c), 'z');
+      expect(fakePlayer.playCalls, plays + 1);
+    });
+
+    test('(c) repeat-all with a window not covering the queue: the added '
+        'track plays once; its own settle re-reporting completed does not '
+        'advance again', () async {
+      final c = await playing100(start: 99);
+      await c.read(queuePlayerProvider.notifier).cycleQueueRepeatMode();
+      expect(c.read(repeatModeProvider), QueueRepeatMode.all);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.off,
+          reason: 'precondition: the model wraps, not the engine');
+      fakePlayer.holdNextEdit = true;
+      await playNext(c, [await fixture.track('z')]);
+      await endDuringPendingInsert();
+      expect(current(c), 'z');
+      final seeks = fakePlayer.seekedItems.length;
+      // The advance's own native seek settles while the plugin still
+      // reports the old end: a repeat of the end just handled.
+      fakePlayer.emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.buffering));
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(current(c), 'z');
+      expect(fakePlayer.seekedItems, hasLength(seeks));
+    });
+
+    test('(d) a hydration chunk landing at the end of the window: playback '
+        'continues with the next track', () async {
+      final c = await playing100();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      final tracks = await sessionTracksOf(c);
+      final gate = repo.hydrationGate = Completer<void>();
+      await notifier.skipToTrack(tracks[60].itemId); // the window's last
+      await repo.hydrationEntered.future;
+      repo.hydrationGate = null;
+      fakePlayer.holdNextEdit = true;
+      final added = fakePlayer.addedBatches.length;
+      gate.complete();
+      await pumpEventQueue();
+      expect(fakePlayer.addedBatches, hasLength(added + 1),
+          reason: 'precondition: the chunk was issued');
+      final plays = fakePlayer.playCalls;
+      await endDuringPendingInsert();
+      expect(current(c), 't61');
+      expect(fakePlayer.playCalls, plays + 1);
+    });
+
+    test('6-R3-03: a user skip taken before the end report\'s task moves on '
+        'once; the stale end does not advance again', () async {
+      final c = await playing100();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      final tracks = await sessionTracksOf(c);
+      repo.hydrationGate = Completer<void>(); // hydration lags behind
+      await notifier.skipToTrack(tracks[60].itemId); // the window's last
+      await pumpEventQueue();
+      final skipping = notifier.skipNext(); // in the lane first
+      // t60 ends as the skip is taken: the end task queues behind the skip.
+      fakePlayer.emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+      await skipping;
+      await pumpEventQueue();
+      expect(current(c), 't61');
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 61);
+      repo.hydrationGate!.complete();
+    });
+  });
+
+  group('6A.1b (O4/DEV-6-03): a prepared session gone before activation', () {
+    const albumIntent = HistoryIntent('album', 'inst-1:1');
+
+    Future<List<HistoryEvent>> clicks() => (db.select(db.historyEvents)
+          ..where((e) => e.kind.equals('clicked')))
+        .get();
+
+    for (final (name, request) in [
+      (
+        'PlayList',
+        const PlayList(['a', 'b'], 0, ListSource('search'),
+            intent: HistoryIntent.track('a')),
+      ),
+      (
+        'PlayQuery',
+        const PlayQuery(
+            source: BrowseSource('library'),
+            currentUuid: 'a',
+            intent: HistoryIntent.track('a')),
+      ),
+      (
+        'PlayCollection',
+        const PlayCollection(AlbumScope(artistId: 1, albumId: 1), ['a', 'b'],
+            shuffle: ShuffleStart.canonical, intent: albumIntent),
+      ),
+    ]) {
+      test('$name ends RejectedEmpty; the active queue is untouched; no click',
+          () async {
+        await fixture.insertSingles(['x']);
+        await fixture.insertAlbum(
+            artist: 'Artist', album: 'Album', uuids: ['a', 'b']);
+        final c = createContainer();
+        await c.read(playbackRequestsProvider)
+            .submit(const PlayList(['x'], 0, ListSource('search')));
+        final active = (await repo.getActiveSession())!.id;
+        final seeds = fakePlayer.seedCalls.length;
+        repo.beforeActivation = (sessionId) async {
+          if (sessionId == active) return;
+          expect(await repo.discardSession(sessionId), isTrue);
+        };
+
+        final outcome = await c.read(playbackRequestsProvider).submit(request);
+
+        expect(outcome, isA<RejectedEmpty>());
+        expect((await repo.getActiveSession())?.id, active);
+        expect(c.read(queuePlayerProvider).queue.sessionId, active);
+        expect(c.read(currentTrackProvider)?.uuidId, 'x');
+        expect(fakePlayer.seedCalls, hasLength(seeds));
+        await pumpEventQueue();
+        expect(await clicks(), isEmpty);
+      });
+    }
+
+    // 6-R2-11b (6-P04 failed queue creation, real path).
+    test('a queue creation whose write fails: Failed, the current queue and '
+        'engine untouched, no click', () async {
+      await fixture.insertSingles(['x']);
+      await fixture.insertAlbum(
+          artist: 'Artist', album: 'Album', uuids: ['a', 'b']);
+      final c = createContainer();
+      await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['x'], 0, ListSource('search')));
+      final active = (await repo.getActiveSession())!.id;
+      final sessions = (await db.select(db.queueSessions).get()).length;
+      final seeds = fakePlayer.seedCalls.length;
+      final plays = fakePlayer.playCalls;
+      repo.createSessionError = Exception('disk I/O error');
+
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          const PlayCollection(AlbumScope(artistId: 1, albumId: 1), ['a', 'b'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+
+      expect(outcome, isA<Failed>());
+      expect((await repo.getActiveSession())?.id, active);
+      expect(c.read(queuePlayerProvider).queue.sessionId, active);
+      expect(c.read(currentTrackProvider)?.uuidId, 'x');
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      expect(fakePlayer.playCalls, plays);
+      expect(await db.select(db.queueSessions).get(), hasLength(sessions));
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+
+    test('a newer request still supersedes: Superseded, not RejectedEmpty',
+        () async {
+      await fixture.insertSingles(['x', 'y']);
+      final c = createContainer();
+      final requests = c.read(playbackRequestsProvider);
+      final older =
+          requests.submit(const PlayList(['x'], 0, ListSource('search')));
+      final newer =
+          requests.submit(const PlayList(['y'], 0, ListSource('search')));
+      expect(await older, isA<Superseded>());
+      expect(await newer, isA<Accepted>());
+    });
+  });
+
+
+  group('6A.1b (spec §5 disappearance, D2): catalog removal between prepare '
+      'and activation', () {
+    const albumIntent = HistoryIntent('album', 'inst-1:1');
+
+    Future<List<HistoryEvent>> clicks() => (db.select(db.historyEvents)
+          ..where((e) => e.kind.equals('clicked')))
+        .get();
+
+    /// A playing queue over x; returns its session id.
+    Future<(ProviderContainer, int)> playingX() async {
+      await fixture.insertSingles(['x']);
+      final c = createContainer();
+      await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['x'], 0, ListSource('search')));
+      return (c, (await repo.getActiveSession())!.id);
+    }
+
+    Future<AlbumScope> album(List<String> uuids) async {
+      await fixture.insertAlbum(artist: 'Artist', album: 'Album', uuids: uuids);
+      final first = await fixture.track(uuids.first);
+      return AlbumScope(artistId: first.artistId!, albumId: first.albumId!);
+    }
+
+    test('review C-1: the old queue ending while a new queue activates does '
+        'not advance the new queue', () async {
+      final (c, active) = await playingX();
+      final scope = await album(['a', 'b', 'c']);
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active) return;
+        repo.beforeActivation = null;
+        fakePlayer.emitPlayerState(
+            EngineTransportState(false, EngineProcessingState.completed));
+        await pumpEventQueue();
+      };
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<Accepted>());
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 0);
+    });
+
+    test('a member removed: accepted without it, one click', () async {
+      final (c, active) = await playingX();
+      final scope = await album(['a', 'b', 'c']);
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active) return;
+        repo.beforeActivation = null;
+        await repo.removeTrackUuidsFromQueues(const ['c']);
+      };
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<Accepted>());
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId), ['a', 'b']);
+      await pumpEventQueue();
+      expect(await clicks(), hasLength(1));
+    });
+
+    test('the target removed: re-resolved to the next member, one click',
+        () async {
+      final (c, active) = await playingX();
+      final scope = await album(['a', 'b', 'c']);
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active) return;
+        repo.beforeActivation = null;
+        await repo.removeTrackUuidsFromQueues(const ['a']);
+      };
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<Accepted>());
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId), ['b', 'c']);
+      expect(fakePlayer.seedCalls.last.currentItemId,
+          c.read(queuePlayerProvider).queue.currentItemId);
+      await pumpEventQueue();
+      expect((await clicks()).map((e) => e.entityType), ['album']);
+    });
+
+    test('a member before the landing target removed: the target is '
+        're-read at its new position', () async {
+      await fixture.insertSingles(['x']);
+      await markDownloaded('x', '/dl/x');
+      final scope = await album(['a', 'b', 'c']);
+      await markDownloaded('b', '/dl/b');
+      await markDownloaded('c', '/dl/c');
+      final c = createContainer(offline: true);
+      await c.read(playbackRequestsProvider)
+          .submit(const PlayList(['x'], 0, ListSource('search')));
+      final active = (await repo.getActiveSession())!.id;
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active) return;
+        repo.beforeActivation = null;
+        await repo.removeTrackUuidsFromQueues(const ['a']);
+      };
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<Accepted>());
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 0);
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.entries.map((e) => (e.uuidId, e.playPosition)),
+          contains(('b', 0)));
+      expect(seed.entries.map((e) => e.uuidId), isNot(contains('a')));
+    });
+
+    test('review r1 #1: a mid-list target removed re-resolves to its '
+        'successor, not the top of the list', () async {
+      final (c, active) = await playingX();
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active) return;
+        repo.beforeActivation = null;
+        await repo.removeTrackUuidsFromQueues(const ['c']);
+      };
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          const PlayList(['a', 'b', 'c', 'd'], 2, ListSource('search'),
+              intent: HistoryIntent.track('c')));
+      expect(outcome, isA<Accepted>());
+      expect(c.read(currentTrackProvider)?.uuidId, 'd');
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId), ['a', 'b', 'd']);
+    });
+
+    test('review r1: a newer request admitted during a stale retry wins',
+        () async {
+      final (c, active) = await playingX();
+      await fixture.insertSingles(['y']);
+      final scope = await album(['a', 'b', 'c']);
+      final requests = c.read(playbackRequestsProvider);
+      Future<PlaybackOutcome>? newer;
+      int? collectionSession;
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active || newer != null) return;
+        collectionSession = sessionId;
+        await repo.removeTrackUuidsFromQueues(const ['a']);
+        newer = requests
+            .submit(const PlayList(['y'], 0, ListSource('search')));
+      };
+      final outcome = await requests.submit(PlayCollection(
+          scope, const ['a', 'b', 'c'],
+          shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<Superseded>());
+      expect(await newer!, isA<Accepted>());
+      expect(c.read(currentTrackProvider)?.uuidId, 'y');
+      expect(await repo.getSessionSnapshot(collectionSession!), isNull,
+          reason: 'the prepared collection session was discarded');
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+
+    test('the whole collection removed: RejectedEmpty, queue untouched, no '
+        'click, nothing left behind', () async {
+      final (c, active) = await playingX();
+      final scope = await album(['a', 'b', 'c']);
+      final seeds = fakePlayer.seedCalls.length;
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active) return;
+        repo.beforeActivation = null;
+        await repo.removeTrackUuidsFromQueues(const ['a', 'b', 'c']);
+      };
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c'],
+              shuffle: ShuffleStart.random, intent: albumIntent));
+      expect(outcome, isA<RejectedEmpty>());
+      expect((await repo.getActiveSession())?.id, active);
+      expect(c.read(currentTrackProvider)?.uuidId, 'x');
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      expect(await repo.pruneInactiveSessions(), 0,
+          reason: 'the prepared session was discarded');
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+
+    test('the target removed on every attempt: bounded, then RejectedEmpty',
+        () async {
+      final (c, active) = await playingX();
+      final scope = await album(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']);
+      final seeds = fakePlayer.seedCalls.length;
+      var attempts = 0;
+      repo.beforeActivation = (sessionId) async {
+        if (sessionId == active) return;
+        attempts++;
+        final current = (await repo.getSessionSnapshot(sessionId))?.currentItem;
+        if (current != null) {
+          await repo.removeTrackUuidsFromQueues([current.uuidId]);
+        }
+      };
+      final outcome = await c.read(playbackRequestsProvider).submit(
+          PlayCollection(scope, const ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+              shuffle: ShuffleStart.canonical, intent: albumIntent));
+      expect(outcome, isA<RejectedEmpty>());
+      expect(attempts, inInclusiveRange(2, 4), reason: 'a small bound');
+      expect((await repo.getActiveSession())?.id, active);
+      expect(c.read(currentTrackProvider)?.uuidId, 'x');
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      expect(await repo.pruneInactiveSessions(), 0);
+      await pumpEventQueue();
+      expect(await clicks(), isEmpty);
+    });
+  });
+
+  group('7B.2a (SC-27 inv. 5): the library relinquishes the output', () {
+    late FakeTimers timers;
+    late AudioFocus focus;
+    late RelinquishingOwner preview;
+
+    setUp(() {
+      timers = FakeTimers();
+      focus = AudioFocus(sessionPort, timer: timers.create);
+      preview = RelinquishingOwner('preview');
+    });
+
+    tearDown(() => focus.dispose());
+
+    /// The library plays and holds the output; the fake engine never asks
+    /// for focus, so the test takes it as the engine's play() would, then
+    /// a preview owner binds and the engine reports playing.
+    Future<QueuePlayer> libraryHolds(ProviderContainer c,
+        {List<String> uuids = const ['a', 'b'], String? downloadedLast}) async {
+      await fixture.insertSingles(uuids);
+      if (downloadedLast != null) {
+        await markDownloaded(uuids.last, downloadedLast);
+      }
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await playFromTrackList(c, uuids, await fixture.track('a'),
+          sourceType: 'search');
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+      focus.bind(AudioOutput.preview, preview);
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      return notifier;
+    }
+
+    Future<bool?> acquirePreview(void Function(bool) onAnswer) async {
+      unawaited(focus.acquire(AudioOutput.preview).then(onAnswer));
+      await pumpEventQueue();
+      return null;
+    }
+
+    test('a preview acquire pauses the library and is granted only once the '
+        'engine reports it is not playing', () async {
+      final c = createContainer(focus: focus);
+      await libraryHolds(c);
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(fakePlayer.pauseCalls, 1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      expect(granted, isNull, reason: 'the engine still reports playing');
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      expect(granted, isTrue);
+      expect(focus.holder, AudioOutput.preview);
+    });
+
+    test('a paused library acknowledges at once', () async {
+      final c = createContainer(focus: focus);
+      final notifier = await libraryHolds(c);
+      await notifier.pause();
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(granted, isTrue);
+    });
+
+    test('a quiesced library acknowledges at once', () async {
+      final c = createContainer(focus: focus);
+      final notifier = await libraryHolds(c);
+      await notifier.quiesce();
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(granted, isTrue);
+      expect(timers.active, isEmpty);
+    });
+
+    test('a late engine end after the library gave up the output advances '
+        'without playing (the wrap re-report included)', () async {
+      final c = createContainer(focus: focus);
+      await libraryHolds(c);
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      expect(granted, isTrue);
+      final plays = fakePlayer.playCalls;
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      expect(fakePlayer.playCalls, plays, reason: 'no automatic resume');
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      expect(focus.holder, AudioOutput.preview);
+    });
+
+    test('a late offline advance after the library gave up the output does '
+        'not play', () async {
+      final c = createContainer(focus: focus, failingReconcile: true);
+      await libraryHolds(c, uuids: const ['a', 'b', 'c'],
+          downloadedLast: '/dl/c');
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      expect(granted, isTrue);
+      final b = (await repo.getPlaybackEntries(
+              c.read(queuePlayerProvider).queue.sessionId!))
+          .firstWhere((e) => e.uuidId == 'b');
+      final plays = fakePlayer.playCalls;
+      fakePlayer.emitUnavailableAdvance(
+          UnavailableAdvance(itemId: b.itemId, playPosition: b.playPosition));
+      await pumpEventQueue();
+      expect(fakePlayer.stopCalls, 0, reason: 'c is playable: advanced');
+      expect(fakePlayer.seekCauses.last,
+          PlaybackTransitionCause.naturalAdvance);
+      expect(fakePlayer.playCalls, plays);
+      expect(focus.holder, AudioOutput.preview);
+    });
+
+    test('R1-02: a transfer refused at the bound does not pause the library '
+        'later', () async {
+      final c = createContainer(focus: focus);
+      await libraryHolds(c);
+      final gate = Completer<void>();
+      fakePlayer.beforeSeed = (_) => gate.future; // the lane is busy
+      unawaited(playFromTrackList(c, const ['b'], await fixture.track('b'),
+          sourceType: 'search'));
+      await pumpEventQueue();
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      timers.fireAll();
+      await pumpEventQueue();
+      expect(granted, isFalse);
+      gate.complete();
+      fakePlayer.beforeSeed = null;
+      await pumpEventQueue();
+      expect(fakePlayer.pauseCalls, 0,
+          reason: 'the library kept the output, so it keeps playing');
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      expect(focus.holder, AudioOutput.queue);
+    });
+
+    test('R1-04: while the library is still stopping, the relinquish waits '
+        'for the stop', () async {
+      final c = createContainer(focus: focus);
+      final notifier = await libraryHolds(c);
+      final gate = Completer<void>();
+      fakePlayer.beforeSeed = (_) => gate.future; // the lane is busy
+      unawaited(playFromTrackList(c, const ['b'], await fixture.track('b'),
+          sourceType: 'search'));
+      await pumpEventQueue();
+      final quiescing = notifier.quiesce();
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(granted, isNull, reason: 'the library is still audible');
+      gate.complete();
+      fakePlayer.beforeSeed = null;
+      await quiescing;
+      await pumpEventQueue();
+      expect(granted, isTrue);
+    });
+
+    test('no overlap while the library is mid-load: the relinquish cancels '
+        'its queued play, so it never starts once preview holds', () async {
+      final output = <String>[];
+      final plugin = _GatedPlugin(output);
+      final engine = JustAudioEngine(plugin,
+          beforePlay: () => focus.beforePlay(AudioOutput.queue));
+      final c = createContainer(engine: engine, focus: focus);
+      await fixture.insertSingles(['a']);
+      await playFromTrackList(c, const ['a'], await fixture.track('a'),
+          sourceType: 'search');
+      expect(c.read(audioPlayWhenReadyProvider), isTrue,
+          reason: 'play desired, its load stalled');
+      final owner = _OutputPreview(output);
+      focus.bind(AudioOutput.preview, owner);
+      expect(await focus.acquire(AudioOutput.preview), isTrue);
+      output.add('preview on');
+      plugin.finishLoad();
+      await pumpEventQueue();
+      expect(output, isNot(contains('library on')),
+          reason: 'the queued library play was cancelled by the relinquish');
+      expect(focus.holder, AudioOutput.preview);
+      _expectNoOverlap(output);
+    });
+
+    test('7-R1-23: preview closed before the library acknowledged: after the '
+        'user resumes, the next natural end still plays on', () async {
+      final c = createContainer(focus: focus);
+      final notifier = await libraryHolds(c, uuids: const ['a', 'b', 'c']);
+      bool? granted;
+      await acquirePreview((g) => granted = g);
+      expect(fakePlayer.pauseCalls, 1, reason: 'the relinquish paused');
+      focus.giveUp(AudioOutput.preview); // preview closed before the ack
+      await pumpEventQueue();
+      expect(granted, isFalse);
+      expect(focus.holder, AudioOutput.queue);
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+
+      await notifier.resume();
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      final plays = fakePlayer.playCalls;
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.completed));
+      await pumpEventQueue();
+
+      expect(fakePlayer.playCalls, greaterThan(plays),
+          reason: 'the library holds the output again: its advance plays');
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      expect(focus.holder, AudioOutput.queue);
+    });
+  });
+
+  group('7B.2a exit proof: preview and the library never overlap (7-U10, '
+      '7-L06)', () {
+    late AudioFocus focus;
+    late List<String> output;
+    late _GatedPlugin plugin;
+    late List<_LoggingPreviewEngine> previews;
+    late _SpyRequests requests;
+    late _SpyClicks clickSpy;
+
+    setUp(() {
+      focus = AudioFocus(sessionPort, timer: FakeTimers().create);
+      output = [];
+      plugin = _GatedPlugin(output);
+      previews = [];
+    });
+
+    tearDown(() => focus.dispose());
+
+    ProviderContainer previewContainer() => createContainer(
+          engine: JustAudioEngine(plugin,
+              beforePlay: () => focus.beforePlay(AudioOutput.queue)),
+          focus: focus,
+          extraOverrides: [
+            previewSourceUrisProvider.overrideWithValue(PreviewSourceUris(
+              baseUrl: 'http://audio.test',
+              mediaToken: 'mt',
+              mayAttachToken: () async => true,
+              isOffline: () => false,
+            )),
+            previewEngineFactoryProvider.overrideWithValue(() {
+              final engine = _LoggingPreviewEngine(output);
+              previews.add(engine);
+              return engine;
+            }),
+            playbackRequestsProvider
+                .overrideWith((ref) => requests = _SpyRequests(ref)),
+            clickRecorderProvider.overrideWith((ref) => clickSpy = _SpyClicks(
+                history: ref.read(historyRepositoryProvider),
+                binding: ServerBindingRepository(db),
+                clock: ref.read(clockProvider))),
+          ],
+        );
+
+    /// The library plays track a (its load finished, output on).
+    Future<ProviderContainer> libraryPlaying() async {
+      await fixture.insertSingles(['a']);
+      final c = previewContainer();
+      c.listen(previewPlayerProvider, (_, _) {});
+      await playFromTrackList(c, const ['a'], await fixture.track('a'),
+          sourceType: 'search');
+      plugin.finishLoad();
+      await pumpEventQueue();
+      expect(output, ['library on']);
+      return c;
+    }
+
+    Future<void> previewPlaying(ProviderContainer c) async {
+      unawaited(c.read(previewControlsProvider).playStaged('i1'));
+      await pumpEventQueue();
+      previews.last.finishLoad(null);
+      await pumpEventQueue();
+      expect(c.read(previewPlayerProvider).status, PreviewStatus.playing);
+    }
+
+    test('opening preview pauses the library first; preview sounds only '
+        'after that', () async {
+      final c = await libraryPlaying();
+      unawaited(c.read(previewControlsProvider).playStaged('i1'));
+      await pumpEventQueue();
+      previews.last.finishLoad(null);
+      await pumpEventQueue();
+      expect(output, ['library on', 'library off', 'preview on']);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      _expectNoOverlap(output);
+    });
+
+    test('an OS play during preview stops preview first, then the library '
+        'plays', () async {
+      final c = await libraryPlaying();
+      await previewPlaying(c);
+      await c.read(playerControlsProvider).click(MediaButton.media);
+      await pumpEventQueue();
+      expect(output.sublist(output.length - 2), ['preview off', 'library on']);
+      expect(c.read(previewPlayerProvider).status, PreviewStatus.idle);
+      expect(focus.holder, AudioOutput.queue);
+      _expectNoOverlap(output);
+    });
+
+    test('an interruption during preview routes to preview and never resumes '
+        'the library', () async {
+      final c = await libraryPlaying();
+      await previewPlaying(c);
+      sessionPort.emit(
+          const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      await pumpEventQueue();
+      sessionPort.emit(
+          const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      await pumpEventQueue();
+      expect(previews.last.pauses, 1);
+      expect(c.read(previewPlayerProvider).status, PreviewStatus.playing);
+      expect(output.where((e) => e == 'library on'), hasLength(1),
+          reason: 'the library never resumed');
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      expect(focus.holder, AudioOutput.preview);
+      _expectNoOverlap(output);
+    });
+
+    test('closing preview leaves the library paused', () async {
+      final c = await libraryPlaying();
+      await previewPlaying(c);
+      await c.read(previewControlsProvider).close();
+      await pumpEventQueue();
+      expect(output.last, 'preview off');
+      expect(output.where((e) => e == 'library on'), hasLength(1));
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('preview never submits a playback request, records a click or '
+        'writes history, and never touches the queue', () async {
+      final c = await libraryPlaying();
+      c.read(clickRecorderProvider); // builds the spy
+      final submits = requests.submits;
+      final clicks = clickSpy.records;
+      final events = (await db.select(db.historyEvents).get()).length;
+      final session = c.read(queuePlayerProvider).queue.sessionId;
+      final seeds = plugin.loadCalls;
+      await previewPlaying(c);
+      await c.read(previewControlsProvider).pause();
+      await c.read(previewControlsProvider).resume();
+      unawaited(c.read(previewControlsProvider).playLibraryTrack('a'));
+      await pumpEventQueue();
+      previews.last.finishLoad(null);
+      await pumpEventQueue();
+      await c.read(previewControlsProvider).close();
+      await pumpEventQueue();
+      expect(requests.submits, submits);
+      expect(clickSpy.records, clicks);
+      expect((await db.select(db.historyEvents).get()).length, events);
+      expect(c.read(queuePlayerProvider).queue.sessionId, session);
+      expect(plugin.loadCalls, seeds, reason: 'no queue rows or reloads');
+      expect(previews.expand((e) => e.loads).map((u) => u.path), [
+        '/tracks/uploads/items/i1/preview',
+        '/tracks/a/stream',
+      ]);
+    });
+  });
+
+  // 7P.1 (SC-27 §6 row 1): a typed engine command failure is published and,
+  // when the engine diverged, answered by a rebuild from queue data: a new
+  // seed around the item the core asked for, never a natural advance.
+  // 7P.2 (5B.0d m6): a failed load is classified by the source the engine
+  // built (the load event names it), never by the catalog's recorded path.
+  group('7P.2 m6: a load failure is classified by the source the engine '
+      'built', () {
+    test('a streamed seed of a recorded download that fails to load is a '
+        'stream failure, not a damaged file', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a'); // recorded and on disk
+      final c = createContainer();
+      final issues = <PlaybackIssue>[];
+      c.read(playbackIssueBusProvider).issues.listen(issues.add);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      final queue = c.read(queuePlayerProvider).queue;
+      fakePlayer.emitLoadEvent(EngineLoadEvent(
+        playlistRevision: fakePlayer.seedRevision,
+        outcome: EngineLoadOutcome.failed,
+        // The engine streamed it (no local path).
+        source: EngineSourceIdentity(
+            sourceId: 41,
+            sessionId: queue.sessionId,
+            itemId: queue.currentItemId!,
+            trackUuid: 'a'),
+      ));
+      await pumpEventQueue();
+
+      final kinds = [
+        for (final i in issues.whereType<PlaybackSourceFailed>()) i.kind
+      ];
+      expect(kinds, hasLength(1));
+      expect(kinds.single,
+          isNot(anyOf(SourceFailureKind.damagedLocalFile,
+              SourceFailureKind.missingLocalFile)),
+          reason: 'the failing source was a stream');
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'),
+          isFalse, reason: 'no suspicion against a file that never played');
+      expect(fakePlayer.refreshedSources, isEmpty,
+          reason: 'no file-to-stream fallback for a stream');
+    });
+  });
+
+  // 7P.2 exit proof (SC-27 §6 "one local-vs-remote decision point"): the
+  // resolver's verdict reaches the engine, which never second-guesses it
+  // from the recorded download.
+  group('7P.2 exit proof: the target source kind reaches the engine', () {
+    Future<String?> recordedPath(String uuid) async =>
+        (await (db.select(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+                .getSingle())
+            .filePath;
+
+    test('a remote target for a track with a recorded file_path streams '
+        '(real engine)', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      existingFiles.remove('/dl/a'); // recorded, but gone from disk
+      final plugin = _ScriptedPlugin();
+      final engine = JustAudioEngine(plugin);
+      addTearDown(engine.dispose);
+      // The catalog can't be corrected, so the path stays recorded.
+      final c = createContainer(engine: engine, failingReconcile: true);
+      final issues = <PlaybackIssue>[];
+      c.read(playbackIssueBusProvider).issues.listen(issues.add);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'search');
+      await pumpEventQueue();
+
+      expect(await recordedPath('a'), '/dl/a', reason: 'precondition');
+      expect(issues, contains(const LocalFileMissing('a', '/dl/a')),
+          reason: 'the resolver decided remote');
+      final load = plugin.loads.single;
+      final current = load.uris[load.initialIndex];
+      expect(current.scheme, isNot('file'),
+          reason: 'the engine streams what the resolver said is remote');
+      expect(current.path, endsWith('tracks/a/stream'));
+      final item = c.read(queuePlayerProvider).queue.currentItemId!;
+      expect(engine.sourceKindOf(item), PlaybackSourceKind.remote);
+    });
+
+    test('the start applies the resolved kind: local for a download on '
+        'disk, remote for a stream', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'search');
+      expect(fakePlayer.seedCalls.last.currentSourceKind,
+          PlaybackSourceKind.local);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('b'),
+          sourceType: 'search');
+      expect(fakePlayer.seedCalls.last.currentSourceKind,
+          PlaybackSourceKind.remote);
+    });
+
+    test('an online restore resolves its landing: a recorded download gone '
+        'from disk is restored as the stream', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      existingFiles.remove('/dl/a');
+      final sessionId = await repo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['a', 'b'],
+        currentIndex: 0,
+      );
+      final snapshot = await repo.getSessionSnapshot(sessionId);
+      await repo.updatePlaybackCursor(
+        sessionId: sessionId,
+        currentItemId: snapshot!.currentItem!.itemId,
+        positionMs: 42000,
+      );
+
+      final c = createContainer(failingReconcile: true);
+      c.read(queuePlayerProvider);
+      await pumpEventQueue();
+
+      expect(fakePlayer.seedCalls, hasLength(1));
+      expect(fakePlayer.seedCalls.single.currentSourceKind,
+          PlaybackSourceKind.remote);
+      expect(fakePlayer.seedCalls.single.initialPosition,
+          const Duration(seconds: 42), reason: 'the same item, kept');
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+    });
+  });
+
+  // 7P.2: every landing the core resolves applies the resolver's kind; a
+  // reseed without a new decision keeps the kind the engine applied.
+  group('7P.2 every landing applies its kind', () {
+    /// a (stream), b (recorded, gone from disk; the catalog can't be
+    /// corrected), c (stream); playing a.
+    Future<(ProviderContainer, QueuePlayer, List<int>)> playingA() async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await markDownloaded('b', '/dl/b');
+      existingFiles.remove('/dl/b');
+      final c = createContainer(failingReconcile: true);
+      await playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('a'), sourceType: 'search');
+      await pumpEventQueue();
+      final items = [for (final t in await sessionTracksOf(c)) t.itemId];
+      expect(fakePlayer.sourceKindOf(items[1]), PlaybackSourceKind.local,
+          reason: 'precondition: b is loaded by the rule as its file');
+      return (c, c.read(queuePlayerProvider.notifier), items);
+    }
+
+    test('a skip onto a loaded source of the other kind reseeds it as the '
+        'target says', () async {
+      final (_, notifier, items) = await playingA();
+      await notifier.skipNext();
+      await pumpEventQueue();
+      final seed = fakePlayer.seedCalls.last;
+      expect((seed.currentItemId, seed.currentSourceKind),
+          (items[1], PlaybackSourceKind.remote));
+      expect(fakePlayer.sourceKindOf(items[1]), PlaybackSourceKind.remote);
+    });
+
+    test('an online tap resolves its landing and applies the kind', () async {
+      final (_, notifier, items) = await playingA();
+      await notifier.skipToTrack(items[1]);
+      await pumpEventQueue();
+      final seed = fakePlayer.seedCalls.last;
+      expect((seed.currentItemId, seed.currentSourceKind),
+          (items[1], PlaybackSourceKind.remote));
+    });
+
+    test('a landing on a loaded source of the same kind is a plain seek, '
+        'not a reseed', () async {
+      final (c, notifier, items) = await playingA();
+      final seeds = fakePlayer.seedCalls.length;
+      await notifier.skipToTrack(items[2]); // c: a stream, loaded as one
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds), reason: 'no reseed');
+      expect(fakePlayer.seekedItems.last, items[2]);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    Future<(ProviderContainer, QueuePlayer)> playingRemoteA() async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      existingFiles.remove('/dl/a');
+      final c = createContainer(failingReconcile: true);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'search');
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls.last.currentSourceKind,
+          PlaybackSourceKind.remote, reason: 'precondition');
+      return (c, c.read(queuePlayerProvider.notifier));
+    }
+
+    test('a rebuild after an engine command failure keeps the applied kind',
+        () async {
+      final (_, _) = await playingRemoteA();
+      final seeds = fakePlayer.seedCalls.length;
+      fakePlayer.emitCommandFailure(EngineCommandFailure(
+        runtimeId: fakePlayer.runtimeId,
+        seedRevision: fakePlayer.seedRevision,
+        playlistRevision: fakePlayer.playlistRevision,
+        command: EngineCommand.insert,
+        reason: EngineCommandFailureReason.failed,
+        diverged: true,
+      ));
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1), reason: 'rebuilt');
+      expect(fakePlayer.seedCalls.last.currentSourceKind,
+          PlaybackSourceKind.remote,
+          reason: 'the rebuild does not re-decide behind the resolver');
+    });
+
+    test('a sync reconcile that keeps the current item keeps its kind',
+        () async {
+      final (c, notifier) = await playingRemoteA();
+      final seeds = fakePlayer.seedCalls.length;
+      await notifier.reconcileAfterSyncQueueMutation(
+          {c.read(queuePlayerProvider).queue.sessionId!});
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.currentSourceKind,
+          PlaybackSourceKind.remote);
+    });
+  });
+
+  group('7P.1 rebuild from queue data', () {
+    late List<PlaybackIssue> issues;
+
+    Future<QueuePlayer> started(ProviderContainer c,
+        {List<String> uuids = const ['a', 'b', 'c'], bool playing = true}) async {
+      issues = [];
+      c.read(playbackIssueBusProvider).issues.listen(issues.add);
+      await fixture.insertSingles(uuids);
+      await playFromTrackList(c, uuids, await fixture.track(uuids.first),
+          sourceType: 'search');
+      final notifier = c.read(queuePlayerProvider.notifier);
+      if (!playing) await notifier.pause();
+      fakePlayer.emitPlayerState(
+          EngineTransportState(playing, EngineProcessingState.ready));
+      await pumpEventQueue();
+      return notifier;
+    }
+
+    int itemOf(ProviderContainer c) =>
+        c.read(queuePlayerProvider).queue.currentItemId!;
+
+    EngineCommandFailure failure({
+      required EngineCommand? command,
+      EngineCommandFailureReason reason = EngineCommandFailureReason.failed,
+      bool diverged = true,
+      int? itemId,
+      Duration? position,
+      PlaybackTransitionCause? cause,
+      int? seedRevision,
+    }) =>
+        EngineCommandFailure(
+          runtimeId: fakePlayer.runtimeId,
+          seedRevision: seedRevision ?? fakePlayer.seedRevision,
+          playlistRevision: fakePlayer.playlistRevision,
+          command: command,
+          reason: reason,
+          diverged: diverged,
+          target: itemId == null
+              ? null
+              : EngineCommandTarget(
+                  itemId: itemId,
+                  trackUuid: 'x',
+                  sourceKind: PlaybackSourceKind.remote),
+          position: position,
+          cause: cause,
+        );
+
+    test('a failed insert while playing reseeds the current item at its '
+        'position from queue data and plays on', () async {
+      final c = createContainer();
+      await started(c);
+      final current = itemOf(c);
+      fakePlayer.emitPosition(const Duration(seconds: 42));
+      final seeds = fakePlayer.seedCalls.length;
+      final plays = fakePlayer.playCalls;
+      final reported = failure(
+          command: EngineCommand.insert,
+          itemId: current + 2,
+          cause: PlaybackTransitionCause.queueEdit);
+      fakePlayer.emitCommandFailure(reported);
+      await pumpEventQueue();
+
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.currentItemId, current);
+      expect(seed.initialPosition, const Duration(seconds: 42));
+      expect(seed.cause, PlaybackTransitionCause.reconcileContinuation,
+          reason: 'a same-item rebuild continues the listen');
+      expect(seed.entries.map((e) => e.itemId), contains(current + 2),
+          reason: 'entries come from the queue, not the engine');
+      expect(fakePlayer.playCalls, greaterThan(plays));
+      expect(c.read(queuePlayerProvider).queue.currentItemId, current);
+      expect(issues.whereType<PlaybackEngineCommandFailed>().single.failure,
+          same(reported));
+    });
+
+    test('a paused queue is rebuilt paused (a restore never starts audio)',
+        () async {
+      final c = createContainer();
+      await started(c, playing: false);
+      final plays = fakePlayer.playCalls;
+      final seeds = fakePlayer.seedCalls.length;
+      fakePlayer.emitCommandFailure(
+          failure(command: EngineCommand.remove, itemId: itemOf(c) + 1));
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.autoPlay, isFalse);
+      expect(fakePlayer.playCalls, plays);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+
+    test('a dropped skip lands on the item the user asked for, as a skip',
+        () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await notifier.skipNext();
+      await pumpEventQueue();
+      final target = itemOf(c);
+      final seeds = fakePlayer.seedCalls.length;
+      fakePlayer.emitCommandFailure(failure(
+          command: EngineCommand.seek,
+          reason: EngineCommandFailureReason.dropped,
+          itemId: target,
+          position: Duration.zero,
+          cause: PlaybackTransitionCause.userSkip));
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.currentItemId, target);
+      expect(seed.initialPosition, Duration.zero);
+      expect(seed.cause, PlaybackTransitionCause.userSkip);
+    });
+
+    test('a dropped seek is rebuilt at the asked position', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await notifier.seek(const Duration(seconds: 30));
+      fakePlayer.emitPosition(const Duration(seconds: 1));
+      fakePlayer.emitCommandFailure(failure(
+          command: EngineCommand.seek,
+          reason: EngineCommandFailureReason.dropped,
+          itemId: itemOf(c),
+          position: const Duration(seconds: 30),
+          cause: PlaybackTransitionCause.userSeek));
+      await pumpEventQueue();
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.currentItemId, itemOf(c));
+      expect(seed.initialPosition, const Duration(seconds: 30));
+      expect(seed.cause, PlaybackTransitionCause.reconcileContinuation);
+    });
+
+    test('repeat-one: a dropped restart seek rebuilds the same item at its '
+        'start and keeps the native loop', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await notifier.cycleQueueRepeatMode(); // all
+      await notifier.cycleQueueRepeatMode(); // one
+      await notifier.skipNext(); // a restart under repeat-one
+      final current = itemOf(c);
+      fakePlayer.emitCommandFailure(failure(
+          command: EngineCommand.seek,
+          reason: EngineCommandFailureReason.dropped,
+          itemId: current,
+          position: Duration.zero,
+          cause: PlaybackTransitionCause.userSeek));
+      await pumpEventQueue();
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.currentItemId, current);
+      expect(seed.initialPosition, Duration.zero);
+      expect(seed.cause, PlaybackTransitionCause.reconcileContinuation);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.one);
+    });
+
+    test('a failed pause is rebuilt paused', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await notifier.pause();
+      final plays = fakePlayer.playCalls;
+      final seeds = fakePlayer.seedCalls.length;
+      fakePlayer.emitCommandFailure(
+          failure(command: EngineCommand.pause, itemId: itemOf(c)));
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.playCalls, plays);
+    });
+
+    test('a failure that leaves the playlist intact is only published',
+        () async {
+      final c = createContainer();
+      await started(c);
+      final seeds = fakePlayer.seedCalls.length;
+      for (final command in [
+        EngineCommand.play,
+        EngineCommand.stop,
+        EngineCommand.setLoopMode,
+        EngineCommand.setVolume,
+      ]) {
+        fakePlayer.emitCommandFailure(
+            failure(command: command, diverged: false));
+      }
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      expect(issues.whereType<PlaybackEngineCommandFailed>(), hasLength(4));
+    });
+
+    test('a failure of a playlist a newer seed replaced is dropped, and a '
+        'duplicate rebuilds once', () async {
+      final c = createContainer();
+      await started(c);
+      final old = failure(command: EngineCommand.insert, itemId: 1);
+      // A new session replaces the playlist the failure was about.
+      await playFromTrackList(c, ['c', 'b'], await fixture.track('c'),
+          sourceType: 'search');
+      await pumpEventQueue();
+      final seeds = fakePlayer.seedCalls.length;
+      fakePlayer.emitCommandFailure(old);
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds), reason: 'stale');
+
+      final current = failure(command: EngineCommand.insert, itemId: 1);
+      fakePlayer.emitCommandFailure(current);
+      fakePlayer.emitCommandFailure(current);
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1), reason: 'once');
+    });
+
+    for (final quiesce in [false, true]) {
+      test('after ${quiesce ? 'quiesce' : 'stop'} a late failure rebuilds '
+          'nothing', () async {
+        final c = createContainer();
+        final notifier = await started(c);
+        final late = failure(command: EngineCommand.insert, itemId: 1);
+        if (quiesce) {
+          await notifier.quiesce();
+        } else {
+          await notifier.stop();
+        }
+        final seeds = fakePlayer.seedCalls.length;
+        final plays = fakePlayer.playCalls;
+        fakePlayer.emitCommandFailure(late);
+        await pumpEventQueue();
+        expect(fakePlayer.seedCalls, hasLength(seeds));
+        expect(fakePlayer.playCalls, plays);
+      });
+    }
+
+    test('while the library has yielded the output a rebuild never plays',
+        () async {
+      final timers = FakeTimers();
+      final focus = AudioFocus(sessionPort, timer: timers.create);
+      addTearDown(focus.dispose);
+      final preview = RelinquishingOwner('preview');
+      final c = createContainer(focus: focus);
+      await started(c);
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+      focus.bind(AudioOutput.preview, preview);
+      unawaited(focus.acquire(AudioOutput.preview));
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      expect(focus.holder, AudioOutput.preview);
+      final plays = fakePlayer.playCalls;
+      final seeds = fakePlayer.seedCalls.length;
+      fakePlayer.emitCommandFailure(
+          failure(command: EngineCommand.insert, itemId: itemOf(c) + 1));
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.playCalls, plays);
+      expect(focus.holder, AudioOutput.preview);
+    });
+
+    test('a transfer to preview that starts while a rebuild is under way '
+        'keeps the rebuild from playing', () async {
+      final timers = FakeTimers();
+      final focus = AudioFocus(sessionPort, timer: timers.create);
+      addTearDown(focus.dispose);
+      final preview = RelinquishingOwner('preview');
+      final c = createContainer(focus: focus);
+      await started(c);
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+      focus.bind(AudioOutput.preview, preview);
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
+      // The rebuild has decided to play on; the transfer starts as it seeds.
+      fakePlayer.beforeSeed = (_) async {
+        unawaited(focus.acquire(AudioOutput.preview));
+        await pumpEventQueue();
+      };
+      final plays = fakePlayer.playCalls;
+      final seeds = fakePlayer.seedCalls.length;
+      fakePlayer.emitCommandFailure(
+          failure(command: EngineCommand.insert, itemId: itemOf(c) + 1));
+      await pumpEventQueue(times: 200);
+      fakePlayer.beforeSeed = null;
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1), reason: 'rebuilt');
+      expect(focus.yieldedBy(AudioOutput.queue), isTrue);
+      expect(fakePlayer.playCalls, plays, reason: 'never takes the output back');
+    });
+  });
+
+  // 7P.1 (SC-27 invariant 13): rebuilds are bounded. A run of failures that
+  // keeps diverging the engine stops honestly; the user's next command
+  // starts a new run and reseeds the engine it can no longer trust.
+  group('7P.1 bounded rebuild', () {
+    Future<QueuePlayer> started(ProviderContainer c) async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await playFromTrackList(c, ['a', 'b', 'c'], await fixture.track('a'),
+          sourceType: 'search');
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      return c.read(queuePlayerProvider.notifier);
+    }
+
+    Future<void> failOnce() async {
+      fakePlayer.emitCommandFailure(EngineCommandFailure(
+        runtimeId: fakePlayer.runtimeId,
+        seedRevision: fakePlayer.seedRevision,
+        playlistRevision: fakePlayer.playlistRevision,
+        command: EngineCommand.insert,
+        reason: EngineCommandFailureReason.failed,
+        diverged: true,
+        cause: PlaybackTransitionCause.queueEdit,
+      ));
+      await pumpEventQueue();
+    }
+
+    test('the fourth rebuild in a run stops instead of looping', () async {
+      final c = createContainer();
+      await started(c);
+      final seeds = fakePlayer.seedCalls.length;
+      for (var i = 0; i < 3; i++) {
+        await failOnce();
+      }
+      expect(fakePlayer.seedCalls, hasLength(seeds + 3));
+      final stops = fakePlayer.stopCalls;
+      await failOnce();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 3), reason: 'no 4th');
+      expect(fakePlayer.stopCalls, stops + 1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+      expect(c.read(queuePlayerProvider).queue.sessionId, isNotNull,
+          reason: 'the queue is kept');
+    });
+
+    test('after it stopped, a resume reseeds the untrusted engine and plays',
+        () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      for (var i = 0; i < 4; i++) {
+        await failOnce();
+      }
+      final seeds = fakePlayer.seedCalls.length;
+      final plays = fakePlayer.playCalls;
+      await notifier.resume();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.currentItemId,
+          c.read(queuePlayerProvider).queue.currentItemId);
+      expect(fakePlayer.playCalls, greaterThan(plays));
+    });
+
+    test('after it stopped, a skip reseeds instead of seeking the untrusted '
+        'engine', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      for (var i = 0; i < 4; i++) {
+        await failOnce();
+      }
+      final seeds = fakePlayer.seedCalls.length;
+      final seeks = fakePlayer.seekedItems.length;
+      await notifier.skipNext();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seekedItems, hasLength(seeks),
+          reason: 'no seek on a diverged playlist');
+    });
+
+    test('user input starts a new run', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      final seeds = fakePlayer.seedCalls.length;
+      for (var i = 0; i < 3; i++) {
+        await failOnce();
+      }
+      await notifier.skipNext();
+      await pumpEventQueue();
+      final afterSkip = fakePlayer.seedCalls.length;
+      for (var i = 0; i < 3; i++) {
+        await failOnce();
+      }
+      expect(fakePlayer.seedCalls, hasLength(afterSkip + 3));
+      expect(afterSkip, greaterThanOrEqualTo(seeds + 3));
+    });
+    test('after it stopped, a seek reseeds at the asked position', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      for (var i = 0; i < 4; i++) {
+        await failOnce();
+      }
+      final seeds = fakePlayer.seedCalls.length;
+      await notifier.seek(const Duration(seconds: 12));
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.initialPosition,
+          const Duration(seconds: 12));
+    });
+  });
+
+  // 7-R1-24: a user resume while preview holds the output must play (spec §5:
+  // "any library resume/play ... first stops preview"); the engine's play()
+  // takes the output back through beforePlay. The yield guard on reseeds is
+  // for automatic plays only.
+  group('7-R1-24: a user resume of an untrusted engine while preview holds',
+      () {
+    late FakeTimers timers;
+    late AudioFocus focus;
+    late RelinquishingOwner preview;
+
+    setUp(() {
+      timers = FakeTimers();
+      focus = AudioFocus(sessionPort, timer: timers.create);
+      preview = RelinquishingOwner('preview');
+    });
+
+    tearDown(() => focus.dispose());
+
+    /// The library played, its engine diverged until the rebuild bound
+    /// stopped it, then preview took the output.
+    Future<QueuePlayer> divergedThenPreview(ProviderContainer c) async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await playFromTrackList(c, ['a', 'b', 'c'], await fixture.track('a'),
+          sourceType: 'search');
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+      focus.bind(AudioOutput.preview, preview);
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      for (var i = 0; i < 4; i++) {
+        fakePlayer.emitCommandFailure(EngineCommandFailure(
+          runtimeId: fakePlayer.runtimeId,
+          seedRevision: fakePlayer.seedRevision,
+          playlistRevision: fakePlayer.playlistRevision,
+          command: EngineCommand.insert,
+          reason: EngineCommandFailureReason.failed,
+          diverged: true,
+          cause: PlaybackTransitionCause.queueEdit,
+        ));
+        await pumpEventQueue();
+      }
+      expect(c.read(audioPlayWhenReadyProvider), isFalse,
+          reason: 'the bound stopped the rebuilds');
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      expect(await focus.acquire(AudioOutput.preview), isTrue);
+      expect(focus.yieldedBy(AudioOutput.queue), isTrue);
+      return c.read(queuePlayerProvider.notifier);
+    }
+
+    test('resume reseeds and plays (the engine play takes the output back)',
+        () async {
+      final c = createContainer(focus: focus);
+      final notifier = await divergedThenPreview(c);
+      final seeds = fakePlayer.seedCalls.length;
+      final plays = fakePlayer.playCalls;
+      await notifier.resume();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1), reason: 'reseeded');
+      expect(fakePlayer.playCalls, greaterThan(plays));
+      expect(c.read(audioPlayWhenReadyProvider), isTrue);
+    });
+
+    test('the play/pause toggle reseeds and plays', () async {
+      final c = createContainer(focus: focus);
+      final notifier = await divergedThenPreview(c);
+      final seeds = fakePlayer.seedCalls.length;
+      final plays = fakePlayer.playCalls;
+      await notifier.togglePlayPause();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.playCalls, greaterThan(plays));
+    });
+
+    // The yield guard of automatic reseeds is pinned by 7P.1's "while the
+    // library has yielded the output a rebuild never plays".
+    test('a seek while paused and yielded does not play', () async {
+      final c = createContainer(focus: focus);
+      await divergedThenPreview(c);
+      final plays = fakePlayer.playCalls;
+      await c.read(queuePlayerProvider.notifier).seek(Duration.zero);
+      await pumpEventQueue();
+      expect(fakePlayer.playCalls, plays,
+          reason: 'a seek while paused and yielded does not play');
+      expect(focus.holder, AudioOutput.preview);
+    });
+  });
+
+  // 7P.1 (5B.0d m5): a hydration chunk extends the window's coverage only
+  // once the engine applied it natively, so native loop-all (which needs the
+  // whole queue loaded) is never set over a window that failed to grow.
+  group('7P.1 coverage acknowledged at native application (m5)', () {
+    Future<(ProviderContainer, QueuePlayer, List<QueueTrackEntry>)>
+        repeatAll70() async {
+      final uuids = List.generate(70, (i) => 't$i');
+      await fixture.insertSingles(uuids);
+      final c = createContainer();
+      await repo.startupRead.future;
+      await playFromTrackList(c, uuids, await fixture.track('t0'),
+          sourceType: 'test');
+      await pumpEventQueue();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.cycleQueueRepeatMode(); // all
+      await pumpEventQueue();
+      return (c, notifier, await sessionTracksOf(c));
+    }
+
+    test('coverage and native loop-all wait for the engine to apply the '
+        'chunk', () async {
+      final (c, notifier, tracks) = await repeatAll70();
+      final window = c.read(queueWindowProvider);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.off,
+          reason: 'the seed holds positions 0..48 of 70');
+      final applied = fakePlayer.appliedGate = Completer<bool>();
+      await notifier.skipToTrack(tracks[40].itemId); // within 24 of the end
+      await pumpEventQueue();
+      expect(fakePlayer.addedBatches, isNotEmpty, reason: 'chunk issued');
+      expect(window.coversQueue(70), isFalse, reason: 'not yet applied');
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.off);
+
+      applied.complete(true);
+      await pumpEventQueue();
+      expect(window.coversQueue(70), isTrue);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.all);
+    });
+
+    test('a chunk the engine failed to apply is never acknowledged', () async {
+      final (c, notifier, tracks) = await repeatAll70();
+      final window = c.read(queueWindowProvider);
+      final end = window.nextForwardHydrationPlayPosition;
+      final applied = fakePlayer.appliedGate = Completer<bool>();
+      await notifier.skipToTrack(tracks[40].itemId);
+      await pumpEventQueue();
+      fakePlayer.appliedGate = null;
+      applied.complete(false);
+      await pumpEventQueue();
+      expect(window.nextForwardHydrationPlayPosition, end);
+      expect(fakePlayer.lastLoopMode, EngineLoopMode.off);
+    });
+
+    test('waiting for the application never holds the lane', () async {
+      final (c, notifier, tracks) = await repeatAll70();
+      fakePlayer.appliedGate = Completer<bool>(); // never completes
+      await notifier.skipToTrack(tracks[40].itemId);
+      await pumpEventQueue();
+      final pauses = fakePlayer.pauseCalls;
+      await notifier.pause().timeout(const Duration(seconds: 1));
+      expect(fakePlayer.pauseCalls, pauses + 1);
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+  });
+
+  // 7P.1 exit proof (SC-27 §6 row 1, 5-U13 regression): on the real
+  // JustAudioEngine over a scripted plugin, a dropped seek, a failed insert
+  // and a late index event each produce a typed failure and a rebuild from
+  // queue data, and nothing is labelled naturalAdvance.
+  group('7P.1 exit proof (real engine, scripted plugin)', () {
+    late _ScriptedPlugin plugin;
+    late JustAudioEngine engine;
+    late List<PlaybackObservation> seen;
+    late List<PlaybackIssue> issues;
+
+    Future<ProviderContainer> playing(List<String> uuids) async {
+      plugin = _ScriptedPlugin();
+      engine = JustAudioEngine(plugin);
+      addTearDown(engine.dispose);
+      seen = [];
+      issues = [];
+      engine.observations.listen(seen.add);
+      final c = createContainer(engine: engine);
+      c.read(playbackIssueBusProvider).issues.listen(issues.add);
+      await fixture.insertSingles(uuids);
+      await playFromTrackList(c, uuids, await fixture.track(uuids.first),
+          sourceType: 'search');
+      await pumpEventQueue();
+      plugin.state(ja.ProcessingState.ready, playing: true);
+      await pumpEventQueue();
+      seen.clear();
+      return c;
+    }
+
+    void expectNoNaturalAdvance() => expect(
+        seen.where(
+            (o) => o.transitionCause == PlaybackTransitionCause.naturalAdvance),
+        isEmpty);
+
+    List<EngineCommandFailure> failures() => [
+          for (final issue in issues.whereType<PlaybackEngineCommandFailed>())
+            issue.failure
+        ];
+
+    test('a seek dropped while loading is rebuilt at the asked position',
+        () async {
+      final c = await playing(['a', 'b', 'c']);
+      final loads = plugin.loads.length;
+      plugin.processing = ja.ProcessingState.loading;
+      await c.read(queuePlayerProvider.notifier)
+          .seek(const Duration(seconds: 30));
+      await pumpEventQueue();
+
+      expect(failures().single.reason, EngineCommandFailureReason.dropped);
+      expect(plugin.loads, hasLength(loads + 1), reason: 'a new seed');
+      expect(plugin.loads.last.initialPosition, const Duration(seconds: 30));
+      expect(plugin.loads.last.initialIndex, 0, reason: 'still track a');
+      expect(c.read(queuePlayerProvider).playback.currentTrack?.uuidId, 'a');
+      expectNoNaturalAdvance();
+    });
+
+    test('a failed insert is rebuilt from queue data, the added track '
+        'included', () async {
+      final c = await playing(['a', 'b']);
+      await fixture.insertSingles(['d']);
+      final loads = plugin.loads.length;
+      plugin.failInserts = true;
+      await addToQueue(c, [await fixture.track('d')]);
+      await pumpEventQueue();
+
+      expect(failures().first.command, EngineCommand.insert);
+      expect(plugin.loads, hasLength(loads + 1));
+      expect(plugin.loads.last.count, 3, reason: 'a, b and d from the queue');
+      expect(plugin.loads.last.initialIndex, 0);
+      expect(c.read(queuePlayerProvider).playback.currentTrack?.uuidId, 'a');
+      expectNoNaturalAdvance();
+    });
+
+    test('a late index event is never committed; the item the core asked '
+        'for is rebuilt', () async {
+      final c = await playing(['a', 'b', 'c']);
+      await c.read(queuePlayerProvider.notifier).skipNext();
+      await pumpEventQueue();
+      expect(c.read(queuePlayerProvider).playback.currentTrack?.uuidId, 'b');
+      seen.clear();
+      final loads = plugin.loads.length;
+      plugin.reportIndex(0); // late: the index before the skip
+      await pumpEventQueue();
+
+      expect(failures(), isNotEmpty);
+      expect(failures().first.reason,
+          EngineCommandFailureReason.unexplainedIndex);
+      expect(plugin.loads, hasLength(loads + 1));
+      expect(plugin.loads.last.initialIndex, 1, reason: 'b, from the queue');
+      expect(c.read(queuePlayerProvider).playback.currentTrack?.uuidId, 'b');
+      expectNoNaturalAdvance();
+    });
+
+    // 7-R1-05 (7P.1 R1-06): the scripted plugin, like just_audio on Android,
+    // keeps its old index after a remove returns until it reports the new
+    // one. Removing an already-played track must not move playback.
+    test('7-R1-05: removing an earlier track with the index reported late '
+        'keeps the playing track: no advance, no rebuild, no failure',
+        () async {
+      final c = await playing(['a', 'b', 'c', 'd']);
+      await c.read(queuePlayerProvider.notifier).skipNext();
+      await pumpEventQueue();
+      expect(c.read(queuePlayerProvider).playback.currentTrack?.uuidId, 'b');
+      final sessionId = c.read(queuePlayerProvider).queue.sessionId!;
+      final a = (await repo.getPlaybackEntries(sessionId))
+          .firstWhere((e) => e.uuidId == 'a');
+      seen.clear();
+      final loads = plugin.loads.length;
+
+      await c.read(queuePlayerProvider.notifier).removeFromQueue(a.itemId);
+      await pumpEventQueue();
+      expect(c.read(queuePlayerProvider).playback.currentTrack?.uuidId, 'b',
+          reason: 'the stale index (1, now c) is not an advance');
+      plugin.reportIndex(0); // the plugin's own report: b moved to 0
+      await pumpEventQueue();
+
+      expect(c.read(queuePlayerProvider).playback.currentTrack?.uuidId, 'b');
+      expect(failures(), isEmpty);
+      expect(plugin.loads, hasLength(loads), reason: 'no rebuild');
+      expectNoNaturalAdvance();
+      expect(seen.last.uncertain, isFalse);
+      expect(seen.last.source?.trackUuid, 'b');
+    });
+  });
+
+  // 7P.1 in-piece review round 1 (`7P.1-review.md`).
+  group('7P.1 review r1', () {
+    Future<QueuePlayer> started(ProviderContainer c) async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await playFromTrackList(c, ['a', 'b', 'c'], await fixture.track('a'),
+          sourceType: 'search');
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      return c.read(queuePlayerProvider.notifier);
+    }
+
+    int itemOf(ProviderContainer c) =>
+        c.read(queuePlayerProvider).queue.currentItemId!;
+
+    void fail(EngineCommand command,
+        {EngineCommandFailureReason reason = EngineCommandFailureReason.failed,
+        int? itemId,
+        Duration? position,
+        PlaybackTransitionCause? cause}) {
+      fakePlayer.emitCommandFailure(EngineCommandFailure(
+        runtimeId: fakePlayer.runtimeId,
+        seedRevision: fakePlayer.seedRevision,
+        playlistRevision: fakePlayer.playlistRevision,
+        command: command,
+        reason: reason,
+        diverged: true,
+        target: itemId == null
+            ? null
+            : EngineCommandTarget(
+                itemId: itemId,
+                trackUuid: 'x',
+                sourceKind: PlaybackSourceKind.remote),
+        position: position,
+        cause: cause,
+      ));
+    }
+
+    test('R1-01: a rebuild onto an item the engine never settled on starts '
+        'it from zero, not at the old track\'s position', () async {
+      final c = createContainer();
+      await started(c);
+      final first = itemOf(c);
+      fakePlayer.emitObservation(playing: true); // settled on a
+      fakePlayer.emitPosition(const Duration(seconds: 170));
+      await pumpEventQueue();
+      // The core moved the engine to c (a wrap target); natively it never got
+      // there before the reseat's insert failed.
+      fakePlayer.commitSilently(first + 2);
+      fail(EngineCommand.insert, itemId: first + 1,
+          cause: PlaybackTransitionCause.queueEdit);
+      await pumpEventQueue();
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.currentItemId, first + 2);
+      expect(seed.initialPosition, Duration.zero);
+    });
+
+    test('R1-01: a dropped seek on one item, then a skip, starts the next '
+        'item from zero', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      final a = itemOf(c);
+      fakePlayer.emitObservation(playing: true);
+      await pumpEventQueue();
+      await notifier.skipNext(); // b
+      fail(EngineCommand.seek,
+          reason: EngineCommandFailureReason.dropped,
+          itemId: a,
+          position: const Duration(seconds: 30),
+          cause: PlaybackTransitionCause.userSeek);
+      await pumpEventQueue();
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.currentItemId, a + 1);
+      expect(seed.initialPosition, Duration.zero);
+    });
+
+    test('R1-01: the same settled item keeps its engine position', () async {
+      final c = createContainer();
+      await started(c);
+      fakePlayer.emitObservation(playing: true);
+      fakePlayer.emitPosition(const Duration(seconds: 42));
+      await pumpEventQueue();
+      fail(EngineCommand.insert, itemId: itemOf(c) + 1,
+          cause: PlaybackTransitionCause.queueEdit);
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls.last.initialPosition,
+          const Duration(seconds: 42));
+    });
+
+    test('R1-02/R2-01: a failed pause is rebuilt paused without a full stop '
+        '(the engine resets its plugin at that seed; the listen is not split)',
+        () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await notifier.pause();
+      final stops = fakePlayer.stopCalls;
+      final seeds = fakePlayer.seedCalls.length;
+      fail(EngineCommand.pause, itemId: itemOf(c));
+      await pumpEventQueue();
+      expect(fakePlayer.stopCalls, stops, reason: 'no stop observation');
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.cause,
+          PlaybackTransitionCause.reconcileContinuation);
+    });
+
+    test('R2-n2: a resume that reseeds an untrusted engine starts an item the '
+        'engine never settled on from zero', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      final first = itemOf(c);
+      fakePlayer.emitObservation(playing: true);
+      fakePlayer.emitPosition(const Duration(seconds: 100));
+      await pumpEventQueue();
+      for (var i = 0; i < 4; i++) {
+        fail(EngineCommand.insert, cause: PlaybackTransitionCause.queueEdit);
+        await pumpEventQueue();
+      }
+      fakePlayer.commitSilently(first + 2);
+      await notifier.resume();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls.last.currentItemId, first + 2);
+      expect(fakePlayer.seedCalls.last.initialPosition, Duration.zero);
+    });
+
+    test('R1-04: a rebuild that could not finish leaves the engine untrusted: '
+        'the next resume reseeds', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await notifier.pause();
+      fakePlayer.beforeSeed = (_) async => throw StateError('db gone');
+      fail(EngineCommand.insert, itemId: itemOf(c) + 1);
+      await pumpEventQueue();
+      fakePlayer.beforeSeed = null;
+      final seeds = fakePlayer.seedCalls.length;
+      await notifier.resume();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+    });
+
+    test('R1-08: a seek after the engine diverged reseeds at the asked '
+        'position', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      fakePlayer.beforeSeed = (_) async => throw StateError('db gone');
+      fail(EngineCommand.insert, itemId: itemOf(c) + 1);
+      await pumpEventQueue();
+      fakePlayer.beforeSeed = null;
+      await notifier.seek(const Duration(seconds: 120));
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls.last.initialPosition,
+          const Duration(seconds: 120));
+    });
+
+    Future<void> exhaust() async {
+      for (var i = 0; i < 4; i++) {
+        fail(EngineCommand.insert, cause: PlaybackTransitionCause.queueEdit);
+        await pumpEventQueue();
+      }
+    }
+
+    test('R1-05: after the bound, repeat-one Next reseeds instead of seeking '
+        'the untrusted engine', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await notifier.cycleQueueRepeatMode(); // all
+      await notifier.cycleQueueRepeatMode(); // one
+      await exhaust();
+      final seeds = fakePlayer.seedCalls.length;
+      await notifier.skipNext();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.initialPosition, Duration.zero);
+    });
+
+    test('R1-05: after the bound, Previous late in a track reseeds at its '
+        'start', () async {
+      final c = createContainer();
+      final notifier = await started(c);
+      await exhaust();
+      fakePlayer.emitPosition(const Duration(seconds: 50));
+      await pumpEventQueue();
+      final seeds = fakePlayer.seedCalls.length;
+      await notifier.skipPrevious();
+      await pumpEventQueue();
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.initialPosition, Duration.zero);
+    });
+
+    test('R1-09: an automatic resume (a natural end) does not start a new '
+        'rebuild run', () async {
+      final c = createContainer();
+      await started(c);
+      for (var i = 0; i < 3; i++) {
+        fail(EngineCommand.insert, cause: PlaybackTransitionCause.queueEdit);
+        await pumpEventQueue();
+      }
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.completed));
+      await pumpEventQueue();
+      final stops = fakePlayer.stopCalls;
+      fail(EngineCommand.insert, cause: PlaybackTransitionCause.queueEdit);
+      await pumpEventQueue();
+      expect(fakePlayer.stopCalls, stops + 1, reason: 'the 4th in the run');
+      expect(c.read(audioPlayWhenReadyProvider), isFalse);
+    });
+  });
+
+  // Sign-off OPEN-M-11 step D, review r1 F3/F5: while the server check failed
+  // a stream behaves like a non-downloaded item offline, and the gate's
+  // verdicts reach the engine through the queue player's lane.
+  group('OPEN-M-11 step D: media token', () {
+    test('streams unavailable (the check failed): a request for a track '
+        'that is not downloaded is refused like offline', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      final c = createContainer(extraOverrides: [
+        streamsUnavailableProvider.overrideWithValue(() => true),
+      ]);
+      final outcome = await c
+          .read(playbackRequestsProvider)
+          .submit(const PlayList(['b'], 0, ListSource('search')));
+      expect(outcome, isA<RejectedUnplayableOffline>());
+      expect(fakePlayer.seedCalls, isEmpty);
+      final ok = await c
+          .read(playbackRequestsProvider)
+          .submit(const PlayList(['a'], 0, ListSource('search')));
+      expect(ok, isA<Accepted>());
+      expect(fakePlayer.seedCalls.last.currentSourceKind,
+          PlaybackSourceKind.local);
+    });
+
+    test('the gate verdicts run in the lane: Verified refreshes, a failed '
+        'check releases what is ahead, a different server stops a streamed '
+        'current item and releases everything', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final engine = _TokenAwareEngine();
+      fakePlayer = engine;
+      final gate = _StatesGate();
+      addTearDown(gate.close);
+      final c = createContainer(engine: engine, extraOverrides: [
+        serverBindingGateProvider.overrideWithValue(gate),
+      ]);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'search');
+      expect(fakePlayer.seedCalls.last.currentSourceKind,
+          PlaybackSourceKind.remote, reason: 'precondition: a streams');
+      c.read(queuePlayerProvider);
+
+      gate.publish(const BindingVerified(token: 't', instanceId: 'i'));
+      await pumpEventQueue();
+      expect(engine.tokenCalls, ['refresh']);
+
+      gate.publish(BindingUnverified(StateError('x')));
+      await pumpEventQueue();
+      expect(engine.tokenCalls, ['refresh', 'release ahead']);
+
+      final stops = engine.stopCalls;
+      gate.publish(const BindingDifferentServer(
+          boundInstanceId: 'a', serverInstanceId: 'b'));
+      await pumpEventQueue();
+      expect(engine.stopCalls, stops + 1, reason: 'a stream was current');
+      expect(engine.tokenCalls,
+          ['refresh', 'release ahead', 'release everything']);
+
+      gate.publish(const BindingVerifying());
+      await pumpEventQueue();
+      expect(engine.tokenCalls, hasLength(3), reason: 'nothing for a pending '
+          'verdict');
+    });
+  });
+
+  group('U17-FE-PB-CORE-B-01: a queue edit does not overwrite engine reports '
+      'that arrive while it reads', () {
+    test('an engine report during the edit\'s queue read is kept: playing, '
+        'not loading', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b', 'c', 'd'],
+          await fixture.track('a'), sourceType: 'test');
+      await pumpEventQueue();
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.buffering));
+      await pumpEventQueue();
+      expect(c.read(queuePlayerProvider).playback.status, PlayerStatus.loading,
+          reason: 'precondition: buffering shows loading');
+      final tracks = await sessionTracksOf(c);
+
+      final gate = Completer<void>();
+      repo.sessionSnapshotGate = gate;
+      final removal = c
+          .read(queuePlayerProvider.notifier)
+          .removeFromQueue(tracks[2].itemId);
+      await repo.sessionSnapshotEntered.future;
+      // The engine finishes buffering while the edit waits on its read.
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      fakePlayer.emitPosition(const Duration(seconds: 3));
+      await pumpEventQueue();
+      expect(c.read(queuePlayerProvider).playback.status, PlayerStatus.playing);
+      gate.complete();
+      await removal;
+      await pumpEventQueue();
+
+      final playback = c.read(queuePlayerProvider).playback;
+      expect(playback.status, PlayerStatus.playing,
+          reason: 'the report that arrived during the read is not undone');
+      expect(playback.processing, EngineProcessingState.ready);
+      expect(playback.position, const Duration(seconds: 3));
+      expect(c.read(queuePlayerProvider).queue.totalCount, 3);
+    });
+
+    test('removing another entry while paused keeps the shown position',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b', 'c', 'd'],
+          await fixture.track('a'), sourceType: 'test');
+      await pumpEventQueue();
+      fakePlayer.emitPosition(const Duration(seconds: 42));
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(false, EngineProcessingState.ready));
+      await pumpEventQueue();
+      final tracks = await sessionTracksOf(c);
+
+      await c
+          .read(queuePlayerProvider.notifier)
+          .removeFromQueue(tracks[2].itemId);
+      await pumpEventQueue();
+
+      final state = c.read(queuePlayerProvider);
+      expect(state.queue.currentItemId, tracks[0].itemId);
+      expect(state.playback.position, const Duration(seconds: 42),
+          reason: 'the current track was not removed: no jump to 0:00');
+    });
+
+    test('review r1 #3: when the engine already moved to the next track, the '
+        'removal does not show the old track\'s position on it', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b', 'c', 'd'],
+          await fixture.track('a'), sourceType: 'test');
+      await pumpEventQueue();
+      fakePlayer.emitPosition(const Duration(seconds: 42));
+      await pumpEventQueue();
+      final tracks = await sessionTracksOf(c);
+      // a ended: the engine is on b, its item-change event not processed.
+      fakePlayer.commitSilently(tracks[1].itemId);
+
+      await c
+          .read(queuePlayerProvider.notifier)
+          .removeFromQueue(tracks[3].itemId);
+      await pumpEventQueue();
+
+      final state = c.read(queuePlayerProvider);
+      expect(state.queue.currentItemId, tracks[1].itemId);
+      expect(state.playback.position, Duration.zero);
+    });
+  });
+
+  group('U17-FE-PB-CORE-B-02: Stop keeps the volume', () {
+    test('after Stop the shown volume is the one the engine still uses',
+        () async {
+      await fixture.insertSingles(['a', 'b']);
+      final c = createContainer();
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.setVolume(0.3);
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      await pumpEventQueue();
+
+      await notifier.stop();
+      await pumpEventQueue();
+
+      final state = c.read(queuePlayerProvider);
+      expect(state.queue.sessionId, isNull, reason: 'precondition: stopped');
+      expect(state.playback.currentTrack, isNull);
+      expect(state.playback.volume, 0.3);
+      expect(c.read(audioVolumeProvider), 0.3);
+      expect(fakePlayer.lastVolume, 0.3);
+    });
+  });
+
+  group('U17-FE-PB-CORE-B-04: a failure classified after the listener moved '
+      'on writes nothing', () {
+    Future<String?> damagedPathOf(String uuid) async =>
+        (await (db.select(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+                .getSingle())
+            .damagedFilePath;
+
+    Future<ProviderContainer> playingDownloadedA() async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('a', '/dl/a');
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      await pumpEventQueue();
+      return c;
+    }
+
+    test('the user skips while the failed download is being checked: no '
+        'suspicion, no stream stand-in, and returning to it later marks '
+        'nothing', () async {
+      final c = await playingDownloadedA();
+      final gate = classifyGate = Completer<void>();
+      fakePlayer.emitSourceFailure(); // a's download fails
+      await pumpEventQueue();
+      await c.read(queuePlayerProvider.notifier).skipNext(); // the user moves
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      gate.complete(); // the check answers "present but failed"
+      await pumpEventQueue();
+
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'),
+          isFalse, reason: 'a check that finished after the move is stale');
+      expect(fakePlayer.refreshedSources, isEmpty);
+
+      await c.read(queuePlayerProvider.notifier).skipPrevious();
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      fakePlayer.emitObservation(playing: true); // a plays again
+      await pumpEventQueue();
+      expect(await damagedPathOf('a'), isNull,
+          reason: 'a healthy download is never marked from a stale check');
+    });
+
+    test('the failed track plays while it is being checked (the run is over): '
+        'no suspicion and no stream stand-in', () async {
+      final c = await playingDownloadedA();
+      final gate = classifyGate = Completer<void>();
+      fakePlayer.emitSourceFailure();
+      await pumpEventQueue();
+      fakePlayer.emitObservation(playing: true); // it plays after all
+      await pumpEventQueue();
+      gate.complete();
+      await pumpEventQueue();
+
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'),
+          isFalse);
+      expect(fakePlayer.refreshedSources, isEmpty);
+      expect(await damagedPathOf('a'), isNull);
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+    });
+
+    test('a natural advance onto the failed (preloaded) download while it is '
+        'checked is not a move: it is still suspected and streamed', () async {
+      await fixture.insertSingles(['a', 'b']);
+      await markDownloaded('b', '/dl/b');
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      await pumpEventQueue();
+      final b = (await sessionTracksOf(c))[1].itemId;
+      final gate = classifyGate = Completer<void>();
+      fakePlayer.emitSourceFailure(itemId: b); // the preloaded file fails
+      await pumpEventQueue();
+      // a ends and the engine moves on to b by itself.
+      await fakePlayer.seekToItem(b,
+          cause: PlaybackTransitionCause.naturalAdvance);
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      gate.complete();
+      await pumpEventQueue();
+
+      expect(c.read(localSourcePolicyProvider).isSuspect('b', '/dl/b'),
+          isTrue, reason: 'handled exactly as before: a real failure');
+      expect(fakePlayer.refreshedSources.single.newHasFile, isFalse);
+    });
+
+    test('review r1 #1: a resume while a streamed track\'s server check '
+        'waits is not a move: a track gone from the server is still skipped',
+        () async {
+      await fixture.insertSingles(['a', 'b']);
+      trackStatuses['a'] = 404; // deleted on the server
+      final c = createContainer();
+      await playFromTrackList(c, const ['a', 'b'], await fixture.track('a'),
+          sourceType: 'test');
+      await pumpEventQueue();
+      final gate = probeGate = Completer<void>();
+      fakePlayer.emitSourceFailure(); // a's stream fails
+      await pumpEventQueue();
+      await c.read(queuePlayerProvider.notifier).resume(); // lock-screen Play
+      await pumpEventQueue();
+      gate.complete(); // the check answers: gone
+      await pumpEventQueue();
+
+      expect(c.read(currentTrackProvider)?.uuidId, 'b',
+          reason: 'handled as before: a gone track is skipped');
+    });
+
+    test('nothing moved meanwhile: the held check is handled as before '
+        '(suspected, streamed, marked once the stream plays)', () async {
+      final c = await playingDownloadedA();
+      final gate = classifyGate = Completer<void>();
+      fakePlayer.emitSourceFailure();
+      await pumpEventQueue();
+      gate.complete();
+      await pumpEventQueue();
+
+      expect(c.read(localSourcePolicyProvider).isSuspect('a', '/dl/a'),
+          isTrue);
+      expect(fakePlayer.refreshedSources.single.newHasFile, isFalse);
+      fakePlayer.emitObservation(playing: true); // the stream plays
+      await pumpEventQueue();
+      expect(await damagedPathOf('a'), '/dl/a');
+    });
+  });
+}
+
+class _LoggingPreviewEngine extends FakePreviewEngine {
+  _LoggingPreviewEngine(this.output);
+  final List<String> output;
+
+  @override
+  Future<void> play() async {
+    await super.play();
+    output.add('preview on');
+  }
+
+  @override
+  Future<void> pause() async {
+    await super.pause();
+    output.add('preview off');
+  }
+
+  @override
+  Future<void> stop() async {
+    await super.stop();
+    if (output.isNotEmpty && output.last != 'preview off') {
+      output.add('preview off');
+    }
+  }
+}
+
+class _SpyRequests extends PlaybackRequests {
+  _SpyRequests(super.ref);
+  int submits = 0;
+
+  @override
+  Future<PlaybackOutcome> submit(PlaybackRequest request) {
+    submits++;
+    return super.submit(request);
+  }
+}
+
+class _SpyClicks extends ClickRecorder {
+  _SpyClicks({required super.history, required super.binding,
+      required super.clock});
+  int records = 0;
+
+  @override
+  Future<void> record(HistoryIntent intent) {
+    records++;
+    return super.record(intent);
+  }
+}
+
+/// Fails if the library and preview outputs were ever on at once.
+void _expectNoOverlap(List<String> output) {
+  var library = false;
+  var preview = false;
+  for (final event in output) {
+    switch (event) {
+      case 'library on':
+        library = true;
+      case 'library off':
+        library = false;
+      case 'preview on':
+        preview = true;
+      case 'preview off':
+        preview = false;
+    }
+    expect(library && preview, isFalse, reason: 'overlap in $output');
+  }
+}
+
+/// A preview owner whose output the test switches on; relinquishing turns
+/// it off and acknowledges at once.
+class _OutputPreview implements AudioFocusOwner, FocusRelinquisher {
+  _OutputPreview(this.output);
+  final List<String> output;
+
+  @override
+  Future<void> relinquishFocus() async => output.add('preview off');
+
+  @override
+  void onInterruptionBegan() {}
+
+  @override
+  void onInterruptionEnded({required bool shouldResume}) {}
+
+  @override
+  void onBecameNoisy() {}
+}
+
+/// A just_audio plugin whose load completes when the test says so, and
+/// which records when the library output starts and stops.
+class _GatedPlugin extends Mock implements ja.AudioPlayer {
+  _GatedPlugin(this.output) {
+    registerFallbackValue(_FakeAudioSource());
+    registerFallbackValue(Duration.zero);
+    registerFallbackValue(ja.LoopMode.off);
+    when(() => setAudioSources(any(),
+            initialIndex: any(named: 'initialIndex'),
+            initialPosition: any(named: 'initialPosition')))
+        .thenAnswer((_) {
+      loadCalls++;
+      return _load.future;
+    });
+    when(() => this.play()).thenAnswer((_) {
+      output.add('library on');
+      return Completer<void>().future;
+    });
+    when(() => pause()).thenAnswer((_) async => output.add('library off'));
+    when(() => stop()).thenAnswer((_) async => output.add('library off'));
+    when(() => setLoopMode(any())).thenAnswer((_) async {});
+    when(() => setVolume(any())).thenAnswer((_) async {});
+    when(() => setShuffleModeEnabled(any())).thenAnswer((_) async {});
+    when(() => dispose()).thenAnswer((_) async {});
+    when(() => playing).thenReturn(false);
+    when(() => processingState).thenReturn(ja.ProcessingState.loading);
+    when(() => duration).thenReturn(null);
+    when(() => position).thenReturn(Duration.zero);
+    when(() => speed).thenReturn(1.0);
+    when(() => currentIndex).thenReturn(0);
+    when(() => currentIndexStream).thenAnswer((_) => const Stream.empty());
+    when(() => playerStateStream).thenAnswer((_) => const Stream.empty());
+    when(() => positionStream).thenAnswer((_) => const Stream.empty());
+    when(() => durationStream).thenAnswer((_) => const Stream.empty());
+    when(() => positionDiscontinuityStream)
+        .thenAnswer((_) => const Stream.empty());
+    when(() => errorStream).thenAnswer((_) => const Stream.empty());
+  }
+  final List<String> output;
+  final _load = Completer<Duration?>();
+  int loadCalls = 0;
+
+  void finishLoad() => _load.complete(null);
 }
 
 Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
@@ -4282,8 +7754,57 @@ class _ObservedStartupRepository extends QueueRepository {
   Object? activeSnapshotError;
   int? failActivationOf;
 
+  /// When set, the next explicit-list session creation fails with it (a
+  /// repository write that fails).
+  Object? createSessionError;
+
+  @override
+  Future<int> createSessionFromExplicitList({
+    required String sourceType,
+    int? sourceArtistId,
+    int? sourceAlbumId,
+    required List<String> trackUuids,
+    int currentIndex = 0,
+    String repeatMode = 'off',
+    bool shuffleEnabled = false,
+    bool activate = true,
+    List<int>? playOrder,
+  }) {
+    final error = createSessionError;
+    if (error != null) {
+      createSessionError = null;
+      return Future.error(error);
+    }
+    return super.createSessionFromExplicitList(
+      sourceType: sourceType,
+      sourceArtistId: sourceArtistId,
+      sourceAlbumId: sourceAlbumId,
+      trackUuids: trackUuids,
+      currentIndex: currentIndex,
+      repeatMode: repeatMode,
+      shuffleEnabled: shuffleEnabled,
+      activate: activate,
+      playOrder: playOrder,
+    );
+  }
+
+  /// Runs after every play-order rewrite (e.g. a sync removal landing right
+  /// after the wrap's order write).
+  Future<void> Function(int sessionId)? afterReplacePlayOrder;
+
+  @override
+  Future<void> replacePlayOrder(int sessionId, List<int> itemIds) async {
+    await super.replacePlayOrder(sessionId, itemIds);
+    await afterReplacePlayOrder?.call(sessionId);
+  }
+
+  /// Runs before every activation (the window between a request's prepare
+  /// and its activation, where catalog sync can still change the session).
+  Future<void> Function(int sessionId)? beforeActivation;
+
   @override
   Future<void> activateSession(int sessionId) async {
+    await beforeActivation?.call(sessionId);
     if (sessionId == failActivationOf) {
       failActivationOf = null;
       throw StateError('db gone');
@@ -4306,6 +7827,23 @@ class _ObservedStartupRepository extends QueueRepository {
     }
     return super.getTrackForItem(sessionId, itemId);
   }
+  /// When set, the next session snapshot read waits on it (one shot).
+  Completer<void>? sessionSnapshotGate;
+  final sessionSnapshotEntered = Completer<void>();
+
+  @override
+  Future<QueueSessionSnapshot?> getSessionSnapshot(int sessionId) async {
+    final gate = sessionSnapshotGate;
+    if (gate != null) {
+      sessionSnapshotGate = null;
+      if (!sessionSnapshotEntered.isCompleted) {
+        sessionSnapshotEntered.complete();
+      }
+      await gate.future;
+    }
+    return super.getSessionSnapshot(sessionId);
+  }
+
   Completer<void>? deactivateGate;
   Completer<void>? removeGate;
   final removeEntered = Completer<void>();
@@ -4362,16 +7900,12 @@ class _ObservedStartupRepository extends QueueRepository {
     required int sessionId,
     required int currentItemId,
     required int positionMs,
-    int? resumeMainItemId,
-    bool updateResumeMainItemId = false,
   }) {
     cursorSaves.add(positionMs);
     return super.updatePlaybackCursor(
       sessionId: sessionId,
       currentItemId: currentItemId,
       positionMs: positionMs,
-      resumeMainItemId: resumeMainItemId,
-      updateResumeMainItemId: updateResumeMainItemId,
     );
   }
 
@@ -4407,6 +7941,72 @@ class _GatedCoverArt extends CoverArtCacheManager {
   }
 }
 
+/// Every play-order row of a session: (play position, canonical position,
+/// uuid), straight from the tables.
+Future<List<(int, int, String)>> _orderRows(AppDatabase db, int sessionId) async {
+  final rows = await db.customSelect(
+    'SELECT po.play_position, qsi.position, qsi.uuid_id '
+    'FROM queue_session_play_order AS po '
+    'JOIN queue_session_items AS qsi ON qsi.item_id = po.item_id '
+    'WHERE po.session_id = ? ORDER BY po.play_position',
+    variables: [Variable.withInt(sessionId)],
+  ).get();
+  return [
+    for (final r in rows)
+      (r.read<int>('play_position'), r.read<int>('position'),
+          r.read<String>('uuid_id')),
+  ];
+}
+
+/// A generator whose first `nextInt` answer is scripted (the first pick of a
+/// collection shuffle); every later draw comes from [_rest].
+class _FirstPickRandom implements Random {
+  _FirstPickRandom(this._first, this._rest);
+  final int Function(int max) _first;
+  final Random _rest;
+  int? firstMax;
+
+  @override
+  int nextInt(int max) {
+    if (firstMax == null) {
+      firstMax = max;
+      return _first(max);
+    }
+    return _rest.nextInt(max);
+  }
+
+  @override
+  double nextDouble() => _rest.nextDouble();
+
+  @override
+  bool nextBool() => _rest.nextBool();
+}
+
+/// Counts the draws a shuffle makes from the injected generator.
+class _RecordingRandom implements Random {
+  _RecordingRandom(this._inner);
+  final Random _inner;
+  int draws = 0;
+
+  @override
+  int nextInt(int max) {
+    draws++;
+    return _inner.nextInt(max);
+  }
+
+  @override
+  double nextDouble() {
+    draws++;
+    return _inner.nextDouble();
+  }
+
+  @override
+  bool nextBool() {
+    draws++;
+    return _inner.nextBool();
+  }
+}
+
 class FakePlaybackEngine
     implements PlaybackEngine {
   final _playerStateController = StreamController<EngineTransportState>.broadcast();
@@ -4425,6 +8025,9 @@ class FakePlaybackEngine
   Completer<void>? addEntriesRelease;
 
   final List<SeedCall> seedCalls = [];
+
+  /// Runs at the start of every seed, before the fake commits or plays.
+  Future<void> Function(int? sessionId)? beforeSeed;
   final List<List<QueuePlaybackEntry>> addedBatches = [];
   final List<List<QueuePlaybackEntry>> replacedFutureBatches = [];
   final List<List<QueuePlaybackEntry>> rebuildCalls = [];
@@ -4462,8 +8065,11 @@ class FakePlaybackEngine
     Duration initialPosition = Duration.zero,
     bool autoPlay = false,
     bool shuffleEnabled = false,
+    PlaybackSourceKind? currentSourceKind,
   }) async {
+    await beforeSeed?.call(sessionId);
     playlistRevision++; // like the engine: every seed is a new revision
+    seedRevision = playlistRevision;
     _loadedEntries = _sorted(entries);
     _currentLocalIndex = _loadedEntries.indexWhere(
       (entry) => entry.itemId == currentItemId,
@@ -4479,8 +8085,12 @@ class FakePlaybackEngine
         initialPosition: initialPosition,
         autoPlay: autoPlay,
         shuffleEnabled: shuffleEnabled,
+        currentSourceKind: currentSourceKind,
       ),
     );
+    _appliedKinds
+      ..clear()
+      ..addAll({if (currentSourceKind != null) currentItemId: currentSourceKind});
     // Like production's structural mutation: commit identity silently.
     if (autoPlay) {
       playCalls++;
@@ -4504,6 +8114,7 @@ class FakePlaybackEngine
 
     playlistRevision++;
     addedBatches.add(additions);
+    _beginHeldEdit();
     for (final entry in _sorted(additions)) {
       final insertionIndex = _insertionIndexFor(entry.playPosition);
       if (_currentLocalIndex != null && insertionIndex <= _currentLocalIndex!) {
@@ -4598,6 +8209,7 @@ class FakePlaybackEngine
 
     playlistRevision++;
     replacedFutureBatches.add(List<QueuePlaybackEntry>.from(entries));
+    _beginHeldEdit();
     _loadedEntries = List<QueuePlaybackEntry>.from(
       _loadedEntries.take(currentIndex + 1),
     );
@@ -4626,6 +8238,50 @@ class FakePlaybackEngine
     _loadedEntries = sorted;
     _currentLocalIndex = nextIndex;
     _committedCurrentItemId = currentItemId;
+    duringRebuild?.call();
+  }
+
+  /// Runs inside every rebuild (a plugin reporting states while its native
+  /// playlist is edited, e.g. completed → buffering → completed again).
+  void Function()? duringRebuild;
+
+  /// Review 6-R3-01, like the real engine: an insert (`addEntries`,
+  /// `replaceFutureEntries`) updates the issued playlist ([loadedItemIds])
+  /// at once but applies natively later. With [holdNextEdit] set, the next
+  /// such insert stays pending until [settleEdit]. A completion reported
+  /// through [completeNatively] while it is pending is masked as buffering;
+  /// at the settle the engine re-reports completed with the ended item still
+  /// current (darwin stays completed after an insert).
+  bool holdNextEdit = false;
+  bool _editPending = false;
+  bool _completedWhilePending = false;
+  bool get editPending => _editPending;
+
+  void _beginHeldEdit() {
+    if (!holdNextEdit) return;
+    holdNextEdit = false;
+    _editPending = true;
+  }
+
+  /// The plugin reaches the end of its native playlist.
+  void completeNatively() {
+    if (_editPending) {
+      _completedWhilePending = true;
+      emitPlayerState(
+          EngineTransportState(true, EngineProcessingState.buffering));
+    } else {
+      emitPlayerState(
+          EngineTransportState(false, EngineProcessingState.completed));
+    }
+  }
+
+  /// The pending insert has applied natively.
+  void settleEdit() {
+    _editPending = false;
+    if (!_completedWhilePending) return;
+    _completedWhilePending = false;
+    emitPlayerState(
+        EngineTransportState(false, EngineProcessingState.completed));
   }
 
   @override
@@ -4681,6 +8337,10 @@ class FakePlaybackEngine
   @override
   int playlistRevision = 0;
 
+  /// 7P.1: the playlist revision of the latest seed (what a typed command
+  /// failure of the current playlist carries).
+  int seedRevision = 0;
+
   final _loadEventsController = StreamController<EngineLoadEvent>.broadcast();
 
   @override
@@ -4711,14 +8371,36 @@ class FakePlaybackEngine
               sessionId: null,
               itemId: entry.itemId,
               trackUuid: entry.uuidId,
-              // Like the engine: what the loaded source plays.
-              localPath: (entry.filePath?.isEmpty ?? true) ? null : entry.filePath),
+              // Like the engine: what the loaded source plays (7P.2: the
+              // kind the core applied wins over the recorded download).
+              localPath: (entry.filePath?.isEmpty ?? true) ||
+                      _appliedKinds[entry.itemId] == PlaybackSourceKind.remote
+                  ? null
+                  : entry.filePath),
       uncertain: uncertain,
       errorCode: code,
     ));
   }
 
   static const _failureSourceIds = 1000;
+
+  final _commandFailuresController =
+      StreamController<EngineCommandFailure>.broadcast();
+
+  @override
+  Stream<EngineCommandFailure> get commandFailures =>
+      _commandFailuresController.stream;
+
+  /// 7P.1 (m5): native application of issued work; a test holds or fails
+  /// it with [appliedGate].
+  Completer<bool>? appliedGate;
+
+  @override
+  Future<bool> whenApplied() => appliedGate?.future ?? Future.value(true);
+
+  /// 7P.1: a typed native command failure as the real engine reports it.
+  void emitCommandFailure(EngineCommandFailure failure) =>
+      _commandFailuresController.add(failure);
 
   @override
   final int runtimeId = 1;
@@ -4737,6 +8419,20 @@ class FakePlaybackEngine
   @override
   bool hasItem(int itemId) =>
       _loadedEntries.any((entry) => entry.itemId == itemId);
+
+  /// 7P.2: kinds a seed applied over the recorded download (by item).
+  final Map<int, PlaybackSourceKind> _appliedKinds = {};
+
+  @override
+  PlaybackSourceKind? sourceKindOf(int itemId) {
+    final entry =
+        _loadedEntries.where((e) => e.itemId == itemId).firstOrNull;
+    if (entry == null) return null;
+    return _appliedKinds[itemId] ??
+        (sourceAvailability(entry)
+            ? PlaybackSourceKind.local
+            : PlaybackSourceKind.remote);
+  }
 
   @override
   Future<void> play() async {
@@ -4860,6 +8556,7 @@ class FakePlaybackEngine
     _positionController.close();
     _observationsController.close();
     _sourceFailuresController.close();
+    _commandFailuresController.close();
     _loadEventsController.close();
     _currentItemIdController.close();
     _unavailableAdvanceController.close();
@@ -4904,6 +8601,9 @@ class SeedCall {
   final bool autoPlay;
   final bool shuffleEnabled;
 
+  /// 7P.2: the kind the core asked the engine to apply to the current item.
+  final PlaybackSourceKind? currentSourceKind;
+
   const SeedCall({
     required this.entries,
     required this.currentItemId,
@@ -4912,6 +8612,7 @@ class SeedCall {
     required this.initialPosition,
     required this.autoPlay,
     required this.shuffleEnabled,
+    this.currentSourceKind,
   });
 }
 
@@ -4934,13 +8635,19 @@ class RecordingAudioServiceBridge extends AudioServiceBridge {
 
 class _MutableOffline extends OfflineModeNotifier {
   @override
-  bool build() => false;
+  bool build() {
+    super.build();
+    return false;
+  }
   void set(bool value) => state = value;
 }
 
 class _OfflineOn extends OfflineModeNotifier {
   @override
-  bool build() => true;
+  bool build() {
+    super.build();
+    return true;
+  }
 }
 
 class _LibraryFixture {
@@ -5095,7 +8802,8 @@ class _StalledPlugin extends Mock implements ja.AudioPlayer {
 class _FakeAudioSource extends Fake implements ja.AudioSource {}
 
 class _RecordingWarm extends QueueWarmService {
-  _RecordingWarm(QueueRepository repo) : super(queueRepo: repo);
+  _RecordingWarm(QueueRepository repo)
+      : super(queueRepo: repo, apiClient: noServerApi());
   final calls = <(int?, int)>[];
   final qualities = <String>[];
 
@@ -5146,4 +8854,111 @@ class _ScriptedSync extends TrackSyncNotifier {
   @override
   Future<TrackSyncState> build() async => const TrackSyncState();
   void push(TrackSyncState next) => state = AsyncData(next);
+}
+
+/// 7P.1: a scripted just_audio player: loads complete at once and are
+/// recorded; the test sets the processing state, fails inserts and reports
+/// indices, deterministically.
+class _ScriptedPlugin extends Mock implements ja.AudioPlayer {
+  _ScriptedPlugin() {
+    registerFallbackValue(_FakeAudioSource());
+    registerFallbackValue(Duration.zero);
+    registerFallbackValue(ja.LoopMode.off);
+    when(() => setAudioSources(any(),
+            initialIndex: any(named: 'initialIndex'),
+            initialPosition: any(named: 'initialPosition')))
+        .thenAnswer((invocation) async {
+      final sources = invocation.positionalArguments[0] as List;
+      final index = invocation.namedArguments[#initialIndex] as int? ?? 0;
+      loads.add((
+        count: sources.length,
+        uris: [for (final s in sources) (s as ja.UriAudioSource).uri],
+        initialIndex: index,
+        initialPosition:
+            invocation.namedArguments[#initialPosition] as Duration? ??
+                Duration.zero,
+      ));
+      _index = index;
+      return const Duration(minutes: 3);
+    });
+    when(() => seek(any(), index: any(named: 'index')))
+        .thenAnswer((invocation) async {
+      final index = invocation.namedArguments[#index] as int?;
+      if (index != null) _index = index;
+    });
+    when(() => insertAudioSource(any(), any())).thenAnswer((_) async {
+      if (failInserts) throw ja.PlayerException(1, 'insert refused', 0);
+    });
+    when(() => removeAudioSourceAt(any())).thenAnswer((_) async {});
+    when(() => this.play()).thenAnswer((_) => Completer<void>().future);
+    when(() => pause()).thenAnswer((_) async {});
+    when(() => stop()).thenAnswer((_) async {});
+    when(() => setLoopMode(any())).thenAnswer((_) async {});
+    when(() => setVolume(any())).thenAnswer((_) async {});
+    when(() => dispose()).thenAnswer((_) async {});
+    when(() => playing).thenAnswer((_) => _playing);
+    when(() => processingState).thenAnswer((_) => processing);
+    when(() => duration).thenReturn(const Duration(minutes: 3));
+    when(() => position).thenReturn(Duration.zero);
+    when(() => speed).thenReturn(1.0);
+    when(() => currentIndex).thenAnswer((_) => _index);
+    when(() => currentIndexStream).thenAnswer((_) => _indices.stream);
+    when(() => playerStateStream).thenAnswer((_) => _states.stream);
+    when(() => positionStream).thenAnswer((_) => const Stream.empty());
+    when(() => durationStream).thenAnswer((_) => const Stream.empty());
+    when(() => positionDiscontinuityStream)
+        .thenAnswer((_) => const Stream.empty());
+    when(() => errorStream).thenAnswer((_) => const Stream.empty());
+  }
+
+  final loads = <({
+    int count,
+    List<Uri> uris,
+    int initialIndex,
+    Duration initialPosition
+  })>[];
+  final _indices = StreamController<int?>.broadcast();
+  final _states = StreamController<ja.PlayerState>.broadcast();
+  int _index = 0;
+  bool _playing = false;
+  bool failInserts = false;
+  ja.ProcessingState processing = ja.ProcessingState.ready;
+
+  void state(ja.ProcessingState next, {required bool playing}) {
+    processing = next;
+    _playing = playing;
+    _states.add(ja.PlayerState(playing, next));
+  }
+
+  void reportIndex(int index) {
+    _index = index;
+    _indices.add(index);
+  }
+}
+
+/// A fake engine that also takes the gate's media-token work (OPEN-M-11
+/// step D).
+class _TokenAwareEngine extends FakePlaybackEngine implements MediaTokenSources {
+  final tokenCalls = <String>[];
+  @override
+  Future<void> refreshWithheldMediaTokens() async => tokenCalls.add('refresh');
+  @override
+  Future<void> releaseRemoteSources({required bool includeCurrent}) async =>
+      tokenCalls.add(includeCurrent ? 'release everything' : 'release ahead');
+}
+
+/// A gate whose states the test publishes.
+class _StatesGate extends Fake implements ServerBindingGate {
+  final _states = StreamController<BindingGateState>.broadcast();
+  BindingGateState _state = const BindingIdle();
+  void publish(BindingGateState s) {
+    _state = s;
+    _states.add(s);
+  }
+
+  Future<void> close() => _states.close();
+  @override
+  BindingGateState get state => _state;
+  @override
+  Stream<BindingGateState> get states => _states.stream;
 }

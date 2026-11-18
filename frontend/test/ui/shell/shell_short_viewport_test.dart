@@ -3,9 +3,7 @@ import 'dart:async';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/stale_downloads_provider.dart';
@@ -26,10 +24,8 @@ void main() {
   late AppDatabase db;
   late BrowseHarness h;
 
-  setUpAll(() => ApiClient.init('http://localhost:8000'));
 
   setUp(() async {
-    initCoverArtCache(CoverArtCacheManager.noop());
     db = AppDatabase(NativeDatabase.memory());
     await seedLibrary(db, const [
       SeedTrack(

@@ -17,6 +17,7 @@ import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/mixins/root_browse_mixin.dart';
+import 'package:frontend/ui/widgets/collection_action_header.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
 
@@ -108,6 +109,11 @@ class _TracksPageState extends ConsumerState<TracksPage>
 
     final body = Column(
       children: [
+        if (_album != null)
+          CollectionActionHeader(
+            scope: _album!,
+            empty: !hasMore && paginatedItems.isEmpty,
+          ),
         if (hasBrowseControls) buildBrowseHeader(hintText: 'Search tracks'),
         Expanded(
           child: isSearchMode

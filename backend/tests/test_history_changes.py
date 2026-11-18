@@ -9,29 +9,16 @@ because track mutations share the counter; the cursor never comes from the
 global MAX.
 """
 
-import importlib
 from contextlib import contextmanager
 import json
-import sys
 import uuid
 
 import pytest
-from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-    sys.modules.pop("app.main", None)
-    sys.modules.pop("app.config", None)
-    import app.main
-
-    importlib.reload(app.main)
-    with TestClient(app.main.app) as c:
-        yield c
+def client(app_client):
+    return app_client
 
 
 def _event(**overrides):
@@ -169,7 +156,9 @@ def test_page_and_latest_share_snapshot_during_a_concurrent_commit(client, monke
                 inserted = True
                 # The writer uses another real WAL connection. It commits
                 # between the reader's page fetch and latest-revision read.
-                db.insert_history_events([HistoryEvent.model_validate(late)])
+                client.app.state.admin_library.insert_history_events(
+                    [HistoryEvent.model_validate(late)]
+                )
             return self.conn.execute(sql, parameters)
 
     @contextmanager

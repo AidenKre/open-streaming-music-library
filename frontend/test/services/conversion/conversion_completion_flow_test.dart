@@ -10,6 +10,7 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/conversion_job.dart';
 import 'package:frontend/models/dto/client_track_dto.dart';
@@ -20,6 +21,7 @@ import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/widgets/stale_downloads_banner.dart';
 import '../../helpers/server_binding.dart';
+import '../../helpers/test_credentials.dart';
 
 /// End-to-end across the conversion -> sync -> stale-download seam: the REAL
 /// jobs notifier polls a fake `/jobs`, a Done transition fires the REAL
@@ -123,7 +125,10 @@ class _FakeServer {
 
 class _Online extends OfflineModeNotifier {
   @override
-  bool build() => false;
+  bool build() {
+    super.build();
+    return false;
+  }
 }
 
 class _FixedSettings extends SettingsNotifier {
@@ -173,19 +178,21 @@ void main() {
 
   late AppDatabase db;
   late _FakeServer server;
+  late ApiClient api;
 
   setUp(() async {
+    final originalPoll = ConversionJobsNotifier.pollInterval;
+    addTearDown(() => ConversionJobsNotifier.pollInterval = originalPoll);
     ConversionJobsNotifier.pollInterval = interval;
     SharedPreferences.setMockInitialValues({});
     db = AppDatabase(NativeDatabase.memory());
     await seedTestBinding(db);
     server = _FakeServer();
-    ApiClient.initForTest('http://test:8080', server.client);
+    api = testApiClient('http://test:8080', server.client);
     await _insertDownloadedTrack(db);
   });
 
   tearDown(() async {
-    ConversionJobsNotifier.pollInterval = const Duration(seconds: 3);
     await db.close();
   });
 
@@ -197,6 +204,8 @@ void main() {
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
+          apiClientProvider.overrideWithValue(api),
+          ...signedInOverrides,
           databaseProvider.overrideWithValue(db),
           autoVerifiedGateOverride(),
           offlineModeProvider.overrideWith(_Online.new),

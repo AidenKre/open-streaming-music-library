@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/painting.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -9,6 +11,9 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 
 void main() {
+  // The reset evicts decoded covers from the painting binding's image cache.
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   late Directory tempDirectory;
 
   setUp(() async {
@@ -22,13 +27,16 @@ void main() {
     }
   });
 
+  late ApiClient api;
+
   void installClient(http.Client client) {
-    ApiClient.initForTest('http://test:8080', client);
+    api = testApiClient('http://test:8080', client);
   }
 
   Future<LocalCoverArtStore> buildStore({http.Client? client}) {
     installClient(client ?? MockClient((_) async => http.Response('', 404)));
     return LocalCoverArtStore.create(
+      apiClient: api,
       directoryProvider: () async => tempDirectory,
     );
   }
@@ -85,8 +93,8 @@ void main() {
     );
 
     await store.download(99);
-    final partial = File(p.join(store.directory.path, '99.bin.partial'));
-    expect(partial.existsSync(), isFalse);
+    expect(store.directory.listSync(), isEmpty,
+        reason: 'no temporary file is left behind');
     expect(store.has(99), isFalse);
   });
 
@@ -106,8 +114,8 @@ void main() {
     expect(ok, isFalse);
     expect(calls, 1);
     expect(store.has(42), isFalse);
-    final partial = File(p.join(store.directory.path, '42.bin.partial'));
-    expect(partial.existsSync(), isFalse);
+    expect(store.directory.listSync(), isEmpty,
+        reason: 'no temporary file is left behind');
   });
 
   test('download returns false and cleans up when persistence fails', () async {
@@ -122,9 +130,61 @@ void main() {
 
     final ok = await store.download(77);
     expect(ok, isFalse);
-    final partial = File(p.join(store.directory.path, '77.bin.partial'));
-    expect(partial.existsSync(), isFalse,
-        reason: '.partial must be cleaned up on filesystem failure');
+    expect(
+        store.directory.listSync().map((e) => p.basename(e.path)), ['77.bin'],
+        reason: 'the temporary file must be cleaned up on filesystem failure');
+  });
+
+  // SP-PE-FE-12 / U25-B-03: two downloads of one cover (two tiles, or a
+  // track download and a tile) used to share one fixed temp file: one
+  // rename moved the other's bytes away, and its own rename then failed.
+  test('two concurrent downloads of one cover both succeed', () async {
+    final release = Completer<void>();
+    var requests = 0;
+    final bothSent = Completer<void>();
+    final store = await buildStore(
+      client: MockClient((_) async {
+        if (++requests == 2) bothSent.complete();
+        await release.future;
+        return http.Response.bytes([5, 6, 7], 200);
+      }),
+    );
+
+    final first = store.download(5);
+    final second = store.download(5);
+    await bothSent.future;
+    release.complete();
+
+    expect(await Future.wait([first, second]), [true, true]);
+    expect(await store.fileFor(5).readAsBytes(), [5, 6, 7]);
+    expect(
+        store.directory.listSync().map((e) => p.basename(e.path)), ['5.bin'],
+        reason: 'no temporary file is left behind');
+  });
+
+  // Review #1 (TR-SWITCH-07 follow-up): the reset no longer waits for ever
+  // on a download worker, and a worker may be fetching a track's cover. A
+  // cover whose response lands after the reset is the previous library's
+  // picture and must not be stored.
+  test('a cover whose response lands after a reset is not stored', () async {
+    final release = Completer<void>();
+    final sent = Completer<void>();
+    final store = await buildStore(
+      client: MockClient((_) async {
+        sent.complete();
+        await release.future;
+        return http.Response.bytes([1, 2], 200);
+      }),
+    );
+
+    final download = store.download(9);
+    await sent.future;
+    await store.resetLocalState();
+    release.complete();
+
+    expect(await download, isFalse);
+    expect(store.directory.listSync(), isEmpty,
+        reason: 'the previous library\'s cover was written after the reset');
   });
 
   test('remove deletes the on-disk file', () async {
@@ -150,5 +210,61 @@ void main() {
 
     expect(store.directory.listSync(), isEmpty);
     expect(store.has(1), isFalse);
+  });
+
+  // TR-SWITCH-02: after a reset (log-out, server switch) the next library's
+  // cover with the same id is a different picture at the same file path. A
+  // decoded image kept in Flutter's image cache under that path would keep
+  // showing the previous library's cover.
+  test('reset evicts decoded cover images from the image cache', () async {
+    final store = await buildStore(
+      client: MockClient((_) async => http.Response.bytes([1, 2], 200)),
+    );
+    await store.download(42);
+    final cache = PaintingBinding.instance.imageCache;
+    addTearDown(() => cache
+      ..clear()
+      ..clearLiveImages());
+    final key = FileImage(store.fileFor(42));
+    final completer =
+        OneFrameImageStreamCompleter(Completer<ImageInfo>().future);
+    final listener = ImageStreamListener((_, _) {});
+    cache.putIfAbsent(key, () => completer);
+    // A cover on screen: its stream has a listener, so it is a live image.
+    completer.addListener(listener);
+    addTearDown(() => completer.removeListener(listener));
+    expect(cache.containsKey(key), isTrue);
+    expect(cache.liveImageCount, 1);
+
+    await store.resetLocalState();
+
+    expect(cache.containsKey(key), isFalse,
+        reason: 'the previous library\'s decoded cover is still cached');
+    expect(cache.liveImageCount, 0,
+        reason: 'a cover on screen keeps its decoded image cached');
+  });
+
+  test('downloads and removals leave the image cache alone', () async {
+    final store = await buildStore(
+      client: MockClient((_) async => http.Response.bytes([1, 2], 200)),
+    );
+    final cache = PaintingBinding.instance.imageCache;
+    addTearDown(() => cache
+      ..clear()
+      ..clearLiveImages());
+    final key = FileImage(store.fileFor(7));
+    final completer =
+        OneFrameImageStreamCompleter(Completer<ImageInfo>().future);
+    cache.putIfAbsent(key, () => completer);
+    final listener = ImageStreamListener((_, _) {});
+    completer.addListener(listener);
+    addTearDown(() => completer.removeListener(listener));
+
+    await store.download(8);
+    await store.remove(8);
+
+    // Ordinary use never blanks a cover on screen.
+    expect(cache.containsKey(key), isTrue);
+    expect(cache.liveImageCount, 1);
   });
 }

@@ -18,6 +18,12 @@ final class PassMoreWork extends PassOutcome {
   const PassMoreWork();
 }
 
+/// The pass hit a wait that only a scope rebuild ends (a 401): the runner
+/// parks for good, with no retry and no backoff change.
+final class PassParked extends PassOutcome {
+  const PassParked();
+}
+
 /// The pass failed: retry after the backoff for [reason] ([retryAfter] is a
 /// floor, e.g. a server Retry-After).
 final class PassFailed extends PassOutcome {
@@ -31,6 +37,8 @@ final class PassFailed extends PassOutcome {
 /// failure backs off. A budgeted pass that reports [PassMoreWork] runs again
 /// after a yield; a [PassFailed] (or a pass that throws) schedules one
 /// retry paced by the [BackoffSchedule]; [PassDone] resets the backoff.
+/// [PassParked] ends the runner's work for its life: later requests are
+/// ignored (a new scope builds a new runner).
 /// Generic: it knows nothing about the subsystem it runs.
 class SingleFlightRunner {
   SingleFlightRunner({
@@ -123,6 +131,12 @@ class SingleFlightRunner {
           case PassDone():
             _backoff.reset();
             if (_reasons.isEmpty) return;
+          case PassParked():
+            _closed = true;
+            _retry?.cancel();
+            _retry = null;
+            _reasons.clear();
+            return;
           case PassMoreWork():
             await Future<void>.delayed(Duration.zero);
           case PassFailed(:final reason, :final retryAfter):

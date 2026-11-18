@@ -5,6 +5,7 @@ helper that maps a Pydantic ``ValidationError`` without ``input`` values."""
 
 import asyncio
 import json
+import logging
 
 import pytest
 from fastapi import Depends, FastAPI
@@ -122,3 +123,54 @@ def test_validation_error_maps_to_422_without_input():
         assert "input" not in item
         assert {"type", "loc", "msg"} <= set(item)
     assert SECRET.decode() not in json.dumps(exc.detail)
+
+
+# ── Phase 7 live gate 7-L-01: a client that goes away while the body is read ──
+
+def _disconnecting_post(app, first_chunks):
+    """Drive the ASGI app; after ``first_chunks`` the client disconnects."""
+    messages = [{"type": "http.request", "body": c, "more_body": True} for c in first_chunks]
+    sent = []
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+        "scheme": "http", "path": "/write", "raw_path": b"/write", "query_string": b"",
+        "root_path": "", "headers": [], "client": ("127.0.0.1", 1), "server": ("testserver", 80),
+    }
+    asyncio.run(app(scope, receive, send))  # an unhandled exception would raise here
+    return sent
+
+
+@pytest.mark.parametrize("first_chunks", [[], [b"x" * 4]], ids=["before-any-byte", "mid-body"])
+def test_a_client_disconnect_while_the_body_is_read_ends_the_request_quietly(first_chunks, caplog):
+    writes = []
+    app = FastAPI()
+
+    @app.post("/write")
+    async def write(raw: bytes = Depends(bounded_body(CAP))):
+        writes.append(raw)  # the route's effect: never reached
+        return {"ok": True}
+
+    with caplog.at_level(logging.DEBUG):
+        sent = _disconnecting_post(app, first_chunks)
+
+    assert writes == []
+    # 499 "client closed request": never seen by anyone (the server drops sends
+    # after a disconnect); it only ends the request without an error.
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert [m["status"] for m in starts] == [499]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [r for r in caplog.records if r.exc_info]
+    # Live gate 7-L-02: one INFO line an operator sees at the default level.
+    operator = [r for r in caplog.records if r.name == "uvicorn.error"]
+    assert [r.levelno for r in operator] == [logging.INFO]
+    assert "client went away" in operator[0].getMessage()
+    assert "/" not in operator[0].getMessage()

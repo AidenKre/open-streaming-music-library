@@ -1,11 +1,13 @@
 import 'package:drift/drift.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/instance_stamp.dart';
 import 'package:uuid/uuid.dart';
 
 /// The local binding to one server (SC-01): the `server_binding` row.
 ///
 /// [instanceId] is null for a provisional binding (not yet verified against
-/// `/app/info`) or a legacy server that reports none.
+/// `/app/info`) or a legacy server that reports none. [userId] is the bound
+/// user; null means unknown user, so the next login resets (SC-01 Phase M).
 class ServerBindingRecord {
   const ServerBindingRecord({
     required this.instanceId,
@@ -13,6 +15,7 @@ class ServerBindingRecord {
     required this.lastBaseUrl,
     required this.boundAtMs,
     required this.catalogReconciled,
+    required this.userId,
   });
 
   final String? instanceId;
@@ -20,6 +23,7 @@ class ServerBindingRecord {
   final String lastBaseUrl;
   final int boundAtMs;
   final bool catalogReconciled;
+  final int? userId;
 }
 
 /// A fenced write's captured `local_binding_id` no longer matches the
@@ -31,6 +35,24 @@ class BindingFencedException implements Exception {
 
   @override
   String toString() => 'BindingFencedException($token)';
+}
+
+/// SC-01 rule 6: a server response was stamped by another instance than the
+/// bound one. The page it carried was not committed, or the write response
+/// was treated as not delivered. Its text names neither id (they are not for
+/// user-visible logs).
+class ServerInstanceChangedException implements Exception {
+  ServerInstanceChangedException({
+    required this.boundInstanceId,
+    required this.servedBy,
+  });
+  final String boundInstanceId;
+  final String servedBy;
+
+  @override
+  String toString() =>
+      'ServerInstanceChangedException: a different server answered; '
+      'the response was not applied';
 }
 
 /// Owns the single `server_binding` row and the durable write fence.
@@ -58,9 +80,12 @@ class ServerBindingRepository {
       _toRecord(await _select().getSingleOrNull());
 
   /// Returns the binding row, creating a provisional one (NULL instance id,
-  /// fresh token) for [baseUrl] if none exists. An existing row is returned
-  /// unchanged.
-  Future<ServerBindingRecord> ensureProvisional(String baseUrl) {
+  /// fresh token) for [baseUrl] if none exists. A login passes both
+  /// [userId] and [instanceId] (M.3c); launch and connect callers pass none
+  /// for now, leaving them NULL (unknown). An existing row is returned
+  /// unchanged: its user and instance are never overwritten.
+  Future<ServerBindingRecord> ensureProvisional(String baseUrl,
+      {int? userId, String? instanceId}) {
     return _db.transaction(() async {
       final existing = await _select().getSingleOrNull();
       if (existing != null) return _toRecord(existing)!;
@@ -71,6 +96,8 @@ class ServerBindingRepository {
               localBindingId: _newBindingId(),
               lastBaseUrl: baseUrl,
               boundAt: _nowMs(),
+              userId: Value(userId),
+              instanceId: Value(instanceId),
             ),
           );
       return _toRecord(await _select().getSingle())!;
@@ -123,10 +150,26 @@ class ServerBindingRepository {
   /// Clears `catalog_reconciled_at_binding` (fenced): a server restored from
   /// a backup may reissue parent ids, so the local parents no longer match
   /// the server's until a reset.
-  Future<void> clearCatalogReconciled(String token) => runFenced(token, () async {
+  Future<void> clearCatalogReconciled(String token, {String? servedBy}) =>
+      runFenced(token, servedBy: servedBy, () async {
         await _db.update(_db.serverBinding).write(
             const ServerBindingCompanion(catalogReconciledAtBinding: Value(false)));
       });
+
+  /// Logout's fence (spec 7.6): mints a new `local_binding_id` and keeps
+  /// every other column, so a late durable write from the old scope is a
+  /// no-op while the local stores stay. Null (and nothing created) without
+  /// a row.
+  Future<ServerBindingRecord?> rotate() {
+    return _db.transaction(() async {
+      final existing = await _select().getSingleOrNull();
+      if (existing == null) return null;
+      await _db.update(_db.serverBinding).write(
+            ServerBindingCompanion(localBindingId: Value(_newBindingId())),
+          );
+      return _toRecord(await _select().getSingle());
+    });
+  }
 
   /// Deletes the binding row: the first step of a reset. Every token
   /// captured before this point is fenced from then on.
@@ -135,12 +178,46 @@ class ServerBindingRepository {
   /// Runs [body] in one Drift transaction that first asserts the binding row
   /// still carries [token]; otherwise throws [BindingFencedException] without
   /// running [body]. A throw from [body] rolls it back.
-  Future<T> runFenced<T>(String token, Future<T> Function() body) {
+  ///
+  /// With [servedBy] (the response's instance stamp, SC-01 rule 6) the same
+  /// transaction then compares it with the bound instance id and throws
+  /// [ServerInstanceChangedException] without running [body] on a mismatch.
+  /// No check when [servedBy] is null (no stamp) or the row is unbound (null
+  /// instance id); a stamp never fills or rebinds the row.
+  Future<T> runFenced<T>(
+    String token,
+    Future<T> Function() body, {
+    String? servedBy,
+  }) {
     return _db.transaction(() async {
       final row = await _select().getSingleOrNull();
-      if (row?.localBindingId != token) throw BindingFencedException(token);
+      if (row == null || row.localBindingId != token) {
+        throw BindingFencedException(token);
+      }
+      final bound = row.instanceId;
+      _assertServedBy(bound, servedBy);
       return body();
     });
+  }
+
+  /// The instance-stamp check for `ApiClient.withInstanceCheck`: throws
+  /// [ServerInstanceChangedException] when [servedBy] names another server
+  /// than the bound one. No row or an unbound row: no check.
+  Future<void> checkServedBy(String servedBy) async {
+    final row = await _select().getSingleOrNull();
+    _assertServedBy(row?.instanceId, servedBy);
+  }
+
+  /// The one comparison rule: no bound id or no stamp means no check.
+  static void _assertServedBy(String? bound, String? servedBy) {
+    if (servedBy != null &&
+        bound != null &&
+        !sameServerInstance(servedBy, bound)) {
+      throw ServerInstanceChangedException(
+        boundInstanceId: bound,
+        servedBy: servedBy,
+      );
+    }
   }
 
   SimpleSelectStatement<$ServerBindingTable, ServerBindingData> _select() =>
@@ -154,6 +231,7 @@ class ServerBindingRepository {
       lastBaseUrl: row.lastBaseUrl,
       boundAtMs: row.boundAt,
       catalogReconciled: row.catalogReconciledAtBinding,
+      userId: row.userId,
     );
   }
 }

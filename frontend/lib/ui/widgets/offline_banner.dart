@@ -16,12 +16,14 @@ class OfflineBanner extends StatelessWidget {
             children: [
               Icon(Icons.cloud_off, size: 16, color: colors.onError),
               const SizedBox(width: 8),
-              Text(
-                'Disconnected - Offline Mode',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: colors.onError,
-                      fontWeight: FontWeight.w600,
-                    ),
+              Expanded(
+                child: Text(
+                  'Disconnected - Offline Mode',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: colors.onError,
+                        fontWeight: FontWeight.w600,
+                      ),
+                ),
               ),
             ],
           ),

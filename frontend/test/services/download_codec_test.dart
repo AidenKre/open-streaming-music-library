@@ -10,6 +10,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import '../helpers/no_server_api.dart';
 
 void main() {
   late AppDatabase db;
@@ -22,7 +23,8 @@ void main() {
     manager = DownloadManager(
       db: db,
       coverArtStore: await LocalCoverArtStore.create(
-          directoryProvider: () async => tempDir),
+          directoryProvider: () async => tempDir, apiClient: noServerApi()),
+      apiClient: noServerApi(),
       directoryProvider: () async => tempDir,
       isOfflineFn: () => true, // jobs stay queued, observable
       codecSupportFn: () => const CodecSupport({

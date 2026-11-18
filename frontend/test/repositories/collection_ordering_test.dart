@@ -1,3 +1,4 @@
+import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
@@ -254,13 +255,17 @@ void main() {
       );
     });
 
-    test('Phase 4: offline does not change membership (Phase 6 will)',
+    // Changed on purpose in 6A.1a: Phase 4 kept the whole membership
+    // offline; Phase 6 narrows an offline collection to its downloads.
+    test('Phase 6: offline narrows a collection to its downloaded members',
         () async {
       await markDownloaded(db, 'n1');
       expect(await uuids(const AlbumScope(artistId: 1, albumId: 2),
-          offline: true), ['n1', 'n2']);
+          offline: true), ['n1']);
       expect(await uuids(const ArtistScope(artistId: 1), offline: true),
-          ['n1', 'n2', 'a1', 's1']);
+          ['n1']);
+      expect(await uuids(const AlbumScope(artistId: 1, albumId: 2)),
+          ['n1', 'n2'], reason: 'online keeps every member');
     });
 
     test('an unknown album or artist has no members', () async {
@@ -318,5 +323,103 @@ void main() {
       offline: false,
     );
     expect(tracks.map((t) => t.uuidId), ['z-first', 'a-second', 'm-third']);
+  });
+
+  group('6A.1a: offline collection membership = the downloaded subset', () {
+    late BrowseRepository repo;
+
+    Future<List<String>> uuids(LibraryScope scope, {required bool offline}) =>
+        repo
+            .getTracksForScope(scope, offline: offline)
+            .then((t) => t.map((x) => x.uuidId).toList());
+
+    Future<void> markDamaged(String uuid) =>
+        (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid))).write(
+          TracksCompanion(damagedFilePath: Value('/downloads/$uuid.bad')),
+        );
+
+    setUp(() async {
+      await seedLibrary(db, const [
+        // A compilation: track artists, titles and uuids all disagree with
+        // the track numbers.
+        SeedTrack(uuid: 'z-first', title: 'Zulu', artistId: 9,
+            artist: 'Zed', albumId: 5, album: 'Hits', trackNumber: 1),
+        SeedTrack(uuid: 'a-second', title: 'Alpha', artistId: 9,
+            artist: 'Amy', albumId: 5, album: 'Hits', trackNumber: 2,
+            downloaded: true),
+        SeedTrack(uuid: 'm-third', title: 'Beta', artistId: 9, artist: 'Moe',
+            albumId: 5, album: 'Hits', trackNumber: 3, downloaded: true),
+        SeedTrack(uuid: 'b-fourth', title: 'Gamma', artistId: 9,
+            artist: 'Bea', albumId: 5, album: 'Hits', trackNumber: 4,
+            downloaded: true),
+        // Artist 1, grid order: New (2010), Old (2001), Mystery (no year,
+        // unknown last), Singles (last). Inserted out of that order.
+        SeedTrack(uuid: 's1', title: 's1', artistId: 1, artist: 'Ann',
+            albumId: 3, album: 'Ann - Singles', albumIsSingles: true,
+            downloaded: true),
+        SeedTrack(uuid: 'u-a', title: 'u-a', artistId: 1, artist: 'Ann',
+            albumId: 6, album: 'Mystery', trackNumber: 2, downloaded: true),
+        SeedTrack(uuid: 'u-b', title: 'u-b', artistId: 1, artist: 'Ann',
+            albumId: 6, album: 'Mystery', trackNumber: 1, downloaded: true),
+        SeedTrack(uuid: 'a1', title: 'a1', artistId: 1, artist: 'Ann',
+            albumId: 1, album: 'Old', albumYear: 2001),
+        SeedTrack(uuid: 'n2', title: 'n2', artistId: 1, artist: 'Ann',
+            albumId: 2, album: 'New', albumYear: 2010, trackNumber: 2),
+        SeedTrack(uuid: 'n1', title: 'n1', artistId: 1, artist: 'Ann',
+            albumId: 2, album: 'New', albumYear: 2010, trackNumber: 1,
+            downloaded: true),
+      ]);
+      repo = BrowseRepository(db);
+    });
+
+    test('a compilation album: downloaded members in track order', () async {
+      const hits = AlbumScope(artistId: 9, albumId: 5);
+      expect(await uuids(hits, offline: true),
+          ['a-second', 'm-third', 'b-fourth']);
+      expect(await uuids(hits, offline: false),
+          ['z-first', 'a-second', 'm-third', 'b-fourth']);
+    });
+
+    test('an artist with Singles and an unknown year: downloaded members in '
+        'the grid order', () async {
+      const ann = ArtistScope(artistId: 1);
+      expect(await uuids(ann, offline: true), ['n1', 'u-b', 'u-a', 's1']);
+      expect(await uuids(ann, offline: false),
+          ['n1', 'n2', 'a1', 'u-b', 'u-a', 's1']);
+    });
+
+    test('a damaged download is not a usable member offline', () async {
+      await markDamaged('m-third');
+      await markDamaged('u-b');
+      expect(await uuids(const AlbumScope(artistId: 9, albumId: 5),
+          offline: true), ['a-second', 'b-fourth']);
+      expect(await uuids(const ArtistScope(artistId: 1), offline: true),
+          ['n1', 'u-a', 's1']);
+    });
+
+    test('a collection with nothing downloaded is empty offline', () async {
+      expect(await uuids(const AlbumScope(artistId: 1, albumId: 1),
+          offline: true), isEmpty);
+    });
+
+    test('track scopes are not narrowed (they are their own membership)',
+        () async {
+      final remote = (await repo.watchTracks().first)
+          .firstWhere((t) => t.uuidId == 'a1');
+      expect(await uuids(TrackScope(remote), offline: true), ['a1']);
+    });
+
+    // Review R1-3: offline a multi-track list plays when any member is
+    // downloaded (PlaybackAvailability), so its membership is narrowed too.
+    test('an explicit track list keeps its downloaded members, in list order',
+        () async {
+      final byUuid = {
+        for (final t in await repo.watchTracks().first) t.uuidId: t,
+      };
+      final list = TracksScope(
+          [byUuid['s1']!, byUuid['a1']!, byUuid['n1']!, byUuid['z-first']!]);
+      expect(await uuids(list, offline: true), ['s1', 'n1']);
+      expect(await uuids(list, offline: false), ['s1', 'a1', 'n1', 'z-first']);
+    });
   });
 }

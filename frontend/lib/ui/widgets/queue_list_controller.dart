@@ -2,7 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/models/playback_availability.dart';
 import 'package:frontend/playback/codec_support.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
+import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/ui/player_controller.dart';
@@ -76,7 +76,7 @@ final queueListControllerFactoryProvider =
       (ref) => () => QueueListController(
         repository: ref.read(queueRepositoryProvider),
         player: ref.read(playerControlsProvider),
-        isOffline: () => ref.read(offlineModeProvider),
+        isOffline: () => ref.read(streamsUnavailableProvider)(),
         codecs: () => ref.read(codecSupportProvider),
       ),
     );

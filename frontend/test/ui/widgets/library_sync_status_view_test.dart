@@ -1,9 +1,7 @@
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/services/library_sync_status.dart';
 import 'package:frontend/ui/home/home_page.dart';
 import 'package:frontend/ui/search_page.dart';
@@ -20,8 +18,6 @@ void main() {
   late FakeSessionControls session;
 
   setUpAll(() {
-    ApiClient.init('http://localhost:8000');
-    initCoverArtCache(CoverArtCacheManager.noop());
   });
   setUp(() async {
     db = AppDatabase(NativeDatabase.memory());

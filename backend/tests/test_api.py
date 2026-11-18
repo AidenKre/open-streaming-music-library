@@ -1,11 +1,8 @@
-import importlib
 import json
-import sys
 from pathlib import Path
 from typing import List, Optional, Set
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.models import (
     Album,
@@ -24,27 +21,13 @@ from app.database.database import EDITABLE_METADATA_COLUMNS
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("MUSIC_LIBRARY_DIR", str(tmp_path / "music"))
-    monkeypatch.setenv("IMPORT_DIR", str(tmp_path / "import"))
-    monkeypatch.setenv("ENABLE_FILE_WATCHER", "false")
-
-    # Ensure env is applied before import
-    sys.modules.pop("app.main", None)
-    # also pop config modules if they cache paths
-    sys.modules.pop("app.config", None)
-    import app.main
-
-    importlib.reload(app.main)
-
-    with TestClient(app.main.app) as c:
-        yield c
+def client(app_client):
+    return app_client
 
 
 def get_artist_id(client, artist_name: str) -> int:
     """Look up artist ID by name from the database."""
-    artists = client.app.state.database.get_artists()
+    artists = client.app.state.admin_library.get_artists()
     for a in artists:
         if a.name.lower() == artist_name.lower():
             return a.id
@@ -56,7 +39,7 @@ def get_album_id(client, album_name: str, artist_name: Optional[str] = None) -> 
     artist_id = None
     if artist_name:
         artist_id = get_artist_id(client, artist_name)
-    albums = client.app.state.database.get_albums(artist_id=artist_id)
+    albums = client.app.state.admin_library.get_albums(artist_id=artist_id)
     for a in albums:
         if a.name is not None and a.name.lower() == album_name.lower():
             return a.id
@@ -66,7 +49,7 @@ def get_album_id(client, album_name: str, artist_name: Optional[str] = None) -> 
 def get_singles_album_id(client, artist_name: str) -> int:
     """Look up single grouping album ID for an artist."""
     artist_id = get_artist_id(client, artist_name)
-    albums = client.app.state.database.get_albums(artist_id=artist_id)
+    albums = client.app.state.admin_library.get_albums(artist_id=artist_id)
     for a in albums:
         if a.is_single_grouping:
             return a.id
@@ -100,7 +83,7 @@ def add_tracks_to_client(
         tracks.append(track)
 
     for track in tracks:
-        assert client.app.state.database.add_track(track)
+        assert client.app.state.admin_library.add_track(track)
 
     return tracks
 
@@ -293,7 +276,7 @@ class TestGetTracks:
             duration=1.0,
         )
         track_aa = Track(file_path=Path("aa.mp3"), metadata=metadata_aa)
-        assert client.app.state.database.add_track(track_aa)
+        assert client.app.state.admin_library.add_track(track_aa)
 
         # Track with plain artist — should also be found when querying MainArtist
         metadata_plain = TrackMetaData(
@@ -303,7 +286,7 @@ class TestGetTracks:
             duration=1.0,
         )
         track_plain = Track(file_path=Path("plain.mp3"), metadata=metadata_plain)
-        assert client.app.state.database.add_track(track_plain)
+        assert client.app.state.admin_library.add_track(track_plain)
 
         # Track that should NOT match
         metadata_other = TrackMetaData(
@@ -313,7 +296,7 @@ class TestGetTracks:
             duration=1.0,
         )
         track_other = Track(file_path=Path("other.mp3"), metadata=metadata_other)
-        assert client.app.state.database.add_track(track_other)
+        assert client.app.state.admin_library.add_track(track_other)
 
         # MainArtist + TheAlbum returns both album_artist and plain artist tracks
         artist_id = get_artist_id(client, album_artist)
@@ -330,7 +313,7 @@ class TestGetTracks:
 
         # feat_artist is NOT a standalone artist — album_artist takes priority,
         # so only MainArtist and OtherArtist exist in the artists table
-        all_artists = client.app.state.database.get_artists()
+        all_artists = client.app.state.admin_library.get_artists()
         artist_names = {a.name for a in all_artists}
         assert feat_artist not in artist_names
 
@@ -434,7 +417,7 @@ class TestGetChanges:
     def test_changes__interleaves_upserts_and_deletes_by_revision(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=2)
         # Delete the first track so its tombstone gets the newest revision.
-        assert client.app.state.database.delete_track(uuid_id=tracks[0].uuid_id)
+        assert client.app.state.admin_library.delete_track(uuid_id=tracks[0].uuid_id)
 
         entries = _drain_changes(client)
         # Strictly increasing revisions across the whole interleaved stream.
@@ -449,7 +432,7 @@ class TestGetChanges:
         # Regression for the old design where deletes only rode page 1: with
         # limit=1 the delete lands on a later page and must still surface.
         tracks = add_tracks_to_client(client=client, amount_to_add=3)
-        assert client.app.state.database.delete_track(uuid_id=tracks[0].uuid_id)
+        assert client.app.state.admin_library.delete_track(uuid_id=tracks[0].uuid_id)
 
         entries = _drain_changes(client, limit=1)
         delete_entries = [e for e in entries if e["type"] == "delete"]
@@ -484,7 +467,8 @@ class TestGetChanges:
         with db._connection(commit=True) as conn:
             conn.execute(
                 "INSERT INTO tracks (uuid_id, file_path, created_at, "
-                "last_updated, revision) VALUES ('orphan', '/o', 0, 0, 3)"
+                "last_updated, revision, owner_id) VALUES ('orphan', '/o', 0, 0, 3, ?)",
+                (client.app.state.admin_user_id,),
             )
             conn.execute("UPDATE revision_counter SET value = 3 WHERE id = 0")
 
@@ -514,7 +498,8 @@ class TestGetChanges:
         with db._connection(commit=True) as conn:
             conn.execute(
                 "INSERT INTO tracks (uuid_id, file_path, created_at, "
-                "last_updated, revision) VALUES ('final-orphan', '/o', 0, 0, 2)"
+                "last_updated, revision, owner_id) VALUES ('final-orphan', '/o', 0, 0, 2, ?)",
+                (client.app.state.admin_user_id,),
             )
             conn.execute("UPDATE revision_counter SET value = 2 WHERE id = 0")
 
@@ -534,7 +519,9 @@ class TestGetChanges:
         # client would read as "caught up" and stop syncing on.
         db = client.app.state.database
         with db._connection(commit=True) as conn:
-            conn.execute("DROP TABLE revision_counter")
+            # latestRevision is per owner (MAX over the owner's rows), so
+            # break a table the change stream itself reads.
+            conn.execute("DROP TABLE track_tombstones")
 
         r = client.get("/changes")
         assert r.status_code == 500
@@ -599,7 +586,7 @@ class TestGetTracksStream:
         track_path.touch()
         track_path.write_bytes(data)
 
-        track_added = client.app.state.database.add_track(track=track)
+        track_added = client.app.state.admin_library.add_track(track=track)
         assert track_added
 
         # Get tracks uuid_id and test that it was added
@@ -790,7 +777,7 @@ class TestGetAlbums:
         metadata = TrackMetaData(artist="artist", duration=1.0)
         track = Track(metadata=metadata, file_path=Path("fake.mp3"))
 
-        client.app.state.database.add_track(track=track)
+        client.app.state.admin_library.add_track(track=track)
 
         artist_id = get_artist_id(client, "artist")
         r = client.get("/albums", params={"artist_id": artist_id})
@@ -847,7 +834,7 @@ class TestGetAlbums:
                     title=title, artist=artist, album=album, duration=1.0
                 )
                 track = Track(file_path=file_path, metadata=metadata)
-                assert client.app.state.database.add_track(track=track)
+                assert client.app.state.admin_library.add_track(track=track)
                 tracks.append(track)
 
         artist_albums: dict[str, Set[str]] = {}
@@ -915,7 +902,7 @@ class TestGetAlbums:
 
             tracks.append(track)
 
-            track_added = client.app.state.database.add_track(track=track)
+            track_added = client.app.state.admin_library.add_track(track=track)
             assert track_added
 
         artist_id = get_artist_id(client, artist)
@@ -947,7 +934,7 @@ class TestGetAlbums:
             metadata = TrackMetaData(artist=artist, album=album, duration=1.0)
             file_path = Path(f"track_{i}")
             track = Track(metadata=metadata, file_path=file_path)
-            track_added = client.app.state.database.add_track(track=track)
+            track_added = client.app.state.admin_library.add_track(track=track)
             assert track_added
 
         artist_id = get_artist_id(client, artist)
@@ -987,7 +974,7 @@ class TestGetAlbums:
                 title=title, artist=artist, album=album, duration=1.0
             )
             track = Track(file_path=file_path, metadata=metadata)
-            assert client.app.state.database.add_track(track=track)
+            assert client.app.state.admin_library.add_track(track=track)
 
         # Albums with album_artist
         for i in range(2):
@@ -1003,7 +990,7 @@ class TestGetAlbums:
                 duration=1.0,
             )
             track = Track(file_path=file_path, metadata=metadata)
-            assert client.app.state.database.add_track(track=track)
+            assert client.app.state.admin_library.add_track(track=track)
 
         r = client.get("/albums")
         assert r.status_code == 200, r.text
@@ -1025,7 +1012,7 @@ class TestGetAlbums:
                 title=title, artist=f"artist_{i}", album=album, duration=1.0
             )
             track = Track(file_path=file_path, metadata=metadata)
-            assert client.app.state.database.add_track(track=track)
+            assert client.app.state.admin_library.add_track(track=track)
 
         gotten_album_names: List[str] = []
         r = client.get("/albums", params={"limit": 2})
@@ -1056,7 +1043,7 @@ class TestGetAlbums:
                 title=title, artist="same_artist", album=album, duration=1.0
             )
             track = Track(file_path=file_path, metadata=metadata)
-            assert client.app.state.database.add_track(track=track)
+            assert client.app.state.admin_library.add_track(track=track)
 
         r = client.get("/albums")
         assert r.status_code == 200, r.text
@@ -1076,7 +1063,7 @@ class TestGetAlbums:
                 title=title, artist=artist, album=album, year=year, duration=1.0
             )
             track = Track(file_path=file_path, metadata=metadata)
-            assert client.app.state.database.add_track(track=track)
+            assert client.app.state.admin_library.add_track(track=track)
 
         artist_id = get_artist_id(client, artist)
         r = client.get("/albums", params={"artist_id": artist_id})
@@ -1092,7 +1079,7 @@ class TestGetAlbums:
             title="song_1", artist="Artist A", album="Album X", duration=1.0
         )
         track1 = Track(file_path=tmp_path / "s1", metadata=metadata1)
-        assert client.app.state.database.add_track(track=track1)
+        assert client.app.state.admin_library.add_track(track=track1)
 
         # Album artist track
         metadata2 = TrackMetaData(
@@ -1103,7 +1090,7 @@ class TestGetAlbums:
             duration=1.0,
         )
         track2 = Track(file_path=tmp_path / "s2", metadata=metadata2)
-        assert client.app.state.database.add_track(track=track2)
+        assert client.app.state.admin_library.add_track(track=track2)
 
         r = client.get("/albums")
         assert r.status_code == 200, r.text
@@ -1120,13 +1107,13 @@ class TestGetAlbums:
             title="song_1", artist="Artist A", album="Greatest Hits", duration=1.0
         )
         track1 = Track(file_path=tmp_path / "s1", metadata=metadata1)
-        assert client.app.state.database.add_track(track=track1)
+        assert client.app.state.admin_library.add_track(track=track1)
 
         metadata2 = TrackMetaData(
             title="song_2", artist="Artist B", album="Greatest Hits", duration=1.0
         )
         track2 = Track(file_path=tmp_path / "s2", metadata=metadata2)
-        assert client.app.state.database.add_track(track=track2)
+        assert client.app.state.admin_library.add_track(track=track2)
 
         r = client.get("/albums")
         assert r.status_code == 200, r.text
@@ -1146,7 +1133,7 @@ class TestSearch:
             duration=1.0,
         )
         track = Track(file_path=tmp_path / "br.mp3", metadata=metadata)
-        assert client.app.state.database.add_track(track=track)
+        assert client.app.state.admin_library.add_track(track=track)
 
         r = client.get("/search", params={"q": "Bohemian"})
         assert r.status_code == 200, r.text
@@ -1160,7 +1147,7 @@ class TestSearch:
             title="Song", artist="Radiohead", album="OK Computer", duration=1.0,
         )
         track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
-        assert client.app.state.database.add_track(track=track)
+        assert client.app.state.admin_library.add_track(track=track)
 
         r = client.get("/search", params={"q": "Radiohead"})
         assert r.status_code == 200, r.text
@@ -1174,7 +1161,7 @@ class TestSearch:
             title="Song", artist="Artist", album="Dark Side of the Moon", duration=1.0,
         )
         track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
-        assert client.app.state.database.add_track(track=track)
+        assert client.app.state.admin_library.add_track(track=track)
 
         r = client.get("/search", params={"q": "Dark Side"})
         assert r.status_code == 200, r.text
@@ -1188,7 +1175,7 @@ class TestSearch:
             title="Song", artist="Artist", album="Album", duration=1.0,
         )
         track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
-        assert client.app.state.database.add_track(track=track)
+        assert client.app.state.admin_library.add_track(track=track)
 
         r = client.get("/search", params={"q": "Song", "types": "tracks"})
         assert r.status_code == 200, r.text
@@ -1202,7 +1189,7 @@ class TestSearch:
             title="Song", artist="Artist", album="Album", duration=1.0,
         )
         track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
-        assert client.app.state.database.add_track(track=track)
+        assert client.app.state.admin_library.add_track(track=track)
 
         r = client.get("/search", params={"q": "xyznonexistent"})
         assert r.status_code == 200, r.text
@@ -1218,6 +1205,9 @@ class TestSearch:
 
 
 class TestAppInfo:
+    # Review r1 R1-16: the convert action is advertised only when the real
+    # encoder probe (ffmpeg) finds an encoder.
+    @pytest.mark.requires_ffmpeg
     def test_app_info__advertises_track_edit_fields(self, client):
         r = client.get("/app/info")
         assert r.status_code == 200, r.text
@@ -1328,3 +1318,55 @@ class TestPatchTrack:
         body = r.json()
         assert body["master_written"] is False
         assert body["revision"] > track.revision
+
+    @pytest.mark.requires_ffmpeg
+    def test_patch__committed_edit_whose_master_swap_fails__503_then_old_conflict(
+        self, client, monkeypatch
+    ):
+        # U07-B-02: the edit commits, then swapping the new master in fails.
+        # The answer is a retryable 503 (the app's PATCH retries it), and the
+        # retry with the same base revision gets the unchanged revision_conflict
+        # body, which the app resolves as its own applied edit.
+        import os
+
+        from tests.test_track_editor import _make_audio
+
+        library = client.app.state.admin_library
+        audio = library.root / "Art" / "song.m4a"
+        _make_audio(audio, title="Old", artist="Art")
+        track = Track(
+            file_path=audio,
+            metadata=TrackMetaData(codec="aac", duration=1.0, title="Old", artist="Art"),
+        )
+        assert library.add_track(track)
+
+        real_replace = os.replace
+        refused = []
+
+        def replace_fails_once(src, dst, *a, **k):
+            if Path(dst) == audio and not refused:
+                refused.append(dst)
+                raise PermissionError("swap refused")
+            return real_replace(src, dst, *a, **k)
+
+        monkeypatch.setattr(os, "replace", replace_fails_once)
+        body = {
+            "base_revision": track.revision,
+            "write_mode": "db_and_master",
+            "title": "New",
+        }
+
+        r = client.patch(f"/tracks/{track.uuid_id}", json=body)
+        assert refused
+        assert r.status_code == 503, r.text
+
+        current = client.get(f"/tracks/{track.uuid_id}").json()
+        assert current["metadata"]["title"] == "New"
+        assert current["revision"] > track.revision
+
+        retry = client.patch(f"/tracks/{track.uuid_id}", json=body)
+        assert retry.status_code == 409, retry.text
+        assert retry.json()["detail"] == {
+            "error": "revision_conflict",
+            "current_revision": current["revision"],
+        }

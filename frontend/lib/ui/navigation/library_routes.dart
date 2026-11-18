@@ -5,6 +5,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/ui/albums_page.dart';
 import 'package:frontend/ui/browse/browse_pages.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
+import 'package:frontend/ui/feed/see_all_recents_page.dart';
 import 'package:frontend/ui/get_info_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 
@@ -64,3 +65,14 @@ void openBrowse(BuildContext context, BrowseDestination destination) {
   };
   Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => page));
 }
+
+/// See all recently played, on the caller's (tab) navigator, starting from
+/// [initialDownloaded] (Home's chip value). Each push is a fresh snapshot.
+void openSeeAllRecents(
+  BuildContext context, {
+  required bool initialDownloaded,
+}) => Navigator.of(context).push(
+  MaterialPageRoute<void>(
+    builder: (_) => SeeAllRecentsPage(initialDownloaded: initialDownloaded),
+  ),
+);

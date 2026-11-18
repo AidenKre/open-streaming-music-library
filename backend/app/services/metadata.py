@@ -1,17 +1,33 @@
 import json
+import logging
 import math
+import signal
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Optional
 
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track_meta_data import TrackMetaData
+from app.services import audio_identity
+from app.services.media_input import ffmpeg_input_args
 from app.services.ffmpeg_runner import (
+    CaptureOverflow,
+    CaptureTimeout,
     FfmpegError,
     FfmpegProcessRegistry,
+    run_capture,
     run_ffmpeg,
     scaled_timeout,
 )
+
+logger = logging.getLogger(__name__)
+
+# stdout bounds for the probes: the metadata JSON can carry large tags; the
+# bitrate and quick-check probes print a few bytes.
+METADATA_PROBE_MAX_STDOUT_BYTES = 16 * 1024 * 1024
+SHORT_PROBE_MAX_STDOUT_BYTES = 64 * 1024
 
 # DB column -> ffmpeg metadata key, for the columns whose tag name differs —
 # derived from the single field-spec table.
@@ -62,6 +78,7 @@ def write_metadata_tags(
     tags: dict[str, str | None],
     registry: Optional[FfmpegProcessRegistry] = None,
     job_id: Optional[Any] = None,
+    input_format: Optional[str] = None,
 ) -> None:
     """Copy ``source`` to ``dest`` with ``tags`` applied, audio bytes untouched.
 
@@ -79,6 +96,7 @@ def write_metadata_tags(
         "-hide_banner",
         "-loglevel", "error",
         "-y",
+        *ffmpeg_input_args(input_format),
         "-i", str(source),
         "-map", "0",
         "-c", "copy",
@@ -94,12 +112,13 @@ def write_metadata_tags(
             registry=registry, job_id=job_id,
         )
     except FfmpegError as e:
-        raise TagWriteError(str(e)) from e
+        logger.warning("tag write failed: %s", e)
+        raise TagWriteError("tag write failed") from e
 
     # Verify the output is still a probe-able audio file (catches a silently
     # corrupt remux). Field-level verification is intentionally light — ffmpeg
     # normalizes some tag spellings, so we confirm probe-ability, not equality.
-    if ffprobe_for_metadata(dest) is None:
+    if ffprobe_for_metadata(dest, input_format) is None:
         dest.unlink(missing_ok=True)
         raise TagWriteError("re-probe of written file failed")
 
@@ -107,8 +126,73 @@ def write_metadata_tags(
 # TODO: possible search database to see if artist/album already exists? and match capitalization? might be confusing...
 
 
-def get_track_metadata(file_path: Path) -> TrackMetaData | None:
-    json_data = ffprobe_for_metadata(file_path)
+class ProbeUnavailable(RuntimeError):
+    """ffprobe could not answer now (missing, cannot start, timed out, or
+    SIGKILLed)."""
+
+
+_raise_if_unavailable: ContextVar[bool] = ContextVar("raise_if_unavailable", default=False)
+
+
+@contextmanager
+def probe_unavailable_raises():
+    """Within this block ffprobe_for_metadata (so get_track_metadata) raises
+    ProbeUnavailable when ffprobe cannot start, instead of returning None:
+    environmental, not the file's own refusal."""
+    token = _raise_if_unavailable.set(True)
+    try:
+        yield
+    finally:
+        _raise_if_unavailable.reset(token)
+
+
+_probe_registry: ContextVar[Optional[FfmpegProcessRegistry]] = ContextVar("probe_registry", default=None)
+
+
+@contextmanager
+def probes_killed_by(registry: Optional[FfmpegProcessRegistry]):
+    """Within this block ffprobe_for_metadata and the ingest quick check run
+    their process registered in ``registry`` (None: none), so closing it at
+    shutdown ends a probe without waiting out the bound."""
+    token = _probe_registry.set(registry)
+    try:
+        yield
+    finally:
+        _probe_registry.reset(token)
+
+
+@contextmanager
+def probe_registration():
+    """The ``registry``/``job_id`` arguments for one probe's ``run_capture``:
+    the registry set by ``probes_killed_by`` under a fresh job id, forgotten
+    afterwards; nothing outside such a block."""
+    registry = _probe_registry.get()
+    if registry is None:
+        yield {}
+        return
+    job_id = object()  # unique per call: concurrent probes never share a kill flag
+    try:
+        yield {"registry": registry, "job_id": job_id}
+    finally:
+        registry.forget(job_id)
+
+
+def probe_timeout(timeout: Optional[float]) -> float:
+    """The bound for one probe: ``timeout``, else the shared probe bound
+    (read at call time)."""
+    return audio_identity.PROBE_TIMEOUT_S if timeout is None else timeout
+
+
+def _probe_unavailable(message: str, cause: Optional[BaseException] = None) -> None:
+    """Unreadable for now (environmental): raises inside
+    probe_unavailable_raises, else None."""
+    if _raise_if_unavailable.get():
+        raise ProbeUnavailable(message) from cause
+    return None
+
+
+def get_track_metadata(file_path: Path, timeout: Optional[float] = None) -> TrackMetaData | None:
+    json_data = ffprobe_for_metadata(file_path, timeout=timeout)
     if json_data is None:
         return None
     metadata = build_track_metadata(json_data)
@@ -119,16 +203,17 @@ def get_track_metadata(file_path: Path) -> TrackMetaData | None:
     return metadata
 
 
-def get_audio_bitrate_kbps(path: Path) -> int | None:
+def get_audio_bitrate_kbps(path: Path, timeout: Optional[float] = None) -> int | None:
     """Return the audio stream's bitrate in kbps, or None on failure.
 
     Issues a targeted ffprobe query for only the bit_rate field — lighter than
-    the full metadata probe. Returns None when ffprobe is unavailable, the file
-    has no audio stream, or the value cannot be parsed. Callers should treat
-    None as "unknown" and proceed conservatively (e.g. allow transcoding).
+    the full metadata probe. Returns None when ffprobe is unavailable, times
+    out (bounded by ``timeout``, default the shared probe bound), the file has
+    no audio stream, or the value cannot be parsed. Callers should treat None
+    as "unknown" and proceed conservatively (e.g. allow transcoding).
     """
     try:
-        result = subprocess.run(
+        result = run_capture(
             [
                 "ffprobe",
                 "-v", "quiet",
@@ -137,11 +222,12 @@ def get_audio_bitrate_kbps(path: Path) -> int | None:
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 str(path),
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
+            timeout_s=probe_timeout(timeout),
+            max_stdout_bytes=SHORT_PROBE_MAX_STDOUT_BYTES,
         )
-    except (FileNotFoundError, OSError):
+    except (FfmpegError, OSError):
+        return None
+    if result.returncode != 0:
         return None
 
     raw = result.stdout.decode("utf-8", errors="replace").strip()
@@ -153,36 +239,53 @@ def get_audio_bitrate_kbps(path: Path) -> int | None:
         return None
 
 
-def ffprobe_for_metadata(file_path: Path) -> dict | None:
+def ffprobe_for_metadata(
+    file_path: Path, input_format: str | None = None, timeout: Optional[float] = None
+) -> dict | None:
+    """ffprobe's JSON for ``file_path``, or None. Bounded by ``timeout``
+    (default the shared probe bound). A tool that cannot start, a time-out or
+    a SIGKILL is unreadable for now (ProbeUnavailable inside
+    probe_unavailable_raises); an overflow or any other non-zero exit (another
+    signal included, as in identity_reasons.reason_for_exit) is the file's own
+    answer (None)."""
     try:
-        completed_process = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-hide_banner",
-                "-show_streams",
-                "-show_format",
-                "-of",
-                "json",
-                str(file_path),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        print("ffprobe not found")
+        with probe_registration() as registration:
+            completed_process = run_capture(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-hide_banner",
+                    "-show_streams",
+                    "-show_format",
+                    "-of",
+                    "json",
+                    *ffmpeg_input_args(input_format),
+                    str(file_path),
+                ],
+                timeout_s=probe_timeout(timeout),
+                max_stdout_bytes=METADATA_PROBE_MAX_STDOUT_BYTES,
+                **registration,
+            )
+    except CaptureOverflow:
         return None
-    except OSError:
-        return None
+    except CaptureTimeout as e:
+        return _probe_unavailable("ffprobe timed out", e)
+    except FfmpegError as e:  # not found, or cannot start
+        if isinstance(e.__cause__, FileNotFoundError):
+            print("ffprobe not found")
+        return _probe_unavailable(str(e), e)
+    except OSError as e:  # setting up the pipes failed (e.g. EMFILE): cannot run now
+        return _probe_unavailable(f"ffprobe cannot run: {e.strerror or type(e).__name__}", e)
 
+    if completed_process.returncode == -signal.SIGKILL:
+        # A stop through the registry, the OOM killer: says nothing about the file.
+        return _probe_unavailable("ffprobe was killed")
     if completed_process.returncode != 0:
         return None
 
     try:
-        return json.loads(completed_process.stdout or "{}")
+        return json.loads(completed_process.stdout.decode("utf-8", errors="replace") or "{}")
     except json.JSONDecodeError:
         return None
 
@@ -255,12 +358,13 @@ def build_track_metadata(json_data: dict) -> TrackMetaData | None:
     return metadata
 
 
-def extract_cover_art_bytes(file_path: Path) -> bytes | None:
+def extract_cover_art_bytes(file_path: Path, input_format: str | None = None) -> bytes | None:
     """Extract embedded cover art from an audio file using ffmpeg."""
     try:
         result = subprocess.run(
             [
                 "ffmpeg",
+                *ffmpeg_input_args(input_format),
                 "-i", str(file_path),
                 "-an",
                 "-vcodec", "copy",

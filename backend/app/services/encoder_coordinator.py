@@ -20,8 +20,9 @@ Lookup order for ``encode_for_stream``:
   - Otherwise: check cache only.
 
 New encodes always land in the cache that matches the quality:
-  - quality == default_quality → default_cache
-  - otherwise                  → cache (stream cache, subject to LRU)
+  - owner is the master admin AND quality == default_quality → default_cache
+  - everything else                                          → cache (stream cache, subject to LRU)
+(``default_cache`` only ever holds admin entries, so lookups stay owner-free.)
 """
 
 import enum
@@ -48,6 +49,7 @@ class PrefetchOutcome(enum.Enum):
     INVALID = "invalid"
 
 from app.services.encoded_cache import CACHE_FILE_SUFFIX, EncodedCache
+from app.services.import_outcome import file_signature
 from app.services.keyed_locks import KeyedLocks
 from app.services.metadata import get_audio_bitrate_kbps
 from app.services.transcoder import (
@@ -103,7 +105,7 @@ class _PriorityPool:
 
     Priority 0 (PRIORITY_HIGH)       — prefetch / queue-warm: encode tasks for
                                         tracks the user is about to play
-                                        (enqueue_prefetch, enqueue_prefetch_batch).
+                                        (enqueue_prefetch).
     Priority 1 (PRIORITY_LOW)        — background quality work: default-cache
                                         migration and library-wide warming from
                                         set_default_quality.
@@ -143,9 +145,16 @@ class _PriorityPool:
             except Exception:
                 pass
 
-    def shutdown(self, wait: bool = True) -> None:
+    def shutdown(self, wait: bool = True, *, cancel_pending: bool = False) -> None:
+        """Stop the worker threads.
+
+        By default the sentinels sort after every queued task, so the pool
+        drains its queue before stopping. With ``cancel_pending`` they sort
+        ahead of every task: each thread exits after the task it is running
+        now, and nothing only queued (or submitted later) starts."""
+        priority = self.PRIORITY_HIGH - 1 if cancel_pending else 10**9
         for _ in self._threads:
-            self._q.put(_Task(priority=10**9, neg_seq=0))  # fn=None → sentinel
+            self._q.put(_Task(priority=priority, neg_seq=0))  # fn=None → sentinel
         if wait:
             for t in self._threads:
                 t.join()
@@ -166,6 +175,11 @@ class EncoderCoordinator:
     # Optional callable that returns all track UUID strings; used by
     # _submit_warm_tasks to pre-encode every track at the new default quality.
     all_uuids_fn: Optional[AllUuidsFn] = None
+    # The master admin's user id; only their encodes at the default quality
+    # land in default_cache. Fixed at construction.
+    admin_owner_id: Optional[int] = None
+    # uuid -> owning user id (or None); used by background prefetch workers.
+    owner_lookup: Optional[Callable[[str], Optional[int]]] = None
     _executor: _PriorityPool = field(init=False)
     # Per-(uuid, quality) encode locks (shared keyed-lock utility). The guard
     # below is NOT the lock registry's internal guard — it protects the
@@ -182,7 +196,7 @@ class EncoderCoordinator:
         self._scratch_dir.mkdir(parents=True, exist_ok=True)
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=False)
+        self._executor.shutdown(wait=False, cancel_pending=True)
 
     def submit_conversion(self, fn: Callable, *args: Any, **kwargs: Any) -> None:
         """Schedule work at PRIORITY_CONVERSION on the shared pool. The one
@@ -206,7 +220,9 @@ class EncoderCoordinator:
         """Called once at app startup before any requests are served.
 
         1. Cleans up orphaned scratch files from interrupted transcodes.
-        2. Resumes warming: submits tasks only for tracks missing from the
+        2. Queues a prune of the default cache's files of every other quality
+           (a cleanup queued by a default change is lost on stop or crash).
+        3. Resumes warming: submits tasks only for tracks missing from the
            default cache (diff-based, avoids spamming the pool with no-ops).
         """
         # 1. Clean orphaned scratch files from interrupted transcodes.
@@ -217,8 +233,16 @@ class EncoderCoordinator:
                 except OSError:
                     pass
 
-        # 2. Resume warming only for tracks not already in the default cache.
         default_quality, default_cache, gen = self._snapshot_default_state()
+
+        # 2. Prune other qualities from the default cache.
+        if default_cache is not None:
+            self._executor.submit(
+                self._delete_default_cache_files, default_cache,
+                priority=_PriorityPool.PRIORITY_LOW,
+            )
+
+        # 3. Resume warming only for tracks not already in the default cache.
         if default_quality == ORIGINAL_QUALITY or self.all_uuids_fn is None:
             return
 
@@ -228,12 +252,27 @@ class EncoderCoordinator:
         else:
             cached = set()
 
-        missing = all_uuids - cached
-        for uuid_id in missing:
-            self._executor.submit(
-                self._warm_one, uuid_id, default_quality, gen,
-                priority=_PriorityPool.PRIORITY_LOW,
-            )
+        for uuid_id in all_uuids - cached:
+            self._submit_warm(uuid_id, default_quality, gen)
+
+    def warm_imported(self, uuid_id: str, owner_id: int) -> None:
+        """Warm a freshly imported track at the default quality (admin only,
+        spec §6.1). A no-op for other owners, at original quality, or when the
+        track is already cached."""
+        if owner_id != self.admin_owner_id:
+            return
+        default_quality, default_cache, gen = self._snapshot_default_state()
+        if default_quality == ORIGINAL_QUALITY:
+            return
+        if default_cache is not None and default_cache.has(uuid_id, default_quality):
+            return
+        self._submit_warm(uuid_id, default_quality, gen)
+
+    def _submit_warm(self, uuid_id: str, quality: str, generation: int) -> None:
+        self._executor.submit(
+            self._warm_one, uuid_id, quality, generation,
+            priority=_PriorityPool.PRIORITY_LOW,
+        )
 
     # ── Cache tier helpers ────────────────────────────────────────────────
 
@@ -245,10 +284,15 @@ class EncoderCoordinator:
         with self._key_locks_guard:
             return self.default_quality, self.default_cache, self._warm_generation
 
-    def _write_cache(self, quality: str) -> EncodedCache:
-        """Return the cache to write new encodes into for this quality."""
+    def _write_cache(self, quality: str, owner_id: int) -> EncodedCache:
+        """Return the cache to write new encodes into for this quality/owner."""
         default_quality, default_cache, _ = self._snapshot_default_state()
-        if default_cache is not None and quality == default_quality:
+        if (
+            default_cache is not None
+            and quality == default_quality
+            and self.admin_owner_id is not None
+            and owner_id == self.admin_owner_id
+        ):
             return default_cache
         return self.cache
 
@@ -281,6 +325,8 @@ class EncoderCoordinator:
         quality: str,
         source_bitrate_kbps: Optional[int] = None,
         source_path: Optional[Path] = None,
+        *,
+        owner_id: int,
     ) -> Optional[EncodeResult]:
         """Return an EncodeResult for streaming, transcoding if needed.
 
@@ -296,6 +342,10 @@ class EncoderCoordinator:
         streaming endpoint, which just queried the track row) skip the redundant
         ``source_lookup`` DB query. Background workers pass None and fall back to
         ``source_lookup``.
+
+        ``owner_id`` (required) is the track row's owner; it only decides the
+        write tier: default_cache iff the owner is the master admin and the
+        quality is the admin's default, else the LRU stream cache.
 
         ORIGINAL_QUALITY always returns the source file directly.
         """
@@ -330,7 +380,7 @@ class EncoderCoordinator:
             if cached is not None:
                 return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
 
-            target_cache = self._write_cache(quality)
+            target_cache = self._write_cache(quality, owner_id)
             # Captured before the source is read: a conversion that replaces
             # the master and evicts this uuid mid-encode invalidates it.
             generation = target_cache.generation(uuid_id)
@@ -355,10 +405,16 @@ class EncoderCoordinator:
                 )
 
             scratch = self._scratch_dir / f"{uuid_lib.uuid4().hex}.m4a"
+            signature_before = file_signature(source)
             ok = self.transcode_fn(source, scratch, bitrate)
             if not ok:
                 if scratch.exists():
                     scratch.unlink(missing_ok=True)
+                return None
+            # A source still being copied would be cached as a partial encode.
+            signature_after = file_signature(source)
+            if signature_before is None or signature_before != signature_after:
+                scratch.unlink(missing_ok=True)
                 return None
 
             cached_path = target_cache.insert(
@@ -393,39 +449,12 @@ class EncoderCoordinator:
         )
         return PrefetchOutcome.QUEUED
 
-    def enqueue_prefetch_batch(
-        self,
-        items: list[tuple[str, str]],
-        source_bitrates: Optional[dict[str, int]] = None,
-    ) -> int:
-        """Schedule a batch of background encodes.
-
-        Each item is ``(uuid_id, quality)``. Items that are already cached,
-        use ORIGINAL_QUALITY, or have invalid quality are silently skipped.
-        ``source_bitrates`` is an optional ``{uuid_id: bitrate_kbps}`` map
-        passed through to workers for passthrough checks.
-        Returns the number of items actually queued.
-        """
-        to_encode = [
-            (uid, q)
-            for uid, q in items
-            if q != ORIGINAL_QUALITY
-            and q in QUALITY_BITRATES_KBPS
-            and not self._has_cached(uid, q)
-        ]
-        if to_encode:
-            self._executor.submit(
-                self._prefetch_batch, to_encode, source_bitrates or {},
-                priority=_PriorityPool.PRIORITY_HIGH,
-            )
-        return len(to_encode)
-
     def set_default_quality(self, new_quality: str) -> bool:
         """Change the default streaming quality. Returns True if warming was submitted.
 
         No-ops when ``new_quality`` equals the current default. Otherwise:
         1. Bumps the warm generation counter to invalidate pending warm tasks.
-        2. Migrates existing default-cache files to the stream cache (background).
+        2. Removes the default cache's files of every other quality (background).
         3. Submits one warm task per UUID (parallel, PRIORITY_LOW).
         """
         # Mutate default_quality and _warm_generation atomically under the
@@ -434,7 +463,6 @@ class EncoderCoordinator:
         with self._key_locks_guard:
             if new_quality == self.default_quality:
                 return False
-            old_quality = self.default_quality
             old_default_cache = self.default_cache
             self.default_quality = new_quality
             self._warm_generation += 1
@@ -442,7 +470,7 @@ class EncoderCoordinator:
 
         if old_default_cache is not None:
             self._executor.submit(
-                self._delete_default_cache_files, old_default_cache, old_quality,
+                self._delete_default_cache_files, old_default_cache,
                 priority=_PriorityPool.PRIORITY_LOW,
             )
 
@@ -456,12 +484,17 @@ class EncoderCoordinator:
         self,
         new_quality: str,
         persist: Callable[[str], None],
+        read_stored: Optional[Callable[[], Optional[str]]] = None,
     ) -> tuple[bool, bool]:
         """Persist ``new_quality`` then update in-memory default, serialized.
 
         Returns ``(changed, warming)``. ``changed`` is False when the new
-        quality already matches the current default (no persist, no warm).
-        ``warming`` mirrors :meth:`set_default_quality`.
+        quality already matches the current default (no live change, no
+        warm). In that case ``read_stored``, when given, returns the stored
+        value; if it differs (for example an invalid row the live default
+        fell back from), ``new_quality`` is persisted to repair it. Without
+        ``read_stored`` nothing is persisted. ``warming`` mirrors
+        :meth:`set_default_quality`.
 
         ``persist`` is invoked under :attr:`_default_quality_update_lock`
         before any in-memory mutation. If it raises, neither the persisted
@@ -472,6 +505,8 @@ class EncoderCoordinator:
         """
         with self._default_quality_update_lock:
             if new_quality == self.default_quality:
+                if read_stored is not None and read_stored() != new_quality:
+                    persist(new_quality)
                 return False, False
             persist(new_quality)
             warming = self.set_default_quality(new_quality)
@@ -486,33 +521,36 @@ class EncoderCoordinator:
         source_bitrate_kbps: Optional[int],
     ) -> None:
         try:
-            self.encode_for_stream(uuid_id, quality, source_bitrate_kbps)
+            if self.owner_lookup is None:
+                return
+            owner = self.owner_lookup(uuid_id)
+            if owner is None:
+                return
+            self.encode_for_stream(
+                uuid_id, quality, source_bitrate_kbps, owner_id=owner
+            )
         except Exception:
             # Background prefetches must never propagate.
             return
 
-    def _prefetch_batch(
-        self,
-        items: list[tuple[str, str]],
-        source_bitrates: dict[str, int],
-    ) -> None:
-        """Encode multiple tracks in one worker call."""
-        for uuid_id, quality in items:
-            try:
-                self.encode_for_stream(uuid_id, quality, source_bitrates.get(uuid_id))
-            except Exception:
-                continue
+    def _delete_default_cache_files(self, cache: EncodedCache) -> None:
+        """Delete every default-cache file whose quality is not the current
+        default (all of them when the default is ``original``).
 
-    def _delete_default_cache_files(self, old_cache: EncodedCache, old_quality: str) -> None:
-        """Delete stale default-cache files for old_quality.
+        The current default is re-read for each file, so a change arriving
+        mid-scan never deletes the newer default's files. Best effort: a file
+        that cannot be unlinked is skipped.
 
         Safe to call while a file is open: on Unix the inode stays alive until
         all file descriptors are closed, so in-flight streams finish normally.
         """
-        old_suffix = f"__q{old_quality}{CACHE_FILE_SUFFIX}"
         try:
-            for entry in old_cache.ctx.cache_dir.iterdir():
-                if not entry.is_file() or not entry.name.endswith(old_suffix):
+            for entry in cache.ctx.cache_dir.iterdir():
+                if not entry.is_file() or not entry.name.endswith(CACHE_FILE_SUFFIX):
+                    continue
+                current_quality, _, _ = self._snapshot_default_state()
+                keep_suffix = f"__q{current_quality}{CACHE_FILE_SUFFIX}"
+                if current_quality != ORIGINAL_QUALITY and entry.name.endswith(keep_suffix):
                     continue
                 try:
                     entry.unlink()
@@ -544,6 +582,8 @@ class EncoderCoordinator:
         if generation != current_generation:
             return
         try:
-            self.encode_for_stream(uuid_id, quality)
+            self.encode_for_stream(
+                uuid_id, quality, owner_id=self.admin_owner_id
+            )
         except Exception:
             pass

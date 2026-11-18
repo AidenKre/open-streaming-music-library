@@ -1,3 +1,5 @@
+import 'package:frontend/playback/playback_target_resolver.dart'
+    show PlaybackSourceKind;
 import 'package:frontend/repositories/queue_repository.dart';
 
 /// What the engine is doing (SC-27 processing axis), independent of the
@@ -73,6 +75,11 @@ class EngineSourceIdentity {
   /// by the catalog's current path (review 2026-11-07).
   final String? localPath;
 
+  /// The source kind the engine applied when it built this source: [localPath]
+  /// is set iff the engine applied `local`.
+  PlaybackSourceKind get sourceKind =>
+      localPath != null ? PlaybackSourceKind.local : PlaybackSourceKind.remote;
+
   @override
   bool operator ==(Object other) =>
       other is EngineSourceIdentity &&
@@ -143,9 +150,13 @@ class EngineLoadEvent {
     this.duration,
     this.errorCode,
     this.errorMessage,
+    this.source,
   });
   final int playlistRevision;
   final EngineLoadOutcome outcome;
+
+  /// The seed's current source: what the load was about (7P.2, m6).
+  final EngineSourceIdentity? source;
 
   /// Engine-measured duration of the current source; null = unknown.
   final Duration? duration;
@@ -175,6 +186,93 @@ class EngineSourceFailure {
   final String? errorMessage;
 }
 
+/// A native command the engine issues to the plugin (SC-27 §6, 7P.1).
+/// There is no move: reorders are a remove plus an insert.
+enum EngineCommand { play, pause, seek, insert, remove, setLoopMode, setVolume, stop }
+
+/// Why a native command did not take effect.
+enum EngineCommandFailureReason {
+  /// The plugin threw.
+  failed,
+
+  /// The plugin accepted the call but did not apply it (a seek while the
+  /// plugin is loading returns without seeking).
+  dropped,
+
+  /// The plugin reported an index the applied playlist cannot explain (a
+  /// late or stale index report); it is never committed.
+  unexplainedIndex,
+}
+
+/// What a failed command was about, by identity only: never a URL, a token
+/// or a file path.
+class EngineCommandTarget {
+  const EngineCommandTarget({
+    required this.itemId,
+    required this.trackUuid,
+    required this.sourceKind,
+  });
+  final int itemId;
+  final String trackUuid;
+  final PlaybackSourceKind sourceKind;
+
+  @override
+  bool operator ==(Object other) =>
+      other is EngineCommandTarget &&
+      other.itemId == itemId &&
+      other.trackUuid == trackUuid &&
+      other.sourceKind == sourceKind;
+
+  @override
+  int get hashCode => Object.hash(itemId, trackUuid, sourceKind);
+
+  @override
+  String toString() => 'EngineCommandTarget(item $itemId, $sourceKind)';
+}
+
+/// A typed native command failure on the engine's stream (SC-27 §6, 7P.1).
+/// When [diverged] the native playlist or output can no longer be trusted:
+/// the engine reports nothing as settled until the next seed, and the
+/// playback core rebuilds from queue data. Carries no plugin message (it
+/// can quote a stream URL or a file path).
+class EngineCommandFailure {
+  const EngineCommandFailure({
+    required this.runtimeId,
+    required this.seedRevision,
+    required this.playlistRevision,
+    required this.command,
+    required this.reason,
+    required this.diverged,
+    this.target,
+    this.position,
+    this.cause,
+    this.errorCode,
+  });
+  final int runtimeId;
+
+  /// The playlist revision of the seed whose playlist the command acted on.
+  final int seedRevision;
+  final int playlistRevision;
+
+  /// Null only for an [EngineCommandFailureReason.unexplainedIndex] outside
+  /// any command.
+  final EngineCommand? command;
+  final EngineCommandFailureReason reason;
+  final bool diverged;
+  final EngineCommandTarget? target;
+
+  /// The position a seek asked for.
+  final Duration? position;
+
+  /// The transition the command carried (a seek's cause).
+  final PlaybackTransitionCause? cause;
+  final int? errorCode;
+
+  @override
+  String toString() => 'EngineCommandFailure($command $reason, $target, '
+      'seed $seedRevision${diverged ? ', diverged' : ''})';
+}
+
 /// The playback engine seen by the playback core (SC-27). No plugin types
 /// cross this boundary; `JustAudioEngine` is the only adapter.
 ///
@@ -184,7 +282,9 @@ class EngineSourceFailure {
 /// behind queued native work.
 abstract interface class PlaybackEngine {
   /// Replaces the loaded window with [entries], current item first to play.
-  /// Sources built from now on belong to [sessionId].
+  /// Sources built from now on belong to [sessionId]. [currentSourceKind] is
+  /// the resolver's verdict for the current item, applied as given; null
+  /// keeps the rule's plan.
   Future<void> setSeed(
     List<QueuePlaybackEntry> entries, {
     required int currentItemId,
@@ -193,6 +293,7 @@ abstract interface class PlaybackEngine {
     Duration initialPosition = Duration.zero,
     bool autoPlay = false,
     bool shuffleEnabled = false,
+    PlaybackSourceKind? currentSourceKind,
   });
 
   /// Inserts entries not yet loaded at their play positions.
@@ -237,6 +338,10 @@ abstract interface class PlaybackEngine {
 
   int? get currentItemId;
 
+  /// The source kind applied to the loaded source of [itemId], or null when
+  /// it is not loaded.
+  PlaybackSourceKind? sourceKindOf(int itemId);
+
   /// Bumped by every structural playlist change the engine issues.
   int get playlistRevision;
   Duration get position;
@@ -250,6 +355,15 @@ abstract interface class PlaybackEngine {
   Stream<UnavailableAdvance> get unavailableAdvanceStream;
   Stream<EngineLoadEvent> get loadEvents;
   Stream<EngineSourceFailure> get sourceFailures;
+
+  /// Typed native command failures (SC-27 §6, 7P.1).
+  Stream<EngineCommandFailure> get commandFailures;
+
+  /// Completes once every native command issued so far has been applied:
+  /// true if all applied, false if one failed or a newer seed replaced
+  /// them (5B.0d m5: coverage is acknowledged at native application).
+  /// Never awaited inside the playback lane (a stalled load would hold it).
+  Future<bool> whenApplied();
 
   /// Identifies this engine instance in its observations.
   int get runtimeId;

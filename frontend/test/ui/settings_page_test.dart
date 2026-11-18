@@ -7,6 +7,7 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/settings_service.dart';
@@ -18,6 +19,7 @@ import 'package:frontend/ui/settings/settings_registry.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
 import 'fake_session_controls.dart';
+import '../helpers/test_credentials.dart';
 
 /// Override that pins [offlineModeProvider] to a fixed value without running
 /// the real health-poll timer.
@@ -25,20 +27,39 @@ class _StubOffline extends OfflineModeNotifier {
   _StubOffline(this._value);
   final bool _value;
   @override
-  bool build() => _value;
+  bool build() {
+    super.build();
+    return _value;
+  }
 }
+
+/// A transport whose delegate each test swaps after the scope exists.
+class _SwapClient extends http.BaseClient {
+  http.Client inner = MockClient((_) async => http.Response('{}', 200));
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      inner.send(request);
+}
+
+final _transport = _SwapClient();
+final _api = testApiClient('http://localhost:8000', _transport);
 
 Widget _wrap(
   SharedPreferences prefs, {
   Future<void> Function()? onDisconnect,
   bool offline = false,
   List<String> losses = const [],
+  FakeSessionControls? session,
 }) {
   return ProviderScope(
     overrides: [
+      apiClientProvider.overrideWithValue(_api),
       sharedPreferencesProvider.overrideWith((_) async => prefs),
+      credentialStoreTestOverride(),
       offlineModeProvider.overrideWith(() => _StubOffline(offline)),
-      if (onDisconnect != null)
+      if (session != null)
+        sessionControlsProvider.overrideWithValue(session)
+      else if (onDisconnect != null)
         sessionControlsProvider.overrideWithValue(
           FakeSessionControls(onDisconnect: onDisconnect)
             ..lossSummaries = losses,
@@ -57,7 +78,9 @@ Widget _wrapNestedSettingsLauncher(
 }) {
   return ProviderScope(
     overrides: [
+      apiClientProvider.overrideWithValue(_api),
       sharedPreferencesProvider.overrideWith((_) async => prefs),
+      credentialStoreTestOverride(),
       offlineModeProvider.overrideWith(() => _StubOffline(false)),
       // One app scope, as in production (no nested override scope).
       sessionControlsProvider.overrideWithValue(
@@ -84,32 +107,37 @@ Widget _wrapNestedSettingsLauncher(
   );
 }
 
-/// Settings is a lazy list: bring its end (Connection) into the tree.
-Future<void> _toBottom(WidgetTester tester) async {
+/// Settings is a lazy list: bring [target] (a Connection / Library tools row)
+/// into the tree. Without a target (the "hidden outside a live session"
+/// cases) scroll to the very end instead, so a negative assert still looks at
+/// the bottom of the list.
+Future<void> _toBottom(WidgetTester tester, [Finder? target]) async {
   final list = find.byType(Scrollable).first;
-  for (var i = 0; i < 5; i++) {
-    await tester.drag(list, const Offset(0, -400));
+  if (target != null) {
+    await tester.scrollUntilVisible(target, 400, scrollable: list);
     await tester.pumpAndSettle();
+    return;
+  }
+  final position = tester.state<ScrollableState>(list).position;
+  for (var i = 0; i < 5; i++) {
+    await tester.drag(list, const Offset(0, -2000));
+    await tester.pumpAndSettle();
+    if (position.pixels >= position.maxScrollExtent) break;
   }
 }
 
 void main() {
   setUp(() {
+    final savedSyncTimeout = SettingsNotifier.backendSyncTimeout;
+    addTearDown(() => SettingsNotifier.backendSyncTimeout = savedSyncTimeout);
     SharedPreferences.setMockInitialValues({});
     // The dialog calls into ApiClient via setStreamQualityFull. Default to a
     // 2xx PUT so persistence happens; individual tests can override.
-    ApiClient.initForTest(
-      'http://localhost:8000',
-      MockClient((_) async => http.Response('{}', 200)),
-    );
+    _transport.inner = MockClient((_) async => http.Response('{}', 200));
     // build()'s backend GET fires when ApiClient.baseUrl is non-empty —
     // tighten its timeout so tests don't hang on the default MockClient that
     // returns 2xx synchronously (which is fine here, but be defensive).
     SettingsNotifier.backendSyncTimeout = const Duration(milliseconds: 200);
-  });
-
-  tearDown(() {
-    ApiClient.init('');
   });
 
   testWidgets('renders both quality dropdowns with the loaded values', (
@@ -121,14 +149,11 @@ void main() {
     });
     final prefs = await SharedPreferences.getInstance();
     // Backend GET returns the same quality — no state change at build().
-    ApiClient.initForTest(
-      'http://localhost:8000',
-      MockClient(
-        (_) async => http.Response(
-          '{"quality":"256"}',
-          200,
-          headers: {'content-type': 'application/json'},
-        ),
+    _transport.inner = MockClient(
+      (_) async => http.Response(
+        '{"quality":"256"}',
+        200,
+        headers: {'content-type': 'application/json'},
       ),
     );
 
@@ -253,6 +278,36 @@ void main() {
     expect(find.text('Close'), findsNothing);
   });
 
+  // Phase M §7.1: Log out sits in Settings → Connection next to Disconnect.
+  // It keeps the local data, so it asks nothing and goes to the controller.
+  testWidgets('Log out sits next to Disconnect and is the controller\'s', (
+    tester,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final session = FakeSessionControls(onDisconnect: () async {});
+    await tester.pumpWidget(_wrap(prefs, session: session));
+    await tester.pumpAndSettle();
+
+    await _toBottom(tester, find.text('Disconnect'));
+    expect(find.text('Log out'), findsOneWidget);
+    expect(find.text('Disconnect'), findsOneWidget);
+    final logOut = tester.getTopLeft(find.text('Log out')).dy;
+    final disconnect = tester.getTopLeft(find.text('Disconnect')).dy;
+    expect(logOut, lessThan(disconnect), reason: 'Log out comes first');
+    await tester.tap(find.text('Log out'));
+    await tester.pumpAndSettle();
+    expect(session.calls, ['logout']);
+    expect(find.byType(BottomSheet), findsNothing);
+  });
+
+  testWidgets('Log out is hidden outside a live session', (tester) async {
+    final prefs = await SharedPreferences.getInstance();
+    await tester.pumpWidget(_wrap(prefs));
+    await tester.pumpAndSettle();
+    await _toBottom(tester);
+    expect(find.text('Log out'), findsNothing);
+  });
+
   testWidgets('Disconnect tap opens the confirmation bottom sheet', (
     tester,
   ) async {
@@ -260,7 +315,7 @@ void main() {
     await tester.pumpWidget(_wrap(prefs, onDisconnect: () async {}));
     await tester.pumpAndSettle();
 
-    await _toBottom(tester);
+    await _toBottom(tester, find.text('Disconnect'));
     await tester.tap(find.text('Disconnect'));
     await tester.pumpAndSettle();
 
@@ -281,7 +336,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await _toBottom(tester);
+    await _toBottom(tester, find.text('Disconnect'));
     await tester.tap(find.text('Disconnect'));
     await tester.pumpAndSettle();
     expect(find.text('Reset and disconnect?'), findsOneWidget);
@@ -301,7 +356,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Settings'), findsOneWidget);
-    await _toBottom(tester);
+    await _toBottom(tester, find.text('Disconnect'));
     expect(find.text('Disconnect'), findsOneWidget);
   });
 
@@ -320,7 +375,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await _toBottom(tester);
+    await _toBottom(tester, find.text('Disconnect'));
     expect(find.text('Disconnect'), findsOneWidget);
     await tester.tap(find.text('Disconnect'));
     await tester.pumpAndSettle();
@@ -349,7 +404,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await _toBottom(tester);
+    await _toBottom(tester, find.text('Disconnect'));
     await tester.tap(find.text('Disconnect'));
     await tester.pumpAndSettle();
     // FilledButton with this label inside the bottom sheet.
@@ -429,7 +484,7 @@ void main() {
       ];
       expect([...titles]..sort(), titles, reason: 'registry order');
       expect(find.text('Playback quality'), findsOneWidget);
-      await _toBottom(tester);
+      await _toBottom(tester, find.text('Library tools'));
       expect(find.text('Library tools'), findsOneWidget);
       expect(find.text('Conversions'), findsOneWidget);
     });
@@ -440,6 +495,7 @@ void main() {
       await tester.pumpWidget(ProviderScope(
         overrides: [
           sharedPreferencesProvider.overrideWith((_) async => prefs),
+          credentialStoreTestOverride(),
           offlineModeProvider.overrideWith(() => _StubOffline(false)),
           settingsSectionsProvider.overrideWithValue(const [
             SettingsSection(id: 'a', order: 0, title: 'Shown'),
@@ -471,6 +527,7 @@ void main() {
       await tester.pumpWidget(ProviderScope(
         overrides: [
           sharedPreferencesProvider.overrideWith((_) async => prefs),
+          credentialStoreTestOverride(),
           offlineModeProvider.overrideWith(() => _StubOffline(false)),
           settingsControlsProvider.overrideWithValue(fake),
         ],
@@ -509,6 +566,7 @@ void main() {
         await tester.pumpWidget(ProviderScope(
           overrides: [
             sharedPreferencesProvider.overrideWith((_) async => prefs),
+            credentialStoreTestOverride(),
             offlineModeProvider.overrideWith(() => _StubOffline(offline)),
             settingsControlsProvider.overrideWithValue(
               _FakeSettings(canChangeServerQuality: allowed),

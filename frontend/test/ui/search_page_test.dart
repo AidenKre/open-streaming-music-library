@@ -7,7 +7,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/database/database.dart';
-import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/download_providers.dart';
@@ -30,6 +29,7 @@ import 'package:frontend/ui/widgets/track_card.dart';
 
 import 'browse_harness.dart';
 import 'fake_library_search_controls.dart';
+import '../helpers/no_server_api.dart';
 
 void main() {
   late AppDatabase db;
@@ -42,6 +42,7 @@ void main() {
     tempDir = await Directory.systemTemp.createTemp('search-page-test');
     coverStore = await LocalCoverArtStore.create(
       directoryProvider: () async => tempDir,
+      apiClient: noServerApi(),
     );
   });
 
@@ -95,7 +96,6 @@ void main() {
     late BrowseHarness h;
 
     setUp(() async {
-      initCoverArtCache(CoverArtCacheManager.noop());
       libDb = AppDatabase(NativeDatabase.memory());
       // Seven tracks match "Blue" by title only; artist/album names don't,
       // so the Songs rail is the only one on screen.
@@ -411,6 +411,58 @@ void main() {
       await teardownTree(tester);
     });
 
+    // 6-R1-05 / DEV-6-05: Search's album and artist cards follow the same
+    // one availability rule as every other surface.
+    testWidgets('offline with the chip off: a remote-only album dims and '
+        'still opens; a partly downloaded album does not dim', (
+      tester,
+    ) async {
+      await seedLibrary(libDb, [
+        const SeedTrack(uuid: 'n1', title: 'Orbit', artistId: 60,
+            artist: 'Nova', albumId: 60, album: 'Nebula'),
+        const SeedTrack(uuid: 'm1', title: 'Moon', artistId: 61,
+            artist: 'Mira', albumId: 61, album: 'Nebula Live'),
+        const SeedTrack(uuid: 'm2', title: 'Tide', artistId: 61,
+            artist: 'Mira', albumId: 61, album: 'Nebula Live',
+            trackNumber: 2, downloaded: true),
+      ]);
+      await tester.pumpWidget(h.wrap(const SearchPage(), offline: true));
+      await search(tester, 'Nebula');
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey)); // OFF
+      await tester.pumpAndSettle();
+
+      Finder albumCard(int id) => find.byWidgetPredicate(
+          (w) => w is AlbumCard && w.album.id == id);
+      LibraryCard cardOf(int id) => tester.widget<LibraryCard>(
+          find.descendant(of: albumCard(id), matching: find.byType(LibraryCard)));
+      expect(cardOf(60).dimmed, isTrue);
+      expect(cardOf(61).dimmed, isFalse);
+      await tester.ensureVisible(albumCard(60));
+      await tester.tap(albumCard(60));
+      await tester.pumpAndSettle();
+      expect(tester.widget<TracksPage>(find.byType(TracksPage)).albumId, 60);
+      await teardownTree(tester);
+    });
+
+    testWidgets('offline with the chip off: a remote-only artist dims and '
+        'still opens', (tester) async {
+      await seedLibrary(libDb, [
+        const SeedTrack(uuid: 'q1', title: 'Quiet One', artistId: 50,
+            artist: 'Quasar', albumId: 50, album: 'Far'),
+      ]);
+      await tester.pumpWidget(h.wrap(const SearchPage(), offline: true));
+      await search(tester, 'Quasar');
+      await tester.tap(find.byKey(FilterBar.downloadedChipKey)); // OFF
+      await tester.pumpAndSettle();
+      final artist = tester.widget<LibraryCard>(find.descendant(
+          of: find.byType(ArtistCard), matching: find.byType(LibraryCard)));
+      expect(artist.dimmed, isTrue);
+      await tester.tap(find.byType(ArtistCard));
+      await tester.pumpAndSettle();
+      expect(tester.widget<AlbumsPage>(find.byType(AlbumsPage)).artistId, 50);
+      await teardownTree(tester);
+    });
+
     testWidgets('the user turning the chip on re-runs downloaded-only', (
       tester,
     ) async {
@@ -627,7 +679,6 @@ void main() {
     late FakeLibrarySearchControls fake;
 
     setUp(() async {
-      initCoverArtCache(CoverArtCacheManager.noop());
       libDb = AppDatabase(NativeDatabase.memory());
       h = await BrowseHarness.create(libDb);
     });

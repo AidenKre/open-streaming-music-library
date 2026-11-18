@@ -14,6 +14,8 @@
 include: package:lints/recommended.yaml
 
 analyzer:
+  exclude:
+    - test_shards/**
   errors:
     use_null_aware_elements: ignore
 

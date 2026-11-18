@@ -57,6 +57,7 @@ class AlbumCard extends ConsumerWidget {
           : 'Album, ${album.name ?? 'Unknown Album'}, by '
                 '${album.artist ?? 'Unknown Artist'}',
       onTap: onTap,
+      dimmed: !availability.isUnknown && !availability.canPlay,
       availability: availability,
       menu: buildLibraryActionMenu(
         scope,

@@ -3,16 +3,24 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/api_client_provider.dart';
+import 'package:frontend/api/auth_api.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_providers.dart';
+import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
+import 'package:frontend/services/credential_store.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/history/listen_recorder.dart';
 import 'package:frontend/services/local_resettable.dart';
+import 'package:frontend/services/operations/durable_submission.dart';
 import 'package:frontend/services/server_binding_gate.dart';
+import 'package:frontend/services/session_event_log.dart';
+import 'package:frontend/services/uploads/upload_manager.dart';
 
 /// Coordinates a full local reset of frontend-owned state in three steps
 /// (SC-15):
@@ -91,7 +99,35 @@ class LocalResetService {
     return prefs.getBool(resetPendingKey) ?? false;
   }
 
+  /// Whether the session token may be sent to the revoke target: the app is
+  /// not offline (after an outage the host at the saved address is in doubt,
+  /// a network switch can put another host there; review F1), and the gate
+  /// verified the bound instance at the revoke client's base URL in this
+  /// scope and no check failed since (a re-probe in flight doesn't forget
+  /// it). Read before the gate is stopped or closed.
+  bool _gateVerified() =>
+      !_ref.read(offlineModeProvider) &&
+      _ref
+          .read(serverBindingGateProvider)
+          .maySendTokenTo(_ref.read(apiClientProvider).baseUrl);
+
+  /// The one-shot revoke client (sign-off OPEN-M-11), taken at the same
+  /// entry point as [_gateVerified] while the lenient revoke rule holds; null
+  /// when it does not.
+  ApiClient? _takeRevoker(bool verified) =>
+      verified ? _ref.read(apiClientProvider).revokeOnceClient() : null;
+
+  /// Revokes the scope's session, best effort, when signed in and a revoker
+  /// was taken.
+  Future<void> _revokeWith(ApiClient? revoker) async {
+    if (revoker != null && _ref.read(credentialsProvider) != null) {
+      await revokeBestEffort(revoker);
+    }
+  }
+
   Future<void> reset() async {
+    final verified = _gateVerified();
+    final revoker = _takeRevoker(verified);
     // 1. Fence. The generation bump happens before the first await. The
     // pending marker is saved first: a kill from here on is finished by the
     // next launch.
@@ -120,9 +156,56 @@ class LocalResetService {
       }
     }
 
+    // Disconnect also revokes the session (best effort), once the fence held
+    // and old-scope work is quiesced, before the wipe deletes the credentials.
+    await _revokeWith(revoker);
+
     // 3. Wipe.
     await _wipe(failures);
     if (failures.isNotEmpty) {
+      throw LocalResetException(failures);
+    }
+  }
+
+  /// Logout (spec 7.6): not a reset, so no marker and no wipe. Bumps the
+  /// generation, quiesces (playback admission first, then listens and
+  /// history, so the last checkpoint lands), rotates the binding token so
+  /// late writes from the old scope are no-ops, stops the gate, revokes the
+  /// session best effort, and deletes the stored credentials. The saved URL
+  /// and every local store stay. Every step runs even if an earlier one
+  /// fails; failures (quiesce ones flagged) are thrown together, except that
+  /// quiesce failures alone do not throw.
+  Future<void> signOut() async {
+    final verified = _gateVerified();
+    final revoker = _takeRevoker(verified);
+    _generation++;
+    final failures = <LocalResetFailure>[];
+    for (final q in _ref.read(localQuiescablesProvider)) {
+      try {
+        await q.quiesce().timeout(quiesceTimeout);
+      } catch (e, st) {
+        failures.add(LocalResetFailure(q.runtimeType, e, st, quiesce: true));
+      }
+    }
+    try {
+      await _ref.read(serverBindingRepositoryProvider).rotate();
+    } catch (e, st) {
+      failures.add(
+        LocalResetFailure(ServerBindingRepository, e, st),
+      );
+    }
+    // Closed for good (not just stopped): no recovery edge may restart it
+    // and hand the rotated token to old-scope runners.
+    final gate = _ref.read(serverBindingGateProvider);
+    gate.stop(); // back to idle: a closed gate keeps its last state
+    gate.dispose();
+    await _revokeWith(revoker);
+    try {
+      await _ref.read(credentialStoreProvider).delete();
+    } catch (e, st) {
+      failures.add(LocalResetFailure(CredentialStore, e, st));
+    }
+    if (failures.any((f) => !f.quiesce)) {
       throw LocalResetException(failures);
     }
   }
@@ -245,7 +328,10 @@ final localQuiescablesProvider = Provider<List<Quiescable>>((ref) {
   return <Quiescable>[
     _PlaybackQuiescable(ref),
     _ListenQuiescable(ref),
+    _PreviewQuiescable(ref),
     _HistoryQuiescable(ref),
+    _UploadsQuiescable(ref),
+    _SubmissionsQuiescable(ref),
   ];
 });
 
@@ -255,6 +341,10 @@ final lossReportersProvider = Provider<List<LossReporter>>((ref) {
   return <LossReporter>[
     ref.read(editOutboxProvider),
     _HistoryLossReporter(ref),
+    UploadLossReporter(
+      intents: ref.read(uploadIntentStoreProvider),
+      binding: ref.read(serverBindingRepositoryProvider),
+    ),
   ];
 });
 
@@ -265,8 +355,9 @@ final localResetServiceProvider = Provider<LocalResetService>((ref) {
 /// Subsystems registered for the full local-reset flow. Each entry is
 /// either a class that implements [LocalResettable] directly (e.g.
 /// [DownloadManager]) or a small adapter for stateless / third-party
-/// reset steps (offline polling stop, SharedPreferences clear, ApiClient URL
-/// clear). Playback is not wiped here: it is quiesced first
+/// reset steps (offline polling stop, SharedPreferences clear). The
+/// [CredentialStore] is a participant too (Phase M, SC-15).
+/// Playback is not wiped here: it is quiesced first
 /// ([localQuiescablesProvider]).
 ///
 /// Order in this list does not matter — [LocalResetService] sorts by
@@ -280,7 +371,8 @@ final localResettablesProvider = Provider<List<LocalResettable>>((ref) {
     ref.read(coverArtCacheProvider),
     ref.read(databaseProvider),
     _PrefsClearResettable(ref),
-    _ApiClientUrlResettable(),
+    ref.read(credentialStoreProvider),
+    ?ref.read(sessionEventLogFileProvider),
   ];
 });
 
@@ -288,7 +380,7 @@ final localResettablesProvider = Provider<List<LocalResettable>>((ref) {
 //
 // Adapters wrap reset steps whose owning class would not otherwise know
 // about [LocalResettable] (Riverpod notifiers accessed via [Ref], the
-// third-party SharedPreferences, the static ApiClient.init entry point).
+// third-party SharedPreferences, the scope rebuild replaces the transport URL).
 // Direct implementors live on the subsystem class itself.
 
 /// The playback runtime as one ordered quiesce participant: closes playback
@@ -317,6 +409,55 @@ class _ListenQuiescable implements Quiescable {
   Future<void> quiesce() async {
     if (_ref.exists(listenRecorderProvider)) {
       await _ref.read(listenRecorderProvider).quiesce();
+    }
+  }
+}
+
+/// The preview player, after listens (SC-15): cancels pending loads, stops
+/// and releases the output. Never builds the player.
+class _PreviewQuiescable implements Quiescable {
+  _PreviewQuiescable(this._ref);
+  final Ref _ref;
+
+  @override
+  String get quiesceName => 'preview';
+
+  @override
+  Future<void> quiesce() async {
+    if (_ref.exists(previewPlayerProvider)) {
+      await _ref.read(previewPlayerProvider.notifier).quiesce();
+    }
+  }
+}
+
+/// Durable submissions, after history (SC-15): aborts sends in flight and
+/// closes admission. Never builds the helper.
+class _UploadsQuiescable implements Quiescable {
+  _UploadsQuiescable(this._ref);
+  final Ref _ref;
+
+  @override
+  String get quiesceName => 'uploads';
+
+  @override
+  Future<void> quiesce() async {
+    if (_ref.exists(uploadManagerProvider)) {
+      await _ref.read(uploadManagerProvider).quiesce();
+    }
+  }
+}
+
+class _SubmissionsQuiescable implements Quiescable {
+  _SubmissionsQuiescable(this._ref);
+  final Ref _ref;
+
+  @override
+  String get quiesceName => 'submissions';
+
+  @override
+  Future<void> quiesce() async {
+    if (_ref.exists(durableSubmissionProvider)) {
+      await _ref.read(durableSubmissionProvider).quiesce();
     }
   }
 }
@@ -356,16 +497,6 @@ class _PrefsClearResettable implements LocalResettable {
         throw StateError('preference "$key" could not be cleared');
       }
     }
-  }
-}
-
-class _ApiClientUrlResettable implements LocalResettable {
-  @override
-  int get resetPriority => ResetPriority.clearTransport;
-
-  @override
-  Future<void> resetLocalState() async {
-    ApiClient.init('');
   }
 }
 

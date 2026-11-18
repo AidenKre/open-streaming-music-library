@@ -63,6 +63,8 @@ Map<String, Object?> _page(
   required int latest,
 }) => {'changes': changes, 'nextCursor': next, 'latestRevision': latest};
 
+ApiClient api = testApiClient('', MockClient((_) async => throw StateError('unset')));
+
 void main() {
   late AppDatabase db;
   late ServerBindingRepository binding;
@@ -78,7 +80,7 @@ void main() {
     SharedPreferences.setMockInitialValues(prefs);
     return SyncService(
       db: db,
-      api: TracksApi(),
+      api: TracksApi(api: api),
       queueRepository: QueueRepository(db),
       prefs: await SharedPreferences.getInstance(),
       bindingToken: token,
@@ -95,7 +97,7 @@ void main() {
     holdResponses = null;
     requestArrived = null;
     trackResponse = null;
-    ApiClient.initForTest(
+    api = testApiClient(
       'http://test:8080',
       MockClient((req) async {
         final segs = req.url.pathSegments;
