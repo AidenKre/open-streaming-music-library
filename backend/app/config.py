@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     enable_deletion_worker: bool = True  # executes accepted server deletion jobs (8A.3c); off leaves them pending until a start with it on
     deletion_janitor_interval_s: int = Field(3600, ge=1)  # seconds between the deletion worker's retries of pending committed clean-ups
     enable_identity_worker: bool = True  # background audio-identity scan (6.5); off stops identity backfill and recompute
+    enable_lastfm_sender: bool = True  # test seam, not an operator setting (off silently queues listens without sending); left out of the operator guide
 
     # Encoded tracks cache (used for transcoded streams)
     encoded_cache_size_gb: float = 5.0
@@ -49,6 +50,20 @@ class Settings(BaseSettings):
     osml_max_users: int = Field(25, ge=0)
     # Test-only: cheap argon2 parameters. Never enable in production.
     osml_insecure_fast_password_hashing: bool = False
+
+    # Last.fm: loose types, no validators, so a typo never stops Settings();
+    # app.services.lastfm_config.resolve_lastfm_config checks them.
+    lastfm_enabled: str | None = None
+    lastfm_api_key: SecretStr | None = None
+    lastfm_api_secret: SecretStr | None = None
+    lastfm_credential_key: SecretStr | None = None
+    lastfm_api_key_file: str | None = None
+    lastfm_api_secret_file: str | None = None
+    lastfm_credential_key_file: str | None = None
+    lastfm_settle_delay_s: str | None = None
+    lastfm_min_request_gap_s: str | None = None
+    lastfm_app_name: str | None = None
+    osml_insecure_lastfm_api_url: str | None = None
 
     # Fingerprinter selection: auto = fpcalc or none (the ffmpeg chromaprint
     # backend is not built, so "ffmpeg" means no fingerprinting). fpcalc_path is used

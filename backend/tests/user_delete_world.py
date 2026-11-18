@@ -50,6 +50,9 @@ USER_ROWS = {
     "deletion_jobs": "owner_id = :uid",
     "deletion_job_items": "owner_id = :uid",
     "deletion_journal": "owner_id = :uid",
+    # Phase 9D.1b: one Last.fm connection per user.
+    "lastfm_connections": "owner_id = :uid",
+    "scrobble_outbox": "owner_id = :uid",
 }
 SERVER_WIDE_TABLES = {"app_settings", "revision_counter", "cover_arts"}
 FTS_TABLES = {"fts_tracks", "fts_artists", "fts_albums"}
@@ -142,6 +145,20 @@ def _deletion_rows(world, uid, track_uuid):
                   "'committed', 0, 0)", (uid, SHARED_DELETION, track_uuid))
 
 
+def _lastfm_rows(world, uid, name):
+    """A bound Last.fm connection (made-up ciphertext) with a pending token."""
+    sql(world.db, "INSERT INTO lastfm_connections (owner_id, connection_id, account_name, "
+                  "session_key_enc, opted_in, needs_reconnect, pending_token_enc, "
+                  "pending_token_expires_at, created_at, updated_at) "
+                  "VALUES (?, ?, ?, ?, 1, 0, ?, 600000, 0, 0)",
+        (uid, f"conn-{name}", f"{name}-on-lastfm", f"enc-session-{name}", f"enc-token-{name}"))
+    for event, status, code, done in ((f"{name}-sent", "sent", None, 5), (f"{name}-wait", "pending", None, None),
+                                      (f"{name}-lost", "dropped", "too_old", 6)):
+        sql(world.db, "INSERT INTO scrobble_outbox (event_uuid, owner_id, payload, listened_at_s, "
+                      "status, result_code, created_at, done_at) VALUES (?, ?, ?, 100, ?, ?, 1, ?)",
+            (event, uid, '{"artist": "Radiohead", "track": "Lucky", "timestamp": 100}', status, code, done))
+
+
 def _upload_rows(world, uid):
     sql(world.db, "INSERT INTO upload_batches (owner_id, batch_uuid, label, created_at, "
                   "updated_at) VALUES (?, ?, 'upload', 0, 0)", (uid, SHARED_BATCH))
@@ -197,6 +214,7 @@ def build_world(settings) -> World:
     _candidate_pair(world, world.sam, world.sam_uuids)
     _per_user_rows(world, world.sam, lucky.uuid_id, "sam")
     _upload_rows(world, world.sam)
+    _lastfm_rows(world, world.sam, "sam")
 
     # Alex: the same "Lucky", plus one of their own.
     a_lucky = add_track(db, settings, world.alex, cover_art_id=shared)
@@ -211,6 +229,7 @@ def build_world(settings) -> World:
     _candidate_pair(world, world.alex, world.alex_uuids)
     _per_user_rows(world, world.alex, a_lucky.uuid_id, "alex")
     _upload_rows(world, world.alex)
+    _lastfm_rows(world, world.alex, "alex")
 
     # Files beside the rows.
     music, data = settings.music_library_dir, settings.app_data_dir

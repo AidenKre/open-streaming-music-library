@@ -72,6 +72,14 @@ OWNER_METHODS: tuple[str, ...] = (
     # 8A.4: the duplicates API's reads.
     "list_duplicate_candidates",
     "count_duplicate_candidates",
+    # 9D.1b: the Last.fm connection and outbox rows behind the routes (spec §7.3, §7.4).
+    "get_lastfm_connection",
+    "store_lastfm_pending_token",
+    "clear_lastfm_pending_token",
+    "bind_lastfm_session",
+    "enable_lastfm_scrobbling",
+    "disconnect_lastfm",
+    "get_lastfm_outbox_summary",
 )
 
 

@@ -158,6 +158,15 @@ class LibraryToolsCapabilities(BaseModel):
     duplicate_review: bool = False
 
 
+class LastfmCapability(BaseModel):
+    available: bool
+
+
+class IntegrationsCapabilities(BaseModel):
+    version: int = 1
+    lastfm: LastfmCapability
+
+
 class AppInfoResponse(BaseModel):
     """App-level bootstrap blob. The home for app-global facts so later phases
     extend it (Phase 2 adds a ``conversion`` block) rather than add endpoints.
@@ -170,6 +179,7 @@ class AppInfoResponse(BaseModel):
     auth: AuthCapabilities
     uploads: UploadsCapabilities
     library_tools: LibraryToolsCapabilities
+    integrations: IntegrationsCapabilities
 
 
 class JobResponse(BaseModel):

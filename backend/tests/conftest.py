@@ -19,18 +19,27 @@ the difference; the product's own setting is untouched. A test about
 durability settings carries ``@pytest.mark.real_sqlite_durability`` and gets
 the unwrapped ``sqlite3.connect`` (``tests/test_sqlite_test_durability.py``
 pins both sides).
+
+No test reaches a host off this machine (9-R1-02: ``RealNetworkRefused``,
+checked at every test's teardown), and the suite's first ``app.config`` import
+reads no ``.env`` from the launch directory (9-R1-03);
+``tests/test_conftest_env_isolation.py`` pins both.
 """
 
+import atexit
 import contextlib
 import functools
+import ipaddress
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping
 from types import ModuleType
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -71,6 +80,87 @@ def _real_sqlite_durability_opt_out(request, monkeypatch):
     if request.node.get_closest_marker("real_sqlite_durability") is not None:
         monkeypatch.setitem(_SYNC_OFF, "enabled", False)
 
+
+# 9-R1-02: no test may reach a host off this machine through a real httpx
+# transport (every app built with ``valid_env()`` holds a client on the real
+# Last.fm URL; only a test's own fake keeps it away). Installed at import,
+# before any ``app`` import, over the class methods, so every transport any
+# code builds is covered. A refused attempt raises ``RealNetworkRefused`` (not
+# an ``httpx`` error, which the client would quietly read as "try later"),
+# sends nothing, and is recorded: ``_no_refused_network`` fails the test at
+# teardown even when the code under test swallowed the error (the sender
+# catches every exception per user). Loopback stays the test's own business.
+class RealNetworkRefused(RuntimeError):
+    """A test tried to reach a host off this machine through a real httpx transport."""
+
+
+_REFUSED_HOSTS: list[str] = []
+_REAL_HTTP_HANDLE = httpx.HTTPTransport.handle_request
+_REAL_ASYNC_HTTP_HANDLE = httpx.AsyncHTTPTransport.handle_async_request
+
+
+def _refuse_off_machine(request) -> None:
+    host = request.url.host
+    if host == "localhost":
+        return
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return
+    except ValueError:
+        pass
+    _REFUSED_HOSTS.append(host)
+    raise RealNetworkRefused(f"a test tried to reach {host} through a real network transport")
+
+
+@functools.wraps(_REAL_HTTP_HANDLE)
+def _guarded_handle_request(self, request):
+    _refuse_off_machine(request)
+    return _REAL_HTTP_HANDLE(self, request)
+
+
+@functools.wraps(_REAL_ASYNC_HTTP_HANDLE)
+async def _guarded_handle_async_request(self, request):
+    _refuse_off_machine(request)
+    return await _REAL_ASYNC_HTTP_HANDLE(self, request)
+
+
+httpx.HTTPTransport.handle_request = _guarded_handle_request
+httpx.AsyncHTTPTransport.handle_async_request = _guarded_handle_async_request
+
+
+def take_refused_hosts() -> list[str]:
+    """The hosts refused since the last call, in order; the record is emptied."""
+    hosts = list(_REFUSED_HOSTS)
+    del _REFUSED_HOSTS[: len(hosts)]
+    return hosts
+
+
+def check_no_refused_network() -> None:
+    """Fails the running test when any refused attempt is on record (and consumes it)."""
+    hosts = take_refused_hosts()
+    if hosts:
+        pytest.fail(
+            f"a test tried to reach {', '.join(sorted(set(hosts)))} through a real network transport",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_refused_network():
+    yield
+    check_no_refused_network()
+
+
+# 9-R1-03: ``app.config`` builds ``settings = Settings()`` at import, and
+# Settings reads ``.env`` relative to the working directory: pytest launched
+# from a developer's ``backend/`` would load its real ``.env`` (external
+# account secrets included) into the test process. The first import happens
+# here, from an empty directory of this process's own, so no launch-directory
+# ``.env`` is read; ``configure_app`` re-imports it from each test's tmp_path.
+_IMPORT_CWD = tempfile.mkdtemp(prefix="osml-tests-import-")
+atexit.register(shutil.rmtree, _IMPORT_CWD, ignore_errors=True)
+with contextlib.chdir(_IMPORT_CWD):
+    import app.config  # noqa: E402,F401
 
 import app.services as _services  # noqa: E402  (after the sqlite3 wrapper)
 from app.services import ffmpeg_runner as _ffmpeg_runner  # noqa: E402
@@ -189,6 +279,9 @@ def configure_app(tmp_path, monkeypatch):
         monkeypatch.setenv("ENABLE_UPLOAD_JANITOR", "false")
         # 8A.3c: and no deletion worker thread; its app tests turn it on.
         monkeypatch.setenv("ENABLE_DELETION_WORKER", "false")
+        # 9D.2b (DEV-9D2b-06): and no Last.fm sender thread; its app tests turn
+        # it on through ``env``.
+        monkeypatch.setenv("ENABLE_LASTFM_SENDER", "false")
         # 6.5B.1b: no fingerprinter unless a test asks for one (fpcalc may be
         # installed on the machine running the tests).
         monkeypatch.setenv("AUDIO_FINGERPRINT_BACKEND", "off")
@@ -198,6 +291,12 @@ def configure_app(tmp_path, monkeypatch):
         monkeypatch.setenv("OSML_ADMIN_PASSWORD", TEST_ADMIN_PASSWORD)
         monkeypatch.delenv("OSML_ADMIN_PASSWORD_FILE", raising=False)
         monkeypatch.setenv("OSML_INSECURE_FAST_PASSWORD_HASHING", "true")
+        # No test may ever contact Last.fm: drop any Last.fm configuration
+        # exported in the shell, so the only one an app test sees is what the
+        # test itself passes through ``env`` (applied next, so it wins).
+        for name in list(os.environ):
+            if name.startswith(("LASTFM_", "OSML_INSECURE_LASTFM_")):
+                monkeypatch.delenv(name)
         for name, value in (env or {}).items():
             monkeypatch.setenv(name, value)
         if encoders is not None:

@@ -106,8 +106,10 @@ void main() {
     ]) {
       testWidgets('summarizes: $label', (tester) async {
         await pump(tester, diag);
-        expect(find.text('Sync & storage'), findsOneWidget);
+        // Phase 9's Home section sits above: bring the row into the lazy list
+        // before looking for its section title.
         await toRow(tester);
+        expect(find.text('Sync & storage'), findsOneWidget);
         expect(find.text(summary), findsOneWidget);
       });
     }

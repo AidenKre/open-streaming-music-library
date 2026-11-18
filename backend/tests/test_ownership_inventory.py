@@ -109,6 +109,14 @@ OWNED = {
     "create_deletion_job",
     "get_deletion_job",
     "list_deletion_jobs",
+    # 9D.1b: the Last.fm connection and outbox rows behind the routes (spec §7.3, §7.4).
+    "get_lastfm_connection",
+    "store_lastfm_pending_token",
+    "clear_lastfm_pending_token",
+    "bind_lastfm_session",
+    "enable_lastfm_scrobbling",
+    "disconnect_lastfm",
+    "get_lastfm_outbox_summary",
 }
 
 # Server-wide: no owner (spec §4.2 "Server-wide methods") plus the users table.
@@ -272,6 +280,28 @@ UPLOAD_COMMIT_WORKER = {
     "adopt_upload_commit_art",
 }
 
+# 9D.1b: the offline operator purge (spec §7.11): every user's Last.fm rows at
+# once, by design. Only ``app/cli.py`` (``lastfm purge``) calls it; no route does.
+LASTFM_PURGE = {"purge_lastfm_data"}
+
+# 9D.2b: the one scrobble sender (spec §7.8). Its due scan spans every owner
+# by design (it decides whom to serve); every later read and write of a user's
+# connection and rows names the owner read from that scan.
+LASTFM_SENDER = {
+    "list_due_lastfm_owners",
+    "read_lastfm_batch",
+    "settle_lastfm_rows",
+    # The retention pass (spec §7.3, §7.8 step 1): server-wide by design.
+    "prune_lastfm_outbox",
+    # Answer rules (§7.9): each names the owner read from the due scan.
+    "count_lastfm_try",
+    "mark_lastfm_alone",
+    "mark_lastfm_needs_reconnect",
+    # 9D.2c: Now Playing re-reads the notice's owner and track inside the gate
+    # (spec §7.10); it names the owner the notice was put for.
+    "read_lastfm_now_playing",
+}
+
 # 8A.3c: the deletion worker, server-wide like the upload workers: it claims
 # any owner's pending item by boot id; every later read and write names the
 # owner read from the claimed row.
@@ -370,7 +400,7 @@ def db(tmp_path):
 def test_every_public_database_method_is_classified():
     groups = [OWNED, SERVER_WIDE, COVER_ART_RELEASE, USER_ADMIN, IDENTITY_WORKER, IDENTITY_RECONCILE,
               STORAGE_LEDGER, UPLOAD_RECEIPT_RECONCILE, UPLOAD_VALIDATION_WORKER, UPLOAD_COMMIT_WORKER,
-              DELETION_WORKER, DELETION_RECOVERY]
+              LASTFM_PURGE, LASTFM_SENDER, DELETION_WORKER, DELETION_RECOVERY]
     assert sum(len(g) for g in groups) == len(set().union(*groups)), "overlapping groups"
     assert _public_methods() == set().union(*groups)
 

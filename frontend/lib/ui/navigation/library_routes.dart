@@ -7,6 +7,7 @@ import 'package:frontend/ui/browse/browse_pages.dart';
 import 'package:frontend/ui/downloaded_tracks_page.dart';
 import 'package:frontend/ui/feed/see_all_recents_page.dart';
 import 'package:frontend/ui/get_info_page.dart';
+import 'package:frontend/ui/listening_stats_page.dart';
 import 'package:frontend/ui/tracks_page.dart';
 
 /// Library navigation, defined once (SC-06/SC-08): every surface opens
@@ -51,8 +52,8 @@ void openTrackInfo(BuildContext context, TrackUI track) {
   ).push(MaterialPageRoute<void>(builder: (_) => GetInfoPage(track: track)));
 }
 
-/// The library browse-all destinations (Home's entry points).
-enum BrowseDestination { artists, albums, tracks, downloaded }
+/// Home's entry-point destinations, opened on Home's navigator.
+enum BrowseDestination { artists, albums, tracks, downloaded, listeningStats }
 
 /// Opens a browse-all page on the caller's (tab) navigator; each owns one
 /// back AppBar.
@@ -62,6 +63,7 @@ void openBrowse(BuildContext context, BrowseDestination destination) {
     BrowseDestination.albums => const AlbumsBrowsePage(),
     BrowseDestination.tracks => const TracksBrowsePage(),
     BrowseDestination.downloaded => const DownloadedTracksPage(),
+    BrowseDestination.listeningStats => const ListeningStatsPage(),
   };
   Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => page));
 }

@@ -48,8 +48,8 @@ def fresh(tmp_path):
     return path
 
 
-def test_latest_schema_version_is_16():
-    assert Database.LATEST_SCHEMA_VERSION == 16
+def test_latest_schema_version_is_17():
+    assert Database.LATEST_SCHEMA_VERSION == 17
 
 
 def test_history_events_columns(fresh):

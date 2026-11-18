@@ -5,6 +5,7 @@ import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/now_playing_publisher.dart';
 import 'package:frontend/playback/queue_warm_listener.dart';
 import 'package:frontend/services/history/listen_recorder.dart';
+import 'package:frontend/services/lastfm/lastfm_now_playing.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/ui/player_controller.dart';
 
@@ -45,6 +46,8 @@ final playbackWiringProvider = Provider<PlaybackWiring>((ref) {
     if (!ref.mounted) return;
     ref.listen(nowPlayingPublisherProvider, (_, _) {});
     ref.listen(queueWarmListenerProvider, (_, _) {});
+    // Last.fm Now Playing (9D, spec §7.10); reads nothing until a track plays.
+    ref.listen(lastfmNowPlayingProvider, (_, _) {});
     // Listen accounting starts behind its startup barrier (5B.3).
     ref.listen(listenRecorderProvider, (_, _) {});
     unawaited(ref.read(listenRecorderProvider).start());

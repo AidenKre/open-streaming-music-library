@@ -13,6 +13,7 @@ import 'package:frontend/playback/now_playing_publisher.dart';
 import 'package:frontend/playback/queue_warm_listener.dart';
 import 'package:frontend/providers/cover_art_cache_manager.dart';
 import 'package:frontend/services/history/listen_recorder.dart';
+import 'package:frontend/services/lastfm/lastfm_now_playing.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/ui/playback_wiring.dart';
 import 'package:frontend/ui/player_controller.dart';
@@ -105,6 +106,40 @@ void main() {
     readiness.markReady();
     await pumpEventQueue();
     expect((publishers, warmers), (1, 1));
+  });
+
+  // Phase 9D.2d (spec §7.10): the Last.fm Now Playing observer is kept
+  // alive from the session-ready signal on, like the other observers.
+  test('Last.fm Now Playing is kept alive from the session-ready signal on',
+      () async {
+    var builds = 0;
+    final readiness = SessionReadiness();
+    final c = ProviderContainer(overrides: [
+      apiOverride,
+      audioServiceProvider.overrideWithValue(bridge),
+      coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
+      playerControlsProvider.overrideWithValue(FakePlayerControls()),
+      sessionReadinessProvider.overrideWithValue(readiness),
+      nowPlayingPublisherProvider.overrideWith(
+        (ref) => NowPlayingPublisher(bridge, CoverArtCacheManager.noop()),
+      ),
+      queueWarmListenerProvider.overrideWith((ref) => _NoWarm()),
+      listenRecorderProvider.overrideWith((ref) => _FakeRecorder()),
+      lastfmNowPlayingProvider.overrideWith((ref) {
+        builds++;
+        return LastfmNowPlaying(ref);
+      }),
+      lastfmPlaybackSignalProvider.overrideWithValue(
+        (status: PlayerStatus.idle, itemId: null, trackUuid: null, atStart: false),
+      ),
+    ]);
+    addTearDown(c.dispose);
+    c.listen(playbackWiringProvider, (_, _) {});
+    await pumpEventQueue();
+    expect(builds, 0, reason: 'nothing before the session is ready');
+    readiness.markReady();
+    await pumpEventQueue();
+    expect(builds, 1);
   });
 
   test('the listen recorder is built and started once the session is ready',

@@ -1,0 +1,2824 @@
+{
+ "about": "Writes workbook.json, the independent fixture workbook for listening stats.",
+ "definitions": "Definitions applied (spec \u00a72, \u00a73 and the 9A.1a plan):\n- a counted listen: kind 'play', entity_type 'track', seconds positive and\n  finite, local_id <= the case boundary, start inside the half-open range and\n  strictly before capturedNow;\n- qualified: seconds >= min(30, length / 2) when length is positive and\n  finite, else seconds >= 30 (unknown, zero or negative length);\n- resolvable: the track has both a tracks row and a trackmetadata row;\n  anything else is unavailable (counted in totals, absent from rankings);\n- artist group: the track's current artist_id when that artist row exists;\n  album group: the track's current album_id when the album row and its album\n  artist row exist (the SC-12 projections' joins);\n- ranks: seconds DESC, qualified DESC, id ASC; top 10;\n- future: a would-be counted listen (kind, type, seconds, boundary) whose\n  start is >= capturedNow, counted whatever the range;\n- buckets: UTC days for rolling ranges, UTC months for years and all time,\n  covering [range start, min(range end, now)); all time starts at the month\n  of the earliest counted listen and is capped to the latest 24 months.",
+ "catalog": {
+  "artists": [
+   {
+    "id": 1,
+    "name": "Aria"
+   },
+   {
+    "id": 2,
+    "name": "Bram"
+   },
+   {
+    "id": 3,
+    "name": "Cleo"
+   }
+  ],
+  "albums": [
+   {
+    "id": 10,
+    "artistId": 1,
+    "name": "One"
+   },
+   {
+    "id": 11,
+    "artistId": 1,
+    "name": "Two"
+   },
+   {
+    "id": 20,
+    "artistId": 2,
+    "name": "Same"
+   },
+   {
+    "id": 30,
+    "artistId": 3,
+    "name": "Fillers"
+   },
+   {
+    "id": 40,
+    "artistId": 98,
+    "name": "Orphaned album"
+   }
+  ],
+  "tracks": [
+   {
+    "uuid": "t-a",
+    "artistId": 1,
+    "albumId": 10,
+    "title": "Song"
+   },
+   {
+    "uuid": "t-b",
+    "artistId": 1,
+    "albumId": 11,
+    "title": "Song"
+   },
+   {
+    "uuid": "t-c",
+    "artistId": 2,
+    "albumId": 20,
+    "title": "Other"
+   },
+   {
+    "uuid": "t-d",
+    "artistId": 2,
+    "albumId": 20,
+    "title": "Tie"
+   },
+   {
+    "uuid": "t-e",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Tie"
+   },
+   {
+    "uuid": "t-0rph",
+    "artistId": 99,
+    "albumId": 10,
+    "title": "Orphan"
+   },
+   {
+    "uuid": "t-none",
+    "artistId": null,
+    "albumId": null,
+    "title": "Bare"
+   },
+   {
+    "uuid": "t-oalb",
+    "artistId": 3,
+    "albumId": 40,
+    "title": "Lost album"
+   },
+   {
+    "uuid": "t-f01",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 1"
+   },
+   {
+    "uuid": "t-f02",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 2"
+   },
+   {
+    "uuid": "t-f03",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 3"
+   },
+   {
+    "uuid": "t-f04",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 4"
+   },
+   {
+    "uuid": "t-f05",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 5"
+   },
+   {
+    "uuid": "t-f06",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 6"
+   },
+   {
+    "uuid": "t-f07",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 7"
+   },
+   {
+    "uuid": "t-f08",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 8"
+   },
+   {
+    "uuid": "t-f09",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 9"
+   },
+   {
+    "uuid": "t-f10",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 10"
+   },
+   {
+    "uuid": "t-f11",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Filler 11"
+   }
+  ],
+  "tracksWithoutMetadata": [
+   "t-nometa"
+  ]
+ },
+ "events": [
+  {
+   "uuid": "e-thr-below-40",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2025-12-28T10:00:00.000Z",
+   "seconds": 19.999,
+   "length": 40.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "below min(30, 40/2) = 20",
+   "localId": 1,
+   "atMs": 1766916000000,
+   "expect": {
+    "metric": true,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-28",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-thr-equal-40",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2025-12-28T11:00:00.000Z",
+   "seconds": 20.0,
+   "length": 40.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "exactly 20: qualifies",
+   "localId": 2,
+   "atMs": 1766919600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-28",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-thr-above-40",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2025-12-28T12:00:00.000Z",
+   "seconds": 20.001,
+   "length": 40.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 3,
+   "atMs": 1766923200000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-28",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-thr-below-200",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-29T10:00:00.000Z",
+   "seconds": 29.999,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 4,
+   "atMs": 1767002400000,
+   "expect": {
+    "metric": true,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-thr-equal-200",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-29T11:00:00.000Z",
+   "seconds": 30.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 5,
+   "atMs": 1767006000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-unk-below",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2025-12-29T12:00:00.000Z",
+   "seconds": 29.5,
+   "length": null,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "unknown length: needs 30",
+   "localId": 6,
+   "atMs": 1767009600000,
+   "expect": {
+    "metric": true,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-unk-equal",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2025-12-29T13:00:00.000Z",
+   "seconds": 30.0,
+   "length": null,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 7,
+   "atMs": 1767013200000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-zero-len",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2025-12-29T14:00:00.000Z",
+   "seconds": 25.0,
+   "length": 0.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "zero length is not a positive known duration: needs 30",
+   "localId": 8,
+   "atMs": 1767016800000,
+   "expect": {
+    "metric": true,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-neg-len",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2025-12-29T15:00:00.000Z",
+   "seconds": 25.0,
+   "length": -10.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 9,
+   "atMs": 1767020400000,
+   "expect": {
+    "metric": true,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-inf-len",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2025-12-29T16:00:00.000Z",
+   "seconds": 29.0,
+   "length": "Infinity",
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "infinite length is not finite: needs 30",
+   "localId": 10,
+   "atMs": 1767024000000,
+   "expect": {
+    "metric": true,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-zero-sec",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-30T10:00:00.000Z",
+   "seconds": 0.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 11,
+   "atMs": 1767088800000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-neg-sec",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-30T11:00:00.000Z",
+   "seconds": -5.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 12,
+   "atMs": 1767092400000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-null-sec",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-30T12:00:00.000Z",
+   "seconds": null,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 13,
+   "atMs": 1767096000000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-inf-sec",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-30T13:00:00.000Z",
+   "seconds": "Infinity",
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 14,
+   "atMs": 1767099600000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-rewind",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2025-12-30T14:00:00.000Z",
+   "seconds": 450.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "rewinds: 450 s of a 200 s track is 1 qualified play",
+   "localId": 15,
+   "atMs": 1767103200000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-tie-e1",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-e",
+   "at": "2025-12-30T16:00:00.000Z",
+   "seconds": 100.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 16,
+   "atMs": 1767110400000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-tie-e2",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-e",
+   "at": "2025-12-30T17:00:00.000Z",
+   "seconds": 100.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 17,
+   "atMs": 1767114000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-dev1",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-d",
+   "at": "2025-12-30T15:00:00.000Z",
+   "seconds": 100.0,
+   "length": 200.0,
+   "pendingUpload": true,
+   "serverRevision": null,
+   "note": "device 1, not yet uploaded",
+   "localId": 18,
+   "atMs": 1767106800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-dev2",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-d",
+   "at": "2025-12-30T15:00:00.000Z",
+   "seconds": 100.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": 7,
+   "note": "device 2, pulled",
+   "localId": 19,
+   "atMs": 1767106800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-tie-orph",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-0rph",
+   "at": "2025-12-30T18:00:00.000Z",
+   "seconds": 200.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 20,
+   "atMs": 1767117600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-none",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-none",
+   "at": "2025-12-30T19:00:00.000Z",
+   "seconds": 60.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 21,
+   "atMs": 1767121200000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-oalb",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-oalb",
+   "at": "2025-12-30T20:00:00.000Z",
+   "seconds": 60.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 22,
+   "atMs": 1767124800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-30",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-clicked",
+   "kind": "clicked",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-31T09:00:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 23,
+   "atMs": 1767171600000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-skip",
+   "kind": "skip",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-31T09:30:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 24,
+   "atMs": 1767173400000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-album-play",
+   "kind": "play",
+   "entityType": "album",
+   "ref": "srv:10",
+   "at": "2025-12-31T10:00:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 25,
+   "atMs": 1767175200000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-gone-1",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-gone",
+   "at": "2025-12-31T11:00:00.000Z",
+   "seconds": 40.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 26,
+   "atMs": 1767178800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": true,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-gone-2",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-gone",
+   "at": "2025-12-31T12:00:00.000Z",
+   "seconds": 10.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 27,
+   "atMs": 1767182400000,
+   "expect": {
+    "metric": true,
+    "qualified": false,
+    "unavailable": true,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-never",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-never",
+   "at": "2025-12-31T13:00:00.000Z",
+   "seconds": 35.0,
+   "length": null,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 28,
+   "atMs": 1767186000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": true,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-nometa",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-nometa",
+   "at": "2025-12-31T14:00:00.000Z",
+   "seconds": 31.0,
+   "length": 60.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 29,
+   "atMs": 1767189600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": true,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-dec31",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-31T23:59:59.999Z",
+   "seconds": 50.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 30,
+   "atMs": 1767225599999,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-31",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-jan1",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2026-01-01T00:00:00.000Z",
+   "seconds": 60.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 31,
+   "atMs": 1767225600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2026-01-01",
+    "utcMonth": "2026-01"
+   }
+  },
+  {
+   "uuid": "e-pre-midnight",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2026-01-01T23:59:00.000Z",
+   "seconds": 600.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "crosses midnight; belongs entirely to 2026-01-01",
+   "localId": 32,
+   "atMs": 1767311940000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2026-01-01",
+    "utcMonth": "2026-01"
+   }
+  },
+  {
+   "uuid": "e-midnight",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2026-01-02T00:00:00.000Z",
+   "seconds": 45.0,
+   "length": 90.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "exactly at midnight: 2026-01-02",
+   "localId": 33,
+   "atMs": 1767312000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2026-01-02",
+    "utcMonth": "2026-01"
+   }
+  },
+  {
+   "uuid": "e-jan3",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2026-01-03T11:59:59.999Z",
+   "seconds": 70.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "1 ms before the main capturedNow",
+   "localId": 34,
+   "atMs": 1767441599999,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2026-01-03",
+    "utcMonth": "2026-01"
+   }
+  },
+  {
+   "uuid": "e-7d-edge-in",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-none",
+   "at": "2025-12-27T12:00:00.000Z",
+   "seconds": 33.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 35,
+   "atMs": 1766836800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-27",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-7d-edge-out",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-none",
+   "at": "2025-12-27T11:59:59.999Z",
+   "seconds": 34.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 36,
+   "atMs": 1766836799999,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-27",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-at-now",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2026-01-03T12:00:00.000Z",
+   "seconds": 80.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 37,
+   "atMs": 1767441600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2026-01-03",
+    "utcMonth": "2026-01"
+   }
+  },
+  {
+   "uuid": "e-future",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2026-02-01T00:00:00.000Z",
+   "seconds": 90.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 38,
+   "atMs": 1769904000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2026-02-01",
+    "utcMonth": "2026-02"
+   }
+  },
+  {
+   "uuid": "e-future-click",
+   "kind": "clicked",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2026-02-01T00:00:00.000Z",
+   "seconds": 90.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "not a play: not in the future diagnostic",
+   "localId": 39,
+   "atMs": 1769904000000,
+   "expect": {
+    "metric": false,
+    "qualified": false,
+    "unavailable": false,
+    "utcDay": "2026-02-01",
+    "utcMonth": "2026-02"
+   }
+  },
+  {
+   "uuid": "e-30d-edge-in",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-oalb",
+   "at": "2025-12-04T12:00:00.000Z",
+   "seconds": 41.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 40,
+   "atMs": 1764849600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-04",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-30d-edge-out",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-oalb",
+   "at": "2025-12-04T11:59:59.999Z",
+   "seconds": 42.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 41,
+   "atMs": 1764849599999,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-04",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-jan2025",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2025-01-01T00:00:00.000Z",
+   "seconds": 300.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 42,
+   "atMs": 1735689600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-01-01",
+    "utcMonth": "2025-01"
+   }
+  },
+  {
+   "uuid": "e-2024-tie",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-e",
+   "at": "2024-07-01T00:00:00.000Z",
+   "seconds": 30.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 43,
+   "atMs": 1719792000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2024-07-01",
+    "utcMonth": "2024-07"
+   }
+  },
+  {
+   "uuid": "e-dec2024",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2024-12-31T23:59:59.999Z",
+   "seconds": 30.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 44,
+   "atMs": 1735689599999,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2024-12-31",
+    "utcMonth": "2024-12"
+   }
+  },
+  {
+   "uuid": "e-old",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2023-06-15T08:00:00.000Z",
+   "seconds": 1000.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "older than the 24-month chart window: totals only",
+   "localId": 45,
+   "atMs": 1686816000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2023-06-15",
+    "utcMonth": "2023-06"
+   }
+  },
+  {
+   "uuid": "e-fill-01",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f01",
+   "at": "2025-06-01T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 46,
+   "atMs": 1748779200000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-01",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-02",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f02",
+   "at": "2025-06-02T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 47,
+   "atMs": 1748865600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-02",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-03",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f03",
+   "at": "2025-06-03T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 48,
+   "atMs": 1748952000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-03",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-04",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f04",
+   "at": "2025-06-04T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 49,
+   "atMs": 1749038400000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-04",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-05",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f05",
+   "at": "2025-06-05T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 50,
+   "atMs": 1749124800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-05",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-06",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f06",
+   "at": "2025-06-06T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 51,
+   "atMs": 1749211200000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-06",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-07",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f07",
+   "at": "2025-06-07T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 52,
+   "atMs": 1749297600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-07",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-08",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f08",
+   "at": "2025-06-08T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 53,
+   "atMs": 1749384000000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-08",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-09",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f09",
+   "at": "2025-06-09T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 54,
+   "atMs": 1749470400000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-09",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-10",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f10",
+   "at": "2025-06-10T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 55,
+   "atMs": 1749556800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-10",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-fill-11",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f11",
+   "at": "2025-06-11T12:00:00.000Z",
+   "seconds": 120.0,
+   "length": 300.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 56,
+   "atMs": 1749643200000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-06-11",
+    "utcMonth": "2025-06"
+   }
+  },
+  {
+   "uuid": "e-late-1",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-12-29T09:00:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "local_id above the boundary case's boundary",
+   "localId": 57,
+   "atMs": 1766998800000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  },
+  {
+   "uuid": "e-late-2",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2025-12-29T09:30:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 58,
+   "atMs": 1767000600000,
+   "expect": {
+    "metric": true,
+    "qualified": true,
+    "unavailable": false,
+    "utcDay": "2025-12-29",
+    "utcMonth": "2025-12"
+   }
+  }
+ ],
+ "cases": [
+  {
+   "name": "7 days",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "rolling",
+    "days": 7
+   },
+   "boundary": null,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 3402.499,
+    "qualifiedPlays": 23,
+    "uniqueTracks": 11,
+    "activeDays": 8,
+    "unavailable": {
+     "listeningSeconds": 116.0,
+     "qualifiedPlays": 3
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "day",
+    "buckets": [
+     {
+      "label": "2025-12-27",
+      "seconds": 33.0
+     },
+     {
+      "label": "2025-12-28",
+      "seconds": 60.0
+     },
+     {
+      "label": "2025-12-29",
+      "seconds": 1198.499
+     },
+     {
+      "label": "2025-12-30",
+      "seconds": 1170.0
+     },
+     {
+      "label": "2025-12-31",
+      "seconds": 166.0
+     },
+     {
+      "label": "2026-01-01",
+      "seconds": 660.0
+     },
+     {
+      "label": "2026-01-02",
+      "seconds": 45.0
+     },
+     {
+      "label": "2026-01-03",
+      "seconds": 70.0
+     }
+    ],
+    "chartCapped": false,
+    "topTracks": [
+     {
+      "id": "t-b",
+      "seconds": 1283.5,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-a",
+      "seconds": 669.999,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-c",
+      "seconds": 580.0,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-e",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-0rph",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-none",
+      "seconds": 93.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-oalb",
+      "seconds": 60.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 1,
+      "seconds": 1953.499,
+      "qualifiedPlays": 8
+     },
+     {
+      "id": 2,
+      "seconds": 780.0,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 3,
+      "seconds": 260.0,
+      "qualifiedPlays": 3
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 11,
+      "seconds": 1283.5,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": 10,
+      "seconds": 869.999,
+      "qualifiedPlays": 5
+     },
+     {
+      "id": 20,
+      "seconds": 780.0,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 30,
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "30 days",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "rolling",
+    "days": 30
+   },
+   "boundary": null,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 3477.499,
+    "qualifiedPlays": 25,
+    "uniqueTracks": 11,
+    "activeDays": 9,
+    "unavailable": {
+     "listeningSeconds": 116.0,
+     "qualifiedPlays": 3
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "day",
+    "buckets": [
+     {
+      "label": "2025-12-04",
+      "seconds": 41.0
+     },
+     {
+      "label": "2025-12-05",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-06",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-07",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-08",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-09",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-10",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-11",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-12",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-13",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-14",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-15",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-16",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-17",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-18",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-19",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-20",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-21",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-22",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-23",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-24",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-25",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-26",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-27",
+      "seconds": 67.0
+     },
+     {
+      "label": "2025-12-28",
+      "seconds": 60.0
+     },
+     {
+      "label": "2025-12-29",
+      "seconds": 1198.499
+     },
+     {
+      "label": "2025-12-30",
+      "seconds": 1170.0
+     },
+     {
+      "label": "2025-12-31",
+      "seconds": 166.0
+     },
+     {
+      "label": "2026-01-01",
+      "seconds": 660.0
+     },
+     {
+      "label": "2026-01-02",
+      "seconds": 45.0
+     },
+     {
+      "label": "2026-01-03",
+      "seconds": 70.0
+     }
+    ],
+    "chartCapped": false,
+    "topTracks": [
+     {
+      "id": "t-b",
+      "seconds": 1283.5,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-a",
+      "seconds": 669.999,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-c",
+      "seconds": 580.0,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-e",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-0rph",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-none",
+      "seconds": 127.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-oalb",
+      "seconds": 101.0,
+      "qualifiedPlays": 2
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 1,
+      "seconds": 1953.499,
+      "qualifiedPlays": 8
+     },
+     {
+      "id": 2,
+      "seconds": 780.0,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 3,
+      "seconds": 301.0,
+      "qualifiedPlays": 4
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 11,
+      "seconds": 1283.5,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": 10,
+      "seconds": 869.999,
+      "qualifiedPlays": 5
+     },
+     {
+      "id": 20,
+      "seconds": 780.0,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 30,
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "this UTC year (2026)",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "thisYear"
+   },
+   "boundary": null,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 775.0,
+    "qualifiedPlays": 4,
+    "uniqueTracks": 3,
+    "activeDays": 3,
+    "unavailable": {
+     "listeningSeconds": 0,
+     "qualifiedPlays": 0
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "month",
+    "buckets": [
+     {
+      "label": "2026-01",
+      "seconds": 775.0
+     }
+    ],
+    "chartCapped": false,
+    "topTracks": [
+     {
+      "id": "t-b",
+      "seconds": 645.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-c",
+      "seconds": 70.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-a",
+      "seconds": 60.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 1,
+      "seconds": 705.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 2,
+      "seconds": 70.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 11,
+      "seconds": 645.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": 20,
+      "seconds": 70.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": 10,
+      "seconds": 60.0,
+      "qualifiedPlays": 1
+     }
+    ]
+   }
+  },
+  {
+   "name": "chosen year 2025",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "year",
+    "year": 2025
+   },
+   "boundary": null,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 4364.499,
+    "qualifiedPlays": 34,
+    "uniqueTracks": 22,
+    "activeDays": 18,
+    "unavailable": {
+     "listeningSeconds": 116.0,
+     "qualifiedPlays": 3
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "month",
+    "buckets": [
+     {
+      "label": "2025-01",
+      "seconds": 300.0
+     },
+     {
+      "label": "2025-02",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-03",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-04",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-05",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-06",
+      "seconds": 1320.0
+     },
+     {
+      "label": "2025-07",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-08",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-09",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-10",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-11",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12",
+      "seconds": 2744.499
+     }
+    ],
+    "chartCapped": false,
+    "topTracks": [
+     {
+      "id": "t-c",
+      "seconds": 810.0,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-b",
+      "seconds": 638.5,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-a",
+      "seconds": 609.999,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-e",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-0rph",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-oalb",
+      "seconds": 143.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-none",
+      "seconds": 127.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-f01",
+      "seconds": 120.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-f02",
+      "seconds": 120.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 3,
+      "seconds": 1663.0,
+      "qualifiedPlays": 16
+     },
+     {
+      "id": 1,
+      "seconds": 1248.499,
+      "qualifiedPlays": 5
+     },
+     {
+      "id": 2,
+      "seconds": 1010.0,
+      "qualifiedPlays": 6
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 30,
+      "seconds": 1520.0,
+      "qualifiedPlays": 13
+     },
+     {
+      "id": 20,
+      "seconds": 1010.0,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 10,
+      "seconds": 809.999,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": 11,
+      "seconds": 638.5,
+      "qualifiedPlays": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "chosen year 2024",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "year",
+    "year": 2024
+   },
+   "boundary": null,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 60.0,
+    "qualifiedPlays": 2,
+    "uniqueTracks": 2,
+    "activeDays": 2,
+    "unavailable": {
+     "listeningSeconds": 0,
+     "qualifiedPlays": 0
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "month",
+    "buckets": [
+     {
+      "label": "2024-01",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-02",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-03",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-04",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-05",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-06",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-07",
+      "seconds": 30.0
+     },
+     {
+      "label": "2024-08",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-09",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-10",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-11",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-12",
+      "seconds": 30.0
+     }
+    ],
+    "chartCapped": false,
+    "topTracks": [
+     {
+      "id": "t-c",
+      "seconds": 30.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-e",
+      "seconds": 30.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 2,
+      "seconds": 30.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": 3,
+      "seconds": 30.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 20,
+      "seconds": 30.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": 30,
+      "seconds": 30.0,
+      "qualifiedPlays": 1
+     }
+    ]
+   }
+  },
+  {
+   "name": "chosen future year 2027",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "year",
+    "year": 2027
+   },
+   "boundary": null,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 0,
+    "qualifiedPlays": 0,
+    "uniqueTracks": 0,
+    "activeDays": 0,
+    "unavailable": {
+     "listeningSeconds": 0,
+     "qualifiedPlays": 0
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "month",
+    "buckets": [],
+    "chartCapped": false,
+    "topTracks": [],
+    "topArtists": [],
+    "topAlbums": []
+   }
+  },
+  {
+   "name": "all time",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "allTime"
+   },
+   "boundary": null,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 6199.499,
+    "qualifiedPlays": 41,
+    "uniqueTracks": 22,
+    "activeDays": 24,
+    "unavailable": {
+     "listeningSeconds": 116.0,
+     "qualifiedPlays": 3
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "month",
+    "buckets": [
+     {
+      "label": "2024-02",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-03",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-04",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-05",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-06",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-07",
+      "seconds": 30.0
+     },
+     {
+      "label": "2024-08",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-09",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-10",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-11",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-12",
+      "seconds": 30.0
+     },
+     {
+      "label": "2025-01",
+      "seconds": 300.0
+     },
+     {
+      "label": "2025-02",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-03",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-04",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-05",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-06",
+      "seconds": 1320.0
+     },
+     {
+      "label": "2025-07",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-08",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-09",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-10",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-11",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12",
+      "seconds": 2744.499
+     },
+     {
+      "label": "2026-01",
+      "seconds": 775.0
+     }
+    ],
+    "chartCapped": true,
+    "topTracks": [
+     {
+      "id": "t-c",
+      "seconds": 1910.0,
+      "qualifiedPlays": 7
+     },
+     {
+      "id": "t-b",
+      "seconds": 1283.5,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-a",
+      "seconds": 669.999,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-e",
+      "seconds": 230.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-0rph",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-oalb",
+      "seconds": 143.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-none",
+      "seconds": 127.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-f01",
+      "seconds": 120.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-f02",
+      "seconds": 120.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 2,
+      "seconds": 2110.0,
+      "qualifiedPlays": 9
+     },
+     {
+      "id": 1,
+      "seconds": 1953.499,
+      "qualifiedPlays": 8
+     },
+     {
+      "id": 3,
+      "seconds": 1693.0,
+      "qualifiedPlays": 17
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 20,
+      "seconds": 2110.0,
+      "qualifiedPlays": 9
+     },
+     {
+      "id": 30,
+      "seconds": 1550.0,
+      "qualifiedPlays": 14
+     },
+     {
+      "id": 11,
+      "seconds": 1283.5,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": 10,
+      "seconds": 869.999,
+      "qualifiedPlays": 5
+     }
+    ]
+   }
+  },
+  {
+   "name": "7 days at UTC midnight",
+   "capturedNow": "2026-01-02T00:00:00.000Z",
+   "range": {
+    "type": "rolling",
+    "days": 7
+   },
+   "boundary": null,
+   "capturedNowMs": 1767312000000,
+   "expected": {
+    "listeningSeconds": 3321.499,
+    "qualifiedPlays": 22,
+    "uniqueTracks": 11,
+    "activeDays": 6,
+    "unavailable": {
+     "listeningSeconds": 116.0,
+     "qualifiedPlays": 3
+    },
+    "futureTimestampCount": 4,
+    "bucketUnit": "day",
+    "buckets": [
+     {
+      "label": "2025-12-26",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12-27",
+      "seconds": 67.0
+     },
+     {
+      "label": "2025-12-28",
+      "seconds": 60.0
+     },
+     {
+      "label": "2025-12-29",
+      "seconds": 1198.499
+     },
+     {
+      "label": "2025-12-30",
+      "seconds": 1170.0
+     },
+     {
+      "label": "2025-12-31",
+      "seconds": 166.0
+     },
+     {
+      "label": "2026-01-01",
+      "seconds": 660.0
+     }
+    ],
+    "chartCapped": false,
+    "topTracks": [
+     {
+      "id": "t-b",
+      "seconds": 1238.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-a",
+      "seconds": 669.999,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-c",
+      "seconds": 510.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-e",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-0rph",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-none",
+      "seconds": 127.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-oalb",
+      "seconds": 60.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 1,
+      "seconds": 1908.499,
+      "qualifiedPlays": 7
+     },
+     {
+      "id": 2,
+      "seconds": 710.0,
+      "qualifiedPlays": 5
+     },
+     {
+      "id": 3,
+      "seconds": 260.0,
+      "qualifiedPlays": 3
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 11,
+      "seconds": 1238.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 10,
+      "seconds": 869.999,
+      "qualifiedPlays": 5
+     },
+     {
+      "id": 20,
+      "seconds": 710.0,
+      "qualifiedPlays": 5
+     },
+     {
+      "id": 30,
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "boundary excludes late arrivals (all time)",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "allTime"
+   },
+   "boundary": 56,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 5199.499,
+    "qualifiedPlays": 39,
+    "uniqueTracks": 22,
+    "activeDays": 24,
+    "unavailable": {
+     "listeningSeconds": 116.0,
+     "qualifiedPlays": 3
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "month",
+    "buckets": [
+     {
+      "label": "2024-02",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-03",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-04",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-05",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-06",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-07",
+      "seconds": 30.0
+     },
+     {
+      "label": "2024-08",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-09",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-10",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-11",
+      "seconds": 0.0
+     },
+     {
+      "label": "2024-12",
+      "seconds": 30.0
+     },
+     {
+      "label": "2025-01",
+      "seconds": 300.0
+     },
+     {
+      "label": "2025-02",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-03",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-04",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-05",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-06",
+      "seconds": 1320.0
+     },
+     {
+      "label": "2025-07",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-08",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-09",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-10",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-11",
+      "seconds": 0.0
+     },
+     {
+      "label": "2025-12",
+      "seconds": 1744.499
+     },
+     {
+      "label": "2026-01",
+      "seconds": 775.0
+     }
+    ],
+    "chartCapped": true,
+    "topTracks": [
+     {
+      "id": "t-c",
+      "seconds": 1910.0,
+      "qualifiedPlays": 7
+     },
+     {
+      "id": "t-b",
+      "seconds": 783.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-e",
+      "seconds": 230.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-0rph",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-a",
+      "seconds": 169.999,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-oalb",
+      "seconds": 143.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-none",
+      "seconds": 127.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-f01",
+      "seconds": 120.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-f02",
+      "seconds": 120.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 2,
+      "seconds": 2110.0,
+      "qualifiedPlays": 9
+     },
+     {
+      "id": 3,
+      "seconds": 1693.0,
+      "qualifiedPlays": 17
+     },
+     {
+      "id": 1,
+      "seconds": 953.499,
+      "qualifiedPlays": 6
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 20,
+      "seconds": 2110.0,
+      "qualifiedPlays": 9
+     },
+     {
+      "id": 30,
+      "seconds": 1550.0,
+      "qualifiedPlays": 14
+     },
+     {
+      "id": 11,
+      "seconds": 783.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 10,
+      "seconds": 369.999,
+      "qualifiedPlays": 4
+     }
+    ]
+   }
+  },
+  {
+   "name": "boundary excludes late arrivals (7 days)",
+   "capturedNow": "2026-01-03T12:00:00.000Z",
+   "range": {
+    "type": "rolling",
+    "days": 7
+   },
+   "boundary": 56,
+   "capturedNowMs": 1767441600000,
+   "expected": {
+    "listeningSeconds": 2402.499,
+    "qualifiedPlays": 21,
+    "uniqueTracks": 11,
+    "activeDays": 8,
+    "unavailable": {
+     "listeningSeconds": 116.0,
+     "qualifiedPlays": 3
+    },
+    "futureTimestampCount": 2,
+    "bucketUnit": "day",
+    "buckets": [
+     {
+      "label": "2025-12-27",
+      "seconds": 33.0
+     },
+     {
+      "label": "2025-12-28",
+      "seconds": 60.0
+     },
+     {
+      "label": "2025-12-29",
+      "seconds": 198.499
+     },
+     {
+      "label": "2025-12-30",
+      "seconds": 1170.0
+     },
+     {
+      "label": "2025-12-31",
+      "seconds": 166.0
+     },
+     {
+      "label": "2026-01-01",
+      "seconds": 660.0
+     },
+     {
+      "label": "2026-01-02",
+      "seconds": 45.0
+     },
+     {
+      "label": "2026-01-03",
+      "seconds": 70.0
+     }
+    ],
+    "chartCapped": false,
+    "topTracks": [
+     {
+      "id": "t-b",
+      "seconds": 783.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-c",
+      "seconds": 580.0,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-e",
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-0rph",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-a",
+      "seconds": 169.999,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": "t-none",
+      "seconds": 93.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-oalb",
+      "seconds": 60.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 1,
+      "seconds": 953.499,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 2,
+      "seconds": 780.0,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 3,
+      "seconds": 260.0,
+      "qualifiedPlays": 3
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 11,
+      "seconds": 783.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 20,
+      "seconds": 780.0,
+      "qualifiedPlays": 6
+     },
+     {
+      "id": 10,
+      "seconds": 369.999,
+      "qualifiedPlays": 4
+     },
+     {
+      "id": 30,
+      "seconds": 200.0,
+      "qualifiedPlays": 2
+     }
+    ]
+   }
+  }
+ ]
+}

@@ -334,3 +334,65 @@ final downloadQualityProvider = Provider<String>((ref) {
   final settings = ref.watch(settingsProvider).value;
   return settings?.downloadQuality ?? originalQuality;
 });
+
+/// Which Home sections the user hid (SC-07), stored on this device. Holds
+/// [HomeSectionSpec.hidePreferenceKey] values; a key not in [hidden] shows.
+class HomeLayoutPreferences {
+  const HomeLayoutPreferences({this.hidden = const {}});
+
+  final Set<String> hidden;
+
+  bool isHidden(String key) => hidden.contains(key);
+
+  @override
+  bool operator ==(Object other) =>
+      other is HomeLayoutPreferences &&
+      other.hidden.length == hidden.length &&
+      other.hidden.containsAll(hidden);
+
+  @override
+  int get hashCode => Object.hashAllUnordered(hidden);
+}
+
+/// [HomeLayoutPreferences] over `SharedPreferences` only (no backend, unlike
+/// [SettingsNotifier]).
+class HomeLayoutPreferencesNotifier
+    extends AsyncNotifier<HomeLayoutPreferences> {
+  static const _hiddenKey = 'settings.homeHiddenSections';
+
+  @override
+  Future<HomeLayoutPreferences> build() async {
+    final prefs = await ref.read(sharedPreferencesProvider.future);
+    return HomeLayoutPreferences(
+      hidden: (prefs.getStringList(_hiddenKey) ?? const <String>[]).toSet(),
+    );
+  }
+
+  /// Calls run one after another, so two toggles inside one platform write
+  /// both stick.
+  Future<void> _queue = Future.value();
+
+  Future<void> setHidden(String key, bool hidden) {
+    final run = _queue.then((_) => _setHidden(key, hidden));
+    _queue = run.then((_) {}, onError: (_) {});
+    return run;
+  }
+
+  Future<void> _setHidden(String key, bool hidden) async {
+    final current = (await future).hidden;
+    if (current.contains(key) == hidden) return;
+    final next = {...current};
+    hidden ? next.add(key) : next.remove(key);
+    final prefs = await ref.read(sharedPreferencesProvider.future);
+    // A refused write must not look saved: the toggle reports it.
+    if (!await prefs.setStringList(_hiddenKey, next.toList()..sort())) {
+      throw StateError('the Home layout could not be saved');
+    }
+    state = AsyncData(HomeLayoutPreferences(hidden: next));
+  }
+}
+
+final homeLayoutPreferencesProvider =
+    AsyncNotifierProvider<HomeLayoutPreferencesNotifier, HomeLayoutPreferences>(
+  HomeLayoutPreferencesNotifier.new,
+);

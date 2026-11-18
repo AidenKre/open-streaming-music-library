@@ -153,23 +153,66 @@ class LibraryToolsFeature {
   };
 }
 
+/// `lastfm: {available}` inside `integrations` (9D).
+class LastfmIntegration {
+  const LastfmIntegration({required this.available});
+  final bool available;
+
+  static LastfmIntegration? fromJson(Object? block) {
+    if (block is! Map) return null;
+    final available = block['available'];
+    return available is bool ? LastfmIntegration(available: available) : null;
+  }
+
+  Map<String, dynamic> toJson() => {'available': available};
+}
+
+/// `integrations: {version, lastfm: {available}}` (9D).
+class IntegrationsFeature {
+  const IntegrationsFeature({required this.version, this.lastfm});
+  final int version;
+  final LastfmIntegration? lastfm;
+
+  static IntegrationsFeature? fromJson(Object? block) {
+    final v = _version(block);
+    if (v == null || block is! Map) return null;
+    return IntegrationsFeature(
+      version: v,
+      lastfm: LastfmIntegration.fromJson(block['lastfm']),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'version': version,
+    if (lastfm != null) 'lastfm': lastfm!.toJson(),
+  };
+}
+
 /// Every feature block this client knows; null = unsupported.
 class FeatureBlocks {
-  const FeatureBlocks({this.history, this.uploads, this.libraryTools});
+  const FeatureBlocks({
+    this.history,
+    this.uploads,
+    this.libraryTools,
+    this.integrations,
+  });
 
   factory FeatureBlocks.fromJson(Map<String, dynamic> root) => FeatureBlocks(
     history: HistoryFeature.fromJson(root['history']),
     uploads: UploadsFeature.fromJson(root['uploads']),
     libraryTools: LibraryToolsFeature.fromJson(root['library_tools']),
+    integrations: IntegrationsFeature.fromJson(root['integrations']),
   );
 
   final HistoryFeature? history;
   final UploadsFeature? uploads;
   final LibraryToolsFeature? libraryTools;
+  final IntegrationsFeature? integrations;
 
   Map<String, dynamic> toJson() => {
     if (history != null) 'history': history!.toJson(),
     if (uploads != null) 'uploads': uploads!.toJson(),
     if (libraryTools != null) 'library_tools': libraryTools!.toJson(),
+    if (integrations != null) 'integrations': integrations!.toJson(),
   };
 }

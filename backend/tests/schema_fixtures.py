@@ -6,17 +6,20 @@ v9 (``main`` @ 3ee4c9e, the last pre-Phase-5 schema), v11 (PR 5A.0,
 a516b17, the last pre-multi-user schema), v13 (``roadmap-integration`` @
 92adfe0, Phase M's fresh schema, the last before Phase 6.5) and v14
 (``roadmap-integration`` @ 2e4e4a4, Phase 6.5's audio identity, the last
-before Phase 7) and v15 (``phase-8-integration`` @ d785b9e, Phase 7's upload
-tables, the last before Phase 8). The server refuses v9-v12 and upgrades
-v13, v14 and v15; the tests build them with plain SQL and open them through
-the production ``Database.initialize()``.
+before Phase 7), v15 (``phase-8-integration`` @ d785b9e, Phase 7's upload
+tables, the last before Phase 8) and v16 (``phase-9-integration`` @ 0c9f5d6,
+Phase 8's deletion tables, the last before Phase 9D.1b's Last.fm tables).
+The server refuses v9-v12 and upgrades v13 to v16; the tests build them with
+plain SQL and open them through the production ``Database.initialize()``.
 
 Each fixture is byte-identical to ``backend/app/database/init.sql`` at its
-commit. To re-freeze v15 (for example after Phase 7 edits its v15 objects in
-place), run from the repository root, naming the last commit whose
-``init.sql`` still ends with ``PRAGMA user_version = 15``:
+commit. To re-freeze v15 or v16 (for example after Phase 7 or Phase 8 edits
+its objects in place), run from the repository root, naming the last commit
+whose ``init.sql`` still ends with ``PRAGMA user_version = <N>``:
 
-    git show <commit>:backend/app/database/init.sql > backend/tests/fixtures/schema_v15.sql
+    git show <commit>:backend/app/database/init.sql > backend/tests/fixtures/schema_v<N>.sql
+
+v16 was produced by exactly this with <commit> = 0c9f5d69a67c5013620c5280c2b57b8d6f20ea14.
 """
 
 import sqlite3
@@ -26,12 +29,12 @@ from app.database.database import DatabaseContext
 from tests.owned_database import OwnedTestDatabase
 
 FIXTURES = Path(__file__).parent / "fixtures"
-LEGACY_VERSIONS = (9, 11, 12, 13, 14, 15)
+LEGACY_VERSIONS = (9, 11, 12, 13, 14, 15, 16)
 INIT_SQL = Path(__file__).parent.parent / "app" / "database" / "init.sql"
 
 
 def make_legacy_database(path: Path, version: int) -> None:
-    """An empty database at a frozen schema ``version`` (9, 11, 12, 13, 14 or 15).
+    """An empty database at a frozen schema ``version`` (9, 11 to 16).
     From v11 on it carries a server instance id, as those versions shipped."""
     if version not in LEGACY_VERSIONS:
         raise ValueError(f"no frozen schema for version {version}")

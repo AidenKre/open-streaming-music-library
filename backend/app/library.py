@@ -86,6 +86,14 @@ OWNED_METHODS = frozenset(
         "create_deletion_job",
         "get_deletion_job",
         "list_deletion_jobs",
+        # 9D.1b: the Last.fm connection and outbox rows behind the routes (spec §7.3, §7.4).
+        "get_lastfm_connection",
+        "store_lastfm_pending_token",
+        "clear_lastfm_pending_token",
+        "bind_lastfm_session",
+        "enable_lastfm_scrobbling",
+        "disconnect_lastfm",
+        "get_lastfm_outbox_summary",
     }
 )
 

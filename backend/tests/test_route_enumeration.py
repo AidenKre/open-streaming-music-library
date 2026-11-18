@@ -38,6 +38,13 @@ def test_the_enumeration_sees_every_route(app_client):
 
     assert {"/tracks", "/tracks/{uuid_id:uuid}/stream", "/history", "/auth/logout", "/docs"} <= paths
     assert len(paths) >= 20
+    # 9D.1d: the Last.fm routes are enumerated like every other route.
+    assert {"/settings/integrations/lastfm", "/settings/integrations/lastfm/connect",
+            "/settings/integrations/lastfm/complete"} <= paths
+    # 9D.2a: the opt-in route too.
+    assert "/settings/integrations/lastfm/enable" in paths
+    # 9D.2c: Now Playing.
+    assert "/settings/integrations/lastfm/now-playing" in paths
 
 
 def test_every_route_is_public_or_refused_without_a_token(app_client):

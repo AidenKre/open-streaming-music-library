@@ -1,0 +1,727 @@
+{
+ "about": "Writes the annual-recap fixture (recap_fixture.json) and its golden exports.",
+ "catalog": {
+  "artists": [
+   {
+    "id": 1,
+    "name": "Aria"
+   },
+   {
+    "id": 2,
+    "name": "Bram \"B\" Lee"
+   },
+   {
+    "id": 3,
+    "name": "Cléo"
+   }
+  ],
+  "albums": [
+   {
+    "id": 10,
+    "artistId": 1,
+    "name": "First Light"
+   },
+   {
+    "id": 20,
+    "artistId": 2,
+    "name": "Second Wind"
+   },
+   {
+    "id": 30,
+    "artistId": 3,
+    "name": "Third/Last"
+   }
+  ],
+  "tracks": [
+   {
+    "uuid": "t-a",
+    "artistId": 1,
+    "albumId": 10,
+    "title": "Alpha",
+    "artistName": "Aria",
+    "albumName": "First Light"
+   },
+   {
+    "uuid": "t-b",
+    "artistId": 1,
+    "albumId": 10,
+    "title": "Beta",
+    "artistName": "Aria",
+    "albumName": "First Light"
+   },
+   {
+    "uuid": "t-c",
+    "artistId": 2,
+    "albumId": 20,
+    "title": "Gamma",
+    "artistName": "Bram \"B\" Lee",
+    "albumName": "Second Wind"
+   },
+   {
+    "uuid": "t-d",
+    "artistId": 2,
+    "albumId": 20,
+    "title": "Delta",
+    "artistName": "Bram \"B\" Lee",
+    "albumName": "Second Wind"
+   },
+   {
+    "uuid": "t-e",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Epsilon",
+    "artistName": "Cléo",
+    "albumName": "Third/Last"
+   },
+   {
+    "uuid": "t-f",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Zeta",
+    "artistName": "Cléo",
+    "albumName": "Third/Last"
+   },
+   {
+    "uuid": "t-g",
+    "artistId": 3,
+    "albumId": 30,
+    "title": "Eta",
+    "artistName": "Cléo",
+    "albumName": "Third/Last"
+   }
+  ],
+  "tracksWithoutMetadata": []
+ },
+ "events": [
+  {
+   "uuid": "r-01",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-01-01T00:00:00.000Z",
+   "seconds": 120.5,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "first ms of 2025",
+   "localId": 1,
+   "atMs": 1735689600000
+  },
+  {
+   "uuid": "r-02",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-03-10T09:00:00.000Z",
+   "seconds": 300.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 2,
+   "atMs": 1741597200000
+  },
+  {
+   "uuid": "r-03",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2025-03-20T21:30:00.000Z",
+   "seconds": 300.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 3,
+   "atMs": 1742506200000
+  },
+  {
+   "uuid": "r-04",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-e",
+   "at": "2025-05-01T08:00:00.000Z",
+   "seconds": 250.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 4,
+   "atMs": 1746086400000
+  },
+  {
+   "uuid": "r-05",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2025-07-04T18:00:00.000Z",
+   "seconds": 350.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 5,
+   "atMs": 1751652000000
+  },
+  {
+   "uuid": "r-06",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-f",
+   "at": "2025-07-05T18:00:00.000Z",
+   "seconds": 250.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 6,
+   "atMs": 1751738400000
+  },
+  {
+   "uuid": "r-07",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-d",
+   "at": "2025-09-09T07:00:00.000Z",
+   "seconds": 280.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 7,
+   "atMs": 1757401200000
+  },
+  {
+   "uuid": "r-08",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-g",
+   "at": "2025-09-10T07:00:00.000Z",
+   "seconds": 20.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "not qualified",
+   "localId": 8,
+   "atMs": 1757487600000
+  },
+  {
+   "uuid": "r-09",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-gone",
+   "at": "2025-11-11T10:00:00.000Z",
+   "seconds": 90.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "deleted track: unavailable, qualified",
+   "localId": 9,
+   "atMs": 1762855200000
+  },
+  {
+   "uuid": "r-10",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-gone",
+   "at": "2025-11-12T10:00:00.000Z",
+   "seconds": 10.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "deleted track: unavailable, not qualified",
+   "localId": 10,
+   "atMs": 1762941600000
+  },
+  {
+   "uuid": "r-11",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-c",
+   "at": "2025-12-31T23:59:59.999Z",
+   "seconds": 50.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "last ms of 2025",
+   "localId": 11,
+   "atMs": 1767225599999
+  },
+  {
+   "uuid": "r-12",
+   "kind": "clicked",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-06-01T12:00:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "a click is not a listen",
+   "localId": 12,
+   "atMs": 1748779200000
+  },
+  {
+   "uuid": "r-13",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-06-02T12:00:00.000Z",
+   "seconds": null,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "unknown seconds: not a listen",
+   "localId": 13,
+   "atMs": 1748865600000
+  },
+  {
+   "uuid": "r-14",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2024-12-31T23:59:59.999Z",
+   "seconds": 999.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "last ms of 2024",
+   "localId": 14,
+   "atMs": 1735689599999
+  },
+  {
+   "uuid": "r-15",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2026-01-01T00:00:00.000Z",
+   "seconds": 60.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "first ms of 2026",
+   "localId": 15,
+   "atMs": 1767225600000
+  },
+  {
+   "uuid": "r-16",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-d",
+   "at": "2026-02-14T12:00:00.000Z",
+   "seconds": 200.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "",
+   "localId": 16,
+   "atMs": 1771070400000
+  },
+  {
+   "uuid": "r-17",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-b",
+   "at": "2026-03-15T11:59:59.999Z",
+   "seconds": 30.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "1 ms before now",
+   "localId": 17,
+   "atMs": 1773575999999
+  },
+  {
+   "uuid": "r-18",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2026-03-15T12:00:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "at capturedNow: future, not counted",
+   "localId": 18,
+   "atMs": 1773576000000
+  },
+  {
+   "uuid": "r-19",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2026-06-01T00:00:00.000Z",
+   "seconds": 500.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "future",
+   "localId": 19,
+   "atMs": 1780272000000
+  },
+  {
+   "uuid": "r-20",
+   "kind": "play",
+   "entityType": "track",
+   "ref": "t-a",
+   "at": "2025-08-08T08:00:00.000Z",
+   "seconds": 1000.0,
+   "length": 200.0,
+   "pendingUpload": false,
+   "serverRevision": null,
+   "note": "local_id above the boundary",
+   "localId": 20,
+   "atMs": 1754640000000
+  }
+ ],
+ "cases": [
+  {
+   "name": "prior year 2025",
+   "year": 2025,
+   "golden": "recap_2025.json",
+   "capturedNow": "2026-03-15T12:00:00.000Z",
+   "capturedNowMs": 1773576000000,
+   "boundary": 19,
+   "expected": {
+    "year": 2025,
+    "yearSoFar": false,
+    "startMs": 1735689600000,
+    "endMs": 1767225600000,
+    "countedEndMs": 1767225600000,
+    "generatedMs": 1773576000000,
+    "listeningSeconds": 2020.5,
+    "qualifiedPlays": 9,
+    "uniqueTracks": 7,
+    "activeDays": 11,
+    "unavailable": {
+     "listeningSeconds": 100.0,
+     "qualifiedPlays": 1
+    },
+    "months": [
+     {
+      "month": "2025-01",
+      "startMs": 1735689600000,
+      "endMs": 1738368000000,
+      "seconds": 120.5
+     },
+     {
+      "month": "2025-02",
+      "startMs": 1738368000000,
+      "endMs": 1740787200000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2025-03",
+      "startMs": 1740787200000,
+      "endMs": 1743465600000,
+      "seconds": 600.0
+     },
+     {
+      "month": "2025-04",
+      "startMs": 1743465600000,
+      "endMs": 1746057600000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2025-05",
+      "startMs": 1746057600000,
+      "endMs": 1748736000000,
+      "seconds": 250.0
+     },
+     {
+      "month": "2025-06",
+      "startMs": 1748736000000,
+      "endMs": 1751328000000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2025-07",
+      "startMs": 1751328000000,
+      "endMs": 1754006400000,
+      "seconds": 600.0
+     },
+     {
+      "month": "2025-08",
+      "startMs": 1754006400000,
+      "endMs": 1756684800000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2025-09",
+      "startMs": 1756684800000,
+      "endMs": 1759276800000,
+      "seconds": 300.0
+     },
+     {
+      "month": "2025-10",
+      "startMs": 1759276800000,
+      "endMs": 1761955200000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2025-11",
+      "startMs": 1761955200000,
+      "endMs": 1764547200000,
+      "seconds": 100.0
+     },
+     {
+      "month": "2025-12",
+      "startMs": 1764547200000,
+      "endMs": 1767225600000,
+      "seconds": 50.0
+     }
+    ],
+    "busiestMonth": "2025-03",
+    "topTracks": [
+     {
+      "id": "t-a",
+      "seconds": 420.5,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-c",
+      "seconds": 400.0,
+      "qualifiedPlays": 2
+     },
+     {
+      "id": "t-b",
+      "seconds": 300.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-d",
+      "seconds": 280.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-e",
+      "seconds": 250.0,
+      "qualifiedPlays": 1
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 1,
+      "seconds": 720.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 2,
+      "seconds": 680.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 3,
+      "seconds": 520.0,
+      "qualifiedPlays": 2
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 10,
+      "seconds": 720.5,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 20,
+      "seconds": 680.0,
+      "qualifiedPlays": 3
+     },
+     {
+      "id": 30,
+      "seconds": 520.0,
+      "qualifiedPlays": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "current year 2026 (Year so far)",
+   "year": 2026,
+   "golden": "recap_2026.json",
+   "capturedNow": "2026-03-15T12:00:00.000Z",
+   "capturedNowMs": 1773576000000,
+   "boundary": 19,
+   "expected": {
+    "year": 2026,
+    "yearSoFar": true,
+    "startMs": 1767225600000,
+    "endMs": 1798761600000,
+    "countedEndMs": 1773576000000,
+    "generatedMs": 1773576000000,
+    "listeningSeconds": 290.0,
+    "qualifiedPlays": 3,
+    "uniqueTracks": 2,
+    "activeDays": 3,
+    "unavailable": {
+     "listeningSeconds": 0.0,
+     "qualifiedPlays": 0
+    },
+    "months": [
+     {
+      "month": "2026-01",
+      "startMs": 1767225600000,
+      "endMs": 1769904000000,
+      "seconds": 60.0
+     },
+     {
+      "month": "2026-02",
+      "startMs": 1769904000000,
+      "endMs": 1772323200000,
+      "seconds": 200.0
+     },
+     {
+      "month": "2026-03",
+      "startMs": 1772323200000,
+      "endMs": 1775001600000,
+      "seconds": 30.0
+     }
+    ],
+    "busiestMonth": "2026-02",
+    "topTracks": [
+     {
+      "id": "t-d",
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": "t-b",
+      "seconds": 90.0,
+      "qualifiedPlays": 2
+     }
+    ],
+    "topArtists": [
+     {
+      "id": 2,
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": 1,
+      "seconds": 90.0,
+      "qualifiedPlays": 2
+     }
+    ],
+    "topAlbums": [
+     {
+      "id": 20,
+      "seconds": 200.0,
+      "qualifiedPlays": 1
+     },
+     {
+      "id": 10,
+      "seconds": 90.0,
+      "qualifiedPlays": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "empty year 2023",
+   "year": 2023,
+   "golden": "recap_2023.json",
+   "capturedNow": "2026-03-15T12:00:00.000Z",
+   "capturedNowMs": 1773576000000,
+   "boundary": 19,
+   "expected": {
+    "year": 2023,
+    "yearSoFar": false,
+    "startMs": 1672531200000,
+    "endMs": 1704067200000,
+    "countedEndMs": 1704067200000,
+    "generatedMs": 1773576000000,
+    "listeningSeconds": 0.0,
+    "qualifiedPlays": 0,
+    "uniqueTracks": 0,
+    "activeDays": 0,
+    "unavailable": {
+     "listeningSeconds": 0.0,
+     "qualifiedPlays": 0
+    },
+    "months": [
+     {
+      "month": "2023-01",
+      "startMs": 1672531200000,
+      "endMs": 1675209600000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-02",
+      "startMs": 1675209600000,
+      "endMs": 1677628800000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-03",
+      "startMs": 1677628800000,
+      "endMs": 1680307200000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-04",
+      "startMs": 1680307200000,
+      "endMs": 1682899200000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-05",
+      "startMs": 1682899200000,
+      "endMs": 1685577600000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-06",
+      "startMs": 1685577600000,
+      "endMs": 1688169600000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-07",
+      "startMs": 1688169600000,
+      "endMs": 1690848000000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-08",
+      "startMs": 1690848000000,
+      "endMs": 1693526400000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-09",
+      "startMs": 1693526400000,
+      "endMs": 1696118400000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-10",
+      "startMs": 1696118400000,
+      "endMs": 1698796800000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-11",
+      "startMs": 1698796800000,
+      "endMs": 1701388800000,
+      "seconds": 0.0
+     },
+     {
+      "month": "2023-12",
+      "startMs": 1701388800000,
+      "endMs": 1704067200000,
+      "seconds": 0.0
+     }
+    ],
+    "busiestMonth": null,
+    "topTracks": [],
+    "topArtists": [],
+    "topAlbums": []
+   }
+  }
+ ],
+ "yearsWithListening": [
+  2026,
+  2025,
+  2024
+ ]
+}

@@ -24,6 +24,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/auth_api.dart';
+import 'package:frontend/api/lastfm_api.dart';
 import 'package:frontend/api/library_tools_api.dart';
 import 'package:frontend/api/uploads_api.dart';
 import 'package:frontend/models/dto/library_tools_dtos.dart';
@@ -390,6 +391,16 @@ void main() {
       detached(() => uploads.getBatch('b1'));
       detached(() => uploads.getItem('i1'));
       detached(() => uploads.cancelItem('i1'));
+
+      // Phase 9 senders (E9): Last.fm (no request reaches Last.fm itself:
+      // these go to this app's server, here a mock).
+      final lastfm = c.read(lastfmApiProvider);
+      await quietly(() => lastfm.status());
+      await quietly(() => lastfm.nowPlaying('u1'));
+      detached(() => lastfm.connect());
+      detached(() => lastfm.complete());
+      detached(() => lastfm.enable('c1'));
+      detached(() => lastfm.disconnect());
       await pumpEventQueue(times: 50);
     }
 
@@ -480,6 +491,8 @@ void main() {
             // Phase 8 (E8): library tools and uploads.
             '/tracks/deletions', '/tracks/duplicates/summary',
             '/tracks/uploads', '/tracks/uploads/b1',
+            // Phase 9 (E9): Last.fm settings on this app's server.
+            '/settings/integrations/lastfm',
           ]),
           reason: 'the sweep reaches the token client: $seen');
     });

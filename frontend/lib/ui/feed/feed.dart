@@ -130,6 +130,43 @@ abstract class FeedSection {
 
 enum RailState { loading, ready, error }
 
+/// Whether the user is looking into a rail (Phase 9 §5): at its start offset
+/// or scrolled in, and whether a pointer is down on it.
+@immutable
+class RailEngagement {
+  const RailEngagement({required this.atStart, required this.pointerDown});
+
+  final bool atStart;
+  final bool pointerDown;
+
+  /// At the start with no pointer down: changing the items moves nothing
+  /// under the user.
+  bool get atRest => atStart && !pointerDown;
+
+  @override
+  bool operator ==(Object other) =>
+      other is RailEngagement &&
+      other.atStart == atStart &&
+      other.pointerDown == pointerDown;
+
+  @override
+  int get hashCode => Object.hash(atStart, pointerDown);
+
+  @override
+  String toString() =>
+      'RailEngagement(atStart: $atStart, pointerDown: $pointerDown)';
+}
+
+/// A surface-supplied notice floated over a rail ([NewActivityNotice]).
+@immutable
+class RailNotice {
+  const RailNotice({required this.message, this.actionLabel, required this.onTap});
+
+  final String message;
+  final String? actionLabel;
+  final VoidCallback onTap;
+}
+
 /// A titled horizontal rail of entity cards with explicit loading / ready /
 /// error state. A loading or failed rail keeps its normal extent; an empty
 /// ready rail disappears entirely, title included. The rail's horizontal
@@ -149,7 +186,19 @@ class EntityRailSection extends FeedSection {
     this.newActivityLabel,
     this.emptyMessage,
     this.trailing,
+    this.subtitle,
+    this.onEngagementChanged,
+    this.notice,
   });
+
+  /// A caption under the title (what the rail is).
+  final String? subtitle;
+
+  /// Opt-in: told whenever the rail's [RailEngagement] changes.
+  final ValueChanged<RailEngagement>? onEngagementChanged;
+
+  /// Shown over the ready rail while non-null; drawn by the surface.
+  final RailNotice? notice;
 
   /// A header action drawn at the end of the title row (e.g. See all).
   final Widget? trailing;
@@ -198,6 +247,7 @@ class EntityRailSection extends FeedSection {
                 trailing,
               ),
             ),
+            if (subtitle != null) _caption(theme, subtitle!),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Text(message, style: theme.textTheme.bodyMedium),
@@ -209,6 +259,11 @@ class EntityRailSection extends FeedSection {
     return SliverToBoxAdapter(child: _EntityRail(section: this));
   }
 }
+
+Widget _caption(ThemeData theme, String text) => Padding(
+  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+  child: Text(text, style: theme.textTheme.bodySmall),
+);
 
 /// A rail's title, with its optional header action at the end of the row.
 Widget _titleRow(Widget title, Widget? trailing) => trailing == null
@@ -283,6 +338,15 @@ class _EntityRailState extends State<_EntityRail> {
   final _controller = _RailController();
   bool _newActivity = false;
 
+  /// Pointers (and trackpad pans) currently down on the rail; only tracked
+  /// when the section opts in to engagement reports.
+  final _pointers = <int>{};
+  RailEngagement? _reported;
+
+  /// A horizontal scroll is under way; its start and end are reported even
+  /// when the [RailEngagement] value is unchanged (the user acted).
+  bool _scrolling = false;
+  bool _reportedScrolling = false;
   /// Bumped when the rail leaves `ready`, so the next ready list does not
   /// restore a stored offset meant for the previous result set.
   int _epoch = 0;
@@ -291,6 +355,7 @@ class _EntityRailState extends State<_EntityRail> {
   void initState() {
     super.initState();
     _controller.addListener(_onScroll);
+    _scheduleEngagementCheck();
   }
 
   @override
@@ -300,7 +365,62 @@ class _EntityRailState extends State<_EntityRail> {
     super.dispose();
   }
 
+  RailEngagement _engagement() {
+    final atStart =
+        !_controller.hasClients || _controller.position.pixels <= 0.5;
+    return RailEngagement(atStart: atStart, pointerDown: _pointers.isNotEmpty);
+  }
+
+  void _reportEngagement() {
+    final callback = widget.section.onEngagementChanged;
+    if (callback == null) return;
+    final now = _engagement();
+    if (now == _reported && _scrolling == _reportedScrolling) return;
+    _reported = now;
+    _reportedScrolling = _scrolling;
+    callback(now);
+  }
+
+  /// After a frame: the list may have been replaced (a new reset token or
+  /// state) and is then back at offset 0 without a scroll notification.
+  void _scheduleEngagementCheck() {
+    if (widget.section.onEngagementChanged == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _reportEngagement();
+    });
+  }
+
+  bool _onScrollNotification(ScrollNotification n) {
+    if (n.metrics.axis != Axis.horizontal) return false;
+    if (n is ScrollStartNotification) {
+      // A drag, fling or animation: not a jump, which starts and ends in the
+      // same call with the position idle and changes no value without a report.
+      if (!_controller.hasClients || !_controller.position.isScrollingNotifier.value) {
+        return false;
+      }
+      _scrolling = true;
+    } else if (n is ScrollEndNotification) {
+      if (!_scrolling) return false;
+      _scrolling = false;
+    } else {
+      return false;
+    }
+    _reportEngagement();
+    return false;
+  }
+
+  void _pointerDown(int id) {
+    _pointers.add(id);
+    _reportEngagement();
+  }
+
+  void _pointerUp(int id) {
+    _pointers.remove(id);
+    _reportEngagement();
+  }
+
   void _onScroll() {
+    _reportEngagement();
     if (_newActivity && _controller.offset <= 0 && mounted) {
       setState(() => _newActivity = false);
     }
@@ -311,6 +431,14 @@ class _EntityRailState extends State<_EntityRail> {
     super.didUpdateWidget(oldWidget);
     final old = oldWidget.section;
     final next = widget.section;
+    if (next.onEngagementChanged == null) {
+      _pointers.clear();
+      _scrolling = false;
+      _reportedScrolling = false;
+      _reported = null;
+    } else {
+      _scheduleEngagementCheck();
+    }
     if (old.resetToken != next.resetToken || next.state != RailState.ready) {
       _newActivity = false;
       // A new result set after loading/error starts at the start.
@@ -399,6 +527,22 @@ class _EntityRailState extends State<_EntityRail> {
       ),
     };
     final label = section.newActivityLabel;
+    final notice = section.notice;
+    final subtitle = section.subtitle;
+    final Widget framed = section.onEngagementChanged == null
+        ? body
+        : Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: (e) => _pointerDown(e.pointer),
+            onPointerUp: (e) => _pointerUp(e.pointer),
+            onPointerCancel: (e) => _pointerUp(e.pointer),
+            onPointerPanZoomStart: (e) => _pointerDown(e.pointer),
+            onPointerPanZoomEnd: (e) => _pointerUp(e.pointer),
+            child: NotificationListener<ScrollNotification>(
+              onNotification: _onScrollNotification,
+              child: body,
+            ),
+          );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -412,6 +556,7 @@ class _EntityRailState extends State<_EntityRail> {
             section.trailing,
           ),
         ),
+        if (subtitle != null) _caption(Theme.of(context), subtitle),
         SizedBox(
           key: ValueKey('feed.rail.${section.id}.body'),
           height: extent.height,
@@ -419,8 +564,18 @@ class _EntityRailState extends State<_EntityRail> {
           // layout space, so showing it moves nothing.
           child: Stack(
             children: [
-              Positioned.fill(child: body),
-              if (_newActivity && label != null)
+              Positioned.fill(child: framed),
+              if (notice != null && section.state == RailState.ready)
+                Positioned(
+                  top: 8,
+                  right: 16,
+                  child: NewActivityNotice(
+                    message: notice.message,
+                    actionLabel: notice.actionLabel,
+                    onRefresh: notice.onTap,
+                  ),
+                )
+              else if (_newActivity && label != null)
                 Positioned(
                   top: 8,
                   right: 16,

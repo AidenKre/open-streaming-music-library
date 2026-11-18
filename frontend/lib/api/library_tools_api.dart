@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/authenticated_client.dart';
+import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/models/dto/library_tools_dtos.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
@@ -29,12 +30,7 @@ class DeletionReceiptUnreadable implements Exception {
 
 /// A page read asked not to wait for the binding found it unverified:
 /// nothing was sent (U33-B-02).
-class LibraryToolsNotConnected implements Exception {
-  const LibraryToolsNotConnected();
-
-  @override
-  String toString() => 'LibraryToolsNotConnected';
-}
+typedef LibraryToolsNotConnected = BindingNotVerified;
 
 /// The /tracks/deletions and /tracks/duplicates transport (Phase 8 spec §4,
 /// server as built).
@@ -73,10 +69,10 @@ class LibraryToolsApi {
     bool waitForBinding = true,
   }) async {
     // A read that must not wait (U33-B-02): not verified, or not allowed by
-    // the token client's own rule (URL, online), means not connected.
-    if (!waitForBinding &&
-        !_gate.allowsTokenTo(Uri.parse(_api.baseUrl))) {
-      throw const LibraryToolsNotConnected();
+    // the token client's own rule (URL, online), is not connected, with its
+    // reason (Phase 9, 9-R2-04; sign-off OPEN-M-11, E8).
+    if (!waitForBinding) {
+      requireVerifiedNow(_gate, url: Uri.parse(_api.baseUrl));
     }
     var aborted = false;
     final signal = Completer<void>();

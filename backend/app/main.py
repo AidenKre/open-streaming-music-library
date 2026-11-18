@@ -16,6 +16,13 @@ from fastapi.responses import FileResponse
 from app.auth.passwords import prepare_dummy_hash
 from app.bootstrap import bootstrap_master_admin
 from app.config import settings
+from app.services.lastfm_accounts import build_lastfm_accounts, lastfm_available
+from app.services.lastfm_outbox import (
+    install_scrobble_outbox,
+    uninstall_scrobble_outbox,
+)
+from app.services.lastfm_sender import ScrobbleSender
+from app.services.lastfm_state import start_lastfm
 from app.auth.middleware import AuthMiddleware
 from app.core.access_log import install_access_log_redaction
 from app.library import Library, current_library, library_root
@@ -75,6 +82,8 @@ from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.api_return_models import (
     AuthCapabilities,
     HistoryCapabilities,
+    IntegrationsCapabilities,
+    LastfmCapability,
     LibraryToolsCapabilities,
     ServerInfo,
     UploadLimitsInfo,
@@ -83,6 +92,7 @@ from app.models.api_return_models import (
 from app.services.upload_limits import effective_upload_limits
 from app.routers.auth import router as auth_router
 from app.routers.history import router as history_router
+from app.routers.lastfm import router as lastfm_router
 from app.routers.deletions import router as deletions_router
 from app.routers.duplicates import router as duplicates_router
 from app.routers.uploads import router as uploads_router
@@ -206,6 +216,7 @@ app.include_router(deletions_router)
 app.include_router(duplicates_router)
 app.include_router(history_router)
 app.include_router(auth_router)
+app.include_router(lastfm_router)
 # Spec §5.3: the auth boundary is the outermost user middleware. Starlette
 # wraps the last-added middleware outermost, so add any future middleware
 # before this line.
@@ -407,6 +418,7 @@ def startup_event():
     app.state.default_cache = None
     app.state.encoder_coordinator = None
     app.state.identity_worker = None
+    app.state.lastfm_sender = None
     app.state.upload_validation_worker = None
     app.state.upload_commit_worker = None
     app.state.upload_janitor_thread = None
@@ -423,6 +435,9 @@ def startup_event():
     # Phase 2's conversion worker share the identical instance.
     app.state.track_locks = TrackLocks()
     app.state.settings = settings
+    # 9D: a wrong Last.fm setting leaves it off or stopped, never stops startup.
+    app.state.lastfm = start_lastfm(settings)
+    app.state.lastfm_accounts = None
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
     app.state.instance_lock = acquire_instance_lock(settings.app_data_dir)
@@ -430,15 +445,21 @@ def startup_event():
     # is a dead process (the flock guarantees one process).
     app.state.boot_id = str(uuid4())
     try:
+        # Only after the lock is ours (a second server opens no client), and inside
+        # the try so a failure building it releases the lock.
+        app.state.lastfm_accounts = build_lastfm_accounts(app.state.lastfm)
         _startup_locked()
     except BaseException:
         workers = _background_workers(app.state)
         try:
             _request_stop(workers)
             _join(workers)
+            _close_lastfm_client()
         finally:
             _release_instance_lock(app.state.instance_lock, _still_running(workers))
         raise
+    # Registered only once startup succeeded: a failed startup runs no shutdown.
+    install_scrobble_outbox(app.state.lastfm)
 
 
 logger = logging.getLogger(__name__)
@@ -849,6 +870,26 @@ def _startup_locked():
         app.state.identity_worker = worker
         worker.start()
 
+    # The Last.fm sender: only while Last.fm is running, on the one gate and
+    # client the accounts service owns. Assigned before start() like the others.
+    accounts = app.state.lastfm_accounts
+    if (
+        app.state.lastfm.is_running
+        and settings.enable_lastfm_sender
+        and accounts is not None
+        and accounts.gate is not None
+    ):
+        sender = ScrobbleSender(
+            database,
+            app.state.lastfm,
+            client=accounts.client,
+            gate=accounts.gate,
+            notices=accounts.notices,
+            settle_delay_s=app.state.lastfm.config.settle_delay_s,
+        )
+        app.state.lastfm_sender = sender
+        sender.start()
+
 
 def _background_workers(state) -> list[tuple[object, object]]:
     """The one list of background worker threads, in stop order, each with the
@@ -857,6 +898,7 @@ def _background_workers(state) -> list[tuple[object, object]]:
     is alive. A new worker (Phase 8's deletion worker, Phase 9's sender) adds
     one line here."""
     entries = (
+        (getattr(state, "lastfm_sender", None), None),
         (getattr(state, "deletion_worker", None), None),
         (getattr(state, "upload_janitor_thread", None), None),
         (getattr(state, "upload_commit_worker", None), getattr(state, "upload_commit_registry", None)),
@@ -899,6 +941,16 @@ def _release_instance_lock(instance_lock, not_done: set) -> None:
         _release_lock_when_done(instance_lock, not_done)  # never while one lives
     else:
         instance_lock.release()
+
+
+def _close_lastfm_client() -> None:
+    """Closes the Last.fm client if one was built; a failure never propagates."""
+    try:
+        client = getattr(getattr(app.state, "lastfm_accounts", None), "client", None)
+        if client is not None:
+            client.close()
+    except Exception as e:
+        logger.warning("Last.fm client close failed: %s", type(e).__name__)
 
 
 def shutdown_event():
@@ -952,13 +1004,23 @@ def shutdown_event():
         orchestrator = getattr(app.state, "conversion_orchestrator", None)
         if orchestrator:
             orchestrator.shutdown()
+        sender = getattr(app.state, "lastfm_sender", None)
+        if sender is not None and sender.is_alive():
+            # A request may still be in flight: the client closes when the sender ends.
+            sender.done.add_done_callback(lambda _: _close_lastfm_client())
+        elif (client := getattr(getattr(app.state, "lastfm_accounts", None), "client", None)) is not None:
+            client.close()  # a failure here is reported, as before; the finally still runs
         if stop_error is not None:
             raise stop_error  # reported as before, after everything was asked to stop
     finally:
-        instance_lock = getattr(app.state, "instance_lock", None)
-        if instance_lock is not None:
-            # Kept while an import or any worker still runs; released after the last.
-            _release_instance_lock(instance_lock, leftover_imports | _still_running(workers))
+        try:
+            # Removed even when a shutdown step raised above (audit DR-f17e5c12-B-03).
+            uninstall_scrobble_outbox()
+        finally:
+            instance_lock = getattr(app.state, "instance_lock", None)
+            if instance_lock is not None:
+                # Kept while an import or any worker still runs; released after the last.
+                _release_instance_lock(instance_lock, leftover_imports | _still_running(workers))
 
 
 def _release_lock_when_done(instance_lock, futures: set) -> None:
@@ -1637,6 +1699,9 @@ def get_app_info():
             server_delete=app.state.settings.library_delete_enabled,
             # 8A.4: the /tracks/duplicates endpoints exist; they need no switch.
             duplicate_review=True,
+        ),
+        integrations=IntegrationsCapabilities(
+            lastfm=LastfmCapability(available=lastfm_available(app.state.lastfm))
         ),
         entities={
             "track": EntityInfo(

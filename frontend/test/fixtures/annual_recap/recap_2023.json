@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "kind": "osml-annual-recap",
+  "year": 2023,
+  "year_so_far": false,
+  "time_zone": "UTC",
+  "range": {
+    "start_utc": "2023-01-01T00:00:00.000Z",
+    "end_utc": "2024-01-01T00:00:00.000Z",
+    "counted_until_utc": "2024-01-01T00:00:00.000Z"
+  },
+  "generated_at_utc": "2026-03-15T12:00:00.000Z",
+  "metrics": {
+    "listening_seconds": 0.0,
+    "qualified_plays": 0,
+    "unique_tracks": 0,
+    "active_days": 0
+  },
+  "unavailable": {
+    "listening_seconds": 0.0,
+    "qualified_plays": 0
+  },
+  "busiest_month": null,
+  "months": [
+    {
+      "month": "2023-01",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-02",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-03",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-04",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-05",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-06",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-07",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-08",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-09",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-10",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-11",
+      "listening_seconds": 0.0
+    },
+    {
+      "month": "2023-12",
+      "listening_seconds": 0.0
+    }
+  ],
+  "top_tracks": [],
+  "top_artists": [],
+  "top_albums": [],
+  "notes": [
+    "All times are UTC. A listen counts in the day, month and year in which it started.",
+    "Listening time is recorded playback time. Rewinding and playing on two devices at once both add time, and a listen cut short when the app was stopped may lose its last seconds.",
+    "A qualified play is a listen of at least 30 seconds, or of at least half the track when the track is shorter than a minute. This is OSML's own threshold.",
+    "Names are the library's current metadata when the recap was generated, not the names at the time of listening.",
+    "Unavailable time is listening to tracks that were deleted or are not in this device's library. It is included in the totals but in no top list.",
+    "Counted from the listening history on this device when the recap was generated. Listens from other devices that had not synced yet are not included."
+  ]
+}

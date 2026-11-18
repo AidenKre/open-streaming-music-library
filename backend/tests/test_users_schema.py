@@ -32,8 +32,8 @@ def _user(conn, username="Sam", *, key=None, folder=None, admin=0, master=0):
     ).lastrowid
 
 
-def test_schema_version_is_16():
-    assert Database.LATEST_SCHEMA_VERSION == 16
+def test_schema_version_is_17():
+    assert Database.LATEST_SCHEMA_VERSION == 17
 
 
 def test_a_user_row_round_trips_with_unknown_timestamps_null(conn):

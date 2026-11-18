@@ -23,6 +23,8 @@ from app.services.user_delete import (
 from app.database.database import (
     DatabaseMissing,
     DatabaseUnreadable,
+    LastfmPurgeBusy,
+    LastfmPurgeIncomplete,
     SchemaVersionRefused,
     server_database,
 )
@@ -45,7 +47,18 @@ def _build_parser() -> argparse.ArgumentParser:
     cmds.add_parser("list")
     for name in ("reset-password", "disable", "enable", "delete"):
         cmds.add_parser(name).add_argument("name")
+    lastfm = sub.add_parser("lastfm")
+    lastfm_cmds = lastfm.add_subparsers(dest="command", required=True, parser_class=_Parser)
+    lastfm_cmds.add_parser("purge")
     return parser
+
+
+# Commands that take the instance lock and refuse while the server runs, with the
+# trailing phrase of the refusal.
+_LOCKED_COMMANDS = {
+    ("users", "delete"): "stop it before deleting a user.",
+    ("lastfm", "purge"): "stop it before purging Last.fm data.",
+}
 
 
 def _iso(ts) -> str:
@@ -87,7 +100,7 @@ def main(
     if settings is None:
         settings = Settings()
     lock = None
-    if args.command == "delete":
+    if (args.group, args.command) in _LOCKED_COMMANDS:
         # Read-only schema check first: nothing is created for a wrong data dir.
         if not _schema_ok(server_database(settings.app_data_dir), err):
             return 1
@@ -97,7 +110,7 @@ def main(
         except InstanceLockHeld:
             print(
                 f"The server is running (it holds {lock_path}); "
-                "stop it before deleting a user.",
+                + _LOCKED_COMMANDS[(args.group, args.command)],
                 file=err,
             )
             return 1
@@ -193,10 +206,42 @@ def _delete(db, user, settings, out, err, confirm) -> int:
     return 0
 
 
+def _lastfm_purge(db, out, err, confirm) -> int:
+    answer = confirm("Type purge to delete every user's Last.fm connection and queued scrobbles: ")
+    if answer != "purge":
+        print("Confirmation did not match; nothing was deleted.", file=err)
+        return 1
+    try:
+        connections, outbox = db.purge_lastfm_data()
+    except LastfmPurgeIncomplete:
+        print(
+            "Deleted the Last.fm rows, but could not compact the database file "
+            "(another program may have it open, or the disk may be full); "
+            "fix that and run lastfm purge again.",
+            file=err,
+        )
+        return 1
+    except LastfmPurgeBusy:
+        print(
+            "Nothing was deleted: another program is writing to the database; "
+            "close it and run lastfm purge again.",
+            file=err,
+        )
+        return 1
+    print(
+        f"Purged Last.fm data: {connections} connections and {outbox} queued scrobbles "
+        "deleted; the database file was compacted.",
+        file=out,
+    )
+    return 0
+
+
 def _run(args, settings, out, err, prompt, confirm) -> int:
     db = server_database(settings.app_data_dir)
     if not _schema_ok(db, err):
         return 1
+    if args.group == "lastfm":
+        return _lastfm_purge(db, out, err, confirm)
     if args.command == "list":
         return _list(db, out)
     user = db.get_user_by_username_key(username_key(args.name))

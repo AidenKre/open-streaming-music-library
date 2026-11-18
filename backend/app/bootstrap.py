@@ -1,7 +1,6 @@
 """Master-admin bootstrap: the admin account comes from the environment."""
 
 import logging
-import stat
 import time
 from pathlib import Path
 
@@ -14,25 +13,16 @@ from app.auth.passwords import (
     validate_password,
     verify_password,
 )
+from app.core.secret_file import (
+    SecretFileUnreadable,
+    read_secret_file,
+    warn_if_group_or_world_readable,
+)
 from app.database import UsernameTaken
 from app.auth.usernames import is_valid_username, username_key
 from app.library_folders import choose_library_folder
 
 logger = logging.getLogger(__name__)
-
-
-def _warn_if_group_or_world_readable(path: Path) -> None:
-    try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except OSError:
-        return
-    if mode & 0o077:
-        logger.warning(
-            "%s is readable by group or others and holds the admin password; "
-            "run: chmod 600 %s",
-            path,
-            path,
-        )
 
 
 def _admin_password(settings) -> str:
@@ -45,17 +35,13 @@ def _admin_password(settings) -> str:
         )
     if password_file is not None:
         try:
-            text = password_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+            text = read_secret_file(password_file)
+        except SecretFileUnreadable as e:
             raise BootstrapError(
-                f"OSML_ADMIN_PASSWORD_FILE {password_file} is not valid UTF-8"
+                f"OSML_ADMIN_PASSWORD_FILE {password_file} {e}"
             ) from None
-        except OSError as e:
-            raise BootstrapError(
-                f"OSML_ADMIN_PASSWORD_FILE {password_file} cannot be read: {e.strerror}"
-            ) from None
-        _warn_if_group_or_world_readable(password_file)
-        return text.removesuffix("\n").removesuffix("\r") if text.endswith("\n") else text
+        warn_if_group_or_world_readable(password_file, holds="the admin password")
+        return text
     return password
 
 
@@ -68,7 +54,7 @@ def bootstrap_master_admin(database, settings, *, env_file: Path | None = None) 
     if not username:
         raise BootstrapError("OSML_ADMIN_USERNAME is not set")
     if env_file is not None and env_file.exists():
-        _warn_if_group_or_world_readable(env_file)
+        warn_if_group_or_world_readable(env_file, holds="the admin password")
     password = _admin_password(settings)
     if not password:
         raise BootstrapError(

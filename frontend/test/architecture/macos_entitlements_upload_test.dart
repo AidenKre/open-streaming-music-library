@@ -1,7 +1,10 @@
 // Phase 7 (DEV-7-03, plan O6): a sandboxed macOS app can read a file the
-// user picked only with `com.apple.security.files.user-selected.read-only`.
-// Uploads never write the selected file, so the read-write variant must not
-// be present. Both entitlement files carry the same rule.
+// user picked only with a `com.apple.security.files.user-selected.*`
+// entitlement. Phase 9 (decision O5, DEV-9-02) moved it from read-only to
+// read-write: the recap's Save panel writes the file the user chose, and
+// read-write includes read, so the upload picker keeps working. The
+// read-only key is gone so the two never disagree. Both entitlement files
+// carry the same rule.
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -30,12 +33,12 @@ const _allowedEntitlements = {
     'com.apple.security.cs.allow-jit',
     'com.apple.security.network.server',
     'com.apple.security.network.client',
-    'com.apple.security.files.user-selected.read-only',
+    'com.apple.security.files.user-selected.read-write',
   },
   'macos/Runner/Release.entitlements': {
     'com.apple.security.app-sandbox',
     'com.apple.security.network.client',
-    'com.apple.security.files.user-selected.read-only',
+    'com.apple.security.files.user-selected.read-write',
   },
 };
 
@@ -56,16 +59,16 @@ void main() {
       late String plist;
       setUp(() => plist = File(path).readAsStringSync());
 
-      test('grants read access to user-selected files', () {
+      test('grants read-write access to user-selected files', () {
         expect(
-          _valueOf(plist, 'com.apple.security.files.user-selected.read-only'),
+          _valueOf(plist, 'com.apple.security.files.user-selected.read-write'),
           'true',
         );
       });
 
-      test('never grants write access to user-selected files', () {
+      test('carries no separate read-only key', () {
         expect(
-          plist.contains('com.apple.security.files.user-selected.read-write'),
+          plist.contains('com.apple.security.files.user-selected.read-only'),
           isFalse,
         );
       });

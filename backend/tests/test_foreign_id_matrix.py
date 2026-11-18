@@ -67,6 +67,10 @@ LISTED_BODY_IDS = {
     # 8A.4: the dismissed or restored pair's two track uuids.
     ("POST", "/tracks/duplicates/dismiss", "body"),
     ("POST", "/tracks/duplicates/restore", "body"),
+    # 9D.2a: the opt-in names the caller's current Last.fm connection.
+    ("POST", "/settings/integrations/lastfm/enable", "body"),
+    # 9D.2c: the Now Playing notice names a track.
+    ("POST", "/settings/integrations/lastfm/now-playing", "body"),
 }
 
 
@@ -852,6 +856,73 @@ def _restore_duplicates(w):
     _set_pair_status(w, "restore", "dismissed")
 
 
+# ── 9D.2a: Last.fm opt-in ────────────────────────────────────────────────────
+
+def _bind_lastfm(library, account):
+    from app.services.lastfm_crypto import encrypt
+    from tests import lastfm_secrets as planted
+
+    token_enc = encrypt(planted.CREDENTIAL_KEY, f"token-{account}")
+    library.store_lastfm_pending_token(token_enc, 2, 1)
+    connection_id = str(uuid.uuid4())
+    library.bind_lastfm_session(
+        token_enc, account_name=account, session_key_enc=encrypt(planted.CREDENTIAL_KEY, "key"),
+        new_connection_id=connection_id, now=1,
+    )
+    return connection_id
+
+
+def _enable_lastfm(w):
+    # sam's connection_id answers byte-for-byte like an unknown one (409, spec §7.4 Enable
+    # names one code for "not the caller's current one") and sam's row is untouched.
+    from app.services.lastfm_accounts import build_lastfm_accounts
+    from app.services.lastfm_state import LastfmService, LastfmState
+
+    state = LastfmState(LastfmService.STOPPED, None)  # enable works while stopped; no config needed
+    w.client.app.state.lastfm = state
+    w.client.app.state.lastfm_accounts = build_lastfm_accounts(state)
+    sams = _bind_lastfm(w.sam, "sams-account")
+    mine = _bind_lastfm(w.alex, "alexs-account")
+    sams_row = w.sam.get_lastfm_connection()
+    path = "/settings/integrations/lastfm/enable"
+    foreign = w.request("POST", path, json={"connection_id": sams})
+    unknown = w.request("POST", path, json={"connection_id": UNKNOWN_UPLOAD})
+    assert (foreign.status_code, foreign.content) == (409, unknown.content), foreign.text
+    assert foreign.json()["detail"]["error"] == "lastfm_connection_changed"
+    assert w.sam.get_lastfm_connection() == sams_row
+    assert w.alex.get_lastfm_connection()["opted_in"] is False
+    r = w.request("POST", path, json={"connection_id": mine})  # control
+    assert r.status_code == 200, r.text
+    assert w.alex.get_lastfm_connection()["opted_in"] is True
+
+
+def _now_playing_lastfm(w):
+    # sam's track uuid answers byte-for-byte like an unknown one (202, spec §7.10: the route
+    # never says whether a notice will be sent). The notice is kept under alex's own id,
+    # so the sender's re-read in alex's catalog finds nothing and sends nothing
+    # (tests/test_lastfm_now_playing.py::test_another_users_track_or_an_unknown_one_sends_nothing).
+    from app.services.lastfm_accounts import LastfmAccounts
+    from app.services.user_cooldown import UserCooldown
+    from app.services.lastfm_state import LastfmService, LastfmState
+    from tests.lastfm_fake import make_config
+    from tests.lastfm_routes import RecordingNotices
+
+    noticed = []
+    state = LastfmState(LastfmService.RUNNING, make_config())
+    w.client.app.state.lastfm = state
+    w.client.app.state.lastfm_accounts = LastfmAccounts(
+        state, client=None, gate=None, cooldown=UserCooldown(), now_ms=lambda: 0,
+        notices=RecordingNotices([], noticed),
+    )
+    path = "/settings/integrations/lastfm/now-playing"
+    foreign = w.request("POST", path, json={"track_uuid": w.theirs.uuid_id})
+    unknown = w.request("POST", path, json={"track_uuid": str(uuid.uuid4())})
+    assert (foreign.status_code, foreign.content) == (202, unknown.content), foreign.text
+    assert {owner for owner, _ in noticed} == {w.alex_id}
+    r = w.request("POST", path, json={"track_uuid": w.mine.uuid_id})  # control: alike
+    assert (r.status_code, r.content) == (202, unknown.content)
+
+
 PROBES = {
     ("GET", "/tracks/{uuid_id:uuid}", "uuid_id"): _get_track,
     ("PATCH", "/tracks/{uuid_id:uuid}", "uuid_id"): _patch_track,
@@ -893,6 +964,10 @@ PROBES = {
     ("GET", "/tracks/duplicates", "after"): _list_duplicates_after,
     ("POST", "/tracks/duplicates/dismiss", "body"): _dismiss_duplicates,
     ("POST", "/tracks/duplicates/restore", "body"): _restore_duplicates,
+    # 9D.2a
+    ("POST", "/settings/integrations/lastfm/enable", "body"): _enable_lastfm,
+    # 9D.2c
+    ("POST", "/settings/integrations/lastfm/now-playing", "body"): _now_playing_lastfm,
 }
 
 

@@ -77,6 +77,18 @@ final libraryToolsAdvertisedProvider = Provider<bool>(
   (ref) => ref.watch(libraryToolsFeatureProvider).value != null,
 );
 
+/// `integrations`, or null when the server doesn't advertise it.
+final integrationsFeatureProvider =
+    FutureProvider<AdvertisedFeature<IntegrationsFeature>?>(
+      (ref) async {
+        final info = await ref.watch(appInfoProvider.future);
+        final block = info.features.integrations;
+        return block == null
+            ? null
+            : AdvertisedFeature(block, fromCache: info.fromCache);
+      },
+    );
+
 /// The block network work may act on: null when absent or `fromCache`. A
 /// cached block may be shown but never starts a request.
 T? featureForNetwork<T>(AdvertisedFeature<T>? advertised) =>

@@ -1,4 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/services/lastfm/lastfm_service.dart';
 import 'package:frontend/services/settings_service.dart';
 
 /// Settings input (SC-26): every Settings change goes through here; the
@@ -18,6 +19,13 @@ abstract interface class SettingsControls {
   Future<void> setDownloadQuality(String quality);
 
   Future<void> setNotifyStaleDownloads(bool notify);
+
+  /// Hide or show a hideable Home section (SC-07 `hidePreferenceKey`).
+  Future<void> setHomeSectionHidden(String key, bool hidden);
+
+  /// Settings was opened: what Settings shows from the server is read again
+  /// (spec §7.12: the Integrations row's status).
+  void onSettingsOpened();
 }
 
 /// Watches the model's rule so watchers of the controller rebuild when it
@@ -54,4 +62,11 @@ class SettingsController implements SettingsControls {
   @override
   Future<void> setNotifyStaleDownloads(bool notify) =>
       _settings.setNotifyStaleDownloads(notify);
+
+  @override
+  Future<void> setHomeSectionHidden(String key, bool hidden) =>
+      _ref.read(homeLayoutPreferencesProvider.notifier).setHidden(key, hidden);
+
+  @override
+  void onSettingsOpened() => _ref.invalidate(lastfmServiceProvider);
 }

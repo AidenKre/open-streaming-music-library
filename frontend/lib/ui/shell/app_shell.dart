@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/ui/home/home_page.dart';
+import 'package:frontend/ui/home/home_suggestions_controller.dart';
 import 'package:frontend/ui/search_page.dart';
 import 'package:frontend/models/server_blocked_reason.dart';
 import 'package:frontend/ui/session_controller.dart';
@@ -79,6 +80,49 @@ class AppShellState extends ConsumerState<AppShell> {
   bool _activeAtRoot = true;
   bool _chromeUpdateScheduled = false;
 
+  /// What the suggestions controller was last told (Home starts visible).
+  bool? _homeVisible; // null until the first report
+  bool _appVisible = true;
+  late final AppLifecycleListener _lifecycle;
+
+  @override
+  void initState() {
+    super.initState();
+    final launch = WidgetsBinding.instance.lifecycleState;
+    _appVisible =
+        launch == null ||
+        launch == AppLifecycleState.resumed ||
+        launch == AppLifecycleState.inactive;
+    // Tell the controller where Home stands once the first frame is built
+    // (an app that starts in the background gets its first frame on resume).
+    WidgetsBinding.instance.addPostFrameCallback((_) => _syncHomeVisible());
+    _lifecycle = AppLifecycleListener(
+      onStateChange: (state) {
+        _appVisible =
+            state == AppLifecycleState.resumed ||
+            state == AppLifecycleState.inactive;
+        _syncHomeVisible();
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _lifecycle.dispose();
+    super.dispose();
+  }
+
+  /// Forward "Home's root is what the user sees" to the controller (SC-26),
+  /// only when it changes. Never called during build.
+  void _syncHomeVisible() {
+    if (!mounted) return;
+    final visible =
+        _appVisible && _tab == ShellTab.home && _atRoot(ShellTab.home);
+    if (visible == _homeVisible) return;
+    _homeVisible = visible;
+    ref.read(homeSuggestionsControlsProvider).setHomeVisible(visible);
+  }
+
   /// The visible tab.
   ShellTab get tab => _tab;
 
@@ -98,6 +142,7 @@ class AppShellState extends ConsumerState<AppShell> {
         if (!mounted) return;
         final atRoot = _atRoot(_tab);
         if (atRoot != _activeAtRoot) setState(() => _activeAtRoot = atRoot);
+        _syncHomeVisible();
       })
       ..scheduleFrame();
   }
@@ -113,6 +158,7 @@ class AppShellState extends ConsumerState<AppShell> {
       _tab = next;
       _activeAtRoot = _atRoot(next);
     });
+    _syncHomeVisible();
     if (next == ShellTab.search) _focusSearchWhenAtRoot();
   }
 
@@ -145,6 +191,7 @@ class AppShellState extends ConsumerState<AppShell> {
       _tab = ShellTab.search;
       _activeAtRoot = _atRoot(ShellTab.search);
     });
+    _syncHomeVisible();
     _focusSearchWhenAtRoot();
   }
 

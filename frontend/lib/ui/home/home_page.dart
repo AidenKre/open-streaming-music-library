@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/feed/feed.dart';
 import 'package:frontend/ui/feed/feed_header.dart';
 import 'package:frontend/ui/home/home_controller.dart';
+import 'package:frontend/repositories/home_suggestions_service.dart' show SuggestionRail;
+import 'package:frontend/ui/home/home_suggestions_controller.dart';
 import 'package:frontend/ui/navigation/library_routes.dart';
 import 'package:frontend/ui/shell/shell_chrome.dart';
 import 'package:frontend/ui/widgets/filter_bar.dart';
@@ -24,7 +27,7 @@ class HomeEntryPoint {
   final BrowseDestination destination;
 }
 
-/// Phase 4's entry points, in order.
+/// Phase 4's entry points, then Phase 9's Listening stats.
 final homeEntryPointsProvider = Provider<List<HomeEntryPoint>>(
   (ref) => const [
     HomeEntryPoint(
@@ -50,6 +53,12 @@ final homeEntryPointsProvider = Provider<List<HomeEntryPoint>>(
       label: 'Downloaded',
       icon: Icons.download_done,
       destination: BrowseDestination.downloaded,
+    ),
+    HomeEntryPoint(
+      id: 'listening_stats',
+      label: 'Listening stats',
+      icon: Icons.insights,
+      destination: BrowseDestination.listeningStats,
     ),
   ],
 );
@@ -93,14 +102,109 @@ class HomeSectionSpec {
 /// Home's sections, listed in [HomeSectionIds.order] (a test guards it; a
 /// later phase inserts its spec at its id's position). Phase 4 registers the
 /// search header, the library sync status and the entry points.
-final homeSectionsProvider = Provider<List<HomeSectionSpec>>(
-  (ref) => [
-    homeSearchSectionSpec,
-    homeSyncStatusSectionSpec,
-    homeEntryPointsSectionSpec,
-    homeFiltersSectionSpec,
-    homeRecentsSectionSpec,
-  ],
+final homeSectionsProvider = Provider<List<HomeSectionSpec>>((ref) {
+  final preferences = ref.watch(homeLayoutPreferencesProvider);
+  // A hideable section stays out while the preference is unknown.
+  final known = preferences.hasValue || preferences.hasError;
+  final hidden = preferences.value?.hidden ?? const <String>{};
+  return [
+    for (final spec in [
+      homeSearchSectionSpec,
+      homeSyncStatusSectionSpec,
+      homeEntryPointsSectionSpec,
+      homeFiltersSectionSpec,
+      homeRecentsSectionSpec,
+      homeRediscoverSectionSpec,
+      homeMoreFromArtistsSectionSpec,
+    ])
+      if (spec.hidePreferenceKey == null ||
+          (known && !hidden.contains(spec.hidePreferenceKey)))
+        spec,
+  ];
+});
+
+/// Rediscover: a frozen-snapshot rail over [HomeSuggestionsControls].
+final homeRediscoverSectionSpec = HomeSectionSpec(
+  id: HomeSectionIds.rediscover,
+  hidePreferenceKey: HomeSectionIds.rediscover,
+  build: (context, ref) => _suggestionsSection(
+    ref,
+    SuggestionRail.rediscover,
+    HomeSectionIds.rediscover,
+    'Rediscover',
+    'Tracks you enjoyed, but haven’t played in two weeks',
+  ),
+);
+
+/// More from your artists: unplayed music from recently listened artists.
+final homeMoreFromArtistsSectionSpec = HomeSectionSpec(
+  id: HomeSectionIds.moreFromArtists,
+  hidePreferenceKey: HomeSectionIds.moreFromArtists,
+  build: (context, ref) => _suggestionsSection(
+    ref,
+    SuggestionRail.moreFromArtists,
+    HomeSectionIds.moreFromArtists,
+    'More from your artists',
+    'Music you haven’t played through yet, from artists you listened to in '
+        'the last 30 days',
+  ),
+);
+
+FeedSection _suggestionsSection(
+  WidgetRef ref,
+  SuggestionRail rail,
+  String id,
+  String title,
+  String subtitle,
+) => _ListenableSection<HomeSuggestionsControls>(
+  id,
+  ref.watch(homeSuggestionsControlsProvider),
+  (context, controls) {
+    void engagement(RailEngagement e) => controls.setRailEngagement(rail, e);
+    return switch (controls.stateOf(rail)) {
+      SuggestionRailLoading() => EntityRailSection(
+        id: id,
+        title: title,
+        subtitle: subtitle,
+        entities: const [],
+        state: RailState.loading,
+        onEngagementChanged: engagement,
+      ),
+      SuggestionRailFailed() => EntityRailSection(
+        id: id,
+        title: title,
+        subtitle: subtitle,
+        entities: const [],
+        state: RailState.error,
+        onRetry: () => controls.retry(rail),
+        onEngagementChanged: engagement,
+      ),
+      SuggestionRailReady(
+        :final tracks,
+        :final emptiedByFilter,
+        :final resetToken,
+        :final showNotice,
+      ) =>
+        EntityRailSection(
+          id: id,
+          title: title,
+          subtitle: subtitle,
+          entities: [for (final t in tracks) TrackEntity(t)],
+          resetToken: resetToken,
+          onTap: (entity, _) =>
+              controls.playTrack((entity as TrackEntity).track),
+          emptyMessage: emptiedByFilter ? 'No downloaded suggestions' : null,
+          onEngagementChanged: engagement,
+          notice: showNotice
+              ? RailNotice(
+                  message: 'New listening activity',
+                  actionLabel: 'Refresh',
+                  onTap: () => controls.refreshRail(rail),
+                )
+              : null,
+        ),
+    }.buildSliver(context);
+  },
 );
 
 /// The Downloaded chip, in its own section above the rails (SC-07, O6):
@@ -182,13 +286,15 @@ EntityRailSection _recentsRail(BuildContext context, HomeControls controls) {
 }
 
 /// A section whose sliver rebuilds when [controls] notifies.
-class _HomeControlsSection extends FeedSection {
-  const _HomeControlsSection(this.id, this.controls, this.builder);
+typedef _HomeControlsSection = _ListenableSection<HomeControls>;
+
+class _ListenableSection<C extends Listenable> extends FeedSection {
+  const _ListenableSection(this.id, this.controls, this.builder);
 
   @override
   final String id;
-  final HomeControls controls;
-  final Widget Function(BuildContext context, HomeControls controls) builder;
+  final C controls;
+  final Widget Function(BuildContext context, C controls) builder;
 
   @override
   Widget buildSliver(BuildContext context) => ListenableBuilder(

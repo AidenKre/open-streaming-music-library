@@ -88,6 +88,10 @@ REGISTRY = {
     "deletion_job_items": _owned("deletion_jobs"),
     # Phase 8 deletion file journal: one row per item, keyed under its item.
     "deletion_journal": _owned("deletion_job_items"),
+    # Phase 9 Last.fm connection: at most one row per user.
+    "lastfm_connections": _owned(),
+    # Phase 9 scrobble outbox: frozen payloads, keyed by event_uuid.
+    "scrobble_outbox": _owned(),
     "fts_tracks": Entry(OWNED_THROUGH, parent="tracks", fts_rowid=True),
     "fts_artists": Entry(OWNED_THROUGH, parent="artists", fts_rowid=True),
     "fts_albums": Entry(OWNED_THROUGH, parent="albums", fts_rowid=True),

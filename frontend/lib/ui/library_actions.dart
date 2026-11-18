@@ -202,6 +202,15 @@ extension RecentTrackPlay on LibraryActionControls {
       playFromList([track], 0, source: recentsQueueSource);
 }
 
+/// The queue source of a track tapped on the statistics screens.
+const listeningStatsQueueSource = 'listening_stats';
+
+extension StatsTrackPlay on LibraryActionControls {
+  /// A statistics track tap: a new single-track queue and one track click.
+  Future<PlaybackOutcome> playStatsTrack(TrackUI track) =>
+      playFromList([track], 0, source: listeningStatsQueueSource);
+}
+
 /// Shown when nothing in a collection plays on this device offline (the
 /// collection header's disabled note and the menu actions' message).
 const nothingPlaysOfflineMessage = 'Nothing here plays offline.';

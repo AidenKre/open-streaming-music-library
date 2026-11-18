@@ -531,6 +531,40 @@ BEGIN
 END
 ''';
 
+const _catalogAttributionTriggersV8 = [
+  '''
+CREATE TRIGGER catalog_attribution_insert
+AFTER INSERT ON trackmetadata
+BEGIN
+  INSERT INTO local_counters (key, value) VALUES ('catalog_attribution', 1)
+  ON CONFLICT(key) DO UPDATE SET value = value + 1;
+END
+''',
+  '''
+CREATE TRIGGER catalog_attribution_delete
+AFTER DELETE ON trackmetadata
+BEGIN
+  INSERT INTO local_counters (key, value) VALUES ('catalog_attribution', 1)
+  ON CONFLICT(key) DO UPDATE SET value = value + 1;
+END
+''',
+  '''
+CREATE TRIGGER catalog_attribution_update
+AFTER UPDATE OF title, artist, album, album_artist, artist_id, album_id
+ON trackmetadata
+WHEN OLD.title IS NOT NEW.title
+  OR OLD.artist IS NOT NEW.artist
+  OR OLD.album IS NOT NEW.album
+  OR OLD.album_artist IS NOT NEW.album_artist
+  OR OLD.artist_id IS NOT NEW.artist_id
+  OR OLD.album_id IS NOT NEW.album_id
+BEGIN
+  INSERT INTO local_counters (key, value) VALUES ('catalog_attribution', 1)
+  ON CONFLICT(key) DO UPDATE SET value = value + 1;
+END
+''',
+];
+
 // ── Column allowlists (mirrors backend database.py) ─────────────────────
 
 const allowedMetadataColumns = {
@@ -1144,7 +1178,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
   ///     [rebuildFtsIndexes] afterwards.
   @override
-  int get schemaVersion => 7;
+  int get schemaVersion => 8;
 
   @override
   StreamQueryUpdateRules get streamUpdateRules => StreamQueryUpdateRules([
@@ -1154,6 +1188,12 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       on: TableUpdateQuery.onTableName('history_events'),
       result: [TableUpdate('local_counters')],
     ),
+    // SC-11: the catalog_attribution triggers bump a counter on every
+    // insert, update and delete of trackmetadata; drift can't see that.
+    const WritePropagation(
+      on: TableUpdateQuery.onTableName('trackmetadata'),
+      result: [TableUpdate('local_counters')],
+    ),
   ]);
 
   @override
@@ -1161,6 +1201,9 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
     onCreate: (m) async {
       await m.createAll();
       await customStatement(_historyContentTriggerV3);
+      for (final stmt in _catalogAttributionTriggersV8) {
+        await customStatement(stmt);
+      }
       for (final stmt in _ftsStatements) {
         await customStatement(stmt);
       }
@@ -1235,6 +1278,12 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       // Phase 8 owned-file cleanup queue: created empty.
       await m.createTable(schema.ownedFileCleanup);
     },
+    from7To8: (m, schema) async {
+      // SC-11: catalog_attribution change counter (insert/update/delete triggers).
+      for (final stmt in _catalogAttributionTriggersV8) {
+        await customStatement(stmt);
+      }
+    },
   );
 
   Future<void> resetLocalData() async {
@@ -1258,6 +1307,10 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
           'DELETE FROM ${_quoteSqlIdentifier(table.actualTableName)}',
         );
       }
+
+      // Deleting trackmetadata fires the catalog_attribution DELETE trigger,
+      // which re-creates its local_counters row after that table was cleared.
+      await customStatement('DELETE FROM local_counters');
 
       try {
         await customStatement('DELETE FROM sqlite_sequence');

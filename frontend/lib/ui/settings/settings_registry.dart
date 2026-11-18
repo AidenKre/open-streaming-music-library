@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/misc.dart' show ProviderListenable;
 import 'package:frontend/ui/settings/phase4_settings.dart';
 import 'package:frontend/ui/settings/phase5_settings.dart';
 import 'package:frontend/ui/settings/phase8_settings.dart';
+import 'package:frontend/ui/settings/phase9_settings.dart';
 
 /// A titled Settings section (SC-21). Ordered by [order]; hidden when none
 /// of its rows is available.
@@ -43,7 +44,9 @@ class SettingsRowContribution {
 /// `SettingsPage`; nothing is pre-registered for features that haven't
 /// landed.
 final settingsSectionsProvider = Provider<List<SettingsSection>>(
-  (ref) => [...phase4SettingsSections, ...phase5SettingsSections],
+  (ref) => [...phase4SettingsSections, ...phase5SettingsSections,
+    ...phase9SettingsSections,
+  ],
 );
 
 /// The Settings rows (Phase 8 adds Manage library / Possible duplicates and
@@ -51,6 +54,7 @@ final settingsSectionsProvider = Provider<List<SettingsSection>>(
 final settingsRowsProvider = Provider<List<SettingsRowContribution>>(
   (ref) => [
     ...phase4SettingsRows,
+    ...phase9SettingsRows,
     ...phase5SettingsRows(ref.watch(diagnosticsRowsProvider)),
     ...phase8SettingsRows,
   ],

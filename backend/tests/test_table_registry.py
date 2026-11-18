@@ -76,6 +76,9 @@ def test_every_table_in_the_schema_has_a_class(conn):
         ("deletion_jobs", registry.OWNED),
         ("deletion_job_items", registry.OWNED),
         ("deletion_journal", registry.OWNED),
+        # Phase 9D.1b: one Last.fm connection per user (spec §7.3).
+        ("lastfm_connections", registry.OWNED),
+        ("scrobble_outbox", registry.OWNED),
         ("fts_tracks", registry.OWNED_THROUGH),
         ("fts_artists", registry.OWNED_THROUGH),
         ("fts_albums", registry.OWNED_THROUGH),
@@ -233,6 +236,8 @@ def test_the_delete_order_is_children_first_and_ends_with_users(conn):
         "fts_tracks",
         "history_hook_failures",
         "history_events",
+        "lastfm_connections",
+        "scrobble_outbox",
         "storage_reservations",
         "track_audio_fingerprint",
         "track_audio_identity",
@@ -337,6 +342,10 @@ def test_rows_deleted_in_that_order_never_violate_a_foreign_key(conn):
             quarantine_path, base_revision, src_dev, src_ino, src_size, master_missing, stage,
             created_at, updated_at) VALUES (1, 'del', 'w', '/m/sam/b', '/m/.deleting/1/del/w', 1,
             1, 2, 3, 0, 'intent', 0, 0);
+        INSERT INTO lastfm_connections (owner_id, connection_id, account_name, session_key_enc,
+            opted_in, created_at, updated_at) VALUES (1, 'c', 'rj', 'enc', 1, 0, 0);
+        INSERT INTO scrobble_outbox (event_uuid, owner_id, payload, listened_at_s, created_at)
+            VALUES ('e', 1, '{}', 0, 0);
         """
     )
 

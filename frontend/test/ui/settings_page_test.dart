@@ -257,7 +257,11 @@ void main() {
     await tester.pumpWidget(_wrap(prefs));
     await tester.pumpAndSettle();
 
-    final switchFinder = find.byType(SwitchListTile);
+    // Phase 9 adds the Home toggles: pick the stale-downloads switch.
+    final switchFinder = find.widgetWithText(
+      SwitchListTile,
+      'Notify about changed downloads',
+    );
     expect(switchFinder, findsOneWidget);
     expect(tester.widget<SwitchListTile>(switchFinder).value, isTrue);
 
@@ -681,6 +685,16 @@ void main() {
       await tester.pumpAndSettle();
     }
 
+    // 9D.2e (spec §7.12): the Integrations row's status is read "each time
+    // Settings opens".
+    testWidgets('opening Settings tells the controller once', (tester) async {
+      await pump(tester);
+      expect(fake.opened, 1);
+      await tester.pump();
+      expect(fake.opened, 1);
+      expect(fake.calls, isEmpty);
+    });
+
     testWidgets('stream quality: default vs this session', (tester) async {
       await pump(tester);
       await tester.tap(find.text('Original').first);
@@ -743,7 +757,13 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.text('128 kbps').last);
       await tester.pumpAndSettle();
-      await tester.tap(find.byType(Switch));
+      await tester.tap(find.descendant(
+        of: find.widgetWithText(
+          SwitchListTile,
+          'Notify about changed downloads',
+        ),
+        matching: find.byType(Switch),
+      ));
       await tester.pumpAndSettle();
       expect(fake.calls, ['download 128', 'notify false']);
     });
@@ -767,4 +787,10 @@ class _FakeSettings implements SettingsControls {
   @override
   Future<void> setNotifyStaleDownloads(bool notify) async =>
       calls.add('notify $notify');
+  @override
+  Future<void> setHomeSectionHidden(String key, bool hidden) async =>
+      calls.add('home $key $hidden');
+  int opened = 0;
+  @override
+  void onSettingsOpened() => opened++;
 }

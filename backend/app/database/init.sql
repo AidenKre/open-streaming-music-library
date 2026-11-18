@@ -578,5 +578,42 @@ END;
 CREATE VIEW IF NOT EXISTS live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks
   WHERE NOT EXISTS (SELECT 1 FROM deletion_journal d WHERE d.uuid_id = tracks.uuid_id);
 
-PRAGMA user_version = 16;
+-- Phase 9D.1b (v17), spec §7.3: one Last.fm connection per user; secrets are Fernet ciphertext, never plaintext.
+CREATE TABLE IF NOT EXISTS lastfm_connections (
+  owner_id                 INTEGER NOT NULL UNIQUE REFERENCES users(id),
+  connection_id            TEXT,
+  account_name             TEXT,
+  session_key_enc          TEXT,
+  opted_in                 INTEGER NOT NULL DEFAULT 0 CHECK (opted_in IN (0,1)),
+  needs_reconnect          INTEGER NOT NULL DEFAULT 0 CHECK (needs_reconnect IN (0,1)),
+  pending_token_enc        TEXT,
+  pending_token_expires_at INTEGER,
+  created_at               INTEGER NOT NULL,
+  updated_at               INTEGER NOT NULL,
+  CHECK ((connection_id IS NULL AND account_name IS NULL AND session_key_enc IS NULL)
+      OR (connection_id IS NOT NULL AND account_name IS NOT NULL AND session_key_enc IS NOT NULL)),
+  CHECK ((pending_token_enc IS NULL) = (pending_token_expires_at IS NULL)),
+  CHECK (opted_in = 0 OR session_key_enc IS NOT NULL)
+);
+
+-- Phase 9D.1b (v17), spec §7.3: the scrobble outbox. The frozen payload is exactly what is sent; there is no link to the track. The second index serves the sender's due scan.
+CREATE TABLE IF NOT EXISTS scrobble_outbox (
+  event_uuid    TEXT NOT NULL PRIMARY KEY,
+  owner_id      INTEGER NOT NULL REFERENCES users(id),
+  payload       TEXT NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'object'),
+  listened_at_s INTEGER NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','ignored','failed','dropped')),
+  result_code   TEXT,
+  attempts      INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  alone         INTEGER NOT NULL DEFAULT 0 CHECK (alone IN (0,1)),
+  created_at    INTEGER NOT NULL,
+  done_at       INTEGER,
+  CHECK ((status = 'pending') = (done_at IS NULL)),
+  CHECK ((status IN ('pending','sent')) = (result_code IS NULL)),
+  CHECK (status <> 'dropped' OR result_code IN ('too_many_tries','too_old','no_answer'))
+);
+CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_owner ON scrobble_outbox(owner_id, status, listened_at_s);
+CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_due ON scrobble_outbox(owner_id, created_at, listened_at_s) WHERE status = 'pending';
+
+PRAGMA user_version = 17;
 COMMIT;

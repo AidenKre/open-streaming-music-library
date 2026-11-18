@@ -149,22 +149,42 @@ class HistorySnapshotService {
 
   /// Captures a token for [filterKey]. The boundary and the content counter
   /// are read in one read transaction so a writer cannot yield a mixed view.
-  /// `catalogAttributionVersion` is left null.
-  Future<HistorySnapshotToken> capture(Object filterKey) async {
-    final row = await _db.transaction(
-      () => _snapshotSelect(
-        _db,
-        boundary: true,
-        attribution: false,
-      ).getSingle(),
-    );
-    return HistorySnapshotToken(
+  /// With [attribution] the same statement also reads the catalog_attribution
+  /// counter into `catalogAttributionVersion`; by default it is left null.
+  Future<HistorySnapshotToken> capture(
+    Object filterKey, {
+    bool attribution = false,
+  }) async => (await captureWith<void>(
+    filterKey,
+    (_) async {},
+    attribution: attribution,
+  )).$1;
+
+  /// [capture] and the reads made under the token in ONE read transaction:
+  /// no writer can commit between the counters and [read]'s rows (9-R1-09).
+  /// Returns the token and [read]'s result.
+  ///
+  /// [read] runs inside that transaction: it must issue all of its reads
+  /// from within the callback (same caveat as [readPage]).
+  Future<(HistorySnapshotToken, T)> captureWith<T>(
+    Object filterKey,
+    Future<T> Function(HistorySnapshotToken token) read, {
+    bool attribution = false,
+  }) => _db.transaction(() async {
+    final row = await _snapshotSelect(
+      _db,
+      boundary: true,
+      attribution: attribution,
+    ).getSingle();
+    final token = HistorySnapshotToken(
       boundaryLocalId: row.read<int>('b'),
       historyContentVersion: row.read<int>('h'),
+      catalogAttributionVersion: attribution ? row.read<int>('a') : null,
       capturedNowUtcMs: _clock.nowUtcMs(),
       filterKey: filterKey,
     );
-  }
+    return (token, await read(token));
+  });
 
   /// Reads one keyset page bound to [token]. In ONE read transaction it first
   /// re-reads the counters the token names and returns [SnapshotExpired]

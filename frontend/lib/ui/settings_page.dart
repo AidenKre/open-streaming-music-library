@@ -1,15 +1,31 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/settings/settings_registry.dart';
+import 'package:frontend/ui/settings_controller.dart';
 
 /// Settings as a session destination (SC-08): renders only the SC-21
 /// registry — ordered sections, each with its available rows; a section
-/// with no available row is hidden. No section is special-cased here.
-class SettingsPage extends ConsumerWidget {
+/// with no available row is hidden. No section is special-cased here. Opening
+/// it tells the controller once (what Settings shows from the server is read
+/// again).
+class SettingsPage extends ConsumerStatefulWidget {
   const SettingsPage({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends ConsumerState<SettingsPage> {
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(() {
+      if (mounted) ref.read(settingsControlsProvider).onSettingsOpened();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final sections = [...ref.watch(settingsSectionsProvider)]
       ..sort((a, b) => a.order.compareTo(b.order));
     final rows = ref.watch(settingsRowsProvider);
