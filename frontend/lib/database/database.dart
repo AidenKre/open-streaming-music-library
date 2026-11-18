@@ -419,6 +419,48 @@ class DurableSubmissions extends Table {
   List<String> get customConstraints => const ['PRIMARY KEY(operation_uuid)'];
 }
 
+/// Phase 8 owned-file cleanup queue: app-owned local files (downloads) whose
+/// DB reference was dropped, enqueued in the same transaction that dropped it
+/// and deleted later by a worker.
+@DataClassName('OwnedFileCleanupRow')
+class OwnedFileCleanupEntries extends Table {
+  @override
+  String get tableName => 'owned_file_cleanup';
+
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get path => text()();
+
+  /// Which owned root the file lives under. Only downloads for now. Raw
+  /// constraint (not `.check`) so the fresh DDL is byte-identical to the
+  /// migration snapshot's.
+  TextColumn get rootKind => text().customConstraint(
+    "NOT NULL CHECK (root_kind IN ('downloads'))",
+  )();
+
+  /// Device id of the file; NULL = unknown.
+  IntColumn get dev => integer().nullable()();
+
+  /// Inode of the file; NULL = unknown.
+  IntColumn get ino => integer().nullable()();
+
+  /// Bytes; NULL = unknown (never 0).
+  IntColumn get size => integer().nullable()();
+
+  /// File modification time, UTC microseconds since epoch; NULL = unknown.
+  IntColumn get mtime => integer().nullable()();
+
+  /// The SC-01 binding token captured by the enqueuing task; NULL = no
+  /// binding row existed.
+  TextColumn get localBindingId => text().nullable()();
+  IntColumn get attempts => integer().withDefault(const Constant(0))();
+
+  /// NULL until a delete attempt fails.
+  TextColumn get lastError => text().nullable()();
+
+  /// UTC milliseconds.
+  IntColumn get createdAt => integer()();
+}
+
 /// Local upload transfer intents (Phase 7 spec section 7), one row per
 /// selected file, keyed by the SC-01 `local_binding_id`.
 @TableIndex(
@@ -1044,6 +1086,9 @@ String _quoteSqlIdentifier(String identifier) {
 
 // ── Database ────────────────────────────────────────────────────────────
 
+/// Why an outbox edit was rejected because its track was deleted server-side.
+const trackGoneRejectionReason = 'Track no longer exists on the server';
+
 @DriftDatabase(
   tables: [
     Artists,
@@ -1063,6 +1108,7 @@ String _quoteSqlIdentifier(String identifier) {
     ActiveListens,
     DurableSubmissions,
     UploadIntents,
+    OwnedFileCleanupEntries,
   ],
 )
 class AppDatabase extends _$AppDatabase implements LocalResettable {
@@ -1098,7 +1144,7 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
   ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
   ///     [rebuildFtsIndexes] afterwards.
   @override
-  int get schemaVersion => 6;
+  int get schemaVersion => 7;
 
   @override
   StreamQueryUpdateRules get streamUpdateRules => StreamQueryUpdateRules([
@@ -1184,6 +1230,10 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       await m.createTable(schema.uploadIntents);
       await m.createIndex(schema.idxDurableSubmissionsUnresolved);
       await m.createIndex(schema.idxUploadIntentsBatch);
+    },
+    from6To7: (m, schema) async {
+      // Phase 8 owned-file cleanup queue: created empty.
+      await m.createTable(schema.ownedFileCleanup);
     },
   );
 
@@ -1370,6 +1420,25 @@ class AppDatabase extends _$AppDatabase implements LocalResettable {
       .replaceAll('\\', '\\\\')
       .replaceAll('%', '\\%')
       .replaceAll('_', '\\_');
+
+  /// A tombstoned track can never accept its unsent edits: resolve the
+  /// `pending`/`conflicted` ones as rejected (visible in the banner), without
+  /// sending anything. Rows already rejected keep their own reason; `take_server`
+  /// rows are untouched. Run inside the transaction that deletes the tracks.
+  Future<void> rejectUnsentEditsOfDeletedTracks(List<String> uuids) =>
+      (update(pendingEdits)
+            ..where(
+              (t) =>
+                  t.uuidId.isIn(uuids) &
+                  t.status.isIn(const ['pending', 'conflicted']),
+            ))
+          .write(
+        const PendingEditsCompanion(
+          status: Value('rejected'),
+          rejectionReason: Value(trackGoneRejectionReason),
+          serverRevision: Value(null),
+        ),
+      );
 
   // ── Optimistic edit write (outbox) ────────────────────────────────────
 

@@ -125,4 +125,30 @@ void main() {
     expect(await db.searchDuringRebuild, 1,
         reason: 'a search saw the emptied index mid-rebuild');
   });
+
+  // Phase 8 adds a rebuild after a failed page (pages that committed changed
+  // the tables): it runs in one transaction too.
+  test('a search during the rebuild after a failed page still finds a track',
+      () async {
+    pages[0] = {
+      'changes': [_upsert('u1', 1)],
+      'nextCursor': null,
+      'latestRevision': 1,
+    };
+    await (await service()).syncChanges();
+
+    // One page commits, the next request fails.
+    pages[1] = {
+      'changes': [_upsert('u2', 2)],
+      'nextCursor': 2,
+      'latestRevision': 3,
+    };
+    db.probing = true;
+    await expectLater((await service()).syncChanges(), throwsA(anything));
+
+    expect(db.searchDuringRebuild, isNotNull,
+        reason: 'the rebuild after the failed page ran and the probe searched');
+    expect(await db.searchDuringRebuild, 1,
+        reason: 'a search saw the emptied index mid-rebuild');
+  });
 }

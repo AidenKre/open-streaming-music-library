@@ -89,7 +89,11 @@ class ReviewItemView {
       reviewVersion: item.reviewVersion,
       displayName: item.filename,
       statusText: uploadStatusText(state, errorCode: code),
-      errorText: uploadDetailText(state, errorCode: code),
+      errorText: uploadDetailText(
+        state,
+        errorCode: code,
+        bytesHere: intent?.bytesOnThisDevice ?? false,
+      ),
       reviewable: reviewable,
       inFlight: _inFlight.contains(state),
       done: _done.contains(state),

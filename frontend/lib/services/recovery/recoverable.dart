@@ -69,6 +69,10 @@ class RecoveryPriority {
   /// page visit.
   static const uploads = 84;
 
+  /// Resume unanswered server deletions and poll their receipts (after
+  /// uploads; Phase 8).
+  static const deleteJobs = 83;
+
   /// Re-dispatch downloads that were left queued while offline.
   static const resumeDownloads = 80;
 
@@ -77,4 +81,8 @@ class RecoveryPriority {
 
   /// Reconcile `tracks.file_path` against the filesystem (cold start / resume).
   static const reconcileDownloads = 60;
+
+  /// Request an owned-file cleanup pass (cold start / resume), after
+  /// [reconcileDownloads]; local only.
+  static const ownedFileCleanup = 55;
 }

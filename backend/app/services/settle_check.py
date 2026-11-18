@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.library import Library
-from app.services.conversion import evict_converted_track_caches
+from app.services.encoded_cache import evict_track_caches
 from app.services.import_outcome import file_signature
 from app.services.metadata import get_track_metadata
 
@@ -24,13 +24,16 @@ logger = logging.getLogger(__name__)
 SETTLE_WINDOW_S = 30.0
 # Longest real wait between looks at the stop flag and at new entries.
 _POLL_S = 1.0
+# A refresh answers DEFER for a track that is pending deletion: its entry is
+# kept with the signature it was scheduled with and retried a window later.
+DEFER = "defer"
 
 
 class SettleCheck:
     def __init__(
         self,
         *,
-        refresh: Callable[[str, int, Path], bool],
+        refresh: Callable[[str, int, Path], "bool | str"],
         clock: Callable[[], float] = time.monotonic,
         stop_event: threading.Event | None = None,
         window: float = SETTLE_WINDOW_S,
@@ -75,7 +78,11 @@ class SettleCheck:
                 # Rescheduled meanwhile: the newer entry stands.
                 if entry is None or entry[2] != signature:
                     continue
-                if keep:
+                if keep == DEFER:
+                    # Pending deletion: nothing was refreshed. Keep the entry
+                    # with its scheduled signature so the change is seen again.
+                    self._entries[uuid_id] = (owner_id, path, signature, self.clock() + self._window)
+                elif keep:
                     self._entries[uuid_id] = (owner_id, path, current, self.clock() + self._window)
                 else:
                     del self._entries[uuid_id]
@@ -122,9 +129,9 @@ def make_settle_refresh(
     """The refresh the check calls when a file changed: re-read only the
     file-derived fields (never tags), then drop every cache entry built from
     the old content and, for the admin, warm again. False skips a track that
-    was deleted or re-organized meanwhile. The refresh also marks the track's
-    audio identity stale; ``identity_signal`` (anything with notify()) is woken
-    once that has committed."""
+    was deleted, is pending deletion or was re-organized meanwhile. The refresh
+    also marks the track's audio identity stale; ``identity_signal`` (anything
+    with notify()) is woken once that has committed."""
 
     def refresh(uuid_id: str, owner_id: int, path: Path) -> bool:
         with track_locks.lock(uuid_id):
@@ -132,8 +139,13 @@ def make_settle_refresh(
             if track is None:
                 # Deleted meanwhile: nothing to refresh, but an entry cached
                 # from the old content would be orphaned.
-                evict_converted_track_caches(uuid_id, cache, default_cache)
+                evict_track_caches(uuid_id, cache, default_cache)
                 return False
+            if database.is_pending_deletion(uuid_id, owner_id=owner_id):
+                # A deletion is in progress (its journal row is written under
+                # this lock): write nothing. A committed deletion evicts the
+                # caches itself; after a rollback DEFER retries it a window later.
+                return DEFER
             if Path(track.file_path).resolve() != Path(path).resolve():
                 return False
             meta = get_track_metadata(path)
@@ -161,7 +173,7 @@ def make_settle_refresh(
                 return False
             if identity_signal is not None:
                 identity_signal.notify()
-        evict_converted_track_caches(uuid_id, cache, default_cache)
+        evict_track_caches(uuid_id, cache, default_cache)
         encoder_coordinator.warm_imported(uuid_id, owner_id)
         return True
 

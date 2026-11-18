@@ -18,6 +18,7 @@ import json
 import sqlite3
 import uuid
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 from fastapi.routing import APIRoute
@@ -44,6 +45,10 @@ LISTED_QUERY_IDS = {
 LISTED_CURSOR_IDS = {
     ("GET", "/tracks/uploads", "after"),
     ("GET", "/tracks/uploads/{batch_uuid:uuid}/items", "after"),
+    # 8A.2b: the deletion receipt cursor carries an operation uuid.
+    ("GET", "/tracks/deletions", "after"),
+    # 8A.4: the duplicates list's cursor carries the pair's two track uuids.
+    ("GET", "/tracks/duplicates", "after"),
 }
 LISTED_BODY_IDS = {
     ("POST", "/jobs", "body"),
@@ -55,6 +60,13 @@ LISTED_BODY_IDS = {
     ("POST", "/tracks/uploads/items/{item_uuid:uuid}/commit", "body"),
     # 7A.3b: the resolve-duplicate request's chosen track and operation uuid.
     ("POST", "/tracks/uploads/items/{item_uuid:uuid}/resolve-duplicate", "body"),
+    # 8A.2b: the deletion preview's target uuids (plan D21).
+    ("POST", "/tracks/deletions/preview", "body"),
+    # 8A.2b: the job's operation uuid and target uuids.
+    ("POST", "/tracks/deletions", "body"),
+    # 8A.4: the dismissed or restored pair's two track uuids.
+    ("POST", "/tracks/duplicates/dismiss", "body"),
+    ("POST", "/tracks/duplicates/restore", "body"),
 }
 
 
@@ -678,6 +690,168 @@ def _resolve_duplicate_body(w):
     assert (r.status_code, r.json()["state"]) == (200, "duplicate"), r.text
 
 
+# ── 8A.2b: deletion preview, jobs and receipts (plan D21) ──────────────────
+
+def _deletion_switch_on(w):
+    w.client.app.state.settings.library_delete_enabled = True
+
+
+def _preview_deletion_body(w):
+    # sam's live track and sam's tombstone answer exactly like an unknown uuid.
+    _deletion_switch_on(w)
+    gone = _track(Path(str(w.theirs.file_path)).parent / "Gone.flac", "Gone")
+    assert w.sam.add_track(gone)
+    assert w.sam.delete_track(gone.uuid_id)
+    revision = w.theirs.revision
+    r = w.request("POST", "/tracks/deletions/preview", json={"targets": [
+        {"uuid_id": w.theirs.uuid_id, "base_revision": revision},
+        {"uuid_id": gone.uuid_id, "base_revision": revision},
+        {"uuid_id": UNKNOWN_UPLOAD, "base_revision": revision},
+    ]})
+    assert r.status_code == 200, r.text
+    rows = [{k: v for k, v in row.items() if k != "uuid_id"} for row in r.json()["targets"]]
+    assert rows[0] == rows[1] == rows[2]
+    assert rows[0]["unknown"] is True and rows[0]["title"] is None
+    assert "Lucky" not in r.text and "Gone" not in r.text
+    mine = w.alex.get_track_by_uuid(w.mine.uuid_id)
+    r = w.request("POST", "/tracks/deletions/preview", json={"targets": [  # control
+        {"uuid_id": mine.uuid_id, "base_revision": mine.revision}]})
+    assert r.json()["targets"][0]["title"] == "Airbag"
+
+
+def _deletion_job_body(op, *targets):
+    return {"operation_uuid": op, "confirmed_count": len(targets),
+            "targets": [{"uuid_id": u, "base_revision": r} for u, r in targets]}
+
+
+def _sams_deletion_job(w, op):
+    from app.models.deletions import DeletionJobRequest
+
+    request = DeletionJobRequest.model_validate(
+        _deletion_job_body(op, (w.theirs.uuid_id, w.theirs.revision)))
+    assert w.sam.create_deletion_job(request, now=1)
+
+
+def _create_deletion_job_body(w):
+    # sam's track in alex's job is accepted exactly like an unknown uuid (frozen,
+    # never looked up), and sam's operation uuid is no handle on sam's job.
+    _deletion_switch_on(w)
+    sams_op = "5a000000-0000-4000-8000-0000000000d1"
+    _sams_deletion_job(w, sams_op)
+    sams_rows = w.rows("SELECT * FROM deletion_job_items WHERE owner_id = ?", (w.sam_id,))
+    revision = w.theirs.revision
+    foreign = w.request("POST", "/tracks/deletions", json=_deletion_job_body(
+        sams_op, (w.theirs.uuid_id, revision)))
+    unknown_op = "a1000000-0000-4000-8000-0000000000d2"
+    unknown = w.request("POST", "/tracks/deletions", json=_deletion_job_body(
+        unknown_op, (UNKNOWN_UPLOAD, revision)))
+    assert (foreign.status_code, unknown.status_code) == (202, 202), foreign.text
+    def masked(r, op, target):  # created_at is the request's own clock
+        body = {k: v for k, v in r.json().items() if k != "created_at"}
+        return json.dumps(body, sort_keys=True).replace(op, "<op>").replace(target, "<t>")
+    assert masked(foreign, sams_op, w.theirs.uuid_id) == masked(unknown, unknown_op, UNKNOWN_UPLOAD)
+    assert w.rows("SELECT * FROM deletion_job_items WHERE owner_id = ?", (w.sam_id,)) == sams_rows
+    assert w.sam.get_track_by_uuid(w.theirs.uuid_id) is not None
+    r = w.request("POST", "/tracks/deletions", json=_deletion_job_body(  # control
+        unknown_op, (w.mine.uuid_id, 1)))
+    assert (r.status_code, r.json()["detail"]["error"]) == (409, "operation_conflict")
+
+
+def _get_deletion_job(w):
+    # sam's job answers exactly like an unknown one, also with the switch off.
+    sams_op = "5a000000-0000-4000-8000-0000000000d3"
+    _sams_deletion_job(w, sams_op)
+    _same_as_unknown(w, "GET", "/tracks/deletions/{}", sams_op, "deletion_job_not_found")
+    from app.models.deletions import DeletionJobRequest
+
+    my_op = "a1000000-0000-4000-8000-0000000000d4"
+    assert w.alex.create_deletion_job(DeletionJobRequest.model_validate(
+        _deletion_job_body(my_op, (w.mine.uuid_id, 1))), now=1)
+    assert w.request("GET", f"/tracks/deletions/{my_op}").status_code == 200  # control
+
+
+def _list_deletions_after(w):
+    # A cursor at sam's job key lists alex's own later jobs, never sam's.
+    sams_op = "5a000000-0000-4000-8000-0000000000d5"
+    _sams_deletion_job(w, sams_op)  # created_at 1
+    from app.models.deletions import DeletionJobRequest
+
+    my_op = "a1000000-0000-4000-8000-0000000000d6"
+    assert w.alex.create_deletion_job(DeletionJobRequest.model_validate(
+        _deletion_job_body(my_op, (w.mine.uuid_id, 1))), now=2)
+    for after in (_upload_cursor(0, sams_op), _upload_cursor(1, sams_op)):
+        r = w.request("GET", "/tracks/deletions", params={"after": after})
+        assert r.status_code == 200, r.text
+        assert [j["operation_uuid"] for j in r.json()["jobs"]] == [my_op]
+    r = w.request("GET", "/tracks/deletions")  # control
+    assert [j["operation_uuid"] for j in r.json()["jobs"]] == [my_op]
+
+
+# ── 8A.4: duplicate pairs ────────────────────────────────────────────────────
+
+def _plant_pair(w, owner_id, a, b):
+    from tests.identity_worker_fixtures import sql
+
+    ua, ub = sorted((a, b))
+    sql(w.db, "INSERT INTO track_duplicate_candidates (owner_id, uuid_a, uuid_b, kind, band_rank, "
+              "sort_score, matcher_version, detected_at) VALUES (?, ?, ?, 'exact', 0, 1.0, 'm', 1)",
+        (owner_id, ua, ub))
+    return ua, ub
+
+
+def _second_track(w, owner_id, name):
+    from tests.identity_worker_fixtures import add_track
+
+    return add_track(w.db, f"/m/{name}.flac", owner_id=owner_id)
+
+
+def _duplicate_pairs(w):
+    """sam's pair and alex's pair; returns (sams, mine)."""
+    sams = _plant_pair(w, w.sam_id, w.theirs.uuid_id, _second_track(w, w.sam_id, "sams-copy"))
+    mine = _plant_pair(w, w.alex_id, w.mine.uuid_id, _second_track(w, w.alex_id, "my-copy"))
+    return sams, mine
+
+
+def _list_duplicates_after(w):
+    # A cursor at (or before) sam's pair key pages through alex's own pairs only.
+    sams, mine = _duplicate_pairs(w)
+    for after in (_upload_cursor(0, 1.0, *sams), _upload_cursor(0, 2.0, *sams)):
+        r = w.request("GET", "/tracks/duplicates", params={"after": after})
+        assert r.status_code == 200, r.text
+        listed = [(p["uuid_a"], p["uuid_b"]) for p in r.json()["pairs"]]
+        assert sams not in listed
+        assert set(listed) <= {mine}
+    r = w.request("GET", "/tracks/duplicates")  # control
+    assert [(p["uuid_a"], p["uuid_b"]) for p in r.json()["pairs"]] == [mine]
+
+
+def _set_pair_status(w, action, status_before):
+    # sam's pair named by alex answers byte-for-byte like an unknown pair and is untouched;
+    # so does a pair of one of alex's tracks with one of sam's.
+    from tests.identity_worker_fixtures import sql
+
+    sams, mine = _duplicate_pairs(w)
+    sql(w.db, "UPDATE track_duplicate_candidates SET status = ?", (status_before,))
+    path = f"/tracks/duplicates/{action}"
+    unknown = w.request("POST", path, json={"uuid_a": UNKNOWN_UPLOAD, "uuid_b": UNKNOWN_UPLOAD[:-2] + "fe"})
+    assert unknown.status_code == 404, unknown.text
+    for a, b in (sams, sams[::-1], (w.mine.uuid_id, w.theirs.uuid_id)):
+        foreign = w.request("POST", path, json={"uuid_a": a, "uuid_b": b})
+        assert (foreign.status_code, foreign.content) == (404, unknown.content)
+    assert w.rows("SELECT status FROM track_duplicate_candidates WHERE owner_id = ?",
+                  (w.sam_id,)) == [(status_before,)]
+    r = w.request("POST", path, json={"uuid_a": mine[1], "uuid_b": mine[0]})  # control
+    assert r.status_code == 200, r.text
+
+
+def _dismiss_duplicates(w):
+    _set_pair_status(w, "dismiss", "open")
+
+
+def _restore_duplicates(w):
+    _set_pair_status(w, "restore", "dismissed")
+
+
 PROBES = {
     ("GET", "/tracks/{uuid_id:uuid}", "uuid_id"): _get_track,
     ("PATCH", "/tracks/{uuid_id:uuid}", "uuid_id"): _patch_track,
@@ -710,6 +884,15 @@ PROBES = {
     ("POST", "/tracks/uploads/items/{item_uuid:uuid}/commit", "body"): _commit_upload_item_body,
     ("POST", "/tracks/uploads/items/{item_uuid:uuid}/resolve-duplicate", "item_uuid"): _resolve_duplicate_item,
     ("POST", "/tracks/uploads/items/{item_uuid:uuid}/resolve-duplicate", "body"): _resolve_duplicate_body,
+    # 8A.2b
+    ("POST", "/tracks/deletions/preview", "body"): _preview_deletion_body,
+    ("POST", "/tracks/deletions", "body"): _create_deletion_job_body,
+    ("GET", "/tracks/deletions/{operation_uuid:uuid}", "operation_uuid"): _get_deletion_job,
+    ("GET", "/tracks/deletions", "after"): _list_deletions_after,
+    # 8A.4: duplicates.
+    ("GET", "/tracks/duplicates", "after"): _list_duplicates_after,
+    ("POST", "/tracks/duplicates/dismiss", "body"): _dismiss_duplicates,
+    ("POST", "/tracks/duplicates/restore", "body"): _restore_duplicates,
 }
 
 

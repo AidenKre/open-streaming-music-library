@@ -122,20 +122,54 @@ class UploadsFeature {
   Map<String, dynamic> toJson() => {'version': version, 'limits': limits.toJson()};
 }
 
+/// `library_tools: {version, server_delete, duplicate_review}` (Phase 8).
+class LibraryToolsFeature {
+  const LibraryToolsFeature({
+    required this.version,
+    required this.serverDelete,
+    required this.duplicateReview,
+  });
+  final int version;
+  final bool serverDelete;
+  final bool duplicateReview;
+
+  static LibraryToolsFeature? fromJson(Object? block) {
+    final v = _version(block);
+    if (v == null || block is! Map) return null;
+    final serverDelete = block['server_delete'];
+    final duplicateReview = block['duplicate_review'];
+    if (serverDelete is! bool || duplicateReview is! bool) return null;
+    return LibraryToolsFeature(
+      version: v,
+      serverDelete: serverDelete,
+      duplicateReview: duplicateReview,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'version': version,
+    'server_delete': serverDelete,
+    'duplicate_review': duplicateReview,
+  };
+}
+
 /// Every feature block this client knows; null = unsupported.
 class FeatureBlocks {
-  const FeatureBlocks({this.history, this.uploads});
+  const FeatureBlocks({this.history, this.uploads, this.libraryTools});
 
   factory FeatureBlocks.fromJson(Map<String, dynamic> root) => FeatureBlocks(
     history: HistoryFeature.fromJson(root['history']),
     uploads: UploadsFeature.fromJson(root['uploads']),
+    libraryTools: LibraryToolsFeature.fromJson(root['library_tools']),
   );
 
   final HistoryFeature? history;
   final UploadsFeature? uploads;
+  final LibraryToolsFeature? libraryTools;
 
   Map<String, dynamic> toJson() => {
     if (history != null) 'history': history!.toJson(),
     if (uploads != null) 'uploads': uploads!.toJson(),
+    if (libraryTools != null) 'library_tools': libraryTools!.toJson(),
   };
 }

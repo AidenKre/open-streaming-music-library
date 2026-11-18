@@ -691,6 +691,31 @@ void main() {
     await _waitForFinish(manager);
   });
 
+  // 8-fix-r1 U24-B-02: the per-uuid dedupe holds across overlapping calls.
+  // The first call awaits a file check (its already-downloaded track) while
+  // the second queues x; the first must not queue x again on resuming.
+  test('overlapping enqueue calls queue one job per uuid', () async {
+    final existingPath = p.join(tempDir.path, 'existing.audio');
+    await File(existingPath).writeAsBytes([9, 9]);
+    await _insertTrack(db, 'old', filePath: existingPath);
+    await _insertTrack(db, 'x');
+    final manager = buildManager(
+      client: MockClient((_) async => http.Response.bytes([1], 200)),
+      isOfflineFn: () => true, // jobs stay queued
+    );
+    addTearDown(manager.dispose);
+
+    final first = manager.enqueueTracks(
+      [_track('old').copyWithFilePath(existingPath), _track('x')],
+      quality: '320',
+    );
+    final second = manager.enqueueTracks([_track('x')], quality: '320');
+    await Future.wait([first, second]);
+
+    expect(manager.snapshot().map((j) => j.uuidId), ['x'],
+        reason: 'one job for x; old is already downloaded');
+  });
+
   test('skips tracks already downloaded', () async {
     final existingPath = p.join(tempDir.path, 'existing.audio');
     await File(existingPath).writeAsBytes([9, 9]);
@@ -798,7 +823,8 @@ void main() {
     'enqueueTracksAtQuality force:true re-downloads even when quality matches '
     '(stale-refresh use case)',
     () async {
-      final existingPath = p.join(tempDir.path, 'existing.audio');
+      final existingPath = p.join(tempDir.path, 'tracks', 'existing.audio');
+      await Directory(p.dirname(existingPath)).create(recursive: true);
       await File(existingPath).writeAsBytes([9, 9]);
       await _insertTrack(
         db,
@@ -921,7 +947,8 @@ void main() {
     'enqueueTracksAtQuality deletes stale file and re-downloads when bitrate '
     'differs',
     () async {
-      final existingPath = p.join(tempDir.path, 'existing.audio');
+      final existingPath = p.join(tempDir.path, 'tracks', 'existing.audio');
+      await Directory(p.dirname(existingPath)).create(recursive: true);
       await File(existingPath).writeAsBytes([9, 9, 9, 9]);
       await _insertTrack(
         db,
@@ -978,7 +1005,8 @@ void main() {
       // `original` — we conservatively re-download. Regressing this branch
       // (returning true for original) would silently restore the old no-op
       // bug for users picking "Download at Original" on a 320 kbps copy.
-      final existingPath = p.join(tempDir.path, 'existing.audio');
+      final existingPath = p.join(tempDir.path, 'tracks', 'existing.audio');
+      await Directory(p.dirname(existingPath)).create(recursive: true);
       await File(existingPath).writeAsBytes([5, 5, 5]);
       await _insertTrack(
         db,
@@ -1608,7 +1636,9 @@ void main() {
   });
 
   test('deleteDownload removes the file and clears file_path', () async {
-    final localPath = p.join(tempDir.path, 'local.audio');
+    // Under the downloads root: only files there are the app's to delete.
+    final localPath = p.join(tempDir.path, 'tracks', 'local.audio');
+    await File(localPath).create(recursive: true);
     await File(localPath).writeAsBytes([1, 2, 3]);
     await _insertTrack(db, 'abc', filePath: localPath);
 
@@ -1630,7 +1660,8 @@ void main() {
   for (final bulk in [false, true]) {
     test('${bulk ? 'deleteDownloadsForUuids' : 'deleteDownload'} removes a '
         'damaged file and clears the mark', () async {
-      final damaged = p.join(tempDir.path, 'damaged.audio');
+      final damaged = p.join(tempDir.path, 'tracks', 'damaged.audio');
+      await File(damaged).create(recursive: true);
       await File(damaged).writeAsBytes([9]);
       await _insertTrack(db, 'abc');
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))

@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_focus.dart';
 import 'package:frontend/playback/just_audio_engine.dart';
@@ -12,7 +13,6 @@ import 'package:frontend/playback/preview_engine.dart';
 
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/playback/track_cache_manager.dart';
-import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/track_codec_lookup_provider.dart';
 import 'package:frontend/services/quality_presets.dart';
 import 'package:frontend/services/server_binding_gate.dart';
@@ -140,7 +140,8 @@ final previewSourceUrisProvider = Provider<PreviewSourceUris>((ref) {
     mediaToken: ref.read(credentialsProvider)?.mediaToken,
     mayAttachToken: () =>
         ref.read(serverBindingGateProvider).whenMaySendTokenTo(baseUrl),
-    isOffline: () => ref.read(offlineModeProvider),
+    // Offline, or the server check failed (sign-off OPEN-M-11: as playback).
+    isOffline: () => ref.read(streamsUnavailableProvider)(),
     localSources: ref.read(localSourcePolicyProvider),
     sourceCodecOf: ref.read(trackSourceCodecLookupProvider),
   );

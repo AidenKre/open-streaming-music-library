@@ -18,6 +18,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/feature_providers.dart';
@@ -38,6 +39,11 @@ const _blob = {
   'uploads': {
     'version': 1,
     'limits': {'max_files_per_batch': 100, 'receives_per_user': 1},
+  },
+  'library_tools': {
+    'version': 1,
+    'server_delete': true,
+    'duplicate_review': false,
   },
 };
 
@@ -145,5 +151,96 @@ void main() {
 
     final history = await _read(c, historyFeatureProvider);
     expect(history!.fromCache, isFalse);
+  });
+
+  // Phase 8B.1b (D32): the library_tools provider pair, same provenance
+  // rules as uploads; `featureForNetwork` gives network work only a block
+  // the server sent on this read.
+  group('library_tools', () {
+    test('online: the block the server sent, not from the cache', () async {
+      SharedPreferences.setMockInitialValues({});
+      final c = _container(offline: false, server: _ok);
+
+      final tools = await _read(c, libraryToolsFeatureProvider);
+
+      expect(tools!.fromCache, isFalse);
+      expect(tools.block.serverDelete, isTrue);
+      expect(tools.block.duplicateReview, isFalse);
+      expect(c.read(libraryToolsAdvertisedProvider), isTrue);
+      expect(featureForNetwork(tools), same(tools.block));
+    });
+
+    test('offline: the cached block is shown but never enables network work',
+        () async {
+      SharedPreferences.setMockInitialValues(
+          {'appInfo.cache': jsonEncode(_blob)});
+      final c = _container(
+        offline: true,
+        server: () => throw StateError('offline: no request'),
+      );
+
+      final tools = await _read(c, libraryToolsFeatureProvider);
+
+      expect(tools!.fromCache, isTrue);
+      expect(c.read(libraryToolsAdvertisedProvider), isTrue);
+      expect(featureForNetwork(tools), isNull);
+    });
+
+    test('a server without the block (or a malformed one): unavailable',
+        () async {
+      SharedPreferences.setMockInitialValues({});
+      final c = _container(
+        offline: false,
+        server: () => http.Response(
+          jsonEncode({
+            'entities': {},
+            'history': {'version': 1},
+            'library_tools': {'version': 1, 'server_delete': true},
+          }),
+          200,
+        ),
+      );
+
+      expect(await _read(c, libraryToolsFeatureProvider), isNull);
+      expect(c.read(libraryToolsAdvertisedProvider), isFalse);
+      expect(featureForNetwork<LibraryToolsFeature>(null), isNull);
+      expect(await _read(c, historyFeatureProvider), isNotNull);
+    });
+
+    // U33-B-03 residual: with no cached blob, a failed (or impossible)
+    // server-info read knows nothing about the server: library tools are
+    // unknown, never "not offered" (unknown is not absent).
+    test('no cache and a failed read: unknown, not absent', () async {
+      SharedPreferences.setMockInitialValues({});
+      final c = _container(offline: false, server: () => http.Response('x', 500));
+      c.listen(libraryToolsFeatureProvider, (_, _) {});
+      await expectLater(
+        c.read(libraryToolsFeatureProvider.future),
+        throwsA(isA<FeatureInfoUnknown>()),
+      );
+      expect(c.read(libraryToolsAdvertisedProvider), isFalse);
+    });
+
+    test('cold offline without a cache: unknown, not absent', () async {
+      SharedPreferences.setMockInitialValues({});
+      final c = _container(
+        offline: true,
+        server: () => throw StateError('offline: no request'),
+      );
+      c.listen(libraryToolsFeatureProvider, (_, _) {});
+      await expectLater(
+        c.read(libraryToolsFeatureProvider.future),
+        throwsA(isA<FeatureInfoUnknown>()),
+      );
+    });
+
+    test('a cached answer without the block stays absent after a failed '
+        'read', () async {
+      SharedPreferences.setMockInitialValues({
+        'appInfo.cache': jsonEncode({'entities': {}}),
+      });
+      final c = _container(offline: false, server: () => http.Response('x', 500));
+      expect(await _read(c, libraryToolsFeatureProvider), isNull);
+    });
   });
 }

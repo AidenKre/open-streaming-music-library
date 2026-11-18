@@ -323,11 +323,13 @@ def test_the_receipt_reconcile_is_a_non_fatal_step_right_before_the_reservation_
         pass
 
     [steps] = world.captured
-    assert [(s.name, s.fatal) for s in steps][-4:] == [
+    assert [(s.name, s.fatal) for s in steps][-6:] == [
         ("upload receipts", False),
         ("upload validation", False),  # 7A.2c
+        ("deletion jobs", False),  # 8A.3d
         ("storage reservations", False),
         ("upload janitor", False),  # 7A.3c
+        ("deletion janitor", False),  # 8A.3d
     ]
 
 

@@ -395,18 +395,18 @@ def test_without_copies_allowed_a_link_across_filesystems_fails_with_nothing_pla
     assert source.exists()
 
 
-# ── link_no_replace keeps its contract (Phase 8's put-back still uses it) ──
+# ── without copies (the deletion put-back, Part B): was link_no_replace ────
 
-@pytest.mark.parametrize("err", [errno.EXDEV, errno.ENOTSUP, errno.EPERM])
-def test_link_no_replace_still_reports_a_refused_link(paths, monkeypatch, err):
-    source, library, final = paths
+@pytest.mark.parametrize("err", [errno.ENOTSUP, errno.EPERM])
+def test_without_copies_a_refused_link_on_one_filesystem_still_renames(paths, monkeypatch, err):
+    """Part B replaced ``link_no_replace`` (which raised here) with this mode."""
+    source, _library, final = paths
+    data = source.read_bytes()
     _refuse(monkeypatch, err)
 
-    with pytest.raises(organizer.HardLinkError):
-        organizer.link_no_replace(source, final, in_use=_never)
+    assert organizer.place_no_replace(source, final, in_use=_never, allow_copy=False) == "moved"
 
-    assert _tree(library) == set()
-    assert source.exists()
+    assert final.read_bytes() == data and not source.exists()
 
 
 # ── review fixes (link-fallback review D-1 and nits) ────────────────────────

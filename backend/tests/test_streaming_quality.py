@@ -1273,8 +1273,11 @@ class TestStreamRangeEdges:
 class TestStreamErrorsCarryNoPaths:
     """SC-22: an error answer never names a server path (7-fix-r0 F0-1a)."""
 
-    def test_a_vanished_encoded_file_answers_404_without_its_path(
-        self, client, tmp_path, monkeypatch
+    # Phase 8 review r2 (OPEN-r1be-01 / 8-R2-01): deliberately changed from
+    # 404. A vanished encoded *cache* file proves only a prune, not that the
+    # track is gone: 503. The subject, no path in the answer, is unchanged.
+    def test_a_vanished_encoded_file_answers_503_without_its_path(
+        self, client, tmp_path, monkeypatch, caplog
     ):
         track = _add_track_with_file(client, tmp_path)
         dead = tmp_path / "cache-dir" / "gone-encoded.m4a"
@@ -1285,8 +1288,30 @@ class TestStreamErrorsCarryNoPaths:
             lambda *a, **k: EncodeResult(path=dead, bitrate_kbps=128, transcoded=True),
         )
 
-        r = client.get(f"/tracks/{track.uuid_id}/stream?quality=original")
+        with caplog.at_level("DEBUG"):
+            r = client.get(f"/tracks/{track.uuid_id}/stream?quality=original")
+
+        assert r.status_code == 503, r.text
+        assert str(tmp_path) not in r.text
+        assert "gone-encoded" not in r.text
+        assert str(tmp_path) not in caplog.text and "gone-encoded" not in caplog.text
+
+    def test_a_vanished_passthrough_master_answers_404_without_its_path(
+        self, client, tmp_path, monkeypatch, caplog
+    ):
+        track = _add_track_with_file(client, tmp_path)
+        dead = tmp_path / "masters" / "gone-master.mp3"
+        coordinator = client.app.state.encoder_coordinator
+        monkeypatch.setattr(
+            coordinator,
+            "encode_for_stream",
+            lambda *a, **k: EncodeResult(path=dead, bitrate_kbps=None, transcoded=False),
+        )
+
+        with caplog.at_level("DEBUG"):
+            r = client.get(f"/tracks/{track.uuid_id}/stream?quality=original")
 
         assert r.status_code == 404, r.text
         assert str(tmp_path) not in r.text
-        assert "gone-encoded" not in r.text
+        assert "gone-master" not in r.text
+        assert str(tmp_path) not in caplog.text and "gone-master" not in caplog.text

@@ -1,21 +1,25 @@
 """Upload rules layer (Phase 7 spec §4).
 
 Lives here: allocation with its limit checks, the DTO builders (item_out,
-_batch_out; later GET routes reuse them), keyset cursors (encode_cursor /
-decode_cursor and _page, shared by every list), the read services, and cancel
+_batch_out; later GET routes reuse them), the read services over the shared
+keyset cursors (app.core.keyset_cursor), and cancel
 (CANCELLABLE is where later pieces register the states a cancel may leave).
 Routes stay thin and turn UploadError into HTTP; the database only stores.
 """
 
-import base64
-import binascii
 import json
 import logging
 import os
 from pathlib import Path
 from dataclasses import asdict
-from uuid import UUID
 
+from app.core.keyset_cursor import (
+    MAX_CURSOR_CHARS,
+    decode_cursor,
+    encode_cursor,
+    invalid_cursor,
+    page_rows,
+)
 from app.database.database import UploadItemsInUse
 from app.services.duplicate_detection import TrackRef
 from app.services.path_sanitize import assert_within
@@ -42,7 +46,6 @@ from app.models.uploads import (
 from app.services.upload_errors import (
     operation_conflict,
     UploadError,
-    invalid_cursor,
     upload_batch_expired,
     upload_batch_not_found,
     upload_duplicate_match_unavailable,
@@ -78,6 +81,8 @@ def _library_track_match(library, uuid_id: str, **base) -> DuplicateMatchOut:
     """One library-track match entry, enriched through the caller's library (a
     track the caller cannot see reads ``available: false``)."""
     track = library.get_track_by_uuid(uuid_id)
+    if track is not None and library.is_pending_deletion(uuid_id):
+        track = None  # a track being deleted reads like a deleted one
     summary = None
     if track is not None:
         meta = track.metadata
@@ -246,66 +251,10 @@ def get_item(library, item_uuid: str) -> UploadItemOut:
     return item_out(row, library)
 
 
-# ── keyset cursors (shared by the batch and item lists) ────────────────────
-
-# Real cursors are well under 200 characters.
-MAX_CURSOR_CHARS = 512
-
-
-def encode_cursor(key: list) -> str:
-    raw = json.dumps(key, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-
-def decode_cursor(text: str, kinds: tuple[str, ...]) -> tuple:
-    """Decode a cursor whose key has the given kinds ("int", "str", "uuid"; "str?"
-    also allows null: a key too long to carry, resolved by the caller from the
-    cursor's own row). Anything malformed is a 422 invalid_cursor."""
-    if len(text) > MAX_CURSOR_CHARS:
-        raise invalid_cursor()
-    try:
-        raw = base64.b64decode(
-            text + "=" * (-len(text) % 4), altchars=b"-_", validate=True
-        )
-        key = json.loads(raw)
-    except (binascii.Error, ValueError, UnicodeError, RecursionError):
-        raise invalid_cursor() from None
-    if not isinstance(key, list) or len(key) != len(kinds):
-        raise invalid_cursor()
-    out = []
-    for value, kind in zip(key, kinds):
-        if kind == "int" and type(value) is int and -(2**63) <= value < 2**63:
-            out.append(value)
-        elif kind == "str?" and value is None:
-            out.append(None)
-        elif kind in ("str", "str?") and isinstance(value, str):
-            try:
-                value.encode("utf-8")  # a lone surrogate would break sqlite3
-            except UnicodeEncodeError:
-                raise invalid_cursor() from None
-            out.append(value)
-        elif kind == "uuid" and isinstance(value, str):
-            try:
-                out.append(str(UUID(value)))
-            except ValueError:
-                raise invalid_cursor() from None
-        else:
-            raise invalid_cursor()
-    return tuple(out)
-
-
-def _page(rows: list[dict], limit: int, key_of) -> tuple[list[dict], str | None]:
-    """Rows were fetched with limit + 1: trim to the page and cursor the last
-    returned row only when more rows exist."""
-    page = rows[:limit]
-    next_after = encode_cursor(key_of(page[-1])) if len(rows) > limit else None
-    return page, next_after
-
-
 def list_batches(library, after: str | None, limit: int) -> UploadBatchPage:
     cursor = None if after is None else decode_cursor(after, ("int", "uuid"))
     rows = library.list_upload_batches(after=cursor, limit=limit + 1)
-    page, next_after = _page(rows, limit, lambda r: [r["created_at"], r["batch_uuid"]])
+    page, next_after = page_rows(rows, limit, lambda r: [r["created_at"], r["batch_uuid"]])
     return UploadBatchPage(batches=[_batch_out(r) for r in page], next_after=next_after)
 
 
@@ -329,7 +278,7 @@ def list_items(library, batch_uuid: str, after: str | None, limit: int) -> Uploa
             raise invalid_cursor()
         cursor = (cursor[0], own["member_order_key"], cursor[2])
     rows = library.list_upload_items(batch_uuid, after=cursor, limit=limit + 1)
-    page, next_after = _page(rows, limit, _item_cursor_key)
+    page, next_after = page_rows(rows, limit, _item_cursor_key)
     return UploadItemPage(items=[item_out(r, library) for r in page], next_after=next_after)
 
 

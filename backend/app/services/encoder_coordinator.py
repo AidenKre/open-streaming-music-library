@@ -89,6 +89,17 @@ class EncodeResult:
     transcoded: bool
 
 
+@dataclass(frozen=True)
+class GenerationToken:
+    """An encode cache's per-uuid generation, captured before the row is read."""
+    cache: EncodedCache
+    uuid_id: str
+    generation: int
+
+    def moved(self) -> bool:
+        return self.cache.generation(self.uuid_id) != self.generation
+
+
 # ── Priority pool ─────────────────────────────────────────────────────────────
 
 @dataclass(order=True)
@@ -312,6 +323,13 @@ class EncoderCoordinator:
                 return True
         return self.cache.has(uuid_id, quality)
 
+    def capture_generation(
+        self, uuid_id: str, quality: str, *, owner_id: int
+    ) -> GenerationToken:
+        """Capture the target cache's generation; call before resolving the row."""
+        cache = self._write_cache(quality, owner_id)
+        return GenerationToken(cache, uuid_id, cache.generation(uuid_id))
+
     # ── Per-key lock helpers ──────────────────────────────────────────────
 
     def _key_lock(self, uuid_id: str, quality: str) -> threading.Lock:
@@ -327,6 +345,7 @@ class EncoderCoordinator:
         source_path: Optional[Path] = None,
         *,
         owner_id: int,
+        generation: Optional[GenerationToken] = None,
     ) -> Optional[EncodeResult]:
         """Return an EncodeResult for streaming, transcoding if needed.
 
@@ -380,10 +399,15 @@ class EncoderCoordinator:
             if cached is not None:
                 return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
 
-            target_cache = self._write_cache(quality, owner_id)
-            # Captured before the source is read: a conversion that replaces
-            # the master and evicts this uuid mid-encode invalidates it.
-            generation = target_cache.generation(uuid_id)
+            if generation is not None:
+                # Captured by the caller before it read the row.
+                target_cache = generation.cache
+                expected = generation.generation
+            else:
+                target_cache = self._write_cache(quality, owner_id)
+                # Captured before the source is read: a conversion that replaces
+                # the master and evicts this uuid mid-encode invalidates it.
+                expected = target_cache.generation(uuid_id)
             source = source_path or self.source_lookup(uuid_id)
             if source is None or not source.exists():
                 raise SourceUnavailable(uuid_id)
@@ -418,7 +442,7 @@ class EncoderCoordinator:
                 return None
 
             cached_path = target_cache.insert(
-                uuid_id, quality, scratch, expected_generation=generation
+                uuid_id, quality, scratch, expected_generation=expected
             )
             if cached_path is None:
                 return None  # encoded from a since-replaced master; the client retries

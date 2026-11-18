@@ -1,4 +1,5 @@
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/jobs_api.dart';
 import 'package:frontend/api/tracks_api.dart';
@@ -89,6 +90,10 @@ class TrackSyncState {
   final Set<int> affectedQueueSessionIds;
   final Set<String> deletedTrackUuids;
 
+  /// Sessions of [affectedQueueSessionIds] whose removed current item was
+  /// the end of the queue (no wrap): playback there stops (U20-B-01).
+  final Set<int> endedQueueSessionIds;
+
   const TrackSyncState({
     this.isSyncing = false,
     this.error,
@@ -98,6 +103,7 @@ class TrackSyncState {
     this.downloadMutationVersion = 0,
     this.affectedQueueSessionIds = const {},
     this.deletedTrackUuids = const {},
+    this.endedQueueSessionIds = const {},
   });
 
   TrackSyncState copyWith({
@@ -107,6 +113,7 @@ class TrackSyncState {
     int? downloadMutationVersion,
     Set<int>? affectedQueueSessionIds,
     Set<String>? deletedTrackUuids,
+    Set<int>? endedQueueSessionIds,
   }) {
     return TrackSyncState(
       isSyncing: isSyncing ?? this.isSyncing,
@@ -119,6 +126,7 @@ class TrackSyncState {
       affectedQueueSessionIds:
           affectedQueueSessionIds ?? this.affectedQueueSessionIds,
       deletedTrackUuids: deletedTrackUuids ?? this.deletedTrackUuids,
+      endedQueueSessionIds: endedQueueSessionIds ?? this.endedQueueSessionIds,
     );
   }
 }
@@ -284,30 +292,29 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
       ),
     );
 
+    SyncService? service;
     try {
-      final service = SyncService(
+      service = SyncService(
         db: ref.read(databaseProvider),
         api: ref.read(tracksApiProvider),
         queueRepository: ref.read(queueRepositoryProvider),
         prefs: await ref.read(sharedPreferencesProvider.future),
         bindingToken: bindingToken,
+        ownedFileCleanup: ref.read(ownedFileCleanupProvider),
       );
       final mutex = ref.read(editSyncMutexProvider);
-      final result = await mutex.run(() => op(service));
+      final built = service;
+      final result = await mutex.run(() => op(built));
       final latest = state.value ?? current;
       state = AsyncData(
-        TrackSyncState(
+        _publishedState(
+          latest,
+          result,
           libraryError: library ? null : latest?.libraryError,
-          queueMutationVersion: result.affectedQueueSessionIds.isEmpty
-              ? (latest?.queueMutationVersion ?? 0)
-              : (latest?.queueMutationVersion ?? 0) + 1,
-          downloadMutationVersion: result.deletedTrackUuids.isEmpty
-              ? (latest?.downloadMutationVersion ?? 0)
-              : (latest?.downloadMutationVersion ?? 0) + 1,
-          affectedQueueSessionIds: result.affectedQueueSessionIds,
-          deletedTrackUuids: result.deletedTrackUuids,
         ),
       );
+      // D29: retries rows a failed cleanup attempt kept.
+      ref.read(ownedFileCleanupRunnerProvider).request('sync');
       return true;
     } catch (e) {
       if ((e is ApiException && e.statusCode == 401) ||
@@ -321,26 +328,53 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
         }
         final latest = state.value ?? current;
         state = AsyncData(
-          TrackSyncState(
+          _publishedState(
+            latest,
+            service?.committedChanges ?? const SyncResult(),
             error: current?.error,
             libraryError: current?.libraryError,
-            queueMutationVersion: latest?.queueMutationVersion ?? 0,
-            downloadMutationVersion: latest?.downloadMutationVersion ?? 0,
           ),
         );
         return false;
       }
       final latest = state.value ?? current;
       state = AsyncData(
-        TrackSyncState(
+        _publishedState(
+          latest,
+          e is BindingFencedException
+              ? const SyncResult()
+              : (service?.committedChanges ?? const SyncResult()),
           error: e.toString(),
           libraryError: library ? e.toString() : latest?.libraryError,
-          queueMutationVersion: latest?.queueMutationVersion ?? 0,
-          downloadMutationVersion: latest?.downloadMutationVersion ?? 0,
         ),
       );
       return false;
     }
+  }
+
+  /// The one publication of what a run changed (success or failure): bumps
+  /// each mutation version once, and only when that kind of change happened.
+  TrackSyncState _publishedState(
+    TrackSyncState? latest,
+    SyncResult changes, {
+    String? error,
+    String? libraryError,
+  }) {
+    final queueVersion = latest?.queueMutationVersion ?? 0;
+    final downloadVersion = latest?.downloadMutationVersion ?? 0;
+    return TrackSyncState(
+      error: error,
+      libraryError: libraryError,
+      queueMutationVersion: changes.affectedQueueSessionIds.isEmpty
+          ? queueVersion
+          : queueVersion + 1,
+      downloadMutationVersion: changes.deletedTrackUuids.isEmpty
+          ? downloadVersion
+          : downloadVersion + 1,
+      affectedQueueSessionIds: changes.affectedQueueSessionIds,
+      deletedTrackUuids: changes.deletedTrackUuids,
+      endedQueueSessionIds: changes.endedQueueSessionIds,
+    );
   }
 }
 

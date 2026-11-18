@@ -11,6 +11,8 @@ import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/server_binding_gate.dart';
+import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
+import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
 import 'package:frontend/services/uploads/upload_manager.dart';
 
 /// Drives best-effort "catch up after a gap" work across the app.
@@ -193,6 +195,8 @@ final recoverablesProvider = Provider<List<RecoverableService>>((ref) {
     _ReconcileDownloadsRecoverable(ref),
     _HistoryRecoverable(ref),
     _UploadsRecoverable(ref),
+    _OwnedFileCleanupRecoverable(ref),
+    DeleteJobsRecoverable(ref),
   ];
 });
 
@@ -347,6 +351,35 @@ class _HistoryRecoverable implements RecoverableService {
         .request(
           trigger.name,
           bypassBackoff: trigger != RecoveryTrigger.coldStart,
+        );
+  }
+}
+
+/// Requests an owned-file cleanup pass on cold start and app resume. Local
+/// only (the pass fences on the current binding itself), so it needs no
+/// binding verification. Never runs the pass body itself; a resume bypasses a
+/// pending backoff.
+class _OwnedFileCleanupRecoverable implements RecoverableService {
+  _OwnedFileCleanupRecoverable(this._ref);
+  final Ref _ref;
+
+  @override
+  bool get requiresBinding => false;
+
+  @override
+  int get recoveryPriority => RecoveryPriority.ownedFileCleanup;
+
+  @override
+  Set<RecoveryTrigger> get triggers =>
+      const {RecoveryTrigger.coldStart, RecoveryTrigger.appResume};
+
+  @override
+  Future<void> recover(RecoveryTrigger trigger) async {
+    _ref
+        .read(ownedFileCleanupRunnerProvider)
+        .request(
+          trigger.name,
+          bypassBackoff: trigger == RecoveryTrigger.appResume,
         );
   }
 }

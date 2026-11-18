@@ -253,6 +253,11 @@ class ServerBindingGate implements TokenPermit {
     return _verify(++_generation, baseUrl, reportOffline);
   }
 
+  /// Whether [awaitVerified] would answer at once: the current connection is
+  /// verified now. A new connection clears this immediately, before its
+  /// state is published.
+  bool get isVerifiedNow => !_closed && _verifiedToken != null;
+
   /// Completes with the binding token once the current connection is
   /// verified. Keeps waiting through failures and a different server.
   Future<String> awaitVerified() {

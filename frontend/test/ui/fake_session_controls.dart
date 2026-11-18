@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:frontend/services/session_service.dart'
     show ServerBlockedReason, SignInNotSavedFailure;
 import 'package:flutter/foundation.dart';
 import 'package:frontend/services/local_reset_service.dart';
+import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/ui/session_controller.dart';
 
 /// Scriptable session controller for widget tests.
@@ -72,6 +75,23 @@ class FakeSessionControls extends ChangeNotifier implements SessionControls {
   @override
   Future<List<String>> pendingLossSummaries() async => lossSummaries;
 
+  /// What a log-out would drop; nothing by default.
+  LogoutLosses logoutLosses = const LogoutLosses(
+    unsentUploads: 0,
+    reviewDrafts: 0,
+    unsentReviews: 0,
+    unsentCancels: 0,
+    unsentDeletions: 0,
+    unconfirmedDeletions: 0,
+  );
+
+  @override
+  Future<LogoutLosses> pendingLogoutLosses() async =>
+      logoutLossesGate?.future ?? logoutLosses;
+
+  /// When set, the count answers only once the test completes it.
+  Completer<LogoutLosses>? logoutLossesGate;
+
   void setBlocked(ServerBlockedReason reason) {
     serverBlocked = reason;
     notifyListeners();
@@ -112,6 +132,8 @@ class FakeSessionControls extends ChangeNotifier implements SessionControls {
       calls.add('register $username $password $confirmation');
   @override
   Future<void> logout() async => calls.add('logout');
+  @override
+  Future<void> logOutKeepingUnsent() async => calls.add('logout keep');
   @override
   Future<void> confirmUserSwitch() async {
     calls.add('confirmUserSwitch');

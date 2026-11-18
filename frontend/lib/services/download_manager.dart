@@ -3,7 +3,8 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Variable;
+import 'package:drift/drift.dart'
+    show TableUpdate, UpdateKind, Variable;
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -11,6 +12,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/codec_support.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
 import 'package:frontend/services/download/track_downloader.dart';
@@ -18,6 +20,7 @@ import 'package:frontend/services/download/worker_pool.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/quality_presets.dart';
+import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:frontend/services/queue_warm_service.dart';
 
 // Re-export the sealed status hierarchy + job/state types so existing
@@ -56,6 +59,8 @@ String formatBytes(int bytes) {
 /// copy.
 class DownloadManager extends ChangeNotifier implements LocalResettable {
   final AppDatabase _db;
+  final OwnedFileCleanup _ownedCleanup;
+  final void Function()? _onOwnedCleanupPending;
   // Optional: if supplied, the server is asked to pre-transcode queued tracks
   // at the current stream quality in parallel with downloading them.
   final QueueWarmService? _warmService;
@@ -134,7 +139,17 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     bool Function()? isOfflineFn,
     void Function()? onNetworkFailure,
     CodecSupport Function()? codecSupportFn,
+    OwnedFileCleanup? ownedFileCleanup,
+    void Function()? onOwnedCleanupPending,
   }) : _db = db,
+       _ownedCleanup =
+           ownedFileCleanup ??
+           OwnedFileCleanup(
+             db: db,
+             documentsDirectory:
+                 directoryProvider ?? getApplicationDocumentsDirectory,
+           ),
+       _onOwnedCleanupPending = onOwnedCleanupPending,
        _warmService = warmService,
        _streamQualityFn = streamQualityFn,
        _codecSupportFn = codecSupportFn {
@@ -146,6 +161,8 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       coverArtStore: coverArtStore,
       directoryProvider: directoryProvider ?? getApplicationDocumentsDirectory,
       apiClient: apiClient,
+      ownedFileCleanup: _ownedCleanup,
+      onOwnedCleanupPending: onOwnedCleanupPending,
       onNetworkFailure: onNetworkFailure,
     );
     _pool = WorkerPool(
@@ -244,6 +261,12 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
       );
     }
 
+    // The loop above awaited (file checks): a concurrent enqueue may have
+    // queued one of these uuids since the snapshot was taken. Re-check the
+    // LIVE queue with no await before adding, so one uuid never gets two jobs
+    // (and so two workers on one file).
+    final live = _queue.state;
+    additions.removeWhere((j) => live.isPending(j.uuidId));
     if (additions.isEmpty) return;
 
     _queue.removeFinishedJobsForUuids(additions.map((j) => j.uuidId));
@@ -428,22 +451,10 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// `_commitDownload` can't restore the row after we null it out.
   Future<void> deleteDownload(String uuidId) async {
     await _pool.fenceUuid(uuidId);
-    final row = await (_db.select(
-      _db.tracks,
-    )..where((t) => t.uuidId.equals(uuidId))).getSingleOrNull();
-    // A kept damaged copy (decision 6) goes with it.
-    for (final path in [row?.filePath, row?.damagedFilePath]) {
-      if (path == null) continue;
-      final f = File(path);
-      if (await f.exists()) {
-        try {
-          await f.delete();
-        } catch (_) {}
-      }
-    }
-    await (_db.update(
-      _db.tracks,
-    )..where((t) => t.uuidId.equals(uuidId))).write(clearedDownloadColumns);
+    final token = (await ServerBindingRepository(_db).current())
+        ?.localBindingId;
+    final pending = await _dropDownloads([uuidId], token);
+    if (pending) _onOwnedCleanupPending?.call();
     _status.bumpVersion();
   }
 
@@ -457,43 +468,81 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     await _pool.fenceUuids(uuidList);
     if (_disposed) return;
 
+    final token = (await ServerBindingRepository(_db).current())
+        ?.localBindingId;
+    var pending = false;
     const chunkSize = 200;
     for (var i = 0; i < uuidList.length; i += chunkSize) {
       final chunk = uuidList.sublist(
         i,
         i + chunkSize > uuidList.length ? uuidList.length : i + chunkSize,
       );
+      if (await _dropDownloads(chunk, token)) pending = true;
+    }
+    if (pending) _onOwnedCleanupPending?.call();
+    _status.bumpVersion();
+  }
 
-      // 1. Read current file paths in a bounded query.
-      final placeholders = List.filled(chunk.length, '?').join(', ');
+  /// Clears the downloaded-state columns of [uuids] and, in the same
+  /// transaction, enqueues their owned files (including a kept damaged copy)
+  /// for durable cleanup. After the commit it attempts the deletions now.
+  /// A transaction failure propagates (nothing is cleared). Returns whether
+  /// any cleanup row was kept for a later retry.
+  Future<bool> _dropDownloads(List<String> uuids, String? token) async {
+    final ids = await _db.transaction(() async {
+      final placeholders = List.filled(uuids.length, '?').join(', ');
       final rows = await _db
           .customSelect(
-            'SELECT uuid_id, file_path, damaged_file_path FROM tracks '
+            'SELECT file_path, damaged_file_path FROM tracks '
             'WHERE uuid_id IN ($placeholders) '
             'AND (file_path IS NOT NULL OR damaged_file_path IS NOT NULL)',
-            variables: chunk.map(Variable.withString).toList(),
+            variables: uuids.map(Variable.withString).toList(),
           )
           .get();
-
-      // 2. Delete files from disk (best-effort — orphan files are harmless).
-      for (final row in rows) {
-        for (final column in const ['file_path', 'damaged_file_path']) {
-          final path = row.readNullable<String>(column);
-          if (path == null) continue;
-          final f = File(path);
-          try {
-            if (await f.exists()) await f.delete();
-          } catch (_) {}
-        }
-      }
-
-      // 3. Null out the downloaded-state columns for this bounded chunk.
-      await (_db.update(
-        _db.tracks,
-      )..where((t) => t.uuidId.isIn(chunk))).write(clearedDownloadColumns);
+      final paths = <String>{
+        for (final row in rows)
+          for (final column in const ['file_path', 'damaged_file_path'])
+            if (row.readNullable<String>(column) case final path?) path,
+      };
+      // Cleared without notifying the tracks watchers: they learn of it once
+      // the whole operation is over (see the publish below), so no DB work
+      // follows the notification. The SET list comes from
+      // [clearedDownloadColumns] itself.
+      final cleared = clearedDownloadColumns.toColumns(false);
+      await _db.customUpdate(
+        'UPDATE tracks SET '
+        '${cleared.keys.map((c) => '$c = ?').join(', ')} '
+        'WHERE uuid_id IN ($placeholders)',
+        variables: [
+          for (final v in cleared.values) v as Variable,
+          ...uuids.map(Variable.withString),
+        ],
+        updates: const {},
+      );
+      return _ownedCleanup.enqueueInTransaction(paths, localBindingId: token);
+    });
+    try {
+      return await _attemptCleanup(ids, token);
+    } finally {
+      _db.notifyUpdates({
+        TableUpdate.onTable(_db.tracks, kind: UpdateKind.update),
+      });
     }
+  }
 
-    _status.bumpVersion();
+  Future<bool> _attemptCleanup(List<int> ids, String? token) async {
+    if (ids.isEmpty) return false;
+    final outcomes = await _ownedCleanup.cleanRows(ids, bindingToken: token);
+    final kept = outcomes.values
+        .where((o) => o == OwnedCleanupOutcome.failed)
+        .length;
+    if (kept > 0) {
+      developer.log(
+        'delete download: $kept file(s) kept for cleanup retry',
+        name: 'DownloadManager',
+      );
+    }
+    return kept > 0;
   }
 
   /// Called by recovery after the binding gate verified the server (and by

@@ -11,6 +11,7 @@ import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_focus.dart';
 import 'package:frontend/playback/codec_support.dart';
 import 'package:frontend/playback/local_source_policy.dart';
+import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/playback/playback_engine.dart';
 import 'package:frontend/playback/preview_engine.dart';
 import 'package:frontend/playback/preview_player.dart';
@@ -133,6 +134,27 @@ void main() {
         credentialsProvider.overrideWithValue(testCredentials),
         serverBindingGateProvider.overrideWithValue(gate),
         offlineModeProvider.overrideWith(_Offline.new),
+      ]);
+      addTearDown(c.dispose);
+      final r = await c
+          .read(previewSourceUrisProvider)
+          .resolve(const LibraryTrackPreview('t1'));
+      expect(r.refusal, PreviewStatus.needsConnection);
+      expect(gate.asked, isEmpty);
+    });
+
+    // Sign-off OPEN-M-11 (E8 review): a failed server check is handled like
+    // offline (as playback does since step D): the preview needs a
+    // connection, not "unavailable".
+    test('the scope provider: the server check failed reads as needs a '
+        'connection', () async {
+      final gate = _Gate(allowed: false);
+      final c = ProviderContainer(overrides: [
+        apiClientProvider.overrideWithValue(testApiClient('http://srv:1',
+            MockClient((_) async => http.Response('', 500)))),
+        credentialsProvider.overrideWithValue(testCredentials),
+        serverBindingGateProvider.overrideWithValue(gate),
+        streamsUnavailableProvider.overrideWithValue(() => true),
       ]);
       addTearDown(c.dispose);
       final r = await c
@@ -758,7 +780,8 @@ void main() {
       final c = ProviderContainer();
       addTearDown(c.dispose);
       expect([for (final q in c.read(localQuiescablesProvider)) q.quiesceName],
-          ['playback', 'listens', 'preview', 'history', 'uploads', 'submissions']);
+          ['playback', 'listens', 'preview', 'history', 'uploads', 'delete-jobs',
+           'owned-file-cleanup', 'submissions']);
     });
 
     test('quiescing never builds a preview player', () async {

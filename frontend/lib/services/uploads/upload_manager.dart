@@ -14,6 +14,7 @@ import 'package:flutter/foundation.dart'
     show ValueListenable, ValueNotifier, mapEquals, setEquals, visibleForTesting;
 import 'package:frontend/api/uploads_api.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
@@ -27,6 +28,7 @@ import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/uploads/upload_import_sync.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/upload_other_device.dart';
+import 'package:frontend/services/uploads/upload_review.dart' show decodeDraft;
 import 'package:frontend/services/uploads/upload_review_transport.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 import 'package:frontend/services/uploads/uploads_network_feature.dart';
@@ -853,8 +855,12 @@ class UploadManager {
   /// rethrows it).
   static _StepResult? _stepFailure(Object e) => switch (e) {
     ApiException(statusCode: 401) => const _StepParked(),
-    ApiException() || NetworkException() || TimeoutException() =>
-      const _StepRetry(),
+    // A withheld request (the server is not verified; nothing was sent) is
+    // retried like a transport failure (sign-off OPEN-M-11).
+    ApiException() ||
+    NetworkException() ||
+    TimeoutException() ||
+    TokenWithheldException() => const _StepRetry(),
     _ => null,
   };
 
@@ -864,8 +870,11 @@ class UploadManager {
   /// The failure hook cases every submission shares: another server answered,
   /// or the manager is closing. The rows stay as they were.
   static SubmissionFailureDisposition? _commonFailure(Object e) => switch (e) {
+    // TokenWithheldException: nothing was sent, the rows stay as they were
+    // (sign-off OPEN-M-11).
     ServerInstanceChangedException() ||
-    UploadTransferAborted() => const LeaveSubmissionUntouched(),
+    UploadTransferAborted() ||
+    TokenWithheldException() => const LeaveSubmissionUntouched(),
     _ => null,
   };
 
@@ -1573,8 +1582,33 @@ final class _StepParked extends _StepResult {
   const _StepParked();
 }
 
-/// The Disconnect confirmation's "unsent uploads" line: this binding's files
-/// whose bytes the server doesn't have yet.
+/// What one sign-in holds in the upload intents that Disconnect or Log out
+/// would drop (DEV-7-22, DEV-8-14); see [UploadLossReporter.counts].
+class UploadLossCounts {
+  const UploadLossCounts({
+    required this.unsent,
+    required this.reviewDrafts,
+    required this.unsentReviews,
+    required this.unsentCancels,
+  });
+
+  /// Files whose bytes the server doesn't have yet (the Disconnect rule).
+  final int unsent;
+
+  /// Reviewable rows with a typed, unconfirmed tag draft.
+  final int reviewDrafts;
+
+  /// Reviews confirmed here that the server hasn't answered.
+  final int unsentReviews;
+
+  /// Cancels the server hasn't answered.
+  final int unsentCancels;
+}
+
+/// The Disconnect confirmation's "unsent uploads" line: the files on this
+/// device (kept ones of an ended sign-in included) whose bytes the server
+/// doesn't have yet. [counts] is the one read of the intents; Log out reuses
+/// it for its extra categories.
 class UploadLossReporter implements LossReporter {
   UploadLossReporter({
     required UploadIntentStore intents,
@@ -1588,20 +1622,45 @@ class UploadLossReporter implements LossReporter {
   static const _unsent = {
     UploadIntentState.allocating,
     UploadIntentState.allocated,
+    _ServerItemState.receiving,
     UploadIntentState.transferring,
     UploadIntentState.needsReselect,
     UploadIntentState.sourceChanged,
   };
 
-  @override
-  Future<String?> pendingLossSummary() async {
+  static const _reviewable = {
+    _ServerItemState.reviewReady,
+    'duplicate_conflict',
+  };
+
+  /// The counts of every row on this device while a binding exists (rows kept
+  /// by an ended sign-in included), or null with no binding. Throws when the
+  /// binding or its intents cannot be read.
+  Future<UploadLossCounts?> counts() async {
     final token = (await _binding.current())?.localBindingId;
     if (token == null) return null;
-    final count = (await _intents.forBinding(
-      token,
-    )).where(
-      (i) => i.bytesOnThisDevice && _unsent.contains(i.lastState),
-    ).length;
+    var unsent = 0, drafts = 0, reviews = 0, cancels = 0;
+    for (final i in await _intents.all()) {
+      final state = i.lastState;
+      if (i.bytesOnThisDevice && _unsent.contains(state)) unsent++;
+      if (_reviewable.contains(state) && decodeDraft(i.draftJson).isNotEmpty) {
+        drafts++;
+      }
+      if (state == UploadIntentState.reviewSubmitted) reviews++;
+      if (state == UploadIntentState.cancelling) cancels++;
+    }
+    return UploadLossCounts(
+      unsent: unsent,
+      reviewDrafts: drafts,
+      unsentReviews: reviews,
+      unsentCancels: cancels,
+    );
+  }
+
+  @override
+  Future<String?> pendingLossSummary() async {
+    final c = await counts();
+    final count = c?.unsent ?? 0;
     return switch (count) {
       0 => null,
       1 => '1 upload not yet sent',

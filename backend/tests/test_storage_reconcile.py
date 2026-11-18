@@ -143,13 +143,18 @@ def test_the_reservation_reconcile_is_a_non_fatal_step_after_the_identity_reconc
         ("audio identity", True),
         # 7A.3c: the upload commit journal, before job reclaim (SC-16e).
         ("upload commit journal", False),
+        # 8A.3d: the deletion journal, right after the upload one (SC-16e).
+        ("deletion journal", False),
         # 7A.2b: receipts settle or release their rows before this reconcile runs.
         ("upload receipts", False),
         # 7A.2c: dead validation leases are re-queued (job reclaim, SC-16e).
         ("upload validation", False),
+        # 8A.3d: deletion job reclaim, after the upload one.
+        ("deletion jobs", False),
         ("storage reservations", False),
-        # 7A.3c: the upload janitor runs last (SC-16e janitors).
+        # 7A.3c: the upload janitor (SC-16e janitors), then 8A.3d's.
         ("upload janitor", False),
+        ("deletion janitor", False),
     ]
 
 

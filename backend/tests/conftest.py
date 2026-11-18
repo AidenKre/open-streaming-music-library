@@ -187,6 +187,8 @@ def configure_app(tmp_path, monkeypatch):
         monkeypatch.setenv("ENABLE_UPLOAD_COMMIT_WORKER", "false")
         # 7A.3c: and no periodic upload janitor thread (the startup pass still runs).
         monkeypatch.setenv("ENABLE_UPLOAD_JANITOR", "false")
+        # 8A.3c: and no deletion worker thread; its app tests turn it on.
+        monkeypatch.setenv("ENABLE_DELETION_WORKER", "false")
         # 6.5B.1b: no fingerprinter unless a test asks for one (fpcalc may be
         # installed on the machine running the tests).
         monkeypatch.setenv("AUDIO_FINGERPRINT_BACKEND", "off")

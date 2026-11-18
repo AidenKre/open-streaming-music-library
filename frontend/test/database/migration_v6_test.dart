@@ -115,7 +115,7 @@ void main() {
     addTearDown(db.close);
     expect(
       (await _rows(db, 'PRAGMA user_version')).single.values.single,
-      6,
+      db.schemaVersion, // the full chain runs to the current version
     );
     expect(
       await _rows(
@@ -192,7 +192,7 @@ void main() {
     addTearDown(second.close);
     expect(
       (await _rows(second, 'PRAGMA user_version')).single.values.single,
-      6,
+      second.schemaVersion, // the full chain runs to the current version
     );
     expect(
       await _rows(second, 'SELECT operation_uuid, state FROM durable_submissions'),

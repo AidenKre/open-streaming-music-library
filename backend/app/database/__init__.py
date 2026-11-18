@@ -24,4 +24,5 @@ from .database import (
     SearchParameter,
     SearchResults,
     TrackNotFound,
+    TrackPendingDeletion,
 )

@@ -234,5 +234,7 @@ def test_recovery_never_replays_a_staged_copy_that_is_not_a_regular_file(tmp_pat
 
     assert target.read_bytes() == b"stale"
     assert elsewhere.read_bytes() == b"another file"
-    assert temp.is_symlink()
-    assert len(db.list_journal_entries()) == 1
+    # Since OPEN-6.5-05 (2026-11-16, state-table I7): the link is never followed or
+    # replayed; startup removes the link name itself and the row goes.
+    assert not temp.is_symlink() and not temp.exists()
+    assert db.list_journal_entries() == []

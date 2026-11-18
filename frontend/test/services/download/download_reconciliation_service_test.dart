@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import 'package:frontend/database/database.dart';
 import 'package:frontend/services/download/download_reconciliation_service.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
+import 'package:frontend/services/storage/owned_file_cleanup.dart';
 
 Future<void> _insertTrack(
   AppDatabase db,
@@ -261,13 +262,13 @@ void main() {
   });
 
   test('concurrent reconcile calls dedupe onto a single run', () async {
-    int callCount = 0;
+    final checks = <String, int>{};
     final gate = Completer<void>();
     final svc = DownloadReconciliationService(
       db: db,
       statusReader: reader,
       fileExists: (path) async {
-        callCount++;
+        checks[path] = (checks[path] ?? 0) + 1;
         await gate.future;
         return false;
       },
@@ -282,7 +283,112 @@ void main() {
     gate.complete();
     final results = await both;
 
+    // Both callers get the one run's answer (a second run would find the
+    // rows already cleared and answer false).
     expect(results, [true, true]);
-    expect(callCount, 2); // one per row, not two per row.
+    // One run: each path is scanned once and re-checked once under its path
+    // lock (8B.2b); a second concurrent scan would add more checks.
+    expect(checks.values, everyElement(2));
+    expect(checks, hasLength(2));
+  });
+  // 8B.2b (OPEN-8B2a-04, 8B.2a review #6): reconcile drops a download's
+  // reference only for the path it found missing, re-checked under the
+  // app-wide path lock the downloader holds from its rename to its DB write.
+  group('8B.2b: reconcile vs a download committing meanwhile', () {
+    test('a full reconcile keeps a new path committed during the scan',
+        () async {
+      final old = p.join(tmp.path, 'old-a.m4a');
+      await _insertTrack(db, 'a', filePath: old, downloadedQuality: '320');
+      final fresh = p.join(tmp.path, 'new-a.m4a');
+      final racing = DownloadReconciliationService(
+        db: db,
+        statusReader: reader,
+        locks: OwnedPathLocks(),
+        fileExists: (path) async {
+          if (path == old) {
+            // A re-download commits a new path while the old one is checked.
+            await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
+                .write(TracksCompanion(filePath: Value(fresh)));
+            return false;
+          }
+          return true;
+        },
+      );
+      await racing.reconcile();
+      expect((await _readDownloadState(db, 'a')).filePath, fresh);
+      expect((await _readDownloadState(db, 'a')).quality, '320');
+    });
+
+    for (final oneTrack in [false, true]) {
+      test('${oneTrack ? 'a one-track' : 'a full'} reconcile waits for a '
+          'download holding the same path and keeps what it committed',
+          () async {
+        final path = p.join(tmp.path, 'a.m4a'); // missing at the scan
+        await _insertTrack(db, 'a', filePath: path, downloadedQuality: '128');
+        final locks = OwnedPathLocks();
+        final scanned = Completer<void>();
+        final svc = DownloadReconciliationService(
+          db: db,
+          statusReader: reader,
+          locks: locks,
+          fileExists: (path) async {
+            final exists = File(path).existsSync();
+            if (!scanned.isCompleted) scanned.complete(); // the scan's check
+            return exists;
+          },
+        );
+        // The downloader's commit window on the same path: rename, then the
+        // DB write, under the path lock.
+        final release = Completer<void>();
+        final commit = locks.withLock(path, () async {
+          await release.future;
+          await File(path).writeAsBytes([1, 2, 3]);
+          await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
+              .write(const TracksCompanion(downloadedQuality: Value('320')));
+        });
+        final run = oneTrack ? svc.reconcileTrack('a') : svc.reconcile();
+        await scanned.future; // found missing before the download landed
+        await pumpEventQueue();
+        release.complete();
+        await commit;
+        await run;
+        final state = await _readDownloadState(db, 'a');
+        expect((state.filePath, state.quality), (path, '320'),
+            reason: 'the committed download is still referenced');
+      });
+    }
+
+    test('a missing file is still cleared under the lock', () async {
+      final path = p.join(tmp.path, 'gone.m4a');
+      await _insertTrack(db, 'a', filePath: path, downloadedQuality: '320');
+      final svc = DownloadReconciliationService(
+          db: db, statusReader: reader, locks: OwnedPathLocks());
+      expect(await svc.reconcile(), isTrue);
+      expect((await _readDownloadState(db, 'a')).filePath, isNull);
+    });
+  });
+  // 8B.2b review r1 #2: rows are cleared one by one; a failure on a later
+  // row must not hide the rows already cleared from the download status.
+  test('8B.2b review: a failure after a row was cleared still publishes '
+      'the change', () async {
+    final a = p.join(tmp.path, 'a.m4a');
+    final b = p.join(tmp.path, 'b.m4a');
+    await _insertTrack(db, 'a', filePath: a);
+    await _insertTrack(db, 'b', filePath: b);
+    final seen = <String, int>{};
+    final svc = DownloadReconciliationService(
+      db: db,
+      statusReader: reader,
+      locks: OwnedPathLocks(),
+      fileExists: (path) async {
+        final n = seen[path] = (seen[path] ?? 0) + 1;
+        if (path == b && n == 2) throw const FileSystemException('EIO');
+        return false;
+      },
+    );
+    final before = reader.downloadStatusVersion.value;
+    await expectLater(svc.reconcile(), throwsA(isA<FileSystemException>()));
+    expect((await _readDownloadState(db, 'a')).filePath, isNull);
+    expect(reader.downloadStatusVersion.value, before + 1);
   });
 }

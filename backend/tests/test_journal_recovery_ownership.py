@@ -13,9 +13,12 @@ the destination is left alone. When ownership cannot be shown, the file stays,
 the row stays and the failure is logged (once by the finisher).
 """
 
+import subprocess
 from pathlib import Path
 
 import pytest
+
+from app.database import ANY_OWNER
 
 import tests.test_conversion as conv
 from app.services.track_editor import finish_kept_journal_rows, reconcile_journal
@@ -24,6 +27,18 @@ from tests.test_identity_conversion import _lossless_world, fixtures  # noqa: F4
 from tests.test_track_editor import _add_track, _db
 
 INTENTS = ["relocate", "convert"]
+
+
+def _other_audio(path: Path) -> bytes:
+    """A real audio file at ``path`` whose audio is not the track's (an 880 Hz sine;
+    aac for .m4a). Since 2026-11-16 (sign-off OPEN-6.5-05) startup settles every row:
+    a file at the destination that is audio of its own becomes a track; a file
+    ffprobe refuses is removed when the track's file hashed (decision D1)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    codec = "aac" if path.suffix == ".m4a" else "flac"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "sine=frequency=880:duration=0.3", "-c:a", codec, str(path)], check=True)
+    return path.read_bytes()
 
 
 def _world(tmp_path):
@@ -62,7 +77,8 @@ def test_startup_keeps_another_tracks_master_at_new_path(tmp_path, intent):
 
     assert new.read_bytes() == b"another track's master"
     assert old.read_bytes() == b"old master"
-    assert [e["intent"] for e in db.list_journal_entries()] == [intent]  # kept for a later look
+    # Since 2026-11-16 (M1): another track's master is never touched and the row goes.
+    assert db.list_journal_entries() == []
 
 
 @pytest.mark.parametrize("intent", INTENTS)
@@ -106,7 +122,12 @@ def test_a_present_temp_means_the_move_never_happened_so_new_path_is_left(tmp_pa
 
 
 @pytest.mark.parametrize("intent", INTENTS)
-def test_a_row_without_a_recorded_temp_leaves_new_path_and_is_kept(tmp_path, intent, caplog):
+def test_a_row_without_a_recorded_temp_leaves_a_file_nothing_can_read_and_the_row_goes(
+    tmp_path, intent, caplog
+):
+    """M4 (since 2026-11-16): with no recorded temp the file at new_path goes to the
+    content rule; here neither it nor the track's own file is audio, so nothing
+    proves anything (decision D2): the file stays, the row goes."""
     db, root, staging, old, track = _world(tmp_path)
     new = root / "song.m4a"
     new.write_bytes(b"a file that is not a track")
@@ -115,10 +136,10 @@ def test_a_row_without_a_recorded_temp_leaves_new_path_and_is_kept(tmp_path, int
     reconcile_journal(db, tmp_path)
     finished, warnings = _finisher_passes(db, tmp_path, caplog)
 
-    assert finished == [0, 0, 0] and len(warnings) == 1
+    assert finished == [0, 0, 0] and warnings == []
     assert new.read_bytes() == b"a file that is not a track"
     assert old.read_bytes() == b"old master"
-    assert [e["intent"] for e in db.list_journal_entries()] == [intent]
+    assert db.list_journal_entries() == []
 
 
 # --- the row's own copy is still removed -------------------------------------------------------
@@ -182,7 +203,7 @@ def test_a_conversion_whose_move_was_refused_never_costs_the_file_at_its_destina
 
     def foreign_file_appears(path, codec_hint, **kwargs):
         if ".tagged." in Path(path).name and not dest.exists():
-            dest.write_bytes(b"someone else's file")
+            _other_audio(dest)
         return real(path, codec_hint, **kwargs)
 
     orch.compute_identity = foreign_file_appears
@@ -194,9 +215,11 @@ def test_a_conversion_whose_move_was_refused_never_costs_the_file_at_its_destina
 
     assert db.get_conversion_job(job_id)["status"] == "failed"
     assert [e["intent"] for e in db.list_journal_entries()] == ["convert"]  # the kept row
+    foreign = dest.read_bytes()
     _recover_both_ways(db, tmp_path, caplog)
 
-    assert dest.read_bytes() == b"someone else's file"
+    assert dest.read_bytes() == foreign  # other audio: kept, now a track of its own
+    assert db.track_path_in_use(str(dest), owner_id=ANY_OWNER, exclude_uuid=track.uuid_id)
     assert source.read_bytes() == original
     assert db.list_journal_entries() == []
     assert conv._staging_files(tmp_path) == []
@@ -227,10 +250,11 @@ def test_a_conversion_whose_commit_failed_never_costs_a_file_that_appears_later(
     assert db.get_conversion_job(job_id)["status"] == "failed"
     assert [e["intent"] for e in db.list_journal_entries()] == ["convert"]
     assert not dest.exists()
-    dest.write_bytes(b"a file that lands there later")
+    foreign = _other_audio(dest)
     _recover_both_ways(db, tmp_path, caplog)
 
-    assert dest.read_bytes() == b"a file that lands there later"
+    assert dest.read_bytes() == foreign  # other audio: kept, now a track of its own
+    assert db.track_path_in_use(str(dest), owner_id=ANY_OWNER, exclude_uuid=track.uuid_id)
     assert source.read_bytes() == original
     assert db.list_journal_entries() == []
     assert conv._staging_files(tmp_path) == []
@@ -264,11 +288,11 @@ def test_a_master_edit_whose_commit_failed_never_costs_a_file_that_appears_later
 
     assert [e["intent"] for e in db.list_journal_entries()] == ["relocate"]
     assert not dest.exists()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(b"a file that lands there later")
+    foreign = _other_audio(dest)
     _recover_both_ways(db, library, caplog)
 
-    assert dest.read_bytes() == b"a file that lands there later"
+    assert dest.read_bytes() == foreign  # other audio: kept, now a track of its own
+    assert db.track_path_in_use(str(dest), owner_id=ANY_OWNER, exclude_uuid=track.uuid_id)
     assert audio.read_bytes() == original
     assert db.list_journal_entries() == []
     assert not any((library / ".staging").iterdir())
@@ -338,7 +362,7 @@ def test_the_startup_sweep_removes_an_edit_temp_no_journal_row_owns(tmp_path):
 
 
 @pytest.mark.parametrize("intent", INTENTS)
-def test_a_new_path_that_differs_from_a_tracks_master_only_in_case_is_kept(tmp_path, intent):
+def test_a_new_path_that_differs_from_a_tracks_master_only_in_case_is_never_touched(tmp_path, intent):
     """On a case-insensitive filesystem (macOS) ``art/song.m4a`` is the same file as
     ``Art/song.m4a``. Recovery treats a case-only difference as the same path."""
     db, root, staging, old, track = _world(tmp_path)
@@ -356,7 +380,8 @@ def test_a_new_path_that_differs_from_a_tracks_master_only_in_case_is_kept(tmp_p
 
     assert master.read_bytes() == b"another track's master"
     assert variant.read_bytes() == b"another track's master"
-    assert [e["intent"] for e in db.list_journal_entries()] == [intent]
+    # Since 2026-11-16 (M1): a claimed path is never touched; the row goes.
+    assert db.list_journal_entries() == []
 
 
 # --- the finish branch: a file at old_path that is another track's master ------------------------
@@ -529,7 +554,8 @@ def test_reverting_a_row_keeps_a_master_at_a_unicode_variant_of_new_path(
 
     assert b.read_bytes() == b"track B master"
     assert old.read_bytes() == b"old master"
-    assert [e["intent"] for e in db.list_journal_entries()] == [intent]  # ownership unproven: kept
+    # Since 2026-11-16 (M1): startup leaves the claimed path alone and drops the row.
+    assert db.list_journal_entries() == []
 
 
 @pytest.mark.requires_ffmpeg

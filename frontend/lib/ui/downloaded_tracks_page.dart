@@ -85,20 +85,19 @@ class _DownloadedTracksPageState extends ConsumerState<DownloadedTracksPage>
           const DamagedDownloadsSection(),
           header,
           Expanded(
-            child: paginatedItems.isEmpty && !hasMore
+            child: paginationFailedEmpty
+                ? buildPaginationFailure()
+                : paginationLoadedEmpty
                 // Centred above the shell's floating chrome (audit 4B(c)).
                 ? const ListStatusMessage('No downloaded tracks yet.')
                 : ListView.builder(
                     controller: scrollController,
                     // Ends above the shell's floating bottom chrome (4B).
                     padding: ShellChromeInsets.padEnd(context),
-                    itemCount: paginatedItems.length + (hasMore ? 1 : 0),
+                    itemCount: paginatedItems.length + (paginationHasTrailing ? 1 : 0),
                     itemBuilder: (context, index) {
                       if (index >= paginatedItems.length) {
-                        return const Padding(
-                          padding: EdgeInsets.all(16),
-                          child: Center(child: CircularProgressIndicator()),
-                        );
+                        return buildPaginationTrailing();
                       }
                       final track = paginatedItems[index];
                       final job = manager.state.jobs

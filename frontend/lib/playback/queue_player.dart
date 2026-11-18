@@ -212,7 +212,8 @@ class QueuePlayer extends Notifier<AudioState>
       if (nextValue.queueMutationVersion <= previousVersion) return;
       if (nextValue.affectedQueueSessionIds.isEmpty) return;
       _runTask('sync reconcile',
-          () => _reconcileInLane(nextValue.affectedQueueSessionIds));
+          () => _reconcileInLane(nextValue.affectedQueueSessionIds,
+              endedSessionIds: nextValue.endedQueueSessionIds));
     });
 
     _subscriptions.add(_player.transportStateStream.listen(_onPlayerStateChanged));
@@ -806,7 +807,8 @@ class QueuePlayer extends Notifier<AudioState>
   Future<void> reconcileAfterSyncQueueMutation(Set<int> affectedSessionIds) =>
       _serialize(() => _reconcileInLane(affectedSessionIds));
 
-  Future<void> _reconcileInLane(Set<int> affectedSessionIds) async {
+  Future<void> _reconcileInLane(Set<int> affectedSessionIds,
+      {Set<int> endedSessionIds = const {}}) async {
     {
       final sessionId = state.queue.sessionId;
       if (sessionId == null || !affectedSessionIds.contains(sessionId)) {
@@ -847,9 +849,16 @@ class QueuePlayer extends Notifier<AudioState>
 
       final nextCurrentItem = snapshot.currentItem!;
       final preservePosition = previousCurrentItemId == nextCurrentItem.itemId;
+      final endLanding =
+          !preservePosition && endedSessionIds.contains(sessionId);
+      final autoPlay = wasPlaying && !endLanding;
+      // OPEN-8-11: an end landing rests paused, so an interruption's end
+      // does not resume it.
+      if (endLanding) _resumeAfterInterruption = false;
       await _startSession(
         sessionId,
-        autoPlay: wasPlaying,
+        autoPlay: autoPlay,
+        pauseBeforeSeed: wasPlaying && !autoPlay,
         initialPosition: preservePosition ? previousPosition : Duration.zero,
         overrideCurrentItem: nextCurrentItem,
         currentSourceKind:
@@ -972,9 +981,13 @@ class QueuePlayer extends Notifier<AudioState>
     });
   }
 
+  /// [pauseBeforeSeed]: an end landing stops: a seed without autoplay keeps
+  /// a play the engine already issued (8-L-02). Paused only after the
+  /// reads, so a failed read leaves the engine as it was.
   Future<void> _startSession(
     int sessionId, {
     required bool autoPlay,
+    bool pauseBeforeSeed = false,
     Duration initialPosition = Duration.zero,
     QueuePlaybackEntry? overrideCurrentItem,
     PlaybackTransitionCause cause = PlaybackTransitionCause.queueReplacement,
@@ -1003,6 +1016,7 @@ class QueuePlayer extends Notifier<AudioState>
       throw StateError('Current queue item could not be loaded');
     }
 
+    if (pauseBeforeSeed) await _player.pause();
     _resetFailureRun();
     _startRebuildRun();
     await _player.setSeed(

@@ -17,14 +17,15 @@ from app.core.internal_dirs import INTERNAL_DIRS, InternalDirRefused, internal_d
 
 # ── the registry ───────────────────────────────────────────────────────────
 
-def test_the_registry_lists_staging_then_uploads():
-    assert INTERNAL_DIRS == (".staging", ".uploads")
+def test_the_registry_lists_staging_then_uploads_then_deleting():
+    # Phase 8A.3c (drift D7, decision O2): the deletion quarantine.
+    assert INTERNAL_DIRS == (".staging", ".uploads", ".deleting")
 
 
 def test_the_dirs_live_directly_under_the_music_library(tmp_path):
     music = tmp_path / "music"
 
-    assert dirs_of(music) == (music / ".staging", music / ".uploads")
+    assert dirs_of(music) == (music / ".staging", music / ".uploads", music / ".deleting")
 
 
 def test_a_refusal_is_a_runtime_error():
@@ -37,6 +38,7 @@ def test_a_refusal_is_a_runtime_error():
 def test_startup_creates_every_internal_dir(app_client, tmp_path):
     assert (tmp_path / "music" / ".staging").is_dir()
     assert (tmp_path / "music" / ".uploads").is_dir()
+    assert (tmp_path / "music" / ".deleting").is_dir()
 
 
 def test_a_restart_keeps_existing_internal_dirs_and_their_contents(open_app_client, tmp_path):
@@ -216,6 +218,20 @@ def test_prune_keeps_a_staged_file_and_its_directories(tmp_path):
     assert empty_sibling.is_dir()
 
 
+def test_prune_never_removes_an_empty_quarantine_folder(tmp_path):
+    # Phase 8A.3c: .deleting/<owner>/<op>/ is pruned by the deletion worker's own
+    # rmdir only, never by the library prune walking up from a track's folder.
+    from app.services.organizer import prune_empty_dirs
+
+    music = tmp_path / "music"
+    op = music / ".deleting" / "1" / "op"
+    op.mkdir(parents=True)
+
+    prune_empty_dirs(op, music)
+
+    assert op.is_dir()
+
+
 def test_prune_still_removes_ordinary_empty_library_dirs(tmp_path):
     from app.services.organizer import prune_empty_dirs
 
@@ -232,7 +248,7 @@ def test_prune_still_removes_ordinary_empty_library_dirs(tmp_path):
 
 # ── the organizer never places a track in an internal dir (S6) ─────────────
 
-@pytest.mark.parametrize("name", [".staging", ".uploads"])
+@pytest.mark.parametrize("name", [".staging", ".uploads", ".deleting"])
 def test_an_artist_named_like_an_internal_dir_is_foldered_beside_it(tmp_path, name):
     # 7-fix-r0 F0-2 (was: refused as FAILS_CHECK): the shared sanitizer folders
     # a component named exactly like an internal dir as "<name>_", so the track

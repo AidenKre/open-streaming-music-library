@@ -179,7 +179,8 @@ def test_the_reclaim_step_runs_after_the_receipts_and_before_the_reservations(co
     names = [(s.name, s.fatal) for s in steps]
     at = names.index(("upload validation", False))
     assert names[at - 1] == ("upload receipts", False)
-    assert names[at + 1] == ("storage reservations", False)
+    # 8A.3d: deletion job reclaim follows it, then the reservations.
+    assert names[at + 1 : at + 3] == [("deletion jobs", False), ("storage reservations", False)]
 
 
 class FakeValidation:

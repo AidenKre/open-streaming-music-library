@@ -528,14 +528,15 @@ class TestStartupRecovery:
             )
             # Shutting the TestClient down here stands in for the crash.
 
-        import app.services.conversion as conversion_module
-        real_evict = conversion_module.evict_converted_track_caches
+        # main imports the helper from encoded_cache when the app (re)loads.
+        import app.services.encoded_cache as encoded_cache_module
+        real_evict = encoded_cache_module.evict_track_caches
 
         def recording_evict(uuid_id, cache, default_cache):
             evicted.append(uuid_id)
             return real_evict(uuid_id, cache, default_cache)
 
-        monkeypatch.setattr(conversion_module, "evict_converted_track_caches", recording_evict)
+        monkeypatch.setattr(encoded_cache_module, "evict_track_caches", recording_evict)
 
         with contextlib.ExitStack() as stack:
             client = stack.enter_context(open_app_client())

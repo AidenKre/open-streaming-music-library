@@ -130,7 +130,8 @@ void main() {
     final c = scope(runner: runner);
     final participants = c.read(localQuiescablesProvider);
     expect(participants.map((p) => p.quiesceName),
-        ['playback', 'listens', 'preview', 'history', 'uploads', 'submissions']);
+        ['playback', 'listens', 'preview', 'history', 'uploads', 'delete-jobs',
+          'owned-file-cleanup', 'submissions']);
     final history = participants.singleWhere((p) => p.quiesceName == 'history');
     await history.quiesce();
     expect(runner.quiesced, 0, reason: 'nothing built: nothing to stop (branch audit 5A N1)');

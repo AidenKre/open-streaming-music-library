@@ -236,7 +236,7 @@ def test_an_edit_waits_for_startup_while_a_converted_temp_is_not_in_place(tmp_pa
     encodes made from the old bytes, so the edit is refused until a restart has
     placed them. After the restart the edit goes through."""
     from app.main import _interrupted_conversion_uuids
-    from app.services.conversion import evict_converted_track_caches
+    from app.services.encoded_cache import evict_track_caches
     from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 
     library, audio, db, track, before = _world(tmp_path)
@@ -260,7 +260,7 @@ def test_an_edit_waits_for_startup_while_a_converted_temp_is_not_in_place(tmp_pa
     uuids = _interrupted_conversion_uuids(db)
     reconcile_journal(db, library)
     for u in uuids:
-        evict_converted_track_caches(u, cache, None)
+        evict_track_caches(u, cache, None)
     assert not cache.has(track.uuid_id, "high")
     # Putting the converted bytes in place bumps the revision (U06-B-06, review
     # finding 10), so the edit is made against the revision after the restart.

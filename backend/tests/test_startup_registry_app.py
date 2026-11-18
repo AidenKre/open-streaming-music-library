@@ -46,7 +46,7 @@ def spied(configure_app, monkeypatch):
         ("reconcile_journal", "journal"),
         ("reconcile_conversion_jobs", "conversion"),
         ("reconcile_audio_identity", "identity"),
-        ("evict_converted_track_caches", "evict"),
+        ("evict_track_caches", "evict"),
     ):
         monkeypatch.setattr(main, name, _wrap(calls, label, getattr(main, name)))
     return main, calls

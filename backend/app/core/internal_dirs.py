@@ -7,7 +7,8 @@ from app.core.operator_log import operator_logger
 
 STAGING = ".staging"
 UPLOADS = ".uploads"
-INTERNAL_DIRS: tuple[str, ...] = (STAGING, UPLOADS)
+DELETING = ".deleting"
+INTERNAL_DIRS: tuple[str, ...] = (STAGING, UPLOADS, DELETING)
 
 
 class InternalDirRefused(RuntimeError):

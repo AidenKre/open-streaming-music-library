@@ -517,6 +517,22 @@ class DurableSubmission implements Quiescable {
     return [for (final r in await query.get()) _toRecord(r)];
   }
 
+  /// Unanswered rows of every binding, for counting what a log-out kept.
+  /// Read-only.
+  Future<List<SubmissionRecord>> unresolvedAll({String? kind}) async {
+    final query = _db.select(_db.durableSubmissions)
+      ..where(
+        (t) =>
+            t.state.isIn([
+              SubmissionState.prepared.name,
+              SubmissionState.sent.name,
+              SubmissionState.ambiguous.name,
+            ]) &
+            (kind == null ? const Constant(true) : t.kind.equals(kind)),
+      );
+    return [for (final r in await query.get()) _toRecord(r)];
+  }
+
   @override
   String get quiesceName => 'submissions';
 

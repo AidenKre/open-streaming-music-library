@@ -126,8 +126,8 @@ class _SignInService extends SessionService {
 
   Object? logoutError;
   @override
-  Future<void> logout() async {
-    calls.add('logout');
+  Future<void> logout({bool keepUnsent = false}) async {
+    calls.add(keepUnsent ? 'logout keep' : 'logout');
     await logoutGate?.future;
     if (logoutError != null) throw logoutError!;
   }
@@ -281,6 +281,14 @@ void signInGroup() {
     });
 
     // Review F4: a second Log out tap while one runs does nothing.
+    // signoff-8-logout-warning round 3: the banner's Log in keeps the unsent
+    // uploads and deletions; the controller only passes that on.
+    test('a log-out that keeps the unsent changes says so to the model',
+        () async {
+      await session().logOutKeepingUnsent();
+      expect(service.calls, ['logout keep']);
+    });
+
     test('a second logout while one runs is ignored', () async {
       service.logoutGate = Completer<void>();
       final first = session().logout();

@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/legacy.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client_provider.dart';
+import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/playback_availability.dart';
 import 'package:frontend/playback/codec_support.dart';
@@ -49,6 +50,12 @@ final downloadManagerProvider = Provider<DownloadManager>((ref) {
     apiClient: ref.read(apiClientProvider),
     coverArtStore: ref.read(localCoverArtStoreProvider),
     directoryProvider: ref.read(downloadDirectoryProvider),
+    ownedFileCleanup: ref.read(ownedFileCleanupProvider),
+    onOwnedCleanupPending: () {
+      if (!providerDisposed) {
+        ref.read(ownedFileCleanupRunnerProvider).request('owned cleanup kept');
+      }
+    },
     warmService: ref.read(queueWarmServiceProvider),
     streamQualityFn: () => ref.read(streamQualityProvider),
     codecSupportFn: () => ref.read(codecSupportProvider),

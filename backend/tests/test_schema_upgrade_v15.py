@@ -3,7 +3,9 @@
 v15 is one additive ladder step holding every Phase 7 table. The server
 accepts v13 and v14 and upgrades both to v15 in one open (13 -> 14 -> 15);
 every other version is refused by the read-only check before any write. The
-admin CLI never migrates, so it requires v15.
+admin CLI never migrates, so it requires the latest version. Since Phase 8A.2a
+(v16, see test_schema_upgrade_v16.py) the same open continues to ``LATEST``,
+so these tests check the 14 -> 15 step's own effects and expect ``LATEST``.
 
 The v13 and v14 files are real: the frozen ``fixtures/schema_v1{3,4}.sql``
 plus plain SQL, opened through the production ``Database.initialize()``.
@@ -29,6 +31,7 @@ from tests.schema_fixtures import (
 _PAST_NS = 1_000_000_000_000_000_000
 OPERATOR = "uvicorn.error"  # app.core.operator_log.operator_logger
 UPGRADABLE = (13, 14)
+LATEST = Database.LATEST_SCHEMA_VERSION  # 16 since Phase 8A.2a
 
 
 def _database(path: Path) -> Database:
@@ -132,31 +135,30 @@ def _rich(path: Path, version: int) -> None:
 # --- the version window -----------------------------------------------------------------------
 
 
-def test_the_latest_schema_is_15():
-    assert Database.LATEST_SCHEMA_VERSION == 15
+def test_the_minimum_schema_is_still_13():
     assert Database.MINIMUM_SCHEMA_VERSION == 13
 
 
-def test_a_fresh_database_lands_on_15(tmp_path):
+def test_a_fresh_database_lands_on_the_latest_version(tmp_path):
     path = tmp_path / "database.db"
     _open(path)
-    assert user_version(path) == 15
+    assert user_version(path) == LATEST
 
 
 @pytest.mark.parametrize("version", UPGRADABLE)
-def test_an_upgradable_database_reaches_15_in_one_open_and_keeps_its_instance_id(tmp_path, version):
+def test_an_upgradable_database_reaches_the_latest_version_in_one_open_and_keeps_its_instance_id(tmp_path, version):
     path = tmp_path / "database.db"
     make_legacy_database(path, version)
 
     db = _database(path)
     assert db.initialize() is True
 
-    assert user_version(path) == 15
+    assert user_version(path) == LATEST
     assert db.get_server_instance_id() == f"inst-v{version}"
 
 
-@pytest.mark.parametrize("version", [12, 16])
-def test_versions_outside_13_to_15_are_refused_untouched(tmp_path, version):
+@pytest.mark.parametrize("version", [12, LATEST + 1])
+def test_versions_outside_the_window_are_refused_untouched(tmp_path, version):
     path = tmp_path / "database.db"
     make_legacy_database(path, 13)
     _set_user_version(path, version)
@@ -172,7 +174,7 @@ def test_versions_outside_13_to_15_are_refused_untouched(tmp_path, version):
     assert sorted(os.listdir(tmp_path)) == listing
 
 
-@pytest.mark.parametrize("version", [12, 16])
+@pytest.mark.parametrize("version", [12, LATEST + 1])
 def test_a_refused_wal_file_keeps_its_sidecars_untouched(tmp_path, version):
     """The refusal comes before any write, ``-wal`` and ``-shm`` included."""
     source = tmp_path / "source.db"
@@ -214,11 +216,11 @@ def test_the_cli_check_refuses_an_upgradable_file_untouched(tmp_path, version):
 
     message = str(refused.value)
     assert f"schema {version}" in message
-    assert "upgrade it to schema 15" in message
+    assert f"upgrade it to schema {LATEST}" in message
     assert path.read_bytes() == data and path.stat().st_mtime_ns == mtime
 
 
-def test_the_cli_check_accepts_15(tmp_path):
+def test_the_cli_check_accepts_the_latest_version(tmp_path):
     path = tmp_path / "database.db"
     _rich(path, 14)
     _open(path)
@@ -244,7 +246,7 @@ def test_the_upgrade_keeps_every_existing_row_byte_for_byte(tmp_path, version):
     assert _fts(path, "fts_tracks", "gone") == []
     sequence = dict(before["sqlite_sequence"])
     assert sequence["conversion_jobs"] == 3 and sequence["tracks"] == 23
-    assert user_version(path) == 15
+    assert user_version(path) == LATEST
 
 
 @pytest.mark.parametrize("version", UPGRADABLE)
@@ -274,11 +276,11 @@ def test_a_second_open_changes_no_row_and_no_schema(tmp_path, version):
 
     assert _rows(path) == rows
     assert _schema(path) == schema
-    assert user_version(path) == 15
+    assert user_version(path) == LATEST
 
 
 @pytest.mark.parametrize("stale", UPGRADABLE)
-def test_a_stale_outer_read_is_a_no_op_on_a_v15_file(tmp_path, monkeypatch, stale):
+def test_a_stale_outer_read_is_a_no_op_on_an_upgraded_file(tmp_path, monkeypatch, stale):
     path = tmp_path / "database.db"
     _rich(path, 14)
     _open(path)
@@ -289,11 +291,11 @@ def test_a_stale_outer_read_is_a_no_op_on_a_v15_file(tmp_path, monkeypatch, stal
 
     assert _rows(path) == rows
     assert _schema(path) == schema
-    assert user_version(path) == 15
+    assert user_version(path) == LATEST
 
 
 @pytest.mark.parametrize("version", UPGRADABLE)
-def test_a_fresh_v15_schema_equals_a_migrated_one(tmp_path, version):
+def test_a_fresh_schema_equals_one_migrated_from_v13_or_v14(tmp_path, version):
     fresh = tmp_path / "fresh" / "database.db"
     migrated = tmp_path / "migrated" / "database.db"
     _open(fresh)
@@ -308,7 +310,7 @@ def test_a_fresh_v15_schema_equals_a_migrated_one(tmp_path, version):
 
 
 @pytest.mark.parametrize("version", UPGRADABLE)
-def test_the_upgrade_is_logged_once_from_the_files_version_to_15(tmp_path, caplog, version):
+def test_the_upgrade_is_logged_once_from_the_files_version_to_the_latest(tmp_path, caplog, version):
     path = tmp_path / "database.db"
     make_legacy_database(path, version)
 
@@ -316,7 +318,7 @@ def test_the_upgrade_is_logged_once_from_the_files_version_to_15(tmp_path, caplo
         _database(path).initialize()
 
     lines = [r.getMessage() for r in caplog.records if r.name == OPERATOR and "schema" in r.getMessage()]
-    assert lines == [f"database schema upgraded from {version} to 15"]
+    assert lines == [f"database schema upgraded from {version} to {LATEST}"]
 
 
 # --- the real startup -------------------------------------------------------------------------
@@ -330,7 +332,7 @@ def test_server_startup_upgrades_an_old_data_dir(tmp_path, configure_app, versio
     main = configure_app()
 
     with TestClient(main.app):
-        assert user_version(path) == 15
+        assert user_version(path) == LATEST
 
     conn = sqlite3.connect(path)
     try:
@@ -364,7 +366,7 @@ def _deny_creating(index: str):
 @pytest.mark.parametrize("index", ["idx_upload_batches_list", "idx_upload_journal_item"])
 @pytest.mark.parametrize("version", UPGRADABLE)
 def test_a_failure_mid_step_rolls_back_to_the_files_version(tmp_path, monkeypatch, version, index):
-    """Both steps share one transaction: a v13 file stays at 13 (not 14).
+    """Every step shares one transaction: a v13 file stays at 13 (not 14).
     The step fails at its first and at its last v15 object."""
     path = tmp_path / "database.db"
     _rich(path, version)
@@ -380,4 +382,4 @@ def test_a_failure_mid_step_rolls_back_to_the_files_version(tmp_path, monkeypatc
     assert _rows(path) == rows
 
     _open(path)  # the next start upgrades it
-    assert user_version(path) == 15
+    assert user_version(path) == LATEST

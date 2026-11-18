@@ -151,7 +151,8 @@ def test_the_journal_step_is_non_fatal_after_the_identity_reconcile_and_before_j
     names = [(s.name, s.fatal) for s in steps]
     at = names.index(("upload commit journal", False))
     assert names[at - 1] == ("audio identity", True)
-    assert names[at + 1] == ("upload receipts", False)
+    # 8A.3d: the deletion journal follows it, then the receipts.
+    assert names[at + 1 : at + 3] == [("deletion journal", False), ("upload receipts", False)]
 
 
 def test_startup_resumes_a_prepared_journal_with_the_real_publisher(configure_app, tmp_path):

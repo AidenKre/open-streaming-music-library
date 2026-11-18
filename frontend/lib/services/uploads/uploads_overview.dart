@@ -323,9 +323,13 @@ class UploadsOverview {
     final offersReselect = state == 'needs_reselect' || state == 'source_changed';
     final offersReviewTags = offersReview(state, i.lastErrorCode);
     final offersChildren = state == 'expanded';
+    // The server's Retry of a lost received file waits for the bytes again,
+    // which this device can't send without them (review r1 #2).
+    final needsBytesHere = i.lastErrorCode == 'upload_source_missing';
     final offersRetry =
         state == 'failed' &&
-        (serverRetryable ?? serverRetryableCodes.contains(i.lastErrorCode));
+        (serverRetryable ?? serverRetryableCodes.contains(i.lastErrorCode)) &&
+        (!needsBytesHere || i.bytesOnThisDevice);
     return UploadRow(
       itemUuid: i.itemUuid,
       batchUuid: i.batchUuid,
@@ -340,7 +344,11 @@ class UploadsOverview {
             ),
       detailText: fromOtherDevice
           ? otherDeviceSendingText
-          : uploadDetailText(state, errorCode: i.lastErrorCode),
+          : uploadDetailText(
+              state,
+              errorCode: i.lastErrorCode,
+              bytesHere: i.bytesOnThisDevice,
+            ),
       sizeText: switch ((sent, total)) {
         (final s?, final t?) => '${formatBytes(s)} of ${formatBytes(t)}',
         (final s?, null) => '${formatBytes(s)} sent',

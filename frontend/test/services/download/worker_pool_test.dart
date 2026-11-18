@@ -353,7 +353,19 @@ void main() {
       atRename2.complete();
       await hold2.future;
     };
-    queue.addAll([_job('a')]);
+    // A replacement download (Phase 8: a commit holds its file's path lock,
+    // and the abandoned worker still holds the lock on `a.m4a`; a
+    // replacement writes its own `a.new-<n>.m4a`).
+    queue.addAll([
+      DownloadJob(
+        uuidId: 'a',
+        title: 't',
+        artist: 'a',
+        quality: '320',
+        status: const Queued(),
+        replacesFilePath: '${tempDir.path}/tracks/a.m4a',
+      ),
+    ]);
     pool.pump();
     await atRename2.future;
 

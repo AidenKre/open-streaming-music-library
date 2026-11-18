@@ -5,6 +5,7 @@ import 'package:drift/drift.dart';
 
 import 'package:frontend/database/database.dart';
 import 'package:frontend/services/download/download_status_reader.dart';
+import 'package:frontend/services/storage/owned_file_cleanup.dart';
 
 /// Reconciles `tracks.file_path` against the filesystem.
 ///
@@ -17,22 +18,25 @@ import 'package:frontend/services/download/download_status_reader.dart';
 ///
 /// Designed to be cheap: a single SELECT pulls just the rows with a non-null
 /// `file_path`, file checks are batched in small concurrent groups to avoid
-/// stalling the event loop on slow filesystems, and DB writes happen inside
-/// one transaction.
+/// stalling the event loop on slow filesystems, and each missing row is
+/// re-checked and cleared under its path lock.
 class DownloadReconciliationService {
   DownloadReconciliationService({
     required AppDatabase db,
     required DownloadStatusReader statusReader,
     Future<bool> Function(String path)? fileExists,
+    OwnedPathLocks? locks,
     int batchSize = 32,
   })  : _db = db,
         _statusReader = statusReader,
         _fileExists = fileExists ?? _defaultFileExists,
+        _locks = locks ?? sharedOwnedPathLocks,
         _batchSize = batchSize;
 
   final AppDatabase _db;
   final DownloadStatusReader _statusReader;
   final Future<bool> Function(String path) _fileExists;
+  final OwnedPathLocks _locks;
   final int _batchSize;
 
   Future<bool>? _running;
@@ -57,14 +61,32 @@ class DownloadReconciliationService {
         .getSingleOrNull();
     final path = row?.filePath;
     if (path == null || await _fileExists(path)) return false;
-    // Only the path that was checked: a download committed meanwhile wins.
-    final cleared = await (_db.update(_db.tracks)
-          ..where((t) => t.uuidId.equals(trackUuid) & t.filePath.equals(path)))
-        .write(clearedDownloadColumns);
-    if (cleared == 0) return false;
+    if (!await _clearIfStillMissing(trackUuid, path)) return false;
     _statusReader.bumpVersion();
     return true;
   }
+
+  /// Under the path lock (the downloader holds it from rename to DB write),
+  /// re-checks that [path] is still missing and clears the download columns
+  /// only if the row still points at that exact path. A download committed
+  /// meanwhile wins. [damagedOnly] forgets just a damaged-only copy's path.
+  /// Returns true iff the row changed. Never deletes a file.
+  Future<bool> _clearIfStillMissing(
+    String uuid,
+    String path, {
+    bool damagedOnly = false,
+  }) => _locks.withLock(path, () async {
+    if (await _fileExists(path)) return false;
+    final changed = damagedOnly
+        ? await (_db.update(_db.tracks)
+              ..where((t) =>
+                  t.uuidId.equals(uuid) & t.damagedFilePath.equals(path)))
+            .write(const TracksCompanion(damagedFilePath: Value(null)))
+        : await (_db.update(_db.tracks)
+              ..where((t) => t.uuidId.equals(uuid) & t.filePath.equals(path)))
+            .write(clearedDownloadColumns);
+    return changed > 0;
+  });
 
   /// Marks a download that is on disk but failed to play as damaged
   /// (decision 6; playback marks only with evidence). `file_path` and the
@@ -92,17 +114,17 @@ class DownloadReconciliationService {
         )
         .get();
 
-    final missing = <String>[];
+    final missing = <(String, String)>[];
     for (var i = 0; i < rows.length; i += _batchSize) {
       final end = (i + _batchSize > rows.length) ? rows.length : i + _batchSize;
       final batch = rows.sublist(i, end);
       final results = await Future.wait(batch.map((r) async {
         final path = r.read<String>('file_path');
         final exists = await _fileExists(path);
-        return exists ? null : r.read<String>('uuid_id');
+        return exists ? null : (r.read<String>('uuid_id'), path);
       }));
-      for (final uuid in results) {
-        if (uuid != null) missing.add(uuid);
+      for (final gone in results) {
+        if (gone != null) missing.add(gone);
       }
     }
 
@@ -125,20 +147,22 @@ class DownloadReconciliationService {
 
     if (missing.isEmpty && damagedGone.isEmpty) return false;
 
-    await _db.transaction(() async {
-      for (final uuid in missing) {
-        await (_db.update(_db.tracks)..where((t) => t.uuidId.equals(uuid)))
-            .write(clearedDownloadColumns);
+    // Per row: path lock, re-check, then the guarded write (no lock is taken
+    // inside a transaction).
+    // A failure on a later row still publishes the rows already cleared.
+    var changed = false;
+    try {
+      for (final (uuid, path) in missing) {
+        if (await _clearIfStillMissing(uuid, path)) changed = true;
       }
       for (final (uuid, path) in damagedGone) {
-        await (_db.update(_db.tracks)
-              ..where((t) =>
-                  t.uuidId.equals(uuid) & t.damagedFilePath.equals(path)))
-            .write(const TracksCompanion(damagedFilePath: Value(null)));
+        if (await _clearIfStillMissing(uuid, path, damagedOnly: true)) {
+          changed = true;
+        }
       }
-    });
-
-    _statusReader.bumpVersion();
-    return true;
+    } finally {
+      if (changed) _statusReader.bumpVersion();
+    }
+    return changed;
   }
 }

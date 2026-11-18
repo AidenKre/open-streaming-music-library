@@ -72,6 +72,10 @@ def test_every_table_in_the_schema_has_a_class(conn):
         ("storage_reservations", registry.OWNED),
         ("upload_item_acknowledgements", registry.OWNED),
         ("upload_commit_journal", registry.OWNED),
+        # Phase 8A.2a: deletion jobs are keyed (owner_id, operation_uuid) like their receipt.
+        ("deletion_jobs", registry.OWNED),
+        ("deletion_job_items", registry.OWNED),
+        ("deletion_journal", registry.OWNED),
         ("fts_tracks", registry.OWNED_THROUGH),
         ("fts_artists", registry.OWNED_THROUGH),
         ("fts_albums", registry.OWNED_THROUGH),
@@ -220,6 +224,9 @@ def test_the_delete_order_is_children_first_and_ends_with_users(conn):
     assert order == [
         "auth_sessions",
         "conversion_jobs",
+        "deletion_journal",
+        "deletion_job_items",
+        "deletion_jobs",
         "edit_journal",
         "fts_albums",
         "fts_artists",
@@ -320,6 +327,16 @@ def test_rows_deleted_in_that_order_never_violate_a_foreign_key(conn):
             base_review_version, reserved_track_uuid, edits, write_tags,
             acknowledged_duplicates, source_path, created_at, updated_at)
             VALUES (1, 'op', 'c', 'committing', 0, 'n', '{}', 0, '{}', '/s', 0, 0);
+        INSERT INTO operation_receipts (owner_id, operation_uuid, kind, request_hash, created_at)
+            VALUES (1, 'del', 'track_deletion', 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 0);
+        INSERT INTO deletion_jobs (owner_id, operation_uuid, created_at, status)
+            VALUES (1, 'del', 0, 'accepted');
+        INSERT INTO deletion_job_items (owner_id, operation_uuid, uuid_id, position, base_revision,
+            status) VALUES (1, 'del', 'w', 0, 1, 'running');
+        INSERT INTO deletion_journal (owner_id, operation_uuid, uuid_id, original_path,
+            quarantine_path, base_revision, src_dev, src_ino, src_size, master_missing, stage,
+            created_at, updated_at) VALUES (1, 'del', 'w', '/m/sam/b', '/m/.deleting/1/del/w', 1,
+            1, 2, 3, 0, 'intent', 0, 0);
         """
     )
 

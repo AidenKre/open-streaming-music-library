@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/misc.dart' show ProviderListenable;
 import 'package:frontend/ui/settings/phase4_settings.dart';
 import 'package:frontend/ui/settings/phase5_settings.dart';
+import 'package:frontend/ui/settings/phase8_settings.dart';
 
 /// A titled Settings section (SC-21). Ordered by [order]; hidden when none
 /// of its rows is available.
@@ -51,5 +52,6 @@ final settingsRowsProvider = Provider<List<SettingsRowContribution>>(
   (ref) => [
     ...phase4SettingsRows,
     ...phase5SettingsRows(ref.watch(diagnosticsRowsProvider)),
+    ...phase8SettingsRows,
   ],
 );

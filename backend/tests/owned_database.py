@@ -62,6 +62,16 @@ OWNER_METHODS: tuple[str, ...] = (
     "get_audio_identity",
     "set_duplicate_candidate_status",
     "get_identity_coverage_summary",
+    # 8A.3a: the reader-side pending-deletion predicate.
+    "is_pending_deletion",
+    # 8A.2b: the deletion preview, jobs and receipts API.
+    "get_deletion_preview_facts",
+    "create_deletion_job",
+    "get_deletion_job",
+    "list_deletion_jobs",
+    # 8A.4: the duplicates API's reads.
+    "list_duplicate_candidates",
+    "count_duplicate_candidates",
 )
 
 

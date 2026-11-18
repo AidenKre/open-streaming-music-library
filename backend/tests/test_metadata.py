@@ -172,9 +172,9 @@ class TestFfprobeForMetadata:
 
 
 class TestTheMetadataProbesReadExitsLikeTheSharedRule:
-    """Review of U05-A-06 (findings 1 and 4): only a SIGKILL is "unreadable
-    for now"; another signal is the file's own answer (None, never raised);
-    an OSError while starting is "cannot run now"."""
+    """Review of U05-A-06 (finding 4): an OSError while starting is "cannot
+    run now". On Phase 8 any signal is "unreadable for now" (recovery's D1);
+    the import quick check keeps the SIGKILL-only rule (test_ingestion)."""
 
     def test_a_sigkill_is_unavailable_for_now_when_asked(self):
         import signal
@@ -186,13 +186,17 @@ class TestTheMetadataProbesReadExitsLikeTheSharedRule:
                 metadata.ffprobe_for_metadata(Path("a.flac"))
 
     @pytest.mark.parametrize("sig", ["SIGSEGV", "SIGABRT", "SIGTERM"])
-    def test_another_signal_is_the_files_own_answer(self, sig):
+    def test_another_signal_is_unavailable_for_now_too(self, sig):
+        """Phase 8: startup recovery's content rule (D1) deletes a leftover
+        only when ffprobe refuses it, so a probe killed by any signal reads as
+        unknown here (test_recovery_audio "crashed"); outside the block None."""
         import signal
 
         with patch("app.services.metadata.run_capture",
                    return_value=_completed([], -getattr(signal, sig), "", "")):
-            with metadata.probe_unavailable_raises():
-                assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
+            assert metadata.ffprobe_for_metadata(Path("a.flac")) is None
+            with metadata.probe_unavailable_raises(), pytest.raises(metadata.ProbeUnavailable):
+                metadata.ffprobe_for_metadata(Path("a.flac"))
 
     def test_an_oserror_while_starting_is_unavailable_for_now(self):
         import errno

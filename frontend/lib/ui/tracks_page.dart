@@ -11,12 +11,14 @@ import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/models/library_scope.dart';
+import 'package:frontend/models/id_hints.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/ui/convert_flow.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/browse_controller.dart';
 import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/mixins/root_browse_mixin.dart';
+import 'package:frontend/ui/selection/track_selection_controller.dart';
 import 'package:frontend/ui/widgets/collection_action_header.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
@@ -30,11 +32,19 @@ class TracksPage extends ConsumerStatefulWidget {
   /// no chrome: `TracksBrowsePage` / the album detail route supply it.
   final bool browseAll;
 
+  /// SC-17 selection mode (whole-library only, so it needs [browseAll]): rows
+  /// become [SelectableTrackTile]s whose tap toggles this controller instead
+  /// of playing, with no row menu. The page only observes the controller and
+  /// forwards taps; the selection lives there, so it survives query, filter
+  /// and window changes. Null: the normal browse page.
+  final TrackSelectionControls? selection;
+
   const TracksPage({
     super.key,
     this.artistId,
     this.albumId,
     this.browseAll = false,
+    this.selection,
   });
 
   @override
@@ -64,6 +74,7 @@ class _TracksPageState extends ConsumerState<TracksPage>
   void initState() {
     super.initState();
     assert(!widget.browseAll || widget.albumId == null);
+    assert(widget.selection == null || widget.browseAll);
     // Creating a Tracks browse route refreshes the library (phase-4 §4);
     // the initial sync belongs to the session host, so details don't.
     if (widget.browseAll) {
@@ -112,14 +123,18 @@ class _TracksPageState extends ConsumerState<TracksPage>
         if (_album != null)
           CollectionActionHeader(
             scope: _album!,
-            empty: !hasMore && paginatedItems.isEmpty,
+            empty: paginationLoadedEmpty,
           ),
         if (hasBrowseControls) buildBrowseHeader(hintText: 'Search tracks'),
         Expanded(
           child: isSearchMode
               ? _buildSearchResults(rows)
+              : paginationFailedEmpty
+              ? buildPaginationFailure()
               : showDownloadedEmpty
               ? const ListStatusMessage('No downloaded tracks yet.')
+              : widget.selection != null && _libraryEmpty
+              ? const ListStatusMessage('Your library is empty.')
               : _buildBrowseList(rows),
         ),
       ],
@@ -128,27 +143,40 @@ class _TracksPageState extends ConsumerState<TracksPage>
     return body;
   }
 
+  /// Selection mode: the window loaded, with nothing in it, and no filter.
+  bool get _libraryEmpty =>
+      hasBrowseControls &&
+      !filters.downloaded &&
+      paginationLoadedEmpty;
+
+  /// Selection mode: the id hint per uuid for the rows listed.
+  Map<String, String> _idHints(List<TrackUI> listed) => widget.selection == null
+      ? const {}
+      : idHints([
+          for (final t in listed)
+            (uuid: t.uuidId, title: t.title, artist: t.artist, album: t.album),
+        ]);
+
   Widget _buildBrowseList(_RowContext rows) {
+    final hints = _idHints(paginatedItems);
     return ListView.builder(
       controller: scrollController,
       // Ends above the shell's floating bottom chrome (4B).
       padding: ShellChromeInsets.padEnd(context),
-      itemCount: paginatedItems.length + (hasMore ? 1 : 0),
+      itemCount: paginatedItems.length + (paginationHasTrailing ? 1 : 0),
       // The builder's context is deliberately unnamed: long-lived flows
       // below (convert: a network sync plus two sheets) use the page's
       // own `context`, so their lifetime is tied to the page rather
       // than to list internals.
       itemBuilder: (_, index) {
         if (index >= paginatedItems.length) {
-          return const Padding(
-            padding: EdgeInsets.all(16),
-            child: Center(child: CircularProgressIndicator()),
-          );
+          return buildPaginationTrailing();
         }
         final track = paginatedItems[index];
         return _buildTrackTile(
           track,
           rows,
+          idHint: hints[track.uuidId],
           onTap: () => ref
               .read(libraryActionsProvider)
               .playQuery(
@@ -163,6 +191,7 @@ class _TracksPageState extends ConsumerState<TracksPage>
   }
 
   Widget _buildSearchResults(_RowContext rows) {
+    final hints = _idHints(search.results.tracks);
     return buildSearchBody(
       results: search.results.tracks,
       noun: 'tracks',
@@ -176,6 +205,7 @@ class _TracksPageState extends ConsumerState<TracksPage>
           return _buildTrackTile(
             track,
             rows,
+            idHint: hints[track.uuidId],
             // Play the visible result list, like the global search.
             onTap: () => ref
                 .read(libraryActionsProvider)
@@ -192,7 +222,21 @@ class _TracksPageState extends ConsumerState<TracksPage>
     TrackUI track,
     _RowContext rows, {
     required VoidCallback onTap,
+    String? idHint,
   }) {
+    final selection = widget.selection;
+    if (selection != null) {
+      // Selection mode: a tap toggles and never plays; no menu, no actions.
+      return ListenableBuilder(
+        listenable: selection,
+        builder: (_, _) => SelectableTrackTile(
+          track: track,
+          selected: selection.isSelected(track.uuidId),
+          onToggle: () => selection.toggle(track),
+          idHint: idHint,
+        ),
+      );
+    }
     final job = rows.manager.state.jobs
         .where((j) => j.uuidId == track.uuidId)
         .firstOrNull;

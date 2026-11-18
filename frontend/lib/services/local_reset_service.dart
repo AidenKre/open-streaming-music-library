@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -12,6 +13,7 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/credential_store.dart';
+import 'package:frontend/services/dead_sign_in_records.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/history/history_providers.dart';
@@ -19,6 +21,8 @@ import 'package:frontend/services/history/listen_recorder.dart';
 import 'package:frontend/services/local_resettable.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
 import 'package:frontend/services/server_binding_gate.dart';
+import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
+import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
 import 'package:frontend/services/session_event_log.dart';
 import 'package:frontend/services/uploads/upload_manager.dart';
 
@@ -171,11 +175,14 @@ class LocalResetService {
   /// generation, quiesces (playback admission first, then listens and
   /// history, so the last checkpoint lands), rotates the binding token so
   /// late writes from the old scope are no-ops, stops the gate, revokes the
-  /// session best effort, and deletes the stored credentials. The saved URL
+  /// session best effort, and deletes the stored credentials. Right after the
+  /// rotation, earlier sign-ins' upload and deletion records are removed
+  /// (best effort, local only), unless [keepUnsent]: then they stay for the
+  /// same user's next login. The saved URL
   /// and every local store stay. Every step runs even if an earlier one
   /// fails; failures (quiesce ones flagged) are thrown together, except that
   /// quiesce failures alone do not throw.
-  Future<void> signOut() async {
+  Future<void> signOut({bool keepUnsent = false}) async {
     final verified = _gateVerified();
     final revoker = _takeRevoker(verified);
     _generation++;
@@ -187,8 +194,37 @@ class LocalResetService {
         failures.add(LocalResetFailure(q.runtimeType, e, st, quiesce: true));
       }
     }
+    // The kept records are found again by their token after the rotation.
     try {
-      await _ref.read(serverBindingRepositoryProvider).rotate();
+      final dead = _ref.read(deadSignInRecordsProvider);
+      if (keepUnsent) {
+        final row = await _ref.read(serverBindingRepositoryProvider).current();
+        if (row != null) await dead.keepForNextLogin(row.localBindingId);
+      } else {
+        await dead.forgetKept();
+      }
+    } catch (e) {
+      developer.log(
+        'kept sign-in token not updated: ${e.runtimeType}',
+        name: 'LocalResetService',
+      );
+    }
+    try {
+      final record = await _ref.read(serverBindingRepositoryProvider).rotate();
+      if (record != null && !keepUnsent) {
+        // Earlier sign-ins' upload and deletion records are fenced for good;
+        // dropping them must never fail the log-out.
+        try {
+          await _ref
+              .read(deadSignInRecordsProvider)
+              .removeAllBut(record.localBindingId);
+        } catch (e) {
+          developer.log(
+            'dead sign-in records not removed: ${e.runtimeType}',
+            name: 'LocalResetService',
+          );
+        }
+      }
     } catch (e, st) {
       failures.add(
         LocalResetFailure(ServerBindingRepository, e, st),
@@ -331,6 +367,8 @@ final localQuiescablesProvider = Provider<List<Quiescable>>((ref) {
     _PreviewQuiescable(ref),
     _HistoryQuiescable(ref),
     _UploadsQuiescable(ref),
+    DeleteJobsQuiescable(ref),
+    _OwnedCleanupQuiescable(ref),
     _SubmissionsQuiescable(ref),
   ];
 });
@@ -343,6 +381,10 @@ final lossReportersProvider = Provider<List<LossReporter>>((ref) {
     _HistoryLossReporter(ref),
     UploadLossReporter(
       intents: ref.read(uploadIntentStoreProvider),
+      binding: ref.read(serverBindingRepositoryProvider),
+    ),
+    DeleteJobsLossReporter(
+      submissions: ref.read(durableSubmissionProvider),
       binding: ref.read(serverBindingRepositoryProvider),
     ),
   ];
@@ -443,6 +485,25 @@ class _UploadsQuiescable implements Quiescable {
   Future<void> quiesce() async {
     if (_ref.exists(uploadManagerProvider)) {
       await _ref.read(uploadManagerProvider).quiesce();
+    }
+  }
+}
+
+/// The owned-file cleanup worker, after uploads and before submissions
+/// (SC-15): stops the runner. The SC-01 fence makes any in-flight cleanup
+/// write a no-op and the wipe empties the table, so no gate is needed. Never
+/// builds the runner.
+class _OwnedCleanupQuiescable implements Quiescable {
+  _OwnedCleanupQuiescable(this._ref);
+  final Ref _ref;
+
+  @override
+  String get quiesceName => 'owned-file-cleanup';
+
+  @override
+  Future<void> quiesce() async {
+    if (_ref.exists(ownedFileCleanupRunnerProvider)) {
+      await _ref.read(ownedFileCleanupRunnerProvider).quiesce();
     }
   }
 }

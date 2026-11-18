@@ -65,8 +65,13 @@ String uploadStatusText(
     };
 
 /// A longer explanation for an item in [state], or null when the status
-/// says it all.
-String? uploadDetailText(String state, {String? errorCode}) =>
+/// says it all. [bytesHere]: this device holds the file's bytes (it was
+/// picked here); false for an adopted row.
+String? uploadDetailText(
+  String state, {
+  String? errorCode,
+  bool bytesHere = true,
+}) =>
     switch (state) {
       'allocated' => switch (errorCode) {
         'upload_slots_busy' =>
@@ -134,6 +139,12 @@ String? uploadDetailText(String state, {String? errorCode}) =>
           "The server can't check files right now. Try again later.",
         'upload_validation_failed' =>
           "The server couldn't finish checking this file. Try again.",
+        // Retry needs the bytes again: only a device that has them can
+        // send it (sign-off s7-app-texts review r1 #2). The device that
+        // added it is not named: it often can't retry either (review-8 #3).
+        'upload_source_missing' when !bytesHere =>
+          'The server no longer has the received file, and this device '
+              'cannot find it. Cancel it and add it again.',
         'upload_source_missing' =>
           'The server no longer has the received file. Try again to send it.',
         'upload_archive_unsupported' =>

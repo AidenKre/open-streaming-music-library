@@ -75,11 +75,13 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
         Expanded(
           child: isSearchMode
               ? _buildSearchResults(isOffline)
+              : paginationFailedEmpty
+              ? buildPaginationFailure()
               : showDownloadedEmpty
               ? const ListStatusMessage('No downloaded artists yet.')
               : _buildGrid(
                   paginatedItems,
-                  showLoader: hasMore,
+                  showLoader: paginationHasTrailing,
                   controller: scrollController,
                   isOffline: isOffline,
                 ),
@@ -122,7 +124,7 @@ class _ArtistPageState extends ConsumerState<ArtistsPage>
       itemCount: artists.length + (showLoader ? 1 : 0),
       itemBuilder: (context, index) {
         if (index >= artists.length) {
-          return const Center(child: CircularProgressIndicator());
+          return buildPaginationTrailing();
         }
         final artist = artists[index];
         if (index % 6 == 0) {

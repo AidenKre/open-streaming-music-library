@@ -2,6 +2,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/settings/credential_storage_diagnostics_view.dart';
 import 'package:frontend/ui/settings/history_diagnostics_view.dart';
+import 'package:frontend/ui/settings/storage_cleanup_diagnostics_view.dart';
 import 'package:frontend/ui/settings/upload_diagnostics_view.dart';
 import 'package:frontend/ui/settings/phase4_settings.dart';
 import 'package:frontend/ui/settings/settings_registry.dart';
@@ -35,6 +36,7 @@ final diagnosticsRowsProvider = Provider<List<DiagnosticsRow>>(
   (ref) => const [
     historyDiagnosticsRow,
     uploadDiagnosticsRow,
+    storageCleanupDiagnosticsRow,
     credentialStorageDiagnosticsRow,
   ],
 );

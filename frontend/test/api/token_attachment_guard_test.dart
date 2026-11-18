@@ -24,6 +24,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/auth_api.dart';
+import 'package:frontend/api/library_tools_api.dart';
+import 'package:frontend/api/uploads_api.dart';
+import 'package:frontend/models/dto/library_tools_dtos.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
@@ -364,6 +367,29 @@ void main() {
       await quietly(() => c
           .read(coverArtCacheProvider)
           .resolveArtUri(hasAlbumArt: true, coverArtId: 9));
+
+      // Phase 8 senders (E8): library tools and uploads. The calls that
+      // wait at the gate are not awaited (unverified, they keep waiting).
+      void detached(Future<Object?> Function() send) =>
+          unawaited(send().then<void>((_) {}, onError: (Object _) {}));
+      final tools = c.read(libraryToolsApiProvider);
+      await quietly(() => tools.listJobs(waitForBinding: false));
+      await quietly(() => tools.listDuplicates(waitForBinding: false));
+      await quietly(() => tools.duplicateSummary(waitForBinding: false));
+      detached(() => tools.preview(
+          const [DeletionTargetDto(uuidId: 'u1', baseRevision: 1)]));
+      detached(() => tools.createJob(DeletionJobRequestDto(
+            operationUuid: '33333333-3333-4333-8333-333333333333',
+            targets: const [DeletionTargetDto(uuidId: 'u1', baseRevision: 1)],
+            confirmedCount: 1,
+          ).toFrozenJson()));
+      detached(() => tools.getJob('33333333-3333-4333-8333-333333333333'));
+      detached(() => tools.dismissPair('u1', 'u2'));
+      final uploads = c.read(uploadsApiProvider);
+      detached(() => uploads.listBatches());
+      detached(() => uploads.getBatch('b1'));
+      detached(() => uploads.getItem('i1'));
+      detached(() => uploads.cancelItem('i1'));
       await pumpEventQueue(times: 50);
     }
 
@@ -447,7 +473,14 @@ void main() {
       final carried = {
         for (final r in seen.where((r) => r.carriesToken)) r.url.path,
       };
-      expect(carried, containsAll(['/tracks', '/tracks/u1', '/jobs']),
+      expect(
+          carried,
+          containsAll([
+            '/tracks', '/tracks/u1', '/jobs',
+            // Phase 8 (E8): library tools and uploads.
+            '/tracks/deletions', '/tracks/duplicates/summary',
+            '/tracks/uploads', '/tracks/uploads/b1',
+          ]),
           reason: 'the sweep reaches the token client: $seen');
     });
   });

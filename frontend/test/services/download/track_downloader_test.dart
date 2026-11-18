@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Value;
+import 'package:drift/drift.dart'
+    show QueryRow, ResultSetImplementation, Selectable, Value, Variable;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -16,7 +17,10 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/track_downloader.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:frontend/api/token_permit.dart';
+
+import '../../helpers/server_binding.dart';
 
 Future<void> _insertTrack(
   AppDatabase db,
@@ -65,6 +69,30 @@ class _SwapClient extends http.BaseClient {
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) =>
       inner.send(request);
+}
+
+/// The real database. When the sweep reads the track rows it starts a
+/// rebind: a reset and a new sign-in landing while the sweep runs (the
+/// statements run in the order they are issued).
+class _RebindDuringSweepDb extends AppDatabase {
+  _RebindDuringSweepDb() : super(NativeDatabase.memory());
+
+  bool armed = false;
+
+  @override
+  Selectable<QueryRow> customSelect(
+    String query, {
+    List<Variable> variables = const [],
+    Set<ResultSetImplementation> readsFrom = const {},
+  }) {
+    if (armed &&
+        query.startsWith('SELECT file_path, damaged_file_path FROM tracks')) {
+      armed = false;
+      unawaited(customStatement(
+          "UPDATE server_binding SET local_binding_id = 'new-session'"));
+    }
+    return super.customSelect(query, variables: variables, readsFrom: readsFrom);
+  }
 }
 
 void main() {
@@ -185,7 +213,8 @@ void main() {
     test('a new download clears the mark and removes the damaged file',
         () async {
       await _insertTrack(db, 'abc');
-      final damaged = File('${tempDir.path}/abc.bad.m4a');
+      final damaged = File('${tempDir.path}/tracks/abc.bad.m4a');
+      await damaged.parent.create(recursive: true);
       await damaged.writeAsBytes([9]);
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
           .write(TracksCompanion(damagedFilePath: Value(damaged.path)));
@@ -215,7 +244,8 @@ void main() {
         registerCanceller: (_) {},
         unregisterCanceller: () {},
       );
-      final damaged = File('${tempDir.path}/abc.old.flac');
+      final damaged = File('${tempDir.path}/tracks/abc.old.flac');
+      await damaged.parent.create(recursive: true);
       await damaged.writeAsBytes([9]);
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
           .write(clearedDownloadColumns.copyWith(
@@ -796,6 +826,68 @@ void main() {
       await db.customStatement('ALTER TABLE tracks RENAME TO tracks_moved');
       await run(buildDownloader(MockClient((_) async => audio())), _job(job1));
       expect(leftover.existsSync(), isTrue);
+    });
+
+    // Phase 8 (review #2 of the Phase 7 part): the sweep only finds; the
+    // owned-file clean-up decides each unlink (DEV-8-08). A leftover of an
+    // abandoned worker that a new session's download replaced under the same
+    // name between the find and the attempt is retired, not deleted.
+    test('a leftover replaced under its name before the attempt is kept',
+        () async {
+      final leftover = await put('$u1.m4a.partial');
+      // Hold the file's path lock, as a writer of that path would.
+      final release = Completer<void>();
+      final held = sharedOwnedPathLocks.withLock(
+          leftover.path, () => release.future);
+      await _insertTrack(db, job1);
+      final download = run(
+          buildDownloader(MockClient((_) async => audio())), _job(job1));
+
+      var enqueued = false;
+      for (var i = 0; i < 1000 && !enqueued; i++) {
+        await Future<void>.delayed(Duration.zero);
+        enqueued =
+            (await db.select(db.ownedFileCleanupEntries).get()).isNotEmpty;
+      }
+      expect(enqueued, isTrue,
+          reason: 'the sweep did not go through the owned-file clean-up');
+      // The new session's download writes the same name meanwhile.
+      await leftover.writeAsBytes([7, 7, 7, 7]);
+      release.complete();
+      await held;
+
+      expect((await download).kind, DownloadOutcomeKind.success);
+      expect(leftover.existsSync(), isTrue,
+          reason: 'a file whose identity changed was deleted');
+      expect(await db.select(db.ownedFileCleanupEntries).get(), isEmpty,
+          reason: 'the row is retired, not kept for a retry');
+    });
+
+    // Cascade-8 review #3: a sweep whose session ends while it runs (a
+    // reset and a new sign-in) must not hand its finds to the new session's
+    // clean-up: the binding is read when the sweep starts and fences it.
+    test('a sweep whose session changes while it runs removes nothing',
+        () async {
+      final rebinding = _RebindDuringSweepDb();
+      addTearDown(rebinding.close);
+      await seedTestBinding(rebinding);
+      final leftover = await put('$u1.m4a.partial');
+      rebinding.armed = true;
+      transport.inner = MockClient((_) async => audio());
+      final downloader = TrackDownloader(
+        db: rebinding,
+        coverArtStore: coverStore,
+        directoryProvider: () async => tempDir,
+        apiClient: api,
+      );
+
+      await run(downloader, _job(job1));
+
+      expect(rebinding.armed, isFalse, reason: 'the sweep read the rows');
+      expect(leftover.existsSync(), isTrue,
+          reason: 'the old session\'s sweep cleaned for the new one');
+      expect(await rebinding.select(rebinding.ownedFileCleanupEntries).get(),
+          isEmpty);
     });
 
     test('runs once: a job\'s own temporary file survives later jobs',

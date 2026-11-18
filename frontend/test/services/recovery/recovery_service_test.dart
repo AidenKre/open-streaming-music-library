@@ -233,21 +233,22 @@ void main() {
         addTearDown(container.dispose);
 
         final registered = container.read(recoverablesProvider);
-        expect(registered, hasLength(7));
+        expect(registered, hasLength(9));
 
         final networkMembers = registered
             .where((r) => r.triggers.contains(RecoveryTrigger.networkRecovered))
             .toList();
-        expect(networkMembers, hasLength(6),
-            reason: 'sync + app-info + history + uploads + resume-downloads + '
-                'resume-conversions fire on network recovery');
+        expect(networkMembers, hasLength(7),
+            reason: 'sync + app-info + history + uploads + delete-jobs + '
+                'resume-downloads + resume-conversions fire on network '
+                'recovery');
 
         final coldMembers = registered
             .where((r) => r.triggers.contains(RecoveryTrigger.coldStart))
             .toList();
-        expect(coldMembers, hasLength(4),
-            reason: 'reconcile + resume-conversions + history + uploads fire '
-                'on cold start');
+        expect(coldMembers, hasLength(6),
+            reason: 'reconcile + resume-conversions + history + uploads + '
+                'delete-jobs + owned-file cleanup fire on cold start');
 
         final conversionMembers = registered
             .where((r) =>

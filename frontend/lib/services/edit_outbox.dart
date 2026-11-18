@@ -333,6 +333,9 @@ class EditOutbox implements LossReporter {
     } on ApiException catch (e) {
       switch (e.statusCode) {
         case 409:
+          // A retryable 409 (e.g. track_pending_deletion) is not a revision
+          // conflict: leave the row pending; the next flush sends it again.
+          if (!e.isDefinitiveRefusal) rethrow;
           // A 409 can be manufactured by our own transport retry: attempt 1
           // committed server-side but its response was lost, so the retried
           // base_revision was stale. Fetch server truth and value-compare —
@@ -358,10 +361,7 @@ class EditOutbox implements LossReporter {
           // tombstone carries a revision above the watermark).
           await binding.runFenced(bindingToken, () async {
             await _revertToSnapshot(row);
-            await _markRejected(
-              row.uuidId,
-              'Track no longer exists on the server',
-            );
+            await _markRejected(row.uuidId, trackGoneRejectionReason);
           });
         case 422:
           // Permanent rejection (capability drift / locked field / validation):
@@ -536,17 +536,21 @@ class EditOutbox implements LossReporter {
     // fresh edit could coalesce onto the just-discarded batch before this
     // write lands, silently undoing the "take server" choice.
     final token = await _captureToken();
-    await mutex.run(
+    // Only an unresolved conflict (or an earlier take-server marker) is
+    // resolved: a row a tombstone already rejected keeps its rejection.
+    final marked = await mutex.run(
       () => binding.runFenced(
         token,
         () => (db.update(db.pendingEdits)
-              ..where((t) => t.uuidId.equals(uuidId)))
+              ..where((t) => t.uuidId.equals(uuidId))
+              ..where((t) => t.status.isIn(const ['conflicted', 'take_server'])))
             .write(const PendingEditsCompanion(
           status: Value('take_server'),
           serverRevision: Value(null),
         )),
       ),
     );
+    if (marked == 0) return;
     await _refetchTakeServer(uuidId);
   }
 

@@ -13,6 +13,8 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/credential_store.dart';
 import 'package:frontend/services/local_reset_service.dart';
+import 'package:frontend/services/dead_sign_in_records.dart';
+import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/session_event_log.dart';
 import 'package:frontend/services/session_readiness.dart';
@@ -268,7 +270,7 @@ class SessionService {
     }
     switch (await _storedSignInVerdict(credentials)) {
       case _StoredSignIn.usable:
-        break;
+        await _takeOverKeptRecords(); // a login closed before its take-over
       case _StoredSignIn.noBinding:
         return _dropStoredSignIn(url, 'no_binding');
       case _StoredSignIn.otherUser:
@@ -416,6 +418,9 @@ class SessionService {
         await _revokeSignIn(held);
         return const SignInFailed(SignInNotSavedFailure.message);
       }
+      // The same (instance, user) pair as the binding row: records kept by a
+      // log-out that kept unsent work continue under this sign-in.
+      if (row != null) await _takeOverKeptRecords();
       await _ref.read(onSessionChangedProvider)?.call();
       return const SignInSucceeded();
     }
@@ -425,6 +430,22 @@ class SessionService {
       return SignInNeedsUserSwitch(session.user.username);
     }
     return SignInDifferentServer(url);
+  }
+
+  /// The same-user take-over of kept upload and deletion records, best
+  /// effort (idempotent).
+  Future<void> _takeOverKeptRecords() async {
+    try {
+      final row = await _ref.read(serverBindingRepositoryProvider).current();
+      if (row != null) {
+        await _ref.read(deadSignInRecordsProvider).takeOver(row.localBindingId);
+      }
+    } catch (e) {
+      developer.log(
+        'kept records not taken over: ${e.runtimeType}',
+        name: 'SessionService',
+      );
+    }
   }
 
   /// Stores the credentials, the URL (idempotent; a reset may have wiped
@@ -518,9 +539,10 @@ class SessionService {
     await reloadSession();
   }
 
-  Future<void> logout() async {
+  /// [keepUnsent]: see [LocalResetService.signOut].
+  Future<void> logout({bool keepUnsent = false}) async {
     try {
-      await _ref.read(localResetServiceProvider).signOut();
+      await _ref.read(localResetServiceProvider).signOut(keepUnsent: keepUnsent);
     } finally {
       await _ref.read(onSessionChangedProvider)?.call();
     }
@@ -660,6 +682,15 @@ class SessionService {
   /// The Disconnect / reset confirmation's "will be lost" lines (SC-15).
   Future<List<String>> pendingLossSummaries() =>
       _ref.read(localResetServiceProvider).pendingLossSummaries();
+
+  /// Never throws: a counter that cannot be built or read is unknown.
+  Future<LogoutLosses> pendingLogoutLosses() async {
+    try {
+      return await _ref.read(logoutLossCounterProvider).count();
+    } catch (_) {
+      return LogoutLosses.unknown;
+    }
+  }
 
   /// The user confirmed connecting to the different server at [url]: reset
   /// local data, then save [url] (after the prefs wipe) so the rebuilt

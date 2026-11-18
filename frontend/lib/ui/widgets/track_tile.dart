@@ -25,6 +25,13 @@ class TrackTile extends StatelessWidget {
   final bool isInteractive;
   final Widget? trailing;
 
+  /// Shown before the cover art (e.g. the selection checkbox); null: nothing.
+  final Widget? leading;
+
+  /// A short id for a row that reads like another listed one (selection
+  /// mode); shown beside, not instead of, the row's badges.
+  final String? idHint;
+
   /// The codec this device can't decode (its user-facing name), shown as
   /// "Unsupported codec" (review major 1); null when it plays.
   final String? unsupportedCodec;
@@ -43,6 +50,8 @@ class TrackTile extends StatelessWidget {
     this.isDimmed = false,
     this.isInteractive = true,
     this.trailing,
+    this.leading,
+    this.idHint,
     this.unsupportedCodec,
   });
 
@@ -66,6 +75,10 @@ class TrackTile extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Row(
                 children: [
+                  if (leading != null) ...[
+                    leading!,
+                    const SizedBox(width: 8),
+                  ],
                   Opacity(
                     opacity: opacity,
                     child: isHighlighted
@@ -126,6 +139,15 @@ class TrackTile extends StatelessWidget {
                       ),
                     ),
                   ),
+                  if (idHint != null) ...[
+                    const SizedBox(width: 8),
+                    Text(
+                      'ID $idHint',
+                      style: textTheme.bodySmall?.copyWith(
+                        color: colors.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                   if (trailing != null) trailing!,
                   if (trailing == null && (conversionJob?.isActive ?? false)) ...[
                     const SizedBox(width: 8),
@@ -239,6 +261,36 @@ List<LibraryMenuEntry> conversionMenuEntries({
       onSelected: onConvert,
     ),
   ];
+}
+
+/// SC-17 selection row: a tap toggles and never plays, and a row that can't
+/// play offline stays selectable. No action menu, and it ignores playability
+/// (no availability, codec or action providers are read).
+class SelectableTrackTile extends StatelessWidget {
+  const SelectableTrackTile({
+    super.key,
+    required this.track,
+    required this.selected,
+    required this.onToggle,
+    this.idHint,
+  });
+
+  final TrackUI track;
+  final bool selected;
+  final VoidCallback onToggle;
+
+  /// A short id shown only when this row would read like another listed one.
+  final String? idHint;
+
+  @override
+  Widget build(BuildContext context) => TrackTile(
+    track: track,
+    leading: Checkbox(value: selected, onChanged: (_) => onToggle()),
+    idHint: idHint,
+    onTap: onToggle,
+    isInteractive: true,
+    isDimmed: false,
+  );
 }
 
 /// A library track row: [TrackTile] with the one SC-06 menu (Get info via

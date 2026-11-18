@@ -363,6 +363,12 @@ class UploadIntentStore {
     for (final r in await _query(bindingToken).get()) UploadIntentRecord._fromRow(r),
   ];
 
+  /// Every row of every binding, for counting what a log-out kept. Read-only.
+  Future<List<UploadIntentRecord>> all() async => [
+    for (final r in await (_db.select(_db.uploadIntents)).get())
+      UploadIntentRecord._fromRow(r),
+  ];
+
   Stream<List<UploadIntentRecord>> watch(String bindingToken) => _query(
     bindingToken,
   ).watch().map((rows) => [for (final r in rows) UploadIntentRecord._fromRow(r)]);

@@ -1,7 +1,6 @@
 import json
 import logging
 import math
-import signal
 import subprocess
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -127,8 +126,8 @@ def write_metadata_tags(
 
 
 class ProbeUnavailable(RuntimeError):
-    """ffprobe could not answer now (missing, cannot start, timed out, or
-    SIGKILLed)."""
+    """ffprobe could not answer now (missing, cannot start, timed out, killed,
+    or an answer that could not be read)."""
 
 
 _raise_if_unavailable: ContextVar[bool] = ContextVar("raise_if_unavailable", default=False)
@@ -243,10 +242,11 @@ def ffprobe_for_metadata(
     file_path: Path, input_format: str | None = None, timeout: Optional[float] = None
 ) -> dict | None:
     """ffprobe's JSON for ``file_path``, or None. Bounded by ``timeout``
-    (default the shared probe bound). A tool that cannot start, a time-out or
-    a SIGKILL is unreadable for now (ProbeUnavailable inside
-    probe_unavailable_raises); an overflow or any other non-zero exit (another
-    signal included, as in identity_reasons.reason_for_exit) is the file's own
+    (default the shared probe bound). A tool that cannot start, a time-out, a
+    kill by any signal, an overflowing or garbled answer is unreadable for now
+    (ProbeUnavailable inside probe_unavailable_raises, else None): startup
+    recovery treats only a refusal as the file's own answer, so nothing it
+    cannot prove reads as one. Any other non-zero exit is the file's own
     answer (None)."""
     try:
         with probe_registration() as registration:
@@ -267,8 +267,8 @@ def ffprobe_for_metadata(
                 max_stdout_bytes=METADATA_PROBE_MAX_STDOUT_BYTES,
                 **registration,
             )
-    except CaptureOverflow:
-        return None
+    except CaptureOverflow as e:
+        return _probe_unavailable("ffprobe answered too much", e)
     except CaptureTimeout as e:
         return _probe_unavailable("ffprobe timed out", e)
     except FfmpegError as e:  # not found, or cannot start
@@ -278,16 +278,18 @@ def ffprobe_for_metadata(
     except OSError as e:  # setting up the pipes failed (e.g. EMFILE): cannot run now
         return _probe_unavailable(f"ffprobe cannot run: {e.strerror or type(e).__name__}", e)
 
-    if completed_process.returncode == -signal.SIGKILL:
-        # A stop through the registry, the OOM killer: says nothing about the file.
+    if completed_process.returncode < 0:
+        # Killed by a signal (a stop, the OOM killer, a crash): says nothing
+        # about the file. Startup recovery's content rule (D1) deletes a
+        # leftover only on a refusal, so this must read as unknown there.
         return _probe_unavailable("ffprobe was killed")
     if completed_process.returncode != 0:
         return None
 
     try:
         return json.loads(completed_process.stdout.decode("utf-8", errors="replace") or "{}")
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as e:
+        return _probe_unavailable("ffprobe answered garbage", e)
 
 
 def build_track_metadata(json_data: dict) -> TrackMetaData | None:

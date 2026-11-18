@@ -318,9 +318,6 @@ CREATE INDEX IF NOT EXISTS idx_tdc_b    ON track_duplicate_candidates(uuid_b);
 -- idx_tdc_list serves Phase 8's per-owner keyset list.
 CREATE INDEX IF NOT EXISTS idx_tdc_list ON track_duplicate_candidates(owner_id, status, band_rank, sort_score DESC, uuid_a, uuid_b);
 
--- One liveness definition (SC-25): the finder, the candidate refresh and Phase 8's list join through this view; Phase 8 adds its pending-deletion marker here, and no consumer writes its own predicate.
-CREATE VIEW IF NOT EXISTS live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks;
-
 -- Phase 7 (v15) upload tables. Client uuids are unique per owner only (decision O2);
 -- a batch's status is derived from its items, never stored.
 CREATE TABLE IF NOT EXISTS upload_batches (
@@ -502,5 +499,84 @@ CREATE TABLE IF NOT EXISTS upload_commit_journal (
 );
 CREATE INDEX IF NOT EXISTS idx_upload_journal_item ON upload_commit_journal(owner_id, item_uuid);
 
-PRAGMA user_version = 15;
+-- Phase 8 (v16) deletion tables: keyed (owner_id, operation_uuid) like their
+-- receipt. The aggregate job outcome is derived from the items; status here is
+-- only the job lifecycle ('accepted' until every item is terminal, then
+-- 'completed'). Receipts and jobs are never pruned.
+CREATE TABLE IF NOT EXISTS deletion_jobs (
+  owner_id       INTEGER NOT NULL REFERENCES users(id),
+  operation_uuid TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  status         TEXT NOT NULL CHECK (status IN ('accepted','completed')),
+  PRIMARY KEY (owner_id, operation_uuid),
+  FOREIGN KEY (owner_id, operation_uuid) REFERENCES operation_receipts(owner_id, operation_uuid)
+);
+CREATE INDEX IF NOT EXISTS idx_deletion_jobs_list ON deletion_jobs(owner_id, created_at, operation_uuid);
+-- Items: one row per target in request order (position); status is the per-target
+-- outcome (SC-16d claim columns lease_boot_id/cancel_requested). No cascade: a job
+-- cannot be deleted under its items, nor an item under its journal row.
+CREATE TABLE IF NOT EXISTS deletion_job_items (
+  owner_id           INTEGER NOT NULL REFERENCES users(id),
+  operation_uuid     TEXT NOT NULL,
+  uuid_id            TEXT NOT NULL,
+  position           INTEGER NOT NULL CHECK (position >= 0),
+  base_revision      INTEGER NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','deleted','already_deleted','conflict','busy','failed')),
+  error_code         TEXT,
+  tombstone_revision INTEGER,
+  detail_json        TEXT,
+  lease_boot_id      TEXT,
+  cancel_requested   INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1)),
+  PRIMARY KEY (owner_id, operation_uuid, uuid_id),
+  UNIQUE (owner_id, operation_uuid, position),
+  FOREIGN KEY (owner_id, operation_uuid) REFERENCES deletion_jobs(owner_id, operation_uuid),
+  CHECK (status <> 'failed' OR error_code IS NOT NULL),
+  CHECK (status NOT IN ('deleted','already_deleted') OR tombstone_revision IS NOT NULL)
+);
+-- Journal: the spec section 5 step 2 file journal; its existence is the
+-- pending-deletion marker read by live_tracks. It outlives the track row until
+-- storage cleanup, so it has no FK to tracks. Identity (dev, ino, size) and the
+-- quarantine path are required unless the master was already missing; cover_art_id
+-- has no FK (shared art may be released, SC-16h).
+CREATE TABLE IF NOT EXISTS deletion_journal (
+  owner_id        INTEGER NOT NULL REFERENCES users(id),
+  operation_uuid  TEXT NOT NULL,
+  uuid_id         TEXT NOT NULL UNIQUE,
+  original_path   TEXT NOT NULL,
+  quarantine_path TEXT,
+  base_revision   INTEGER NOT NULL,
+  src_dev         INTEGER,
+  src_ino         INTEGER,
+  src_size        INTEGER,
+  src_mtime_ns    INTEGER,
+  exact_digest    TEXT,
+  cover_art_id    INTEGER,
+  master_missing  INTEGER NOT NULL CHECK (master_missing IN (0,1)),
+  stage           TEXT NOT NULL CHECK (stage IN ('intent','moved','committed')),
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  PRIMARY KEY (owner_id, operation_uuid, uuid_id),
+  FOREIGN KEY (owner_id, operation_uuid, uuid_id) REFERENCES deletion_job_items(owner_id, operation_uuid, uuid_id),
+  CHECK (master_missing = 1 OR (quarantine_path IS NOT NULL AND src_dev IS NOT NULL AND src_ino IS NOT NULL AND src_size IS NOT NULL)),
+  CHECK (master_missing = 0 OR quarantine_path IS NULL)
+);
+-- The journal is written under the track lock before the catalog delete, so at
+-- insert it must name a catalog row of the same owner (an unknown, foreign or
+-- already-deleted uuid never gets one); afterwards its owner and track never
+-- change. These are the schema's first triggers.
+CREATE TRIGGER IF NOT EXISTS deletion_journal_names_own_track BEFORE INSERT ON deletion_journal
+WHEN NOT EXISTS (SELECT 1 FROM tracks WHERE uuid_id = NEW.uuid_id AND owner_id = NEW.owner_id)
+BEGIN
+  SELECT RAISE(ABORT, 'deletion_journal must name a track of its owner');
+END;
+CREATE TRIGGER IF NOT EXISTS deletion_journal_keeps_its_track BEFORE UPDATE OF owner_id, uuid_id ON deletion_journal
+WHEN NEW.owner_id IS NOT OLD.owner_id OR NEW.uuid_id IS NOT OLD.uuid_id
+BEGIN
+  SELECT RAISE(ABORT, 'deletion_journal owner and track never change');
+END;
+-- One liveness definition (SC-25): the finder, the candidate refresh and Phase 8's list join through this view; the pending-deletion marker is a deletion_journal row (Phase 8), and no consumer writes its own predicate.
+CREATE VIEW IF NOT EXISTS live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks
+  WHERE NOT EXISTS (SELECT 1 FROM deletion_journal d WHERE d.uuid_id = tracks.uuid_id);
+
+PRAGMA user_version = 16;
 COMMIT;

@@ -11,6 +11,8 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/playback/track_cache_manager.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
+import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/quality_presets.dart';
@@ -78,8 +80,14 @@ class TrackDownloader {
     required LocalCoverArtStore coverArtStore,
     required Future<Directory> Function() directoryProvider,
     required ApiClient apiClient,
+    OwnedFileCleanup? ownedFileCleanup,
+    void Function()? onOwnedCleanupPending,
     void Function()? onNetworkFailure,
   }) : _db = db,
+       _ownedCleanup =
+           ownedFileCleanup ??
+           OwnedFileCleanup(db: db, documentsDirectory: directoryProvider),
+       _onOwnedCleanupPending = onOwnedCleanupPending,
        _coverArtStore = coverArtStore,
        _directoryProvider = directoryProvider,
        _apiClient = apiClient,
@@ -90,6 +98,8 @@ class TrackDownloader {
   final Future<Directory> Function() _directoryProvider;
   final ApiClient _apiClient;
   final void Function()? _onNetworkFailure;
+  final OwnedFileCleanup _ownedCleanup;
+  final void Function()? _onOwnedCleanupPending;
 
   Directory? _downloadDir;
 
@@ -348,95 +358,148 @@ class TrackDownloader {
     required int received,
     String? replacesFilePath,
   }) async {
-    final beforeRename = testHookBeforeRename;
-    if (beforeRename != null) await beforeRename(uuidId);
+    // The commit window holds the destination's path lock, so a cleanup retry
+    // for the same path waits for it. Late-branch destination files are
+    // enqueued for durable cleanup (never deleted in place) and attempted
+    // only after the lock is released (cleanRows takes the same lock).
+    List<int> swapIds = const [];
+    String? swapBindingToken;
+    List<int> lateIds = const [];
+    String? lateToken;
+    var late = false;
+    (Object, StackTrace)? recordFailure;
+    final proceed = await _ownedCleanup.withPathLock(destination.path, () async {
+      final beforeRename = testHookBeforeRename;
+      if (beforeRename != null) await beforeRename(uuidId);
 
-    if (!generationCheck()) {
-      await _deleteIfExists(partial);
-      return false;
-    }
+      if (!generationCheck()) {
+        await _deleteIfExists(partial);
+        return false;
+      }
 
-    if (await destination.exists()) await destination.delete();
-    await partial.rename(destination.path);
+      if (await destination.exists()) await destination.delete();
+      await partial.rename(destination.path);
 
-    final beforeDbWrite = testHookBeforeDbWrite;
-    if (beforeDbWrite != null) await beforeDbWrite(uuidId);
+      final beforeDbWrite = testHookBeforeDbWrite;
+      if (beforeDbWrite != null) await beforeDbWrite(uuidId);
 
-    // Reset/fence happened between rename and DB write. The destination file
-    // isn't referenced by any row yet, so the reset path couldn't have deleted
-    // it — clean up here. For replacement jobs we deliberately leave the OLD
-    // file and OLD DB row intact: callers rely on the invariant that a failed
-    // replacement preserves the working copy.
-    if (!generationCheck()) {
-      await _deleteIfExists(destination);
-      return false;
-    }
+      Future<void> enqueueLate({bool clearRow = false}) async {
+        late = true;
+        lateToken = (await ServerBindingRepository(_db).current())
+            ?.localBindingId;
+        lateIds = await _db.transaction(() async {
+          if (clearRow) {
+            await (_db.update(_db.tracks)
+                  ..where((t) => t.uuidId.equals(uuidId)))
+                .write(clearedDownloadColumns);
+          }
+          return _ownedCleanup.enqueueInTransaction([
+            destination.path,
+          ], localBindingId: lateToken);
+        });
+      }
 
-    // A damaged copy (decision 6) is superseded by this download: the
-    // write clears its mark and the file is removed once the swap is in.
-    final String? damagedFilePath;
-    final int updatedRows;
-    try {
-      damagedFilePath = (await (_db.select(_db.tracks)
-                ..where((t) => t.uuidId.equals(uuidId)))
-              .getSingleOrNull())
-          ?.damagedFilePath;
-      updatedRows =
-          await (_db.update(
-            _db.tracks,
-          )..where((t) => t.uuidId.equals(uuidId))).write(
-            TracksCompanion(
-              damagedFilePath: const Value(null),
-              filePath: Value(destination.path),
-              downloadedBitrateKbps: Value(downloadedBitrate),
-              fileSizeBytes: Value(received),
-              downloadedQuality: Value(downloadedQuality),
-              downloadedAtRevision: Value(downloadedAtRevision),
-              downloadedCodec: Value(downloadedCodec),
-              staleDismissedAtRevision: const Value(null),
+      // Reset/fence happened between rename and DB write. The destination
+      // file isn't referenced by any row yet. For replacement jobs we
+      // deliberately leave the OLD file and OLD DB row intact: callers rely
+      // on the invariant that a failed replacement preserves the working
+      // copy.
+      if (!generationCheck()) {
+        await enqueueLate();
+        return false;
+      }
+
+      // One transaction swaps the row and enqueues the files it stops
+      // referencing: the replaced file and a superseded damaged copy
+      // (decision 6), whose mark this write clears. Nothing is deleted here;
+      // the rows are cleaned after the lock is released.
+      final swapToken = (await ServerBindingRepository(_db).current())
+          ?.localBindingId;
+      // A record step that throws (its transaction rolled back) leaves the
+      // renamed file referenced by no row: it goes to the durable clean-up
+      // like a late commit, which keeps it if a row names it after all. If
+      // even that fails, the file stays. The error is rethrown after the
+      // clean-up attempt below.
+      final ({int rows, List<int> ids}) swap;
+      try {
+        swap = await _db.transaction(() async {
+          final damaged = (await (_db.select(_db.tracks)
+                    ..where((t) => t.uuidId.equals(uuidId)))
+                  .getSingleOrNull())
+              ?.damagedFilePath;
+          final rows =
+              await (_db.update(_db.tracks)
+                    ..where((t) => t.uuidId.equals(uuidId)))
+                  .write(
+                TracksCompanion(
+                  damagedFilePath: const Value(null),
+                  filePath: Value(destination.path),
+                  downloadedBitrateKbps: Value(downloadedBitrate),
+                  fileSizeBytes: Value(received),
+                  downloadedQuality: Value(downloadedQuality),
+                  downloadedAtRevision: Value(downloadedAtRevision),
+                  downloadedCodec: Value(downloadedCodec),
+                  staleDismissedAtRevision: const Value(null),
+                ),
+              );
+          if (rows == 0) return (rows: 0, ids: const <int>[]);
+          final superseded = {
+            ?replacesFilePath,
+            ?damaged,
+          }..remove(destination.path);
+          return (
+            rows: rows,
+            ids: await _ownedCleanup.enqueueInTransaction(
+              superseded.toList(),
+              localBindingId: swapToken,
             ),
           );
-    } catch (_) {
-      // The renamed file may be listed by no row; remove it unless a row
-      // names it (or that question itself fails: keep the file).
-      var named = true;
-      try {
-        named = await _rowNamesPath(destination.path);
-      } catch (_) {}
-      if (!named) await _deleteIfExists(destination);
-      rethrow;
-    }
-    if (updatedRows == 0) {
-      await _deleteIfExists(destination);
-      return false;
-    }
-    if (!generationCheck()) {
-      await (_db.update(
-        _db.tracks,
-      )..where((t) => t.uuidId.equals(uuidId))).write(clearedDownloadColumns);
-      await _deleteIfExists(destination);
-      if (replacesFilePath != null && replacesFilePath != destination.path) {
-        await _deleteIfExists(File(replacesFilePath));
+        });
+      } catch (e, st) {
+        recordFailure = (e, st);
+        try {
+          await enqueueLate();
+        } catch (_) {}
+        return false;
       }
-      // The write above already cleared the damaged mark, so nothing else
-      // would remove the damaged copy.
-      if (damagedFilePath != null && damagedFilePath != destination.path) {
-        await _deleteIfExists(File(damagedFilePath));
+      swapIds = swap.ids;
+      swapBindingToken = swapToken;
+      if (swap.rows == 0) {
+        await enqueueLate();
+        return false;
       }
-      return false;
+      if (!generationCheck()) {
+        // The same transaction drops the reference and enqueues the file.
+        await enqueueLate(clearRow: true);
+        return false;
+      }
+      return true;
+    });
+    // Cleanup runs only now, after the path lock is released (cleanRows takes
+    // the same lock) and outside any transaction.
+    final outcomes = <OwnedCleanupOutcome>[];
+    if (swapIds.isNotEmpty) {
+      outcomes.addAll(
+        (await _ownedCleanup.cleanRows(
+          swapIds,
+          bindingToken: swapBindingToken,
+        )).values,
+      );
     }
-
-    // DB swap committed; the new file is the canonical copy. Remove the old
-    // file unconditionally — a fence/reset firing now must not strand it,
-    // because the row no longer references it. Best-effort delete: an orphan
-    // is harmless.
-    if (replacesFilePath != null && replacesFilePath != destination.path) {
-      await _deleteIfExists(File(replacesFilePath));
+    if (late) {
+      outcomes.addAll(
+        (await _ownedCleanup.cleanRows(
+          lateIds,
+          bindingToken: lateToken,
+        )).values,
+      );
     }
-    if (damagedFilePath != null && damagedFilePath != destination.path) {
-      await _deleteIfExists(File(damagedFilePath));
+    if (outcomes.contains(OwnedCleanupOutcome.failed)) {
+      _onOwnedCleanupPending?.call();
     }
-    return true;
+    final failure = recordFailure;
+    if (failure != null) Error.throwWithStackTrace(failure.$1, failure.$2);
+    return proceed;
   }
 
   /// The track's local revision and source codec right now (both null for an
@@ -516,19 +579,6 @@ class TrackDownloader {
     await _coverArtStore.download(coverArtId);
   }
 
-  /// Whether any track row names [path] as its file or damaged copy.
-  Future<bool> _rowNamesPath(String path) async {
-    final rows = await _db
-        .customSelect(
-          'SELECT 1 FROM tracks WHERE file_path = ? OR damaged_file_path = ? '
-          'LIMIT 1',
-          variables: [Variable.withString(path), Variable.withString(path)],
-          readsFrom: {_db.tracks},
-        )
-        .get();
-    return rows.isNotEmpty;
-  }
-
   Future<Directory>? _dirPreparation;
 
   /// Resolves and creates the downloads folder and sweeps it once, sharing one
@@ -574,13 +624,20 @@ class TrackDownloader {
 
   /// Removes this downloader's own leftovers (`<uuid>.<ext>.partial`,
   /// `<uuid>.new-<n>.<ext>.partial`, `<uuid>.new-<n>.<ext>`) from [dir].
-  /// Deletes only when ALL hold: [dir] is a real directory (not a link); the
-  /// entry is a regular file (not a link) listed non-recursively; its basename
-  /// matches the patterns above; and no track row names it, by full path or
-  /// by basename (the documents folder can move). Rows are read once, first;
-  /// if that fails nothing is deleted. Never fails the download.
+  /// The sweep only FINDS candidates; the owned-file clean-up decides each
+  /// unlink (inside the downloads folder, ordinary file, no track refers to
+  /// it, size and modification time unchanged). A file is a candidate only
+  /// when ALL hold: [dir] is a real directory (not a link); the entry is a
+  /// regular file (not a link) listed non-recursively; its basename matches
+  /// the patterns above; and no track row names it, by full path or by
+  /// basename (the documents folder can move). Rows are read once, first; if
+  /// that fails nothing is done. Never fails the download.
   Future<void> _sweepLeftovers(Directory dir) async {
     try {
+      // Fenced on the binding the sweep started under: a session that ends
+      // while it runs must not have its finds enqueued under the next one.
+      final token = (await ServerBindingRepository(_db).current())
+          ?.localBindingId;
       if (FileSystemEntity.typeSync(dir.path, followLinks: false) !=
           FileSystemEntityType.directory) {
         return;
@@ -603,6 +660,7 @@ class TrackDownloader {
         }
       }
       final entries = await dir.list(followLinks: false).toList();
+      final candidates = <String>[];
       for (final entity in entries) {
         try {
           if (entity is! File) continue;
@@ -619,8 +677,37 @@ class TrackDownloader {
               namedBasenames.contains(name)) {
             continue;
           }
-          await File(entity.path).delete();
+          candidates.add(entity.path);
         } catch (_) {}
+      }
+      if (candidates.isEmpty) return;
+      // No path lock of ours is held here: the sweep runs before any job of
+      // this downloader commits.
+      final List<int> ids;
+      if (token != null) {
+        // A BindingFencedException (binding changed) ends the sweep via the
+        // outer catch with nothing enqueued.
+        ids = await ServerBindingRepository(_db).runFenced(
+          token,
+          () => _ownedCleanup.enqueueInTransaction(
+            candidates,
+            localBindingId: token,
+          ),
+        );
+      } else {
+        final enqueued = await _db.transaction(() async {
+          if (await ServerBindingRepository(_db).current() != null) return null;
+          return _ownedCleanup.enqueueInTransaction(
+            candidates,
+            localBindingId: null,
+          );
+        });
+        if (enqueued == null) return;
+        ids = enqueued;
+      }
+      final outcomes = await _ownedCleanup.cleanRows(ids, bindingToken: token);
+      if (outcomes.values.contains(OwnedCleanupOutcome.failed)) {
+        _onOwnedCleanupPending?.call();
       }
     } catch (e) {
       developer.log(

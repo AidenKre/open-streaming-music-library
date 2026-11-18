@@ -45,6 +45,7 @@ class SeedTrack {
     this.discNumber = 1,
     this.albumYear,
     this.albumIsSingles = false,
+    this.revision = 1,
   });
 
   final String uuid;
@@ -60,6 +61,9 @@ class SeedTrack {
   /// Album-level fields (taken from the first track seeding the album).
   final int? albumYear;
   final bool albumIsSingles;
+
+  /// The server revision the track is seeded at.
+  final int revision;
 }
 
 /// Safe to call again on a seeded DB: existing artists/albums are kept.
@@ -97,7 +101,7 @@ Future<void> seedLibrary(AppDatabase db, List<SeedTrack> tracks) async {
       'uuid_id': t.uuid,
       'created_at': 1000,
       'last_updated': 1000,
-      'revision': 1,
+      'revision': t.revision,
       'metadata': {
         'title': t.title,
         'artist': t.artist,

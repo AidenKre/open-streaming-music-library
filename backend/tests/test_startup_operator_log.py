@@ -43,7 +43,7 @@ def test_the_schema_upgrade_is_logged_with_both_versions(tmp_path, caplog):
         _database(path).initialize()
 
     [line] = [m for m in _operator_lines(caplog) if "schema" in m]
-    assert "13" in line and "15" in line
+    assert "13" in line and str(Database.LATEST_SCHEMA_VERSION) in line
     assert str(tmp_path) not in line and "Private Library" not in line
 
 
@@ -55,7 +55,7 @@ def test_no_upgrade_line_for_a_new_or_current_database(tmp_path, caplog):
     assert [m for m in _operator_lines(caplog) if "schema" in m] == []
     conn = sqlite3.connect(path)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == Database.LATEST_SCHEMA_VERSION
     finally:
         conn.close()
 

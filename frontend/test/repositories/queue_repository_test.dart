@@ -100,26 +100,241 @@ void main() {
   test(
     'getSessionSnapshot recovers when current_item_id points at a deleted track',
     () async {
+      // 8-fix-r1 U20-B-01 (deliberately strengthened, was: current at index
+      // 0, where the first and the next survivor are the same entry): the
+      // current item is in the middle, so the landing tells them apart.
       await fixture.insertSingles(['a', 'b', 'c']);
       final sessionId = await repo.createSessionFromExplicitList(
         sourceType: 'search',
         trackUuids: const ['a', 'b', 'c'],
-        currentIndex: 0,
+        currentIndex: 1,
       );
 
       // Drop the current track's row (as a tombstone sync would). The INNER
       // JOIN on tracks then resolves current_item_id to null; the snapshot must
-      // recover to the first surviving entry rather than returning null.
-      await db.customStatement("DELETE FROM tracks WHERE uuid_id = 'a'");
+      // recover to the next surviving entry rather than returning null or
+      // restarting from the first.
+      await db.customStatement("DELETE FROM tracks WHERE uuid_id = 'b'");
 
       final entry = await repo.getFirstPlayableEntry(sessionId);
-      expect(entry!.uuidId, 'b');
+      expect(entry!.uuidId, 'a');
 
       final snapshot = await repo.getSessionSnapshot(sessionId);
       expect(snapshot!.currentItem, isNotNull);
-      expect(snapshot.currentItem!.uuidId, 'b');
+      expect(snapshot.currentItem!.uuidId, 'c');
     },
   );
+
+  // 8-fix-r1 U20-B-01 (coordinator decision, logged major deviation): a sync
+  // removal of a session's current item lands on the next surviving entry in
+  // play order (shuffle order when shuffled; a run of removed entries is
+  // skipped); only repeat-all wraps to the first survivor; at the end
+  // otherwise the session rests on the last survivor and is reported ended,
+  // so the player stops there instead of restarting the queue.
+  group('U20-B-01: a removed current item lands on the next survivor', () {
+    Future<String?> currentUuid(int sessionId) async {
+      final row = await db.customSelect(
+        'SELECT qsi.uuid_id AS u FROM queue_sessions AS s '
+        'LEFT JOIN queue_session_items AS qsi '
+        'ON qsi.item_id = s.current_item_id WHERE s.id = ?',
+        variables: [Variable.withInt(sessionId)],
+      ).getSingle();
+      return row.read<String?>('u');
+    }
+
+    Future<int> positionMsOf(int sessionId) async =>
+        (await (db.select(db.queueSessions)
+                  ..where((s) => s.id.equals(sessionId)))
+                .getSingle())
+            .currentPositionMs;
+
+    Future<int> session(List<String> uuids, String current,
+        {String repeat = 'off'}) async {
+      final id = await repo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: uuids,
+        currentIndex: uuids.indexOf(current),
+        repeatMode: repeat,
+      );
+      final item = (await repo.getSessionTracksInPlayOrder(id))
+          .firstWhere((e) => e.uuidId == current)
+          .itemId;
+      await repo.updatePlaybackCursor(
+          sessionId: id, currentItemId: item, positionMs: 45000);
+      return id;
+    }
+
+    test('in the middle: the next entry, at its start', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      final id = await session(['a', 'b', 'c', 'd'], 'b');
+
+      final result = await repo.removeTrackUuidsFromQueues(const ['b']);
+
+      expect(await currentUuid(id), 'c');
+      expect(await positionMsOf(id), 0);
+      expect(result.affectedSessionIds, {id});
+      expect(result.endedSessionIds, isEmpty);
+    });
+
+    test('a run of removed entries is skipped', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      final id = await session(['a', 'b', 'c', 'd'], 'b');
+
+      final result = await repo.removeTrackUuidsFromQueues(const ['b', 'c']);
+
+      expect(await currentUuid(id), 'd');
+      expect(result.endedSessionIds, isEmpty);
+    });
+
+    test('the last entry under repeat-all wraps to the first survivor',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      final id = await session(['a', 'b', 'c', 'd'], 'c', repeat: 'all');
+
+      final result =
+          await repo.removeTrackUuidsFromQueues(const ['a', 'c', 'd']);
+
+      expect(await currentUuid(id), 'b');
+      expect(result.endedSessionIds, isEmpty);
+    });
+
+    test('the last entry with repeat off: rests on the last survivor, ended',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final id = await session(['a', 'b', 'c'], 'c');
+
+      final result = await repo.removeTrackUuidsFromQueues(const ['c']);
+
+      expect(await currentUuid(id), 'b',
+          reason: 'the end of the queue, not its first entry');
+      expect(await positionMsOf(id), 0);
+      expect(result.endedSessionIds, {id});
+    });
+
+    test('the current and every later entry removed, repeat off: ended on '
+        'the last survivor before them', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+      final id = await session(['a', 'b', 'c', 'd', 'e'], 'c');
+
+      final result =
+          await repo.removeTrackUuidsFromQueues(const ['a', 'c', 'd', 'e']);
+
+      expect(await currentUuid(id), 'b');
+      expect(result.endedSessionIds, {id});
+    });
+
+    test('repeat-one: the next entry in the middle; ended at the end',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'x', 'y']);
+      final middle = await session(['a', 'b', 'c'], 'b', repeat: 'one');
+      final last = await session(['x', 'y'], 'y', repeat: 'one');
+
+      final result = await repo.removeTrackUuidsFromQueues(const ['b', 'y']);
+
+      expect(await currentUuid(middle), 'c');
+      expect(await currentUuid(last), 'x');
+      expect(result.endedSessionIds, {last});
+    });
+
+    test('shuffled: the next entry of the shuffled play order', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd', 'e']);
+      // Play order e, b, d, a, c; canonical next of b would be c, the first
+      // survivor e.
+      final id = await repo.createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['a', 'b', 'c', 'd', 'e'],
+        shuffleEnabled: true,
+        playOrder: const [4, 1, 3, 0, 2],
+      );
+      final b = (await repo.getSessionTracksInPlayOrder(id))
+          .firstWhere((e) => e.uuidId == 'b')
+          .itemId;
+      await repo.updatePlaybackCursor(
+          sessionId: id, currentItemId: b, positionMs: 1000);
+
+      await repo.removeTrackUuidsFromQueues(const ['b']);
+
+      expect(await currentUuid(id), 'd');
+    });
+
+    test('a removed entry that is not current changes nothing about the '
+        'current one', () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final id = await session(['a', 'b', 'c'], 'b');
+
+      final result = await repo.removeTrackUuidsFromQueues(const ['c']);
+
+      expect(await currentUuid(id), 'b');
+      expect(await positionMsOf(id), 45000);
+      expect(result.affectedSessionIds, {id});
+      expect(result.endedSessionIds, isEmpty);
+    });
+
+    test('every entry removed: no current item, not reported ended (the '
+        'player stops an emptied queue)', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final id = await session(['a', 'b'], 'b');
+
+      final result = await repo.removeTrackUuidsFromQueues(const ['a', 'b']);
+
+      expect(await currentUuid(id), isNull);
+      expect(result.affectedSessionIds, {id});
+      expect(result.endedSessionIds, isEmpty);
+    });
+
+    // Review r1-fe-a #1: until the player's reconcile runs it still holds
+    // the removed item; a cursor save of it must not overwrite the landing.
+    test('a cursor save of a removed item keeps the landing', () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      final id = await session(['a', 'b', 'c'], 'b');
+      final removed = (await repo.getSessionTracksInPlayOrder(id))
+          .firstWhere((e) => e.uuidId == 'b')
+          .itemId;
+
+      await repo.removeTrackUuidsFromQueues(const ['b']);
+      await repo.updatePlaybackCursor(
+          sessionId: id, currentItemId: removed, positionMs: 50000);
+
+      expect(await currentUuid(id), 'c');
+      expect(await positionMsOf(id), 0);
+    });
+
+    // Review r1-fe-a #3: a current item without a play-order row is still
+    // cleared (as before), not left pointing at a deleted item.
+    test('a removed current without a play-order row is cleared', () async {
+      await fixture.insertSingles(['a', 'b']);
+      final id = await session(['a', 'b'], 'b');
+      final b = (await repo.getSessionTracksInPlayOrder(id))
+          .firstWhere((e) => e.uuidId == 'b')
+          .itemId;
+      await db.customStatement(
+          'DELETE FROM queue_session_play_order WHERE item_id = ?', [b]);
+
+      final result = await repo.removeTrackUuidsFromQueues(const ['b']);
+
+      final row = await (db.select(db.queueSessions)
+            ..where((s) => s.id.equals(id)))
+          .getSingle();
+      expect(row.currentItemId, isNull);
+      expect(result.endedSessionIds, isEmpty);
+    });
+
+    test('each affected session lands by its own order', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'x', 'y']);
+      // An earlier session, inactive once the next one activates (not a
+      // prepared one: those keep their refusal, see the 6A.1b group).
+      final second = await repo.createSessionFromExplicitList(
+          sourceType: 'search',
+          trackUuids: const ['x', 'b', 'y', 'a'],
+          currentIndex: 1);
+      final first = await session(['a', 'b', 'c'], 'b');
+
+      await repo.removeTrackUuidsFromQueues(const ['b']);
+
+      expect(await currentUuid(first), 'c');
+      expect(await currentUuid(second), 'y');
+    });
+  });
 
   test(
     'replacePlayOrder changes effective order without rewriting canonical order',

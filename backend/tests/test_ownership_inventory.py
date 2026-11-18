@@ -79,6 +79,11 @@ OWNED = {
     # 6.5A.3: the candidate-store API for Phase 8 and L08 (no endpoint).
     "set_duplicate_candidate_status",
     "get_identity_coverage_summary",
+    # 8A.4: the duplicates API's reads (spec §4).
+    "list_duplicate_candidates",
+    "count_duplicate_candidates",
+    # 8A.3a: the reader-side pending-deletion predicate (open_track_source).
+    "is_pending_deletion",
     # 7A.1d: the upload API (spec §4), reached only through the caller's Library.
     "allocate_upload_batch",
     "get_upload_batch",
@@ -99,6 +104,11 @@ OWNED = {
     "accept_upload_commit",
     "resolve_upload_duplicate",
     "get_upload_preview",
+    # 8A.2b: the deletion preview, jobs and receipts API (spec §4).
+    "get_deletion_preview_facts",
+    "create_deletion_job",
+    "get_deletion_job",
+    "list_deletion_jobs",
 }
 
 # Server-wide: no owner (spec §4.2 "Server-wide methods") plus the users table.
@@ -128,6 +138,11 @@ SERVER_WIDE = {
     "get_setting",
     "read_setting",
     "set_setting",
+    # The durable point: a checkpoint and flush of the whole database file, reading
+    # and returning no rows of any owner. Callers: the deletion executor's flush and
+    # janitor pass, the moving edit and conversion writers, their runtime finish,
+    # and startup journal recovery (sign-off OPEN-6.5-05, decision D12).
+    "make_durable",
 }
 
 # Global cover-art release (SC-16h): deletes a cover_arts row only when no
@@ -257,14 +272,45 @@ UPLOAD_COMMIT_WORKER = {
     "adopt_upload_commit_art",
 }
 
+# 8A.3c: the deletion worker, server-wide like the upload workers: it claims
+# any owner's pending item by boot id; every later read and write names the
+# owner read from the claimed row.
+DELETION_WORKER = {
+    "claim_next_deletion_item",
+    "finish_deletion_item",
+    "read_deletion_target",
+    "begin_track_deletion",
+    "mark_deletion_moved",
+    "commit_track_deletion",
+    "finish_deletion_cleanup",
+    "clear_deletion_journal",
+    # Fix round 1 (8-R1-01): the release rule reads the item's own journal
+    # row and requeues the item, both by the claimed row's owner.
+    "get_deletion_journal",
+    "release_deletion_item",
+    # OPEN-8-01 B (signoff-8-deletion-recovery): the executor's per-job flush
+    # asks whether the claimed item's job (by the claimed row's owner) still
+    # has a pending item; its one caller is DeletionExecutor.execute.
+    "deletion_job_has_pending_items",
+}
+
+# 8A.3d: deletion startup recovery, job reclaim and the quarantine janitor
+# (SC-16e): server-wide maintenance over every owner's deletion rows; every
+# write names the owner read from the row.
+DELETION_RECOVERY = {
+    "reclaim_deletion_items",
+    "list_deletion_journals",
+    "mark_deletion_recovery_required",
+}
+
 # Spec §4.2: the only places that may skip the owner predicate, as
 # (path under app/, enclosing function). The encoder's owner lookup arrives
 # in M.2a. The M.2b CLI and user delete need none: they act on one user's id.
 ANY_OWNER_SITES: set[tuple[str, str]] = {
-    ("main.py", "_resolve_track_source_path"),
-    # M.2a: _prefetch_one's by-UUID owner read, before the generation capture;
-    # it decides only the write tier (default_cache is the admin's).
-    ("main.py", "_resolve_track_owner"),
+    # 8A.3a (was main.py _resolve_track_source_path / _resolve_track_owner):
+    # the background encoder's by-UUID read (prefetch owner, warm source),
+    # answered only for a live track; the owner decides only the write tier.
+    ("services/track_source.py", "_live_track_any_owner"),
     # The conversion worker: one by-id read of its job; the rest of the run
     # uses that job's owner.
     ("services/conversion.py", "ConversionOrchestrator._run_job"),
@@ -275,6 +321,11 @@ ANY_OWNER_SITES: set[tuple[str, str]] = {
     ("services/track_editor.py", "finish_kept_journal_rows"),
     # Journal recovery: a master of any owner at new_path is not the row's own copy.
     ("services/track_editor.py", "_reconcile_relocate"),
+    # Startup settle (sign-off OPEN-6.5-05): another track's master (any owner) is
+    # never deleted, adopted or hashed; a leftover becomes a track only at a path
+    # no track of any owner uses.
+    ("services/journal_settle.py", "_Row.claimed"),
+    ("services/journal_settle.py", "_Row._organizer"),
     # U06-B-06: a same-file conversion's swap never overwrites a file another track
     # (of any owner) names.
     ("services/track_editor.py", "_reconcile_inplace"),
@@ -318,7 +369,8 @@ def db(tmp_path):
 
 def test_every_public_database_method_is_classified():
     groups = [OWNED, SERVER_WIDE, COVER_ART_RELEASE, USER_ADMIN, IDENTITY_WORKER, IDENTITY_RECONCILE,
-              STORAGE_LEDGER, UPLOAD_RECEIPT_RECONCILE, UPLOAD_VALIDATION_WORKER, UPLOAD_COMMIT_WORKER]
+              STORAGE_LEDGER, UPLOAD_RECEIPT_RECONCILE, UPLOAD_VALIDATION_WORKER, UPLOAD_COMMIT_WORKER,
+              DELETION_WORKER, DELETION_RECOVERY]
     assert sum(len(g) for g in groups) == len(set().union(*groups)), "overlapping groups"
     assert _public_methods() == set().union(*groups)
 

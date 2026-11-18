@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import stat
+import threading
 import unicodedata
 import uuid
 from pathlib import Path
@@ -17,6 +18,7 @@ from app.database.database import (
     EDITABLE_METADATA_COLUMNS,
     RevisionConflict,
     TrackNotFound,
+    TrackPendingDeletion,
     normalize_edit_fields,
 )
 from app.models.track import Track
@@ -35,7 +37,7 @@ from app.services.organizer import (
     prune_empty_dirs,
     sanitized_destination_path,
 )
-from app.services.path_sanitize import assert_within
+from app.services.path_sanitize import assert_name_within, assert_within
 from app.services.track_edit import WriteMode
 
 
@@ -61,11 +63,16 @@ class TrackEditor:
     region; the ``edit_journal`` + ``reconcile_journal`` make the move↔commit
     window crash-safe."""
 
-    def __init__(self, music_library_dir: Path, staging_dir: Path, identity_signal=None):
+    def __init__(
+        self, music_library_dir: Path, staging_dir: Path, identity_signal=None,
+        pending_old_masters=None,
+    ):
         self._library = Path(music_library_dir)
         # Anything with notify() (the app passes the identity worker's wake-up); None = no wake-up.
         self._identity_signal = identity_signal
         self._staging = Path(staging_dir)
+        # Old masters kept after a failed durable point (shared with conversion).
+        self._pending = pending_old_masters if pending_old_masters is not None else PendingOldMasters()
 
     def apply_edit(
         self,
@@ -78,7 +85,14 @@ class TrackEditor:
         """Returns ``(new_revision, master_written)``. ``db_only`` never touches
         the file. ``db_and_master`` also rewrites the file's tags and relocates
         it when artist/album change — except for WAV or a missing master, which
-        degrade to DB-only with ``master_written=False``."""
+        degrade to DB-only with ``master_written=False``. Raises
+        ``TrackPendingDeletion`` (writing nothing) for a track whose deletion
+        is pending."""
+        # The caller holds the track lock, and the deletion worker writes its
+        # journal row only under that same lock, so this check holds for the
+        # whole edit.
+        if library.is_pending_deletion(uuid_id):
+            raise TrackPendingDeletion(uuid_id)
         # Canonicalize up front (NFC + year/date reconciliation) so the merged
         # state, the destination path, and the file tags are all derived from
         # the same bytes the DB spine will store. The spine normalizes again
@@ -114,19 +128,9 @@ class TrackEditor:
     def _finish_kept_rows(self, library: Library, uuid_id: str) -> None:
         """Finish this track's kept journal rows (same recovery as startup)
         before staging or writing; refuse the edit if any row remains."""
-        for entry in library.list_journal_entries():
-            if entry["uuid_id"] != uuid_id:
-                continue
-            try:
-                _reconcile_one(
-                    library.database, entry, self._library, self._identity_signal,
-                    runtime=True,
-                )
-            except Exception as e:
-                logger.warning(
-                    "could not finish kept journal entry %s: %s",
-                    entry["id"], type(e).__name__,
-                )
+        finish_track_journal_rows(
+            library, uuid_id, self._library, self._identity_signal, self._pending
+        )
         if library.has_journal_entry_for_uuid(uuid_id):
             raise MasterWriteError(
                 "an earlier file operation on this track could not be finished"
@@ -260,6 +264,7 @@ class TrackEditor:
         except BaseException:
             temp.unlink(missing_ok=True)  # nothing journaled yet
             raise
+        flushed = flush_journal_row(library.database, entry, uuid_id)
         if not move_file(file_path=temp, destination_path=dest):
             # The staged temp stays until the row is gone: while the row exists
             # it shows recovery that the move never happened.
@@ -284,27 +289,120 @@ class TrackEditor:
             temp.unlink(missing_ok=True)
             raise
         # Committed: DB now points at `dest`; the old master is redundant.
-        # Never delete the new master through another spelling of its path.
-        if not _is_current_master(str(source), str(dest)):
-            source.unlink(missing_ok=True)
-            prune_empty_dirs(source.parent, root)
-        library.delete_journal_entry(entry)
+        settle_old_master(
+            library, entry, uuid_id, source, dest, root, self._pending, wait=flushed
+        )
         self._notify_identity()
         return rev
 
 
+def finish_track_journal_rows(
+    library: Library, uuid_id: str, music_library_dir: Path, identity_signal,
+    pending_old_masters,
+) -> None:
+    """Finish this track's kept journal rows at runtime (same recovery as
+    startup). The caller holds the track lock; a row that cannot finish stays."""
+    for entry in library.list_journal_entries():
+        if entry["uuid_id"] != uuid_id:
+            continue
+        try:
+            _reconcile_one(
+                library.database, entry, music_library_dir, identity_signal,
+                runtime=True, pending_old_masters=pending_old_masters,
+            )
+        except Exception as e:
+            logger.warning(
+                "could not finish kept journal entry %s: %s",
+                entry["id"], type(e).__name__,
+            )
+
+
+def reached_durable_point(database: Database, *, wait: bool = True) -> bool:
+    """Whether every committed transaction is on disk; a failure counts as no.
+    ``wait=False`` asks once without waiting (``make_durable(timeout=0)``)."""
+    try:
+        if not wait:
+            return bool(database.make_durable(timeout=0))
+        return bool(database.make_durable())
+    except Exception as e:
+        logger.warning("durable point failed: %s", type(e).__name__)
+        return False
+
+
+def flush_journal_row(database: Database, entry_id: int, uuid_id: str) -> bool:
+    """Best-effort durable point between a journal row insert and the file move;
+    the move goes ahead either way (decision D10), with one path-free line.
+    Returns whether the point was reached."""
+    if reached_durable_point(database):
+        return True
+    operator_logger.warning(
+        "journal entry %s for track %s: the file moves before a database flush",
+        entry_id, uuid_id,
+    )
+    return False
+
+
+def settle_old_master(
+    library: Library, entry_id: int, uuid_id: str, source: Path, dest: Path, root: Path,
+    pending_old_masters: "PendingOldMasters", *, wait: bool = True,
+) -> None:
+    """After the commit that points the track at ``dest``: delete the old master
+    and the journal row once the commit is durable. Otherwise both stay, the old
+    file is remembered, and a later edit, conversion or idle pass settles it.
+    ``wait=False`` (the first point already failed) asks once without waiting."""
+    if reached_durable_point(library.database, wait=wait):
+        # Never delete the new master through another spelling of its path.
+        if not _is_current_master(str(source), str(dest)):
+            source.unlink(missing_ok=True)
+            prune_empty_dirs(source.parent, root)
+        library.delete_journal_entry(entry_id)
+        return
+    try:  # best effort: the operation committed and answers success either way
+        row = next((e for e in library.list_journal_entries() if e["id"] == entry_id), None)
+        if row is not None:
+            pending_old_masters.remember(row, source)
+    except Exception as e:
+        logger.warning("could not remember the old file of %s: %s", uuid_id, type(e).__name__)
+    operator_logger.warning(
+        "journal entry %s for track %s: the old file waits for a database flush",
+        entry_id, uuid_id,
+    )
+
+
 def reconcile_journal(
-    database: Database, music_library_dir: Path, identity_signal=None
+    database: Database, music_library_dir: Path, identity_signal=None,
+    *, read_audio=None, cover_art=None,
 ) -> None:
     """Idempotent startup pass that finishes or reverts every outstanding
     ``edit_journal`` row, closing the move↔commit window. Safe to run on every
     boot; a clean shutdown leaves no rows. A recovered master write marks the track's
-    audio identity stale and then wakes ``identity_signal`` (anything with notify())."""
-    for entry in database.list_journal_entries(owner_id=ANY_OWNER):
+    audio identity stale and then wakes ``identity_signal`` (anything with notify()).
+    Every row is settled (``journal_settle``); ``read_audio`` reads a file
+    (default ``recovery_audio.read_audio``), ``cover_art`` (a CoverArtManager or
+    None) serves a leftover that becomes a track."""
+    # Local imports: journal_settle imports this module.
+    from app.services.journal_settle import JournalRowKept, settle_journal_row
+    from app.services.recovery_audio import read_audio as default_read_audio
+
+    entries = database.list_journal_entries(owner_id=ANY_OWNER)
+    # A row may itself be only in the page cache; flush once before any file moves.
+    if entries and not reached_durable_point(database):
+        operator_logger.warning(
+            "edit journal recovery goes ahead before a database flush (%d entries)",
+            len(entries),
+        )
+    for entry in entries:
         try:
-            _reconcile_one(database, entry, music_library_dir, identity_signal)
+            settle_journal_row(
+                database, entry,
+                _row_root(database, entry, music_library_dir, check=assert_name_within),
+                identity_signal, read_audio or default_read_audio, cover_art,
+            )
         except Exception as e:  # never let one bad row block startup
-            reason = str(e) if isinstance(e, JournalOwnershipUnproven) else type(e).__name__
+            reason = (
+                str(e) if isinstance(e, (JournalOwnershipUnproven, JournalRowKept))
+                else type(e).__name__
+            )
             operator_logger.warning(
                 "journal entry %s for track %s kept: %s", entry["id"], entry["uuid_id"], reason
             )
@@ -312,20 +410,17 @@ def reconcile_journal(
 
 def _reconcile_one(
     database: Database, entry: dict, music_library_dir: Path, identity_signal=None,
-    *, runtime: bool = False,
+    *, runtime: bool = False, pending_old_masters: Optional["PendingOldMasters"] = None,
 ) -> None:
     # ``runtime`` is recovery while the server is up: it never deletes a library
     # file and never places converted bytes (rows that need that wait for startup).
-    # Each row's root comes from its owner; every check precedes any disk touch.
-    root = library_root(music_library_dir, database.get_user(entry["owner_id"]))
-    for key in ("old_path", "new_path"):
-        if entry[key]:
-            assert_within(entry[key], root)
-    if entry["temp_path"]:
-        assert_within(entry["temp_path"], Path(music_library_dir) / STAGING)
+    root = _row_root(database, entry, music_library_dir)
     intent = entry["intent"]
     if intent == "relocate":
-        _reconcile_relocate(database, entry, root, identity_signal, runtime=runtime)
+        _reconcile_relocate(
+            database, entry, root, identity_signal, runtime=runtime,
+            pending_old_masters=pending_old_masters,
+        )
     elif intent == "inplace":
         _reconcile_inplace(database, entry, identity_signal, runtime=runtime)
     elif intent == "convert":
@@ -334,12 +429,31 @@ def _reconcile_one(
         # same-codec re-encode (path unchanged) is exactly _reconcile_inplace.
         # No separate reconcile body needed.
         if entry["new_path"] and entry["new_path"] != entry["old_path"]:
-            _reconcile_relocate(database, entry, root, identity_signal, runtime=runtime)
+            _reconcile_relocate(
+                database, entry, root, identity_signal, runtime=runtime,
+                pending_old_masters=pending_old_masters,
+            )
         else:
             _reconcile_inplace(database, entry, identity_signal, runtime=runtime)
     else:
         # Unknown intent (shouldn't happen) — drop it so it can't loop forever.
         database.delete_journal_entry(entry["id"], owner_id=entry["owner_id"])
+
+
+def _row_root(
+    database: Database, entry: dict, music_library_dir: Path, check=assert_within
+) -> Path:
+    """The row owner's library root, after ``check`` shows that every path of the
+    row lies inside it (the staged copy inside the staging dir); before any disk
+    touch. Startup checks the entries themselves (``assert_name_within``): it
+    never follows a symlink at a row's path, it settles around it."""
+    root = library_root(music_library_dir, database.get_user(entry["owner_id"]))
+    for key in ("old_path", "new_path"):
+        if entry[key]:
+            check(entry[key], root)
+    if entry["temp_path"]:
+        check(entry["temp_path"], Path(music_library_dir) / STAGING)
+    return root
 
 
 def _mark_identity_stale(database: Database, entry: dict, identity_signal) -> None:
@@ -350,6 +464,47 @@ def _mark_identity_stale(database: Database, entry: dict, identity_signal) -> No
         entry["uuid_id"], reason, owner_id=entry["owner_id"]
     ) and identity_signal is not None:
         identity_signal.notify()
+
+
+class PendingOldMasters:
+    """Old masters this process kept because the commit that replaced them was not
+    yet durable, keyed by journal row. Runtime recovery deletes one only while the
+    file at its path is still that same file object."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._files: dict[tuple, tuple] = {}
+
+    def remember(self, entry: dict, path) -> None:
+        identity = _file_identity(path)
+        if identity is not None:
+            with self._lock:
+                self._files[_row_key(entry)] = identity
+
+    def holds(self, entry: dict) -> bool:
+        with self._lock:
+            return _row_key(entry) in self._files
+
+    def is_same_file(self, entry: dict, path) -> bool:
+        with self._lock:
+            identity = self._files.get(_row_key(entry))
+        return identity is not None and _file_identity(path) == identity
+
+    def forget(self, entry: dict) -> None:
+        with self._lock:
+            self._files.pop(_row_key(entry), None)
+
+
+def _file_identity(path) -> Optional[tuple]:
+    """A regular file's or a symbolic link's own (lstat) device, inode, size,
+    mtime, ctime; None otherwise. Removing a link removes only its name."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 class JournalOwnershipUnproven(Exception):
@@ -370,9 +525,34 @@ def _defer_unlink(path: str, current: Optional[str], entry: dict) -> None:
         )
 
 
+def _finish_old_master_at_runtime(
+    database: Database, entry: dict, old_path: str, current: str, root: Path,
+    pending_old_masters: Optional[PendingOldMasters],
+) -> None:
+    """Delete an old master this process remembered, once the commit is durable
+    and only while it is still the same file; otherwise defer like any row."""
+    if (
+        pending_old_masters is not None
+        and pending_old_masters.holds(entry)
+        and os.path.lexists(old_path)
+    ):
+        if pending_old_masters.is_same_file(entry, old_path):
+            if not reached_durable_point(database):
+                raise JournalRecoveryDeferred(
+                    f"journal entry {entry['id']} waits for a database flush"
+                )
+            # Again after the point: an outside change during the checkpoint.
+            if pending_old_masters.is_same_file(entry, old_path):
+                Path(old_path).unlink(missing_ok=True)  # a link: only its name
+                prune_empty_dirs(Path(old_path).parent, root)
+                return
+        pending_old_masters.forget(entry)
+    _defer_unlink(old_path, current, entry)
+
+
 def _reconcile_relocate(
     database: Database, entry: dict, root: Path, identity_signal=None,
-    *, runtime: bool = False,
+    *, runtime: bool = False, pending_old_masters: Optional["PendingOldMasters"] = None,
 ) -> None:
     # Whether the DB commit landed is the source of truth: if file_path == the
     # journal's new_path the move is durable → finish (delete the old master);
@@ -393,7 +573,9 @@ def _reconcile_relocate(
             and not _is_current_master(old_path, current)
         ):
             if runtime:
-                _defer_unlink(old_path, current, entry)
+                _finish_old_master_at_runtime(
+                    database, entry, old_path, current, root, pending_old_masters
+                )
             else:
                 Path(old_path).unlink(missing_ok=True)
                 prune_empty_dirs(Path(old_path).parent, root)
@@ -429,6 +611,8 @@ def _reconcile_relocate(
     if temp_path:
         Path(temp_path).unlink(missing_ok=True)
     database.delete_journal_entry(entry["id"], owner_id=entry["owner_id"])
+    if pending_old_masters is not None:
+        pending_old_masters.forget(entry)
 
 
 def _another_spelling_of(dest: Path, source: Path) -> bool:
@@ -524,9 +708,7 @@ def _reconcile_inplace(
         if not _is_regular_file(temp_path):
             _end_swap_job(database, entry, SWAP_UNPROVEN_TEXT)
             raise JournalOwnershipUnproven("the staged copy is not a regular file")
-        fsync_file(Path(temp_path))
-        os.replace(temp_path, old_path)
-        flush_move(Path(old_path), Path(temp_path))
+        _replay_staged_copy(Path(temp_path), Path(old_path))
         placed = True
     if convert and not runtime and not placed:
         # The staged file is already gone: prove the swap happened before the job
@@ -568,6 +750,13 @@ def _reconcile_inplace(
         database.bump_track_revision(entry["uuid_id"], owner_id=entry["owner_id"])
         _end_swap_job(database, entry, None)
     database.delete_journal_entry(entry["id"], owner_id=entry["owner_id"])
+
+
+def _replay_staged_copy(temp: Path, target: Path) -> None:
+    """Redo an in-place row's replace: flush the staged copy, then put it in place."""
+    fsync_file(temp)
+    os.replace(temp, target)
+    flush_move(target, temp)
 
 
 def _probe_master(entry: dict):
@@ -666,7 +855,8 @@ def _end_swap_job(database: Database, entry: dict, error_text: Optional[str]) ->
 
 
 def finish_kept_journal_rows(
-    database, music_library_dir, track_locks, identity_signal=None, *, reported=None
+    database, music_library_dir, track_locks, identity_signal=None, *, reported=None,
+    pending_old_masters=None,
 ) -> int:
     """Finish journal rows kept after a failed identity mark, in a running server.
 
@@ -678,7 +868,7 @@ def finish_kept_journal_rows(
     for the next pass or for startup. ``reported`` (a set the caller keeps
     across passes) logs a row that keeps failing once, not on every pass; it is
     keyed by (id, uuid, created_at) because row ids are reused, and forgets
-    rows that are gone.
+    rows that are gone. A row whose track is pending deletion is left for later.
     Returns the number of rows finished."""
     finished = 0
     entries = database.list_journal_entries(owner_id=ANY_OWNER)
@@ -698,8 +888,14 @@ def finish_kept_journal_rows(
             )
             if current is None or _temp_present(current):
                 continue
+            # The row is kept for a later pass; finally still releases the lock.
+            if database.is_pending_deletion(
+                current["uuid_id"], owner_id=current["owner_id"]
+            ):
+                continue
             _reconcile_one(
-                database, current, music_library_dir, identity_signal, runtime=True
+                database, current, music_library_dir, identity_signal, runtime=True,
+                pending_old_masters=pending_old_masters,
             )
             finished += 1
         except Exception as e:  # noqa: BLE001 - the row stays for the next pass or startup

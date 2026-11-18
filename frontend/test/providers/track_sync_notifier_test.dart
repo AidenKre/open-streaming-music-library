@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:drift/drift.dart' show Value, Variable;
+import 'package:drift/drift.dart' show QueryRow, Value, Variable;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
@@ -15,12 +15,14 @@ import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/repositories/queue_repository.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
+import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
 import 'package:frontend/services/sync_service.dart';
 import 'package:http/http.dart';
 import 'package:http/testing.dart';
@@ -44,6 +46,18 @@ class _StubOffline extends OfflineModeNotifier {
     super.build();
     return _value;
   }
+}
+
+/// An offline flag the test flips (8-R1-12).
+class _ToggleOffline extends OfflineModeNotifier {
+  _ToggleOffline(this._initial);
+
+  final bool _initial;
+
+  @override
+  bool build() => _initial;
+
+  void setOffline(bool value) => state = value;
 }
 
 Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
@@ -221,6 +235,7 @@ void main() {
     bool offline = false,
     LocalCoverArtStore? localCoverArtStore,
     Directory? downloadDirectory,
+    _ToggleOffline? toggleOffline,
   }) {
     container = ProviderContainer(
       overrides: [
@@ -228,7 +243,8 @@ void main() {
         databaseProvider.overrideWithValue(db),
         autoVerifiedGateOverride(),
         tracksApiProvider.overrideWithValue(TracksApi(api: api)),
-        offlineModeProvider.overrideWith(() => _StubOffline(offline)),
+        offlineModeProvider.overrideWith(
+            () => toggleOffline ?? _StubOffline(offline)),
         if (localCoverArtStore != null)
           localCoverArtStoreProvider.overrideWithValue(localCoverArtStore),
         if (downloadDirectory != null)
@@ -910,7 +926,7 @@ void main() {
         ),
       );
 
-      final c = createContainer();
+      final c = createContainer(downloadDirectory: tempDir);
       await waitForBuild(c);
       final notifier = c.read(trackSyncProvider.notifier);
       await notifier.sync();
@@ -919,11 +935,13 @@ void main() {
         'uuid-keep',
         'uuid-drop',
       });
-      final downloadedFile = File('${tempDir.path}/uuid-drop.audio')
+      // Under the downloads root: only files there are the app's to delete.
+      final downloadedFile = File('${tempDir.path}/tracks/uuid-drop.audio')
+        ..createSync(recursive: true)
         ..writeAsBytesSync([1, 2, 3]);
       // Review (decision 6): a kept damaged copy goes with the track too.
       // (A row holds one or the other; both columns are collected.)
-      final damagedFile = File('${tempDir.path}/uuid-drop.damaged.audio')
+      final damagedFile = File('${tempDir.path}/tracks/uuid-drop.damaged.audio')
         ..writeAsBytesSync([9]);
       await (db.update(
         db.tracks,
@@ -982,6 +1000,74 @@ void main() {
           .get();
       expect(dropAlbumFts, isEmpty);
       expect(await SyncCursorStore(db).read(SyncStream.catalog), 3);
+    });
+
+    // 8-fix-r1 8-R1-12 (spec §7 "offline second client", unit half): a
+    // client that is offline while another deletes a track keeps its row,
+    // queue entry and download; the tombstone sync after it reconnects
+    // removes all three.
+    test('an offline client keeps its download until the tombstone sync, '
+        'then removes row, queue entry and file', () async {
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async => _changesResponse([
+              _upsert(1, _trackJson('uuid-keep')),
+              _upsert(2, _trackJson('uuid-drop')),
+            ])),
+      );
+      final offline = _ToggleOffline(false);
+      final c = createContainer(
+          downloadDirectory: tempDir, toggleOffline: offline);
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+      final file = File('${tempDir.path}/tracks/uuid-drop.audio')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync([1, 2, 3]);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('uuid-drop')))
+          .write(TracksCompanion(
+        filePath: Value(file.path),
+        downloadedBitrateKbps: const Value(320),
+        fileSizeBytes: const Value(3),
+        downloadedQuality: const Value('320'),
+      ));
+      final queueRepo = QueueRepository(db);
+      final sessionId = await queueRepo.createSessionFromExplicitList(
+          sourceType: 'search', trackUuids: const ['uuid-keep', 'uuid-drop']);
+
+      // Another client deletes uuid-drop; this one is offline.
+      var requests = 0;
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async {
+          requests++;
+          return _changesResponse([_delete(3, 'uuid-drop')]);
+        }),
+      );
+      offline.setOffline(true);
+      await notifier.sync();
+
+      expect(requests, 0);
+      expect((await db.select(db.tracks).get()).map((t) => t.uuidId).toSet(),
+          {'uuid-keep', 'uuid-drop'});
+      expect(file.existsSync(), isTrue, reason: 'still playable offline');
+      expect(
+          (await queueRepo.getSessionTracksInPlayOrder(sessionId))
+              .map((e) => e.uuidId),
+          ['uuid-keep', 'uuid-drop']);
+
+      offline.setOffline(false);
+      await notifier.sync();
+
+      expect(requests, 1);
+      expect((await db.select(db.tracks).get()).map((t) => t.uuidId),
+          ['uuid-keep']);
+      expect(file.existsSync(), isFalse);
+      expect(
+          (await queueRepo.getSessionTracksInPlayOrder(sessionId))
+              .map((e) => e.uuidId),
+          ['uuid-keep']);
+      expect(c.read(trackSyncProvider).value!.deletedTrackUuids, {'uuid-drop'});
     });
 
     test('sync tombstones fence active download jobs', () async {
@@ -1533,8 +1619,20 @@ void main() {
         final sessionRow = await (db.select(
           db.queueSessions,
         )..where((s) => s.id.equals(sessionId))).getSingle();
-        expect(sessionRow.currentItemId, isNull);
+        // 8-fix-r1 U20-B-01 (deliberately changed, was: current_item_id
+        // NULL): the removed current was the last entry, repeat off, so the
+        // cursor rests on the last survivor (the end of the queue).
+        final keepItem = (await queueRepo.getSessionTracksInPlayOrder(
+          sessionId,
+        )).single;
+        expect(keepItem.uuidId, 'uuid-keep');
+        expect(sessionRow.currentItemId, keepItem.itemId);
         expect(sessionRow.currentPositionMs, 0);
+        expect(
+          c.read(trackSyncProvider).value!.endedQueueSessionIds,
+          {sessionId},
+          reason: 'the player is told the queue ended (no autoplay)',
+        );
         // 6-R1-10: resume_main_item_id is never written (the column stays).
         expect(sessionRow.resumeMainItemId, isNull);
 
@@ -1626,6 +1724,218 @@ void main() {
         expect(after.currentItem!.playPosition, 0);
       },
     );
+  });
+
+  // 8-fix-r1 TR-DELETE-01 (spec §6: the tombstone path drives the player
+  // reconcile and the download removal): each page commits on its own, so a
+  // run that fails after a page of tombstones committed must still publish
+  // what it changed (queue sessions, deleted uuids) and rebuild search.
+  group('TR-DELETE-01: tombstones committed before a failure are published',
+      () {
+    late int sessionId;
+
+    Response unauthorized() => Response(
+          '{"detail":{"code":"invalid_token","message":"Sign in again."}}',
+          401,
+          headers: {'content-type': 'application/json'},
+        );
+
+    Future<TrackSyncNotifier> seedLibrary(ProviderContainer c) async {
+      installClient(
+        'http://localhost:8000',
+        MockClient(
+          (req) async => _changesResponse([
+            _upsert(
+              1,
+              _richTrackJson('uuid-gone',
+                  title: 'Vanishing Song',
+                  artist: 'A',
+                  album: 'AL',
+                  artistId: 10,
+                  albumId: 100),
+            ),
+            _upsert(
+              2,
+              _richTrackJson('uuid-keep',
+                  title: 'Keep',
+                  artist: 'B',
+                  album: 'BL',
+                  artistId: 11,
+                  albumId: 101),
+            ),
+          ]),
+        ),
+      );
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+      sessionId = await QueueRepository(db).createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['uuid-gone', 'uuid-keep'],
+        currentIndex: 1,
+      );
+      return notifier;
+    }
+
+    /// Page 1 tombstones uuid-gone and points at a page 2, which [page2]
+    /// answers.
+    void tombstoneThen(Response Function() page2) {
+      var call = 0;
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async {
+          call++;
+          if (call == 1) {
+            return _changesResponse([_delete(3, 'uuid-gone')], nextCursor: 3);
+          }
+          return page2();
+        }),
+      );
+    }
+
+    Future<List<QueryRow>> ftsMatches() => db
+        .customSelect(
+            "SELECT rowid FROM fts_tracks WHERE fts_tracks MATCH '\"Vanishing\"*'")
+        .get();
+
+    test('a failed later page: the tombstone reaches the queue, downloads '
+        'and search; the error is still published', () async {
+      final c = createContainer();
+      final notifier = await seedLibrary(c);
+      final before = c.read(trackSyncProvider).value!;
+      expect(await ftsMatches(), hasLength(1));
+
+      tombstoneThen(() => Response('boom', 500));
+      await notifier.sync();
+
+      expect((await db.select(db.tracks).get()).map((t) => t.uuidId),
+          ['uuid-keep'],
+          reason: 'page 1 committed');
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 3);
+      final state = c.read(trackSyncProvider).value!;
+      expect(state.error, isNotNull);
+      expect(state.isSyncing, isFalse);
+      expect(state.queueMutationVersion, before.queueMutationVersion + 1);
+      expect(state.affectedQueueSessionIds, {sessionId});
+      expect(state.downloadMutationVersion, before.downloadMutationVersion + 1);
+      expect(state.deletedTrackUuids, {'uuid-gone'});
+      expect(await ftsMatches(), isEmpty,
+          reason: 'search no longer finds the deleted track');
+    });
+
+    test('a 401 on a later page: published too, and no error', () async {
+      final c = createContainer();
+      final notifier = await seedLibrary(c);
+      final before = c.read(trackSyncProvider).value!;
+
+      tombstoneThen(unauthorized);
+      await notifier.sync();
+
+      final state = c.read(trackSyncProvider).value!;
+      expect(state.error, isNull);
+      expect(state.queueMutationVersion, before.queueMutationVersion + 1);
+      expect(state.affectedQueueSessionIds, {sessionId});
+      expect(state.downloadMutationVersion, before.downloadMutationVersion + 1);
+      expect(state.deletedTrackUuids, {'uuid-gone'});
+      expect(await ftsMatches(), isEmpty);
+    });
+
+    // Review r1-fe-a #2: "ended" is the last landing's verdict, not a
+    // union over pages: a later page that re-lands the session on an entry
+    // queued meanwhile clears it.
+    test('a later page that re-lands an ended session clears its ended '
+        'mark', () async {
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async => _changesResponse([
+              _upsert(1, _trackJson('uuid-a')),
+              _upsert(2, _trackJson('uuid-b')),
+              _upsert(3, _trackJson('uuid-n')),
+            ])),
+      );
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+      final queueRepo = QueueRepository(db);
+      final id = await queueRepo.createSessionFromExplicitList(
+          sourceType: 'search',
+          trackUuids: const ['uuid-a', 'uuid-b'],
+          currentIndex: 1);
+
+      var call = 0;
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async {
+          call++;
+          if (call == 1) {
+            // b (current, last) goes: the session rests on a, ended.
+            return _changesResponse([_delete(4, 'uuid-b')], nextCursor: 4);
+          }
+          // Between pages the user queues n; then a goes too: n is next.
+          await queueRepo.appendManualItems(id, const ['uuid-n']);
+          return _changesResponse([_delete(5, 'uuid-a')]);
+        }),
+      );
+      await notifier.sync();
+
+      final state = c.read(trackSyncProvider).value!;
+      expect(state.affectedQueueSessionIds, {id});
+      expect(state.endedQueueSessionIds, isEmpty);
+    });
+
+    // Review r2 8-R2-13: a fence means a reset is wiping the store; what an
+    // earlier page committed must not queue a player reconcile or a download
+    // removal against it. Only the error is published.
+    test('a reset fence on a later page publishes only the error', () async {
+      final c = createContainer();
+      final notifier = await seedLibrary(c);
+      final before = c.read(trackSyncProvider).value!;
+
+      var call = 0;
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async {
+          call++;
+          if (call == 1) {
+            return _changesResponse([_delete(3, 'uuid-gone')], nextCursor: 3);
+          }
+          await ServerBindingRepository(db).fence(); // reset step 1
+          return _changesResponse([_delete(4, 'uuid-keep')]);
+        }),
+      );
+      await notifier.sync();
+
+      expect((await db.select(db.tracks).get()).map((t) => t.uuidId),
+          ['uuid-keep'],
+          reason: 'page 1 committed; the fenced page 2 wrote nothing');
+      final state = c.read(trackSyncProvider).value!;
+      expect(state.isSyncing, isFalse);
+      expect(state.error, isNotNull);
+      expect(state.queueMutationVersion, before.queueMutationVersion);
+      expect(state.downloadMutationVersion, before.downloadMutationVersion);
+      expect(state.affectedQueueSessionIds, isEmpty);
+      expect(state.deletedTrackUuids, isEmpty);
+      expect(state.endedQueueSessionIds, isEmpty);
+    });
+
+    test('nothing committed: nothing published (unchanged rule)', () async {
+      final c = createContainer();
+      final notifier = await seedLibrary(c);
+      final before = c.read(trackSyncProvider).value!;
+
+      installClient('http://localhost:8000',
+          MockClient((req) async => Response('boom', 500)));
+      await notifier.sync();
+
+      final state = c.read(trackSyncProvider).value!;
+      expect(state.error, isNotNull);
+      expect(state.queueMutationVersion, before.queueMutationVersion);
+      expect(state.downloadMutationVersion, before.downloadMutationVersion);
+      expect(state.affectedQueueSessionIds, isEmpty);
+      expect(state.deletedTrackUuids, isEmpty);
+      expect(await ftsMatches(), hasLength(1));
+    });
   });
 
   group('TrackSyncNotifier.syncFresh', () {
@@ -1867,6 +2177,168 @@ void main() {
             'orphaned card survives indefinitely until some other page '
             'happens to trigger a sync.',
       );
+    });
+  });
+
+  // Phase 8B.2a / D29: every successful sync requests an owned-file cleanup
+  // pass, which retries rows an earlier attempt kept.
+  test('a sync requests an owned-file cleanup pass', () async {
+    installClient(
+      'http://localhost:8000',
+      MockClient((req) async => _changesResponse([])),
+    );
+    final c = createContainer(downloadDirectory: tempDir);
+    await waitForBuild(c);
+    final kept = File('${tempDir.path}/tracks/kept.audio')
+      ..createSync(recursive: true)
+      ..writeAsBytesSync([1, 2, 3]);
+    await db.transaction(
+      () => c
+          .read(ownedFileCleanupProvider)
+          .enqueueInTransaction([kept.path], localBindingId: null),
+    );
+    await c.read(trackSyncProvider.notifier).sync();
+    await c.read(ownedFileCleanupRunnerProvider).whenIdle();
+    expect(kept.existsSync(), isFalse);
+  });
+  // 8B.2b / D25, spec §6 last paragraph: "Cancel in-flight/queued downloads
+  // for tombstoned UUIDs and fence late completion against absent/current
+  // track generation so it cannot restore a row/path" (8-U08, 8-C03 unit
+  // halves), through the app's wiring: the tombstone sync publishes the
+  // deleted UUIDs and the download manager fences them.
+  group('8B.2b D25: downloads of a tombstoned track', () {
+    List<String> audioFiles() {
+      final dir = Directory('${tempDir.path}/tracks');
+      if (!dir.existsSync()) return const [];
+      return [
+        for (final f in dir.listSync().whereType<File>())
+          if (!f.path.endsWith('.partial')) f.path.split('/').last,
+      ];
+    }
+
+    Map<String, dynamic> track(int rev, String uuid) => _upsert(
+      rev,
+      _richTrackJson(uuid, title: 'Song $uuid', artist: 'Artist',
+          album: 'Album', artistId: 11, albumId: 101),
+    );
+
+    test('a queued job is dropped and never requested; the others go on',
+        () async {
+      const busy = ['k1', 'k2', 'k3', 'k4']; // WorkerPool.maxConcurrent
+      var deleteMode = false;
+      final held = StreamController<List<int>>.broadcast();
+      addTearDown(held.close);
+      final streamed = <String>[];
+      installClient(
+        'http://localhost:8000',
+        MockClient.streaming((req, _) async {
+          final path = req.url.path;
+          if (path.endsWith('/changes')) {
+            final body = deleteMode
+                ? _changesResponse([_delete(10, 'uuid-drop')]).body
+                : _changesResponse([
+                    for (var i = 0; i < busy.length; i++) track(i + 1, busy[i]),
+                    track(5, 'uuid-drop'),
+                  ]).body;
+            return StreamedResponse(Stream.value(utf8.encode(body)), 200);
+          }
+          if (path.endsWith('/stream')) {
+            streamed.add(req.url.pathSegments[1]);
+            return StreamedResponse(held.stream, 200, contentLength: 999,
+                headers: {'x-audio-extension': 'audio'});
+          }
+          return StreamedResponse(Stream.value(utf8.encode('{}')), 404);
+        }),
+      );
+      final coverStore = await LocalCoverArtStore.create(
+        apiClient: api,
+        directoryProvider: () async => tempDir,
+      );
+      final c = createContainer(
+          localCoverArtStore: coverStore, downloadDirectory: tempDir);
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+
+      final manager = c.read(downloadManagerProvider);
+      Future<TrackUI> ui(String u) async =>
+          TrackUI.fromQueryRow((await db.getTrackByUuid(u)).single);
+      await manager.enqueueTracks(
+          [for (final u in [...busy, 'uuid-drop']) await ui(u)],
+          quality: '320');
+      await _waitFor(() => streamed.length == busy.length);
+      final drop = manager.snapshot().singleWhere((j) => j.uuidId == 'uuid-drop');
+      expect(drop.isQueued, isTrue);
+      final version = manager.downloadStatusVersion.value;
+
+      deleteMode = true;
+      await notifier.sync();
+      await _waitFor(() => manager.downloadStatusVersion.value > version);
+
+      expect(manager.snapshot().map((j) => j.uuidId).toSet(), busy.toSet());
+      expect(manager.snapshot().every((j) => j.isActive), isTrue);
+      await pumpEventQueue();
+      expect(streamed, isNot(contains('uuid-drop')));
+      expect(await db.getTrackByUuid('uuid-drop'), isEmpty);
+    });
+
+    test('a download finishing after the tombstone committed restores no '
+        'row and leaves no file', () async {
+      var deleteMode = false;
+      installClient(
+        'http://localhost:8000',
+        MockClient.streaming((req, _) async {
+          final path = req.url.path;
+          if (path.endsWith('/changes')) {
+            final body = deleteMode
+                ? _changesResponse([_delete(2, 'uuid-drop')]).body
+                : _changesResponse([track(1, 'uuid-drop')]).body;
+            return StreamedResponse(Stream.value(utf8.encode(body)), 200);
+          }
+          if (path.endsWith('/tracks/uuid-drop/stream')) {
+            return StreamedResponse(Stream.value([1, 2, 3]), 200,
+                contentLength: 3, headers: {'x-audio-extension': 'audio'});
+          }
+          return StreamedResponse(Stream.value(utf8.encode('{}')), 404);
+        }),
+      );
+      final coverStore = await LocalCoverArtStore.create(
+        apiClient: api,
+        directoryProvider: () async => tempDir,
+      );
+      final c = createContainer(
+          localCoverArtStore: coverStore, downloadDirectory: tempDir);
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+
+      final manager = c.read(downloadManagerProvider);
+      final atCommit = Completer<void>();
+      final release = Completer<void>();
+      manager.testHookBeforeDbWrite = (_) async {
+        if (!atCommit.isCompleted) atCommit.complete();
+        await release.future;
+      };
+      await manager.enqueueTracks(
+          [TrackUI.fromQueryRow((await db.getTrackByUuid('uuid-drop')).single)],
+          quality: '320');
+      await atCommit.future;
+      expect(audioFiles(), ['uuid-drop.audio'], reason: 'renamed, unrecorded');
+
+      final version = manager.downloadStatusVersion.value;
+      deleteMode = true;
+      await notifier.sync(); // the tombstone commits while the worker waits
+      expect(await db.getTrackByUuid('uuid-drop'), isEmpty);
+      release.complete();
+      // The tombstone's fence awaited the worker, then published.
+      await _waitFor(() => manager.downloadStatusVersion.value > version);
+      expect(manager.snapshot(), isEmpty);
+      await c.read(ownedFileCleanupRunnerProvider).whenIdle();
+
+      expect(await db.getTrackByUuid('uuid-drop'), isEmpty,
+          reason: 'no row restored');
+      expect(audioFiles(), isEmpty, reason: 'the late file is owned-cleaned');
+      expect(await db.select(db.ownedFileCleanupEntries).get(), isEmpty);
     });
   });
 }

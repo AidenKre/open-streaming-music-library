@@ -40,7 +40,7 @@ UploadItem _item({
 });
 
 UploadIntentRecord _intent(String state, {String? code, String uuid = 'i-1',
-    String batch = 'b-1'}) => UploadIntentRecord(
+    String batch = 'b-1', String? sha256}) => UploadIntentRecord(
   itemUuid: uuid,
   batchUuid: batch,
   parentItemUuid: null,
@@ -57,7 +57,7 @@ UploadIntentRecord _intent(String state, {String? code, String uuid = 'i-1',
   createdAtMs: 0,
   updatedAtMs: 0,
   expectedLength: null,
-  expectedSha256: null,
+  expectedSha256: sha256,
   descriptor: null,
 );
 
@@ -252,6 +252,35 @@ void main() {
         ),
         isFalse,
       );
+    });
+  });
+
+  // Sign-off s7-app-texts review-8 #1: the review page words a lost received
+  // file like the Uploads page: only a device with the file can send it.
+  group('the server lost the received file', () {
+    test('picked on this device: try again', () {
+      final v = _view(_item(), intent: _intent('failed',
+          code: 'upload_source_missing', sha256: 'abc'));
+      expect(v.errorText,
+          'The server no longer has the received file. Try again to send it.');
+    });
+
+    test('not on this device (or no record here): the true step', () {
+      // The owner's wording (2026-11-17).
+      const notHere = "The server no longer has the received file, and this "
+          'device cannot find it. Cancel it and add it again.';
+      expect(
+          _view(_item(), intent: _intent('failed',
+              code: 'upload_source_missing')).errorText,
+          notHere);
+      expect(
+          _view(_item(state: 'failed', error: {
+            'code': 'upload_source_missing',
+            'message': 'gone',
+            'retryable': true,
+          }))
+              .errorText,
+          notHere);
     });
   });
 }

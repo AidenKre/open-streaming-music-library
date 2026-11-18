@@ -120,8 +120,7 @@ mixin RootBrowseMixin<W extends ConsumerStatefulWidget, T>
   bool get showDownloadedEmpty =>
       hasBrowseControls &&
       filters.downloaded &&
-      !hasMore &&
-      paginatedItems.isEmpty;
+      paginationLoadedEmpty;
 
   /// The search field and chip bar, shown above the list.
   Widget buildBrowseHeader({required String hintText}) {

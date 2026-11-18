@@ -83,7 +83,21 @@ class QueueSessionSnapshot {
 class QueueTrackRemovalResult {
   final Set<int> affectedSessionIds;
 
-  const QueueTrackRemovalResult({required this.affectedSessionIds});
+  /// Sessions whose current item was removed at the end of the queue with
+  /// no wrap (repeat off or one): their current item now rests on the last
+  /// survivor, and playback there must stop rather than go on.
+  final Set<int> endedSessionIds;
+
+  /// Every session whose removed current item got a landing decision in
+  /// this call (ended or not): the latest verdict on [endedSessionIds] for
+  /// these replaces any earlier one.
+  final Set<int> relandedSessionIds;
+
+  const QueueTrackRemovalResult({
+    required this.affectedSessionIds,
+    this.endedSessionIds = const {},
+    this.relandedSessionIds = const {},
+  });
 }
 
 /// The queue store. Every public writer is fenced (SC-01 rule 4, D16): the
@@ -344,7 +358,22 @@ class QueueRepository {
     // resolves it to null). Fall back to the first surviving entry so a queue
     // with remaining tracks stays restorable instead of resolving to null.
     if (currentItem == null && totalCount > 0) {
-      currentItem = await getFirstPlayableEntry(sessionId);
+      final danglingId = session.currentItemId;
+      if (danglingId != null) {
+        final at = await _db.customSelect(
+          'SELECT play_position FROM queue_session_play_order '
+          'WHERE session_id = ? AND item_id = ?',
+          variables: [Variable.withInt(sessionId), Variable.withInt(danglingId)],
+        ).getSingleOrNull();
+        if (at != null) {
+          final nextId = await _nextSurvivorItemId(
+              sessionId, at.read<int>('play_position'));
+          if (nextId != null) {
+            currentItem = await getPlaybackEntryForItem(sessionId, nextId);
+          }
+        }
+      }
+      currentItem ??= await getFirstPlayableEntry(sessionId);
     }
 
     return QueueSessionSnapshot(
@@ -352,6 +381,56 @@ class QueueRepository {
       totalCount: totalCount,
       currentItem: currentItem,
     );
+  }
+
+  /// The item id of the first entry after [afterPlayPosition] in play order
+  /// whose track row exists and whose track uuid is not in [removedUuids].
+  Future<int?> _nextSurvivorItemId(
+    int sessionId,
+    int afterPlayPosition, {
+    List<String> removedUuids = const [],
+  }) async {
+    final notRemoved = removedUuids.isEmpty
+        ? ''
+        : ' AND qsi.uuid_id NOT IN (${List.filled(removedUuids.length, '?').join(', ')})';
+    final row = await _db.customSelect(
+      'SELECT po.item_id AS item_id '
+      'FROM queue_session_play_order AS po '
+      'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+      'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+      'WHERE po.session_id = ? AND po.play_position > ?$notRemoved '
+      'ORDER BY po.play_position ASC LIMIT 1',
+      variables: [
+        Variable.withInt(sessionId),
+        Variable.withInt(afterPlayPosition),
+        for (final u in removedUuids) Variable.withString(u),
+      ],
+    ).getSingleOrNull();
+    return row?.read<int>('item_id');
+  }
+
+  /// The item id of the last surviving entry before [beforePlayPosition] in
+  /// play order (same survivor rule as [_nextSurvivorItemId]).
+  Future<int?> _previousSurvivorItemId(
+    int sessionId,
+    int beforePlayPosition,
+    List<String> removedUuids,
+  ) async {
+    final row = await _db.customSelect(
+      'SELECT po.item_id AS item_id '
+      'FROM queue_session_play_order AS po '
+      'INNER JOIN queue_session_items AS qsi ON po.item_id = qsi.item_id '
+      'INNER JOIN tracks AS t ON qsi.uuid_id = t.uuid_id '
+      'WHERE po.session_id = ? AND po.play_position < ? '
+      'AND qsi.uuid_id NOT IN (${List.filled(removedUuids.length, '?').join(', ')}) '
+      'ORDER BY po.play_position DESC LIMIT 1',
+      variables: [
+        Variable.withInt(sessionId),
+        Variable.withInt(beforePlayPosition),
+        for (final u in removedUuids) Variable.withString(u),
+      ],
+    ).getSingleOrNull();
+    return row?.read<int>('item_id');
   }
 
   /// The lowest-play-position entry whose track row still exists. Used as a
@@ -651,11 +730,26 @@ class QueueRepository {
     required int currentItemId,
     required int positionMs,
   }) {
+    // Conditional: a save naming an item that is no longer in the session
+    // (the player has not reconciled a sync removal yet) must not write the
+    // removed item back over the landing.
     return _fenced(
       () =>
-          (_db.update(
-            _db.queueSessions,
-          )..where((s) => s.id.equals(sessionId))).write(
+          (_db.update(_db.queueSessions)..where(
+                (s) =>
+                    s.id.equals(sessionId) &
+                    existsQuery(
+                      _db.selectOnly(_db.queueSessionItems)
+                        ..addColumns([_db.queueSessionItems.itemId])
+                        ..where(
+                          _db.queueSessionItems.sessionId.equals(sessionId) &
+                              _db.queueSessionItems.itemId.equals(
+                                currentItemId,
+                              ),
+                        ),
+                    ),
+              ))
+              .write(
             QueueSessionsCompanion(
               currentItemId: Value(currentItemId),
               currentPositionMs: Value(positionMs),
@@ -899,23 +993,68 @@ class QueueRepository {
     final placeholders = List.filled(uuids.length, '?').join(', ');
     final itemIdSubquery =
         'SELECT item_id FROM queue_session_items WHERE uuid_id IN ($placeholders)';
+
+    // Land each session whose current item is being removed, before the
+    // play-order rows go (the removed current's play_position is needed).
+    final removedCurrents = await _db.customSelect(
+      'SELECT s.id AS session_id, s.repeat_mode AS repeat_mode, '
+      'po.play_position AS play_position '
+      'FROM queue_sessions AS s '
+      'LEFT JOIN queue_session_play_order AS po '
+      'ON po.session_id = s.id AND po.item_id = s.current_item_id '
+      'WHERE s.current_item_id IN ($itemIdSubquery)',
+      variables: [for (final u in uuids) Variable.withString(u)],
+    ).get();
+    final landings = <int, int?>{};
+    final endedSessionIds = <int>{};
+    for (final row in removedCurrents) {
+      final sessionId = row.read<int>('session_id');
+      final position = row.readNullable<int>('play_position');
+      // A prepared, never-activated session is not playing: losing its
+      // current item clears it so activation refuses (6A.1b). A current item
+      // without a play-order row has no place to land from: cleared too.
+      if (position == null || _prepared.containsKey(sessionId)) {
+        landings[sessionId] = null;
+        continue;
+      }
+      var landing = await _nextSurvivorItemId(sessionId, position,
+          removedUuids: uuids);
+      if (landing == null) {
+        if (row.read<String>('repeat_mode') == 'all') {
+          landing = await _nextSurvivorItemId(sessionId, -1,
+              removedUuids: uuids);
+        } else {
+          landing = await _previousSurvivorItemId(sessionId, position, uuids);
+          if (landing != null) endedSessionIds.add(sessionId);
+        }
+      }
+      landings[sessionId] = landing;
+    }
+
     await _db.customStatement(
       'DELETE FROM queue_session_play_order WHERE item_id IN ($itemIdSubquery)',
       uuids,
     );
-    await _db.customStatement(
-      'UPDATE queue_sessions '
-      'SET current_item_id = NULL, current_position_ms = 0 '
-      'WHERE current_item_id IN ($itemIdSubquery)',
-      uuids,
-    );
+    // Sessions whose current item is not removed keep it; removed currents
+    // were landed above (NULL when nothing survives).
+    for (final entry in landings.entries) {
+      await _db.customStatement(
+        'UPDATE queue_sessions '
+        'SET current_item_id = ?, current_position_ms = 0 WHERE id = ?',
+        [entry.value, entry.key],
+      );
+    }
     await (_db.delete(
       _db.queueSessionItems,
     )..where((t) => t.uuidId.isIn(uuids))).go();
     await _compactQueueSessionPositions(affectedSessionIds.toList());
     await _touchSessions(affectedSessionIds);
 
-    return QueueTrackRemovalResult(affectedSessionIds: affectedSessionIds);
+    return QueueTrackRemovalResult(
+      affectedSessionIds: affectedSessionIds,
+      endedSessionIds: endedSessionIds,
+      relandedSessionIds: landings.keys.toSet(),
+    );
   }
 
   Future<void> deactivateAll() => _fenced(_deactivateAll);

@@ -12,7 +12,6 @@ from __future__ import annotations
 import itertools
 import logging
 import os
-import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +19,7 @@ from typing import Any, Callable, Optional
 
 from app import config
 from app.core.operator_log import operator_logger
+from app.core.sqlite_busy import is_sqlite_busy
 from app.database.database import ANY_OWNER
 from app.services import audio_identity
 from app.services.audio_identity import (
@@ -356,15 +356,9 @@ class AudioIdentityWorker(WorkerThread):
             return StepResult("tool_missing", uuid_id, TOOL_MISSING_RETRY_S)
         return self._record_attempt(subject, reason, now)
 
-    @staticmethod
-    def _is_busy(e: Exception) -> bool:
-        return isinstance(e, sqlite3.OperationalError) and any(
-            word in str(e).lower() for word in ("locked", "busy")
-        )
-
     def _after_exception(self, e: Exception) -> StepResult:
         uuid_id = self._uuid
-        if self._is_busy(e):
+        if is_sqlite_busy(e):
             logger.info("audio identity worker: database busy; retrying later")
             return StepResult("busy", uuid_id, BUSY_RETRY_S)
         if uuid_id is None:
@@ -391,7 +385,7 @@ class AudioIdentityWorker(WorkerThread):
                 self._stat1 = _stat(subject["file_path"])
             return self._record_attempt(subject, REASON_INTERNAL_ERROR, int(self._clock()), layer=layer)
         except Exception as e2:  # noqa: BLE001
-            if self._is_busy(e2):
+            if is_sqlite_busy(e2):
                 return StepResult("busy", uuid_id, BUSY_RETRY_S)
             if subject is None:
                 return StepResult("error", uuid_id, BUSY_RETRY_S)

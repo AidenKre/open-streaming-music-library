@@ -82,6 +82,12 @@ REGISTRY = {
     "upload_item_acknowledgements": _owned("upload_items"),
     # Spec 6 publication journal; needs its receipt and its item.
     "upload_commit_journal": _owned("upload_items", "operation_receipts"),
+    # Phase 8 deletion jobs: keyed (owner_id, operation_uuid) like their receipt.
+    "deletion_jobs": _owned("operation_receipts"),
+    # Phase 8 deletion job items: one row per target, keyed under their job.
+    "deletion_job_items": _owned("deletion_jobs"),
+    # Phase 8 deletion file journal: one row per item, keyed under its item.
+    "deletion_journal": _owned("deletion_job_items"),
     "fts_tracks": Entry(OWNED_THROUGH, parent="tracks", fts_rowid=True),
     "fts_artists": Entry(OWNED_THROUGH, parent="artists", fts_rowid=True),
     "fts_albums": Entry(OWNED_THROUGH, parent="albums", fts_rowid=True),

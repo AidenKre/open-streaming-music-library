@@ -48,8 +48,8 @@ def fresh(tmp_path):
     return path
 
 
-def test_latest_schema_version_is_15():
-    assert Database.LATEST_SCHEMA_VERSION == 15
+def test_latest_schema_version_is_16():
+    assert Database.LATEST_SCHEMA_VERSION == 16
 
 
 def test_history_events_columns(fresh):
@@ -57,7 +57,7 @@ def test_history_events_columns(fresh):
     cols = _columns(path, "history_events")
     assert {name: (t, nn) for name, (t, nn, _) in cols.items()} == PAYLOAD_COLUMNS
     assert [name for name, (_, _, pk) in cols.items() if pk] == ["event_uuid"]
-    assert user_version(path) == 15
+    assert user_version(path) == Database.LATEST_SCHEMA_VERSION
 
 
 def test_history_hook_failures_columns(fresh):

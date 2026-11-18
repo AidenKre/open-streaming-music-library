@@ -108,7 +108,10 @@ void main() {
   });
 
   test('deleteDamaged removes the kept file and the mark', () async {
-    final file = File('${tempDir.path}/a.bad')..writeAsBytesSync([9]);
+    // Under the downloads root: only files there are the app's to delete.
+    final file = File('${tempDir.path}/tracks/a.bad')
+      ..createSync(recursive: true)
+      ..writeAsBytesSync([9]);
     await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
         .write(TracksCompanion(damagedFilePath: Value(file.path)));
     await c.read(downloadsControlsProvider).deleteDamaged('a');

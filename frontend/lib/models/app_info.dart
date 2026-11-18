@@ -146,6 +146,7 @@ class AppInfo {
     this.conversion = const ConversionCapabilities(),
     this.features = const FeatureBlocks(),
     this.fromCache = false,
+    this.isBuiltInDefault = false,
   });
 
   /// True when this came from the prefs-cached blob or the built-in default,
@@ -153,12 +154,27 @@ class AppInfo {
   /// the UI; never enables a network action by itself.
   final bool fromCache;
 
+  /// True for the client's built-in fallback (no live answer, no usable
+  /// cache): nothing is known about the server's features, so an absent
+  /// block means unknown, not "not offered".
+  final bool isBuiltInDefault;
+
   /// This blob marked as cache-sourced.
   AppInfo asCached() => AppInfo(
     entities: entities,
     conversion: conversion,
     features: features,
     fromCache: true,
+    isBuiltInDefault: isBuiltInDefault,
+  );
+
+  /// This blob marked as the built-in fallback (also cache-sourced).
+  AppInfo asBuiltInDefault() => AppInfo(
+    entities: entities,
+    conversion: conversion,
+    features: features,
+    fromCache: true,
+    isBuiltInDefault: true,
   );
 
   /// The typed SC-03 feature blocks; an absent block means unsupported.

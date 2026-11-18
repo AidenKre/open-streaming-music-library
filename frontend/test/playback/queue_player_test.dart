@@ -1040,6 +1040,28 @@ void main() {
       expect(c.read(currentTrackProvider)?.uuidId, 'a');
     });
 
+    // Review r2 OPEN-r1be-01: a stream the server refuses with 503 (a
+    // permission or I/O error on the master, a pruned transcode) fails in the
+    // player with no HTTP status; the track check answers 200, so the track
+    // is kept: no skip, no stop, no source rebuilt, no second check.
+    test('a refused stream of a track the server still has (track check 200) '
+        'is kept: no skip, no stop', () async {
+      await fixture.insertSingles(['a', 'b']);
+      trackStatuses['a'] = 200;
+      final c = await playingList(const ['a', 'b']);
+      final seeks = fakePlayer.seekedItems.length;
+      final seeds = fakePlayer.seedCalls.length;
+      await fail();
+      await fail(); // the same source reported again
+      expect(issues.whereType<PlaybackSourceFailed>().map((i) => i.kind),
+          [SourceFailureKind.unknown]);
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(fakePlayer.seekedItems, hasLength(seeks));
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      expect(fakePlayer.refreshedSources, isEmpty);
+      expect(fakePlayer.stopCalls, 0);
+    });
+
     test('an uncertain failure is unknown and never skips', () async {
       await fixture.insertSingles(['a', 'b']);
       trackStatuses['a'] = 404;
@@ -4159,6 +4181,8 @@ void main() {
     expect(snapshot?.session.currentPositionMs, 75000);
   });
 
+  // 8-fix-r1 U20-B-01 (deliberately changed, was: lands on the first entry
+  // 'a' at play position 0): playback goes on with the next survivor.
   test(
     'sync queue mutation clears deleted current item and loads fallback',
     () async {
@@ -4185,9 +4209,9 @@ void main() {
         db.queueSessions,
       )..where((s) => s.id.equals(sessionId))).getSingle();
       expect(await _playOrderCount(db, sessionId), 2);
-      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
       expect(c.read(audioPositionProvider), Duration.zero);
-      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 0);
+      expect(c.read(queuePlayerProvider).queue.currentPlayPosition, 1);
       expect(c.read(queuePlayerProvider).queue.totalCount, 2);
       expect(
         c.read(queuePlayerProvider).queue.currentItemId,
@@ -4312,6 +4336,426 @@ void main() {
       expect(fakePlayer.seedCalls.last.autoPlay, isTrue);
     },
   );
+
+  // 8B.2b / 8-C01 (unit half), spec §6: "Existing tombstone path removes
+  // local metadata, queue entries and managed downloads, and `QueuePlayer`
+  // reconciles the current track (SC-27)." No playback-core change: the
+  // tombstone's queue edit and the sync state reach the player as in the
+  // app (`SyncService._deleteTracks` → `TrackSyncState` → reconcile).
+  group('8B.2b: a sync tombstone of queued tracks', () {
+    Future<void> tombstone(List<String> uuids) async {
+      // What `SyncService._deleteTracks` does, in its order.
+      await repo.removeTrackUuidsFromQueues(uuids);
+      for (final u in uuids) {
+        await db.customStatement(
+            'DELETE FROM trackmetadata WHERE uuid_id = ?', [u]);
+        await db.customStatement('DELETE FROM tracks WHERE uuid_id = ?', [u]);
+      }
+    }
+
+    test('the playing downloaded track and a future entry: both leave the '
+        'queue, the player lands on a survivor, and no seed names the '
+        'deleted file', () async {
+      await fixture.insertSingles(['a', 'b', 'c', 'd']);
+      await markDownloaded('b', '/dl/b');
+      final sync = _ScriptedSync();
+      final c = createContainer(sync: sync);
+      await playFromTrackList(c, const ['a', 'b', 'c', 'd'],
+          await fixture.track('b'), sourceType: 'test');
+      await pumpEventQueue();
+      final id = c.read(queuePlayerProvider).queue.sessionId!;
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      final seeds = fakePlayer.seedCalls.length;
+
+      await tombstone(['b', 'd']);
+      sync.push(TrackSyncState(
+        queueMutationVersion: 1,
+        affectedQueueSessionIds: {id},
+        downloadMutationVersion: 1,
+        deletedTrackUuids: const {'b', 'd'},
+      ));
+      await pumpEventQueue();
+
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId), ['a', 'c'],
+          reason: 'the surviving queue, in order');
+      final state = c.read(queuePlayerProvider);
+      expect(state.queue.sessionId, id);
+      expect(state.queue.totalCount, 2);
+      // 8-fix-r1 U20-B-01 (deliberately strengthened, was isIn(['a', 'c'])):
+      // the next survivor after b, not the first entry.
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+      expect((await repo.getActiveSession())?.currentItemId,
+          state.queue.currentItemId,
+          reason: 'state and the persisted cursor agree');
+      expect(state.playback.playWhenReady, isTrue, reason: 'playback goes on');
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      final seed = fakePlayer.seedCalls.last;
+      expect(seed.cause, PlaybackTransitionCause.queueReplacement,
+          reason: 'a genuine boundary: the deleted listen closes once');
+      expect(seed.entries.map((e) => e.uuidId), isNot(contains('b')));
+      expect(seed.entries.map((e) => e.uuidId), isNot(contains('d')));
+      expect(seed.entries.map((e) => e.filePath), isNot(contains('/dl/b')));
+    });
+
+    test('a future entry only: the current item continues where it was',
+        () async {
+      await fixture.insertSingles(['a', 'b', 'c']);
+      await markDownloaded('a', '/dl/a');
+      final sync = _ScriptedSync();
+      final c = createContainer(sync: sync);
+      await playFromTrackList(c, const ['a', 'b', 'c'],
+          await fixture.track('a'), sourceType: 'test');
+      await c.read(queuePlayerProvider.notifier)
+          .seek(const Duration(seconds: 40));
+      final id = c.read(queuePlayerProvider).queue.sessionId!;
+      final item = c.read(queuePlayerProvider).queue.currentItemId;
+
+      await tombstone(['c']);
+      sync.push(TrackSyncState(
+          queueMutationVersion: 1, affectedQueueSessionIds: {id}));
+      await pumpEventQueue();
+
+      expect((await sessionTracksOf(c)).map((e) => e.uuidId), ['a', 'b']);
+      expect(c.read(queuePlayerProvider).queue.currentItemId, item);
+      expect(c.read(audioPositionProvider), const Duration(seconds: 40));
+      expect(fakePlayer.seedCalls.last.cause,
+          PlaybackTransitionCause.reconcileContinuation);
+      expect(fakePlayer.seedCalls.last.entries.map((e) => e.uuidId),
+          isNot(contains('c')));
+    });
+  });
+
+  // 8-fix-r1 U20-B-01 (coordinator decision, logged major deviation): when a
+  // sync removes the playing track, playback lands on the next survivor in
+  // play order; only repeat-all wraps; at the end otherwise it stops there
+  // (no restart from the first track, no autoplay).
+  group('U20-B-01: where playback lands after a sync removes the playing '
+      'track', () {
+    var version = 0;
+    setUp(() => version = 0);
+
+    /// The tombstone as `SyncService._deleteTracks` applies it, and the sync
+    /// state it publishes.
+    Future<void> tombstone(_ScriptedSync sync, List<String> uuids) async {
+      final removal = await repo.removeTrackUuidsFromQueues(uuids);
+      for (final u in uuids) {
+        await db.customStatement(
+            'DELETE FROM trackmetadata WHERE uuid_id = ?', [u]);
+        await db.customStatement('DELETE FROM tracks WHERE uuid_id = ?', [u]);
+      }
+      version++;
+      sync.push(TrackSyncState(
+        queueMutationVersion: version,
+        affectedQueueSessionIds: removal.affectedSessionIds,
+        endedQueueSessionIds: removal.endedSessionIds,
+      ));
+      await pumpEventQueue();
+    }
+
+    Future<ProviderContainer> playing(
+        _ScriptedSync sync, List<String> uuids, String current) async {
+      await fixture.insertSingles(uuids);
+      final c = createContainer(sync: sync);
+      await playFromTrackList(c, uuids, await fixture.track(current),
+          sourceType: 'test');
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, current);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      return c;
+    }
+
+    Future<void> setRepeat(ProviderContainer c, QueueRepeatMode mode) async {
+      final notifier = c.read(queuePlayerProvider.notifier);
+      while (c.read(queuePlayerProvider).queue.repeatMode != mode) {
+        await notifier.cycleQueueRepeatMode();
+      }
+    }
+
+    test('the last track with repeat off: stops on the end of the queue, '
+        'paused, not on the first track', () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'c');
+      final id = c.read(queuePlayerProvider).queue.sessionId!;
+      final seeds = fakePlayer.seedCalls.length;
+
+      await tombstone(sync, const ['c']);
+
+      final state = c.read(queuePlayerProvider);
+      expect(state.queue.sessionId, id, reason: 'the queue is kept');
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      expect(state.playback.playWhenReady, isFalse, reason: 'no autoplay');
+      expect(fakePlayer.seedCalls, hasLength(seeds + 1));
+      expect(fakePlayer.seedCalls.last.autoPlay, isFalse);
+      expect(fakePlayer.seedCalls.last.cause,
+          PlaybackTransitionCause.queueReplacement);
+      expect((await repo.getActiveSession())?.currentItemId,
+          state.queue.currentItemId);
+    });
+
+    // Sign-off OPEN-8-11 (owner, 2026-11-17: "Follow the recommendation"):
+    // an end landing rests paused even when an OS interruption had paused
+    // playback first; a landing that plays on keeps resuming as before.
+    Future<void> interruption(AudioSessionEvent event) async {
+      sessionPort.emit(event);
+      await pumpEventQueue();
+    }
+
+    test('OPEN-8-11: interrupted, then the playing last track is deleted: '
+        'the end of the interruption does not start the new last track',
+        () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'c');
+      await interruption(
+          const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+
+      await tombstone(sync, const ['c']);
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      final plays = fakePlayer.playCalls;
+
+      await interruption(
+          const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      expect(fakePlayer.playCalls, plays, reason: 'rests paused (DEV-8-09)');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+    });
+
+    test('OPEN-8-11 (unchanged): interrupted, then the playing middle track '
+        'is deleted: the next track plays when the interruption ends',
+        () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'b');
+      await interruption(
+          const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      await tombstone(sync, const ['b']);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse,
+          reason: 'still interrupted');
+      final plays = fakePlayer.playCalls;
+
+      await interruption(
+          const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      expect(fakePlayer.playCalls, plays + 1);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    test('OPEN-8-11 (unchanged): interrupted, then a track that is not '
+        'playing is deleted: the interruption end resumes the same track',
+        () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'c');
+      await interruption(
+          const AudioInterruptionBegan(AudioInterruptionKind.pause));
+      await tombstone(sync, const ['a']);
+      final plays = fakePlayer.playCalls;
+
+      await interruption(
+          const AudioInterruptionEnded(AudioInterruptionKind.pause));
+      expect(fakePlayer.playCalls, plays + 1);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    test('F903-B-03: the playing last track is deleted and the landing\'s '
+        'queue read fails: nothing changes, the engine is not paused',
+        () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'c');
+      final before = c.read(queuePlayerProvider);
+      final pauses = fakePlayer.pauseCalls;
+      final seeds = fakePlayer.seedCalls.length;
+
+      repo.getTrackForItemError = StateError('db busy'); // the seed's read
+      await tombstone(sync, const ['c']);
+      repo.getTrackForItemError = null;
+
+      expect(fakePlayer.pauseCalls, pauses,
+          reason: 'commit last: a failed read leaves the engine as it was');
+      expect(fakePlayer.seedCalls, hasLength(seeds));
+      final state = c.read(queuePlayerProvider);
+      expect(state.playback.playWhenReady, isTrue);
+      expect(state.queue.currentItemId, before.queue.currentItemId);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    test('the last track under repeat-all: wraps to the first and plays on',
+        () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'c');
+      await setRepeat(c, QueueRepeatMode.all);
+
+      await tombstone(sync, const ['c']);
+
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      expect(fakePlayer.seedCalls.last.autoPlay, isTrue);
+    });
+
+    test('repeat-one: the next track plays in the middle; at the end it '
+        'stops', () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'b');
+      await setRepeat(c, QueueRepeatMode.one);
+
+      await tombstone(sync, const ['b']);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+
+      await tombstone(sync, const ['c']);
+      expect(c.read(currentTrackProvider)?.uuidId, 'a');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+      expect(fakePlayer.seedCalls.last.autoPlay, isFalse);
+    });
+
+    test('shuffled: the next track of the shuffled order', () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c', 'd', 'e'], 'a');
+      final notifier = c.read(queuePlayerProvider.notifier);
+      await notifier.toggleShuffle();
+      await notifier.skipNext();
+      await pumpEventQueue();
+      final order = (await sessionTracksOf(c)).map((e) => e.uuidId).toList();
+      expect(c.read(currentTrackProvider)?.uuidId, order[1]);
+
+      await tombstone(sync, [order[1]]);
+
+      expect(c.read(currentTrackProvider)?.uuidId, order[2],
+          reason: 'the next of the shuffled order, not its first entry');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+    });
+
+    test('a removed track that is not playing changes nothing about what '
+        'plays', () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'b');
+      await c.read(queuePlayerProvider.notifier)
+          .seek(const Duration(seconds: 30));
+      final item = c.read(queuePlayerProvider).queue.currentItemId;
+
+      await tombstone(sync, const ['a']);
+
+      expect(c.read(queuePlayerProvider).queue.currentItemId, item);
+      expect(c.read(audioPositionProvider), const Duration(seconds: 30));
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      expect(fakePlayer.seedCalls.last.cause,
+          PlaybackTransitionCause.reconcileContinuation);
+    });
+
+    // Review r1-fe-a #1: the sync publishes only at the end of its run;
+    // a cursor save of the removed item in between (here a pause) must not
+    // send playback back to the first track.
+    test('a cursor save between the removal and the reconcile keeps the '
+        'landing', () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'b');
+      final id = c.read(queuePlayerProvider).queue.sessionId!;
+
+      final removal = await repo.removeTrackUuidsFromQueues(const ['b']);
+      await c.read(queuePlayerProvider.notifier).pause();
+      sync.push(TrackSyncState(
+        queueMutationVersion: 1,
+        affectedQueueSessionIds: removal.affectedSessionIds,
+        endedQueueSessionIds: removal.endedSessionIds,
+      ));
+      await pumpEventQueue();
+
+      expect(c.read(queuePlayerProvider).queue.sessionId, id);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    test('an ended report never pauses an item that is still current (the '
+        'reconcile ran after the cursor moved on)', () async {
+      final sync = _ScriptedSync();
+      final c = await playing(sync, const ['a', 'b', 'c'], 'b');
+      final id = c.read(queuePlayerProvider).queue.sessionId!;
+      final item = c.read(queuePlayerProvider).queue.currentItemId;
+      await repo.removeTrackUuidsFromQueues(const ['c']);
+
+      sync.push(TrackSyncState(
+        queueMutationVersion: 1,
+        affectedQueueSessionIds: {id},
+        endedQueueSessionIds: {id},
+      ));
+      await pumpEventQueue();
+
+      expect(c.read(queuePlayerProvider).queue.currentItemId, item);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+    });
+
+    // 8-fix-r3 8-L-02 (live gate B1, PD.c): the real engine keeps a play it
+    // already issued across a seed without autoplay, so the end landing
+    // played on once the engine reported its load. These tests let the fake
+    // engine report its desired transport after the reconcile's seed, as the
+    // adapter does, and judge what the engine was left wanting.
+    group('with the engine reporting its transport (8-L-02)', () {
+      Future<void> enginePlaying() async {
+        fakePlayer.emitPlayerState(const EngineTransportState(
+            true, EngineProcessingState.ready));
+        await pumpEventQueue();
+      }
+
+      Future<void> engineSettles() async {
+        fakePlayer.emitSettledTransport();
+        await pumpEventQueue();
+      }
+
+      test('(c) the last track, playing, repeat off: the engine is stopped on '
+          'the last survivor, not left playing it', () async {
+        final sync = _ScriptedSync();
+        final c = await playing(sync, const ['a', 'b', 'c', 'd', 'e'], 'e');
+        await enginePlaying();
+        expect(fakePlayer.wantsPlaying, isTrue);
+
+        await tombstone(sync, const ['e']);
+        await engineSettles();
+
+        final state = c.read(queuePlayerProvider);
+        expect(c.read(currentTrackProvider)?.uuidId, 'd');
+        expect(fakePlayer.wantsPlaying, isFalse,
+            reason: 'no autoplay: the engine must not keep playing');
+        expect(state.playback.playWhenReady, isFalse);
+        expect(state.playback.status, isNot(PlayerStatus.playing));
+        expect(c.read(audioPositionProvider), Duration.zero);
+      });
+
+      test('(a) the playing track mid-queue: the next track plays on',
+          () async {
+        final sync = _ScriptedSync();
+        final c = await playing(sync, const ['a', 'b', 'c', 'd'], 'b');
+        await enginePlaying();
+
+        await tombstone(sync, const ['b']);
+        await engineSettles();
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'c');
+        expect(fakePlayer.wantsPlaying, isTrue);
+        expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      });
+
+      test('(b) paused after a seek: lands on the next track, paused, at the '
+          'start', () async {
+        final sync = _ScriptedSync();
+        final c = await playing(sync, const ['a', 'b', 'c', 'd'], 'b');
+        await enginePlaying();
+        final notifier = c.read(queuePlayerProvider.notifier);
+        await notifier.pause();
+        await notifier.seek(const Duration(seconds: 3));
+        fakePlayer.emitPlayerState(const EngineTransportState(
+            false, EngineProcessingState.ready));
+        await pumpEventQueue();
+
+        await tombstone(sync, const ['b']);
+        await engineSettles();
+
+        expect(c.read(currentTrackProvider)?.uuidId, 'c');
+        expect(fakePlayer.wantsPlaying, isFalse);
+        expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+        expect(c.read(audioPositionProvider), Duration.zero);
+      });
+    });
+  });
 
   group('6A.1b (SC-27, D3): the queue order uses the injected generator', () {
     test('toggling shuffle on draws from the overridden generator', () async {
@@ -8037,6 +8481,15 @@ class FakePlaybackEngine
   int playCalls = 0;
   int pauseCalls = 0;
   int stopCalls = 0;
+
+  /// The desired transport as `JustAudioEngine` keeps it: a play stays
+  /// issued across a seed without autoplay (just_audio keeps `playing`
+  /// across a playlist replacement); only a pause or a stop clears it.
+  bool wantsPlaying = false;
+
+  /// What the adapter reports once a seeded load settles.
+  void emitSettledTransport() => emitPlayerState(
+      EngineTransportState(wantsPlaying, EngineProcessingState.ready));
   EngineLoopMode? lastLoopMode;
   double? lastVolume;
   String? lastStreamQuality;
@@ -8094,6 +8547,7 @@ class FakePlaybackEngine
     // Like production's structural mutation: commit identity silently.
     if (autoPlay) {
       playCalls++;
+      wantsPlaying = true;
     }
   }
 
@@ -8437,11 +8891,13 @@ class FakePlaybackEngine
   @override
   Future<void> play() async {
     playCalls++;
+    wantsPlaying = true;
   }
 
   @override
   Future<void> pause() async {
     pauseCalls++;
+    wantsPlaying = false;
   }
 
   @override
@@ -8458,6 +8914,7 @@ class FakePlaybackEngine
   @override
   Future<void> stop() async {
     stopCalls++;
+    wantsPlaying = false;
   }
 
   int setLoopModeFailures = 0;

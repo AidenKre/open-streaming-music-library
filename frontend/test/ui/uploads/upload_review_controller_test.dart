@@ -12,13 +12,16 @@
 // stops when the item changes or the page closes; one submit at a time.
 import 'dart:async';
 
+import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart' show StateProvider;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/providers/providers.dart' show databaseProvider;
 import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
 import 'package:frontend/services/uploads/upload_duplicate_decisions.dart';
@@ -31,6 +34,7 @@ import 'package:frontend/ui/preview_controller.dart';
 import 'package:frontend/ui/uploads/upload_review_controller.dart';
 
 import '../../helpers/duplicate_check_fixtures.dart';
+import '../../repositories/catalog_seed.dart';
 import '../fake_uploads_controls.dart';
 
 UploadItem _item(
@@ -644,6 +648,71 @@ void main() {
       await settle();
       expect(c.current!.itemUuid, 'c');
       expect(c.current!.done, isTrue);
+      c.dispose();
+    });
+  });
+
+  // 8B.2b (D27; spec §6 last paragraph: "Remove converted/uploaded receipt
+  // navigation actions when the referenced track no longer resolves, but
+  // preserve historical outcome records"; 8-C05 unit half), over real Drift:
+  // the imported track resolves through the local mirror, and a sync
+  // tombstone deleting it takes View track away; the outcome stays.
+  group('View track after a tombstone (real Drift)', () {
+    late AppDatabase db;
+
+    setUp(() async {
+      db = AppDatabase(NativeDatabase.memory());
+      addTearDown(db.close);
+      final seed = CatalogSeed(db);
+      await seed.artist(1, 'Aria');
+      await seed.album(1, artistId: 1, name: 'One');
+      await seed.track('t-3', artistId: 1, albumId: 1);
+      container.dispose();
+      container = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          uploadReviewProvider.overrideWithValue(review),
+          appInfoProvider.overrideWith((ref) async => defaultAppInfo()),
+          previewControlsProvider.overrideWithValue(preview),
+          uploadIntentsProvider.overrideWith((ref) => intents.stream),
+          uploadsOverviewProvider.overrideWith((ref) => ref.watch(overview)),
+        ],
+      );
+    });
+
+    Future<void> drain() async {
+      for (var i = 0; i < 5; i++) {
+        await settle();
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+
+    test('resolves while the track exists; a tombstone removes it and the '
+        'imported outcome stays', () async {
+      final c = await started(at: 'c');
+      local({'c': ('committing', null)});
+      await settle();
+      review.server['c'] = _item('c', state: 'imported', result: 't-3');
+      local({'c': ('imported', null)});
+      await drain();
+      expect(c.currentTrack?.uuidId, 't-3');
+      expect(c.lastImported?.track?.uuidId, 't-3');
+      final status = c.current!.statusText;
+
+      // What `SyncService._deleteTracks` does to the row (child first).
+      await (db.delete(db.trackmetadata)
+            ..where((t) => t.uuidId.equals('t-3')))
+          .go();
+      await (db.delete(db.tracks)..where((t) => t.uuidId.equals('t-3'))).go();
+      await drain();
+
+      expect(c.currentTrack, isNull, reason: 'no View track on the item');
+      expect(c.lastImported!.track, isNull,
+          reason: 'no View track on the imported line');
+      expect(c.lastImported!.displayName, 'c.flac');
+      expect(c.current!.itemUuid, 'c');
+      expect(c.current!.done, isTrue);
+      expect(c.current!.statusText, status, reason: 'the outcome is kept');
       c.dispose();
     });
   });

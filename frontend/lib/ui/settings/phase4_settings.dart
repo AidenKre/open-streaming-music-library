@@ -291,8 +291,8 @@ class _ConversionsRow extends StatelessWidget {
   }
 }
 
-/// Signs out but keeps every local store (spec 7.6), so it needs no
-/// confirmation.
+/// Signs out but keeps every local store (spec 7.6). It asks first only when
+/// unsent work would be dropped.
 class _LogOutRow extends ConsumerWidget {
   const _LogOutRow();
 
@@ -304,7 +304,9 @@ class _LogOutRow extends ConsumerWidget {
       subtitle: const Text(
         'Sign out of this account; downloads and library stay on this device',
       ),
-      onTap: () => unawaited(ref.read(sessionControlsProvider).logout()),
+      onTap: () => unawaited(
+        logOutAfterWarning(context, ref.read(sessionControlsProvider)),
+      ),
     );
   }
 }

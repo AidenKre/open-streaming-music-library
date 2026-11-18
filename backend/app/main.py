@@ -43,6 +43,7 @@ from app.database import (
     SearchEntityType,
     SearchParameter,
     TrackNotFound,
+    TrackPendingDeletion,
 )
 from app.models import (
     Album,
@@ -74,6 +75,7 @@ from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.api_return_models import (
     AuthCapabilities,
     HistoryCapabilities,
+    LibraryToolsCapabilities,
     ServerInfo,
     UploadLimitsInfo,
     UploadsCapabilities,
@@ -81,11 +83,14 @@ from app.models.api_return_models import (
 from app.services.upload_limits import effective_upload_limits
 from app.routers.auth import router as auth_router
 from app.routers.history import router as history_router
+from app.routers.deletions import router as deletions_router
+from app.routers.duplicates import router as duplicates_router
 from app.routers.uploads import router as uploads_router
 from app.core.api_errors import api_error
 from app.services.metadata import TagWriteError
 from app.services.job_runtime import CancelTokens
 from app.services.storage_ledger import StagedQuota, StorageLedger
+from app.services import deletion_recovery
 from app.services import upload_commit, upload_janitor, upload_publish, upload_recovery
 from app.services import upload_receipt as upload_receipts
 from app.services import upload_validation, upload_zip
@@ -104,12 +109,13 @@ from app.services.conversion import (
     NoOpConversion,
     PendingRecovery,
     TargetPathTaken,
-    evict_converted_track_caches,
     reconcile_conversion_jobs,
 )
+from app.services.deletion_errors import track_pending_deletion_error
 from app.services.track_editor import (
     MasterSwapPending,
     MasterWriteError,
+    PendingOldMasters,
     TrackEditor,
     finish_kept_journal_rows,
     reconcile_journal,
@@ -120,6 +126,8 @@ from app.services.import_folders import (
 )
 from app.services.import_archive import import_archive_limits, sweep_workspace, upload_only_settings_notice
 from app.services.ingestion import IMPORTED_DIR_NAME
+from app.services.deletion_worker import DeletionExecutor, DeletionWorker
+from app.services.encoded_cache import evict_track_caches
 from app.services.pipeline import make_pipeline
 from app.services.track_locks import TrackLocks
 from app.services import (
@@ -134,13 +142,15 @@ from app.services import (
     normalize_quality,
     probe_available_encoders,
 )
-from app.services.encoder_coordinator import (
-    EncodeResult,
-    PrefetchOutcome,
-    SourceUnavailable,
-)
+from app.services.encoder_coordinator import PrefetchOutcome
 from app.services.ffmpeg_runner import FfmpegProcessRegistry, kill_orphaned_ffmpeg
 from app.services import audio_identity
+from app.services.track_source import (
+    TrackSourceError,
+    live_source_path,
+    live_track_owner,
+    open_track_source,
+)
 from app.services.fingerprinter import detect_fingerprinter
 from app.services.startup_recovery import StartupStep, run_startup_recovery
 from app.services.file_watcher import stop_watchers
@@ -192,22 +202,14 @@ async def lifespan(_app: FastAPI):
 # TODO: Dependency inject depends on get_database into api endpoints (and make the new function needed for this)
 app = FastAPI(lifespan=lifespan)
 app.include_router(uploads_router)
+app.include_router(deletions_router)
+app.include_router(duplicates_router)
 app.include_router(history_router)
 app.include_router(auth_router)
 # Spec §5.3: the auth boundary is the outermost user middleware. Starlette
 # wraps the last-added middleware outermost, so add any future middleware
 # before this line.
 app.add_middleware(AuthMiddleware)
-
-
-def _resolve_track_source_path(database: Database, uuid_id: str) -> Optional[Path]:
-    track = database.get_track_by_uuid(uuid_id, owner_id=ANY_OWNER)
-    return track.file_path if track is not None else None
-
-
-def _resolve_track_owner(database: Database, uuid_id: str) -> Optional[int]:
-    track = database.get_track_by_uuid(uuid_id, owner_id=ANY_OWNER)
-    return track.owner_id if track is not None else None
 
 
 def _interrupted_conversion_uuids(database: Database) -> set[str]:
@@ -231,6 +233,7 @@ def _startup_recovery_steps(
     uploads_root: Path,
     boot_id: str,
     cover_art,
+    track_locks,
 ) -> list[StartupStep]:
     # A convert journal row outliving a crash means its commit may have landed
     # without the encoded caches being evicted. Read the rows before journal
@@ -241,7 +244,8 @@ def _startup_recovery_steps(
     def edit_journal() -> None:
         # Finish/revert any edit interrupted by a crash before serving requests.
         reconcile_journal(
-            database, settings.music_library_dir, identity_signal=identity_signal
+            database, settings.music_library_dir, identity_signal=identity_signal,
+            cover_art=cover_art,
         )
 
     def conversion_jobs() -> None:
@@ -255,7 +259,7 @@ def _startup_recovery_steps(
             reconcile_conversion_jobs(database, staging_dir)
         finally:
             for uuid_id in interrupted_conversion_uuids:
-                evict_converted_track_caches(uuid_id, encoded_cache, default_cache)
+                evict_track_caches(uuid_id, encoded_cache, default_cache)
 
     def audio_identity_reconcile() -> None:
         reconcile_audio_identity(
@@ -310,6 +314,18 @@ def _startup_recovery_steps(
         finally:
             upload_zip.reconcile_expanded_archives(database, uploads_root)
 
+    # Unresolved, like the deletion worker's executor: journal quarantine paths
+    # are compared as strings built from this root.
+    deletion_journal, deletion_jobs, deletion_janitor = deletion_recovery.startup_steps(
+        database,
+        music_library_dir=settings.music_library_dir,
+        track_locks=track_locks,
+        cover_art=cover_art,
+        cache=encoded_cache,
+        default_cache=default_cache,
+        boot_id=boot_id,
+    )
+
     # Fatal: a failure escaping any of these aborted startup before the
     # registry existed; kept.
     return [
@@ -320,17 +336,24 @@ def _startup_recovery_steps(
         # Non-fatal: the worker claims only committing journals, so a skipped
         # journal is just left for the next start.
         StartupStep("upload commit journal", upload_commit_reconcile),
+        # SC-16e, O4 non-fatal: a failure leaves the journal, so the track stays
+        # hidden and mutators keep refusing it.
+        deletion_journal,
         # Receipts settle or release their rows first (non-fatal: a failure leaves
         # rows as they were).
         StartupStep("upload receipts", upload_receipt_reconcile),
         # Then items a dead process was validating go back to the queue.
         StartupStep("upload validation", upload_validation_reconcile),
+        # SC-16e, O4 non-fatal: unreclaimed items wait for the next start.
+        deletion_jobs,
         # After job reclaim (the conversion step fails jobs left running), before
         # any janitor. Non-fatal: a failure only leaves orphaned reservations
         # counted, which makes admission more conservative, never less.
         StartupStep("storage reservations", storage_ledger.reconcile),
         # Last. Non-fatal: a skipped pass only leaves stages for the next pass.
         StartupStep("upload janitor", upload_janitor_once),
+        # SC-16e, O4 non-fatal: a failed pass leaves the journal for the next one.
+        deletion_janitor,
     ]
 
 
@@ -387,6 +410,7 @@ def startup_event():
     app.state.upload_validation_worker = None
     app.state.upload_commit_worker = None
     app.state.upload_janitor_thread = None
+    app.state.deletion_worker = None
     app.state.upload_commit_registry = None
     app.state.upload_validation_registry = None
     app.state.fingerprinter = None
@@ -502,10 +526,14 @@ def _startup_locked():
         uploads_root=settings.music_library_dir.resolve() / UPLOADS,
         boot_id=app.state.boot_id,
     )
+    # Old masters kept after a failed durable point; every runtime journal finisher
+    # (edit, conversion, idle pass) shares this one registry.
+    app.state.pending_old_masters = PendingOldMasters()
     app.state.track_editor = TrackEditor(
         music_library_dir=settings.music_library_dir,
         staging_dir=staging_dir,
         identity_signal=app.state.identity_wakeup,
+        pending_old_masters=app.state.pending_old_masters,
     )
     # Independent of the worker flag; a missing tool gives None versions.
     matcher_version = default_matcher_version()
@@ -562,6 +590,7 @@ def _startup_locked():
             uploads_root=settings.music_library_dir.resolve() / UPLOADS,
             boot_id=app.state.boot_id,
             cover_art=app.state.cover_art_manager,
+            track_locks=app.state.track_locks,
         )
     )
 
@@ -578,13 +607,13 @@ def _startup_locked():
 
     encoder_coordinator = EncoderCoordinator(
         cache=encoded_cache,
-        source_lookup=lambda uuid_id: _resolve_track_source_path(database, uuid_id),
+        source_lookup=lambda uuid_id: live_source_path(database, uuid_id),
         workers=max(1, settings.encoded_cache_prefetch_workers),
         default_cache=default_cache,
         default_quality=default_quality,
         all_uuids_fn=app.state.admin_library.get_all_track_uuids,
         admin_owner_id=app.state.admin_user_id,
-        owner_lookup=lambda uuid_id: _resolve_track_owner(database, uuid_id),
+        owner_lookup=lambda uuid_id: live_track_owner(database, uuid_id),
     )
     app.state.encoder_coordinator = encoder_coordinator
     encoder_coordinator.startup()
@@ -608,6 +637,7 @@ def _startup_locked():
         available_encoders=app.state.available_encoders,
         storage_ledger=app.state.storage_ledger,
         identity_signal=app.state.identity_wakeup,
+        pending_old_masters=app.state.pending_old_masters,
     )
     app.state.conversion_orchestrator.resume_queued()
 
@@ -772,6 +802,32 @@ def _startup_locked():
         app.state.upload_janitor_thread = janitor_thread
         janitor_thread.start()
 
+    if settings.enable_deletion_worker:
+        # Assigned before start() so a failing start is cleaned up by startup_event.
+        deletion_executor = DeletionExecutor(
+            database,
+            # Unresolved: the path check accepts stored masters under the
+            # configured root or under its real path.
+            music_library_dir=settings.music_library_dir,
+            track_locks=app.state.track_locks,
+            cover_art=app.state.cover_art_manager,
+            cache=app.state.encoded_cache,
+            default_cache=app.state.default_cache,
+            boot_id=app.state.boot_id,
+        )
+        deletion_worker = DeletionWorker(
+            deletion_executor,
+            idle_poll_s=5.0,
+            janitor=deletion_recovery.DeletionJanitor(
+                database,
+                executor=deletion_executor,
+                music_library_dir=settings.music_library_dir,
+            ),
+            janitor_interval_s=settings.deletion_janitor_interval_s,
+        )
+        app.state.deletion_worker = deletion_worker
+        deletion_worker.start()
+
     # Last, and outside the watcher block: it needs its own stop flag because
     # import_stop does not exist when the watcher is off. Assigned before
     # start() so a failing start is cleaned up by startup_event.
@@ -787,6 +843,7 @@ def _startup_locked():
                 database, settings.music_library_dir, app.state.track_locks,
                 identity_signal=app.state.identity_wakeup,
                 reported=set(),  # each failing row is logged once per process
+                pending_old_masters=app.state.pending_old_masters,
             ),
         )
         app.state.identity_worker = worker
@@ -800,6 +857,7 @@ def _background_workers(state) -> list[tuple[object, object]]:
     is alive. A new worker (Phase 8's deletion worker, Phase 9's sender) adds
     one line here."""
     entries = (
+        (getattr(state, "deletion_worker", None), None),
         (getattr(state, "upload_janitor_thread", None), None),
         (getattr(state, "upload_commit_worker", None), getattr(state, "upload_commit_registry", None)),
         (getattr(state, "upload_validation_worker", None), getattr(state, "upload_validation_registry", None)),
@@ -1162,42 +1220,17 @@ def stream_track(
             detail=f"Unsupported quality preset: {quality}",
         )
 
-    search_parameters = [SearchParameter(column="uuid_id", operator="=", value=uuid_id)]
-    track_list: List[Track] = library.get_tracks(
-        search_parameters=search_parameters
-    )
-    if len(track_list) <= 0:
-        raise HTTPException(
-            status_code=404, detail=f"Could not find track with uuid: {uuid_id}"
-        )
-    track: Track = track_list[0]
-    # None = unknown; a real 0 is kept so the header can report it.
-    source_bitrate = (
-        int(track.metadata.bitrate_kbps)
-        if track.metadata.bitrate_kbps is not None else None
-    )
-
-    coordinator: EncoderCoordinator = app.state.encoder_coordinator
     try:
-        encode_result: Optional[EncodeResult] = coordinator.encode_for_stream(
+        opened = open_track_source(
+            library,
             uuid_id,
             quality_canonical,
-            source_bitrate_kbps=source_bitrate,
-            source_path=track.file_path,
-            owner_id=track.owner_id,
+            coordinator=app.state.encoder_coordinator,
         )
-    except SourceUnavailable:
-        # Track row exists but its source file is gone — 404 so clients drop it
-        # instead of retrying a permanently-missing file as if it were transient.
-        raise HTTPException(
-            status_code=404,
-            detail=f"Source file for track {uuid_id} is no longer available",
-        )
-    if encode_result is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unable to encode track {uuid_id} at quality {quality_canonical}",
-        )
+    except TrackSourceError as exc:
+        raise exc.http()
+    track = opened.track
+    encode_result = opened.encode
     file_path = encode_result.path
 
     # Use audio/mp4 only when we actually transcoded; for passthrough (including
@@ -1234,22 +1267,8 @@ def stream_track(
         "X-Track-Revision": str(track.revision),
     }
 
-    # Open the cache file eagerly (before returning the StreamingResponse) so
-    # the active file descriptor pins the inode. EncodedCache pruning and
-    # default-quality changes may unlink the path after we validate it but
-    # before a lazy generator would otherwise open it; on Unix the open
-    # handle keeps the data readable even after unlink, so streaming
-    # survives concurrent cache eviction.
-    try:
-        f = file_path.open("rb")
-    except FileNotFoundError:
-        logger.warning("track file is gone before open: %s", file_path)
-        raise HTTPException(
-            status_code=404, detail="The track's file is no longer available"
-        )
-
     return ranged_file_response(
-        f,
+        opened.file,
         media_type=media_type,
         range_header=request.headers.get("range"),
         headers=extra_headers,
@@ -1614,6 +1633,11 @@ def get_app_info():
                 **asdict(effective_upload_limits(app.state.settings))
             )
         ),
+        library_tools=LibraryToolsCapabilities(
+            server_delete=app.state.settings.library_delete_enabled,
+            # 8A.4: the /tracks/duplicates endpoints exist; they need no switch.
+            duplicate_review=True,
+        ),
         entities={
             "track": EntityInfo(
                 fields=track_fields, actions=["convert"] if targets else []
@@ -1652,7 +1676,8 @@ def patch_track(
     confirmation-gated ``db_and_master`` also rewrites the file tags and
     relocates the master when artist/album change (WAV / missing master degrade
     to DB-only with ``master_written=False``). Per-uuid serialized; the DB
-    layer's typed conflicts map to HTTP status codes."""
+    layer's typed conflicts map to HTTP status codes. A track pending deletion
+    is refused with 409 ``track_pending_deletion``."""
     uuid_id = str(uuid_id)
     track_editor: TrackEditor = app.state.track_editor
     track_locks: TrackLocks = app.state.track_locks
@@ -1668,6 +1693,8 @@ def patch_track(
             )
     except TrackNotFound:
         raise HTTPException(status_code=404, detail="Track not found")
+    except TrackPendingDeletion:
+        raise track_pending_deletion_error(409)
     except RevisionConflict as e:
         raise HTTPException(
             status_code=409,
@@ -1737,6 +1764,8 @@ def post_job(
         )
     except TrackNotFound:
         raise HTTPException(status_code=404, detail="Track not found")
+    except TrackPendingDeletion:
+        raise track_pending_deletion_error(409)
     except MasterNotFound:
         raise HTTPException(status_code=404, detail="Master file not found")
     except RevisionConflict as e:

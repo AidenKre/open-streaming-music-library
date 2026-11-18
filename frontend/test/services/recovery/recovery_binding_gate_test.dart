@@ -213,9 +213,11 @@ void main() {
       RecoveryPriority.appInfo: true,
       RecoveryPriority.history: true,
       RecoveryPriority.uploads: true,
+      RecoveryPriority.deleteJobs: true,
       RecoveryPriority.resumeDownloads: true,
       RecoveryPriority.resumeConversions: true,
       RecoveryPriority.reconcileDownloads: false,
+      RecoveryPriority.ownedFileCleanup: false,
     });
   });
 }

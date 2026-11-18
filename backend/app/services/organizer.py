@@ -25,6 +25,7 @@ from app.services.metadata import (
     ProbeUnavailable, extract_cover_art_bytes, get_track_metadata, probe_unavailable_raises, probes_killed_by,
 )
 from app.services.path_sanitize import (
+    PathEscapesRoot,
     _MAX_COMPONENT_LEN,
     UnsafePathComponent,
     assert_within,
@@ -140,6 +141,9 @@ class OrganizerContext:
     # True while the app is shutting down: the organizer then skips the hash and
     # leaves the identity pending for the worker.
     should_stop: Callable[[], bool] | None = None
+    # Whether a track already uses a path (any owner); register_in_place refuses
+    # such a path. organize() does not use it.
+    path_in_use: Callable[[Path], bool] | None = None
     # The metadata probe runs registered here, so closing it at shutdown ends it.
     probe_registry: FfmpegProcessRegistry | None = None
     # The tracks whose master file sits in a folder, with their stored exact
@@ -218,20 +222,9 @@ class Organizer:
             print(f"Destination {destination_path} is inside an internal directory.")
             return ImportOutcome.FAILS_CHECK
 
-        cover_art_result: CoverArtAddResult | None = None
-        art_bytes: bytes | None = None
-
-        # Extract and register cover art if present
-        if trackmetadata.has_album_art and self.ctx.add_cover_art is not None:
-            art_bytes = extract_cover_art_bytes(file_path)
-            if art_bytes:
-                try:
-                    cover_art_result = self.ctx.add_cover_art(art_bytes)
-                    trackmetadata = trackmetadata.model_copy(
-                        update={"cover_art_id": cover_art_result.cover_art_id}
-                    )
-                except ValueError as e:
-                    print(f"Failed to add cover art for {file_path}: {e}")
+        trackmetadata, cover_art_result, art_bytes = self._register_cover_art(
+            file_path, trackmetadata
+        )
 
         # Changed since it was read: abandon without touching the file.
         if file_signature(file_path) != before:
@@ -274,23 +267,7 @@ class Organizer:
             file_path=destination_path, metadata=trackmetadata, audio_identity=identity
         )
 
-        try:
-            was_added = self.ctx.add_to_database(track)
-        except CoverArtGone:
-            # The shared art was released between add_cover_art and the insert:
-            # re-register it and retry exactly once.
-            was_added = False
-            if art_bytes and self.ctx.add_cover_art is not None:
-                try:
-                    cover_art_result = self.ctx.add_cover_art(art_bytes)
-                    track.metadata = trackmetadata = trackmetadata.model_copy(
-                        update={"cover_art_id": cover_art_result.cover_art_id}
-                    )
-                    was_added = self.ctx.add_to_database(track)
-                except CoverArtGone:
-                    pass
-                except Exception as e:
-                    print(f"Retry after vanished cover art failed for {destination_path}: {e}")
+        was_added, cover_art_result = self._add_track(track, art_bytes, cover_art_result)
         if not was_added:
             print(f"Failed to add track to database after move: {destination_path}")
             rollback_move(destination_path=destination_path, original_path=file_path)
@@ -302,6 +279,77 @@ class Organizer:
         if self.ctx.on_imported is not None:
             self.ctx.on_imported(track, before)
         return ImportOutcome.IMPORTED
+
+    def register_in_place(
+        self, file_path: Path, metadata: TrackMetaData, identity: Any = None
+    ) -> str | None:
+        """Make a file that already lies inside the library root a track, without
+        moving it. Returns the new track's uuid, or None (nothing touched) for a
+        path outside the root, in an internal folder, not a regular file, already
+        used by a track, or refused by the database."""
+        root = self.ctx.music_library_dir
+        try:
+            assert_within(file_path, root)
+        except PathEscapesRoot:
+            return None
+        if is_internal_path(file_path, root):
+            return None
+        try:
+            if not stat.S_ISREG(os.lstat(file_path).st_mode):
+                return None
+        except OSError:
+            return None
+        if self.ctx.path_in_use is not None and self.ctx.path_in_use(file_path):
+            return None
+        metadata, cover_art_result, art_bytes = self._register_cover_art(file_path, metadata)
+        track = Track(file_path=file_path, metadata=metadata, audio_identity=identity)
+        was_added, cover_art_result = self._add_track(track, art_bytes, cover_art_result)
+        if not was_added:
+            self._cleanup_cover_art(cover_art_result)
+            return None
+        return track.uuid_id
+
+    def _register_cover_art(
+        self, file_path: Path, metadata: TrackMetaData
+    ) -> tuple[TrackMetaData, CoverArtAddResult | None, bytes | None]:
+        """Extract and register the file's cover art, if it has any. Returns the
+        metadata (pointing at the art), the add result and the art bytes."""
+        cover_art_result: CoverArtAddResult | None = None
+        art_bytes: bytes | None = None
+        if metadata.has_album_art and self.ctx.add_cover_art is not None:
+            art_bytes = extract_cover_art_bytes(file_path)
+            if art_bytes:
+                try:
+                    cover_art_result = self.ctx.add_cover_art(art_bytes)
+                    metadata = metadata.model_copy(
+                        update={"cover_art_id": cover_art_result.cover_art_id}
+                    )
+                except ValueError as e:
+                    print(f"Failed to add cover art for {file_path}: {e}")
+        return metadata, cover_art_result, art_bytes
+
+    def _add_track(
+        self, track: Track, art_bytes: bytes | None,
+        cover_art_result: CoverArtAddResult | None,
+    ) -> tuple[bool, CoverArtAddResult | None]:
+        """Insert the track; if its shared art was released between add_cover_art
+        and the insert, re-register the art and retry exactly once. Returns
+        whether it was added and the cover-art result now in effect."""
+        try:
+            return self.ctx.add_to_database(track), cover_art_result
+        except CoverArtGone:
+            if art_bytes and self.ctx.add_cover_art is not None:
+                try:
+                    cover_art_result = self.ctx.add_cover_art(art_bytes)
+                    track.metadata = track.metadata.model_copy(
+                        update={"cover_art_id": cover_art_result.cover_art_id}
+                    )
+                    return self.ctx.add_to_database(track), cover_art_result
+                except CoverArtGone:
+                    pass
+                except Exception as e:
+                    print(f"Retry after vanished cover art failed for {track.file_path}: {e}")
+            return False, cover_art_result
 
     def _choose_destination(self, base: Path, source: Path, incoming: Any) -> Path | ImportOutcome:
         """``base`` when the name is free; DUPLICATE when it or any of its
@@ -480,17 +528,6 @@ FALLBACK_ERRNOS = (errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, er
 COPY_BLOCK_BYTES = 1024 * 1024
 
 
-def link_no_replace(source: Path, destination: Path, *, in_use) -> bool:
-    """Hard-link ``source`` to ``destination`` under the destination directory
-    lock, never replacing anything. False when the destination exists, is a
-    track's master (``in_use(destination)``), or its parent is unusable. On an
-    OSError the folders this call made are removed again (one at a time under
-    their own locks, deepest first, never one that is not empty) and the error
-    propagates; a failure of ``os.link`` itself (including a filesystem that
-    refuses hard links) is raised as ``HardLinkError``. Never moves or copies."""
-    return _place(source, destination, in_use=in_use, fallback=False) is not None
-
-
 def temp_name_for(destination: Path) -> Path:
     """The hidden name next to ``destination`` a copy is written under: derived
     from the final name, a fixed 43 bytes, so it fits wherever the final does."""
@@ -500,10 +537,14 @@ def temp_name_for(destination: Path) -> Path:
 
 def place_no_replace(source: Path, destination: Path, *, in_use, before_fallback=None,
                      allow_copy: bool = True, copy_floor_bytes=None, seam=None, before_temp=None):
-    """Put ``source`` at ``destination`` without ever replacing anything:
-    ``"linked"`` (hard link, or our own earlier link), ``"moved"``, ``"copied"``,
-    or None when the name is taken, is a track's master, or its parent is
-    unusable. Exactly ``link_no_replace``, except that a link refused with one of
+    """Put ``source`` at ``destination`` under the destination directory lock
+    without ever replacing anything: ``"linked"`` (hard link, or our own earlier
+    link), ``"moved"``, ``"copied"``, or None when the name is taken, is a
+    track's master (``in_use(destination)``), or its parent is unusable. On a
+    failure the folders this call made are removed again (one at a time under
+    their own locks, deepest first, never one that is not empty) and the error
+    propagates; a refused link with an errno outside ``FALLBACK_ERRNOS`` is
+    raised as ``HardLinkError``. A link refused with one of
     ``FALLBACK_ERRNOS`` falls back: ``"rename"`` calls ``before_fallback("rename")``
     then moves the source (same filesystem); ``"copy"`` (EXDEV; a plain EXDEV
     OSError when not ``allow_copy``) answers None for a taken name, refuses with
@@ -514,13 +555,6 @@ def place_no_replace(source: Path, destination: Path, *, in_use, before_fallback
     ``before_fallback("copy")``, then copies through the temp and leaves the
     source alone. A fallback failure removes this call's temp and folders and
     propagates unchanged. ``seam(name)`` is a test hook."""
-    return _place(source, destination, in_use=in_use, fallback=True,
-                  before_fallback=before_fallback, allow_copy=allow_copy,
-                  copy_floor_bytes=copy_floor_bytes, seam=seam, before_temp=before_temp)
-
-
-def _place(source, destination, *, in_use, fallback, before_fallback=None,
-           allow_copy=True, copy_floor_bytes=None, seam=None, before_temp=None):
     parent = destination.parent
     created = []  # the directories this call makes, deepest first
     with _directory_locks.lock(directory_lock_key(parent)):
@@ -540,7 +574,7 @@ def _place(source, destination, *, in_use, fallback, before_fallback=None,
                 # Our own earlier link (a crash before the journal moved) is not a collision.
                 return "linked" if is_own_hard_link(source, destination) else None
             except OSError as e:
-                if not fallback or e.errno not in FALLBACK_ERRNOS:
+                if e.errno not in FALLBACK_ERRNOS:
                     failure = HardLinkError(e.errno, e.strerror)
                     failure.__cause__ = e
                 elif e.errno == errno.EXDEV and not allow_copy:

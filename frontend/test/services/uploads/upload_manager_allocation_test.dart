@@ -10,6 +10,7 @@
 // they were and nothing more is sent (DEV-7-09).
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
@@ -145,6 +146,33 @@ void main() {
     h.manager.start();
     await h.pump();
     expect(_allocations(h.api), ['allocate u-1']);
+  });
+
+  // Sign-off OPEN-M-11 (E8): a withheld token means nothing was sent: the
+  // rows stay as they were (not "ambiguous"), and the next pass allocates
+  // with no status query first.
+  test('the token withheld on the allocation: nothing was sent, the rows '
+      'stay as they were, and the next pass allocates', () async {
+    var first = true;
+    final defaultAllocate = h.api.onAllocate;
+    h.api.onAllocate = (body) async {
+      if (first) {
+        first = false;
+        throw const TokenWithheldException();
+      }
+      return defaultAllocate(body);
+    };
+    await h.verify();
+    await h.manager.addFiles([await h.file('a.flac', 'abc')]);
+    await h.pump();
+
+    expect((await h.submissions()).single['state'], isNot('ambiguous'));
+
+    h.timers.fire();
+    await h.pump();
+    expect(_allocations(h.api), ['allocate u-1', 'allocate u-1'],
+        reason: 'no batch status query: nothing had been sent');
+    expect((await h.intents()).single['last_state'], isIn(_allocatedOrLater));
   });
 
   test('an answer from another server leaves the rows exactly as they were '

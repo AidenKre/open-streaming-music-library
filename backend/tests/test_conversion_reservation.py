@@ -222,7 +222,14 @@ def _squat_target(db, orch, track, source, job_id):
 
 
 def _pending_recovery(db, orch, track, source, job_id):
-    db.insert_journal_entry("inplace", track.uuid_id)
+    # A row the running server cannot finish: a same-path conversion whose staged
+    # copy still waits to be put in place (runtime never places converted bytes).
+    # Since sign-off OPEN-6.5-05 (2026-11-16) the job first finishes the rows runtime
+    # recovery can finish, so a bare row no longer stops it.
+    staged = orch.staging_dir / f"{track.uuid_id}.999.tagged.flac"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"owned")
+    db.insert_journal_entry("convert", track.uuid_id, old_path=str(source), temp_path=str(staged))
 
 
 @pytest.mark.parametrize(

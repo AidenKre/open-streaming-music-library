@@ -3,8 +3,8 @@
 // after history and before durable submissions, without building the
 // manager just to stop it. The Disconnect confirmation gets "N uploads not
 // yet sent" for this binding's files whose bytes the server doesn't have
-// (rows of an earlier sign-in can't be sent any more, so they are not
-// counted). One manager per scope, sharing the scope's DurableSubmission.
+// (round 3: rows kept from an ended sign-in are counted too: a reset
+// removes them). One manager per scope, sharing the scope's DurableSubmission.
 import 'dart:async';
 
 import 'package:drift/native.dart';
@@ -16,6 +16,8 @@ import 'package:frontend/api/uploads_api.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/clock.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:frontend/services/dead_sign_in_records.dart';
 import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
 import 'package:frontend/services/uploads/upload_import_sync.dart';
@@ -107,6 +109,7 @@ void main() {
       expect(await reporter.pendingLossSummary(), '2 uploads not yet sent');
 
       // States whose bytes the server has, or that ended, don't count.
+      // A failed file stays on the server (Retry needs nothing from here).
       for (final s in ['validating', 'review_ready', 'imported', 'cancelled',
           'failed', 'rejected']) {
         await h.db.customStatement(
@@ -115,9 +118,10 @@ void main() {
         expect(await reporter.pendingLossSummary(), '1 upload not yet sent',
             reason: s);
       }
-      // Those that still need sending do.
-      for (final s in ['allocated', 'transferring', 'needs_reselect',
-          'source_changed']) {
+      // Those that still need sending do; so does a part-received one
+      // (signoff-8-logout-warning #4).
+      for (final s in ['allocated', 'transferring', 'receiving',
+          'needs_reselect', 'source_changed']) {
         await h.db.customStatement(
           "UPDATE upload_intents SET last_state = '$s' WHERE item_uuid = 'u-2'",
         );
@@ -125,8 +129,47 @@ void main() {
             reason: s);
       }
 
-      await h.binding.rotate(); // rows of an earlier sign-in: not counted
-      expect(await reporter.pendingLossSummary(), isNull);
+      // Kept from an ended sign-in (round 3): a reset removes them, so they
+      // count.
+      await h.binding.rotate();
+      expect(await reporter.pendingLossSummary(), '2 uploads not yet sent');
+    });
+  });
+
+  // signoff-8-logout-warning round 3: a log-out that kept the unsent
+  // records, then the same user's login took them over: a file cut off
+  // mid-transfer continues from this device, under the new sign-in.
+  group('taken over after the same user signs in again', () {
+    late UploadHarness h;
+    setUp(() async {
+      SharedPreferences.setMockInitialValues({});
+      h = await UploadHarness.create();
+      await h.verify();
+    });
+    tearDown(() => h.dispose());
+
+    test('a file mid-transfer is sent again from this device', () async {
+      await h.manager.addFiles([await h.file('a.flac', 'abc')]);
+      await h.pump();
+      expect(h.api.openPuts, hasLength(1));
+      final item = h.api.openPuts.single.itemUuid;
+
+      await h.manager.quiesce(); // the session ended
+      final records = DeadSignInRecords(db: h.db, binding: h.binding);
+      await records.keepForNextLogin(h.token);
+      await h.binding.rotate();
+      final token = (await h.binding.current())!.localBindingId;
+      await records.takeOver(token);
+      h.gate.gate.stop();
+      await h.verify();
+      h.manager = h.build();
+      h.manager.start();
+      await h.pump();
+
+      expect(h.api.openPuts.map((p) => p.itemUuid), [item]);
+      final row = (await h.intents()).single;
+      expect(row['local_binding_id'], token);
+      expect(row['last_state'], isNot('on_other_device'));
     });
   });
 
@@ -160,6 +203,8 @@ void main() {
         'preview',
         'history',
         'uploads',
+        'delete-jobs',
+        'owned-file-cleanup',
         'submissions',
       ]);
       await participants

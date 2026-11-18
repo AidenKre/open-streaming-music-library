@@ -907,13 +907,13 @@ class TestReconcileJournal:
         reconcile_journal(db, tmp_path)
 
         # OPEN-A-03 (2026-11-14): the old master is missing, so the moved copy is the
-        # track's last one. Recovery keeps it and the row; it prunes nothing. (A root
-        # can only be emptied by a prune when the master is missing, which is now
-        # always a kept row; the root guard stays covered by
+        # track's last one; since OPEN-6.5-05 (2026-11-16) it is adopted (state-table
+        # row 6) and the row goes. Nothing is pruned. (The root guard stays covered by
         # test_second_users_row_is_reconciled_against_their_root.)
         assert new.read_bytes() == b"new"
+        assert db.get_track_file_path(uuid) == str(new)
         assert root.is_dir(), "pruning walked past the owner's root"
-        assert len(db.list_journal_entries()) == 1
+        assert db.list_journal_entries() == []
 
     def test_second_users_row_is_reconciled_against_their_root(self, tmp_path):
         db = _db(tmp_path)

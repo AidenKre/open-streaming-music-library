@@ -57,6 +57,51 @@ def test_a_literal_child_reaches_its_route_in_either_order(app_client, first):
     assert (response.status_code, response.json()) == (200, {"batches": [], "next_after": None})
 
 
+def _place_routes_under(app, prefix, *, first: bool):
+    """Move every route under ``prefix`` (a Phase 8 router's) to the front or
+    the end of the app's routes, keeping their relative order."""
+    routes = app.router.routes
+    moved = [r for r in routes if isinstance(r, APIRoute) and r.path.startswith(prefix)]
+    assert moved, f"no routes under {prefix}"
+    for route in moved:
+        routes.remove(route)
+    if first:
+        routes[0:0] = moved
+    else:
+        routes.extend(moved)
+
+
+# 8A.1 (plan D19, 8-U02): ``deletions`` left the non-UUID 404 list below; it
+# is a literal child now. With the switch off (the default) both deletion
+# routes answer the switch's 403, which only the deletions router gives.
+@pytest.mark.parametrize("first", [True, False], ids=["declared-first", "declared-last"])
+@pytest.mark.parametrize("path", ["/tracks/deletions", "/tracks/deletions/preview"])
+def test_the_deletions_literal_reaches_its_router_in_either_order(app_client, first, path):
+    _place_routes_under(app_client.app, "/tracks/deletions", first=first)
+
+    response = app_client.post(path, json={})
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"]["error"] == "library_delete_disabled"
+    # A GET or PATCH on the literal is not read as a track ID either: GET
+    # /tracks/deletions is the receipt list (8A.2b), readable with the switch off.
+    assert app_client.get(path).status_code == (200 if path == "/tracks/deletions" else 405)
+    assert app_client.patch(path, json={}).status_code == 405
+
+
+# 8A.1 (plan D19, 8-U02): ``duplicates`` is a literal child too. 8A.4: its
+# router lists the caller's pairs (no switch: duplicate review needs none).
+@pytest.mark.parametrize("first", [True, False], ids=["declared-first", "declared-last"])
+def test_the_duplicates_literal_reaches_its_router_in_either_order(app_client, first):
+    _place_routes_under(app_client.app, "/tracks/duplicates", first=first)
+
+    response = app_client.get("/tracks/duplicates")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"pairs": [], "next_after": None}
+    assert app_client.patch("/tracks/duplicates", json={}).status_code == 405
+
+
 def test_the_warm_literal_is_never_read_as_a_track_id(app_client):
     # warm is a POST route; a GET or PATCH on its path must not be captured by
     # the track routes (which answered "Track not found" before the converter).
@@ -103,7 +148,8 @@ def test_the_handlers_receive_the_canonical_string(app_client):
 
 # ``uploads`` left this list in 7A.1d: it is now a real literal child
 # (tests/test_uploads_api.py), covered by the literal-child tests above.
-@pytest.mark.parametrize("segment", ["nope", "123", "deletions", UNKNOWN + "x"])
+# ``deletions`` left it in 8A.1 (plan D19) for the same reason.
+@pytest.mark.parametrize("segment", ["nope", "123", UNKNOWN + "x"])
 def test_a_non_uuid_segment_answers_404_on_every_track_route(app_client, segment):
     assert app_client.get(f"/tracks/{segment}").status_code == 404
     assert app_client.get(f"/tracks/{segment}/stream").status_code == 404

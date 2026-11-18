@@ -38,7 +38,7 @@ def _never_in_use(_path):
     return False
 
 
-# ── organizer.link_no_replace ──────────────────────────────────────────────
+# ── organizer.place_no_replace (the hard link it tries first) ──────────────────────────────────────────────
 
 def test_an_existing_hard_link_of_the_source_counts_as_linked(tmp_path):
     work = tmp_path / "work.flac"
@@ -47,7 +47,7 @@ def test_an_existing_hard_link_of_the_source_counts_as_linked(tmp_path):
     final.parent.mkdir()
     os.link(work, final)
 
-    assert organizer.link_no_replace(work, final, in_use=_never_in_use) is True
+    assert organizer.place_no_replace(work, final, in_use=_never_in_use) == "linked"
 
 
 def test_a_symlink_to_the_source_at_the_destination_is_not_our_link(tmp_path):
@@ -57,7 +57,7 @@ def test_a_symlink_to_the_source_at_the_destination_is_not_our_link(tmp_path):
     final.parent.mkdir()
     os.symlink(work, final)
 
-    assert organizer.link_no_replace(work, final, in_use=_never_in_use) is False
+    assert organizer.place_no_replace(work, final, in_use=_never_in_use) is None
     assert os.path.islink(final)
 
 
@@ -70,7 +70,7 @@ def test_a_symlinked_source_is_not_proof_either(tmp_path):
     final.parent.mkdir()
     os.link(real, final)
 
-    assert organizer.link_no_replace(work, final, in_use=_never_in_use) is False
+    assert organizer.place_no_replace(work, final, in_use=_never_in_use) is None
 
 
 # ── startup recovery ───────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ import sqlite3
 
 import pytest
 
+from app.database.database import Database
 from tests.cli_fixtures import (
     ADMIN,
     add_track,
@@ -148,7 +149,7 @@ def test_every_command_refuses_a_missing_database_and_creates_nothing(settings, 
 
 
 @pytest.mark.parametrize("argv", COMMANDS)
-@pytest.mark.parametrize("version", [12, 13, 14, 16])
+@pytest.mark.parametrize("version", [12, 13, 14, 15, Database.LATEST_SCHEMA_VERSION + 1])
 def test_every_command_refuses_another_schema_version_untouched(settings, tmp_path, argv, version):
     path = database_file(settings)
     path.parent.mkdir(parents=True)

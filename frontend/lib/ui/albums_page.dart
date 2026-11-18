@@ -75,7 +75,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
         if (!hasBrowseControls && widget.artistId != null)
           CollectionActionHeader(
             scope: ArtistScope(artistId: widget.artistId!),
-            empty: !hasMore && paginatedItems.isEmpty,
+            empty: paginationLoadedEmpty,
           ),
         if (hasBrowseControls)
           buildBrowseHeader(hintText: 'Search albums')
@@ -90,11 +90,13 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
                   // browse window's load-more listener.
                   builder: (albums) => _buildGrid(albums, showLoader: false),
                 )
+              : paginationFailedEmpty
+              ? buildPaginationFailure()
               : showDownloadedEmpty
               ? const ListStatusMessage('No downloaded albums yet.')
               : _buildGrid(
                   paginatedItems,
-                  showLoader: hasMore,
+                  showLoader: paginationHasTrailing,
                   controller: scrollController,
                 ),
         ),
@@ -122,7 +124,7 @@ class _AlbumsPageState extends ConsumerState<AlbumsPage>
       itemCount: albums.length + (showLoader ? 1 : 0),
       itemBuilder: (context, index) {
         if (index >= albums.length) {
-          return const Center(child: CircularProgressIndicator());
+          return buildPaginationTrailing();
         }
         final album = albums[index];
         if (index % 6 == 0) {

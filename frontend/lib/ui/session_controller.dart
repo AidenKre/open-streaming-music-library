@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/services/account_rules.dart';
 import 'package:frontend/services/local_reset_service.dart';
+import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/services/session_service.dart';
 
 enum SessionPhase {
@@ -65,6 +66,10 @@ abstract interface class SessionControls implements Listenable {
   /// Log out (spec 7.6): local data is kept; the app opens at Log in.
   Future<void> logout();
 
+  /// The signed-out banner's Log in: logs out and keeps the unsent uploads
+  /// and deletions for the same user's next login.
+  Future<void> logOutKeepingUnsent();
+
   /// Set when a login found another user's data on this device: the new
   /// user's name, for the confirmation. Nothing was stored yet.
   String? get pendingUserSwitch;
@@ -104,6 +109,9 @@ abstract interface class SessionControls implements Listenable {
 
   /// What a reset would lose, for the confirmation copy (SC-15).
   Future<List<String>> pendingLossSummaries();
+
+  /// What logging out would drop for this sign-in (DEV-7-22, DEV-8-14).
+  Future<LogoutLosses> pendingLogoutLosses();
 
   /// Why the session is blocked (different server, SC-01 rule 1, or signed
   /// out by a 401), or none. Network work waits; local playback and browsing
@@ -232,7 +240,12 @@ class SessionController extends ChangeNotifier implements SessionControls {
   }
 
   @override
-  Future<void> logout() async {
+  Future<void> logOutKeepingUnsent() => _logout(keepUnsent: true);
+
+  @override
+  Future<void> logout() => _logout(keepUnsent: false);
+
+  Future<void> _logout({required bool keepUnsent}) async {
     if (_loggingOut ||
         _phase == SessionPhase.resetting ||
         _phase == SessionPhase.resetComplete) {
@@ -241,7 +254,7 @@ class SessionController extends ChangeNotifier implements SessionControls {
     _loggingOut = true;
     _set(SessionPhase.signingOut);
     try {
-      await _service.logout();
+      await _service.logout(keepUnsent: keepUnsent);
     } catch (e) {
       developer.log(
         'Sign-out did not finish cleanly: ${e.runtimeType}',
@@ -396,6 +409,10 @@ class SessionController extends ChangeNotifier implements SessionControls {
   @override
   Future<List<String>> pendingLossSummaries() =>
       _service.pendingLossSummaries();
+
+  @override
+  Future<LogoutLosses> pendingLogoutLosses() =>
+      _service.pendingLogoutLosses();
 
   @override
   Future<void> disconnect() => _runReset(_service.resetLocalData);

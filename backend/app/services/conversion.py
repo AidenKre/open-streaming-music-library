@@ -10,6 +10,7 @@ scheduler, no new lock registry, no new staging directory.
 import enum
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any, Callable, FrozenSet, Optional
 
 from app.core.durable_fs import fsync_file
 from app.core.media_types import CODEC_TO_EXT, is_lossless, is_lossy
+from app.core.operator_log import operator_logger
 from app.library import Library, library_root
 from app.database import ANY_OWNER
 from app.database.database import (
@@ -24,11 +26,12 @@ from app.database.database import (
     EDITABLE_METADATA_COLUMNS,
     RevisionConflict,
     TrackNotFound,
+    TrackPendingDeletion,
 )
 from app.models.track import Track
 from app.services import audio_identity
 from app.services.audio_identity import AudioIdentity, ExactAudioHash
-from app.services.encoded_cache import EncodedCache
+from app.services.encoded_cache import EncodedCache, evict_track_caches
 from app.services.encoder_coordinator import EncoderCoordinator
 from app.services.ffmpeg_runner import FfmpegProcessRegistry, kill_orphaned_ffmpeg
 from app.services.metadata import (
@@ -41,6 +44,13 @@ from app.services.metadata import (
 from app.services.organizer import flush_move, move_back, move_file, prune_empty_dirs
 from app.services.path_sanitize import PathEscapesRoot, assert_within
 from app.services.storage_ledger import CONVERSION, InsufficientStorage, StorageLedger
+from app.services.track_editor import (
+    PendingOldMasters,
+    finish_track_journal_rows,
+    flush_journal_row,
+    reached_durable_point,
+    settle_old_master,
+)
 from app.services.track_locks import TrackLocks
 from app.services.transcoder import (
     QUALITY_BITRATES_KBPS,
@@ -284,6 +294,7 @@ class ConversionOrchestrator:
     available_encoders: FrozenSet[str]
     storage_ledger: StorageLedger
     identity_signal: Optional[Any] = None
+    pending_old_masters: Optional[PendingOldMasters] = None
     compute_identity: Callable[..., AudioIdentity] = field(default=audio_identity.compute_identity)
     check_strict_decode: Callable[..., Optional[str]] = field(
         default=audio_identity.check_strict_decode
@@ -293,6 +304,18 @@ class ConversionOrchestrator:
         default=lambda: time.sleep(SWAP_RETRY_PAUSE_S)
     )
     _registry: FfmpegProcessRegistry = field(default_factory=FfmpegProcessRegistry)
+
+    def __post_init__(self) -> None:
+        if self.pending_old_masters is None:
+            self.pending_old_masters = PendingOldMasters()
+
+    def _finish_journal_rows(self, library: Library, uuid_id: str) -> None:
+        """Finish this track's kept journal rows at runtime; the caller holds the
+        track lock."""
+        finish_track_journal_rows(
+            library, uuid_id, self.music_library_dir, self.identity_signal,
+            self.pending_old_masters,
+        )
 
     def enqueue(
         self,
@@ -308,40 +331,52 @@ class ConversionOrchestrator:
         function raises, so nothing may rely on it to surface a bad request.
         Raises ``ConversionJobActive`` if the track already has one queued or
         running (a double-tap, or a retry of a timed-out-but-landed POST,
-        must not re-encode an already-converted master).
+        must not re-encode an already-converted master). Raises
+        ``TrackPendingDeletion`` for a track whose deletion is pending; the
+        check and the job insert run under the track lock.
         """
         # TODO(bulk-jobs): accept a set/album/artist selector and mint one job
         # per track under a shared batch_id (best-effort, per-job independent).
         # Uploads are not a job type: they live under /tracks/uploads (Phase 7).
-        track = library.get_track_by_uuid(uuid_id)
-        if track is None:
-            raise TrackNotFound(uuid_id)
-        if base_revision is None or base_revision != track.revision:
-            raise RevisionConflict(uuid_id, base_revision, track.revision)
+        # The deletion worker writes its journal row only under this track
+        # lock and treats a queued job as busy, so the pending-deletion check
+        # and the job insert must be atomic with respect to the lock: a
+        # deletion that marks the track while this request waits for the lock
+        # must still stop it.
+        with self.track_locks.lock(uuid_id):
+            # Read under the lock so every check uses the row as it is now.
+            track = library.get_track_by_uuid(uuid_id)
+            if track is None:
+                raise TrackNotFound(uuid_id)
+            if library.is_pending_deletion(uuid_id):
+                raise TrackPendingDeletion(uuid_id)
+            if base_revision is None or base_revision != track.revision:
+                raise RevisionConflict(uuid_id, base_revision, track.revision)
 
-        source = Path(track.file_path)
-        if not source.exists():
-            raise MasterNotFound(uuid_id)
+            source = Path(track.file_path)
+            if not source.exists():
+                raise MasterNotFound(uuid_id)
 
-        # Before the request's own checks: while an earlier file operation (e.g.
-        # a same-file swap the next start finishes, U06-B-06) is kept, the track's
-        # stored format may not be its file's yet.
-        if library.has_journal_entry_for_uuid(uuid_id):
-            raise PendingRecovery(uuid_id)
-        _validate_request(track, target_codec, target_bitrate_kbps, self.available_encoders)
-        _resolve_dest(source, target_codec)
+            self._finish_journal_rows(library, uuid_id)
+            # Before the request's own checks: while an earlier file operation (e.g.
+            # a same-file swap the next start finishes, U06-B-06) is kept, the track's
+            # stored format may not be its file's yet.
+            if library.has_journal_entry_for_uuid(uuid_id):
+                raise PendingRecovery(uuid_id)
+            _validate_request(track, target_codec, target_bitrate_kbps, self.available_encoders)
+            _resolve_dest(source, target_codec)
 
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
-        # Read-only: a queued job holds nothing; the run reserves.
-        self.storage_ledger.check(
-            owner_id=library.owner_id, purpose=CONVERSION,
-            nbytes=_reservation_bytes(track, source, target_codec, target_bitrate_kbps),
-        )
+            self.staging_dir.mkdir(parents=True, exist_ok=True)
+            # Read-only: a queued job holds nothing; the run reserves.
+            self.storage_ledger.check(
+                owner_id=library.owner_id, purpose=CONVERSION,
+                nbytes=_reservation_bytes(track, source, target_codec, target_bitrate_kbps),
+            )
 
-        job_id = library.insert_conversion_job(
-            uuid_id, target_codec, CODEC_TO_EXT[target_codec], target_bitrate_kbps,
-            base_revision=base_revision,
-        )
+            job_id = library.insert_conversion_job(
+                uuid_id, target_codec, CODEC_TO_EXT[target_codec], target_bitrate_kbps,
+                base_revision=base_revision,
+            )
         self.encoder_coordinator.submit_conversion(self._run_job, job_id)
         return job_id
 
@@ -379,6 +414,8 @@ class ConversionOrchestrator:
             return str(e) or type(e).__name__
         if isinstance(e, InsufficientDiskSpace):
             return e.message  # numbers only, no path
+        if isinstance(e, TrackPendingDeletion):
+            return "the track is being deleted"
         if isinstance(e, PathEscapesRoot):
             return "the master or its destination is outside the owner's library"
         if isinstance(e, MasterNotFound):
@@ -434,8 +471,12 @@ class ConversionOrchestrator:
         )
         assert_within(source, root)
         assert_within(dest, root)
-        if library.has_journal_entry_for_uuid(uuid_id):
-            raise PendingRecovery(f"{uuid_id} has an unfinished file operation awaiting recovery")
+        with self.track_locks.lock(uuid_id):
+            self._finish_journal_rows(library, uuid_id)
+            if library.has_journal_entry_for_uuid(uuid_id):
+                raise PendingRecovery(f"{uuid_id} has an unfinished file operation awaiting recovery")
+        if library.is_pending_deletion(uuid_id):
+            raise TrackPendingDeletion(uuid_id)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         reservation = self.storage_ledger.reserve(
             owner_id=library.owner_id, purpose=CONVERSION,
@@ -519,6 +560,9 @@ class ConversionOrchestrator:
                     or current.file_path != track.file_path
                 ):
                     raise ConversionFailed(TRACK_CHANGED_ERROR)
+                # Authoritative: the deletion worker marks only under this lock.
+                if library.is_pending_deletion(uuid_id):
+                    raise TrackPendingDeletion(uuid_id)
                 if source_side is not None and self._generation(library, uuid_id) != source_side.generation:
                     raise ConversionFailed(TRACK_CHANGED_ERROR)
                 self._raise_if_cancelled(library, job_id)
@@ -529,6 +573,7 @@ class ConversionOrchestrator:
                         old_path=str(source), new_path=str(dest),
                         temp_path=str(tagged_temp),
                     )
+                    flushed = flush_journal_row(self.database, entry, uuid_id)
                     if not move_file(file_path=tagged_temp, destination_path=dest):
                         # While the row exists the staged temp is its evidence
                         # that the move never happened; drop it only after the
@@ -561,9 +606,10 @@ class ConversionOrchestrator:
                     committed = True
                     self._evict(uuid_id)
                     # Committed: DB now points at `dest`; the old master is redundant.
-                    source.unlink(missing_ok=True)
-                    prune_empty_dirs(source.parent, root)
-                    library.delete_journal_entry(entry)
+                    settle_old_master(
+                        library, entry, uuid_id, source, dest, root, self.pending_old_masters,
+                        wait=flushed,
+                    )
                     self._notify_identity()
                 else:
                     # The journal row commits WITH the DB update, so "row
@@ -576,6 +622,12 @@ class ConversionOrchestrator:
                     )
                     committed = True
                     journal_owns_temp = True
+                    # Best effort: the replace goes ahead either way (decision D10).
+                    if not reached_durable_point(self.database):
+                        operator_logger.warning(
+                            "conversion of track %s replaced its file before a database flush",
+                            uuid_id,
+                        )
                     try:
                         os.replace(tagged_temp, source)
                     except OSError:
@@ -846,20 +898,12 @@ class ConversionOrchestrator:
 
     def _evict(self, uuid_id: str) -> None:
         # Lazy re-warm: the next stream re-encodes from the new master.
-        evict_converted_track_caches(uuid_id, self.cache, self.default_cache)
+        evict_track_caches(uuid_id, self.cache, self.default_cache)
 
     def _raise_if_cancelled(self, library: Library, job_id: int) -> None:
         job = library.get_conversion_job(job_id)
         if job is not None and job["status"] == "cancelled":
             raise ConversionFailed("cancelled")
-
-
-def evict_converted_track_caches(
-    uuid_id: str, cache: EncodedCache, default_cache: Optional[EncodedCache]
-) -> None:
-    cache.remove_all_for_uuid(uuid_id)
-    if default_cache is not None:
-        default_cache.remove_all_for_uuid(uuid_id)
 
 
 def reconcile_conversion_jobs(database: Database, staging_dir: Path) -> None:
@@ -887,4 +931,15 @@ def reconcile_conversion_jobs(database: Database, staging_dir: Path) -> None:
         if (
             ".convert." in path.name or ".tagged." in path.name or ".edit." in path.name
         ) and str(path) not in owned:
+            _remove_staged_entry(path)
+
+
+def _remove_staged_entry(path: Path) -> None:
+    """Remove a regular file or a symbolic link (its name, never its target);
+    leave anything else (a folder). Never raises: one entry never stops startup."""
+    try:
+        mode = os.lstat(path).st_mode
+        if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
             path.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning("staging sweep skipped an entry: %s", type(e).__name__)

@@ -76,7 +76,14 @@ def test_no_route_serves_identity_or_duplicates(configure_app):
     paths = [getattr(route, "path", "") for route in configure_app().app.routes]
     assert paths  # the app has routes, so an empty match below means something
     # 7A.3b: the spec names the one upload route that resolves a duplicate.
-    allowed = {"/tracks/uploads/items/{item_uuid:uuid}/resolve-duplicate"}
+    allowed = {
+        "/tracks/uploads/items/{item_uuid:uuid}/resolve-duplicate",
+        # 8A.1 / 8A.4 (plan D18, spec §4): Phase 8's duplicates routes, by name.
+        "/tracks/duplicates",
+        "/tracks/duplicates/summary",
+        "/tracks/duplicates/dismiss",
+        "/tracks/duplicates/restore",
+    }
     assert [p for p in paths if IDENTITY_WORDS.search(p) and p not in allowed] == []
 
 
@@ -95,7 +102,12 @@ def test_app_info_has_no_identity_block(app_client):
     assert response.status_code == 200
     keys = list(_keys(response.json()))
     assert keys
-    assert [k for k in keys if IDENTITY_WORDS.search(k)] == []
+    # 8A.1 (plan D18, spec §3, SC-03): the one allowed key is Phase 8's
+    # ``library_tools.duplicate_review`` capability flag. It is a boolean that
+    # says whether the duplicates review endpoints exist; it carries no
+    # identity data. Still no identity block.
+    allowed = {"library_tools.duplicate_review"}
+    assert [k for k in keys if IDENTITY_WORDS.search(k) and k not in allowed] == []
 
 
 # 7A.2c (D36): the only response schema that exposes duplicate data is the
@@ -110,6 +122,20 @@ EXPOSED_DUPLICATE_SCHEMA = {
     "DuplicateMatchOut",
     "DuplicateStagedSummary",
     "DuplicateTrackSummary",
+    # 8A.1 (plan D18): the library_tools capability flag, a boolean, no data.
+    "LibraryToolsCapabilities.duplicate_review",
+    # 8A.4 (plan D18, spec §4): the Possible duplicates list, on purpose.
+    "DuplicatePairPage",
+    "DuplicatePairOut",
+    "DuplicatePairTrack",
+    # 8A.4 (spec §4 summary, plan D17): per-band counts, the coverage counts
+    # and the active fingerprinter's name, on purpose.
+    "DuplicateSummaryOut",
+    "DuplicateSummaryOut.fingerprinter",
+    "DuplicateBands",
+    "IdentityCoverage",
+    "IdentityCoverage.fingerprint",
+    "FingerprintCoverage",
 }
 
 

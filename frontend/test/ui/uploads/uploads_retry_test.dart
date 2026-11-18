@@ -28,6 +28,8 @@ import '../browse_harness.dart';
 import '../fake_session_controls.dart';
 import '../fake_uploads_controls.dart';
 
+// A file picked on this device (it has the digest): a lost received file
+// can be sent again from here (review r1 #2 keeps Retry for such rows only).
 UploadIntentRecord _intent(String state, {String? code}) => UploadIntentRecord(
   itemUuid: 'i',
   batchUuid: 'b',
@@ -45,7 +47,7 @@ UploadIntentRecord _intent(String state, {String? code}) => UploadIntentRecord(
   createdAtMs: 0,
   updatedAtMs: 0,
   expectedLength: null,
-  expectedSha256: null,
+  expectedSha256: 'abc',
   descriptor: null,
 );
 

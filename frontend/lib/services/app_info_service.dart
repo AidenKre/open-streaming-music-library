@@ -84,7 +84,7 @@ class AppInfoService {
         developer.log('app/info cache parse failed: $e', name: 'AppInfoService');
       }
     }
-    return defaultAppInfo().asCached();
+    return defaultAppInfo().asBuiltInDefault();
   }
 }
 

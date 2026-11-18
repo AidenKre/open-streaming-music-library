@@ -16,6 +16,7 @@ from app.models import Track, TrackMetaData
 from tests.fingerprint_fixtures import random_print
 from tests.identity_worker_fixtures import sql
 from tests.owned_database import add_test_user
+from tests.pending_deletion import mark_pending_deletion
 from tests.upload_validation_fixtures import (
     FINGERPRINTER,
     FakeCompute,
@@ -185,6 +186,19 @@ def test_a_track_deleted_after_validation_reads_as_unavailable(env):
     staged = env.stage(content=b"audio-A")
     env.validate()
     assert Library(env.db, env.admin).delete_track(track)
+
+    [match] = env.get(staged)["duplicate_check"]["matches"]
+
+    assert (match["track_uuid"], match["available"], match["track"]) == (track, False, None)
+
+
+def test_a_track_pending_deletion_reads_as_unavailable(env):
+    """Review r1 8-R1-07: one liveness definition (live_tracks): a track whose
+    deletion is pending is not offered as the library copy to keep."""
+    track = env.track(b"audio-A")
+    staged = env.stage(content=b"audio-A")
+    env.validate()
+    mark_pending_deletion(env.db.context.database_path, track)
 
     [match] = env.get(staged)["duplicate_check"]["matches"]
 

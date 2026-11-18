@@ -120,3 +120,16 @@ def assert_within(path, root) -> None:
         resolved_root
     ):
         raise PathEscapesRoot(f"{path} is not strictly inside {root}")
+
+
+def assert_name_within(path, root) -> None:
+    """Like ``assert_within`` for the directory entry ``path`` names, not for what
+    a symlink there points to: only the parent is resolved. For a caller that
+    never follows that entry (it lstats it, and only unlinks a link itself)."""
+    entry = Path(path)
+    if entry.name in ("", ".", ".."):
+        raise PathEscapesRoot(f"{path} is not strictly inside {root}")
+    resolved_parent = entry.parent.resolve()
+    resolved_root = Path(root).resolve()
+    if resolved_parent != resolved_root and not resolved_parent.is_relative_to(resolved_root):
+        raise PathEscapesRoot(f"{path} is not strictly inside {root}")

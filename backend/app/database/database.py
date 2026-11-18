@@ -1,9 +1,12 @@
 import dataclasses
+import fcntl
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unicodedata
 import uuid
@@ -76,6 +79,9 @@ ARTIST_TEXT_COLUMNS = {"name"}
 ALLOWED_OPERATORS = ["=", ">=", "<=", "<", ">"]
 
 
+DELETION_ITEM_TERMINAL_STATES = ("deleted", "already_deleted", "conflict", "busy", "failed")
+
+
 class _AnyOwner:
     """Sentinel for the few reads that deliberately span all owners."""
 
@@ -134,9 +140,9 @@ def _owner_predicate(column: str, owner_id: object) -> tuple[str, tuple]:
     return f"{column} = ?", (_require_owner(owner_id),)
 
 
-# The v14 objects, created by the 13 -> 14 step. Each statement's text must match
-# init.sql's (minus IF NOT EXISTS); the fresh-vs-migrated parity test in
-# tests/test_schema_upgrade_v14.py enforces it.
+# The v14 objects, created by the 13 -> 14 step. Each statement's text matched
+# init.sql's v14 (minus IF NOT EXISTS); since v16 the 15 -> 16 step replaces
+# live_tracks, and the fresh-vs-migrated parity tests compare the end result.
 SCHEMA_V14_DDL = (
     """CREATE TABLE track_audio_identity (
   uuid_id         TEXT PRIMARY KEY REFERENCES tracks(uuid_id) ON DELETE CASCADE,
@@ -349,6 +355,76 @@ SCHEMA_V15_DDL: tuple[str, ...] = (
 )
 
 
+# The v16 objects, created by the 15 -> 16 step. Each statement's text must match
+# init.sql's (minus IF NOT EXISTS); the fresh-vs-migrated parity test in
+# tests/test_schema_upgrade_v16.py enforces it. The DROP VIEW is migration-only
+# (init.sql has no DROP); the parity test compares the resulting sqlite_master.
+SCHEMA_V16_DDL: tuple[str, ...] = (
+    """CREATE TABLE deletion_jobs (
+  owner_id       INTEGER NOT NULL REFERENCES users(id),
+  operation_uuid TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  status         TEXT NOT NULL CHECK (status IN ('accepted','completed')),
+  PRIMARY KEY (owner_id, operation_uuid),
+  FOREIGN KEY (owner_id, operation_uuid) REFERENCES operation_receipts(owner_id, operation_uuid)
+)""",
+    "CREATE INDEX idx_deletion_jobs_list ON deletion_jobs(owner_id, created_at, operation_uuid)",
+    """CREATE TABLE deletion_job_items (
+  owner_id           INTEGER NOT NULL REFERENCES users(id),
+  operation_uuid     TEXT NOT NULL,
+  uuid_id            TEXT NOT NULL,
+  position           INTEGER NOT NULL CHECK (position >= 0),
+  base_revision      INTEGER NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','deleted','already_deleted','conflict','busy','failed')),
+  error_code         TEXT,
+  tombstone_revision INTEGER,
+  detail_json        TEXT,
+  lease_boot_id      TEXT,
+  cancel_requested   INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1)),
+  PRIMARY KEY (owner_id, operation_uuid, uuid_id),
+  UNIQUE (owner_id, operation_uuid, position),
+  FOREIGN KEY (owner_id, operation_uuid) REFERENCES deletion_jobs(owner_id, operation_uuid),
+  CHECK (status <> 'failed' OR error_code IS NOT NULL),
+  CHECK (status NOT IN ('deleted','already_deleted') OR tombstone_revision IS NOT NULL)
+)""",
+    """CREATE TABLE deletion_journal (
+  owner_id        INTEGER NOT NULL REFERENCES users(id),
+  operation_uuid  TEXT NOT NULL,
+  uuid_id         TEXT NOT NULL UNIQUE,
+  original_path   TEXT NOT NULL,
+  quarantine_path TEXT,
+  base_revision   INTEGER NOT NULL,
+  src_dev         INTEGER,
+  src_ino         INTEGER,
+  src_size        INTEGER,
+  src_mtime_ns    INTEGER,
+  exact_digest    TEXT,
+  cover_art_id    INTEGER,
+  master_missing  INTEGER NOT NULL CHECK (master_missing IN (0,1)),
+  stage           TEXT NOT NULL CHECK (stage IN ('intent','moved','committed')),
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  PRIMARY KEY (owner_id, operation_uuid, uuid_id),
+  FOREIGN KEY (owner_id, operation_uuid, uuid_id) REFERENCES deletion_job_items(owner_id, operation_uuid, uuid_id),
+  CHECK (master_missing = 1 OR (quarantine_path IS NOT NULL AND src_dev IS NOT NULL AND src_ino IS NOT NULL AND src_size IS NOT NULL)),
+  CHECK (master_missing = 0 OR quarantine_path IS NULL)
+)""",
+    """CREATE TRIGGER deletion_journal_names_own_track BEFORE INSERT ON deletion_journal
+WHEN NOT EXISTS (SELECT 1 FROM tracks WHERE uuid_id = NEW.uuid_id AND owner_id = NEW.owner_id)
+BEGIN
+  SELECT RAISE(ABORT, 'deletion_journal must name a track of its owner');
+END""",
+    """CREATE TRIGGER deletion_journal_keeps_its_track BEFORE UPDATE OF owner_id, uuid_id ON deletion_journal
+WHEN NEW.owner_id IS NOT OLD.owner_id OR NEW.uuid_id IS NOT OLD.uuid_id
+BEGIN
+  SELECT RAISE(ABORT, 'deletion_journal owner and track never change');
+END""",
+    "DROP VIEW live_tracks",
+    """CREATE VIEW live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks
+  WHERE NOT EXISTS (SELECT 1 FROM deletion_journal d WHERE d.uuid_id = tracks.uuid_id)""",
+)
+
+
 class SchemaVersionRefused(Exception):
     """Fatal startup error: the database file is not at the supported schema."""
 
@@ -451,6 +527,31 @@ class UploadItemsInUse(Exception):
 
 class TrackNotFound(Exception):
     """Raised when a metadata edit targets a uuid that no longer exists."""
+
+
+class DeletionRecheckFailed(Exception):
+    """The owner's track no longer matches what the deletion worker journaled
+    (gone, another revision or another path); nothing was changed."""
+
+
+class TrackAlreadyDeleted(Exception):
+    """``_delete_track_in`` met the owner's own tombstone for the uuid: the
+    track is already deleted, and its tombstone revision is not bumped again."""
+
+    def __init__(self, uuid_id: str, revision: int):
+        self.uuid_id = uuid_id
+        self.revision = revision
+        super().__init__(f"track {uuid_id} is already deleted (revision {revision})")
+
+
+class TrackPendingDeletion(Exception):
+    """A mutator met the pending-deletion marker (a ``deletion_journal`` row)
+    under the track lock. Retryable: a rolled-back deletion leaves a healthy
+    track."""
+
+    def __init__(self, uuid_id: str):
+        self.uuid_id = uuid_id
+        super().__init__(f"track {uuid_id} is pending deletion")
 
 
 class EmptyTrackEdit(Exception):
@@ -727,7 +828,7 @@ class Database:
     # Schema version a freshly-initialized database lands on. ``initialize``
     # accepts MINIMUM_SCHEMA_VERSION..LATEST_SCHEMA_VERSION (upgrading in place);
     # the admin CLI accepts only LATEST. Keep LATEST in sync with ``init.sql``.
-    LATEST_SCHEMA_VERSION = 15
+    LATEST_SCHEMA_VERSION = 16
     MINIMUM_SCHEMA_VERSION = 13
 
     def _existing_schema_version(self) -> int | None:
@@ -822,6 +923,7 @@ class Database:
             steps = {
                 13: self._migrate_13_to_14,
                 14: self._migrate_14_to_15,
+                15: self._migrate_15_to_16,
             }
             if not self.MINIMUM_SCHEMA_VERSION <= current <= self.LATEST_SCHEMA_VERSION:
                 raise SchemaVersionRefused(
@@ -862,6 +964,12 @@ class Database:
         for statement in SCHEMA_V15_DDL:
             conn.execute(statement)
         conn.execute("PRAGMA user_version = 15")
+
+    def _migrate_15_to_16(self, conn) -> None:
+        # Individual conn.execute calls only: executescript would COMMIT first.
+        for statement in SCHEMA_V16_DDL:
+            conn.execute(statement)
+        conn.execute("PRAGMA user_version = 16")
 
     @staticmethod
     def _with_operation_in(conn, *, owner_id, operation_uuid, kind, request_model, now):
@@ -3082,6 +3190,21 @@ class Database:
         )
 
     @staticmethod
+    def _requeue_match_in(conn, uuid_ids) -> int:
+        """Send these tracks' matching back to pending on the caller's
+        connection (never commits). Only ``match_state`` changes, and only on
+        rows not already pending: the audio bytes did not change, so nothing is
+        re-hashed. Returns the number of rows requeued."""
+        uuid_ids = list(uuid_ids)
+        if not uuid_ids:
+            return 0
+        return conn.execute(
+            "UPDATE track_audio_identity SET match_state = 'pending' "
+            f"WHERE match_state <> 'pending' AND uuid_id IN ({', '.join('?' * len(uuid_ids))})",
+            uuid_ids,
+        ).rowcount
+
+    @staticmethod
     def _stat_columns(exact_state: str, stat: Optional[tuple[int, int, int]]) -> dict[str, Any]:
         """The stat columns to store with an identity: the snapshot only when an
         identity value is written (exact state not 'pending'), else all NULL."""
@@ -3258,6 +3381,7 @@ class Database:
         # Redundant; it states idx_tai_work's own predicate so the planner may use it.
         "AND (exact_state = 'pending' OR fp_state = 'pending' OR match_state = 'pending') "
         "AND NOT EXISTS (SELECT 1 FROM edit_journal j WHERE j.uuid_id = i.uuid_id) "
+        "AND EXISTS (SELECT 1 FROM live_tracks lt WHERE lt.uuid_id = i.uuid_id) "
         "ORDER BY priority, next_attempt_at, rowid"
     )
     # Two fixed texts (one bound parameter, ?1 = now): without a fingerprinter the
@@ -3269,9 +3393,10 @@ class Database:
         self, now: int, *, skip: Mapping[str, int], owner_id: Owner, fingerprint: bool = False
     ) -> Optional[str]:
         """The next due uuid by (priority, rowid), skipping any with an edit_journal
-        row and any in ``skip`` (uuid -> generation) while its generation still
-        matches. Pending fingerprints count as work only when ``fingerprint`` is
-        true (see ``_IDENTITY_QUEUE_SQL``). The queue spans every owner, so only
+        row or a pending deletion (not in live_tracks) and any in ``skip``
+        (uuid -> generation) while its generation still matches. Pending
+        fingerprints count as work only when ``fingerprint`` is true (see
+        ``_IDENTITY_QUEUE_SQL``). The queue spans every owner, so only
         ANY_OWNER is accepted."""
         if owner_id is not ANY_OWNER:
             raise TypeError("next_identity_work requires owner_id=ANY_OWNER")
@@ -3313,7 +3438,8 @@ class Database:
     ) -> bool:
         """The worker's compare-and-set write: one transaction that writes ``values``
         only if the row still has ``generation``, the track still has this owner and
-        path, no edit_journal row exists, and ``verify()`` (run inside the
+        path, no edit_journal row exists, the track is not pending deletion (refused
+        like an edit journal), and ``verify()`` (run inside the
         transaction) is true. Otherwise changes nothing and returns False.
 
         ``fingerprint`` (optional) is the fingerprint layer's result, a mapping
@@ -3341,7 +3467,7 @@ class Database:
             self._check_fingerprint(fingerprint)
         with self._connection(commit=True, immediate=True) as conn:
             current = conn.execute(
-                "SELECT 1 FROM track_audio_identity i JOIN tracks t ON t.uuid_id = i.uuid_id "
+                "SELECT 1 FROM track_audio_identity i JOIN live_tracks t ON t.uuid_id = i.uuid_id "
                 "WHERE i.uuid_id = ? AND i.generation = ? AND t.owner_id = ? AND t.file_path = ? "
                 "AND NOT EXISTS (SELECT 1 FROM edit_journal j WHERE j.uuid_id = i.uuid_id)",
                 (uuid_id, generation, owner_id, file_path),
@@ -3490,7 +3616,8 @@ class Database:
         Opens its own immediate transaction. It writes only if the subject's
         identity row is unchanged since it was read: same ``generation``,
         ``exact_state`` and ``fp_state``, ``match_state`` still 'pending', the
-        track belongs to ``owner_id`` and has no ``edit_journal`` row. Otherwise it returns False
+        track belongs to ``owner_id``, is live (no deletion journal) and has no
+        ``edit_journal`` row. Otherwise it returns False
         and changes nothing.
 
         Each ``TrackRef`` match is upserted in canonical (min, max) uuid order.
@@ -3528,7 +3655,7 @@ class Database:
             subject_row = conn.execute(
                 "SELECT i.exact_kind, i.exact_digest, i.sample_rate_hz, i.channels, i.bits_per_sample, "
                 "i.fp_algorithm "
-                "FROM track_audio_identity i JOIN tracks t ON t.uuid_id = i.uuid_id "
+                "FROM track_audio_identity i JOIN live_tracks t ON t.uuid_id = i.uuid_id "
                 "WHERE i.uuid_id = ? AND i.generation = ? AND i.exact_state = ? "
                 "AND i.fp_state = ? AND i.match_state = 'pending' AND t.owner_id = ? "
                 "AND NOT EXISTS (SELECT 1 FROM edit_journal j WHERE j.uuid_id = i.uuid_id)",
@@ -3625,6 +3752,19 @@ class Database:
         live tracks is found: a foreign or unknown pair is "not found" and
         returns False with nothing changed. Setting the status it already has
         returns True and writes nothing. Opens its own transaction.
+
+        A restore that reopens a dismissed pair also sends both tracks'
+        matching back to pending in the same transaction: the matcher never
+        re-checks a dismissed pair, so it may be stale (a track changed while
+        dismissed), and only a new match run removes or re-types it. The
+        caller wakes the identity worker after the commit.
+
+        The not-comparable rule (DEV-6.5-15) runs when a track's state is
+        written and skips dismissed pairs, so a pair restored after one of its
+        tracks became not comparable for the pair's kind is dropped here, in
+        the same transaction (with that track's other open pairs of the kind).
+        A track that becomes not comparable later is handled by the
+        write-time rule.
         """
         if status not in ("open", "dismissed"):
             raise ValueError(f"status must be 'open' or 'dismissed', got {status!r}")
@@ -3632,7 +3772,7 @@ class Database:
         a, b = min(uuid_a, uuid_b), max(uuid_a, uuid_b)
         with self._connection(commit=True, immediate=True) as conn:
             row = conn.execute(
-                "SELECT c.status FROM track_duplicate_candidates c "
+                "SELECT c.status, c.kind FROM track_duplicate_candidates c "
                 "WHERE c.uuid_a = ? AND c.uuid_b = ? AND c.owner_id = ? "
                 "AND EXISTS (SELECT 1 FROM live_tracks WHERE uuid_id = c.uuid_a AND owner_id = ?) "
                 "AND EXISTS (SELECT 1 FROM live_tracks WHERE uuid_id = c.uuid_b AND owner_id = ?)",
@@ -3646,7 +3786,137 @@ class Database:
                     "WHERE uuid_a = ? AND uuid_b = ?",
                     (status, a, b),
                 )
+                if status == "open":
+                    self._requeue_match_in(conn, (a, b))
+                    self._drop_restored_not_comparable_in(conn, (a, b), row[1])
             return True
+
+    @staticmethod
+    def _drop_restored_not_comparable_in(conn, uuid_ids, kind: str) -> None:
+        """For a just-restored pair of ``kind``: each track whose layer of that
+        kind is not comparable loses its open pairs of that kind (the pair
+        included), on the caller's connection (never commits). A track without
+        an identity row has nothing to drop."""
+        column, not_comparable = {
+            "exact": ("exact_state", EXACT_NOT_COMPARABLE_STATES),
+            "fingerprint": ("fp_state", FINGERPRINT_NOT_COMPARABLE_STATES),
+        }[kind]
+        for uuid_id in uuid_ids:
+            state = conn.execute(
+                f"SELECT {column} FROM track_audio_identity WHERE uuid_id = ?", (uuid_id,)
+            ).fetchone()
+            if state is not None and state[0] in not_comparable:
+                Database._drop_open_pairs_in(conn, uuid_id, kind)
+
+    def list_duplicate_candidates(
+        self,
+        *,
+        owner_id: int,
+        status: str,
+        after: tuple[int, float, str, str] | None,
+        limit: int,
+    ) -> list[dict]:
+        """One keyset page of the owner's duplicate pairs with the given status.
+
+        Ordered by (band_rank, sort_score DESC, uuid_a, uuid_b); ``after`` is
+        the last row's (band_rank, sort_score, uuid_a, uuid_b) and the page
+        starts strictly after it. Returns at most ``limit`` rows. Both members
+        join through ``live_tracks``, so a pair with a pending-deletion member
+        is omitted. Each row carries both tracks' summaries (``file_path`` is
+        for the service layer); a NULL audio property stays None.
+        """
+        owner = _require_owner(owner_id)
+        params: dict[str, object] = {
+            "owner": owner,
+            "status": status,
+            "min_band": after[0] if after is not None else 0,
+            "limit": limit,
+        }
+        keyset = ""
+        if after is not None:
+            params.update(r=after[0], s=after[1], a=after[2], b=after[3])
+            keyset = (
+                "AND (c.band_rank > :r OR (c.band_rank = :r AND (c.sort_score < :s "
+                "OR (c.sort_score = :s AND (c.uuid_a > :a OR (c.uuid_a = :a AND c.uuid_b > :b))))))"
+            )
+
+        def cols(p: str) -> str:
+            return (
+                f"t{p}.uuid_id AS {p}_uuid_id, t{p}.revision AS {p}_revision, "
+                f"m{p}.title AS {p}_title, m{p}.artist AS {p}_artist, m{p}.album AS {p}_album, "
+                f"m{p}.codec AS {p}_codec, m{p}.bitrate_kbps AS {p}_bitrate_kbps, "
+                f"m{p}.sample_rate_hz AS {p}_sample_rate_hz, m{p}.channels AS {p}_channels, "
+                f"m{p}.duration AS {p}_duration_s, t{p}.created_at AS {p}_added_at, "
+                f"l{p}.file_path AS {p}_file_path"
+            )
+
+        def join(p: str) -> str:
+            return (
+                f"CROSS JOIN live_tracks l{p} ON l{p}.uuid_id = c.uuid_{p} AND l{p}.owner_id = c.owner_id "
+                f"CROSS JOIN tracks t{p} ON t{p}.id = l{p}.id "
+                f"LEFT JOIN trackmetadata m{p} ON m{p}.uuid_id = c.uuid_{p} "
+            )
+
+        sql = (
+            "SELECT c.uuid_a, c.uuid_b, c.kind, c.band_rank, c.sort_score, c.detected_at, c.status, "
+            f"{cols('a')}, {cols('b')} "
+            f"FROM track_duplicate_candidates c {join('a')}{join('b')}"
+            "WHERE c.owner_id = :owner AND c.status = :status AND c.band_rank >= :min_band "
+            f"{keyset} "
+            "ORDER BY c.band_rank, c.sort_score DESC, c.uuid_a, c.uuid_b LIMIT :limit"
+        )
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        def side(row, p: str) -> dict:
+            return {
+                k: row[f"{p}_{k}"]
+                for k in (
+                    "uuid_id", "revision", "title", "artist", "album", "codec",
+                    "bitrate_kbps", "sample_rate_hz", "channels", "duration_s",
+                    "added_at", "file_path",
+                )
+            }
+
+        return [
+            {
+                "uuid_a": r["uuid_a"],
+                "uuid_b": r["uuid_b"],
+                "kind": r["kind"],
+                "band_rank": r["band_rank"],
+                "sort_score": r["sort_score"],
+                "detected_at": r["detected_at"],
+                "status": r["status"],
+                "track_a": side(r, "a"),
+                "track_b": side(r, "b"),
+            }
+            for r in rows
+        ]
+
+    def count_duplicate_candidates(self, *, owner_id: int) -> dict:
+        """Open/dismissed pair counts per band for one owner.
+
+        Returns ``{band: {"open": n, "dismissed": n}}`` for every band, with a
+        real 0 where there are no pairs. Both members join through
+        ``live_tracks`` (same owner), so a pair with a pending-deletion member
+        is not counted.
+        """
+        from app.services.duplicate_detection import BAND_RANK  # import cycle
+
+        owner = _require_owner(owner_id)
+        counts = {band: {"open": 0, "dismissed": 0} for band in BAND_RANK}
+        band_of = {rank: band for band, rank in BAND_RANK.items()}
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT c.band_rank, c.status, COUNT(*) FROM track_duplicate_candidates c "
+                "CROSS JOIN live_tracks la ON la.uuid_id = c.uuid_a AND la.owner_id = c.owner_id "
+                "CROSS JOIN live_tracks lb ON lb.uuid_id = c.uuid_b AND lb.owner_id = c.owner_id "
+                "WHERE c.owner_id = ? GROUP BY c.band_rank, c.status",
+                (owner,),
+            ).fetchall()
+        for rank, status, n in rows:
+            counts[band_of[rank]][status] = n
+        return counts
 
     def get_identity_coverage_summary(self, *, owner_id: int) -> dict:
         """Per-layer state counts over one owner's live tracks.
@@ -4184,7 +4454,7 @@ class Database:
             with self._connection(commit=True) as conn:
                 cursor = conn.execute(
                     "UPDATE trackmetadata SET cover_art_id = ? WHERE uuid_id = ? "
-                    "AND uuid_id IN (SELECT uuid_id FROM tracks WHERE uuid_id = ?"
+                    "AND uuid_id IN (SELECT uuid_id FROM live_tracks WHERE uuid_id = ?"
                     + suffix
                     + ")",
                     (cover_art_id, uuid_id, uuid_id, *params),
@@ -4733,6 +5003,578 @@ class Database:
         )
         return rows[0] if rows else None
 
+    @staticmethod
+    def _is_pending_deletion_in(conn, uuid_id: str, owner: int) -> bool:
+        row = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM tracks WHERE uuid_id = ? AND owner_id = ?)"
+            " AND NOT EXISTS(SELECT 1 FROM live_tracks WHERE uuid_id = ? AND owner_id = ?)",
+            (uuid_id, owner, uuid_id, owner),
+        ).fetchone()
+        return bool(row[0])
+
+    def is_pending_deletion(self, uuid_id: str, *, owner_id: int) -> bool:
+        """True when the owner's track exists but is missing from ``live_tracks``.
+
+        The marker is a ``deletion_journal`` row, which ``live_tracks`` excludes.
+        A tombstoned, unknown or foreign track is not pending (it answers like
+        unknown)."""
+        owner_id = _require_owner(owner_id)
+        with self._connection() as conn:
+            return self._is_pending_deletion_in(conn, uuid_id, owner_id)
+
+    @staticmethod
+    def _deletion_busy_in(conn, uuid_id: str, owner: int) -> bool:
+        """True when the owner's track is mid-operation and must not be deleted
+        now: an active conversion, an edit journal row, a non-terminal upload
+        commit journal row naming it, or a pending deletion. Owner-scoped."""
+        if conn.execute(
+            "SELECT 1 FROM conversion_jobs WHERE uuid_id = ? AND owner_id = ?"
+            " AND status IN ('queued','running') LIMIT 1",
+            (uuid_id, owner),
+        ).fetchone():
+            return True
+        if conn.execute(
+            "SELECT 1 FROM edit_journal WHERE uuid_id = ? AND owner_id = ? LIMIT 1",
+            (uuid_id, owner),
+        ).fetchone():
+            return True
+        if conn.execute(
+            "SELECT 1 FROM upload_commit_journal WHERE reserved_track_uuid = ?"
+            " AND owner_id = ? AND state IN ('committing','prepared','moved') LIMIT 1",
+            (uuid_id, owner),
+        ).fetchone():
+            return True
+        return Database._is_pending_deletion_in(conn, uuid_id, owner)
+
+    def get_deletion_preview_facts(
+        self, uuid_ids: list[str], *, owner_id: int
+    ) -> dict[str, dict]:
+        """What the deletion preview needs per requested UUID, for the owner only:
+        a live track (state, revision, title, artist, album, file_path, busy), an
+        own tombstone (state, revision), else absent. Writes nothing."""
+        owner = _require_owner(owner_id)
+        facts: dict[str, dict] = {}
+        with self._connection() as conn:
+            for start in range(0, len(uuid_ids), 500):
+                chunk = uuid_ids[start : start + 500]
+                marks = ",".join("?" * len(chunk))
+                for r in conn.execute(
+                    "SELECT t.uuid_id, t.revision, t.file_path, m.title, m.artist, m.album"
+                    " FROM tracks t LEFT JOIN trackmetadata m ON m.uuid_id = t.uuid_id"
+                    f" WHERE t.owner_id = ? AND t.uuid_id IN ({marks})",
+                    (owner, *chunk),
+                ):
+                    facts[r["uuid_id"]] = {
+                        "state": "live",
+                        "revision": r["revision"],
+                        "title": r["title"],
+                        "artist": r["artist"],
+                        "album": r["album"],
+                        "file_path": str(r["file_path"]),
+                        "busy": self._deletion_busy_in(conn, r["uuid_id"], owner),
+                    }
+                for r in conn.execute(
+                    "SELECT uuid_id, revision FROM track_tombstones"
+                    f" WHERE owner_id = ? AND uuid_id IN ({marks})",
+                    (owner, *chunk),
+                ):
+                    facts.setdefault(
+                        r["uuid_id"], {"state": "tombstone", "revision": r["revision"]}
+                    )
+        return facts
+
+    def read_deletion_target(self, uuid_id: str, *, owner_id: int) -> dict:
+        """What the deletion worker revalidates under the track lock, for the
+        owner only: a live track (state, revision, file_path, cover_art_id, busy),
+        an own tombstone (state, revision), else absent. Writes nothing."""
+        owner = _require_owner(owner_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT t.revision, t.file_path, m.cover_art_id FROM tracks t"
+                " LEFT JOIN trackmetadata m ON m.uuid_id = t.uuid_id"
+                " WHERE t.uuid_id = ? AND t.owner_id = ?",
+                (uuid_id, owner),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "state": "live",
+                    "revision": row["revision"],
+                    "file_path": str(row["file_path"]),
+                    "cover_art_id": row["cover_art_id"],
+                    "busy": self._deletion_busy_in(conn, uuid_id, owner),
+                }
+            tomb = conn.execute(
+                "SELECT revision FROM track_tombstones WHERE uuid_id = ? AND owner_id = ?",
+                (uuid_id, owner),
+            ).fetchone()
+            if tomb is not None:
+                return {"state": "tombstone", "revision": tomb["revision"]}
+        return {"state": "absent"}
+
+    def create_deletion_job(self, request, *, owner_id: int, now: int) -> bool:
+        """True for a new job, False for an exact replay. The operation hash is
+        order-normalised (plan D6); the job keeps the request order. Targets are
+        stored as given: nothing is looked up."""
+        owner = _require_owner(owner_id)
+        op = str(request.operation_uuid)
+        targets = [(str(t.uuid_id), t.base_revision) for t in request.targets]
+        with self._connection(commit=True, immediate=True) as conn:
+            outcome = self._with_operation_in(
+                conn,
+                owner_id=owner,
+                operation_uuid=op,
+                kind="track_deletion",
+                request_model=request.receipt_model(),
+                now=now,
+            )
+            if isinstance(outcome, OpReplay):
+                return False
+            conn.execute(
+                "INSERT INTO deletion_jobs (owner_id, operation_uuid, created_at, status)"
+                " VALUES (?, ?, ?, 'accepted')",
+                (owner, op, now),
+            )
+            conn.executemany(
+                "INSERT INTO deletion_job_items (owner_id, operation_uuid, uuid_id,"
+                " position, base_revision, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                [
+                    (owner, op, uuid_id, index, revision)
+                    for index, (uuid_id, revision) in enumerate(targets)
+                ],
+            )
+            self._set_operation_result_in(
+                conn, owner_id=owner, operation_uuid=op, result_ref=op
+            )
+        return True
+
+    def claim_next_deletion_item(self, *, boot_id: str) -> dict | None:
+        """Claim the first pending deletion item of any owner (job created_at,
+        operation_uuid, item position) by a pending -> running CAS stamping
+        ``boot_id`` (SC-16d). None when nothing is pending."""
+        # Deferred: the services package imports this module.
+        from app.services import job_runtime
+
+        job_runtime.register_job_table(
+            "deletion_job_items",
+            key_columns=("owner_id", "operation_uuid", "uuid_id"),
+            state_column="status",
+            terminal_states=DELETION_ITEM_TERMINAL_STATES,
+        )
+        with self._connection(commit=True, immediate=True) as conn:
+            row = conn.execute(
+                "SELECT i.owner_id, i.operation_uuid, i.uuid_id, i.base_revision"
+                " FROM deletion_job_items i JOIN deletion_jobs j"
+                " ON j.owner_id = i.owner_id AND j.operation_uuid = i.operation_uuid"
+                " JOIN users u ON u.id = i.owner_id"
+                " WHERE i.status = 'pending' AND u.deleting_at IS NULL"
+                " ORDER BY j.created_at, i.operation_uuid, i.position LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            key = {
+                "owner_id": row["owner_id"],
+                "operation_uuid": row["operation_uuid"],
+                "uuid_id": row["uuid_id"],
+            }
+            if not job_runtime.claim(conn, "deletion_job_items", key, boot_id=boot_id):
+                return None
+            return {**key, "base_revision": row["base_revision"]}
+
+    def finish_deletion_item(
+        self,
+        *,
+        owner_id: int,
+        operation_uuid: str,
+        uuid_id: str,
+        boot_id: str,
+        status: str,
+        error_code: str | None = None,
+        tombstone_revision: int | None = None,
+        details=(),
+    ) -> bool:
+        """Terminalize a running item this boot leased; True iff the row changed.
+        The job completes once none of its items is non-terminal."""
+        from app.services import deletion_errors  # deferred, as above
+
+        details = list(details)
+        if status not in DELETION_ITEM_TERMINAL_STATES:
+            raise ValueError("status must be a terminal item state")
+        if error_code is not None and error_code not in deletion_errors.ITEM_ERROR_CODES:
+            raise ValueError("unknown item error code")
+        if any(d not in deletion_errors.ITEM_DETAIL_CODES for d in details):
+            raise ValueError("unknown item detail code")
+        with self._connection(commit=True, immediate=True) as conn:
+            cursor = conn.execute(
+                "UPDATE deletion_job_items SET status = ?, error_code = ?,"
+                " tombstone_revision = ?, detail_json = ?"
+                " WHERE owner_id = ? AND operation_uuid = ? AND uuid_id = ?"
+                " AND status = 'running' AND lease_boot_id = ?",
+                (
+                    status, error_code, tombstone_revision, json.dumps(details),
+                    owner_id, operation_uuid, uuid_id, boot_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._complete_deletion_job_if_done_in(conn, owner_id, operation_uuid)
+            return True
+
+    @staticmethod
+    def _complete_deletion_job_if_done_in(conn, owner: int, operation_uuid: str) -> None:
+        open_items = conn.execute(
+            "SELECT 1 FROM deletion_job_items WHERE owner_id = ?"
+            " AND operation_uuid = ? AND status IN ('pending','running') LIMIT 1",
+            (owner, operation_uuid),
+        ).fetchone()
+        if open_items is None:
+            conn.execute(
+                "UPDATE deletion_jobs SET status = 'completed'"
+                " WHERE owner_id = ? AND operation_uuid = ?",
+                (owner, operation_uuid),
+            )
+
+    def begin_track_deletion(
+        self,
+        *,
+        owner_id: int,
+        operation_uuid: str,
+        uuid_id: str,
+        boot_id: str,
+        base_revision: int,
+        original_path: str,
+        quarantine_path: str | None,
+        identity,
+        cover_art_id: int | None,
+        master_missing: bool,
+        now: int,
+    ) -> str:
+        """Write the deletion journal row (stage 'intent') before any move.
+        "ok", or "gone" (the item is not ours and running), "conflict" (the
+        track changed) or "busy". Nothing is written unless "ok"."""
+        owner = _require_owner(owner_id)
+        src = tuple(identity) if identity is not None else (None, None, None, None)
+        with self._connection(commit=True, immediate=True) as conn:
+            leased = conn.execute(
+                "SELECT 1 FROM deletion_job_items WHERE owner_id = ? AND operation_uuid = ?"
+                " AND uuid_id = ? AND status = 'running' AND lease_boot_id = ?",
+                (owner, operation_uuid, uuid_id, boot_id),
+            ).fetchone()
+            if leased is None:
+                return "gone"
+            track = conn.execute(
+                "SELECT revision, file_path FROM tracks WHERE uuid_id = ? AND owner_id = ?",
+                (uuid_id, owner),
+            ).fetchone()
+            if (
+                track is None
+                or track["revision"] != base_revision
+                or str(track["file_path"]) != str(original_path)
+            ):
+                return "conflict"
+            if self._deletion_busy_in(conn, uuid_id, owner):
+                return "busy"
+            conn.execute(
+                "INSERT INTO deletion_journal (owner_id, operation_uuid, uuid_id,"
+                " original_path, quarantine_path, base_revision, src_dev, src_ino,"
+                " src_size, src_mtime_ns, exact_digest, cover_art_id, master_missing,"
+                " stage, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'intent', ?, ?)",
+                (
+                    owner, operation_uuid, uuid_id, str(original_path), quarantine_path,
+                    base_revision, *src, cover_art_id, 1 if master_missing else 0, now, now,
+                ),
+            )
+        return "ok"
+
+    def mark_deletion_moved(
+        self, *, owner_id: int, operation_uuid: str, uuid_id: str, now: int
+    ) -> None:
+        owner = _require_owner(owner_id)
+        with self._connection(commit=True, immediate=True) as conn:
+            conn.execute(
+                "UPDATE deletion_journal SET stage = 'moved', updated_at = ?"
+                " WHERE owner_id = ? AND operation_uuid = ? AND uuid_id = ?"
+                " AND stage = 'intent'",
+                (now, owner, operation_uuid, uuid_id),
+            )
+
+    def commit_track_deletion(
+        self,
+        *,
+        owner_id: int,
+        operation_uuid: str,
+        uuid_id: str,
+        boot_id: str,
+        base_revision: int,
+        original_path: str,
+        details,
+        now: int,
+    ) -> int:
+        """The one transaction of a deletion: recheck, tombstone and delete the
+        catalog rows, mark the item deleted, complete the job, journal
+        'committed'. Returns the tombstone revision."""
+        from app.services import deletion_errors  # deferred, as above
+
+        owner = _require_owner(owner_id)
+        details = list(details)
+        if any(d not in deletion_errors.ITEM_DETAIL_CODES for d in details):
+            raise ValueError("unknown item detail code")
+        with self._connection(commit=True, immediate=True) as conn:
+            track = conn.execute(
+                "SELECT revision, file_path FROM tracks WHERE uuid_id = ? AND owner_id = ?",
+                (uuid_id, owner),
+            ).fetchone()
+            if (
+                track is None
+                or track["revision"] != base_revision
+                or str(track["file_path"]) != str(original_path)
+            ):
+                raise DeletionRecheckFailed(uuid_id)
+            revision = self._delete_track_in(conn, uuid_id, owner_id=owner)
+            cursor = conn.execute(
+                "UPDATE deletion_job_items SET status = 'deleted', tombstone_revision = ?,"
+                " detail_json = ? WHERE owner_id = ? AND operation_uuid = ? AND uuid_id = ?"
+                " AND status = 'running' AND lease_boot_id = ?",
+                (revision, json.dumps(details), owner, operation_uuid, uuid_id, boot_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("deletion item is not running under this boot")
+            self._complete_deletion_job_if_done_in(conn, owner, operation_uuid)
+            cursor = conn.execute(
+                "UPDATE deletion_journal SET stage = 'committed', updated_at = ?"
+                " WHERE owner_id = ? AND operation_uuid = ? AND uuid_id = ?",
+                (now, owner, operation_uuid, uuid_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("deletion journal row is missing")
+        return revision
+
+    def clear_deletion_journal(
+        self, *, owner_id: int, operation_uuid: str, uuid_id: str
+    ) -> bool:
+        """Drop an uncommitted journal row (never a committed one); True iff
+        one row went."""
+        owner = _require_owner(owner_id)
+        with self._connection(commit=True, immediate=True) as conn:
+            cursor = conn.execute(
+                "DELETE FROM deletion_journal WHERE owner_id = ? AND operation_uuid = ?"
+                " AND uuid_id = ? AND stage IN ('intent','moved')",
+                (owner, operation_uuid, uuid_id),
+            )
+            return cursor.rowcount == 1
+
+    def get_deletion_journal(
+        self, *, owner_id: int, operation_uuid: str, uuid_id: str
+    ) -> dict | None:
+        """The owner's journal row for one item, or None. Writes nothing."""
+        owner = _require_owner(owner_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM deletion_journal WHERE owner_id = ?"
+                " AND operation_uuid = ? AND uuid_id = ?",
+                (owner, operation_uuid, uuid_id),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def release_deletion_item(
+        self, *, owner_id: int, operation_uuid: str, uuid_id: str, boot_id: str
+    ) -> bool:
+        """Put a running item this boot holds back to pending, only while it has
+        no journal row. True iff the item changed."""
+        owner = _require_owner(owner_id)
+        with self._connection(commit=True, immediate=True) as conn:
+            cursor = conn.execute(
+                "UPDATE deletion_job_items SET status = 'pending', lease_boot_id = NULL"
+                " WHERE owner_id = ? AND operation_uuid = ? AND uuid_id = ?"
+                " AND status = 'running' AND lease_boot_id = ?"
+                " AND NOT EXISTS (SELECT 1 FROM deletion_journal d"
+                " WHERE d.owner_id = deletion_job_items.owner_id"
+                " AND d.operation_uuid = deletion_job_items.operation_uuid"
+                " AND d.uuid_id = deletion_job_items.uuid_id)",
+                (owner, operation_uuid, uuid_id, boot_id),
+            )
+            return cursor.rowcount == 1
+
+    def finish_deletion_cleanup(
+        self, *, owner_id: int, operation_uuid: str, uuid_id: str, details
+    ) -> None:
+        """After storage cleanup: drop the committed journal row and set the
+        item's final details."""
+        owner = _require_owner(owner_id)
+        with self._connection(commit=True, immediate=True) as conn:
+            conn.execute(
+                "DELETE FROM deletion_journal WHERE owner_id = ? AND operation_uuid = ?"
+                " AND uuid_id = ? AND stage = 'committed'",
+                (owner, operation_uuid, uuid_id),
+            )
+            conn.execute(
+                "UPDATE deletion_job_items SET detail_json = ? WHERE owner_id = ?"
+                " AND operation_uuid = ? AND uuid_id = ? AND status = 'deleted'",
+                (json.dumps(list(details)), owner, operation_uuid, uuid_id),
+            )
+
+    def make_durable(self, *, timeout: float = 1) -> bool:
+        """True only when every transaction committed before this call is in
+        the database file and that file was synced (OPEN-8-01 part B). A reader
+        on an older snapshot or a writer that outlasts ``timeout`` answers
+        False (a FULL checkpoint holds the write lock while it waits for
+        readers; the next pass retries). Exceptions propagate."""
+        with self._connection(timeout=timeout) as conn:
+            conn.execute("PRAGMA fullfsync=ON")
+            busy, log, checkpointed = conn.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+            synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+        if not (busy == 0 and log >= 0 and log == checkpointed):
+            return False
+        # The last connection to close checkpoints the WAL itself with a plain
+        # fsync (no F_FULLFSYNC on macOS), so the checkpoint above often finds
+        # nothing to do and issues no full flush. Flush the main file here:
+        # F_FULLFSYNC flushes the drive cache, covering the earlier plain syncs.
+        # synchronous OFF means no durability is configured (test process only).
+        if synchronous != 0:
+            fd = os.open(self.context.database_path, os.O_RDONLY)
+            try:
+                if sys.platform == "darwin":
+                    try:
+                        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+                    except OSError as exc:
+                        # A file system without F_FULLFSYNC: SQLite's own fallback.
+                        logger.warning(
+                            "full flush refused (%s); the database file got a plain fsync",
+                            type(exc).__name__,
+                        )
+                        os.fsync(fd)
+                else:
+                    os.fsync(fd)
+            finally:
+                os.close(fd)
+        return True
+
+    def deletion_job_has_pending_items(self, *, owner_id: int, operation_uuid: str) -> bool:
+        owner = _require_owner(owner_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM deletion_job_items WHERE owner_id = ? AND operation_uuid = ?"
+                " AND status = 'pending' LIMIT 1",
+                (owner, operation_uuid),
+            ).fetchone()
+        return row is not None
+
+    def reclaim_deletion_items(self, *, boot_id: str) -> int:
+        """Startup reclaim, server-wide: requeue running items left by another
+        boot (or with no lease) that have no deletion journal row, since a
+        journal-backed item waits for journal recovery. Then complete accepted
+        jobs that have no open item left. Returns the number of items requeued.
+        Idempotent: a second call with nothing left to do changes nothing."""
+        with self._connection(commit=True, immediate=True) as conn:
+            cursor = conn.execute(
+                "UPDATE deletion_job_items SET status = 'pending', lease_boot_id = NULL"
+                " WHERE status = 'running'"
+                " AND (lease_boot_id IS NULL OR lease_boot_id <> ?)"
+                " AND NOT EXISTS (SELECT 1 FROM deletion_journal d"
+                " WHERE d.owner_id = deletion_job_items.owner_id"
+                " AND d.operation_uuid = deletion_job_items.operation_uuid"
+                " AND d.uuid_id = deletion_job_items.uuid_id)",
+                (boot_id,),
+            )
+            requeued = cursor.rowcount
+            conn.execute(
+                "UPDATE deletion_jobs SET status = 'completed' WHERE status = 'accepted'"
+                " AND NOT EXISTS (SELECT 1 FROM deletion_job_items i"
+                " WHERE i.owner_id = deletion_jobs.owner_id"
+                " AND i.operation_uuid = deletion_jobs.operation_uuid"
+                " AND i.status IN ('pending','running'))"
+            )
+            return requeued
+
+    def list_deletion_journals(self, *, stages) -> list[dict]:
+        """Every deletion journal row (all owners) whose stage is in ``stages``,
+        ordered by owner, operation and track. Writes nothing."""
+        stages = tuple(stages)
+        if any(st not in ("intent", "moved", "committed") for st in stages):
+            raise ValueError("unknown deletion journal stage")
+        if not stages:
+            return []
+        marks = ",".join("?" for _ in stages)
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM deletion_journal WHERE stage IN (" + marks + ")"
+                " ORDER BY owner_id, operation_uuid, uuid_id",
+                stages,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_deletion_recovery_required(
+        self, *, owner_id: int, operation_uuid: str, uuid_id: str, boot_id: str
+    ) -> bool:
+        """Startup recovery could not resolve a journal: fail the item left
+        running by another boot with ``recovery_required`` (the journal stays)
+        and complete its job when nothing is open. A terminal item is never
+        rewritten. True iff the item changed."""
+        owner = _require_owner(owner_id)
+        with self._connection(commit=True, immediate=True) as conn:
+            cursor = conn.execute(
+                "UPDATE deletion_job_items SET status = 'failed',"
+                " error_code = 'recovery_required'"
+                " WHERE owner_id = ? AND operation_uuid = ? AND uuid_id = ?"
+                " AND status = 'running'"
+                " AND (lease_boot_id IS NULL OR lease_boot_id <> ?)",
+                (owner, operation_uuid, uuid_id, boot_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._complete_deletion_job_if_done_in(conn, owner, operation_uuid)
+            return True
+
+    def get_deletion_job(self, operation_uuid, *, owner_id: int) -> dict | None:
+        owner = _require_owner(owner_id)
+        key = str(uuid.UUID(str(operation_uuid)))
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT operation_uuid, created_at FROM deletion_jobs"
+                " WHERE owner_id = ? AND operation_uuid = ?",
+                (owner, key),
+            ).fetchone()
+            if row is None:
+                return None
+            items = conn.execute(
+                "SELECT uuid_id, position, base_revision, status, error_code,"
+                " tombstone_revision, detail_json FROM deletion_job_items"
+                " WHERE owner_id = ? AND operation_uuid = ? ORDER BY position",
+                (owner, key),
+            ).fetchall()
+        return {
+            "operation_uuid": row["operation_uuid"],
+            "created_at": row["created_at"],
+            "items": [dict(i) for i in items],
+        }
+
+    def list_deletion_jobs(
+        self, *, owner_id: int, after: tuple[int, str] | None, limit: int
+    ) -> list[dict]:
+        """Keyset page ascending by (created_at, operation_uuid), each job with
+        its non-zero per-status item counts. Jobs are kept, never pruned."""
+        owner = _require_owner(owner_id)
+        sql = "SELECT operation_uuid, created_at FROM deletion_jobs WHERE owner_id = ?"
+        params: list = [owner]
+        if after is not None:
+            sql += " AND (created_at, operation_uuid) > (?, ?)"
+            params += [after[0], after[1]]
+        sql += " ORDER BY created_at, operation_uuid LIMIT ?"
+        params.append(limit)
+        with self._connection() as conn:
+            jobs = [dict(row) for row in conn.execute(sql, params)]
+            counts: dict[str, dict[str, int]] = {}
+            if jobs:
+                marks = ",".join("?" for _ in jobs)
+                for row in conn.execute(
+                    "SELECT operation_uuid, status, count(*) FROM deletion_job_items"
+                    f" WHERE owner_id = ? AND operation_uuid IN ({marks})"
+                    " GROUP BY operation_uuid, status",
+                    (owner, *[j["operation_uuid"] for j in jobs]),
+                ):
+                    counts.setdefault(row[0], {})[row[1]] = row[2]
+        return [{**j, "state_counts": counts.get(j["operation_uuid"], {})} for j in jobs]
+
     def get_track_file_path(self, uuid_id: str, *, owner_id: Owner) -> Optional[str]:
         """Current ``tracks.file_path`` for a uuid, or None if the track is gone.
         Used by journal reconcile to tell whether a relocate's DB commit landed."""
@@ -5088,6 +5930,7 @@ class Database:
         channels: Optional[int],
         duration: Optional[float],
         owner_id: int,
+        file_path: Optional[str] = None,
     ) -> Optional[int]:
         """Re-write the file-derived fields of an owned track (settle check,
         m-L-08) in one transaction and bump its revision. Unknown stays None.
@@ -5103,7 +5946,7 @@ class Database:
                 return None
             revision = self._apply_conversion_result(
                 conn, uuid_id, codec, bitrate_kbps, sample_rate_hz, channels,
-                duration=duration,
+                file_path=file_path, duration=duration,
             )
             # The file changed after import: every identity layer is stale.
             self._mark_audio_identity_stale_in(conn, uuid_id, "settle")
@@ -5128,53 +5971,82 @@ class Database:
             (track_db_id, fts_title, effective_artist, fts_album),
         )
 
+    def _delete_track_in(self, conn, uuid_id: str, *, owner_id: int) -> int:
+        """Delete the owner's track inside the caller's transaction.
+
+        Runs inside the caller's ``BEGIN IMMEDIATE``; never opens, commits,
+        rolls back or closes a connection. Records a tombstone (a plain INSERT,
+        never a replace, so an existing tombstone is not re-bumped), deletes
+        trackmetadata/tracks/FTS rows and prunes orphaned album/artist parents.
+        Returns the tombstone revision. Does not touch ``deletion_journal``.
+
+        Raises ``TrackAlreadyDeleted(uuid, revision)`` when the owner's own
+        tombstone exists for the uuid, and ``TrackNotFound`` otherwise when no
+        live track of this owner has it (an unknown uuid, another user's live
+        track and another user's tombstone are indistinguishable). Nothing is
+        written in either case.
+
+        The deletion worker must hold the track's ``TrackLocks`` lock (lock
+        order: track -> directory -> DB).
+        """
+        _require_owner(owner_id)
+        # Fetch metadata before deletion for FTS cleanup
+        meta_row = conn.execute(
+            "SELECT tm.track_id, tm.artist_id, tm.album_id, tm.title, "
+            "tm.artist, tm.album, tm.album_artist "
+            "FROM trackmetadata tm JOIN tracks t ON t.uuid_id = tm.uuid_id "
+            "WHERE tm.uuid_id = ? AND t.owner_id = ?",
+            (uuid_id, owner_id),
+        ).fetchone()
+
+        if meta_row is None:
+            tomb = conn.execute(
+                "SELECT revision FROM track_tombstones "
+                "WHERE uuid_id = ? AND owner_id = ?",
+                (uuid_id, owner_id),
+            ).fetchone()
+            if tomb is not None:
+                raise TrackAlreadyDeleted(uuid_id, tomb["revision"])
+            raise TrackNotFound(uuid_id)
+
+        artist_id = meta_row["artist_id"]
+        album_id = meta_row["album_id"]
+
+        # Record a tombstone before the hard delete so incremental
+        # sync clients can reconcile the removal — the row is about to
+        # vanish from `tracks`/`trackmetadata`, leaving the frontend no
+        # other signal that it ever existed.
+        revision = self._next_revision(conn)
+        conn.execute(
+            "INSERT INTO track_tombstones "
+            "(uuid_id, deleted_at, revision, owner_id) "
+            "VALUES (?, unixepoch(), ?, ?)",
+            (uuid_id, revision, owner_id),
+        )
+
+        # Delete trackmetadata and tracks
+        conn.execute("DELETE FROM trackmetadata WHERE uuid_id = ?", (uuid_id,))
+        conn.execute("DELETE FROM tracks WHERE uuid_id = ?", (uuid_id,))
+
+        # Delete from FTS for tracks
+        self._fts_delete_track_in(conn, meta_row)
+
+        # Cleanup now-orphaned parents (album before artist — an album
+        # row references an artist). Shared with the metadata-edit
+        # spine so add/update/delete reconcile orphans one way.
+        self._orphan_gc_album(conn, album_id)
+        self._orphan_gc_artist(conn, artist_id)
+        return revision
+
     def delete_track(
         self, uuid_id: str, timeout: float = 5, *, owner_id: int
     ) -> bool:
         _require_owner(owner_id)
         try:
-            with self._connection(commit=True, timeout=timeout) as conn:
-                # Fetch metadata before deletion for FTS cleanup
-                meta_row = conn.execute(
-                    "SELECT tm.track_id, tm.artist_id, tm.album_id, tm.title, "
-                    "tm.artist, tm.album, tm.album_artist "
-                    "FROM trackmetadata tm JOIN tracks t ON t.uuid_id = tm.uuid_id "
-                    "WHERE tm.uuid_id = ? AND t.owner_id = ?",
-                    (uuid_id, owner_id),
-                ).fetchone()
-
-                if meta_row is None:
-                    raise ValueError("No rows deleted")
-
-                artist_id = meta_row["artist_id"]
-                album_id = meta_row["album_id"]
-
-                # Record a tombstone before the hard delete so incremental
-                # sync clients can reconcile the removal — the row is about to
-                # vanish from `tracks`/`trackmetadata`, leaving the frontend no
-                # other signal that it ever existed.
-                conn.execute(
-                    "INSERT OR REPLACE INTO track_tombstones "
-                    "(uuid_id, deleted_at, revision, owner_id) "
-                    "VALUES (?, unixepoch(), ?, ?)",
-                    (uuid_id, self._next_revision(conn), owner_id),
-                )
-
-                # Delete trackmetadata and tracks
-                conn.execute(
-                    "DELETE FROM trackmetadata WHERE uuid_id = ?", (uuid_id,)
-                )
-                conn.execute("DELETE FROM tracks WHERE uuid_id = ?", (uuid_id,))
-
-                # Delete from FTS for tracks
-                self._fts_delete_track_in(conn, meta_row)
-
-                # Cleanup now-orphaned parents (album before artist — an album
-                # row references an artist). Shared with the metadata-edit
-                # spine so add/update/delete reconcile orphans one way.
-                self._orphan_gc_album(conn, album_id)
-                self._orphan_gc_artist(conn, artist_id)
-
+            with self._connection(
+                commit=True, timeout=timeout, immediate=True
+            ) as conn:
+                self._delete_track_in(conn, uuid_id, owner_id=owner_id)
             return True
         except Exception as e:
             print(f"Failed to delete track {uuid_id}. {e}")

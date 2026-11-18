@@ -152,6 +152,12 @@ class UploadsCapabilities(BaseModel):
     limits: UploadLimitsInfo
 
 
+class LibraryToolsCapabilities(BaseModel):
+    version: int = 1
+    server_delete: bool
+    duplicate_review: bool = False
+
+
 class AppInfoResponse(BaseModel):
     """App-level bootstrap blob. The home for app-global facts so later phases
     extend it (Phase 2 adds a ``conversion`` block) rather than add endpoints.
@@ -163,6 +169,7 @@ class AppInfoResponse(BaseModel):
     history: HistoryCapabilities
     auth: AuthCapabilities
     uploads: UploadsCapabilities
+    library_tools: LibraryToolsCapabilities
 
 
 class JobResponse(BaseModel):

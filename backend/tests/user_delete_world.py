@@ -46,6 +46,10 @@ USER_ROWS = {
     "storage_reservations": "owner_id = :uid",
     "upload_item_acknowledgements": "owner_id = :uid",
     "upload_commit_journal": "owner_id = :uid",
+    # Phase 8A.2a: keyed (owner_id, operation_uuid) like their receipt (DEV-7-01).
+    "deletion_jobs": "owner_id = :uid",
+    "deletion_job_items": "owner_id = :uid",
+    "deletion_journal": "owner_id = :uid",
 }
 SERVER_WIDE_TABLES = {"app_settings", "revision_counter", "cover_arts"}
 FTS_TABLES = {"fts_tracks", "fts_artists", "fts_albums"}
@@ -117,6 +121,25 @@ SHARED_BATCH = "00000000-0000-4000-8000-0000000000b1"
 SHARED_ZIP = "00000000-0000-4000-8000-0000000000a1"
 SHARED_ITEM = "00000000-0000-4000-8000-0000000000a2"
 SHARED_OPERATION = "00000000-0000-4000-8000-0000000000c1"
+SHARED_DELETION = "00000000-0000-4000-8000-0000000000d1"
+
+
+def _deletion_rows(world, uid, track_uuid):
+    """A deletion job for ``track_uuid`` (written while the track is still
+    live; the caller deletes the track afterwards)."""
+    sql(world.db, "INSERT INTO operation_receipts (owner_id, operation_uuid, kind, request_hash, "
+                  "created_at, result_ref) VALUES (?, ?, 'track_deletion', ?, 0, ?)",
+        (uid, SHARED_DELETION, "d" * 64, SHARED_DELETION))
+    sql(world.db, "INSERT INTO deletion_jobs (owner_id, operation_uuid, created_at, status) "
+                  "VALUES (?, ?, 0, 'accepted')", (uid, SHARED_DELETION))
+    sql(world.db, "INSERT INTO deletion_job_items (owner_id, operation_uuid, uuid_id, position, "
+                  "base_revision, status, tombstone_revision) VALUES (?, ?, ?, 0, 1, 'deleted', 99)",
+        (uid, SHARED_DELETION, track_uuid))
+    # Committed with storage cleanup pending: the journal outlives the track row.
+    sql(world.db, "INSERT INTO deletion_journal (owner_id, operation_uuid, uuid_id, original_path, "
+                  "quarantine_path, base_revision, src_dev, src_ino, src_size, master_missing, "
+                  "stage, created_at, updated_at) VALUES (?, ?, ?, '/m/o', '/m/q', 1, 1, 2, 3, 0, "
+                  "'committed', 0, 0)", (uid, SHARED_DELETION, track_uuid))
 
 
 def _upload_rows(world, uid):
@@ -168,6 +191,7 @@ def build_world(settings) -> World:
     lib = Library(db, world.sam)
     revision = lib.get_track_by_uuid(zebra.uuid_id).revision
     lib.apply_track_metadata_edit(zebra.uuid_id, {"title": "Renamedtitle"}, revision)
+    _deletion_rows(world, world.sam, gone.uuid_id)
     assert lib.delete_track(gone.uuid_id)  # leaves a tombstone
     world.sam_uuids = [lucky.uuid_id, zebra.uuid_id]
     _candidate_pair(world, world.sam, world.sam_uuids)
@@ -180,6 +204,7 @@ def build_world(settings) -> World:
                       track_number=8, cover_art_id=alex_only)
     a_gone = add_track(db, settings, world.alex, title="Alexgone", album="Amnesiac",
                        track_number=9)
+    _deletion_rows(world, world.alex, a_gone.uuid_id)
     assert Library(db, world.alex).delete_track(a_gone.uuid_id)
     a_gone.file_path.unlink()  # delete_track removes rows only
     world.alex_uuids = [a_lucky.uuid_id, a_kid.uuid_id]

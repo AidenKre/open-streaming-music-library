@@ -37,7 +37,10 @@ def test_the_janitor_is_the_last_non_fatal_startup_step(configure_app, monkeypat
 
     [steps] = captured
     names = [(s.name, s.fatal) for s in steps]
-    assert names[-2:] == [("storage reservations", False), ("upload janitor", False)]
+    # 8A.3d: the deletion janitor follows it (SC-16e janitors).
+    assert names[-3:] == [
+        ("storage reservations", False), ("upload janitor", False), ("deletion janitor", False),
+    ]
 
 
 def _seed_idle_item(db_path, owner, item="7a1f0d2e-1b2c-4d3e-8f4a-5b6c7d8e9f01"):

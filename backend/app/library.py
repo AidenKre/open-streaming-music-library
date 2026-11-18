@@ -16,6 +16,9 @@ OWNED_METHODS = frozenset(
         "get_audio_identity",
         "set_duplicate_candidate_status",
         "get_identity_coverage_summary",
+        # 8A.4: the duplicates API's reads.
+        "list_duplicate_candidates",
+        "count_duplicate_candidates",
         "insert_conversion_job",
         "insert_journal_entry",
         "insert_history_events",
@@ -25,6 +28,8 @@ OWNED_METHODS = frozenset(
         "get_track_by_uuid",
         "apply_track_metadata_edit",
         "get_track_file_path",
+        # 8A.3a: reader-side pending-deletion predicate.
+        "is_pending_deletion",
         "delete_track",
         "get_track_tombstones",
         "get_all_track_uuids",
@@ -76,6 +81,11 @@ OWNED_METHODS = frozenset(
         "accept_upload_commit",
         "resolve_upload_duplicate",
         "release_cancelled_upload_source",
+        # 8A.2b: the deletion preview, jobs and receipts API (spec §4).
+        "get_deletion_preview_facts",
+        "create_deletion_job",
+        "get_deletion_job",
+        "list_deletion_jobs",
     }
 )
 

@@ -5,9 +5,11 @@ import 'package:frontend/services/session_service.dart' show ServerBlockedReason
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/widgets/server_blocked_banner.dart';
 
+import '../browse_harness.dart' show teardownTree;
 import '../fake_session_controls.dart';
 
 void main() {
@@ -107,7 +109,29 @@ void main() {
       final fake = await pumpSignedOut(tester);
       await tester.tap(find.widgetWithText(TextButton, 'Log in'));
       await tester.pumpAndSettle();
-      expect(fake.calls, ['logout']);
+      // Round 3: a log-out that keeps the unsent changes.
+      expect(fake.calls, ['logout keep']);
+    });
+
+    // signoff-8-logout-warning round 3 (user 2026-11-14): after an ended
+    // session there is nothing to choose, so no sheet: Log in logs out
+    // keeping the unsent uploads and deletions for the same user's next
+    // login (where they continue).
+    testWidgets('with unsent changes: no sheet; they are kept', (tester) async {
+      final fake = await pumpSignedOut(tester);
+      fake.logoutLosses = const LogoutLosses(
+        unsentUploads: 2,
+        reviewDrafts: 1,
+        unsentReviews: 0,
+        unsentCancels: 1,
+        unsentDeletions: 1,
+        unconfirmedDeletions: 3,
+      );
+      await tester.tap(find.widgetWithText(TextButton, 'Log in'));
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(fake.calls, ['logout keep']);
+      await teardownTree(tester);
     });
 
     testWidgets('different server wins: its banner, not the signed-out one',

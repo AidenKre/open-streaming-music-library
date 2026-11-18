@@ -38,12 +38,6 @@ def upload_item_not_cancellable(state: str) -> UploadError:
     )
 
 
-def invalid_cursor() -> UploadError:
-    return UploadError(
-        422, "invalid_cursor", "The page cursor is not valid.", retryable=False
-    )
-
-
 def upload_batch_not_found() -> UploadError:
     return UploadError(
         404, "upload_batch_not_found", "Upload batch not found.", retryable=False

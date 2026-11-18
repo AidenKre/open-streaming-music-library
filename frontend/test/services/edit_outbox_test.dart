@@ -1588,4 +1588,105 @@ void main() {
       expect(_patchCalls, isEmpty);
     });
   });
+  // 8B.2b S8 (U23-FE-SYNC-B-01, DEV-8-02): the server answers a PATCH of a
+  // track whose deletion is pending with a retryable 409
+  // `track_pending_deletion` (no `current_revision`). That is "wait a
+  // moment", not a revision conflict: the edit stays pending and is sent
+  // again at the next flush, no conflict prompt, no self-resolve read. Once
+  // the tombstone syncs, the tombstone rule rejects it without a PATCH.
+  group('8B.2b: a 409 for a track being deleted', () {
+    http.Response pendingDeletion() => http.Response(
+        jsonEncode({
+          'detail': {
+            'error': 'track_pending_deletion',
+            'message': 'This track is being deleted.',
+            'retryable': true,
+          }
+        }),
+        409,
+        headers: {'content-type': 'application/json'});
+
+    test('leaves the edit pending with its base and values; the next flush '
+        'sends it again', () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, revision: 5);
+      var answer = pendingDeletion();
+      var trackReads = 0;
+      final outbox = _container(db,
+          onPatch: (_) async => answer,
+          onGetTrack: (uuid) async {
+            trackReads++;
+            return _trackResponse(uuid: uuid, title: 'Server');
+          }).read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'A'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+
+      await outbox.flush();
+
+      final row = await db.select(db.pendingEdits).getSingle();
+      expect((row.status, row.baseRevision, row.serverRevision),
+          ('pending', 5, null));
+      expect(jsonDecode(row.valuesJson), {'title': 'A'});
+      expect(trackReads, 0, reason: 'not a conflict: nothing to compare');
+      expect(await db.pendingEditCounts(),
+          (pending: 1, conflicted: 0, rejected: 0));
+      final title = await db
+          .customSelect("SELECT title FROM trackmetadata WHERE uuid_id='u1'")
+          .getSingle();
+      expect(title.read<String>('title'), 'A', reason: 'the edit is kept');
+
+      answer = _ok(); // the deletion was rolled back
+      await outbox.flush();
+      expect(_patchCalls, hasLength(2));
+      expect(_patchCalls.last.body['base_revision'], 5);
+      expect(await db.select(db.pendingEdits).get(), isEmpty);
+    });
+
+    test('a revision conflict still becomes a conflict', () async {
+      final db = await _boundDb();
+      addTearDown(db.close);
+      await _seedTrack(db, revision: 5);
+      final outbox = _container(db,
+          onPatch: (_) async => _conflict(9),
+          onGetTrack: (uuid) async =>
+              _trackResponse(uuid: uuid, title: 'Server')).read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'u1',
+        edit: const MetadataEdit.empty().set('title', 'A'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 5,
+      );
+      await outbox.flush();
+      final row = await db.select(db.pendingEdits).getSingle();
+      expect((row.status, row.serverRevision), ('conflicted', 9));
+    });
+  });
+  // 8B.2b review r1 #1: a tombstone can turn a conflicted row into
+  // `rejected` while the conflict sheet is open; a later "Take server" must
+  // not overwrite that rejection (only a conflicted row can be resolved).
+  test('8B.2b review: Take server on a row a tombstone already rejected '
+      'keeps the rejection', () async {
+    final db = await _boundDb();
+    addTearDown(db.close);
+    await _seedTrack(db, revision: 5);
+    final outbox = _container(db, onPatch: (_) async => _ok())
+        .read(editOutboxProvider);
+    await db.customStatement(
+      "INSERT INTO pending_edits (uuid_id, values_json, write_mode, "
+      "base_revision, status, rejection_reason, updated_at) VALUES "
+      "('u1', '{\"title\":\"A\"}', 'db_only', 5, 'rejected', "
+      "'Track no longer exists on the server', 1)",
+    );
+
+    await outbox.resolveTakeServer('u1');
+
+    final row = await db.select(db.pendingEdits).getSingleOrNull();
+    expect((row?.status, row?.rejectionReason),
+        ('rejected', 'Track no longer exists on the server'));
+  });
 }

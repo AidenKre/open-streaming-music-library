@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/services/local_reset_service.dart';
+import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/services/session_service.dart';
 import 'package:frontend/ui/server_address_page.dart';
@@ -63,6 +64,17 @@ class _FakeService extends SessionService {
 
   @override
   Future<List<String>> pendingLossSummaries() async => losses;
+
+  LogoutLosses logoutLosses = const LogoutLosses(
+    unsentUploads: 0,
+    reviewDrafts: 0,
+    unsentReviews: 0,
+    unsentCancels: 0,
+    unsentDeletions: 0,
+    unconfirmedDeletions: 0,
+  );
+  @override
+  Future<LogoutLosses> pendingLogoutLosses() async => logoutLosses;
 
   @override
   Future<LocalResetException?> resetForNewServer(String url) async {
@@ -377,6 +389,20 @@ void main() {
         await session().pendingLossSummaries(),
         ['2 unsent metadata edits'],
       );
+    });
+
+    // signoff-8-logout-warning: the log-out warning's counts are the model's.
+    test('the log-out losses come from the model', () async {
+      const losses = LogoutLosses(
+        unsentUploads: 2,
+        reviewDrafts: 0,
+        unsentReviews: null,
+        unsentCancels: 0,
+        unsentDeletions: 0,
+        unconfirmedDeletions: 1,
+      );
+      service.logoutLosses = losses;
+      expect(await session().pendingLogoutLosses(), same(losses));
     });
   });
 

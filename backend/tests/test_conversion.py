@@ -1367,6 +1367,26 @@ class TestPendingRecovery:
         assert owned.read_bytes() == b"owned"
 
     @requires_ffmpeg
+    def test_queued_job__a_row_runtime_can_finish_appears__is_settled_and_the_job_converts(
+        self, tmp_path
+    ):
+        """The fence in the job run (sign-off OPEN-6.5-05): a row the running server
+        can finish (here an in-place row whose replace already happened) is finished
+        under the track lock, and the conversion goes on instead of refusing."""
+        db, orch, coordinator = _make_orchestrator(tmp_path)
+        source = _root(tmp_path) / "song.flac"
+        _make_audio(source)
+        track = _add_track(db, source)
+        job_id = orch.enqueue(_lib(orch), track.uuid_id, "aac", 192, track.revision)
+        db.insert_journal_entry("inplace", track.uuid_id, old_path=str(source))
+
+        _run_submitted(coordinator)
+
+        assert db.get_conversion_job(job_id)["status"] == "done"
+        assert db.list_journal_entries() == []
+        assert source.with_suffix(".m4a").exists()
+
+    @requires_ffmpeg
     def test_temp_names_are_job_scoped(self, tmp_path, monkeypatch):
         db, orch, coordinator = _make_orchestrator(tmp_path)
         source = _root(tmp_path) / "song.flac"
@@ -2038,7 +2058,10 @@ class TestSameFileSwapRetryOnly:
 
         _start(db, tmp_path)
 
-        assert source.read_bytes() == original and other.read_bytes() == original
+        # Phase 8's startup settle (OPEN-6.5-05, rule b): the old path's copy has the
+        # track's own audio, so it is removed as redundant; the track's file stays.
+        assert other.read_bytes() == original
+        assert not source.exists() or source.read_bytes() == original
         job = db.get_conversion_job(job_id)
         assert (job["status"], job["error_text"]) == ("failed", TRACK_CHANGED_ERROR)
         assert db.list_journal_entries() == []
@@ -2154,7 +2177,10 @@ class TestSameFileSwapStartupRecheck:
         job = db.get_conversion_job(job_id)
         assert (job["status"], job["error_text"]) == ("failed", TRACK_CHANGED_ERROR)
         assert db.list_journal_entries() == []
-        assert source.read_bytes() == original and other.read_bytes() == original
+        # Phase 8's startup settle (OPEN-6.5-05, rule b): the old path's copy has the
+        # track's own audio, so it is removed as redundant; the track's file stays.
+        assert other.read_bytes() == original
+        assert not source.exists() or source.read_bytes() == original
 
     def test_a_lost_staged_file_and_a_missing_master_end_the_job(self, tmp_path, monkeypatch):
         db, orch, track, source, original, job_id, entry = self._failed_twice(
@@ -2166,7 +2192,126 @@ class TestSameFileSwapStartupRecheck:
 
         job = db.get_conversion_job(job_id)
         assert (job["status"], job["error_text"]) == ("failed", SWAP_UNPROVEN_TEXT)
-        assert len(db.list_journal_entries()) == 1  # nothing proves anything: kept
+        # Phase 8's startup settle (OPEN-6.5-05): a row with no copy and no track
+        # file goes (on Phase 7 it is kept); the job's sentence is the same.
+        assert db.list_journal_entries() == []
+
+
+@pytest.mark.requires_ffmpeg
+class TestSameFileSwapPhase8:
+    """Phase 8's startup settles journal rows through ``journal_settle``; its
+    deletion answers busy while a journal row exists."""
+
+    def _failed_twice(self, tmp_path, monkeypatch):
+        return TestSameFileSwapRetryOnly()._failed_twice(tmp_path, monkeypatch)
+
+    def test_a_deletion_of_the_track_is_busy_while_the_row_is_kept(self, tmp_path, monkeypatch):
+        db, orch, track, source, original, job_id, entry = self._failed_twice(
+            tmp_path, monkeypatch)
+
+        assert db.read_deletion_target(track.uuid_id, owner_id=db.owner_id)["busy"] is True
+
+        _start(db, tmp_path)
+        assert db.read_deletion_target(track.uuid_id, owner_id=db.owner_id)["busy"] is False
+
+    def test_a_staged_copy_that_is_no_regular_file_ends_lost_with_the_old_columns(
+        self, tmp_path, monkeypatch
+    ):
+        """D9: the replace never happened; the track is read again from its file."""
+        db, orch, track, source, original, job_id, entry = self._failed_twice(
+            tmp_path, monkeypatch)
+        staged = Path(entry["temp_path"])
+        elsewhere = staged.with_name("elsewhere.mp3")
+        elsewhere.write_bytes(staged.read_bytes())
+        staged.unlink()
+        staged.symlink_to(elsewhere)
+        committed = db.get_track_by_uuid(track.uuid_id)
+
+        _start(db, tmp_path)
+
+        assert source.read_bytes() == original
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("failed", SWAP_LOST_TEXT)
+        after = db.get_track_by_uuid(track.uuid_id)
+        assert after.metadata.bitrate_kbps == pytest.approx(192, abs=8)
+        assert after.revision > committed.revision
+
+    @pytest.mark.parametrize("case", ["at_its_own_path", "recorded_elsewhere"])
+    def test_a_missing_track_file_gets_the_converted_copy_and_ends_done(
+        self, tmp_path, monkeypatch, case
+    ):
+        """At its own path the copy is put in place (the redo); recorded elsewhere,
+        the converted copy is adopted as the track's file."""
+        db, orch, track, source, original, job_id, entry = self._failed_twice(
+            tmp_path, monkeypatch)
+        converted = Path(entry["temp_path"]).read_bytes()
+        if case == "at_its_own_path":
+            source.unlink()
+        else:
+            _sql(db, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
+                 (str(source.with_name("moved.mp3")), track.uuid_id))
+
+        _start(db, tmp_path)
+
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("done", None)
+        after = db.get_track_by_uuid(track.uuid_id)
+        assert Path(after.file_path).read_bytes() == converted
+        assert db.list_journal_entries() == []
+
+
+@pytest.mark.requires_ffmpeg
+class TestSameFileSwapPhase8Recheck:
+    """Review of the Phase 8 cascade, findings 1 and 2."""
+
+    def _failed_twice(self, tmp_path, monkeypatch):
+        return TestSameFileSwapRetryOnly()._failed_twice(tmp_path, monkeypatch)
+
+    @pytest.mark.parametrize("crash_at", ["settle_swapped_conversion_job", "delete_journal_entry"])
+    def test_a_stop_after_adopting_the_converted_copy_still_ends_done(
+        self, tmp_path, monkeypatch, crash_at
+    ):
+        """The adopted copy is the track's file: a rerun never calls that "moved on"."""
+        db, orch, track, source, original, job_id, entry = self._failed_twice(
+            tmp_path, monkeypatch)
+        converted = Path(entry["temp_path"]).read_bytes()
+        _sql(db, "UPDATE tracks SET file_path = ? WHERE uuid_id = ?",
+             (str(source.with_name("moved.mp3")), track.uuid_id))
+
+        class Crash(BaseException):
+            pass
+
+        def crash(*args, **kwargs):
+            raise Crash()
+
+        with monkeypatch.context() as m:
+            m.setattr(db, crash_at, crash)
+            with pytest.raises(Crash):
+                reconcile_journal(db, tmp_path)
+        _start(db, tmp_path)
+
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("done", None)
+        assert Path(db.get_track_by_uuid(track.uuid_id).file_path).read_bytes() == converted
+        assert db.list_journal_entries() == []
+
+    def test_an_unreadable_master_with_a_lost_staged_file_ends_the_job(
+        self, tmp_path, monkeypatch
+    ):
+        """ffprobe refuses the file for good: D9 (the columns become unknown), the job
+        ends and the row goes, so the track is not busy for good."""
+        db, orch, track, source, original, job_id, entry = self._failed_twice(
+            tmp_path, monkeypatch)
+        Path(entry["temp_path"]).unlink()
+        source.write_bytes(b"not audio at all")
+
+        _start(db, tmp_path)
+
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("failed", SWAP_UNPROVEN_TEXT)
+        assert db.list_journal_entries() == []
+        assert db.get_track_by_uuid(track.uuid_id).metadata.codec is None
+        assert db.read_deletion_target(track.uuid_id, owner_id=db.owner_id)["busy"] is False
 
 
 class TestAlreadyInTheTargetFormat:

@@ -40,3 +40,44 @@ final uploadsFeatureProvider =
 final uploadsAdvertisedProvider = Provider<bool>(
   (ref) => ref.watch(uploadsFeatureProvider).value != null,
 );
+
+/// Nothing is known about the server's features (no live answer and no
+/// cached one): unknown, never "not offered".
+class FeatureInfoUnknown implements Exception {
+  const FeatureInfoUnknown();
+
+  @override
+  String toString() => 'FeatureInfoUnknown';
+}
+
+/// `library_tools`, or null when the server doesn't advertise it; a
+/// [FeatureInfoUnknown] error when nothing is known about the server.
+final libraryToolsFeatureProvider =
+    FutureProvider<AdvertisedFeature<LibraryToolsFeature>?>(
+      (ref) async {
+        final info = await ref.watch(appInfoProvider.future);
+        final block = info.features.libraryTools;
+        if (block == null && info.isBuiltInDefault) {
+          throw const FeatureInfoUnknown();
+        }
+        return block == null
+            ? null
+            : AdvertisedFeature(block, fromCache: info.fromCache);
+      },
+      // Unknown is an answer, not a transient failure: re-running cannot
+      // learn more, so it must surface at once rather than sit in retry.
+      retry: (count, error) => error is FeatureInfoUnknown
+          ? null
+          : ProviderContainer.defaultRetry(count, error),
+    );
+
+/// The server advertises `library_tools`, from a live answer or the cache.
+/// False while loading, on error, or with no block.
+final libraryToolsAdvertisedProvider = Provider<bool>(
+  (ref) => ref.watch(libraryToolsFeatureProvider).value != null,
+);
+
+/// The block network work may act on: null when absent or `fromCache`. A
+/// cached block may be shown but never starts a request.
+T? featureForNetwork<T>(AdvertisedFeature<T>? advertised) =>
+    advertised == null || advertised.fromCache ? null : advertised.block;

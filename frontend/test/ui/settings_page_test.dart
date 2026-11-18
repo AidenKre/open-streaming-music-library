@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart' show StateProvider;
@@ -10,6 +12,7 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/logout_losses.dart';
 import 'package:frontend/services/settings_service.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/settings_controller.dart';
@@ -18,6 +21,7 @@ import 'package:frontend/ui/session/session_host.dart';
 import 'package:frontend/ui/settings/settings_registry.dart';
 import 'package:frontend/ui/widgets/top_bar_actions.dart';
 
+import 'browse_harness.dart' show teardownTree;
 import 'fake_session_controls.dart';
 import '../helpers/test_credentials.dart';
 
@@ -279,7 +283,8 @@ void main() {
   });
 
   // Phase M §7.1: Log out sits in Settings → Connection next to Disconnect.
-  // It keeps the local data, so it asks nothing and goes to the controller.
+  // It keeps the local data; with nothing unsent (signoff-8-logout-warning)
+  // it asks nothing and goes to the controller.
   testWidgets('Log out sits next to Disconnect and is the controller\'s', (
     tester,
   ) async {
@@ -298,6 +303,143 @@ void main() {
     await tester.pumpAndSettle();
     expect(session.calls, ['logout']);
     expect(find.byType(BottomSheet), findsNothing);
+  });
+
+  // signoff-8-logout-warning (DEV-7-22, DEV-8-14, user 2026-11-14 "warn
+  // first"): with unsent work, Log out asks first and names it; the token
+  // changes only after the user confirms.
+  group('Log out with unsent work', () {
+    Future<FakeSessionControls> openSheet(
+      WidgetTester tester, {
+      required LogoutLosses losses,
+    }) async {
+      final prefs = await SharedPreferences.getInstance();
+      final session = FakeSessionControls(onDisconnect: () async {})
+        ..logoutLosses = losses;
+      await tester.pumpWidget(_wrap(prefs, session: session));
+      await tester.pumpAndSettle();
+      await _toBottom(tester, find.text('Disconnect'));
+      await tester.tap(find.text('Log out'));
+      await tester.pumpAndSettle();
+      return session;
+    }
+
+    const unsent = LogoutLosses(
+      unsentUploads: 2,
+      reviewDrafts: 0,
+      unsentReviews: 0,
+      unsentCancels: 0,
+      unsentDeletions: 1,
+      unconfirmedDeletions: 0,
+    );
+
+    Finder inSheet(Pattern text) => find.descendant(
+      of: find.byType(BottomSheet),
+      matching: find.textContaining(text),
+    );
+
+    testWidgets('asks first, naming the unsent things',
+        (tester) async {
+      final session = await openSheet(tester, losses: unsent);
+      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(find.text('Log out and discard unsent changes?'), findsOneWidget);
+      expect(
+        inSheet(
+          "This device hasn't finished sending these to the server. If you "
+          'log out, this device stops trying.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        inSheet("2 uploads that didn't finish"),
+        findsOneWidget,
+      );
+      expect(inSheet('1 track deletion'), findsOneWidget);
+      // Round 3 (user 2026-11-14): no instructions on the lines.
+      expect(inSheet('again'), findsNothing);
+      expect(
+        inSheet('Downloads and your library stay on this device.'),
+        findsOneWidget,
+      );
+      expect(find.widgetWithText(FilledButton, 'Log out and discard'),
+          findsOneWidget);
+      // Round 2 (user 2026-11-14): no vague "work", no list header.
+      expect(inSheet(RegExp(r'\bwork\b', caseSensitive: false)), findsNothing);
+      expect(inSheet('These will be lost'), findsNothing);
+      expect(inSheet('Not sent after you log out'), findsNothing);
+      expect(session.calls, isEmpty, reason: 'nothing changes while it asks');
+      await teardownTree(tester);
+    });
+
+    testWidgets('Cancel changes nothing', (tester) async {
+      final session = await openSheet(tester, losses: unsent);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(session.calls, isEmpty);
+      await teardownTree(tester);
+    });
+
+    testWidgets('dismissing the sheet counts as Cancel', (tester) async {
+      final session = await openSheet(tester, losses: unsent);
+      await tester.tapAt(const Offset(10, 10)); // the barrier
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(session.calls, isEmpty);
+      await teardownTree(tester);
+    });
+
+    testWidgets('confirming logs out', (tester) async {
+      final session = await openSheet(tester, losses: unsent);
+      await tester.tap(find.widgetWithText(FilledButton, 'Log out and discard'));
+      await tester.pumpAndSettle();
+      expect(session.calls, ['logout']);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a double tap while counting opens one sheet', (tester) async {
+      final prefs = await SharedPreferences.getInstance();
+      final gate = Completer<LogoutLosses>();
+      final session = FakeSessionControls(onDisconnect: () async {})
+        ..logoutLossesGate = gate;
+      await tester.pumpWidget(_wrap(prefs, session: session));
+      await tester.pumpAndSettle();
+      await _toBottom(tester, find.text('Disconnect'));
+      await tester.tap(find.text('Log out'));
+      await tester.pump();
+      await tester.tap(find.text('Log out'));
+      await tester.pump();
+      gate.complete(unsent);
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(session.calls, isEmpty);
+      await teardownTree(tester);
+    });
+
+    testWidgets('a count that could not be read still asks, saying so',
+        (tester) async {
+      final session = await openSheet(
+        tester,
+        losses: const LogoutLosses(
+          unsentUploads: null,
+          reviewDrafts: null,
+          unsentReviews: null,
+          unsentCancels: null,
+          unsentDeletions: 0,
+          unconfirmedDeletions: 0,
+        ),
+      );
+      expect(find.text('Log out and discard unsent changes?'), findsOneWidget);
+      expect(
+        inSheet('Some unsent changes could not be counted.'),
+        findsOneWidget,
+      );
+      expect(session.calls, isEmpty);
+      await teardownTree(tester);
+    });
   });
 
   testWidgets('Log out is hidden outside a live session', (tester) async {

@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     upload_janitor_interval_s: int = Field(3600, ge=1)  # seconds between periodic janitor passes
     upload_stage_expiry_s: int = Field(7 * 86400, ge=1)  # an unconfirmed staged item expires after this long without progress
     upload_retention_s: int = Field(30 * 86400, ge=1)  # ended batch and item records are pruned after this long
+    library_delete_enabled: bool = False  # operator switch for server-side library delete (8A); off hides it and refuses it
+    enable_deletion_worker: bool = True  # executes accepted server deletion jobs (8A.3c); off leaves them pending until a start with it on
+    deletion_janitor_interval_s: int = Field(3600, ge=1)  # seconds between the deletion worker's retries of pending committed clean-ups
     enable_identity_worker: bool = True  # background audio-identity scan (6.5); off stops identity backfill and recompute
 
     # Encoded tracks cache (used for transcoded streams)

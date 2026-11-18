@@ -3,6 +3,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/ui/conversions_page.dart';
 import 'package:frontend/ui/downloading_page.dart';
+import 'package:frontend/ui/duplicates/duplicates_page.dart';
+import 'package:frontend/ui/manage_library/manage_library_page.dart';
 import 'package:frontend/ui/session_controller.dart';
 import 'package:frontend/ui/settings_page.dart';
 import 'package:frontend/ui/settings/sync_diagnostics_page.dart';
@@ -28,6 +30,12 @@ enum SessionDestination {
   /// The Uploads page (Phase 7): a top-bar action, shown with the server's
   /// `uploads` feature block.
   uploads,
+
+  /// Manage library (Phase 8): reached from Settings -> Library tools.
+  manageLibrary,
+
+  /// Possible duplicates (Phase 8): reached from Settings -> Library tools.
+  duplicates,
 }
 
 /// The page for a [SessionDestination].
@@ -38,6 +46,8 @@ Widget sessionDestinationPage(SessionDestination destination) =>
       SessionDestination.conversions => const ConversionsPage(),
       SessionDestination.syncDiagnostics => const SyncDiagnosticsPage(),
       SessionDestination.uploads => const UploadsPage(),
+      SessionDestination.manageLibrary => const ManageLibraryPage(),
+      SessionDestination.duplicates => const DuplicatesPage(),
     };
 
 /// The session route host (SC-08): a navigator above the shell (its root

@@ -8,7 +8,8 @@ import 'package:frontend/ui/widgets/reset_confirm_sheet.dart';
 
 /// The persistent blocked banner, by the session's reason. Different server
 /// (SC-01 rule 1): Reset (keep the URL) or Disconnect, each confirmed.
-/// Signed out (Phase M 7.7): Log in, which logs out first. Renders nothing
+/// Signed out (Phase M 7.7): Log in, which logs out first and keeps the unsent
+/// uploads and deletions for the same user's next login. Renders nothing
 /// when the session is not blocked.
 class ServerBlockedBanner extends ConsumerWidget {
   const ServerBlockedBanner({super.key});
@@ -64,7 +65,7 @@ class ServerBlockedBanner extends ConsumerWidget {
                             style: TextButton.styleFrom(
                               foregroundColor: onBanner,
                             ),
-                            onPressed: () => unawaited(session.logout()),
+                            onPressed: () => unawaited(session.logOutKeepingUnsent()),
                             child: const Text('Log in'),
                           )
                         else ...[

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:frontend/ui/widgets/list_status_message.dart';
 
 /// Drives an infinite-scroll list off a *reactive* growing window: it watches
 /// the first `N` rows in display order and grows `N` by [pageSize] as the user
@@ -21,6 +22,34 @@ mixin CursorPaginationMixin<T> {
   List<T> paginatedItems = [];
   bool hasMore = true;
   bool isLoading = false;
+
+  /// The window's stream failed (a local query error); pages may show a
+  /// retry. Cleared by [retryPagination] and by a restart.
+  bool paginationFailed = false;
+
+  /// The window settled with nothing in it. The one "loaded and empty"
+  /// test: a failed read is unknown, never empty.
+  bool get paginationLoadedEmpty =>
+      !paginationFailed && !hasMore && paginatedItems.isEmpty;
+
+  /// The read failed and there is nothing to show: pages put
+  /// [buildPaginationFailure] in place of the list, before any empty state.
+  bool get paginationFailedEmpty => paginationFailed && paginatedItems.isEmpty;
+
+  Widget buildPaginationFailure() =>
+      LoadFailureNotice(onRetry: retryPagination);
+
+  /// Whether a list needs a trailing slot: the load-more spinner, or the
+  /// compact failure notice after a failure with rows kept.
+  bool get paginationHasTrailing => hasMore || paginationFailed;
+
+  /// The trailing slot's content (see [paginationHasTrailing]).
+  Widget buildPaginationTrailing() => paginationFailed
+      ? LoadFailureNotice(onRetry: retryPagination, compact: true)
+      : const Padding(
+          padding: EdgeInsets.all(16),
+          child: Center(child: CircularProgressIndicator()),
+        );
 
   /// Target size of the watched window; grows by [pageSize] on [loadMore].
   int _loadedCount = 0;
@@ -125,7 +154,33 @@ mixin CursorPaginationMixin<T> {
   void _subscribe() {
     _pageSub?.cancel();
     _pendingItems = null; // never deliver a stale window from the old query
-    _pageSub = watchPage(limit: _loadedCount).listen(_onWindowEmission);
+    paginationFailed = false;
+    _pageSub = watchPage(
+      limit: _loadedCount,
+    ).listen(_onWindowEmission, onError: _onWindowError);
+  }
+
+  /// Resubscribes at the current window after a failure.
+  void retryPagination() {
+    if (_suspended) return;
+    if (mounted) {
+      setState(() {
+        paginationFailed = false;
+        hasMore = true; // loading again: not "empty" until the window answers
+      });
+    }
+    _subscribe();
+  }
+
+  void _onWindowError(Object error, StackTrace stack) {
+    // Only the type: an error's text can carry paths or SQL.
+    debugPrint('pagination failed: ${error.runtimeType}');
+    if (!mounted) return;
+    setState(() {
+      paginationFailed = true;
+      hasMore = false;
+      isLoading = false;
+    });
   }
 
   /// Leading + trailing coalescing: the first emission renders immediately;
@@ -150,6 +205,7 @@ mixin CursorPaginationMixin<T> {
     if (!mounted) return;
     setState(() {
       paginatedItems = items;
+      paginationFailed = false;
       hasMore = items.length == _loadedCount;
       isLoading = false;
     });

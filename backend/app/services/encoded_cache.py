@@ -152,3 +152,12 @@ class EncodedCache:
                 total -= size
             except OSError:
                 continue
+
+
+def evict_track_caches(
+    uuid_id: str, cache: EncodedCache, default_cache: Optional[EncodedCache]
+) -> None:
+    """Drop every encoded entry of a track whose master changed or is gone (conversion, settle refresh, deletion)."""
+    cache.remove_all_for_uuid(uuid_id)
+    if default_cache is not None:
+        default_cache.remove_all_for_uuid(uuid_id)

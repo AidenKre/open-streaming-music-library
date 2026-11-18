@@ -455,6 +455,43 @@ def test_a_user_root_containing_another_users_root_is_refused(tmp_path, monkeypa
     assert world.files["alex_workspace"].exists()
 
 
+# --- Phase 8A.3c: the user's deletion quarantine (.deleting/<id>, decision O2) ---------
+
+
+def _quarantine(world, uid):
+    path = world.settings.music_library_dir / ".deleting" / str(uid) / "op" / "track.flac"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"quarantined master")
+    return path
+
+
+def test_step_2_removes_only_the_users_quarantine_folder(world, paths, monkeypatch):
+    sam_q, alex_q = _quarantine(world, world.sam), _quarantine(world, world.alex)
+    _crash_after(monkeypatch, 2)
+
+    with pytest.raises(Crash):
+        run_user_delete(world.db, world.sam, paths)
+
+    deleting = world.settings.music_library_dir / ".deleting"
+    assert not exists(deleting / str(world.sam))
+    assert alex_q.read_bytes() == b"quarantined master"
+    assert deleting.is_dir()
+    assert not exists(sam_q)
+
+
+def test_a_symlinked_quarantine_folder_is_refused(world, paths):
+    alex_q = _quarantine(world, world.alex)
+    deleting = world.settings.music_library_dir / ".deleting"
+    (deleting / str(world.sam)).symlink_to(deleting / str(world.alex), target_is_directory=True)
+    before = dump(world.db)
+
+    with pytest.raises(DeleteRefused):
+        run_user_delete(world.db, world.sam, paths)
+
+    assert dump(world.db) == before
+    assert alex_q.read_bytes() == b"quarantined master"
+
+
 # --- sign-off DEV-7-14 point 1: import-folder archive unpacks ---------------------------
 
 

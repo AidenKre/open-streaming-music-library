@@ -574,8 +574,13 @@ void main() {
   // whether a failed item offers Retry; the code list is only the fallback
   // while no flag is known (before the first listing, offline).
   group('TR-UPLOAD-03 Retry follows the server retryable flag', () {
-    UploadRow failed(String code, {bool? retryable}) => UploadsOverview.of(
-      intents: [_intent('i', 'failed', code: code)],
+    // Picked on this device (it has the digest, so the bytes), unless
+    // [picked] is false (adopted: no digest).
+    UploadRow failed(String code, {bool? retryable, bool picked = true}) =>
+        UploadsOverview.of(
+      intents: [
+        _intent('i', 'failed', code: code, sha256: picked ? 'abc' : null),
+      ],
       progress: const {},
       availability: UploadsAvailability.available,
       retryable: {'i': ?retryable},
@@ -608,6 +613,69 @@ void main() {
         expect(failed(code).offersRetry, isTrue, reason: code);
       }
       expect(failed('upload_invalid_audio').offersRetry, isFalse);
+    });
+
+    // Sign-off s7-app-texts review r1 #2: the server lost the received file;
+    // its Retry puts the item back to waiting for the bytes, which only a
+    // device that has them can send. Retry here would strand it.
+    group('the server lost the received file', () {
+      test('picked on this device: Retry, and the text says to try again',
+          () {
+        final row = failed('upload_source_missing', retryable: true);
+        expect(row.offersRetry, isTrue);
+        expect(row.detailText,
+            'The server no longer has the received file. Try again to send '
+            'it.');
+      });
+
+      test('not on this device: no Retry, Cancel, and the true step', () {
+        final row =
+            failed('upload_source_missing', retryable: true, picked: false);
+        expect(row.offersRetry, isFalse);
+        expect(row.canRetry, isFalse);
+        expect(row.offersCancel, isTrue);
+        // Review-8 #3: no "unless another device retries it": the device
+        // that added it often can't (it lost its record, or its row never
+        // learns of the failure).
+        expect(row.detailText,
+            'The server no longer has the received file, and this device '
+            'cannot find it. Cancel it and add it again.');
+      });
+
+      // The two rules agree: a lost file is failed, not waiting, so another
+      // device sending other files of the upload changes nothing on it.
+      test('while another device sends other files of the upload: still the '
+          'lost-file text, Cancel, no Retry', () {
+        final row = UploadsOverview.of(
+          intents: [
+            _intent('i', 'failed', code: 'upload_source_missing'),
+            _intent('j', 'on_other_device'),
+          ],
+          progress: const {},
+          availability: UploadsAvailability.available,
+          retryable: {'i': true},
+          otherDeviceSending: {'b-1'},
+        ).rows.first;
+        expect(row.statusText, 'Failed');
+        expect(row.detailText,
+            'The server no longer has the received file, and this device '
+            'cannot find it. Cancel it and add it again.');
+        expect(row.offersRetry, isFalse);
+        expect(row.offersCancel, isTrue);
+        expect(row.needsAttention, isTrue);
+      });
+
+      test('not on this device, no flag known: no Retry either', () {
+        expect(
+            failed('upload_source_missing', picked: false).offersRetry,
+            isFalse);
+      });
+
+      test('other retryable codes still offer Retry without the bytes here',
+          () {
+        expect(failed('probe_timeout', retryable: true, picked: false)
+            .offersRetry, isTrue);
+      });
     });
   });
 }

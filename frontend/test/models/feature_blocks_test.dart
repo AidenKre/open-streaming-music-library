@@ -157,6 +157,89 @@ void main() {
     });
   });
 
+  // Phase 8B.1b (SC-03, D32, O6): `library_tools: {version, server_delete,
+  // duplicate_review}`, always sent by an 8A.1 server. A flag that is
+  // missing or not a bool is unknown: the block is malformed and only this
+  // feature is unavailable (unknown is never read as false).
+  group('library_tools block', () {
+    test('the 8A.1 block parses with both flags', () {
+      final f = FeatureBlocks.fromJson({
+        'library_tools': {
+          'version': 1,
+          'server_delete': true,
+          'duplicate_review': false,
+        },
+      });
+      final t = f.libraryTools!;
+      expect(t.version, 1);
+      expect(t.serverDelete, isTrue);
+      expect(t.duplicateReview, isFalse);
+    });
+
+    test('the switch turned off is a present block with serverDelete false',
+        () {
+      final t = FeatureBlocks.fromJson({
+        'library_tools': {
+          'version': 1,
+          'server_delete': false,
+          'duplicate_review': true,
+        },
+      }).libraryTools!;
+      expect(t.serverDelete, isFalse);
+      expect(t.duplicateReview, isTrue);
+    });
+
+    test('unknown fields are tolerated; a later version is kept', () {
+      final t = FeatureBlocks.fromJson({
+        'library_tools': {
+          'version': 3,
+          'server_delete': true,
+          'duplicate_review': true,
+          'bulk_edit': {'x': 1},
+        },
+      }).libraryTools!;
+      expect(t.version, 3);
+    });
+
+    test('absent or malformed: only library tools is unavailable', () {
+      for (final block in <Object?>[
+        null,
+        true,
+        1,
+        <String, Object?>{},
+        {'server_delete': true, 'duplicate_review': true}, // no version
+        {'version': '1', 'server_delete': true, 'duplicate_review': true},
+        {'version': 0, 'server_delete': true, 'duplicate_review': true},
+        {'version': 1, 'duplicate_review': true}, // flag missing
+        {'version': 1, 'server_delete': true}, // flag missing
+        {'version': 1, 'server_delete': 'true', 'duplicate_review': false},
+        {'version': 1, 'server_delete': 1, 'duplicate_review': false},
+        {'version': 1, 'server_delete': false, 'duplicate_review': null},
+      ]) {
+        final f = FeatureBlocks.fromJson({
+          'history': {'version': 1},
+          'library_tools': block,
+        });
+        expect(f.libraryTools, isNull, reason: '$block');
+        expect(f.history, isNotNull, reason: 'history survives $block');
+      }
+    });
+
+    test('toJson round-trips through the cache', () {
+      final info = AppInfo.fromJson({
+        'library_tools': {
+          'version': 1,
+          'server_delete': true,
+          'duplicate_review': false,
+        },
+      });
+      final back = AppInfo.fromJson(info.toJson()).features.libraryTools!;
+      expect(back.version, 1);
+      expect(back.serverDelete, isTrue);
+      expect(back.duplicateReview, isFalse);
+    });
+  });
+
   group('AppInfo', () {
     test('carries the parsed blocks; unknown blocks are ignored', () {
       final info = AppInfo.fromJson({

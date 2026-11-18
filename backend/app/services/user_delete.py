@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.core.internal_dirs import STAGING, UPLOADS
+from app.core.internal_dirs import DELETING, STAGING, UPLOADS
 from app.database.table_registry import delete_order
 from app.library import library_root
 from app.library_folders import matching_import_dirs
@@ -38,6 +38,7 @@ class DeletePaths:
     workspace_root: Path
     staging_dir: Path
     uploads_dir: Path
+    deleting_dir: Path
     cache_dirs: tuple
     cover_art_dir: Path
 
@@ -53,6 +54,7 @@ class DeletePaths:
             workspace_root=data / "workspace",
             staging_dir=music / STAGING,
             uploads_dir=music / UPLOADS,
+            deleting_dir=music / DELETING,
             cache_dirs=(data / "encoded_cache", data / "default_cache"),
             cover_art_dir=data / "cover_art",
         )
@@ -74,6 +76,7 @@ def _user_roots(user, paths, match_case=True):
         *_import_root_names(folder, paths, match_case),
         (paths.workspace_root, f"u{user['id']}"),
         (paths.uploads_dir, str(user["id"])),  # the user's staged uploads
+        (paths.deleting_dir, str(user["id"])),  # the user's deletion quarantine
     ]
 
 
@@ -81,7 +84,8 @@ def _configured_dirs(paths):
     return [
         paths.app_data_dir, paths.import_dir, paths.music_library_dir,
         paths.user_import_dir, paths.workspace_root, paths.staging_dir,
-        paths.uploads_dir, paths.cover_art_dir, *paths.cache_dirs,
+        paths.uploads_dir, paths.deleting_dir, paths.cover_art_dir,
+        *paths.cache_dirs,
     ]
 
 
