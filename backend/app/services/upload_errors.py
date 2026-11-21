@@ -370,12 +370,12 @@ def upload_prepared_unreadable() -> UploadError:
     )
 
 
-def upload_library_links_unsupported() -> UploadError:
+def upload_library_changed() -> UploadError:
     return UploadError(
         500,
-        "upload_library_links_unsupported",
-        "This server's library cannot take uploaded files (it does not support hard links)."
-        " Ask the server's operator.",
+        "upload_library_changed",
+        "This file could not be imported: the server's library folder was changed outside the"
+        " server. After the server's admin fixes it, cancel this upload and add the file again.",
         retryable=False,
     )
 

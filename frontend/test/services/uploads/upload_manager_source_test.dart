@@ -10,6 +10,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/api/api_client.dart' show NetworkException;
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_item_rules.dart';
@@ -93,6 +94,37 @@ void main() {
     h.clock.advance(const Duration(hours: 1));
     h.timers.fire();
     await h.pump();
+    expect(h.api.puts.where((p) => p.itemUuid == 'u-2'), hasLength(1));
+  });
+
+  test('a resumed transfer whose stored file location can no longer be read '
+      'needs reselecting and is not tried again on its own', () async {
+    await h.manager.addFiles([await h.file('a.flac', 'abc')]);
+    await h.verify();
+    // The first send was cut: the row keeps its transfer operation id and
+    // the next send asks the server first.
+    h.api.openPuts.single.fail(NetworkException('cut', attemptsMade: 1));
+    await h.pump();
+    expect((await row('u-2'))['transfer_operation_uuid'], isNotNull);
+    expect((await row('u-2'))['last_state'], UploadIntentState.allocated);
+    // The stored location is unreadable (a format this app does not know).
+    await h.db.customUpdate(
+      "UPDATE upload_intents SET source_descriptor_json = '{\"v\":2}' "
+      "WHERE item_uuid = 'u-2'",
+    );
+
+    h.clock.advance(const Duration(hours: 1));
+    h.timers.fire();
+    await h.pump();
+
+    expect((await row('u-2'))['last_state'], UploadIntentState.needsReselect);
+    // Nothing more is tried for it, however long the app waits.
+    final calls = h.api.calls.length;
+    h.clock.advance(const Duration(hours: 1));
+    h.timers.fire();
+    await h.pump();
+    expect((await row('u-2'))['last_state'], UploadIntentState.needsReselect);
+    expect(h.api.calls.skip(calls).where((c) => c.endsWith(' u-2')), isEmpty);
     expect(h.api.puts.where((p) => p.itemUuid == 'u-2'), hasLength(1));
   });
 

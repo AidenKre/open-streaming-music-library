@@ -16,6 +16,9 @@ import 'package:frontend/ui/widgets/reset_confirm_sheet.dart';
 class LibrarySyncStatusView extends ConsumerWidget {
   const LibrarySyncStatusView({super.key});
 
+  /// The last library sync failed.
+  static const failedMessage = "Couldn't sync your library.";
+
   static const serverRestoredMessage =
       "The server's library looks restored from an older backup. This device "
       "can't sync with it until it is reset.";
@@ -59,7 +62,7 @@ class LibrarySyncStatusView extends ConsumerWidget {
                 child: Text(
                   restored
                       ? serverRestoredMessage
-                      : "Couldn't sync your library.",
+                      : failedMessage,
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: theme.colorScheme.error,
                   ),

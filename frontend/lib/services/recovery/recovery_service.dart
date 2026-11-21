@@ -269,11 +269,17 @@ class _ResumeDownloadsRecoverable implements RecoverableService {
   int get recoveryPriority => RecoveryPriority.resumeDownloads;
 
   @override
-  Set<RecoveryTrigger> get triggers => const {RecoveryTrigger.networkRecovered};
+  Set<RecoveryTrigger> get triggers =>
+      const {RecoveryTrigger.networkRecovered, RecoveryTrigger.boundServerBack};
 
   @override
   Future<void> recover(RecoveryTrigger trigger) async {
-    _ref.read(downloadManagerProvider).resumeIfPaused();
+    final downloads = _ref.read(downloadManagerProvider);
+    if (resumesParkedWork(trigger, _ref.read(serverBindingGateProvider))) {
+      downloads.resumeAfterBoundServerBack();
+    } else {
+      downloads.resumeIfPaused();
+    }
   }
 }
 
@@ -346,12 +352,14 @@ class _HistoryRecoverable implements RecoverableService {
 
   @override
   Future<void> recover(RecoveryTrigger trigger) async {
-    _ref
-        .read(historyRunnerProvider)
-        .request(
-          trigger.name,
-          bypassBackoff: trigger != RecoveryTrigger.coldStart,
-        );
+    final runner = _ref.read(historyRunnerProvider);
+    if (resumesParkedWork(trigger, _ref.read(serverBindingGateProvider))) {
+      runner.resumeParked();
+    }
+    runner.request(
+      trigger.name,
+      bypassBackoff: trigger != RecoveryTrigger.coldStart,
+    );
   }
 }
 
@@ -402,11 +410,13 @@ class _UploadsRecoverable implements RecoverableService {
 
   @override
   Future<void> recover(RecoveryTrigger trigger) async {
-    _ref
-        .read(uploadManagerProvider)
-        .request(
-          trigger.name,
-          bypassBackoff: trigger != RecoveryTrigger.coldStart,
-        );
+    final uploads = _ref.read(uploadManagerProvider);
+    if (resumesParkedWork(trigger, _ref.read(serverBindingGateProvider))) {
+      uploads.resumeAfterBoundServerBack();
+    }
+    uploads.request(
+      trigger.name,
+      bypassBackoff: trigger != RecoveryTrigger.coldStart,
+    );
   }
 }

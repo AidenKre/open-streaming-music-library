@@ -555,6 +555,45 @@ void main() {
       });
     });
 
+    // The server says what holds the converted file's path: only another
+    // track's record ("track"), or a file on disk ("file").
+    group('409 target_exists', () {
+      const fileThere =
+          "A file already exists at the converted file's location.";
+      String forDetail(Map<String, Object?> detail) =>
+          conversionErrorMessage(_apiError(409, detail));
+
+      test('another track recorded at the path says so', () {
+        expect(
+          forDetail({'error': 'target_exists', 'taken_by': 'track'}),
+          "Another track is recorded at the converted file's location.",
+        );
+      });
+
+      test('a file at the path says a file is there', () {
+        expect(
+          forDetail({'error': 'target_exists', 'taken_by': 'file'}),
+          fileThere,
+        );
+      });
+
+      test('without the key, or with anything else, a file is named', () {
+        expect(forDetail({'error': 'target_exists'}), fileThere);
+        expect(
+          forDetail({'error': 'target_exists', 'taken_by': 'folder'}),
+          fileThere,
+        );
+        expect(
+          forDetail({'error': 'target_exists', 'taken_by': null}),
+          fileThere,
+        );
+        expect(
+          forDetail({'error': 'target_exists', 'taken_by': 7}),
+          fileThere,
+        );
+      });
+    });
+
     test('maps each backend error to readable text', () {
       expect(
         conversionErrorMessage(_apiError(409, {'error': 'target_exists'})),

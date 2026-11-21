@@ -226,11 +226,8 @@ class ManageLibraryController extends ChangeNotifier
 
   @override
   ServerDeleteAvailability get availability {
-    final feature = _ref.read(libraryToolsFeatureProvider);
-    return serverDeleteAvailability(
-      loading: !feature.hasValue && !feature.hasError,
-      failed: feature.hasError && !feature.hasValue,
-      advertised: feature.hasValue ? feature.value : null,
+    return serverDeleteAvailabilityOf(
+      _ref.read(libraryToolsFeatureProvider),
       offline: _ref.read(offlineModeProvider),
     );
   }

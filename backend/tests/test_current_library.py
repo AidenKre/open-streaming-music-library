@@ -9,7 +9,6 @@ from starlette.requests import Request
 from app.auth.principal import Principal
 from app.database.database import Database
 from app.library import Library, current_library
-from app.services.path_sanitize import PathEscapesRoot
 from tests.auth_helpers import flac_track
 from tests.conftest import bearer
 from tests.sqlite_helpers import sql_rows
@@ -150,14 +149,23 @@ def test_the_folder_is_the_one_the_users_row_names_at_each_request(app_client, t
 
 
 @pytest.mark.parametrize("folder", ["..", ".", "a/b", "/abs"])
-def test_a_user_whose_folder_name_is_invalid_is_still_refused(app_client, folder):
+def test_a_user_whose_folder_name_is_invalid_is_still_refused(app_client, folder, caplog):
+    """Refused as a typed answer (the account's music folder is not usable),
+    never a crash; the operator line never repeats a stored name that is not a
+    plain folder name (it could be an absolute path)."""
     body = _register(app_client, "Sam")
     sam = body["user"]["id"]
     _add_root_route(app_client.app)
     sql_rows(app_client, "UPDATE users SET library_folder = ? WHERE id = ?", (folder, sam))
 
-    with pytest.raises(PathEscapesRoot):
-        app_client.get("/test-only/library", headers=bearer(body["token"]))
+    with caplog.at_level("WARNING", logger="uvicorn.error"):
+        response = app_client.get("/test-only/library", headers=bearer(body["token"]))
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"] == "library_folder_unusable"
+    [line] = [r.getMessage() for r in caplog.records
+              if r.name == "uvicorn.error" and "library folder" in r.getMessage()]
+    assert f"({folder} in the music folder)" not in line
 
 
 def test_a_principal_without_a_session_folder_is_refused(app_client):

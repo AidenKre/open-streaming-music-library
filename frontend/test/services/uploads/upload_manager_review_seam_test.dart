@@ -14,6 +14,8 @@ import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_review_transport.dart';
+import 'package:frontend/services/uploads/upload_types.dart'
+    show UploadIntentMissing;
 
 import '../../helpers/fake_uploads_api.dart';
 import '../../helpers/upload_manager_harness.dart';
@@ -89,6 +91,25 @@ void main() {
         .firstWhere((s) => s['operation_uuid'] == row['operation_uuid']);
     expect(sub['kind'], 'upload_commit');
     expect(sub['state'], 'accepted');
+  });
+
+  test('a review action for an item this device has no record of is refused '
+      'to the caller: nothing is frozen or sent', () async {
+    final before = await h.submissions();
+    for (final kind in ReviewActionKind.values) {
+      await expectLater(
+        h.manager.submitReviewAction(
+          'no-such-item',
+          kind,
+          reviewVersion: 1,
+          body: {'base_review_version': 1, 'edits': {}, 'write_tags': false},
+        ),
+        throwsA(isA<UploadIntentMissing>()),
+      );
+    }
+    await h.pump();
+    expect(await h.submissions(), before);
+    expect(review.sent, isEmpty);
   });
 
   test('a repeated tap of the same review version reuses the operation id; '

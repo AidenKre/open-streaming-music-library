@@ -40,8 +40,8 @@ OWNED = {
     # U05-B-01: the tracks (and stored exact hashes) whose master lies in one
     # library folder; the import's name-clash test (ANY_OWNER from make_pipeline).
     "track_identities_in_folder",
-    "delete_track",
-    "get_track_tombstones",
+    # The admin tool's library check: the master paths of one owner's live tracks.
+    "live_track_paths",
     "get_all_track_uuids",
     "get_changes",
     "get_artists",
@@ -90,7 +90,6 @@ OWNED = {
     "list_upload_items",
     "get_upload_item",
     "list_upload_batches",
-    "transition_upload_item",
     # 7A.2b: the streamed receipt.
     "begin_upload_receipt",
     "complete_upload_receipt",
@@ -118,6 +117,12 @@ OWNED = {
     "disconnect_lastfm",
     "get_lastfm_outbox_summary",
 }
+
+# Owned methods a Library does not offer: no request and no service acting for
+# one owner calls them. Start-up recovery does, on the Database, naming the
+# owner of the row it settles (``journal_settle``: a same-file conversion whose
+# swap the start finished).
+OWNED_NOT_ON_A_LIBRARY = {"bump_track_revision"}
 
 # Server-wide: no owner (spec §4.2 "Server-wide methods") plus the users table.
 SERVER_WIDE = {
@@ -282,6 +287,8 @@ UPLOAD_COMMIT_WORKER = {
     "prune_upload_batch",
     # 7A.3c: startup adoption of unjournaled commit art (7A.3a review #2).
     "adopt_upload_commit_art",
+    # A commit re-run keeps its earlier art while another commit's journal names it.
+    "upload_commit_art_named_elsewhere",
 }
 
 # 9D.1b: the offline operator purge (spec §7.11): every user's Last.fm rows at
@@ -430,13 +437,22 @@ def test_calling_an_owned_method_without_an_owner_is_a_type_error(db, name):
 
 
 def test_a_library_exposes_exactly_the_owned_methods(db):
+    """All of them but the ones named in ``OWNED_NOT_ON_A_LIBRARY``."""
     library = Library(db, db.owner_id)
 
-    for name in OWNED:
+    assert OWNED_NOT_ON_A_LIBRARY <= OWNED
+    for name in OWNED - OWNED_NOT_ON_A_LIBRARY:
         assert callable(getattr(library, name)), name
-    for name in _public_methods() - OWNED:
+    for name in (_public_methods() - OWNED) | OWNED_NOT_ON_A_LIBRARY:
         with pytest.raises(AttributeError):
             getattr(library, name)
+
+
+def test_the_librarys_allow_list_names_only_methods_the_database_has():
+    """A name left on the list after its method is gone would hide that."""
+    from app.library import OWNED_METHODS
+
+    assert OWNED_METHODS == OWNED - OWNED_NOT_ON_A_LIBRARY
 
 
 def _track():
@@ -495,7 +511,6 @@ def test_an_owned_insert_needs_a_real_owner(db, call, owner):
         lambda db: Database.bump_track_revision(db, "u", owner_id=ANY_OWNER),
         lambda db: Database.apply_track_metadata_edit(db, "u", {}, 1, owner_id=ANY_OWNER),
         lambda db: Database.update_track_cover_art_id(db, "u", 1, owner_id=ANY_OWNER),
-        lambda db: Database.delete_track(db, "u", owner_id=ANY_OWNER),
         lambda db: Database.delete_journal_entry(db, 1, owner_id=ANY_OWNER),
         lambda db: Database.set_user_setting(db, "k", "v", owner_id=ANY_OWNER),
         lambda db: Database.refresh_track_audio_properties(
@@ -504,7 +519,7 @@ def test_an_owned_insert_needs_a_real_owner(db, call, owner):
         ),
     ],
     ids=["mark_running", "mark_failed", "mark_cancelled", "complete_job", "undo_swap", "settle_swap", "bump_revision", "edit",
-         "update_cover_art", "delete_track", "delete_journal_entry", "set_user_setting",
+         "update_cover_art", "delete_journal_entry", "set_user_setting",
          "refresh_audio"],
 )
 def test_an_owned_write_never_accepts_any_owner(db, call):
@@ -562,6 +577,59 @@ def _any_owner_sites() -> set[tuple[str, str]]:
 
 def test_any_owner_appears_only_at_the_documented_sites():
     assert _any_owner_sites() == ANY_OWNER_SITES
+
+
+# Where the Database itself is taken out of a Library (``unbound_database``:
+# every owner's rows are within its reach), as (path under app/, enclosing
+# function). Only the file operations that must look beyond the owner; never a
+# route, and never a helper a route could hand its Library to for owned data.
+UNBOUND_DATABASE_SITES: set[tuple[str, str]] = {
+    # Where the property is defined.
+    ("library.py", "Library.unbound_database"),
+    # Runtime recovery of the track's kept journal rows: each row names its owner.
+    ("services/journal_recovery.py", "finish_track_journal_rows"),
+    # Whether a kept row of the track waits for the next start (its job, by the row's owner).
+    ("services/journal_recovery.py", "swap_waits_for_start"),
+    # The move of a master: no path another track's row (of any owner) names; the durable points.
+    ("services/master_replace.py", "move_to_new_path"),
+    ("services/master_replace.py", "settle_old_master"),
+}
+
+
+def _attribute_sites(*names: str) -> set[tuple[str, str]]:
+    """Every (path under app/, enclosing function) that reads an attribute
+    called one of ``names``, or mentions one in a ``getattr``-style string."""
+    sites = set()
+    for path in sorted(APP_DIR.rglob("*.py")):
+        relative = path.relative_to(APP_DIR).as_posix()
+
+        def visit(node, scope):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if isinstance(child, ast.FunctionDef) and child.name in names:
+                        sites.add((relative, f"{scope}.{child.name}" if scope else child.name))
+                    visit(child, f"{scope}.{child.name}" if scope else child.name)
+                    continue
+                if (isinstance(child, ast.Attribute) and child.attr in names) or (
+                    isinstance(child, ast.Constant) and child.value in names
+                ):
+                    sites.add((relative, scope or "<module>"))
+                visit(child, scope)
+
+        visit(ast.parse(path.read_text()), "")
+    return sites
+
+
+def test_the_unbound_database_is_taken_from_a_library_only_at_the_documented_sites():
+    """A Library binds every call to its owner; ``unbound_database`` is the one
+    way around that. The route guard below reads only an endpoint's own source,
+    so a helper could hand a request's Library on: this test reads every module
+    of the server instead."""
+    assert _attribute_sites("unbound_database") == UNBOUND_DATABASE_SITES
+
+
+def test_nothing_outside_the_library_reads_its_private_database():
+    assert {site for site in _attribute_sites("_db") if site[0] != "library.py"} == set()
 
 
 # Routes that may read the raw Database: only server-wide facts.

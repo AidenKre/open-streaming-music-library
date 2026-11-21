@@ -35,7 +35,7 @@ from libarchive.exception import ArchiveError
 from app.config import Settings
 from app.core.operator_log import operator_logger
 from app.services import upload_errors as errors
-from app.services.import_outcome import file_identity
+from app.services.import_outcome import file_identity, open_no_follow
 from app.services.path_sanitize import PathEscapesRoot, assert_within
 from app.services.storage_ledger import IMPORT_UNPACK, InsufficientStorage
 from app.services.upload_validation import ValidationFailed
@@ -98,6 +98,12 @@ def _block_size(path) -> int:
         return max(_MIN_BLOCK, os.statvfs(path).f_frsize)
     except (OSError, AttributeError):
         return _MIN_BLOCK
+
+
+def ratio_budget(limits, size: int) -> int:
+    """The most an archive of ``size`` bytes may declare in all: the
+    compression ratio applied to the whole archive file."""
+    return limits.max_compression_ratio * max(size, 1)
 
 
 def _name_budget(limits) -> int:
@@ -171,12 +177,21 @@ def _reader(f, ext: str) -> _Reader:
 
 def inspect(source, limits, *, should_stop=None) -> ArchivePlan:
     """The archive's plan (its audio members, the count of skipped entries),
-    or ``ValidationFailed`` with the same refusals as an uploaded ZIP.
+    or ``ValidationFailed``: for a ZIP the refusals of an uploaded ZIP, plus
+    the whole-archive ratio over its audio entries.
     ``source`` is a path, or a binary file already open (read, not closed).
     ``should_stop()`` abandons a tar walk or a listing with ``ArchiveStopped``."""
     name = _name(source)
     if name.endswith(".zip"):
-        return inspect_archive(source, limits)
+        plan = inspect_archive(source, limits)
+        # Each member passed its own ratio; the whole archive gets the rule of a
+        # tar or RAR too (an overlapped ZIP points many entries at one copy).
+        declared = sum(m.declared_bytes for m in plan.members)
+        if declared:  # nothing declared cannot exceed it: the file is not looked at
+            size = os.stat(source).st_size if _is_path(source) else os.fstat(source.fileno()).st_size
+            if declared > ratio_budget(limits, size):
+                raise ValidationFailed(errors.upload_archive_ratio_exceeded())
+        return plan
     ext = _ext(name)
     if ext is None:
         raise ValidationFailed(errors.upload_archive_invalid())
@@ -284,7 +299,7 @@ def _list(f, ext: str, limits, should_stop=None) -> ArchivePlan:
     budget, and ``should_stop()`` is checked per entry."""
     size = os.fstat(f.fileno()).st_size
     name_budget = _name_budget(limits)
-    budget = limits.max_compression_ratio * max(size, 1)
+    budget = ratio_budget(limits, size)
     reader = _reader(f, ext)
     if ext != ".rar":
         _walk_tar(f, gz=ext == ".tar.gz", size=size, budget=budget,
@@ -373,7 +388,8 @@ class _Coded(Exception):
 
 
 class ArchiveRefused(_Coded):
-    """Final: the same bytes would be refused again (``code`` in REFUSAL_CODES).
+    """Final: the same bytes would be refused again (``code`` in REFUSAL_CODES,
+    or ``set_aside_failed`` for a remembered archive that could not be set aside).
     ``remembered``: refused earlier, unchanged since, and not inspected again."""
 
     def __init__(self, code, *, remembered=False):
@@ -399,10 +415,6 @@ class ArchiveStopped(Exception):
 class ArchiveChanged(Exception):
     """The file that was opened is not the file that was looked at first (its
     name, or a folder on the way, now leads elsewhere): nothing was read from it."""
-
-
-def _open_no_follow(path, flags):
-    return os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
 
 
 @dataclass(frozen=True)
@@ -432,8 +444,9 @@ class ArchiveUnpacker:
     audio entries written, each into a folder of its own (``<position>/<file
     name>``: no tree from the archive's paths) inside a fresh folder that
     never outlives the ``with`` block.
-    A refusal is remembered by the file's identity and the limits in effect,
-    so an unchanged archive is not inspected again on every scan."""
+    A refusal, or an archive kept because it could not be set aside, is
+    remembered by the file's identity and the limits in effect, so an
+    unchanged archive is not inspected again on every scan."""
 
     def __init__(self, *, owner_id, ledger, limits, chunk_size=1024 * 1024):
         self._owner_id = owner_id
@@ -451,9 +464,15 @@ class ArchiveUnpacker:
         limits: the caller can skip it without reading it."""
         return self._known(archive, file_identity(archive), self._limits()) is not None
 
+    def remember_kept(self, archive, identity, code: str) -> None:
+        """Remembers an archive kept in its folder after its unpack because it
+        could not be set aside: ``remembered`` answers True while it and the
+        limits are unchanged, so it is not unpacked again in this run."""
+        self._refused[archive] = (identity, self._limits(), code)
+
     def byte_budget(self, size: int) -> int:
         """The most an archive of ``size`` bytes may expand to under the current limits."""
-        return self._limits().max_compression_ratio * max(size, 1)
+        return ratio_budget(self._limits(), size)
 
     def header_cap(self) -> int:
         """The most tar headers a walk reads under the current limits."""
@@ -493,7 +512,7 @@ class ArchiveUnpacker:
             # Opened once: the copy reads the very file that was inspected. It
             # is opened without following a link, and it must be the file that
             # was looked at first.
-            source = open(archive, "rb", buffering=0, opener=_open_no_follow)
+            source = open(archive, "rb", buffering=0, opener=open_no_follow)
         except OSError as exc:
             if exc.errno == errno.ELOOP:  # a link put at the name after the look
                 raise ArchiveChanged() from None

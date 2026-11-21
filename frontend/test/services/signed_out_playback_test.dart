@@ -90,6 +90,7 @@ void main() {
       s.container.read(apiClientProvider).getJson(['tracks']),
       throwsA(anything),
     );
+    await pumpEventQueue(); // the bound server's identity is read again first
     expect(s.session.serverBlocked.value, ServerBlockedReason.signedOut);
     final sent = s.server.private.length;
 

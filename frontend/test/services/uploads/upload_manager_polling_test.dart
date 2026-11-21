@@ -309,4 +309,23 @@ void main() {
     await h.pump();
     expect(afters.take(2), [null, 'cursor-2']);
   });
+
+  test('a cursor the server already gave ends the read of the batch',
+      () async {
+    final afters = <String?>[];
+    h.api.onListItems = (batch, after) async {
+      afters.add(after);
+      // Without the guard the read would never end; fail instead.
+      if (afters.length > 20) throw StateError('the same page for ever');
+      return UploadItemPage.fromJson({
+        'items': [itemJson('u-2', batchUuid: batch, state: 'review_ready')],
+        'next_after': 'x',
+      });
+    };
+    // Entering the page polls once.
+    visible.value = true;
+    await h.pump();
+    expect(afters, [null, 'x']);
+    expect((await h.states())['u-2'], 'review_ready');
+  });
 }

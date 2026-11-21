@@ -19,6 +19,7 @@ from app.models import Track, TrackMetaData
 from tests.owned_database import add_test_user
 from tests.pending_deletion import mark_pending_deletion
 from tests.sqlite_helpers import sql_exec
+from tests.track_removal import delete_track
 
 UNKNOWN = "00000000-0000-4000-8000-0000000000ee"
 
@@ -74,7 +75,7 @@ def test_an_own_live_track_reports_its_identity_revision_and_path(me):
 
 def test_an_own_tombstone_reports_its_existing_revision(db, me):
     uuid_id = _add(me, "Gone")
-    assert me.delete_track(uuid_id)
+    assert delete_track(me, uuid_id)
     [tombstone_revision] = [
         r[0] for r in sqlite3.connect(db.context.database_path).execute(
             "SELECT revision FROM track_tombstones WHERE uuid_id = ?", (uuid_id,))
@@ -88,7 +89,7 @@ def test_an_own_tombstone_reports_its_existing_revision(db, me):
 def test_unknown_foreign_live_and_foreign_tombstone_are_all_absent(me, sam):
     their_live = _add(sam, "Lucky")
     their_gone = _add(sam, "Gone")
-    assert sam.delete_track(their_gone)
+    assert delete_track(sam, their_gone)
     mine = _add(me, "Airbag")
 
     facts = me.get_deletion_preview_facts([UNKNOWN, their_live, their_gone, mine])
@@ -110,13 +111,13 @@ def test_many_targets_in_one_call(me):
 
 @pytest.mark.parametrize("status,busy", [
     ("queued", True), ("running", True),
-    ("completed", False), ("failed", False), ("cancelled", False),
+    ("done", False), ("failed", False), ("cancelled", False),
 ])
 def test_an_active_conversion_makes_the_track_busy(me, status, busy):
     uuid_id = _add(me, "Converting")
     job_id = me.insert_conversion_job(uuid_id, "aac", "m4a", 192)
     if status != "queued":
-        sql_exec(me.database, "UPDATE conversion_jobs SET status = ? WHERE id = ?", (status, job_id))
+        sql_exec(me.unbound_database, "UPDATE conversion_jobs SET status = ? WHERE id = ?", (status, job_id))
 
     assert me.get_deletion_preview_facts([uuid_id])[uuid_id]["busy"] is busy
 
@@ -135,7 +136,7 @@ def test_an_edit_journal_row_makes_the_track_busy(me):
 def test_a_non_terminal_upload_commit_journal_makes_the_track_busy(me, state, busy):
     uuid_id = _add(me, "Publishing")
     sql_exec(
-        me.database,
+        me.unbound_database,
         "INSERT INTO upload_commit_journal (owner_id, operation_uuid, item_uuid, state,"
         " base_review_version, reserved_track_uuid, edits, write_tags,"
         " acknowledged_duplicates, source_path, created_at, updated_at)"
@@ -148,7 +149,7 @@ def test_a_non_terminal_upload_commit_journal_makes_the_track_busy(me, state, bu
 
 def test_a_pending_deletion_makes_the_track_busy(me):
     uuid_id = _add(me, "Deleting")
-    mark_pending_deletion(me.database.context.database_path, uuid_id)
+    mark_pending_deletion(me.unbound_database.context.database_path, uuid_id)
 
     facts = me.get_deletion_preview_facts([uuid_id])
 
@@ -159,10 +160,10 @@ def test_a_pending_deletion_makes_the_track_busy(me):
 def test_another_users_busy_rows_do_not_make_my_track_busy(me, sam):
     # Track UUIDs are global, but a foreign row naming my UUID is not mine.
     uuid_id = _add(me, "Mine")
-    sql_exec(me.database,
+    sql_exec(me.unbound_database,
          "INSERT INTO edit_journal (intent, uuid_id, created_at, owner_id) VALUES ('x', ?, 0, ?)",
          (uuid_id, sam.owner_id))
-    sql_exec(me.database,
+    sql_exec(me.unbound_database,
          "INSERT INTO conversion_jobs (uuid_id, target_codec, target_container, status, owner_id)"
          " VALUES (?, 'aac', 'm4a', 'running', ?)", (uuid_id, sam.owner_id))
 
@@ -172,7 +173,7 @@ def test_another_users_busy_rows_do_not_make_my_track_busy(me, sam):
 def test_reading_the_facts_writes_nothing(db, me, sam):
     mine = _add(me, "Mine")
     gone = _add(me, "Gone")
-    assert me.delete_track(gone)
+    assert delete_track(me, gone)
     theirs = _add(sam, "Theirs")
     before = _dump(db)
 

@@ -10,6 +10,7 @@ import unicodedata
 from typing import Any, List, Optional
 
 from app.core.owner import _and_owner, Owner, _owner_predicate, _require_owner
+from app.core.operator_log import operator_logger
 from app.database.core import (
     CoverArtGone,
     DatabaseCore,
@@ -30,6 +31,9 @@ from app.models.track import Track
 # (codec/duration/bitrate_kbps/sample_rate_hz/channels/has_album_art/
 # cover_art_id) which must never be hand-edited.
 EDITABLE_METADATA_COLUMNS = [spec.key for spec in EDIT_FIELD_SPECS]
+
+# Rows per read of ``live_track_paths``: each page is its own short read.
+TRACK_PATH_PAGE = 2000
 
 
 class EmptyTrackEdit(Exception):
@@ -110,8 +114,9 @@ class TracksPart(DatabaseCore):
     ) -> bool:
         _require_owner(owner_id)
         if track.metadata.is_empty():
-            print(
-                f"empty metadata track passed to Database.add_track(): {track.metadata}"
+            operator_logger.warning(
+                "empty metadata track passed to Database.add_track(): %s",
+                track.metadata,
             )
             return False
 
@@ -133,7 +138,13 @@ class TracksPart(DatabaseCore):
             # again; choose another name for the file.
             raise
         except Exception as e:
-            print(f"Failed to add track {track}. {e}")
+            operator_logger.error(
+                "Failed to add track %s: %s",
+                track.uuid_id,
+                # A database error's own text names no path and holds no values.
+                str(e) if isinstance(e, sqlite3.Error)
+                else (getattr(e, "strerror", None) or type(e).__name__),
+            )
             return False
 
     @staticmethod
@@ -433,6 +444,29 @@ class TracksPart(DatabaseCore):
                 (_fold_path(folder), *params),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def live_track_paths(self, *, owner_id: Owner):
+        """The master file paths of the owner's tracks (of any owner with
+        ``ANY_OWNER``), read from ``live_tracks`` so a track whose deletion is in
+        progress is left out. Read in pages of ``TRACK_PATH_PAGE`` by id, each on
+        its own connection, closed before its paths are yielded: no transaction
+        is held between pages, so a caller's slow work on a path never keeps a
+        read snapshot open (it would hold up the server's checkpoints)."""
+        suffix, params = _and_owner("owner_id", owner_id)
+        after = 0
+        while True:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, file_path FROM live_tracks"
+                    " WHERE file_path IS NOT NULL AND id > ?" + suffix
+                    + " ORDER BY id LIMIT ?",
+                    (after, *params, TRACK_PATH_PAGE),
+                ).fetchall()
+            if not rows:
+                return
+            after = rows[-1]["id"]
+            for row in rows:
+                yield row["file_path"]
 
     # ── Conversion jobs (Phase 2 master-type conversion) ─────────────────────
 
@@ -808,36 +842,6 @@ class TracksPart(DatabaseCore):
             self._mark_audio_identity_stale_in(conn, uuid_id, "settle")
             return revision
 
-    def delete_track(
-        self, uuid_id: str, timeout: float = 5, *, owner_id: int
-    ) -> bool:
-        _require_owner(owner_id)
-        try:
-            with self._connection(
-                commit=True, timeout=timeout, immediate=True
-            ) as conn:
-                self._delete_track_in(conn, uuid_id, owner_id=owner_id)
-            return True
-        except Exception as e:
-            print(f"Failed to delete track {uuid_id}. {e}")
-            return False
-
-    def get_track_tombstones(self, *, owner_id: Owner) -> list[str]:
-        """Return uuids of all hard-deleted tracks. Incremental sync streams
-        tombstones by revision via ``get_changes``; this remains as a simple
-        helper for ops and tests."""
-        suffix, params = _and_owner("owner_id", owner_id)
-        try:
-            with self._connection() as conn:
-                rows = conn.execute(
-                    "SELECT uuid_id FROM track_tombstones WHERE 1 = 1" + suffix,
-                    params,
-                ).fetchall()
-                return [row[0] for row in rows]
-        except Exception as e:
-            print(f"Error fetching track tombstones: {e}")
-            return []
-
     def filter_owned_track_uuids(
         self, uuid_ids: list[str], *, owner_id: int
     ) -> list[str]:
@@ -865,5 +869,5 @@ class TracksPart(DatabaseCore):
                 ).fetchall()
                 return [row[0] for row in rows]
         except Exception as e:
-            print(f"Error fetching all track UUIDs: {e}")
+            operator_logger.error("Error fetching all track UUIDs: %s", e)
             return []

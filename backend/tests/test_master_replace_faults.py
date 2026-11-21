@@ -54,6 +54,7 @@ from tests.replace_matrix_rig import (
     meet_at_runtime,
 )
 from tests.track_paths import allow_two_tracks_on_one_path, set_track_path
+from tests.track_removal import delete_track
 
 # The sentences a client reads on a same-file conversion's job (pinned copies).
 SWAP_REFUSED = (
@@ -337,6 +338,29 @@ def run_case(world, case: Case) -> None:
     assert world.recorder.steps.count("ledger.release") == (world.writer.kind == "convert")
     check_safe(world)
     check_evidence(world)
+
+
+@pytest.mark.parametrize("case_id", [
+    "W2-the row's deletion is refused after the old file went",
+    "W4-the identity write is refused",
+    "W4-the row's deletion is refused",
+])
+def test_a_failure_after_the_commit_never_fails_the_job(tmp_path, monkeypatch, case_id):
+    """A job that fails for a reason the server has no sentence for says "The
+    conversion failed. The original was kept." That is true only before the
+    commit. Here a step fails after it: the converted file is the track's file,
+    so the job stays done with no text, also when the writer's own handler
+    tries to mark it failed with that sentence (the first and the last case:
+    the error leaves the writer)."""
+    case = CASES_BY_ID[case_id]
+    world = build_world(tmp_path, monkeypatch, WRITERS[case.writer])
+
+    run_case(world, case)
+
+    assert world.job() == ("done", None)
+    assert world.track()["codec"] == AUDIO[world.writer.new_audio][0]
+    if "deletion is refused" in case_id:
+        assert "db.mark_conversion_job_failed" in world.recorder.steps, world.recorder.steps
 
 
 @pytest.mark.parametrize("path", ["start", *RUNTIME_PATHS])
@@ -1001,7 +1025,7 @@ def test_an_edits_kept_row_is_finished_once_the_other_track_left_the_path(tmp_pa
     world.recorder.begin("start")
     world.start_up()
     assert len(world.journal()) == 1
-    assert world.db._real.delete_track(other, owner_id=world.owner)
+    assert delete_track(world.db._real, other, owner_id=world.owner)
     with world.outside():
         world.old.unlink()
 
@@ -1357,7 +1381,7 @@ def test_when_the_track_is_gone_no_file_of_the_row_is_lost(tmp_path, monkeypatch
         world.recorder.place(step)
         world.recorder.run_killed(world.run_writer)
         before = {rel: data for rel, data in world.files().items() if not rel.startswith(".staging")}
-        assert world.db._real.delete_track(world.uuid, owner_id=world.owner)
+        assert delete_track(world.db._real, world.uuid, owner_id=world.owner)
 
         world.recorder.begin("start")
         world.start_up()

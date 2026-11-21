@@ -1,11 +1,14 @@
 """Owner binding: a Library exposes owned Database methods with owner_id fixed."""
 
 import functools
+import threading
 from pathlib import Path, PurePath, PureWindowsPath
 
 from fastapi import Request
 
 from app.auth.principal import auth_error, current_principal
+from app.core.api_errors import api_error
+from app.core.operator_log import operator_logger
 from app.services.path_sanitize import PathEscapesRoot, assert_within
 
 OWNED_METHODS = frozenset(
@@ -30,8 +33,6 @@ OWNED_METHODS = frozenset(
         "get_track_file_path",
         # 8A.3a: reader-side pending-deletion predicate.
         "is_pending_deletion",
-        "delete_track",
-        "get_track_tombstones",
         "get_all_track_uuids",
         "get_changes",
         "get_artists",
@@ -49,12 +50,12 @@ OWNED_METHODS = frozenset(
         "complete_conversion_job",
         "undo_inplace_conversion",
         "settle_swapped_conversion_job",
-        "bump_track_revision",
         "refresh_track_audio_properties",
         "list_journal_entries",
         "has_journal_entry_for_uuid",
         "track_path_in_use",
         "track_identities_in_folder",
+        "live_track_paths",
         "delete_journal_entry",
         "get_tracks_missing_cover_art",
         "update_track_cover_art_id",
@@ -69,7 +70,6 @@ OWNED_METHODS = frozenset(
         "list_upload_items",
         "get_upload_item",
         "list_upload_batches",
-        "transition_upload_item",
         # 7A.2b: the streamed byte receipt.
         "begin_upload_receipt",
         "complete_upload_receipt",
@@ -105,6 +105,10 @@ class Library:
     Exposes only the owned Database methods named in the allow-list, with
     ``owner_id`` bound; callers cannot pass their own. ``current_library``
     binds the request principal's Library.
+
+    ``tests/test_ownership_inventory.py`` holds the same list from the other
+    side: every public Database method classified, and the owned methods a
+    Library does not offer, each with its reason.
     """
 
     def __init__(self, db, owner_id, root=None):
@@ -115,8 +119,13 @@ class Library:
         self.root = root
 
     @property
-    def database(self):
-        """The raw Database, for the journal recovery that takes an explicit owner."""
+    def unbound_database(self):
+        """The Database itself, not bound to this owner: every owner's rows are
+        within reach of it. Only for the file operations that must look beyond
+        the owner (is a path another track's of any owner; the durable point;
+        the recovery of a journal row, which names the row's own owner). Every
+        use is listed in ``tests/test_ownership_inventory.py``; no route uses it.
+        """
         return self._db
 
     def __getattr__(self, name):
@@ -133,17 +142,23 @@ class Library:
         return bound
 
 
-def library_root(music_library_dir, user) -> Path:
-    """The user's library root: music_library_dir / user["library_folder"]."""
-    folder = user["library_folder"]
-    if (
+def is_plain_folder_name(folder) -> bool:
+    """Whether a stored library folder is one plain path component: a
+    non-empty string, not ``.`` or ``..``, with no separator, never absolute."""
+    return not (
         not isinstance(folder, str)
         or folder in ("", ".", "..")
         or "/" in folder
         or "\\" in folder
         or PurePath(folder).is_absolute()
         or PureWindowsPath(folder).is_absolute()
-    ):
+    )
+
+
+def library_root(music_library_dir, user) -> Path:
+    """The user's library root: music_library_dir / user["library_folder"]."""
+    folder = user["library_folder"]
+    if not is_plain_folder_name(folder):
         raise PathEscapesRoot(f"library_folder is not a plain component: {folder!r}")
     root = Path(music_library_dir) / folder
     assert_within(root, music_library_dir)
@@ -155,10 +170,38 @@ def current_library(request: Request) -> Library:
     folder = (request.scope.get("state") or {}).get("library_folder")
     if folder is None:
         raise auth_error("auth_required")
-    return Library(
-        request.app.state.database,
-        principal.user_id,
-        root=library_root(
-            request.app.state.settings.music_library_dir, {"library_folder": folder}
-        ),
+    try:
+        root = library_root(request.app.state.settings.music_library_dir, {"library_folder": folder})
+    except PathEscapesRoot:
+        _report_unusable_folder(request.app.state, principal.user_id, folder)
+        raise api_error(
+            503, "library_folder_unusable",
+            "This account's music folder on the server is not usable. The server's admin needs"
+            " to fix it.",
+            retryable=False,
+        ) from None
+    return Library(request.app.state.database, principal.user_id, root=root)
+
+
+# Guards the per-server set of users whose unusable library folder was
+# already reported: every request of theirs refuses, the operator needs to
+# read it once per server start.
+_reported_lock = threading.Lock()
+
+
+def _report_unusable_folder(state, user_id: int, folder) -> None:
+    with _reported_lock:
+        reported = getattr(state, "reported_unusable_folders", None)
+        if reported is None:
+            reported = state.reported_unusable_folders = set()
+        if user_id in reported:
+            return
+        reported.add(user_id)
+    # A stored name that is not a plain folder name could be an absolute path.
+    shown = folder if is_plain_folder_name(folder) else "(not a plain folder name)"
+    operator_logger.warning(
+        "The music library folder of user %s (%s in the music folder) is not usable: it is not"
+        " a plain folder name or it leads outside the music folder. That user's library answers"
+        " 503 until it is fixed.",
+        user_id, shown,
     )

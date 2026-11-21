@@ -19,6 +19,7 @@ from app.library import Library
 from app.models import Track, TrackMetaData
 from tests.owned_database import add_test_user
 from tests.pending_deletion import mark_pending_deletion
+from tests.track_removal import delete_track
 
 PATH = "/tracks/deletions/preview"
 UNKNOWN = "00000000-0000-4000-8000-0000000000ee"
@@ -48,7 +49,7 @@ def sam(client):
 
 def _root(library, tmp_path):
     """The owner's library root (MUSIC_LIBRARY_DIR is ``tmp_path / "music"``)."""
-    return tmp_path / "music" / library.database.get_user(library.owner_id)["library_folder"]
+    return tmp_path / "music" / library.unbound_database.get_user(library.owner_id)["library_folder"]
 
 
 def _add(library, tmp_path, title, *, content=b"0123456789", write=True):
@@ -180,8 +181,8 @@ def test_a_master_outside_the_owners_root_is_not_reported_present(client, me, tm
 
 def test_an_own_tombstone_is_already_deleted_with_its_revision(client, me, tmp_path):
     track = _add(me, tmp_path, "Gone")
-    assert me.delete_track(track.uuid_id)
-    [[tombstone_revision]] = sqlite3.connect(me.database.context.database_path).execute(
+    assert delete_track(me, track.uuid_id)
+    [[tombstone_revision]] = sqlite3.connect(me.unbound_database.context.database_path).execute(
         "SELECT revision FROM track_tombstones WHERE uuid_id = ?", (track.uuid_id,)).fetchall()
 
     [row] = _preview(client, (track.uuid_id, track.revision)).json()["targets"]
@@ -210,7 +211,7 @@ def test_a_revision_mismatch_is_a_conflict(client, me, tmp_path):
 
 def test_a_pending_deletion_is_busy(client, me, tmp_path):
     track = _add(me, tmp_path, "Deleting")
-    mark_pending_deletion(me.database.context.database_path, track.uuid_id)
+    mark_pending_deletion(me.unbound_database.context.database_path, track.uuid_id)
 
     [row] = _preview(client, (track.uuid_id, track.revision)).json()["targets"]
 
@@ -229,7 +230,7 @@ def test_an_active_conversion_is_busy(client, me, tmp_path):
 def test_another_users_live_track_and_tombstone_answer_like_unknown(client, sam, tmp_path):
     theirs = _add(sam, tmp_path, "Lucky")
     their_gone = _add(sam, tmp_path, "Exit Music")
-    assert sam.delete_track(their_gone.uuid_id)
+    assert delete_track(sam, their_gone.uuid_id)
 
     rows = _preview(
         client, (theirs.uuid_id, theirs.revision), (their_gone.uuid_id, their_gone.revision),
@@ -256,15 +257,15 @@ def test_targets_answer_in_request_order(client, me, tmp_path):
 def test_the_preview_writes_nothing(client, me, sam, tmp_path):
     mine = _add(me, tmp_path, "Mine")
     gone = _add(me, tmp_path, "Gone")
-    assert me.delete_track(gone.uuid_id)
+    assert delete_track(me, gone.uuid_id)
     theirs = _add(sam, tmp_path, "Theirs")
-    before = _dump(me.database)
+    before = _dump(me.unbound_database)
 
     response = _preview(client, (mine.uuid_id, mine.revision), (gone.uuid_id, 1),
                         (theirs.uuid_id, 1), (UNKNOWN, 1))
 
     assert response.status_code == 200
-    assert _dump(me.database) == before
+    assert _dump(me.unbound_database) == before
 
 
 def test_the_response_carries_no_path(client, me, tmp_path):
@@ -416,7 +417,7 @@ def test_possible_duplicates_and_the_preview_give_the_same_answer(client, me, tm
     track = build(me, tmp_path)
     partner = _add(me, tmp_path, "Partner")
     a, b = sorted((track.uuid_id, partner.uuid_id))
-    conn = sqlite3.connect(me.database.context.database_path)
+    conn = sqlite3.connect(me.unbound_database.context.database_path)
     try:
         conn.execute(
             "INSERT INTO track_duplicate_candidates (owner_id, uuid_a, uuid_b, kind, band_rank, "

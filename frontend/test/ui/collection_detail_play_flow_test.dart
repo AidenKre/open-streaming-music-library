@@ -23,6 +23,7 @@ import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/tracks_page.dart';
 
 import '../helpers/no_server_api.dart';
+import '../helpers/run_async_until.dart';
 import '../helpers/server_binding.dart';
 import 'browse_harness.dart';
 import 'collection_playback_harness.dart';
@@ -183,9 +184,11 @@ void main() {
             db: db, covers: covers, dir: dir, player: player, child: page));
         await tester.pumpAndSettle();
         await tester.tap(find.bySemanticsLabel('Play album'));
-        await tester.runAsync(() => pumpEventQueue(times: 50));
+        await runAsyncUntil(tester, () => clickRecorded(db),
+            reason: 'the accepted Play records its click');
         await tester.pumpAndSettle();
         expect(player.activated, hasLength(1));
+        expect(clickSpy(tester).submitted, hasLength(1));
         expect(await recordedClicks(tester, db), [('album', 'srv-1:2')]);
         expect(find.text("Couldn't start playback."), findsNothing);
         await teardownTree(tester);
@@ -208,20 +211,26 @@ void main() {
       ));
       await tester.pumpAndSettle();
       await tester.tap(find.bySemanticsLabel('Play album'));
-      await tester.runAsync(() => pumpEventQueue(times: 50));
+      await runAsyncUntil(
+          tester,
+          () => find.text("Couldn't start playback.").evaluate().isNotEmpty,
+          reason: 'the failure is explained');
       await tester.pumpAndSettle();
       expect(find.text("Couldn't start playback."), findsOneWidget);
       expect(find.text('Retry'), findsOneWidget);
       expectEnabled(tester, 'Play album', true);
       expectEnabled(tester, 'Shuffle album', true);
       expect(player.activated, isEmpty);
+      expect(clickSpy(tester).submitted, isEmpty);
       expect(await recordedClicks(tester, db), isEmpty);
 
       await tester.tap(find.text('Retry'));
-      await tester.runAsync(() => pumpEventQueue(times: 50));
+      await runAsyncUntil(tester, () => clickRecorded(db),
+          reason: 'the Retry plays and records its click');
       await tester.pumpAndSettle();
       expect(find.text("Couldn't start playback."), findsNothing);
       expect(player.activated, hasLength(1));
+      expect(clickSpy(tester).submitted, hasLength(1));
       expect(await recordedClicks(tester, db), [('album', 'srv-1:2')]);
       await teardownTree(tester);
     });
@@ -258,13 +267,17 @@ void main() {
       await tester.pumpAndSettle();
       expectEnabled(tester, 'Play album', true); // counts know no codec (O2)
       await tester.tap(find.bySemanticsLabel('Play album'));
-      await tester.runAsync(() => pumpEventQueue(times: 50));
+      await runAsyncUntil(
+          tester,
+          () => find.text('Nothing here plays offline.').evaluate().isNotEmpty,
+          reason: 'the refusal is explained');
       await tester.pumpAndSettle();
       expect(find.text('Nothing here plays offline.'), findsOneWidget);
       // Pre-merge A6-03: a retry would get the same answer, so none is
       // offered (this expected Retry before).
       expect(find.text('Retry'), findsNothing);
       expect(player.activated, isEmpty);
+      expect(clickSpy(tester).submitted, isEmpty);
       expect(await recordedClicks(tester, db), isEmpty);
       await teardownTree(tester);
     });

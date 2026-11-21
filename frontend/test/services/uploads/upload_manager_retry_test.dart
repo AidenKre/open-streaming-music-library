@@ -169,6 +169,16 @@ void main() {
     expect(await row(), before);
   });
 
+  test('an item this device has no record of is refused to the caller: '
+      'nothing is sent', () async {
+    final callsBefore = h.api.calls.length;
+    await expectLater(
+      h.manager.retry('no-such-item'),
+      throwsA(isA<UploadIntentMissing>()),
+    );
+    expect(h.api.calls.length, callsBefore);
+  });
+
   test('offline, nothing is sent', () async {
     final callsBefore = h.api.calls.length;
     h.offline = true;

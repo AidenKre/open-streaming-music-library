@@ -17,7 +17,7 @@ from app.services import import_archive
 from tests.archive_builders import rar4 as _rar4, rar5 as _rar5, rar_vint as _rar_vint
 from tests.upload_zip_fixtures import tiny_limits
 from app.core.media_types import ARCHIVE_EXTENSIONS, AUDIO_EXTENSIONS
-from app.services.import_outcome import ImportOutcome
+from app.services.import_outcome import ImportOutcome, file_identity
 from app.services.ffmpeg_runner import CaptureResult
 
 
@@ -218,7 +218,7 @@ class TestIngestionServiceIngestFile:
         svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
-            assert svc.ingest_file(music_path) is True
+            assert svc.ingest_file(music_path, imported_dir=tmp_path / ".imported") is True
             organize_function.assert_called_once_with(music_path)
 
     def test_ingest_file__unsupported_extension__returns_false_and_does_not_organize(self, tmp_path: Path):
@@ -234,7 +234,7 @@ class TestIngestionServiceIngestFile:
         quick_check = MagicMock(return_value=True)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", quick_check):
-            assert svc.ingest_file(path) is False
+            assert svc.ingest_file(path, imported_dir=tmp_path / ".imported") is False
 
             organize_function.assert_not_called()
             quick_check.assert_not_called()
@@ -250,7 +250,7 @@ class TestIngestionServiceIngestFile:
         svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=False):
-            assert svc.ingest_file(music_path) is False
+            assert svc.ingest_file(music_path, imported_dir=tmp_path / ".imported") is False
             organize_function.assert_not_called()
 
     def test_ingest_file__invalid_archive__returns_false_and_does_not_organize(self, tmp_path: Path):
@@ -263,7 +263,7 @@ class TestIngestionServiceIngestFile:
         )
         svc = ingestion.Ingestor(ctx)
 
-        assert svc.ingest_file(archive_path) is False
+        assert svc.ingest_file(archive_path, imported_dir=tmp_path / ".imported") is False
         organize_function.assert_not_called()
 
     def test_ingest_file__archive_with_music_and_non_music__organizes_only_music(self, tmp_path: Path):
@@ -283,7 +283,7 @@ class TestIngestionServiceIngestFile:
         svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
-            assert svc.ingest_file(archive_path) is True
+            assert svc.ingest_file(archive_path, imported_dir=tmp_path / ".imported") is True
 
         # Review r1 DEV-M-10: the extraction dir is removed after handling, so
         # compare with the archive's audio members, not the workspace. Round 2:
@@ -308,7 +308,7 @@ class TestIngestionServiceIngestFile:
         svc = ingestion.Ingestor(ctx)
 
         with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
-            assert svc.ingest_file(archive_path) is True
+            assert svc.ingest_file(archive_path, imported_dir=tmp_path / ".imported") is True
 
         assert any(call.args[0].suffix.lower() in AUDIO_EXTENSIONS for call in organize_function.call_args_list)
 
@@ -332,7 +332,7 @@ class TestIngestionServiceIngestFile:
         with patch(
             "app.services.ingestion.does_music_pass_quick_check", side_effect=quick_check_side_effect
         ):
-            assert svc.ingest_file(archive_path) is True
+            assert svc.ingest_file(archive_path, imported_dir=tmp_path / ".imported") is True
 
         called_paths = {call.args[0].name for call in organize_function.call_args_list}
         assert called_paths == {"good.mp3"}
@@ -352,11 +352,34 @@ class TestIngestionServiceIngestFile:
 
         quick_check = MagicMock(return_value=True)
         with patch("app.services.ingestion.does_music_pass_quick_check", quick_check):
-            assert svc.ingest_file(archive_path) is True
+            assert svc.ingest_file(archive_path, imported_dir=tmp_path / ".imported") is True
 
         organize_function.assert_not_called()
         quick_check.assert_not_called()
 
+
+class TestTheImportFolderIsAlwaysNamed:
+    """Without its import folder an import cannot delete or set aside a fully
+    handled archive, so the archive would stay and be unpacked again at every
+    start. A caller must say which folder the file lies in."""
+
+    @pytest.mark.parametrize("method", ["ingest", "ingest_file"])
+    def test_a_call_without_the_imported_folder_is_refused(self, tmp_path: Path, method):
+        folder = tmp_path / "import"
+        folder.mkdir()
+        archive = folder / "album.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("song.mp3", "a")
+        organize = MagicMock(return_value=ImportOutcome.IMPORTED)
+        svc = ingestion.Ingestor(ingestion.IngestorContext(
+            workspace_dir=tmp_path / "workspace", organize_function=organize))
+
+        with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
+            with pytest.raises(TypeError):
+                getattr(svc, method)(archive)
+
+        organize.assert_not_called()
+        assert archive.exists() and not (tmp_path / "workspace").exists()
 
 
 class TestHandledArchiveIsSetAside:
@@ -573,7 +596,8 @@ class TestAnEnvironmentalFailureKeepsTheArchive:
 
         with patch("app.services.ffmpeg_runner.subprocess.Popen", side_effect=FileNotFoundError):
             with caplog.at_level(logging.INFO):
-                assert self._ingestor(tmp_path / "ws", organize).ingest_file(song) is False
+                assert self._ingestor(tmp_path / "ws", organize).ingest_file(
+                    song, imported_dir=song.parent / ".imported") is False
 
         organize.assert_not_called()
         assert song.read_bytes() == b"audio"
@@ -710,7 +734,8 @@ def test_two_same_named_archives_set_aside_at_once_are_both_kept(tmp_path: Path)
     with patch.object(ingestion, "_imported_lock", SpyLock()), \
             patch("app.services.ingestion.os.rename", side_effect=move_after_both_probed):
         threads = [
-            threading.Thread(target=ingestion.move_to_imported, args=(archive, imported))
+            threading.Thread(target=ingestion.move_to_imported,
+                             args=(archive, imported, file_identity(archive)))
             for archive in (first, second)
         ]
         for t in threads:
@@ -796,7 +821,8 @@ class TestAnIncompleteArchiveIsKept:
         assert not (folder / ".imported").exists()
         assert not workspace.exists() or list(workspace.iterdir()) == []
         kept = [r.getMessage() for r in caplog.records if "album.tar" in r.getMessage()]
-        assert kept == [f"archive kept: {archive} (incomplete)"]
+        # Named relative to its import folder, never by its full path.
+        assert kept == ["archive kept: album.tar of user None (incomplete)"]
 
         # The writer resumes; the next attempt (modify event or scan) imports it whole.
         with open(archive, "ab") as f:
@@ -847,7 +873,8 @@ class TestAnIncompleteArchiveIsKept:
             archive = tmp_path / f"cut{cut}.tar.gz"
             archive.write_bytes(whole[:cut])
             organize = MagicMock(return_value=ImportOutcome.IMPORTED)
-            assert self._ingestor(tmp_path / "ws", organize).ingest(archive) is ImportOutcome.REFUSED
+            assert self._ingestor(tmp_path / "ws", organize).ingest(
+                archive, imported_dir=tmp_path / ".imported") is ImportOutcome.REFUSED
             organize.assert_not_called()
 
     def test_a_zip_cut_at_a_member_boundary_fails_without_its_central_directory(self, tmp_path: Path):
@@ -868,7 +895,8 @@ class TestAnIncompleteArchiveIsKept:
             archive = tmp_path / f"cut{cut}.zip"
             archive.write_bytes(data[:cut])
             organize = MagicMock(return_value=ImportOutcome.IMPORTED)
-            assert self._ingestor(tmp_path / "ws", organize).ingest(archive) is ImportOutcome.REFUSED
+            assert self._ingestor(tmp_path / "ws", organize).ingest(
+                archive, imported_dir=tmp_path / ".imported") is ImportOutcome.REFUSED
             organize.assert_not_called()
 
 
@@ -1084,7 +1112,7 @@ class TestMetadataProbeThatCannotStart:
         assert not (folder / ".imported").exists()
         add.assert_not_called()
         warnings = [r.getMessage() for r in caplog.records if "album.zip" in r.getMessage()]
-        assert warnings == [f"archive kept: {archive} (tool_unavailable)"]
+        assert warnings == ["archive kept: album.zip of user None (tool_unavailable)"]
 
 
 class TestTheCompletenessCheckIsBounded:
@@ -1150,7 +1178,7 @@ class TestTheCompletenessCheckIsBounded:
         archive = folder / "bomb.tar.gz"
         archive.write_bytes(gzip.compress(self._tar_of_zeros(4 * 1024 * 1024, end_marker=False)))
 
-        assert self._ingestor(tmp_path / "ws").ingest(archive) is ImportOutcome.REFUSED
+        assert self._ingestor(tmp_path / "ws").ingest(archive, imported_dir=folder / ".imported") is ImportOutcome.REFUSED
 
     def test_an_unchanged_refused_archive_is_not_checked_for_completeness_again(self, tmp_path: Path):
         folder = tmp_path / "import"
@@ -1167,8 +1195,8 @@ class TestTheCompletenessCheckIsBounded:
         check = MagicMock(side_effect=ingestion.archive_is_complete)
 
         with patch("app.services.ingestion.archive_is_complete", check):
-            assert ingestor.ingest(archive) is ImportOutcome.REFUSED
-            assert ingestor.ingest(archive) is ImportOutcome.REFUSED
+            assert ingestor.ingest(archive, imported_dir=folder / ".imported") is ImportOutcome.REFUSED
+            assert ingestor.ingest(archive, imported_dir=folder / ".imported") is ImportOutcome.REFUSED
 
         assert check.call_count == 1
 
@@ -1254,7 +1282,7 @@ class TestTheIngestProbesAreBounded:
         registry.close()  # shutdown: every probe started from now on is killed
         _, _, ingestor = self._pipeline(tmp_path, registry)
         with timed() as elapsed:
-            outcome = ingestor.ingest(self.song)
+            outcome = ingestor.ingest(self.song, imported_dir=self.song.parent / ".imported")
 
         assert elapsed() < WITHIN_S
         assert outcome is ImportOutcome.TOOL_UNAVAILABLE

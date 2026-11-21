@@ -81,7 +81,8 @@ class UploadHarness {
       interceptor == null ? memory : memory.interceptWith(interceptor),
     );
     final binding = ServerBindingRepository(db);
-    final token = await seedTestBinding(db, reconciled: true);
+    final token =
+        await seedTestBinding(db, instanceId: instanceId, reconciled: true);
     final gate = ControlledGate(db);
     final h = UploadHarness._(dir, db, binding, token, gate);
     h.instanceId = instanceId;

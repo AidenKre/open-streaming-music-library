@@ -33,7 +33,7 @@ from app.services import audio_identity
 from app.services.audio_identity import AudioIdentity, ExactAudioHash
 from app.services.encoded_cache import EncodedCache, evict_track_caches
 from app.services.encoder_coordinator import EncoderCoordinator
-from app.services.ffmpeg_runner import FfmpegProcessRegistry, ToolOptions, kill_orphaned_ffmpeg
+from app.services.ffmpeg_runner import FfmpegProcessRegistry, ToolOptions
 from app.services.metadata import (
     TagWriteError,
     build_ffmpeg_tags,
@@ -41,11 +41,12 @@ from app.services.metadata import (
     ffprobe_for_metadata,
     write_metadata_tags,
 )
-from app.services.organizer import flush_move
+from app.services.file_ops import flush_move
 from app.services.path_sanitize import PathEscapesRoot, assert_within
 from app.services.storage_ledger import CONVERSION, InsufficientStorage, StorageLedger
 from app.services.journal_recovery import (
     PendingOldMasters,
+    file_identity,
     finish_track_journal_rows,
     is_regular_file,
     reached_durable_point,
@@ -81,6 +82,10 @@ AUDIO_UNVERIFIED_ERROR = (
 SOURCE_DAMAGED_ERROR = (
     "Conversion stopped: the original has damaged audio, so it was not converted."
 )
+# What a job says when it failed for a reason the server has no sentence for.
+# Such a job never committed (only a queued or running job is marked failed), so
+# the original is still the track's file.
+CONVERSION_FAILED_ERROR = "The conversion failed. The original was kept."
 # A same-file swap that was refused is taken back (the owner's decision of
 # 2026-11-18: one attempt, "make the conversion fail and say to convert again").
 SWAP_REFUSED_ERROR = (
@@ -130,9 +135,20 @@ class NoOpConversion(Exception):
 InsufficientDiskSpace = InsufficientStorage
 
 
+# What holds the converted master's path (``TargetPathTaken.taken_by``; the
+# values are part of the 409 ``target_exists`` answer).
+TAKEN_BY_FILE = "file"
+TAKEN_BY_TRACK = "track"
+
+
 class TargetPathTaken(Exception):
-    """The converted master's path (same stem, new extension) is already
-    occupied by a different file."""
+    """The converted master's path (same stem, new extension) is taken.
+    ``taken_by`` is ``TAKEN_BY_FILE`` when a different file is at the path, and
+    ``TAKEN_BY_TRACK`` when nothing is there and another track's row names it."""
+
+    def __init__(self, *, taken_by: str):
+        super().__init__(taken_by)
+        self.taken_by = taken_by
 
 
 class PendingRecovery(Exception):
@@ -210,10 +226,12 @@ def _probe_intrinsic_fields(
         raise ConversionFailed("post-conversion probe failed")
     metadata = build_track_metadata(raw)
     if metadata is None or metadata.codec != target_codec:
-        raise ConversionFailed(
-            f"post-conversion probe codec mismatch: expected {target_codec}, "
-            f"got {metadata.codec if metadata else None}"
+        # What it reads as is for the log; a person reads the job's text.
+        logger.warning(
+            "the converted file reads as %s, not as %s",
+            metadata.codec if metadata is not None else "nothing readable", target_codec,
         )
+        raise ConversionFailed(CONVERSION_FAILED_ERROR)
     return metadata.codec, metadata.bitrate_kbps, metadata.sample_rate_hz, metadata.channels
 
 
@@ -260,10 +278,18 @@ def _resolve_dest(
     if dest.exists():
         if os.path.samefile(dest, source):
             return source
-        raise TargetPathTaken(str(dest))
+        raise TargetPathTaken(taken_by=TAKEN_BY_FILE)
     if named_by_another_track(dest):
-        raise TargetPathTaken(str(dest))
+        raise TargetPathTaken(taken_by=TAKEN_BY_TRACK)
     return dest
+
+
+def _master_identity(path: Path) -> Optional[tuple]:
+    """Which file a master's path names and which file it reads as (through a
+    link: its target), each with its size and times. None when either cannot be
+    read: unknown is never "unchanged"."""
+    own, read_as = file_identity(path), file_identity(path, follow=True)
+    return None if own is None or read_as is None else (own, read_as)
 
 
 def _validate_request(track: Track, target_codec: str, target_bitrate_kbps: Optional[int],
@@ -272,9 +298,10 @@ def _validate_request(track: Track, target_codec: str, target_bitrate_kbps: Opti
         raise ConversionRequestInvalid(f"unsupported or unavailable target codec: {target_codec}")
     if is_lossy(target_codec):
         if target_bitrate_kbps not in LOSSY_BITRATE_PRESETS_KBPS:
+            *others, lowest = sorted(LOSSY_BITRATE_PRESETS_KBPS, reverse=True)
             raise ConversionRequestInvalid(
-                f"{target_codec} requires a target bitrate of one of "
-                f"{sorted(LOSSY_BITRATE_PRESETS_KBPS, reverse=True)}"
+                f"{target_codec} requires a target bitrate of "
+                f"{', '.join(str(kbps) for kbps in others)} or {lowest} kbps"
             )
     elif target_bitrate_kbps is not None:
         raise ConversionRequestInvalid(f"{target_codec} is lossless and takes no target bitrate")
@@ -445,9 +472,10 @@ class ConversionOrchestrator:
     @staticmethod
     def _job_error_text(e: Exception) -> str:
         """The text a client reads in ``GET /jobs``: curated for the named
-        failures, never an arbitrary exception's text (it may name a path)."""
+        failures, never an arbitrary exception's text (it may name a path) and
+        never a class name (that goes to the server's log)."""
         if isinstance(e, (ConversionFailed, PendingRecovery)):
-            return str(e) or type(e).__name__
+            return str(e) or CONVERSION_FAILED_ERROR
         if isinstance(e, InsufficientDiskSpace):
             return e.message  # numbers only, no path
         if isinstance(e, TrackPendingDeletion):
@@ -456,9 +484,10 @@ class ConversionOrchestrator:
             return "the master or its destination is outside the owner's library"
         if isinstance(e, MasterNotFound):
             return "master file not found"
-        # The type only: an arbitrary exception's text may name a path.
+        # The type only, and only in the log: an arbitrary exception's text may
+        # name a path, and a person reads the job's text.
         logger.warning("conversion job failed: %s", type(e).__name__)
-        return f"conversion failed ({type(e).__name__})"
+        return CONVERSION_FAILED_ERROR
 
     def _run_job(self, job_id: int) -> None:
         # Mandatory outer catch: EncoderCoordinator's pool logs only the type
@@ -665,6 +694,9 @@ class ConversionOrchestrator:
                             "saved change (the conversion itself is already on disk)",
                             uuid_id,
                         )
+                    # The original as it is just before the swap: a refused swap is
+                    # taken back only while this very file is still in place.
+                    original = _master_identity(source)
                     try:
                         os.replace(tagged_temp, source)
                     except OSError as e:
@@ -674,7 +706,10 @@ class ConversionOrchestrator:
                             " the original (%s)", uuid_id, type(e).__name__,
                         )
                         self._undo_refused_swap(
-                            library, job_id, uuid_id, entry, current, tagged_temp
+                            library, job_id, uuid_id, entry, current, tagged_temp,
+                            original_in_place=(
+                                original is not None and _master_identity(source) == original
+                            ),
                         )
                         return
                     flush_move(source, tagged_temp)
@@ -712,11 +747,13 @@ class ConversionOrchestrator:
 
     def _undo_refused_swap(
         self, library: Library, job_id: int, uuid_id: str, entry: int, before: Track,
-        staged: Path,
+        staged: Path, *, original_in_place: bool,
     ) -> None:
         """The same-file swap was refused after its commit: take the commit back.
         The caller holds the track lock; ``before`` is the track as read under
-        it just before the commit.
+        it just before the commit; ``original_in_place`` says that the file at
+        the master's path is still the very file that was there just before the
+        swap (same file, size and times).
 
         One transaction (``undo_inplace_conversion``) writes the catalog row back,
         deletes the journal row and fails the job with ``SWAP_REFUSED_ERROR``.
@@ -726,13 +763,16 @@ class ConversionOrchestrator:
         point the staged copy stays: a power cut could bring its journal row
         back, which needs it; the next start removes a copy no row names.
 
-        When the commit cannot be taken back (the transaction is refused, or the
-        staged copy is no longer there, so the rename may have happened) nothing
-        is improvised: the committed conversion, its journal row and whatever is
-        staged stay, as after a crash at this instant, the job says the next
-        start checks the track, and every start reads the row until it is settled."""
+        When the commit cannot be taken back (the transaction is refused; the
+        staged copy is no longer there, so the rename may have happened; or the
+        original is not shown to be in place: a file system that copies instead
+        of renaming can write over it and fail with the staged copy still there)
+        nothing is improvised: the committed conversion, its journal row and
+        whatever is staged stay, as after a crash at this instant, the job says
+        the next start checks the track, and every start reads the row until it
+        is settled."""
         undone = None
-        if is_regular_file(staged):
+        if original_in_place and is_regular_file(staged):
             meta = before.metadata
             try:
                 undone = library.undo_inplace_conversion(
@@ -992,10 +1032,15 @@ def reconcile_conversion_jobs(database: Database, staging_dir: Path) -> None:
     """Startup pass, run AFTER reconcile_journal: no worker thread survives
     a process restart, so any conversion_jobs row still 'running' is
     orphaned -- flip it to failed (the master is untouched: conversion only
-    writes temps until its commit, which also marks the job done). Then kill
-    any ffmpeg a hard-killed predecessor left writing into staging, and
+    writes temps until its commit, which also marks the job done). Then
     sweep every staged temp (conversion or master edit) that no journal row
-    owns any more (a crash before the commit leaves them behind)."""
+    owns any more (a crash before the commit leaves them behind).
+
+    A hard-killed server leaves its conversion ffmpeg running (each has its
+    own session), still writing a temp this sweep deletes. Start-up kills
+    those before it comes here (``main``: ``kill_orphaned_ffmpeg`` over every
+    internal dir, staging among them, before any ffmpeg of this process
+    exists); this function lists no processes itself."""
     for job in database.list_conversion_jobs_with_status(
         "running", owner_id=ANY_OWNER
     ):
@@ -1005,10 +1050,6 @@ def reconcile_conversion_jobs(database: Database, staging_dir: Path) -> None:
     owned = {e["temp_path"] for e in database.list_journal_entries(owner_id=ANY_OWNER) if e["temp_path"]}
     if not staging_dir.is_dir():
         return
-    # A hard-killed server leaves its conversion ffmpeg running (each has its
-    # own session), still writing a temp the sweep below deletes. No ffmpeg
-    # of this process exists yet, so anything writing here is an orphan.
-    kill_orphaned_ffmpeg(staging_dir)
     for path in staging_dir.iterdir():
         if (
             ".convert." in path.name or ".tagged." in path.name or ".edit." in path.name

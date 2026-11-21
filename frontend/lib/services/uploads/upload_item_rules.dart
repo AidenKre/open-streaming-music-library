@@ -237,7 +237,7 @@ const serverRetryableCodes = {
 /// The error codes of a `review_ready` item the server will refuse again, so
 /// the user cannot fix it by confirming (7-R1-UI-01): it is shown as not
 /// importable, needs attention, and offers only Cancel.
-const serverRefusedReviewCodes = {'upload_library_links_unsupported'};
+const serverRefusedReviewCodes = {'upload_library_changed'};
 
 /// True for a `review_ready` item carrying a [serverRefusedReviewCodes] code.
 bool isServerRefusedReview(String state, String? errorCode) =>
@@ -250,6 +250,7 @@ bool offersReview(String state, String? errorCode) =>
     reviewableStates.contains(state) && !isServerRefusedReview(state, errorCode);
 
 /// Whether an item in [state] is failed, refused, or waiting for the user.
+/// One rule for Uploads rows, ZIP children and counts.
 bool needsUserAttention(String state, String? errorCode) =>
     uploadAttentionStates.contains(state) ||
     isServerRefusedReview(state, errorCode);

@@ -504,6 +504,28 @@ class TestExtractCoverArtBytes:
         self._runner(monkeypatch, raises=CaptureOverflow("ffmpeg stdout exceeded 16777216 bytes"))
         assert metadata.extract_cover_art_bytes(Path("/fake/file.mp3")) is None
 
+    def test_a_cover_over_the_output_bound_is_logged_once_without_its_path(self, monkeypatch, caplog):
+        # A dropped cover must not be silent; the log line names no folder or file.
+        self._runner(monkeypatch, raises=CaptureOverflow("ffmpeg stdout exceeded 16777216 bytes"))
+        caplog.set_level("INFO", logger=metadata.__name__)
+
+        metadata.extract_cover_art_bytes(Path("/music/Private Artist/Secret Song.m4a"))
+
+        [record] = [r for r in caplog.records if r.name == metadata.__name__]
+        message = record.getMessage()
+        assert record.levelname == "WARNING"
+        assert str(metadata.COVER_ART_MAX_BYTES) in message
+        assert "Private Artist" not in message and "Secret Song" not in message
+
+    def test_a_cover_that_cannot_be_read_for_another_reason_is_not_logged_as_too_large(
+            self, monkeypatch, caplog):
+        self._runner(monkeypatch, result=CaptureResult(1, b"", ""))
+        caplog.set_level("INFO", logger=metadata.__name__)
+
+        metadata.extract_cover_art_bytes(Path("/fake/file.m4a"))
+
+        assert [r for r in caplog.records if r.name == metadata.__name__] == []
+
 
 # --- pre-merge A3-04: the cover extraction on staged upload bytes is bounded ---------
 

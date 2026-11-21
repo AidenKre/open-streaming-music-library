@@ -88,6 +88,8 @@ class UploadReview {
     final token = await _token();
     final result = <UploadItem>[];
     String? cursor;
+    // A repeated cursor would loop forever.
+    final seenCursors = <String>{};
     do {
       // The review page's read: like the person's own action, it waits for
       // a server check only within the gate's bound, and fails at once on a
@@ -107,7 +109,7 @@ class UploadReview {
         }
       }
       cursor = page.nextAfter;
-    } while (cursor != null);
+    } while (cursor != null && seenCursors.add(cursor));
     return result;
   }
 

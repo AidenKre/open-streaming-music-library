@@ -1,5 +1,6 @@
 """Tests for default streaming quality persistence and two-tier cache."""
 
+import logging
 import sqlite3
 import threading
 import time
@@ -14,6 +15,7 @@ from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator
 from app.services.transcoder import ORIGINAL_QUALITY
 from tests.owned_database import add_test_user
+from tests.encoder_pool_fixtures import stop_every_encoder_pool  # noqa: F401  (autouse fixture)
 from tests.quality_fixtures import _store_quality
 
 # The master admin's id: only its tracks are routed to default_cache (M.2a).
@@ -322,7 +324,7 @@ class TestTwoTierCache:
         gate = _threading.Event()
 
         def fake_transcode(src: Path, dst: Path, bitrate: int) -> bool:
-            gate.wait()  # block until both quality changes have been submitted
+            assert gate.wait(10)  # block until both quality changes have been submitted
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"encoded" * 10)
             return True
@@ -587,7 +589,7 @@ class TestQualitySettingsAPI:
         _install_fake_coordinator(client)
         coordinator = client.app.state.encoder_coordinator
         qualities = ["96", "128", "192", "256", "320"]
-        barrier = threading.Barrier(len(qualities))
+        barrier = threading.Barrier(len(qualities), timeout=10)
 
         def worker(q):
             barrier.wait()
@@ -597,8 +599,9 @@ class TestQualitySettingsAPI:
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            t.join(timeout=10)
 
+        assert not any(t.is_alive() for t in threads)
         assert _stored_quality(client) == coordinator.default_quality
         assert coordinator.default_quality in qualities
 
@@ -618,15 +621,20 @@ class TestStartupQualityValidation:
         with TestClient(bootstrap_main.app) as c:
             _store_quality(c, value)
 
-    def test_startup__invalid_persisted_falls_back_to_env(self, configure_app, capsys):
+    def test_startup__invalid_persisted_falls_back_to_env(self, configure_app, caplog):
         self._seed_persisted_quality(
             configure_app, "lossless-MQA", env={"DEFAULT_STREAMING_QUALITY": "192"}
         )
 
         app_main = self._boot_app(configure_app, env_quality="192")
-        with TestClient(app_main.app) as c:
-            assert c.app.state.encoder_coordinator.default_quality == "192"
-        assert "lossless-MQA" in capsys.readouterr().out  # the fallback is logged
+        with caplog.at_level(logging.DEBUG, logger="uvicorn.error"):
+            with TestClient(app_main.app) as c:
+                assert c.app.state.encoder_coordinator.default_quality == "192"
+        # The fallback is logged for the operator.
+        assert any(
+            "lossless-MQA" in r.getMessage() and r.levelno == logging.WARNING
+            for r in caplog.records if r.name == "uvicorn.error"
+        )
 
     def test_startup__invalid_persisted_and_env_falls_back_to_original(self, configure_app):
         from app.services.transcoder import ORIGINAL_QUALITY as _ORIG

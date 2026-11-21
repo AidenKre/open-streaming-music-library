@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/server_identity_api.dart';
 import 'package:frontend/api/token_permit.dart';
+import 'package:frontend/models/instance_stamp.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
@@ -36,7 +37,7 @@ class BindingVerified extends BindingGateState {
   const BindingVerified({required this.token, required this.instanceId});
   final String token;
 
-  /// Null: a legacy server without `server.instance_id`.
+  /// The bound instance (a row without one is never verified).
   final String? instanceId;
 }
 
@@ -57,9 +58,21 @@ class BindingDifferentServer extends BindingGateState {
   final String serverInstanceId;
 }
 
-/// Signed out by a 401 (Phase M 7.7): closed until the scope is rebuilt.
+/// Signed out: the bound server refused the token with a 401 (Phase M 7.7,
+/// [ServerBindingGate.checkAfterUnauthorized]). Closed until the scope is
+/// rebuilt.
 class BindingSignedOut extends BindingGateState {
   const BindingSignedOut();
+}
+
+/// Why the check failed when a request with the token got a 401: the
+/// server at the address refused the token; who that server is, is read
+/// next ([ServerBindingGate.checkAfterUnauthorized]).
+class TokenRefusedByServer implements Exception {
+  const TokenRefusedByServer();
+
+  @override
+  String toString() => 'TokenRefusedByServer';
 }
 
 /// [ServerBindingGate.awaitVerified] was pending when the gate was disposed.
@@ -78,8 +91,10 @@ class BindingGateClosedException implements Exception {
 /// [BackoffSchedule]; a different server blocks without retrying.
 ///
 /// It also checks locally that the binding's user is the signed-in user
-/// (spec 7.4). Without credentials, or when the row's user differs or is
-/// unknown (NULL), the gate stays [BindingNoSession] and sends nothing.
+/// (spec 7.4). Without credentials, when the row's user differs or is
+/// unknown (NULL), or when the row has no instance id (never written: no
+/// server may adopt it), the gate stays [BindingNoSession] and sends
+/// nothing.
 class ServerBindingGate implements TokenPermit {
   ServerBindingGate({
     required ServerBindingRepository repository,
@@ -297,6 +312,69 @@ class ServerBindingGate implements TokenPermit {
     _publish(const BindingIdle());
   }
 
+  /// Set by [checkAfterUnauthorized] for a 401 with no stamp, until the
+  /// identity read explains it: the bound server answering means signed out;
+  /// another server, a different server. A read that fails drops it.
+  bool _unauthorizedPending = false;
+
+  /// The bound instance this gate last verified; a 401 can only answer a
+  /// request sent while verified, so it is known whenever one arrives.
+  String? _verifiedInstanceId;
+
+  /// A different-server verdict, and no verified one since: no token has
+  /// gone out since then, so a 401 arriving now came from that other server.
+  bool _differentSinceVerified = false;
+
+  /// A request with the token got a 401 (Phase M 7.7). Who sent it decides
+  /// what it means, and the token is withheld from that moment on.
+  ///
+  /// [servedBy], the answer's own `X-Server-Instance-Id` stamp (the server
+  /// stamps every answer, its 401s included), says who sent it: the bound
+  /// instance means signed out at once ([closeSignedOut]); another instance
+  /// means [BindingDifferentServer] at once, not signed out (the token may
+  /// still be good at the bound server).
+  ///
+  /// With no stamp (not an OSML server, a proxy), the check counts as failed
+  /// at once ([BindingUnverified]: playback releases the media token from
+  /// the sources ahead and treats streams as unavailable) and the identity
+  /// of the server at [baseUrl] is read, token-free: the bound server
+  /// answering means signed out, never verified; another server, a
+  /// different server; a recovery edge meanwhile decides the same way. A
+  /// read that fails drops the 401: the gate stays unverified and retries as
+  /// any failed check does, and the next verified contact decides (a token
+  /// the bound server did revoke gets a fresh, stamped 401 there).
+  ///
+  /// Ignored once signed out or closed, and after a different-server verdict
+  /// until the next verified one (no token has gone out since: that other
+  /// server explains the 401); an unstamped 401 is also ignored while an
+  /// identity read for an earlier one is out.
+  void checkAfterUnauthorized(String baseUrl, {String? servedBy}) {
+    if (_closed || _signedOut || _differentSinceVerified) return;
+    final bound = _verifiedInstanceId;
+    if (servedBy != null && bound != null) {
+      _unauthorizedPending = false;
+      if (sameServerInstance(servedBy, bound)) {
+        closeSignedOut();
+        return;
+      }
+      _invalidate();
+      _publish(
+        BindingDifferentServer(
+          boundInstanceId: bound,
+          serverInstanceId: servedBy,
+        ),
+      );
+      return;
+    }
+    if (_unauthorizedPending) return;
+    _unauthorizedPending = true;
+    _invalidate();
+    _publish(const BindingUnverified(TokenRefusedByServer()));
+    _verdictPending = true;
+    _backoff.reset();
+    unawaited(_verify(_generation, baseUrl, true));
+  }
+
   /// Closes the gate after a 401 (Phase M 7.7): no more probes, and awaiters
   /// keep waiting until [dispose] (the scope rebuild) ends the wait.
   void closeSignedOut() {
@@ -366,11 +444,14 @@ class ServerBindingGate implements TokenPermit {
     try {
       final row = await _repository.current();
       if (_isStale(generation)) return;
-      // No credentials, no row, or a row for another (or an unknown) user:
-      // never verify, never probe. Runners keep waiting (spec 7.4).
+      // No credentials, no row, a row for another (or an unknown) user, or a
+      // row without the bound server's instance id (never written: the
+      // sign-in stores it; unknown is never "any server"): never verify,
+      // never probe. Runners keep waiting (spec 7.4).
       if (_signedInUserId == null ||
           row == null ||
-          row.userId != _signedInUserId) {
+          row.userId != _signedInUserId ||
+          row.instanceId == null) {
         _verifiedBaseUrl = null;
         _publish(const BindingNoSession());
         return;
@@ -398,6 +479,7 @@ class ServerBindingGate implements TokenPermit {
       // the server's own answers. Only the header stamp is compared leniently.
       if (bound != null && server != null && bound != server) {
         _verifiedBaseUrl = null;
+        _unauthorizedPending = false; // the other server explains a 401
         _publish(
           BindingDifferentServer(
             boundInstanceId: bound,
@@ -413,6 +495,12 @@ class ServerBindingGate implements TokenPermit {
           'bound to instance $bound but the server reports no instance id',
         );
       }
+      if (_unauthorizedPending) {
+        // The bound server itself refused the token: signed out. The gate
+        // never reopens on the way.
+        closeSignedOut();
+        return;
+      }
 
       await _repository.recordVerified(
         token,
@@ -423,6 +511,7 @@ class ServerBindingGate implements TokenPermit {
       _backoff.reset();
       _verifiedToken = token;
       _verifiedBaseUrl = baseUrl;
+      _verifiedInstanceId = server ?? bound;
       _publish(BindingVerified(token: token, instanceId: server ?? bound));
       _waiter?.complete(token);
       _waiter = null;
@@ -435,6 +524,8 @@ class ServerBindingGate implements TokenPermit {
     } catch (e) {
       if (_isStale(generation)) return;
       _verifiedBaseUrl = null;
+      // An identity read that cannot settle a 401's sender drops the 401.
+      _unauthorizedPending = false;
       _publish(BindingUnverified(e));
       _retryTimer = _timer(_backoff.nextDelay(), () {
         _retryTimer = null;
@@ -448,6 +539,8 @@ class ServerBindingGate implements TokenPermit {
 
   void _publish(BindingGateState state) {
     _state = state;
+    if (state is BindingDifferentServer) _differentSinceVerified = true;
+    if (state is BindingVerified) _differentSinceVerified = false;
     if (state is! BindingVerifying) {
       _verdictPending = false;
       _lastVerdict = state;

@@ -9,6 +9,8 @@ import 'package:frontend/services/uploads/upload_duplicate_decisions.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/upload_review.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
+import 'package:frontend/services/uploads/upload_types.dart'
+    show UploadIntentMissing;
 
 import '../../helpers/upload_manager_harness.dart';
 
@@ -106,7 +108,11 @@ void main() {
 
   test('Cancel writes nothing to a row of another sign-in', () async {
     await insertOther();
-    await h.manager.cancel('other-1');
+    // To this sign-in the row is no record: the cancel is refused.
+    await expectLater(
+      h.manager.cancel('other-1'),
+      throwsA(isA<UploadIntentMissing>()),
+    );
     final row = await h.db
         .customSelect(
           "SELECT last_state, updated_at FROM upload_intents "

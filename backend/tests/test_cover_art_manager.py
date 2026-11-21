@@ -14,6 +14,7 @@ from PIL import Image
 from tests.owned_database import OwnedTestDatabase
 from app.database.database import Database, DatabaseContext
 from app.services.cover_art_manager import CoverArtContext, CoverArtManager
+from app.services.import_outcome import ImportOutcome
 
 
 def _create_database(tmp_path: Path) -> Database:
@@ -835,7 +836,7 @@ class TestDedupeReuseRace:
             get_track_metadata.return_value = TrackMetaData(
                 title="T", artist="Artist", duration=1.0, has_album_art=True,
             )
-            assert organizer.organize_file(file_path=source) is True
+            assert organizer.organize(file_path=source) is ImportOutcome.IMPORTED
 
         [track] = db.get_tracks()
         cover_art_id = track.metadata.cover_art_id

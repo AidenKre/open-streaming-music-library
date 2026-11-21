@@ -8,7 +8,9 @@ pipe, session and signal behavior is the operating system's, not a fake's.
 
 from __future__ import annotations
 
+import errno
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -377,6 +379,30 @@ class TestRegistry:
         assert result.returncode == 0
 
 
+@pytest.fixture(scope="module")
+def ionice_home(tmp_path_factory):
+    """One fake ionice script for the module: the first start of a newly
+    written program is slow on macOS (about 0.2 s, a security check), so each
+    test sets the script's mode in a data file instead of writing a new one."""
+    home = tmp_path_factory.mktemp("ionice")
+    ionice = home / "ionice"
+    ionice.write_text(
+        "#!/bin/sh\n"
+        'home=${0%/*}\n'
+        'echo "$*" >> "$home/calls"\n'
+        'read mode < "$home/mode"\n'
+        'if [ "$mode" = refuse ]; then\n'
+        '  echo "ionice: ioprio_set failed: Operation not permitted" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        f'if [ "$mode" = answer-check ] && [ "$2" = {shlex.quote(sys.executable)} ]; then exit 0; fi\n'
+        "shift\n"
+        'exec "$@"\n'
+    )
+    ionice.chmod(0o755)
+    return home
+
+
 class TestLowPriority:
     """Spec §2: low priority is a command prefix (``nice -n 10``, plus
     ``ionice -c3`` on Linux), never ``preexec_fn``."""
@@ -391,6 +417,9 @@ class TestLowPriority:
     def _argv(self, monkeypatch, popen_spy, *, platform, present):
         monkeypatch.setattr(ffmpeg_runner.sys, "platform", platform)
         monkeypatch.setattr(ffmpeg_runner.shutil, "which", self._which("ffmpeg", *present))
+        # These tests build the prefix only: an ionice that is present can set
+        # the priority here (whether it can is checked once, tested below).
+        monkeypatch.setattr(ffmpeg_runner, "_ionice_usable", lambda path: True, raising=False)
         # The spy starts the real process, so the fake /usr/bin/ionice path
         # must not be executed: stop at the Popen call.
         def refuse(cmd, **kwargs):
@@ -431,6 +460,131 @@ class TestLowPriority:
                 options=ToolOptions(low_priority=True))
         assert "ffmpeg-xyz" in str(exc_info.value) and "not found" in str(exc_info.value)
         assert popen_spy == []
+
+    @staticmethod
+    def _fake_ionice(home, *, refuse, real_check=True):
+        """An ionice that records each call. Refusing, it answers like util-linux
+        where the system refuses ioprio_set (some containers): a message and
+        exit 1, without starting the command. Otherwise it starts the command;
+        with ``real_check=False`` it answers the server's check (the do-nothing
+        Python) with exit 0 instead of starting an interpreter for it. The
+        script is the module's one ``ionice_home`` script; this sets its mode
+        and empties its record."""
+        mode = "refuse" if refuse else ("run" if real_check else "answer-check")
+        (home / "mode").write_text(mode + "\n")
+        calls = home / "calls"
+        calls.unlink(missing_ok=True)
+        return home / "ionice", calls
+
+    @staticmethod
+    def _on_linux_with(monkeypatch, ionice):
+        real_which = shutil.which
+        monkeypatch.setattr(ffmpeg_runner.sys, "platform", "linux")
+        monkeypatch.setattr(ffmpeg_runner.shutil, "which",
+                            lambda name: str(ionice) if name == "ionice" else real_which(name))
+        monkeypatch.setattr(ffmpeg_runner, "_IONICE_USABLE", {}, raising=False)  # nothing known yet
+        # Nor a wait left by another test's unanswered check (the path is shared).
+        monkeypatch.setattr(ffmpeg_runner, "_IONICE_RECHECK_AT", {}, raising=False)
+
+    # A tiny real program: what is under test is the argv and how often the
+    # check runs, not the tool, so no interpreter is started for it.
+    _TOOL = [shutil.which("echo") or "/bin/echo", "ran"]
+
+    @classmethod
+    def _low_priority_run(cls):
+        return run_capture(list(cls._TOOL), timeout_s=10, max_stdout_bytes=64,
+                           options=ToolOptions(low_priority=True))
+
+    @classmethod
+    def _ran_the_tool(cls, line):
+        return line.endswith(" ".join(cls._TOOL))
+
+    def test_where_the_priority_is_refused_the_tool_runs_without_ionice(self, monkeypatch, ionice_home, caplog):
+        ionice, calls = self._fake_ionice(ionice_home, refuse=True)
+        self._on_linux_with(monkeypatch, ionice)
+        caplog.set_level("INFO", logger=ffmpeg_runner.__name__)
+
+        results = [self._low_priority_run() for _ in range(2)]
+
+        # Not a failed tool (exit 1 read as a decode error), and asked only once.
+        assert [(r.returncode, r.stdout) for r in results] == [(0, b"ran\n")] * 2
+        assert len(calls.read_text().splitlines()) == 1
+        [record] = [r for r in caplog.records if r.name == ffmpeg_runner.__name__]
+        assert "ionice" in record.getMessage() and str(ionice_home) not in record.getMessage()
+
+    def test_where_ionice_works_every_low_priority_tool_runs_through_it(self, monkeypatch, ionice_home):
+        ionice, calls = self._fake_ionice(ionice_home, refuse=False)
+        self._on_linux_with(monkeypatch, ionice)
+
+        results = [self._low_priority_run() for _ in range(2)]
+
+        assert [(r.returncode, r.stdout) for r in results] == [(0, b"ran\n")] * 2
+        lines = calls.read_text().splitlines()
+        assert len(lines) == 3  # one check, then both runs
+        assert all(line.startswith("-c3 ") and self._ran_the_tool(line) for line in lines[1:])
+
+    # The check's own start is ``subprocess.run``; the tool's is ``Popen``. Each
+    # case makes the first check end one way, lets later checks start the fake
+    # ionice for real (which answers the check without starting an
+    # interpreter), and counts the checks.
+    _FIRST_CHECK = {
+        "timed-out": subprocess.TimeoutExpired(["ionice"], 10),
+        "EAGAIN": OSError(errno.EAGAIN, "Resource temporarily unavailable"),
+        "EMFILE": OSError(errno.EMFILE, "Too many open files"),
+        "ENOENT": FileNotFoundError(errno.ENOENT, "No such file or directory"),
+        "EACCES": PermissionError(errno.EACCES, "Permission denied"),
+    }
+
+    def _runs_after_a_first_check(self, monkeypatch, ionice_home, caplog, case, at):
+        """One low-priority run at each monotonic time in ``at``; the first check
+        ends as ``case``, later checks start the working fake, which answers them."""
+        ionice, calls = self._fake_ionice(ionice_home, refuse=False, real_check=False)
+        self._on_linux_with(monkeypatch, ionice)
+        caplog.set_level("INFO", logger=ffmpeg_runner.__name__)
+        now = [0.0]
+        monkeypatch.setattr(ffmpeg_runner, "_ionice_clock", lambda: now[0], raising=False)
+        monkeypatch.setattr(ffmpeg_runner, "_IONICE_RECHECK_AT", {}, raising=False)
+        real_run = subprocess.run
+        checks = []
+
+        def run(cmd, *args, **kwargs):
+            checks.append(now[0])
+            if len(checks) == 1:
+                raise self._FIRST_CHECK[case]
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(ffmpeg_runner.subprocess, "run", run)
+        results = []
+        for t in at:
+            now[0] = t
+            results.append(self._low_priority_run())
+        through_ionice = [line for line in calls.read_text().splitlines() if self._ran_the_tool(line)] \
+            if calls.exists() else []
+        warnings = [r for r in caplog.records if r.name == ffmpeg_runner.__name__]
+        return results, checks, len(through_ionice), warnings
+
+    @pytest.mark.parametrize("case", ["timed-out", "EAGAIN", "EMFILE"])
+    def test_a_check_that_gave_no_answer_waits_a_minute_before_the_next(self, monkeypatch, ionice_home, caplog, case):
+        # 0 s: the check gives no answer, the tool runs without ionice. 30 s and
+        # 59.9 s: inside the minute, no check, no ionice. 60 s: checked again, it
+        # works. 61 s and an hour later: that definite answer is remembered.
+        results, checks, through_ionice, warnings = self._runs_after_a_first_check(
+            monkeypatch, ionice_home, caplog, case, at=[0.0, 30.0, 59.9, 60.0, 61.0, 3600.0])
+
+        assert [(r.returncode, r.stdout) for r in results] == [(0, b"ran\n")] * 6
+        assert checks == [0.0, 60.0]
+        assert through_ionice == 3
+        assert warnings == []
+
+    @pytest.mark.parametrize("case", ["ENOENT", "EACCES"])
+    def test_an_ionice_that_cannot_be_executed_is_remembered(self, monkeypatch, ionice_home, caplog, case):
+        results, checks, through_ionice, warnings = self._runs_after_a_first_check(
+            monkeypatch, ionice_home, caplog, case, at=[0.0, 30.0, 61.0, 3600.0])
+
+        assert [(r.returncode, r.stdout) for r in results] == [(0, b"ran\n")] * 4
+        assert (checks, through_ionice) == ([0.0], 0)
+        [record] = warnings
+        assert "ionice" in record.getMessage() and str(ionice_home) not in record.getMessage()
 
     @pytest.mark.skipif(shutil.which("nice") is None, reason="nice not available")
     @pytest.mark.integration

@@ -33,6 +33,7 @@ import 'browse_harness.dart';
 import 'fake_library_actions.dart';
 import 'fake_library_search_controls.dart';
 import '../helpers/no_server_api.dart';
+import '../helpers/run_async_until.dart';
 import '../helpers/library_seed.dart' show SeedTrack, markDownloaded, seedLibrary;
 
 void main() {
@@ -203,10 +204,10 @@ void main() {
       await tester.showKeyboard(find.byType(TextField));
       tester.testTextInput.enterText('Blue');
       await tester.testTextInput.receiveAction(TextInputAction.search);
-      await tester.pump(); // one frame: the search starts
-      await tester.pump(); // ... and lands
-      await tester.runAsync(() => Future<void>.delayed(Duration.zero));
-      await tester.pump();
+      // Real turns and frames only: fake time stays short of the debounce.
+      await runAsyncUntil(
+          tester, () => find.byType(TrackCard).evaluate().isNotEmpty,
+          reason: 'the search lands before the debounce would fire');
       expect(find.byType(TrackCard), findsWidgets);
       // The debounce timer from typing was cancelled; nothing re-runs.
       await tester.pump(const Duration(milliseconds: 350));

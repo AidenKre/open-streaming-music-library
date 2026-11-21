@@ -106,7 +106,7 @@ void main() {
 
   test('a binding without a known instance (legacy-unbound) is not checked',
       () async {
-    final token = await seedTestBinding(db); // instance_id NULL
+    final token = await seedTestBinding(db, instanceId: null);
 
     await repo.runFenced(token, writeCursor, servedBy: _other);
 

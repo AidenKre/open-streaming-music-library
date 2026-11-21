@@ -9,6 +9,8 @@ flock locks belong to the open file description, so two independent opens in
 one test process conflict exactly like two processes would.
 """
 
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -25,6 +27,40 @@ def test_acquire_creates_lock_file_and_second_acquire_is_refused(tmp_path):
         assert str(tmp_path / "osml.lock") in str(excinfo.value)
     finally:
         first.release()
+
+
+def test_a_refused_acquire_logs_nothing_its_caller_says_it_once(tmp_path, caplog):
+    # The admin tool prints its own one line; a line logged here as well
+    # reached the tool's standard error as a second one.
+    first = acquire_instance_lock(tmp_path)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(InstanceLockHeld):
+                acquire_instance_lock(tmp_path)
+    finally:
+        first.release()
+
+    assert caplog.records == []
+
+
+def test_a_start_refused_by_the_lock_logs_one_error_line(tmp_path, configure_app, caplog):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    other_instance = acquire_instance_lock(data_dir)
+    try:
+        main = configure_app()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(InstanceLockHeld):
+                with TestClient(main.app):
+                    pass
+    finally:
+        other_instance.release()
+
+    refusals = [r for r in caplog.records if "osml.lock" in r.getMessage()]
+    assert [r.levelno for r in refusals] == [logging.ERROR]
+    # An operator line names the lock, not the folder it lies in.
+    assert str(tmp_path) not in refusals[0].getMessage()
+    assert str(tmp_path.resolve()) not in refusals[0].getMessage()
 
 
 def test_release_allows_reacquire(tmp_path):

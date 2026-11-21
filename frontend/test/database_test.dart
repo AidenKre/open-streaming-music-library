@@ -365,14 +365,20 @@ void main() {
     }
 
     test('getAllAlbumDownloadCounts groups every album in one query', () async {
+      // A second album for A, so grouping by artist gives other counts.
       final (_, albumA) =
           await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
       await insertTrack(db, uuid: 'a2', artist: 'A', album: 'AL');
+      final (_, albumA2) =
+          await insertTrack(db, uuid: 'a3', artist: 'A', album: 'AM');
       final (_, albumB) =
           await insertTrack(db, uuid: 'b1', artist: 'B', album: 'BL');
       await markDownloaded('a1');
+      await markDownloaded('a3');
 
       final counts = await db.getAllAlbumDownloadCounts();
+      expect(counts[albumA2!]!.total, 1);
+      expect(counts[albumA2]!.downloaded, 1);
       expect(counts[albumA!]!.total, 2);
       expect(counts[albumA]!.downloaded, 1);
       expect(counts[albumB!]!.total, 1);
@@ -380,15 +386,20 @@ void main() {
     });
 
     test('getAllArtistDownloadCounts groups every artist', () async {
+      // Two albums for A, so grouping by album gives other counts.
       final (artistA, _) =
           await insertTrack(db, uuid: 'a1', artist: 'A', album: 'AL');
-      await insertTrack(db, uuid: 'a2', artist: 'A', album: 'AL');
+      await insertTrack(db, uuid: 'a2', artist: 'A', album: 'AM');
+      final (artistB, _) =
+          await insertTrack(db, uuid: 'b1', artist: 'B', album: 'BL');
       await markDownloaded('a1');
       await markDownloaded('a2');
 
       final counts = await db.getAllArtistDownloadCounts();
       expect(counts[artistA!]!.total, 2);
       expect(counts[artistA]!.downloaded, 2);
+      expect(counts[artistB!]!.total, 1);
+      expect(counts[artistB]!.downloaded, 0);
     });
   });
 
@@ -1836,7 +1847,17 @@ void main() {
     });
 
     test('is a no-op for an unknown uuid', () async {
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated, revision, "
+        "file_path, downloaded_at_revision) "
+        "VALUES ('u1', 0, 0, 9, '/x.flac', 5)",
+      );
+
       await db.dismissStaleDownload('does-not-exist'); // must not throw
+
+      final rows = await db.select(db.tracks).get();
+      expect(rows.map((r) => (r.uuidId, r.staleDismissedAtRevision)),
+          [('u1', null)], reason: 'no other track stamped, no row added');
     });
 
     test('dismissStaleDownloads stamps each listed track only', () async {
@@ -2057,8 +2078,20 @@ void main() {
 
     test('genreSuggestions is distinct, case-insensitive, limited', () async {
       await seed();
+      // A second track of the same genre: suggested once.
+      await db.customStatement(
+        "INSERT INTO tracks (uuid_id, created_at, last_updated) "
+        "VALUES ('u4', 0, 0)",
+      );
+      await db.customStatement(
+        "INSERT INTO trackmetadata "
+        "(uuid_id, genre, duration, bitrate_kbps, sample_rate_hz, channels, "
+        "has_album_art) VALUES ('u4', 'Rock', 1, 1, 1, 2, 0)",
+      );
       expect(await db.genreSuggestions('ro'), ['Rock', 'rock and roll']);
+      expect(await db.genreSuggestions('RO'), ['Rock', 'rock and roll']);
       expect(await db.genreSuggestions('ja'), ['Jazz']);
+      expect(await db.genreSuggestions('ro', limit: 1), ['Rock']);
       expect(await db.artistSuggestions('rad', limit: 1), hasLength(1));
     });
 

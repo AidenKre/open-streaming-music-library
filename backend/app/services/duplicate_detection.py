@@ -450,6 +450,58 @@ def _fingerprint_state(fp) -> str:
     return fp.state
 
 
+def find_matches(
+    conn,
+    identity: AudioIdentity,
+    *,
+    owner_id: int,
+    exclude: frozenset[str] = frozenset(),
+    extra_subjects: Sequence[StagedIdentity] = (),
+    params: MatcherParams | None = None,
+) -> tuple[DuplicateMatch, ...]:
+    """The matches of ``find_duplicates``, without the coverage counts.
+
+    Same arguments and the same results as ``find_duplicates(...).matches``;
+    it skips the coverage query, which reads every live track of the owner.
+    """
+    owner = _require_owner(owner_id)
+    subject = identity.exact
+    library: list[str] = []
+    staged: list[StagedRef] = []
+    if isinstance(subject, ExactAudioHash):
+        rows = conn.execute(
+            "SELECT i.uuid_id, i.sample_rate_hz, i.channels, i.bits_per_sample "
+            "FROM track_audio_identity i JOIN live_tracks lt ON lt.uuid_id = i.uuid_id "
+            "WHERE i.exact_kind = ? AND i.exact_digest = ? AND i.exact_digest IS NOT NULL "
+            "AND i.exact_state IN ('current','pending') AND lt.owner_id = ?",
+            (subject.kind, subject.digest, owner),
+        ).fetchall()
+        for row in rows:
+            uuid_id = row[0]
+            if uuid_id in exclude:
+                continue
+            candidate = ExactAudioHash(subject.kind, subject.digest, row[1], row[2], row[3])
+            if exact_match(subject, candidate):
+                library.append(uuid_id)
+        staged = [
+            s.ref for s in extra_subjects if exact_match(subject, s.identity.exact)
+        ]
+    if params is None:
+        from app.config import settings
+
+        params = MatcherParams.from_settings(settings)
+    exact_matches = [DuplicateMatch(TrackRef(u), "exact", "exact", None) for u in library] + [
+        DuplicateMatch(r, "exact", "exact", None) for r in staged
+    ]
+    seen = {m.subject for m in exact_matches}
+    fp_matches = [
+        m
+        for m in _fingerprint_matches(conn, identity.fingerprint, owner, exclude, extra_subjects, params)
+        if m.subject not in seen
+    ]
+    return tuple(sorted(exact_matches + fp_matches, key=_rank_key))
+
+
 def find_duplicates(
     conn,
     identity: AudioIdentity,
@@ -490,44 +542,15 @@ def find_duplicates(
     Results are never capped; display limits belong to the caller. A subject
     without a usable hash or print matches nothing on that layer.
 
-    The query runs on the caller's connection and inside the caller's
+    The coverage counts read every live track of the owner; a caller that
+    needs only the matches uses ``find_matches``.
+
+    The queries run on the caller's connection and inside the caller's
     transaction; this function never opens, commits or closes anything.
     """
-    owner = _require_owner(owner_id)
-    subject = identity.exact
-    library: list[str] = []
-    staged: list[StagedRef] = []
-    if isinstance(subject, ExactAudioHash):
-        rows = conn.execute(
-            "SELECT i.uuid_id, i.sample_rate_hz, i.channels, i.bits_per_sample "
-            "FROM track_audio_identity i JOIN live_tracks lt ON lt.uuid_id = i.uuid_id "
-            "WHERE i.exact_kind = ? AND i.exact_digest = ? AND i.exact_digest IS NOT NULL "
-            "AND i.exact_state IN ('current','pending') AND lt.owner_id = ?",
-            (subject.kind, subject.digest, owner),
-        ).fetchall()
-        for row in rows:
-            uuid_id = row[0]
-            if uuid_id in exclude:
-                continue
-            candidate = ExactAudioHash(subject.kind, subject.digest, row[1], row[2], row[3])
-            if exact_match(subject, candidate):
-                library.append(uuid_id)
-        staged = [
-            s.ref for s in extra_subjects if exact_match(subject, s.identity.exact)
-        ]
-    if params is None:
-        from app.config import settings
-
-        params = MatcherParams.from_settings(settings)
-    exact_matches = [DuplicateMatch(TrackRef(u), "exact", "exact", None) for u in library] + [
-        DuplicateMatch(r, "exact", "exact", None) for r in staged
-    ]
-    seen = {m.subject for m in exact_matches}
-    fp_matches = [
-        m
-        for m in _fingerprint_matches(conn, identity.fingerprint, owner, exclude, extra_subjects, params)
-        if m.subject not in seen
-    ]
-    matches = tuple(sorted(exact_matches + fp_matches, key=_rank_key))
-    exact_cov, fp_cov = _coverage(conn, identity, owner, exclude)
+    matches = find_matches(
+        conn, identity, owner_id=owner_id, exclude=exclude,
+        extra_subjects=extra_subjects, params=params,
+    )
+    exact_cov, fp_cov = _coverage(conn, identity, owner_id, exclude)
     return DuplicateReport(exact_cov, fp_cov, matches)

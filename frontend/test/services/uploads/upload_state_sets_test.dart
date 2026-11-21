@@ -101,22 +101,35 @@ void main() {
       }
     });
 
-    test('a ready row takes the state of a read only when that state ended',
-        () async {
-      for (final s in _every) {
-        await h.store.insertAll(h.token, [_new('i-$s')], state: 'review_ready');
+    // A reviewable row also takes `failed`: reads are not ordered against
+    // each other, and a failed row takes a reviewable read, so between the
+    // two the read that lands last wins and a late read is taken back by the
+    // next read.
+    test('a reviewable row takes the state of a read only when that state '
+        'ended or failed', () async {
+      for (final reviewable in _reviewable) {
+        for (final s in _every) {
+          await h.db.customUpdate('DELETE FROM upload_intents');
+          await h.store.insertAll(h.token, [_new('i-$s')], state: reviewable);
+          await h.store.mirrorReviewStates(h.token, [_item('i-$s', s)]);
+          expect(
+            (await _rows(h))['i-$s']!.$1,
+            _ended.contains(s) || s == 'failed' ? s : reviewable,
+            reason: '$reviewable <- $s',
+          );
+        }
       }
-      await h.store.mirrorReviewStates(h.token, [
-        for (final s in _every) _item('i-$s', s),
-      ]);
-      final rows = await _rows(h);
-      for (final s in _every) {
-        expect(
-          rows['i-$s']!.$1,
-          _ended.contains(s) ? s : 'review_ready',
-          reason: s,
-        );
-      }
+    });
+
+    test('a late ready read over a failed row is taken back by the next '
+        'read', () async {
+      await h.store.insertAll(h.token, [_new('i-1')], state: 'failed');
+      // A read that began while the item was still ready lands late.
+      await h.store.mirrorReviewStates(h.token, [_item('i-1', 'review_ready')]);
+      expect((await _rows(h))['i-1']!.$1, 'review_ready');
+      // The next read says what the server holds now.
+      await h.store.mirrorReviewStates(h.token, [_item('i-1', 'failed')]);
+      expect((await _rows(h))['i-1']!.$1, 'failed');
     });
 
     test('Cancel writes nothing to an ended row and writes every other row',

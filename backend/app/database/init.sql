@@ -228,7 +228,8 @@ CREATE TABLE IF NOT EXISTS conversion_jobs (
     "target_codec"     TEXT NOT NULL,
     "target_container" TEXT NOT NULL,
     "target_bitrate"   INTEGER,
-    "status"           TEXT NOT NULL DEFAULT 'queued',
+    "status"           TEXT NOT NULL DEFAULT 'queued'
+                       CHECK ("status" IN ('queued','running','done','failed','cancelled')),
     "error_text"       TEXT,
     "batch_id"         TEXT, -- TODO(bulk-jobs): set by a future bulk enqueue
     "created_at"       INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -240,6 +241,10 @@ CREATE TABLE IF NOT EXISTS conversion_jobs (
 CREATE INDEX IF NOT EXISTS idx_conversion_jobs_uuid ON conversion_jobs("uuid_id");
 CREATE INDEX IF NOT EXISTS idx_conversion_jobs_status ON conversion_jobs("status");
 CREATE INDEX IF NOT EXISTS idx_conversion_jobs_owner_id ON conversion_jobs("owner_id", "id");
+-- One queued or running job per track. insert_conversion_job checks the same
+-- inside its own transaction; the index holds for every writer.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversion_jobs_one_active
+    ON conversion_jobs("uuid_id") WHERE "status" IN ('queued','running');
 
 CREATE TABLE IF NOT EXISTS history_events (
     "event_uuid" TEXT NOT NULL PRIMARY KEY,

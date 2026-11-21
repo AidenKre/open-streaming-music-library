@@ -86,8 +86,12 @@ def post_job(
         raise HTTPException(
             status_code=409, detail={"error": "job_active", "job_id": e.job_id}
         )
-    except TargetPathTaken:
-        raise HTTPException(status_code=409, detail={"error": "target_exists"})
+    except TargetPathTaken as e:
+        # ``taken_by`` says what holds the converted file's path: "file" (a file
+        # is there) or "track" (nothing is there; another track's row names it).
+        raise HTTPException(
+            status_code=409, detail={"error": "target_exists", "taken_by": e.taken_by}
+        )
     except PendingRecovery as e:
         detail = {"error": "pending_recovery"}
         if e.message is not None:

@@ -19,6 +19,7 @@ import 'package:frontend/api/authenticated_client.dart';
 import 'package:frontend/api/library_tools_api.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/services/deletion/delete_job.dart';
+import 'package:frontend/services/deletion/deletion_text.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
 
@@ -70,6 +71,39 @@ void main() {
     h.timers.fire();
     await h.pump();
     expect(h.job('op-1')!.phase, DeleteJobPhase.running);
+  });
+
+  // The server no longer knows an accepted job (its database was restored
+  // from an older backup): what happened to it is unknown. It says so and is
+  // not polled again.
+  test('an accepted job the server no longer knows shows its status as '
+      'unknown and is not polled again', () async {
+    await h.submitAll([('a', 1), ('b', 2)]);
+    await h.pump();
+    serverSays('op-1', 'running', [
+      deletionItemJson('a', status: 'running'),
+      deletionItemJson('b', baseRevision: 2),
+    ]);
+    h.timers.fire();
+    await h.pump();
+    expect(h.job('op-1')!.phase, DeleteJobPhase.running);
+
+    h.api.serverJobs.remove('op-1');
+    h.timers.fire();
+    await h.pump();
+    final job = h.job('op-1')!;
+    expect(job.phase, DeleteJobPhase.unknown);
+    expect(jobPhaseText(job.phase), 'Status unknown');
+    expect(job.items, isEmpty, reason: 'the last outcomes read are stale');
+    expect(job.targets.map((t) => t.uuidId), ['a', 'b']);
+
+    final polls = h.api.callsOf('getJob').length;
+    h.timers.fire();
+    await h.pump();
+    h.manager.request('coldStart');
+    await h.pump();
+    expect(h.api.callsOf('getJob'), hasLength(polls));
+    expect(h.syncRequests, 0);
   });
 
   test('an accepted job is polled until it is finished, then never again',
@@ -362,6 +396,27 @@ void main() {
     h.manager.request('networkRecovered', bypassBackoff: true);
     await h.pump();
     expect(h.api.calls.length, sent);
+  });
+
+  // Another server at the address answered the 401. Once the bound server
+  // is verified again, the session resumes the manager: a deletion pass
+  // runs in this scope.
+  test('a runner parked by a 401 runs again once resumed', () async {
+    await h.submitAll([('a', 1)]);
+    await h.pump();
+    final onGetJob = h.api.onGetJob;
+    h.api.onGetJob = (_) async =>
+        throw apiError(401, 'auth_required', retryable: false);
+    h.timers.fire();
+    await h.pump();
+    final sent = h.api.calls.length;
+
+    h.api.onGetJob = onGetJob;
+    h.manager.resumeAfterBoundServerBack();
+    h.manager.request('boundServerBack', bypassBackoff: true);
+    await h.pump();
+    expect(h.api.calls.length, greaterThan(sent),
+        reason: 'the deletion pass polls again');
   });
 
   test('follow polls a job known only from the receipt list', () async {

@@ -6,8 +6,10 @@ as "not created", so a later conflict or failure never released it (a leak).
 At startup, for a ``committing`` journal that records no art but whose work
 copy has embedded art, the journal step resolves that art again. When the
 resolved art row is referenced by no track and no other journal, it is this
-operation's: the journal records it as created, and the re-run keeps that
-ownership. Art a track already uses is never adopted, so it survives."""
+operation's: the journal records it as created. The re-run then gives that
+art back and registers the image again as its own (a new id), so a crash at
+any point leaves no image named by nothing. Art a track already uses is never
+adopted, so it survives."""
 
 import pytest
 
@@ -53,16 +55,17 @@ def test_a_conflict_after_the_crash_releases_the_adopted_art(world):
 
 
 def test_an_import_after_the_crash_keeps_one_art_row(world):
+    # The re-run gives back the adopted image and registers it again (a new
+    # id): one row is left, and the imported track names it.
     commit = world.crash_at("after_art_registered")
-    [art] = art_ids(world.db)
+    assert len(art_ids(world.db)) == 1
 
     world.restart()
     world.restart()
 
     assert item_row(world.db, commit)["state"] == "imported"
     [meta] = sql(world.db, "SELECT cover_art_id FROM trackmetadata WHERE uuid_id = ?", (commit["track"],))
-    assert meta["cover_art_id"] == art
-    assert art_ids(world.db) == [art]
+    assert art_ids(world.db) == [meta["cover_art_id"]]
 
 
 def test_art_a_track_already_uses_is_never_adopted_and_survives(world):

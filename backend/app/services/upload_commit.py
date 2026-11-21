@@ -11,12 +11,15 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
+from app.core.durable_fs import fsync_file
 from app.core.operator_log import operator_logger
 from app.database.operation_receipts import OperationConflict
 from app.models.uploads import CommitOperation, CommitRequest
 from app.core.internal_dirs import is_internal_path
 from app.models.track_meta_data import TrackMetaData
-from app.services import audio_identity, metadata, organizer, upload_recovery, upload_validation
+from app.services import (
+    audio_identity, metadata, organizer, upload_placement, upload_recovery, upload_validation,
+)
 from app.services.audio_identity import ExactAudioHash, identity_to_columns
 from app.services.ffmpeg_runner import ToolOptions
 from app.services.media_input import demuxer_for
@@ -37,6 +40,7 @@ from app.services.upload_errors import (
     tag_write_unsupported,
     upload_item_not_committable,
     upload_item_not_found,
+    upload_library_changed,
     upload_review_version_conflict,
 )
 from app.services.upload_receipt import ReceiptFiles, _item_dir, owner_dir, remove_verified
@@ -128,9 +132,11 @@ class _SourceMissing(Exception):
 
 
 def _failure_for(exc: Exception) -> tuple[UploadError, str]:
-    """The retryable item error of a failed step and the item state it ends in."""
+    """The item error of a failed step and the item state it ends in."""
     if isinstance(exc, _SourceMissing):
         return upload_source_missing(), "failed"
+    if isinstance(exc, upload_placement.LibraryChanged):
+        return upload_library_changed(), "review_ready"
     if isinstance(exc, InsufficientStorage):
         return upload_storage_refused(exc), "review_ready"
     if isinstance(exc, metadata.TagWriteError):
@@ -168,14 +174,6 @@ def _final_stem(display_name: str, track_uuid: str, extension: str) -> str:
     room = _MAX_FILE_NAME - utf8_len(f"-{track_uuid}{extension}")  # UTF-8 bytes
     stem = cut_to_bytes(stem, room).rstrip(" .")
     return stem or "upload"
-
-
-def _fsync_file(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 class UploadCommitWorker(PollingWorkerThread):
@@ -266,7 +264,10 @@ class UploadCommitWorker(PollingWorkerThread):
 
     def _hand_over(self, prepared):
         try:
-            return self._after_prepared(prepared)
+            # The publisher re-reads the cover art; it runs registered in this
+            # worker's registry so that shutdown ends it.
+            with metadata.probes_killed_by(self._registry):
+                return self._after_prepared(prepared)
         except Exception as e:
             log.warning("upload commit hand-over failed: %s", type(e).__name__)
             return "error"
@@ -327,13 +328,15 @@ class UploadCommitWorker(PollingWorkerThread):
                 owner_id=claimed["owner_id"], operation_uuid=claimed["operation_uuid"],
                 boot_id=self._boot_id, error_code=error.code, error_message=error.message,
                 item_state=item_state, reservation_id=self._reservation_id,
-                keep_reservation=not removed, now=int(self._clock()))
+                keep_reservation=not removed, retryable=error.retryable, now=int(self._clock()))
         except Exception as e:
             log.warning("upload commit failure not recorded: %s", type(e).__name__)
             done = False
         if not done:
             self._give_back(claimed)
             return "error"
+        if isinstance(exc, upload_placement.LibraryChanged):
+            upload_placement.log_library_changed(claimed["owner_id"], exc)
         art_id, created = self._art
         if created == 1 and art_id is not None:
             try:
@@ -358,8 +361,6 @@ class UploadCommitWorker(PollingWorkerThread):
 
     def _prepare(self, claimed, job_id):
         """Steps 1-2. Returns the prepared journal row, or None when stopped."""
-        from app.library import library_root  # deferred: app.library imports the services
-
         owner = claimed["owner_id"]
         stage = owner_dir(self._uploads_root, owner)
         source = Path(claimed["source_path"])
@@ -373,7 +374,8 @@ class UploadCommitWorker(PollingWorkerThread):
         if extension is None:
             raise ValueError("no validated extension")
         track_uuid = claimed["reserved_track_uuid"]
-        root = library_root(self._music_library_dir, self._database.get_user(owner))
+        root = upload_placement.owner_library_root(
+            self._music_library_dir, self._database.get_user(owner))
 
         # Step 1: the planned name (only journaled, never created here).
         stem = _final_stem(claimed["filename"], track_uuid, extension)
@@ -394,7 +396,7 @@ class UploadCommitWorker(PollingWorkerThread):
             self._process_step(
                 self._tool_step, self._write_tags, source, work, metadata.build_ffmpeg_tags(edits),
                 job_id=job_id, input_format=self._input_format(claimed))
-            _fsync_file(work)
+            fsync_file(work)
             if os.path.getsize(work) > reserve:
                 raise OSError("tag-written work file larger than its reservation")
         else:
@@ -402,7 +404,7 @@ class UploadCommitWorker(PollingWorkerThread):
             with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
                 shutil.copyfileobj(src, out)
                 out.flush()
-                os.fsync(out.fileno())
+            fsync_file(work)
         ReceiptFiles().sync_dir(work.parent)
         self._at("after_work_fsync")
         if self._interrupted():
@@ -430,7 +432,7 @@ class UploadCommitWorker(PollingWorkerThread):
         final_path = organizer.sanitized_destination_path(
             f"{stem}-{track_uuid}{extension}",
             TrackMetaData(**{k: v for k, v in final.items() if k != "v"}), root)
-        assert_within(final_path, root)
+        upload_placement.assert_final_within(final_path, root)
         if is_internal_path(final_path, self._music_library_dir):
             raise ValueError("final path is internal")
 
@@ -457,8 +459,37 @@ class UploadCommitWorker(PollingWorkerThread):
 
     def _register_art(self, claimed, work):
         """Register the work file's embedded art; journal it at once. Returns
-        the cover art id, or None (no data, or not an image)."""
-        data = self._extract_art(work, input_format=self._input_format(claimed))
+        the cover art id, or None (no data, or not an image).
+
+        A rerun first gives back the art an earlier run of this operation
+        created, then forgets it in the journal, and only then registers the
+        image again. In this order a crash at any point leaves no image that
+        nothing names: until the journal is cleared it still names the earlier
+        art, and art registered after the clear is adopted at start-up because
+        the journal then names none. Clearing first would leak the earlier art.
+        The earlier art is kept, and still ours, when another commit's journal
+        names it (its registration found the same image): giving it back looks
+        only at tracks, so that commit would lose its cover. An image this call
+        created is given back at once when journaling it fails, since nothing
+        would name it otherwise."""
+        owner, operation = claimed["owner_id"], claimed["operation_uuid"]
+        old = claimed["cover_art_id"]
+        kept = None  # earlier art of ours another journal also names
+        if claimed["cover_art_created"] == 1 and old is not None:
+            if self._database.upload_commit_art_named_elsewhere(
+                    owner_id=owner, operation_uuid=operation, cover_art_id=old):
+                kept = old
+            else:
+                self._cover_art.release_if_unreferenced(old)
+                if not self._database.record_upload_commit_art(
+                        owner_id=owner, operation_uuid=operation,
+                        boot_id=self._boot_id, cover_art_id=None,
+                        cover_art_created=False, now=int(self._clock())):
+                    raise RuntimeError("commit lease lost while recording artwork")
+                self._art = (None, None)
+        # Registered in this worker's registry so that shutdown ends the extraction.
+        with metadata.probes_killed_by(self._registry):
+            data = self._extract_art(work, input_format=self._input_format(claimed))
         if not data:
             return None
         try:
@@ -467,23 +498,30 @@ class UploadCommitWorker(PollingWorkerThread):
             log.warning("embedded artwork not usable: %s", type(e).__name__)
             return None
         self._at("after_art_registered")
-        # A rerun that dedupes onto art this operation created still owns it.
-        created = result.was_created or (
-            claimed["cover_art_created"] == 1 and claimed["cover_art_id"] == result.cover_art_id)
-        if not self._database.record_upload_commit_art(
-                owner_id=claimed["owner_id"], operation_uuid=claimed["operation_uuid"],
-                boot_id=self._boot_id, cover_art_id=result.cover_art_id,
-                cover_art_created=created, now=int(self._clock())):
+        created = result.was_created or result.cover_art_id == kept
+        try:
+            recorded = self._database.record_upload_commit_art(
+                owner_id=owner, operation_uuid=operation, boot_id=self._boot_id,
+                cover_art_id=result.cover_art_id, cover_art_created=created,
+                now=int(self._clock()))
+        except Exception:
+            self._give_back_unrecorded_art(result)
+            raise
+        if not recorded:
+            self._give_back_unrecorded_art(result)
             raise RuntimeError("commit lease lost while recording artwork")
         self._art = (result.cover_art_id, 1 if created else 0)
-        # The journal no longer names the earlier art this operation created.
-        old = claimed["cover_art_id"]
-        if claimed["cover_art_created"] == 1 and old is not None and old != result.cover_art_id:
-            try:
-                self._cover_art.release_if_unreferenced(old)
-            except Exception as e:
-                log.warning("replaced commit artwork not released: %s", type(e).__name__)
         return result.cover_art_id
+
+    def _give_back_unrecorded_art(self, result):
+        """An image this call created that the journal could not name: nothing
+        else would ever give it back."""
+        if not result.was_created:
+            return
+        try:
+            self._cover_art.release_if_unreferenced(result.cover_art_id)
+        except Exception as e:
+            log.warning("unrecorded commit artwork not released: %s", type(e).__name__)
 
     def _verify_digest(self, claimed, work, probed, job_id):
         """SC-25: the prepared work file against the staged identity. Returns

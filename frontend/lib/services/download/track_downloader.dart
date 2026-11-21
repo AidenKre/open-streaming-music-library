@@ -739,11 +739,23 @@ class TrackDownloader {
   /// whole, with every entry left in it: the app's own folder; a link in it
   /// is removed as a link, never followed.
   ///
+  /// A reset deletes nothing behind a link. When the downloads folder is
+  /// itself a link, the clean-up is not asked to delete anything (the files
+  /// behind it are not in the app's own folder): the queued rows are dropped,
+  /// the link goes as a link, and the recorded and queued files behind it
+  /// stay and are reported like any other file left.
+  ///
   /// Files an earlier delete left queued for the clean-up are attempted too.
   /// A recorded or queued file that is still on the device afterwards
   /// (outside the folder, by path or through a link) is left where it is
   /// and reported once: this throws [DownloadsLeftByReset]. Its row no longer names it,
   /// so a rerun of the reset finds nothing to report.
+  ///
+  /// When the database step fails, the folder still goes and the failure is
+  /// rethrown; where the folder is a link, the files behind it that the
+  /// database records are reported as left instead ([DownloadsLeftByReset]),
+  /// and when even they cannot be read the link stays, so the next run
+  /// (the reset is incomplete) can still find and report them.
   ///
   /// A downloads folder, or a link in its place, still there after its
   /// removal throws a [FileSystemException], so the reset is incomplete and
@@ -751,9 +763,18 @@ class TrackDownloader {
   /// [DownloadsLeftByReset], that is reported first and the folder at the
   /// next run. A plain file in the folder's place is left and not reported.
   Future<void> deleteDownloadsForReset() async {
+    // Whether the folder is a link decides what may be deleted, and only a
+    // look that succeeded decides it. A look that fails here is tried again
+    // after the database step and before anything is deleted; a failure
+    // then ends the step with nothing deleted (the next run tries again).
+    _FolderLook? look;
+    try {
+      look = await _lookAtDownloadsFolder();
+    } catch (_) {}
+    final linked = look?.linked ?? false;
     final String? token;
     final List<String> paths;
-    final List<int> ids;
+    List<int> ids;
     try {
       token = (await ServerBindingRepository(_db).current())?.localBindingId;
       (paths, ids) = await _db.transaction(() async {
@@ -767,42 +788,70 @@ class TrackDownloader {
         // the previous user's too: attempted and looked for like the rest.
         final queued =
             await _db.select(_db.ownedFileCleanupEntries).get();
+        final all = [...recorded, for (final r in queued) r.path];
+        if (linked) {
+          // Nothing behind the link is deleted: no row is left to try.
+          await _db.delete(_db.ownedFileCleanupEntries).go();
+          return (all, const <int>[]);
+        }
         final newIds = await _ownedCleanup.enqueueInTransaction(
           recorded,
           localBindingId: token,
         );
-        return (
-          [...recorded, for (final r in queued) r.path],
-          [...newIds, for (final r in queued) r.id],
-        );
+        return (all, [...newIds, for (final r in queued) r.id]);
       });
-    } catch (_) {
+    } catch (e, st) {
+      if (look == null) {
+        try {
+          look = await _lookAtDownloadsFolder();
+        } catch (_) {
+          // Not settled: nothing is removed, the next run tries again.
+          Error.throwWithStackTrace(e, st);
+        }
+      }
+      if (look.linked) {
+        final List<String> known;
+        try {
+          known = [
+            ...await _db.ownedTrackFilePaths(),
+            for (final r in await _db.select(_db.ownedFileCleanupEntries).get())
+              r.path,
+          ];
+        } catch (_) {
+          // The link stays: the next run can still find what is behind it.
+          Error.throwWithStackTrace(e, st);
+        }
+        final left = await _removeFolderCountingLeft(look.folder, known);
+        if (left > 0) {
+          developer.log(
+            'reset database step failed: ${e.runtimeType}',
+            name: 'TrackDownloader',
+          );
+          throw DownloadsLeftByReset(left);
+        }
+        Error.throwWithStackTrace(e, st);
+      }
       // The folder still goes; the failure is the reset's to report.
       await deleteDownloadDirectory();
       rethrow;
     }
-    await _ownedCleanup.cleanRows(ids, bindingToken: token);
-    // Where each recorded file really is (its folder's links resolved, the
-    // file itself not followed), read before the folder goes. Whatever the
-    // clean-up decided, every one is looked for again below.
-    final recorded = [for (final path in paths) await _realLocation(path)];
-    final folder = p.join((await _directoryProvider()).path, 'tracks');
-    final root = await _realLocation(folder);
-    await deleteDownloadDirectory();
+    if (look == null) {
+      // Looked at now, before anything is deleted; a failure ends the step.
+      look = await _lookAtDownloadsFolder();
+      if (look.linked) {
+        // Nothing behind the link is deleted: no row is left to try.
+        await _db.delete(_db.ownedFileCleanupEntries).go();
+        ids = const [];
+      }
+    }
+    if (ids.isNotEmpty) await _ownedCleanup.cleanRows(ids, bindingToken: token);
+    final folder = look.folder;
+    final left = await _removeFolderCountingLeft(folder, paths);
     // Left: the folder, or a link in its place, is still there. A plain
     // file named like the folder is not the app's and is never removed.
     final folderLeft = _removableFolderTypes.contains(
       await FileSystemEntity.type(folder, followLinks: false),
     );
-    var left = 0;
-    for (final path in recorded) {
-      // A file the folder's removal took was the app's own.
-      if (path == root || p.isWithin(root, path)) continue;
-      if (await FileSystemEntity.type(path, followLinks: false) !=
-          FileSystemEntityType.notFound) {
-        left++;
-      }
-    }
     if (left > 0) throw DownloadsLeftByReset(left);
     if (folderLeft) {
       throw FileSystemException(
@@ -810,6 +859,43 @@ class TrackDownloader {
         folder,
       );
     }
+  }
+
+  /// Removes the downloads [folder] ([deleteDownloadDirectory]) and returns
+  /// how many of the recorded [paths] are still on the device outside it.
+  /// Where each one really is (its folder's links resolved, the file itself
+  /// not followed) is read before the folder goes; a file the folder's own
+  /// removal took was the app's own and is not counted. Through a linked
+  /// folder nothing is inside it: what is behind the link counts.
+  Future<int> _removeFolderCountingLeft(
+    String folder,
+    List<String> paths,
+  ) async {
+    final recorded = [for (final path in paths) await _realLocation(path)];
+    final root = await _realLocation(folder);
+    await deleteDownloadDirectory();
+    var left = 0;
+    for (final path in recorded) {
+      if (path == root || p.isWithin(root, path)) continue;
+      if (await FileSystemEntity.type(path, followLinks: false) !=
+          FileSystemEntityType.notFound) {
+        left++;
+      }
+    }
+    return left;
+  }
+
+  /// The downloads folder's path and whether it is itself a link (read
+  /// without following it). Throws when the app's files folder cannot be
+  /// found.
+  Future<_FolderLook> _lookAtDownloadsFolder() async {
+    final folder = p.join((await _directoryProvider()).path, 'tracks');
+    return (
+      folder: folder,
+      linked:
+          await FileSystemEntity.type(folder, followLinks: false) ==
+          FileSystemEntityType.link,
+    );
   }
 
   /// [path] with its folder's links resolved; the last part is not followed.
@@ -859,6 +945,9 @@ class TrackDownloader {
     } catch (_) {}
   }
 }
+
+/// The downloads folder as one successful look found it.
+typedef _FolderLook = ({String folder, bool linked});
 
 /// Clean-up rows a commit step enqueued, with the binding token they were
 /// enqueued under.

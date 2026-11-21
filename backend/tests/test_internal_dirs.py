@@ -374,9 +374,36 @@ def test_startup_kills_orphaned_ffmpeg_in_every_internal_dir(configure_app, tmp_
     with TestClient(main.app):
         pass
 
-    # Only ffmpeg writing into an internal dir; .staging may be listed twice
-    # (the conversion reconcile keeps its own kill before its sweep).
-    assert set(killed) == {900001, 900002}
+    # Only ffmpeg writing into an internal dir, each killed once.
+    assert killed == [900001, 900002]
+
+
+def test_startup_lists_processes_once_and_before_it_sweeps_staged_files(
+    configure_app, tmp_path, monkeypatch
+):
+    """Listing every process costs a ``ps`` run (or a walk of /proc): one start
+    lists them once, for all internal dirs together. That one listing comes
+    before the sweep of staged files, so a left-over ffmpeg is killed while the
+    temp it writes still exists, not after the sweep removed it."""
+    from app.services import ffmpeg_runner
+
+    staged_temp = tmp_path / "music" / ".staging" / "u.7.convert.m4a"
+    staged_temp.parent.mkdir(parents=True)
+    staged_temp.write_bytes(b"x")
+    listings = []
+
+    def list_processes():
+        listings.append(staged_temp.exists())
+        return []
+
+    monkeypatch.setattr(ffmpeg_runner, "_list_processes", list_processes)
+    main = configure_app()
+
+    with TestClient(main.app):
+        pass
+
+    assert listings == [True]
+    assert not staged_temp.exists()
 
 
 # ── the .staging sweep cannot reach .uploads ───────────────────────────────

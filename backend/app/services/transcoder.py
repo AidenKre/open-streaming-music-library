@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import FrozenSet, Optional
 
+from app.core.operator_log import operator_logger
 from app.services.ffmpeg_runner import (
     NO_OPTIONS,
     FfmpegError,
@@ -64,13 +65,13 @@ def resolve_default_quality(stored: Optional[str], configured: Optional[str]) ->
         try:
             return normalize_quality(candidate)
         except ValueError:
-            print(
-                f"Invalid {source_label} default_streaming_quality "
-                f"{candidate!r}; falling back."
+            operator_logger.warning(
+                "Invalid %s default_streaming_quality %r; falling back.",
+                source_label, candidate,
             )
-    print(
-        f"No valid default_streaming_quality configured; using "
-        f"{ORIGINAL_QUALITY!r}."
+    operator_logger.warning(
+        "No valid default_streaming_quality configured; using %r.",
+        ORIGINAL_QUALITY,
     )
     return ORIGINAL_QUALITY
 

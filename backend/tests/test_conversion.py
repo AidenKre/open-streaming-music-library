@@ -49,6 +49,9 @@ from app.services.transcoder import TranscodeResult, transcode
 from tests.tool_call_capture import bound_to
 from tests.track_paths import allow_two_tracks_on_one_path, set_track_path
 
+# What a job says when it failed for a reason the server has no sentence for.
+CONVERSION_FAILED_TEXT = "The conversion failed. The original was kept."
+
 # Registered marker (plan D16): tests/conftest.py skips without ffmpeg/ffprobe.
 requires_ffmpeg = pytest.mark.requires_ffmpeg
 
@@ -459,7 +462,7 @@ class TestRunTimeRefusals:
         _run_submitted(coordinator)
 
         job = db.get_conversion_job(job_id)
-        assert (job["status"], job["error_text"]) == ("failed", "conversion failed (NoOpConversion)")
+        assert (job["status"], job["error_text"]) == ("failed", CONVERSION_FAILED_TEXT)
         assert transcoded == []
         assert source.read_bytes() == b"fake"
         assert db.list_journal_entries() == []
@@ -505,7 +508,7 @@ class TestRunTimeRefusals:
         _run_submitted(coordinator)
 
         job = db.get_conversion_job(job_id)
-        assert (job["status"], job["error_text"]) == ("failed", "conversion failed (TargetPathTaken)")
+        assert (job["status"], job["error_text"]) == ("failed", CONVERSION_FAILED_TEXT)
         assert squatter.read_bytes() == b"someone else"
         assert source.read_bytes() == b"fake"
         assert db.list_journal_entries() == []
@@ -569,24 +572,6 @@ class TestReconcileConversionJobs:
         assert owned_tagged.exists()
         assert editor_temp.exists()
         assert unrelated.exists()
-
-    def test_reconcile__kills_orphaned_ffmpeg_before_sweeping(self, tmp_path, monkeypatch):
-        db, _, _ = _make_orchestrator(tmp_path)
-        staging = tmp_path / ".staging"
-        staging.mkdir()
-        temp = staging / "u1.7.convert.m4a.partial"
-        temp.write_bytes(b"x")
-        seen = []
-
-        def fake_kill(work_dir):
-            seen.append((work_dir, temp.exists()))
-            return []
-
-        monkeypatch.setattr(conversion_module, "kill_orphaned_ffmpeg", fake_kill)
-        reconcile_conversion_jobs(db, staging)
-
-        assert seen == [(staging, True)]  # killed while the temp still existed
-        assert not temp.exists()
 
 
 class TestResumeQueued:
@@ -1230,8 +1215,9 @@ class TestSamePathJournaling:
 
         job = db.get_conversion_job(job_id)
         assert job["status"] == "failed"
-        # 7-fix-r0 F0-1: an unexpected error is stored by type name only.
-        assert job["error_text"] == "conversion failed (OperationalError)"
+        # An unexpected error is stored as one plain sentence: no text of the
+        # error (it may name a path) and no class name.
+        assert job["error_text"] == CONVERSION_FAILED_TEXT
         assert db.list_journal_entries() == []
         assert _staging_files(tmp_path) == []
         _assert_track_untouched(db, track, source, original)
@@ -1399,8 +1385,9 @@ class TestWorkerBookkeepingFailures:
 
         job = db.get_conversion_job(job_id)
         assert job["status"] == "failed"
-        # 7-fix-r0 F0-1: an unexpected error is stored by type name only.
-        assert job["error_text"] == "conversion failed (OperationalError)"
+        # An unexpected error is stored as one plain sentence: no text of the
+        # error (it may name a path) and no class name.
+        assert job["error_text"] == CONVERSION_FAILED_TEXT
         # No longer "active": the track can be converted again.
         assert orch.enqueue(_lib(orch), track.uuid_id, "aac", 192, track.revision) != job_id
 
@@ -1415,6 +1402,7 @@ class TestWorkerBookkeepingFailures:
         finally:
             if proc.poll() is None:
                 proc.kill()
+                proc.wait(timeout=5)
 
     @pytest.mark.integration
     def test_shutdown__a_conversion_that_starts_its_ffmpeg_afterwards_is_killed(
@@ -1896,6 +1884,30 @@ def _fail_tagged_replace(monkeypatch, times=1, *, after=False):
     return failures
 
 
+def _copy_over_then_fail_tagged_replace(monkeypatch, *, into_the_file):
+    """``os.replace`` of a staged converted file as a file system without a real
+    rename makes it: the staged bytes are put at the destination's name
+    (``into_the_file``: written into the file that is there; else a new file
+    takes the name), then it fails, and the staged file is still there."""
+    real_replace = os.replace
+    failures = []
+
+    def replace(src, dst, *args, **kwargs):
+        if ".tagged." in str(src) and not failures:
+            failures.append(Path(src))
+            if into_the_file:
+                Path(dst).write_bytes(Path(src).read_bytes())
+            else:
+                copy = Path(str(dst) + ".copy")
+                copy.write_bytes(Path(src).read_bytes())
+                real_replace(copy, dst)
+            raise OSError("simulated failure after the copy")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(conversion_module.os, "replace", replace)
+    return failures
+
+
 def _refuse_undo(monkeypatch, db):
     """The database refuses the transaction that takes the conversion back."""
     def busy(*args, **kwargs):
@@ -2096,6 +2108,111 @@ class TestSameFileSwapRefused:
         assert (job["status"], job["error_text"]) == ("done", None)
         assert source.read_bytes() != original
         assert db.list_journal_entries() == []
+
+    @pytest.mark.parametrize(
+        "into_the_file", [True, False],
+        ids=["written into the original", "a new file under the original's name"],
+    )
+    def test_a_swap_that_wrote_over_the_original_and_kept_the_staged_copy_is_not_undone(
+        self, tmp_path, monkeypatch, into_the_file
+    ):
+        """A file system without a real rename may copy the staged file over the
+        original and then fail with the staged file still there. A staged copy
+        that is still there proves nothing then: the original is gone, so the
+        catalog must keep describing the converted file, and the next start
+        settles the job."""
+        db, orch, coordinator, track, source, original, job_id = self._setup(tmp_path)
+        with monkeypatch.context() as m:
+            failures = _copy_over_then_fail_tagged_replace(m, into_the_file=into_the_file)
+            _run_submitted(coordinator)
+
+        assert len(failures) == 1
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("failed", SWAP_PENDING_TEXT)
+        [entry] = db.list_journal_entries()
+        staged = Path(entry["temp_path"]).read_bytes()
+        assert source.read_bytes() == staged != original
+        # Not written back to the original's values: the file is the converted one.
+        assert db.get_track_by_uuid(track.uuid_id).metadata.bitrate_kbps == pytest.approx(128, abs=8)
+
+        _start(db, tmp_path)
+
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("done", None)
+        assert source.read_bytes() == staged
+        assert db.list_journal_entries() == [] and _staging_files(tmp_path) == []
+
+    def test_a_refused_swap_whose_original_cannot_be_examined_is_not_undone(
+        self, tmp_path, monkeypatch
+    ):
+        """The master could not be examined before the swap nor after it: two
+        unknowns are not "the same file". Nothing is taken back."""
+        db, orch, coordinator, track, source, original, job_id = self._setup(tmp_path)
+        with monkeypatch.context() as m:
+            m.setattr(conversion_module, "_master_identity", lambda path: None)
+            failures = _fail_tagged_replace(m)
+            _run_submitted(coordinator)
+
+        assert len(failures) == 1
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("failed", SWAP_PENDING_TEXT)
+        [entry] = db.list_journal_entries()
+        assert Path(entry["temp_path"]).is_file()
+        assert db.get_track_by_uuid(track.uuid_id).metadata.bitrate_kbps == pytest.approx(128, abs=8)
+
+    def test_a_refused_swap_that_removed_the_original_is_not_undone(self, tmp_path, monkeypatch):
+        """A rename that removes what is at the destination and then fails: the
+        staged copy is still there and the original is gone. The catalog keeps
+        describing the converted file, and the next start puts it in place."""
+        db, orch, coordinator, track, source, original, job_id = self._setup(tmp_path)
+        real_replace = os.replace
+        failures = []
+
+        def remove_then_fail(src, dst, *args, **kwargs):
+            if ".tagged." in str(src) and not failures:
+                failures.append(Path(src))
+                os.unlink(dst)
+                raise OSError("simulated failure after the destination was removed")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(conversion_module.os, "replace", remove_then_fail)
+            _run_submitted(coordinator)
+
+        assert len(failures) == 1 and not source.exists()
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("failed", SWAP_PENDING_TEXT)
+        [entry] = db.list_journal_entries()
+        staged = Path(entry["temp_path"]).read_bytes()
+        assert db.get_track_by_uuid(track.uuid_id).metadata.bitrate_kbps == pytest.approx(128, abs=8)
+
+        _start(db, tmp_path)
+
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("done", None)
+        assert source.read_bytes() == staged
+        assert db.list_journal_entries() == [] and _staging_files(tmp_path) == []
+
+    def test_a_swap_that_wrote_through_a_linked_original_is_not_undone(
+        self, tmp_path, monkeypatch
+    ):
+        """The master's path is a link: bytes written through it change the file
+        it points to and leave the link itself as it was."""
+        db, orch, coordinator, track, source, original, job_id = self._setup(tmp_path)
+        target = source.with_name("kept elsewhere.mp3")
+        source.rename(target)
+        source.symlink_to(target)
+        with monkeypatch.context() as m:
+            failures = _copy_over_then_fail_tagged_replace(m, into_the_file=True)
+            _run_submitted(coordinator)
+
+        assert len(failures) == 1
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("failed", SWAP_PENDING_TEXT)
+        [entry] = db.list_journal_entries()
+        assert source.is_symlink()
+        assert target.read_bytes() == Path(entry["temp_path"]).read_bytes() != original
+        assert db.get_track_by_uuid(track.uuid_id).metadata.bitrate_kbps == pytest.approx(128, abs=8)
 
     def test_the_running_server_never_puts_the_file_in_place(self, tmp_path, monkeypatch):
         """Phase 6.5's rule stands: the idle pass leaves the row to the next start,
@@ -2657,7 +2774,7 @@ class TestSwapJobTransitions:
         db, orch, track, job_id = self._job(tmp_path, "done")
         revision = db.get_track_by_uuid(track.uuid_id).revision
 
-        assert db.bump_track_revision(track.uuid_id) == revision + 1
+        assert db.bump_track_revision(track.uuid_id, owner_id=db.owner_id) == revision + 1
         assert db.get_track_by_uuid(track.uuid_id).revision == revision + 1
 
     def _committed(self, tmp_path):
@@ -2785,6 +2902,6 @@ class TestSwapJobTransitions:
 def test_start_up_and_the_job_use_the_same_track_changed_text():
     """Pre-merge D1-02: the start-up copy of the sentence (not imported, to avoid
     an import cycle) must stay the job's own."""
-    from app.services import journal_recovery
+    from app.services import journal_settle
 
-    assert journal_recovery.TRACK_CHANGED_TEXT == conversion_module.TRACK_CHANGED_ERROR
+    assert journal_settle.TRACK_CHANGED_TEXT == conversion_module.TRACK_CHANGED_ERROR

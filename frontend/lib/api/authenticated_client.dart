@@ -1,5 +1,6 @@
 import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/token_permit.dart';
+import 'package:frontend/models/instance_stamp.dart';
 import 'package:frontend/services/credential_store.dart';
 import 'package:http/http.dart' as http;
 
@@ -16,14 +17,15 @@ Map<String, String> bearerAuthHeader(String token) => {
 /// always carries this scope's token, even if it outlives a timed-out quiesce.
 ///
 /// [onUnauthorized] is called synchronously on a 401, before the response is
-/// returned. It is a no-op once [dispose]d, and it only sets in-memory state:
+/// returned, with the answer's `X-Server-Instance-Id` stamp (null without
+/// one): who sent the 401. It is a no-op once [dispose]d, and it only sets in-memory state:
 /// this class never touches stored credentials.
 class AuthenticatedClient extends http.BaseClient {
   AuthenticatedClient(
     http.Client inner,
     Credentials credentials, {
     required TokenPermit permit,
-    void Function()? onUnauthorized,
+    void Function(String? servedBy)? onUnauthorized,
   }) : _permit = permit,
        _inner = inner,
        _credentials = credentials,
@@ -32,7 +34,7 @@ class AuthenticatedClient extends http.BaseClient {
   final TokenPermit _permit;
   final http.Client _inner;
   final Credentials _credentials;
-  final void Function()? _onUnauthorized;
+  final void Function(String? servedBy)? _onUnauthorized;
   bool _disposed = false;
 
   @override
@@ -55,7 +57,9 @@ class AuthenticatedClient extends http.BaseClient {
     if (!allowed) throw const TokenWithheldException();
     request.headers.addAll(own);
     final response = await _inner.send(request);
-    if (response.statusCode == 401 && !_disposed) _onUnauthorized?.call();
+    if (response.statusCode == 401 && !_disposed) {
+      _onUnauthorized?.call(instanceStampFrom(response.headers));
+    }
     return response;
   }
 

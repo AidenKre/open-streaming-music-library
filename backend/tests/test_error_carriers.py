@@ -230,11 +230,12 @@ UPLOAD_ROWS = [
      _env("upload_prepared_unreadable",
           "The server couldn't read the file after preparing it.", True),
      None),
-    ("library_links_unsupported", "upload_library_links_unsupported",
-     lambda: upload_errors.upload_library_links_unsupported(), 500,
-     _env("upload_library_links_unsupported",
-          "This server's library cannot take uploaded files (it does not support hard links)."
-          " Ask the server's operator.", False),
+    ("library_changed", "upload_library_changed",
+     lambda: upload_errors.upload_library_changed(), 500,
+     _env("upload_library_changed",
+          "This file could not be imported: the server's library folder was changed outside the"
+          " server. After the server's admin fixes it, cancel this upload and add the file"
+          " again.", False),
      None),
     ("archive_invalid", "upload_archive_invalid",
      lambda: upload_errors.upload_archive_invalid(), 422,

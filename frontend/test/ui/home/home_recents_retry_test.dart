@@ -10,6 +10,7 @@ import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/recently_played_repository.dart';
 import 'package:frontend/ui/home/home_page.dart';
 
+import '../../helpers/run_async_until.dart';
 import '../../helpers/server_binding.dart';
 import '../../repositories/catalog_seed.dart';
 import '../browse_harness.dart';
@@ -59,15 +60,17 @@ void main() {
       const HomePage(),
       overrides: [recentlyPlayedRepositoryProvider.overrideWithValue(repo)],
     ));
-    await tester.runAsync(() => pumpEventQueue(times: 20));
-    await tester.pump();
+    await runAsyncUntil(
+        tester, () => find.text('Retry').evaluate().isNotEmpty,
+        reason: 'the failed query offers Retry');
     expect(find.text('Recently played'), findsOneWidget);
     expect(find.text('Retry'), findsOneWidget);
     expect(find.text('Alpha Song'), findsNothing);
 
     await tester.tap(find.text('Retry'));
-    await tester.runAsync(() => pumpEventQueue(times: 20));
-    await tester.pump();
+    await runAsyncUntil(
+        tester, () => find.text('Alpha Song').evaluate().isNotEmpty,
+        reason: 'Retry shows the rail');
     expect(repo.queries, 2);
     expect(find.text('Retry'), findsNothing);
     expect(find.text('Alpha Song'), findsOneWidget);

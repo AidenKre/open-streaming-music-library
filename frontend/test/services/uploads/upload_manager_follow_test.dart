@@ -193,6 +193,26 @@ void main() {
     expect(pollTimers(), isEmpty);
   });
 
+  // Another server's 401 parked the manager and stopped the follow; once
+  // the bound server is verified again the session resumes the manager, and
+  // the commit still in flight is followed again, as a fresh start would.
+  test('a 401 that parked the follow, then the bound server back: the commit '
+      'is followed again while Uploads is hidden', () async {
+    h.api.onListItems = (batch, after) async =>
+        throw apiError(401, 'unauthorized');
+    await poll();
+    await poll();
+    expect(lists(), 1, reason: 'parked: the follow stopped');
+    expect((await h.states())['u-2'], 'committing');
+
+    serverSays('imported');
+    h.manager.resumeAfterBoundServerBack();
+    h.manager.request('boundServerBack', bypassBackoff: true);
+    await h.pump();
+    await poll();
+    expect((await h.states())['u-2'], 'imported');
+  });
+
   test('another server answering: the row stays committing and the follow '
       'stops', () async {
     h.api.onListItems = (batch, after) async =>

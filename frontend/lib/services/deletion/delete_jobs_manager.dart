@@ -9,7 +9,6 @@
 // reaches deleted asks for one `/changes` sync. No UI here, and no Drift
 // table: jobs live in memory (O8); only the submissions are durable.
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
@@ -129,6 +128,10 @@ class DeleteJobsManager {
   final String Function() _newUuid;
   late final SingleFlightRunner _runner;
   final _closing = Completer<void>();
+
+  /// The bound server is verified again after another server's 401: a
+  /// runner the 401 parked runs the next request.
+  void resumeAfterBoundServerBack() => _runner.resumeParked();
   final _jobs = ValueNotifier<Map<String, DeleteJob>>(const {});
   final _followed = <String>{};
   final _submitting = Expando<Future<String>>('delete-submit');
@@ -446,7 +449,7 @@ class DeleteJobsManager {
                 phase: row.state == SubmissionState.ambiguous
                     ? DeleteJobPhase.unconfirmed
                     : DeleteJobPhase.submitting,
-                targets: _targetsOf(row.frozenBodyJson),
+                targets: _knownTargetsOf(row.frozenBodyJson),
                 submittedAtMs: row.createdAtMs,
               ),
             ),
@@ -461,7 +464,7 @@ class DeleteJobsManager {
         switch (outcome) {
           case SubmissionAccepted(:final receipt):
             final targets =
-                _jobs.value[op]?.targets ?? _targetsOf(row.frozenBodyJson);
+                _jobs.value[op]?.targets ?? _knownTargetsOf(row.frozenBodyJson);
             final DeletionJobDto dto;
             try {
               dto = DeletionJobDto.fromJson(receipt);
@@ -491,7 +494,8 @@ class DeleteJobsManager {
                   operationUuid: op,
                   phase: DeleteJobPhase.rejected,
                   targets:
-                      _jobs.value[op]?.targets ?? _targetsOf(row.frozenBodyJson),
+                      _jobs.value[op]?.targets ??
+                      _knownTargetsOf(row.frozenBodyJson),
                   rejectionCode: code,
                   submittedAtMs: row.createdAtMs,
                 ),
@@ -589,7 +593,27 @@ class DeleteJobsManager {
         if (e.statusCode == 404 && e.errorCode == 'deletion_job_not_found') {
           // A followed job is read once, found or not.
           _followed.remove(op);
-          if (!_jobs.value.containsKey(op)) continue;
+          final known = _jobs.value[op];
+          if (known == null) continue;
+          if (known.phase == DeleteJobPhase.accepted ||
+              known.phase == DeleteJobPhase.running) {
+            // The server no longer knows a job it accepted (a restored
+            // database): its outcome is unknown and asking again cannot
+            // help. The last outcomes read are dropped as stale.
+            await _apply(
+              token,
+              () => _putJob(
+                DeleteJob(
+                  operationUuid: op,
+                  phase: DeleteJobPhase.unknown,
+                  targets: known.targets,
+                  createdAt: known.createdAt,
+                  submittedAtMs: known.submittedAtMs,
+                ),
+              ),
+            );
+            continue;
+          }
         }
         failed = true;
         continue;
@@ -696,16 +720,22 @@ class DeleteJobsManager {
     if (!_closed) write();
   }
 
-  static List<DeletionTargetDto> _targetsOf(String? frozenBodyJson) {
-    if (frozenBodyJson == null) return const [];
-    final body = jsonDecode(frozenBodyJson) as Map<String, dynamic>;
-    return [
-      for (final t in (body['targets'] as List).cast<Map<String, dynamic>>())
-        DeletionTargetDto(
-          uuidId: t['uuid_id'] as String,
-          baseRevision: t['base_revision'] as int,
-        ),
-    ];
+  /// The targets of a stored request; a [FormatException] when the stored
+  /// text cannot be read (a submit then sends nothing new).
+  static List<DeletionTargetDto> _targetsOf(String? frozenBodyJson) =>
+      frozenBodyJson == null
+      ? const []
+      : DeletionJobRequestDto.targetsOfFrozenJson(frozenBodyJson);
+
+  /// [_targetsOf] for a pass: a stored request that cannot be read has no
+  /// known targets. The pass still sends it as stored (the server's answer
+  /// settles it) and goes on with the other rows.
+  static List<DeletionTargetDto> _knownTargetsOf(String? frozenBodyJson) {
+    try {
+      return _targetsOf(frozenBodyJson);
+    } on FormatException {
+      return const [];
+    }
   }
 
   static DeleteJobPhase _phaseOf(String status) => switch (status) {

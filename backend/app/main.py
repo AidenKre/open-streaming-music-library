@@ -21,7 +21,7 @@ from app.services.lastfm_state import start_lastfm
 from app.auth.middleware import AuthMiddleware
 from app.core.access_log import install_access_log_redaction
 from app.library import Library, library_root
-from app.core.instance_lock import acquire_instance_lock
+from app.core.instance_lock import InstanceLockHeld, acquire_instance_lock
 from app.core.operator_log import operator_logger
 from app.core.internal_dirs import STAGING, UPLOADS, ensure_internal_dirs, is_or_inside as _is_or_inside
 from app.services.user_delete import (
@@ -355,7 +355,14 @@ def startup_event():
     app.state.lastfm_accounts = None
 
     settings.app_data_dir.mkdir(parents=True, exist_ok=True)
-    app.state.instance_lock = acquire_instance_lock(settings.app_data_dir)
+    try:
+        app.state.instance_lock = acquire_instance_lock(settings.app_data_dir)
+    except InstanceLockHeld as exc:
+        operator_logger.error(
+            "Startup refused: another instance holds osml.lock in the data folder; "
+            "run with --workers 1"
+        )
+        raise
     # SC-16d: identifies this process's job leases; any other boot id on a lease
     # is a dead process (the flock guarantees one process).
     app.state.boot_id = str(uuid4())
@@ -402,12 +409,12 @@ def _startup_locked():
         ),
     )
     # No ffmpeg of this process exists yet, so any ffmpeg writing into an
-    # internal dir is an orphan. (reconcile_conversion_jobs keeps its own
-    # .staging kill, which its test pins before the sweep.)
-    for internal_dir in internal_dirs:
-        kill_orphaned_ffmpeg(internal_dir)
+    # internal dir is an orphan. One listing of the processes for all of them,
+    # and the only one of a start: the sweep of staged files
+    # (reconcile_conversion_jobs) relies on it having run.
+    kill_orphaned_ffmpeg(*internal_dirs)
 
-    print(f"app data dir: {settings.app_data_dir}")
+    operator_logger.info("app data dir: %s", settings.app_data_dir)
 
     # Set up database
     database = server_database(settings.app_data_dir)

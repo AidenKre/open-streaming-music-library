@@ -464,3 +464,73 @@ def test_an_interruption_the_server_survives(tmp_path, monkeypatch, name, cell, 
     world.recorder.begin("start")
     world.start_up()
     check_final(world, expect)
+
+
+# --- the running server takes a move back, and is killed between its two steps ------------------------
+
+
+@pytest.mark.parametrize("stranger", [True, False], ids=["a stranger's file appears", "nothing appears"])
+@pytest.mark.parametrize("step", ["db.delete_journal_entry", "fs.unlink T"])
+@pytest.mark.parametrize("path", ["edit", "conversion"])
+@pytest.mark.parametrize("name", ["W1", "W2"])
+def test_a_kill_while_the_running_server_takes_a_move_back(
+    tmp_path, monkeypatch, name, path, step, stranger
+):
+    """A moving writer was interrupted before its move and the server lived on:
+    its journal row and its staged copy are left, and nothing is at the new
+    path. The same track's next edit or conversion request takes the move back:
+    the row goes and the staged copy goes. A kill between the two must not
+    leave a row without its staged copy: recovery reads that as "the move
+    happened" (G3), and would remove a file that appears at the new path
+    afterwards as the operation's own. With ``stranger`` such a file appears,
+    and the next start leaves it alone. Without, nothing appears, and no folder
+    the interrupted move made is left behind: once the row is gone the next
+    start has nothing to learn the folder from, so it must go before the row."""
+    writer = WRITERS[name]
+    world = build_world(tmp_path, monkeypatch, writer)
+    world.recorder.place("fs.replace T -> N")
+    with pytest.raises(Crash):
+        world.run_writer()
+    check_evidence(world)
+    try:
+        world.recorder.begin(f"runtime {path}")
+        world.recorder.place(step)
+        world.recorder.run_killed(world.next_edit if path == "edit" else world.next_conversion)
+        check_safe(world)
+        check_evidence(world)
+        end = E_OLD if writer.kind == "edit" else C_OLD
+        if stranger:
+            theirs = master("Z", "Stranger", "Else")
+            with world.outside():
+                world.new.parent.mkdir(exist_ok=True)
+                world.new.write_bytes(theirs)
+            end = replace(end, extra_files=((writer.new_rel, theirs),))
+
+        world.recorder.begin("start")
+        world.start_up()
+
+        check_final(world, end)
+    finally:
+        world.recorder.thaw()
+
+
+@pytest.mark.parametrize("step", ["db.delete_journal_entry", "fs.unlink T"])
+def test_a_kill_while_a_refused_move_is_taken_back_leaves_no_folder(tmp_path, monkeypatch, step):
+    """The move itself is refused after its folder was made: the writer deletes
+    its row and its staged copy. Killed between the two, the next start finds a
+    staged copy no row names and nothing else: the folder the refused move made
+    is gone already."""
+    world = build_world(tmp_path, monkeypatch, WRITERS["W1"])
+    try:
+        world.recorder.place("fs.replace T -> N", "raise", error=OSError(13, "Permission denied"))
+        world.recorder.place(step)
+        world.recorder.run_killed(world.run_writer)
+        check_safe(world)
+        check_evidence(world)
+
+        world.recorder.begin("start")
+        world.start_up()
+
+        check_final(world, E_OLD)
+    finally:
+        world.recorder.thaw()

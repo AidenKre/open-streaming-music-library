@@ -317,7 +317,8 @@ def test_a_final_the_server_cannot_open_is_unknown_not_other_audio(world, db, mu
 
 def test_a_symlink_loop_above_the_final_is_not_ours_and_never_raises(world, db, music, caplog):
     """S7LF-R-02: resolving a final whose folder is a symlink loop raises; the
-    final cannot be this import's, so the item goes back to review as before."""
+    final cannot be this import's, so the item goes back to review. The folder
+    on the way is a link below the library folder, so the refusal is for good."""
     commit, _ = _hp(db, music, final_bytes=None)
     root = library_root(db, music, commit["owner_id"])
     (root / "a").symlink_to(root / "b")
@@ -331,7 +332,7 @@ def test_a_symlink_loop_above_the_final_is_not_ours_and_never_raises(world, db, 
 
     assert exact.calls == []
     item = item_row(db, commit)
-    assert (item["state"], item["error_code"]) == ("review_ready", "upload_commit_failed")
+    assert (item["state"], item["error_code"]) == ("review_ready", "upload_library_changed")
     assert track_row(db, commit["track"]) is None
 
 

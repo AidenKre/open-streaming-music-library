@@ -30,10 +30,10 @@ import 'package:frontend/services/uploads/uploads_overview.dart'
 import 'package:frontend/services/uploads/upload_manager.dart'
     show uploadIntentsProvider;
 import 'package:frontend/services/uploads/upload_types.dart'
-    show RetryOutcome;
+    show RetryOutcome, UploadIntentMissing;
 import 'package:frontend/services/uploads/upload_review.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart'
-    show retryOutcomeText, uploadActionFailedText;
+    show reviewItemNotHereText, retryOutcomeText, uploadActionFailedText;
 import 'package:frontend/services/uploads/uploads_overview_provider.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/ui/preview_controller.dart';
@@ -376,9 +376,15 @@ class UploadReviewController extends ChangeNotifier
   /// screen, the draft and a submit stay on the item shown until it is
   /// ready; a newer move makes an older one a no-op. The item is then
   /// refreshed in the background and never waits on the network (7-R1-20).
+  /// The preview stops when the move is asked for and again when the item
+  /// changes.
   Future<void> _goTo(int index) async {
     final generation = ++_navigation;
     final uuid = _order[index];
+    // Before the draft read: a preview still loading could start to sound
+    // during it, and closing it after it sounded would leave the music
+    // paused. Closed now, before it sounded, it gives the music back.
+    unawaited(_preview.close());
     // Started alongside the local draft load, never awaited: a gated or hung
     // read cannot hold the move. It only refreshes the item, never _position.
     unawaited(
@@ -389,6 +395,9 @@ class UploadReviewController extends ChangeNotifier
     await _loadDraft(uuid);
     final at = _order.indexOf(uuid);
     if (_disposed || generation != _navigation || at < 0) return;
+    // Again as the item changes: while the draft was read the old item was
+    // still on screen and its preview could be started; it must not play on
+    // over the next item.
     unawaited(_preview.close());
     _position = at;
     _notify();
@@ -505,12 +514,22 @@ class UploadReviewController extends ChangeNotifier
       await send(item);
     } on SubmissionConflict {
       _notice = 'This file is already being imported.';
+    } on UploadIntentMissing {
+      await _itemNotHere();
     } catch (_) {
       _notice = uploadActionFailedText;
     } finally {
       _busy = false;
       _notify();
     }
+  }
+
+  /// The item has no upload record on this device: read the list again, then
+  /// say so (set after the read, so a failed read's notice does not replace
+  /// this one).
+  Future<void> _itemNotHere() async {
+    await refresh();
+    _notice = reviewItemNotHereText;
   }
 
   @override
@@ -537,6 +556,9 @@ class UploadReviewController extends ChangeNotifier
     if (uuid == null || !(current?.canCancel ?? false) || _busy) return;
     try {
       await _review.cancel(uuid);
+    } on UploadIntentMissing {
+      await _itemNotHere();
+      _notify();
     } catch (_) {
       _notice = uploadActionFailedText;
       _notify();
@@ -619,6 +641,8 @@ class UploadReviewController extends ChangeNotifier
       } else {
         _notice = retryOutcomeText(outcome);
       }
+    } on UploadIntentMissing {
+      await _itemNotHere();
     } catch (_) {
       _notice = uploadActionFailedText;
     } finally {

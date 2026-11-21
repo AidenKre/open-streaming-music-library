@@ -52,10 +52,9 @@ class _SignInFlow {
   /// BEFORE the credentials are stored or any scope uses them.
   ///
   /// - no row, or the same pair: store, bind with both IDs, rebuild;
-  /// - same instance (or an unknown one on the row's own URL), another (or
-  ///   unknown) user: held, [SignInNeedsUserSwitch];
-  /// - a different instance, or an unknown one on another URL: held,
-  ///   [SignInDifferentServer].
+  /// - the same instance, another (or an unknown) user: held,
+  ///   [SignInNeedsUserSwitch];
+  /// - a different or an unknown instance: held, [SignInDifferentServer].
   Future<SignInOutcome> _signIn(
     Future<AuthSession> Function(AuthApi api) authenticate,
   ) async {
@@ -110,18 +109,13 @@ class _SignInFlow {
       await revokeSignIn(held);
       return const SignInFailed(SignInNotSavedFailure.message);
     }
-    // A NULL row instance is unknown: only a login on the URL the row was
-    // created for may count as the same server (and fill it in). On another
-    // URL it could be any server, so the different-server sheet (m-R2-08).
-    // Exact on purpose (SC-01): this decides a reset, and both ids come from
-    // the server's own answers. Only the header stamp is compared leniently.
-    final instanceCompatible = row?.instanceId == null
-        ? row?.lastBaseUrl == url
-        : row!.instanceId == session.serverInstanceId;
-    if (row == null ||
-        (instanceCompatible &&
-            row.userId != null &&
-            row.userId == session.user.id)) {
+    // The same (instance, user) pair as the binding row, or no row. Every
+    // row carries both ids ([persistSignIn], its one writer, stores them), so
+    // a row lacking one is never the same pair. Exact on purpose (SC-01):
+    // this decides a reset, and both ids come from the server's own answers.
+    // Only the header stamp is compared leniently.
+    final sameInstance = row?.instanceId == session.serverInstanceId;
+    if (row == null || (sameInstance && row.userId == session.user.id)) {
       try {
         await persistSignIn(held);
       } catch (_) {
@@ -139,9 +133,7 @@ class _SignInFlow {
     final replaced = _pendingSignIn;
     _pendingSignIn = held;
     if (replaced != null) await revokeSignIn(replaced);
-    if (instanceCompatible) {
-      return SignInNeedsUserSwitch(session.user.username);
-    }
+    if (sameInstance) return SignInNeedsUserSwitch(session.user.username);
     return SignInDifferentServer(url);
   }
 
@@ -170,20 +162,12 @@ class _SignInFlow {
     await store.save(h.session.credentials);
     try {
       final prefs = await _ref.read(sharedPreferencesProvider.future);
-      final repo = _ref.read(serverBindingRepositoryProvider);
-      final row = await repo.ensureProvisional(
+      // An existing row is returned unchanged: it is this same pair.
+      await _ref.read(serverBindingRepositoryProvider).ensureProvisional(
         h.url,
         userId: h.session.user.id,
         instanceId: h.session.serverInstanceId,
       );
-      // An existing row is returned unchanged: fill an unknown instance in.
-      if (row.instanceId == null) {
-        await repo.recordVerified(
-          row.localBindingId,
-          instanceId: h.session.serverInstanceId,
-          baseUrl: h.url,
-        );
-      }
       await prefs.setString(SessionService.serverUrlKey, h.url);
     } catch (_) {
       try {

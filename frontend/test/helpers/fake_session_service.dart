@@ -44,8 +44,14 @@ class FakeSessionService implements SessionService {
   /// When set, connect throws it (a storage fault).
   Object? connectThrows;
 
+  /// When set, [connect] waits for it.
+  Completer<void>? connectGate;
+  int connects = 0;
+
   @override
   Future<ConnectOutcome> connect(String url) async {
+    connects++;
+    await connectGate?.future;
     if (connectThrows != null) throw connectThrows!;
     if (differentServer) return ConnectDifferentServer(url);
     final error = connectError;
@@ -181,5 +187,5 @@ class FakeSessionService implements SessionService {
   Future<void> onSessionActivated() async => activations++;
 
   @override
-  void onUnauthorized() => unauthorized++;
+  void onUnauthorized([String? servedBy]) => unauthorized++;
 }

@@ -249,10 +249,11 @@ class TrackSyncNotifier extends AsyncNotifier<TrackSyncState> {
     } catch (e) {
       if ((e is ApiException && e.statusCode == 401) ||
           e is ServerInstanceChangedException) {
-        // Signed out, or a page stamped by another server (SC-01 rule 6):
-        // a wait, not a failure. Back to the pre-run errors; the client's 401
-        // hook already closed the gate, and a stamp mismatch is handed to the
-        // gate (rule 1's different-server flow).
+        // A 401, or a page stamped by another server (SC-01 rule 6): a wait,
+        // not a failure. Back to the pre-run errors; the client's 401 hook
+        // already withheld the token and handed the 401's stamp to the gate
+        // (signed out, or another server), and a stamp mismatch is handed to
+        // the gate (rule 1's different-server flow).
         if (e is ServerInstanceChangedException && connection != null) {
           gate.reportDifferentInstance(connection, e);
         }

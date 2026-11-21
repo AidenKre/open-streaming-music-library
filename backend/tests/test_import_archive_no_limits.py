@@ -13,8 +13,10 @@ archive (IMPORT_ARCHIVE_MAX_ENTRIES). Uploaded ZIPs keep every limit
 
 import io
 import logging
+import struct
 import tarfile
 import zipfile
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -465,3 +467,72 @@ def test_r2_7_the_disk_cost_uses_the_disks_block_size(db, tmp_path, owner, monke
 
 def test_r2_7_the_block_size_is_at_least_4_kib():
     assert import_archive._block_size(Path("/")) >= 4096
+
+
+# --- the whole-archive ratio for a ZIP ------------------------------------------------------
+
+def _overlapped_zip(path, *, entries, data):
+    """A ZIP whose central directory lists ``entries`` audio entries that all
+    point at one stored copy of ``data``: each passes its own ratio (stored,
+    1:1), while together they declare ``entries × len(data)`` bytes from a
+    file of little more than ``len(data)`` bytes."""
+    crc = zlib.crc32(data)
+    local = struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, 0, 0, 0, crc, len(data), len(data), 5, 0)
+    local += b"0.mp3" + data
+    central = b""
+    for i in range(entries):
+        name = f"{i:04}.mp3".encode()
+        central += struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, 0, 0, 0, crc, len(data),
+                               len(data), len(name), 0, 0, 0, 0, 0, 0) + name
+    end = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, entries, entries, len(central), len(local), 0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(local + central + end)
+    return path
+
+
+_OVERLAP_DATA = bytes(range(256)) * 256  # 64 KiB
+
+
+def test_an_overlapped_zip_is_refused_by_the_whole_archive_ratio(tmp_path):
+    path = _overlapped_zip(tmp_path / "overlap.zip", entries=200, data=_OVERLAP_DATA)
+    limits = _defaults()
+    assert 200 * len(_OVERLAP_DATA) > limits.max_compression_ratio * path.stat().st_size
+
+    _fail(path, "upload_archive_ratio_exceeded", limits)
+
+
+def test_the_whole_archive_ratio_boundary_for_a_zip(tmp_path):
+    """The rule and the numbers of a tar or RAR: the declared sizes against
+    the ratio times the archive's size."""
+    path = _overlapped_zip(tmp_path / "overlap.zip", entries=20, data=_OVERLAP_DATA)
+    declared, size = 20 * len(_OVERLAP_DATA), path.stat().st_size
+    at = -(-declared // size)  # the smallest ratio that admits it
+    assert at > 1
+
+    assert len(import_archive.inspect(path, ImportArchiveLimits(1000, at)).members) == 20
+    _fail(path, "upload_archive_ratio_exceeded", ImportArchiveLimits(1000, at - 1))
+
+
+def test_an_overlapped_zip_in_an_import_folder_is_refused_once_and_not_inspected_again(
+        db, tmp_path, owner, caplog, monkeypatch):
+    """Not a lack of space, tried and logged again at every scan and change
+    event: a refusal of the archive itself, remembered while it is unchanged."""
+    folder = tmp_path / "import-users" / "sam"
+    archive = _overlapped_zip(folder / "overlap.zip", entries=200, data=_OVERLAP_DATA)
+    floor = 1 * MiB
+    ingestor = _ingestor(db, tmp_path, owner, free=floor + archive.stat().st_size, floor=floor)
+    inspected = MagicMock(side_effect=import_archive.inspect)
+    monkeypatch.setattr(import_archive, "inspect", inspected)
+
+    with caplog.at_level(logging.INFO):
+        first = ingestor.ingest(archive, imported_dir=folder / ".imported")
+        again = ingestor.ingest(archive, imported_dir=folder / ".imported")
+
+    assert (first, again) == (ImportOutcome.REFUSED, ImportOutcome.REFUSED)
+    assert inspected.call_count == 1
+    assert archive.exists() and not (folder / ".imported").exists()
+    assert sql(db, "SELECT * FROM storage_reservations") == []
+    assert [r.getMessage() for r in caplog.records if r.name == OPERATOR] == [
+        f"An archive in an import folder of user {owner} was not unpacked (ratio_exceeded);"
+        " it stays in the folder."
+    ]

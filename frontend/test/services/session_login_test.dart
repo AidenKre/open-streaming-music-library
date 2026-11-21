@@ -352,32 +352,25 @@ void main() {
       expect(rebuilds, 1);
     });
 
-    // Review r1 m-R1-44: a row whose instance is unknown (NULL) is compared
-    // as at connect: unknown is not "different". The same user keeps
-    // everything and the login fills the instance in.
-    test('a row with an unknown (NULL) instance and the same user is the '
-        'same pair', () async {
+    // A row whose instance is unknown (NULL) is never written: the sign-in,
+    // its one writer, stores the server's instance id. If one were found it
+    // is not "matches any server" (review r2 m-R2-08): user ids are small
+    // per-server integers, so the login could be any server. The
+    // different-server sheet, nothing persisted, on any URL.
+    test('a row with an unknown (NULL) instance on the same URL is the '
+        'different-server sheet; nothing is persisted or filled in', () async {
       final row = await repo().ensureProvisional('http://s', userId: 7);
-      await db.customStatement(
-        'INSERT INTO pending_edits (uuid_id, values_json, write_mode, status, '
-        "updated_at) VALUES ('a', '{}', 'db_only', 'pending', 1)",
-      );
       final c = scope();
       expect(await c.read(sessionServiceProvider).login('alice', 'pw-alice-1'),
-          isA<SignInSucceeded>());
-      expect(_events, isNot(contains('wipe')));
-      expect(await pendingEdits(), 1);
+          isA<SignInDifferentServer>()
+              .having((o) => o.url, 'url', 'http://s'));
+      expect(await store.read(), isNull);
       final bound = (await repo().current())!;
       expect(bound.localBindingId, row.localBindingId);
-      expect(bound.instanceId, 'inst-1');
-      expect(bound.userId, 7);
+      expect(bound.instanceId, isNull);
+      expect(rebuilds, 0);
     });
 
-    // Review r2 m-R2-08: an unknown (NULL) instance is not "matches any
-    // server". It may be filled only by a login for the same user on the URL
-    // the row was created for (above). On another URL the login could be any
-    // server (user ids are small per-server integers): the different-server
-    // sheet, nothing persisted.
     group('a row with an unknown (NULL) instance, a login on another URL', () {
       Future<String> seedLegacyRow({required int userId}) async {
         final row =
@@ -567,12 +560,14 @@ void main() {
       expect(rebuilds, 0);
     });
 
-    test('a NULL row instance with another user is the user switch, not a '
-        'different server', () async {
+    // A row whose instance is unknown is never written (the sign-in stores
+    // it); if one were found, unknown is never the same server.
+    test('a NULL row instance with another user is the different-server '
+        'sheet', () async {
       await repo().ensureProvisional('http://s', userId: 7);
       final c = scope();
       expect(await c.read(sessionServiceProvider).login('bob', 'pw-bob-123'),
-          isA<SignInNeedsUserSwitch>());
+          isA<SignInDifferentServer>());
     });
 
     // Review r1 m-R1-45: a held sign-in is never dropped without a revoke:

@@ -13,6 +13,7 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/media_token_binding.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/damaged_downloads_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
@@ -21,6 +22,7 @@ import 'package:frontend/ui/widgets/damaged_downloads_section.dart';
 
 import '../fake_downloads_controls.dart';
 import '../../helpers/no_server_api.dart';
+import '../../helpers/run_async_until.dart';
 import '../../helpers/test_offline.dart';
 
 Future<void> _insertTrack(AppDatabase db, String uuid,
@@ -109,9 +111,14 @@ void main() {
     await tester.pump(const Duration(milliseconds: 1));
   }
 
+  /// Until the section's query has answered (its provider holds a value),
+  /// not for a count of turns; fails if it never answers.
   Future<void> settle(WidgetTester tester) async {
-    await tester.runAsync(() => pumpEventQueue(times: 50));
-    await tester.pump();
+    final container = ProviderScope.containerOf(
+        tester.element(find.byType(DamagedDownloadsSection)));
+    await runAsyncUntil(
+        tester, () => container.read(damagedDownloadsProvider).hasValue,
+        reason: 'the damaged downloads query answers');
   }
 
   testWidgets('hidden when there are no damaged downloads', (tester) async {

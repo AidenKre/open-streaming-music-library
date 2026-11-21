@@ -16,6 +16,14 @@ class DeletionTargetDto {
   final String uuidId;
   final int baseRevision;
 
+  factory DeletionTargetDto.fromJson(Object? json) {
+    final m = jsonObject(json, 'deletion target');
+    return DeletionTargetDto(
+      uuidId: jsonString(m, 'uuid_id'),
+      baseRevision: jsonInt(m, 'base_revision'),
+    );
+  }
+
   Map<String, dynamic> toJson() => {
     'uuid_id': uuidId,
     'base_revision': baseRevision,
@@ -49,6 +57,15 @@ class DeletionJobRequestDto {
 
   /// The exact request text, encoded once and reused on every retry.
   String toFrozenJson() => jsonEncode(toJson());
+
+  /// The targets of a request text written by [toFrozenJson]; text that is
+  /// not such a request is a [FormatException].
+  static List<DeletionTargetDto> targetsOfFrozenJson(String frozenJson) {
+    final m = jsonObject(jsonDecode(frozenJson), 'deletion request');
+    return [
+      for (final t in jsonList(m, 'targets')) DeletionTargetDto.fromJson(t),
+    ];
+  }
 }
 
 class DeletionPreviewTargetDto {

@@ -6,7 +6,8 @@
   (`uvicorn app.main:app --workers 1`). At startup the server takes an
   exclusive `flock` on `APP_DATA_DIR/osml.lock` before opening the database; a
   second process (or a second uvicorn worker) on the same data directory
-  refuses to start and logs the lock path.
+  refuses to start: it logs one line naming the lock file (`osml.lock` in the
+  data folder), then uvicorn reports the failed start.
 - **POSIX hosts only** (Linux, macOS): the instance lock uses `fcntl.flock`.
 - **Fresh schema (schema 1).** A database at an older (or newer) schema
   number is refused at startup and its files are left untouched (the data
@@ -47,7 +48,9 @@
   download one.
 - **`ffmpeg` and `ffprobe`** on `PATH`. Without `ffprobe` no file is imported:
   each one stays in its import folder and is logged as
-  `import failed: <path> (tool_unavailable)` (an archive as `archive kept:`).
+  `import failed: <file> of user <id> (tool_unavailable)` (an archive as
+  `archive kept:`), `<file>` being its path relative to the user's import
+  folder and `<id>` the user's id.
   `ffmpeg` writes metadata edits into the files, reads embedded cover art,
   encodes streams at a quality other than `original`, converts a track's file
   format, and computes the audio hash that finds exact duplicates.
@@ -197,7 +200,8 @@ logged at INFO level, which the server's default logging does not show).
   (the last with a warning), it is moved to `.imported/` in its import
   folder; moving it back out imports it again. An archive kept
   because of a problem outside the file (a missing `ffprobe`, a busy database,
-  a failed move) is logged as `archive kept: <path> (<reason>)` and retried at
+  a failed move) is logged as `archive kept: <file> of user <id> (<reason>)`
+  (`<file>` relative to the import folder) and retried at
   the next server start or when it changes. A RAR written without its end
   block (RAR before 3.0, or `-en`) is never imported.
 - **Other files.** A file whose name is neither supported audio nor an
@@ -205,7 +209,8 @@ logged at INFO level, which the server's default logging does not show).
   logged, whether it was there at start or arrived later.
 - **Refused files.** A duplicate, or a file that fails the `ffprobe` audio
   check, stays where it is, is logged as
-  `import failed: <path> (<reason>)`, and is retried at the next start.
+  `import failed: <file> of user <id> (<reason>)` (`<file>` relative to the
+  import folder), and is retried at the next start.
   The audio check trusts the `.flac` extension: a text file named `.flac`
   passes it and is imported as a track with empty metadata that can't play.
 
@@ -219,6 +224,7 @@ uv run python -m app.cli users reset-password NAME
 uv run python -m app.cli users disable NAME
 uv run python -m app.cli users enable NAME
 uv run python -m app.cli users delete NAME
+uv run python -m app.cli library check [NAME]
 ```
 
 - `list` prints `id`, `username`, `role`, `folder`, `created`, `disabled`,
@@ -243,7 +249,53 @@ uv run python -m app.cli users delete NAME
   removes the user's music folder, import folder, rows, sessions and cached
   encodings. An interrupted delete is finished by rerunning it or at the next
   server start.
-- Exit codes: `0` done, `1` refused or failed, `2` bad usage.
+- `uv run python -m app.cli library check [NAME]` checks one user's music
+  folder (every user's without `NAME`). It lists the files no track uses
+  (`NAME<TAB>unused<TAB>path`), the tracks whose file is missing (`missing`) and
+  the folders or files it could not read (`unreadable`), paths relative to the
+  user's folder, then one summary line per user. A track whose stored path
+  lies outside that folder (for example after the music folder was moved and a
+  link left at the old place) is counted, not checked. When a user has such a
+  track, a track stored through a link inside their folder, or a track whose
+  path runs through a folder that cannot be read, the list of files no track
+  uses is not made for them (`files no track uses: not
+  checked`): such a track may reach any file. A file any user's live track
+  reaches, directly or through symbolic links, is never listed as unused
+  (whose track it is is not shown). A folder that appears a second time
+  without a symbolic link (a bind mount, a second mount point, a macOS
+  firmlink spelling) is not recognised, and its files may be listed as
+  unused: do not act on such a list without checking. When a track's path
+  cannot be followed (a loop of links, a folder that cannot be searched), the
+  list of files no track uses is not made for anyone in that run, and one
+  line right after the first says so (`Files no track uses are not listed in
+  this run: a track's path could not be followed (a link loop, or a folder
+  that cannot be read).`). It writes no library file and no
+  database row, and runs beside the server. (Like every admin command, it
+  first checks the schema number by reading the database read-only; only when
+  a `-wal` file is there without its `-shm`, it reads a copy of the database
+  and that `-wal` made in the system's temporary folder (`TMPDIR`), and removes
+  the copy afterwards.) Like `delete`, it refuses a folder other than the one
+  the server recorded. It walks into no symbolic link inside a user's folder
+  (track paths that run through links are resolved with `realpath`, which
+  opens no file): each link is listed as a link (`link`) with its own count,
+  never as a file no track uses, and the tracks stored through a link are
+  counted but not checked. It does not check a user whose folder is itself a
+  link, lies outside the music folder or cannot be read (`NAME: not checked:
+  ...`), nor a user being deleted. When only part could not be read, the
+  summary says its counts are lower bounds. The library is read while the
+  server runs, so a file imported or removed during the check may be listed;
+  run the check again before acting on a finding. It never reports a copy
+  temporary (`.<hex>.osml-part`), even one left over, and it does not walk the
+  internal folders at the top of the music folder or the data folder. Names
+  are printed with backslash escapes for control characters, so each finding
+  is one line. Findings are not an error: it exits `0` when every user was
+  checked in full, and `1` when a user was not checked, something could not be
+  read, a link was found (what it points at was not checked) or a track is
+  stored outside the user's folder; the other users are still checked.
+- Exit codes: `0` done, `1` refused or failed, `2` bad usage. For
+  `library check`: `0` only when every user was checked in full, `1` when a
+  user was not checked, something could not be read, a link was found or a
+  track is stored outside the user's folder.
 
 ## Last.fm scrobbling (operator guide)
 

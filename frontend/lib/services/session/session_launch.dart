@@ -1,6 +1,6 @@
 part of '../session_service.dart';
 
-enum _StoredSignIn { usable, noBinding, otherUser, noUser }
+enum _StoredSignIn { usable, noBinding, otherUser }
 
 /// The saved-session launch: what the app does at start with the saved
 /// server address and the stored sign-in. It asks the pending-reset question
@@ -43,15 +43,13 @@ class _SessionLaunch {
   /// Whether stored credentials may be used at launch (m-R1-18, m-R1-36):
   /// only with a binding row whose user is theirs. Never attach credentials
   /// to requests for a binding they don't match. Launch creates no row (login
-  /// does, spec 7.4), and a row of another or an unknown user is kept as is.
+  /// does, spec 7.4), and a row of another user is kept as is. (A row
+  /// without a user is never written: its one writer, the sign-in, stores
+  /// the user's id; it would count as another user's.)
   Future<_StoredSignIn> _storedSignInVerdict(Credentials credentials) async {
     final row = await _ref.read(serverBindingRepositoryProvider).current();
     if (row == null) return _StoredSignIn.noBinding;
-    if (row.userId != credentials.userId) {
-      return row.userId == null
-          ? _StoredSignIn.noUser
-          : _StoredSignIn.otherUser;
-    }
+    if (row.userId != credentials.userId) return _StoredSignIn.otherUser;
     return _StoredSignIn.usable;
   }
 
@@ -156,8 +154,6 @@ class _SessionLaunch {
         return _dropStoredSignIn(url, 'no_binding');
       case _StoredSignIn.otherUser:
         return _dropStoredSignIn(url, 'binding_other_user');
-      case _StoredSignIn.noUser:
-        return _dropStoredSignIn(url, 'binding_without_user');
     }
     final result = await _ref.read(publicApiClientProvider).healthCheck(retry: false);
     switch (_launchHealth(result)) {

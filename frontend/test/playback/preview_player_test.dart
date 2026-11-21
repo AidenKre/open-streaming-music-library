@@ -581,6 +581,76 @@ void main() {
         expect(engines.expand((e) => e.loads), isEmpty);
       });
 
+      // A preview that cannot load never sounds: the music is not left
+      // paused for it until the page closes.
+      test('its load fails after the hand-over: the library holds the output '
+          'again and is told, while the preview shows the failure; closing '
+          'it afterwards hands nothing back a second time; Play asks for '
+          'the output again', () async {
+        final c = await libraryHolding();
+        final engine = await loading(c);
+        expect(focus.holder, AudioOutput.preview);
+        engine.failLoad();
+        await pumpEventQueue();
+        expect(state(c).status, PreviewStatus.failed);
+        expect(state(c).source, source);
+        expect(engine.plays, 0);
+        expect(focus.holder, AudioOutput.queue);
+        expect(focus.yieldedBy(AudioOutput.queue), isFalse);
+        expect(library.returns, 1);
+
+        unawaited(player(c).play(source));
+        await pumpEventQueue();
+        expect(library.relinquishes, 2, reason: 'a new hand-over');
+        library.acknowledge();
+        await pumpEventQueue();
+        engines.last.finishLoad(const Duration(seconds: 30));
+        await pumpEventQueue();
+        expect(engines.last.plays, 1);
+        expect(state(c).status, PreviewStatus.playing);
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 1);
+      });
+
+      test('its load fails after the hand-over, then it is closed: the '
+          'library is told once', () async {
+        final c = await libraryHolding();
+        final engine = await loading(c);
+        engine.failLoad();
+        await pumpEventQueue();
+        await player(c).close();
+        expect(library.returns, 1);
+        expect(focus.holder, AudioOutput.queue);
+        expect(state(c).status, PreviewStatus.idle);
+      });
+
+      test('a second preview, started after the first sounded, whose load '
+          'fails: nothing is handed back (the library stays paused for the '
+          'person to resume)', () async {
+        final c = await libraryHolding();
+        final engine = await playing(c);
+        unawaited(player(c).play(const LibraryTrackPreview('t2')));
+        await pumpEventQueue();
+        expect(state(c).status, PreviewStatus.loading);
+        engine.failLoad();
+        await pumpEventQueue();
+        expect(state(c).status, PreviewStatus.failed);
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 0);
+      });
+
+      test('unplugged headphones while it loads, then the load fails: '
+          'nothing is handed back', () async {
+        final c = await libraryHolding();
+        final engine = await loading(c);
+        player(c).onBecameNoisy();
+        await pumpEventQueue();
+        engine.failLoad();
+        await pumpEventQueue();
+        expect(focus.holder, AudioOutput.preview);
+        expect(library.returns, 0);
+      });
+
       test('paused, then closed, after it sounded: nothing is handed back '
           '(the library stays paused for the person to resume)', () async {
         final c = await libraryHolding();

@@ -51,7 +51,7 @@ from app.services.journal_recovery import (
     is_current_master,
     reached_durable_point,
 )
-from app.services.organizer import flush_move, move_back, move_file, prune_empty_dirs
+from app.services.file_ops import flush_move, move_back, move_file, prune_empty_dirs
 
 # The lines these functions log keep the logger name they had in track_editor.py.
 logger = logging.getLogger("app.services.track_editor")
@@ -86,7 +86,7 @@ def move_to_new_path(
         # file is there: that track's master is missing, and a later deletion
         # of either track would take the other's file. Refused like a file at
         # the path.
-        if library.database.track_path_in_use(
+        if library.unbound_database.track_path_in_use(
             str(dest), owner_id=ANY_OWNER, exclude_uuid=uuid_id
         ):
             raise MoveRefused()
@@ -96,10 +96,13 @@ def move_to_new_path(
     except BaseException:
         release_staged()  # nothing journaled yet
         raise
-    flushed = flush_journal_row(library.database, entry, uuid_id)
+    flushed = flush_journal_row(library.unbound_database, entry, uuid_id)
     if not move_file(file_path=staged, destination_path=dest):
-        # The staged copy stays until the row is gone: while the row exists
-        # it shows recovery that the move never happened.
+        # A folder the refused move made goes while the row still exists (after
+        # it nothing would tell the next start about the folder). The staged
+        # copy stays until the row is gone: while the row exists it shows
+        # recovery that the move never happened.
+        prune_empty_dirs(dest.parent, root)
         library.delete_journal_entry(entry)
         release_staged()
         raise MoveRefused()
@@ -151,7 +154,7 @@ def settle_old_master(
     and the journal row once the commit is durable. Otherwise both stay, the old
     file is remembered, and a later edit, conversion or idle pass settles it.
     ``wait=False`` (the first point already failed) asks once without waiting."""
-    if reached_durable_point(library.database, wait=wait):
+    if reached_durable_point(library.unbound_database, wait=wait):
         # Never delete the new master through another spelling of its path.
         if not is_current_master(str(source), str(dest)):
             source.unlink(missing_ok=True)

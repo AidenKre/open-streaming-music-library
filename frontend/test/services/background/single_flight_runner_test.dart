@@ -253,6 +253,46 @@ void main() {
     await runner.quiesce(); // still quiesces cleanly
   });
 
+  // A 401 from another server at the address parked the runner; once the
+  // bound server is verified again the session reopens it (the scope and its
+  // sign-in stay), and the next request runs a pass.
+  test('a parked runner reopened by resumeParked runs the next request',
+      () async {
+    runner.request('timer');
+    await settle();
+    pending[0].complete(const PassParked());
+    await settle();
+
+    runner.resumeParked();
+    runner.request('boundServerBack', bypassBackoff: true);
+    await settle();
+    expect(passes, hasLength(2));
+    expect(passes.last, {'boundServerBack'});
+    pending[1].complete(const PassDone());
+    await settle();
+  });
+
+  test('resumeParked never reopens a quiesced runner, and does nothing to a '
+      'runner that is not parked', () async {
+    runner.request('timer');
+    await settle();
+    pending[0].complete(const PassParked());
+    await settle();
+    await runner.quiesce();
+    runner.resumeParked();
+    runner.request('boundServerBack', bypassBackoff: true);
+    await settle();
+    expect(passes, hasLength(1), reason: 'a quiesced runner stays closed');
+
+    final other = make();
+    other.resumeParked(); // not parked: nothing changes
+    other.request('timer');
+    await settle();
+    expect(passes, hasLength(2));
+    pending[1].complete(const PassDone());
+    await settle();
+  });
+
   test('a rerun queued during the parked pass is dropped too', () async {
     runner.request('timer');
     await settle();

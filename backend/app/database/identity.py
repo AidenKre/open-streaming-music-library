@@ -221,15 +221,16 @@ class IdentityPart(DatabaseCore):
             return True
 
     def find_duplicates_for_track(self, uuid_id: str, identity, *, owner_id: int):
-        """The worker's read: ``find_duplicates`` for one library track against its
-        owner's live library, uncapped, excluding the track itself. ``owner_id`` is
-        the track's real owner, never ANY_OWNER."""
+        """The worker's read: the matches of one library track against its owner's
+        live library, uncapped, excluding the track itself; the matches only,
+        without the coverage counts. ``owner_id`` is the track's real owner, never
+        ANY_OWNER."""
         # Local import: app.services' package init imports this module (cycle).
         from app.services import duplicate_detection
 
         owner = _require_owner(owner_id)
         with self._connection() as conn:
-            return duplicate_detection.find_duplicates(
+            return duplicate_detection.find_matches(
                 conn, identity, owner_id=owner, exclude=frozenset({uuid_id})
             )
 

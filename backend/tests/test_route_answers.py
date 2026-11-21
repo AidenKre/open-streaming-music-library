@@ -679,7 +679,16 @@ def test_patch_real_db_only_edit(client):
             409,
             {"detail": {"error": "job_active", "job_id": 42}},
         ),
-        (TargetPathTaken(SOME_UUID), 409, {"detail": {"error": "target_exists"}}),
+        (
+            TargetPathTaken(taken_by="file"),
+            409,
+            {"detail": {"error": "target_exists", "taken_by": "file"}},
+        ),
+        (
+            TargetPathTaken(taken_by="track"),
+            409,
+            {"detail": {"error": "target_exists", "taken_by": "track"}},
+        ),
         (PendingRecovery(SOME_UUID), 409, {"detail": {"error": "pending_recovery"}}),
         (
             NoOpConversion(SOME_UUID),
@@ -721,7 +730,8 @@ def test_patch_real_db_only_edit(client):
     ],
     ids=[
         "not-found", "pending-deletion", "master-not-found", "job-active",
-        "target-exists", "pending-recovery", "no-op", "request-invalid",
+        "target-exists-file", "target-exists-track", "pending-recovery", "no-op",
+        "request-invalid",
         "insufficient-storage", "free-space-unknown", "busy",
     ],
 )

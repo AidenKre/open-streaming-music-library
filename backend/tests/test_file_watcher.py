@@ -81,7 +81,7 @@ class TestCanOpenForRead:
         path = tmp_path / "file.bin"
         path.write_bytes(b"x")
 
-        with patch("app.services.file_watcher.open", side_effect=PermissionError):
+        with patch("app.services.import_outcome.open", side_effect=PermissionError):
             assert file_watcher.can_open_for_read(path) is False
 
 
@@ -305,9 +305,10 @@ class TestStopDrainsTheExecutor:
 
         watcher = FileWatcher(tmp_path, on_file)
         paths = [tmp_path / f"{i:02d}.mp3" for i in range(12)]
-        with patch("app.services.file_watcher.wait_until_ready", return_value=True):
+        with patch("app.services.file_watcher.wait_until_ready", return_value=True) as ready:
             for path in paths:
                 watcher._submit_new(path)
+            futures = list(watcher._futures)
             # The pool runs exactly max_workers at once; each blocks on `proceed`,
             # so wait for precisely that many starts (no negative-window wait).
             started = watcher.executor._max_workers
@@ -316,12 +317,19 @@ class TestStopDrainsTheExecutor:
             assert 0 < started < len(paths)
             stopper = threading.Thread(target=watcher.stop_file_watcher)
             stopper.start()
-            stopper.join(0.2)
+            # Stop cancels every queued item while the running ones still work
+            # (the stopping flag alone would also keep them from importing, so
+            # the cancellation itself is what is checked).
+            deadline = time.monotonic() + 5
+            while sum(f.cancelled() for f in futures) < len(paths) - started:
+                assert time.monotonic() < deadline, "stop left queued work in the pool"
+                time.sleep(0.001)
             proceed.set()
             stopper.join(5)
 
         assert not stopper.is_alive()
         assert len(handled) == started
+        assert ready.call_count == started  # queued items never began their wait
         assert self._alive(watcher) == []
 
     def test_a_file_that_becomes_ready_after_stop_is_not_handled(self, tmp_path: Path, caplog):
@@ -537,6 +545,37 @@ class TestAFileThatChangedDuringItsAttemptIsTriedAgain:
         submit.assert_not_called()
         assert path not in watcher.processed
 
+    def test_a_change_announced_while_the_attempt_ends_is_not_lost(self, tmp_path: Path):
+        """The copy resumes after the attempt's last look at the file and
+        before the path is released: its modify event meets the path still in
+        flight and is dropped. The watcher looks once more after releasing it."""
+        path = tmp_path / "a.flac"
+        path.write_bytes(b"x")
+        watcher = FileWatcher(import_dir=tmp_path, on_file=MagicMock(return_value=False))
+        watcher.processed.add(path)
+        real_signature = file_watcher.file_signature
+        looks = []
+
+        def signature_then_the_copy_resumes(p):
+            looks.append(p)
+            seen = real_signature(p)
+            if len(looks) == 2:  # the look after the attempt
+                with open(p, "ab") as f:
+                    f.write(b"more")
+                watcher.on_modified(MagicMock(is_directory=False, src_path=str(p)))
+            return seen
+
+        with (
+            patch("app.services.file_watcher.wait_until_ready", return_value=True),
+            patch("app.services.file_watcher.file_signature", signature_then_the_copy_resumes),
+            patch.object(watcher.executor, "submit") as submit,
+        ):
+            watcher.process_file_after_stable(path)
+        watcher.executor.shutdown(wait=True)
+
+        submit.assert_called_once_with(watcher.process_file_after_stable, path)
+        assert path in watcher.processed
+
 
 @pytest.mark.usefixtures("fast_stability_poll")
 class TestTheStartupScanUsesTheNameRuleOfNewFiles:
@@ -578,7 +617,7 @@ class TestTheStartupScanUsesTheNameRuleOfNewFiles:
         logged = "\n".join(r.getMessage() for r in caplog.records)
         for path in other + skipped:
             assert path.name not in printed
-            assert str(path) not in logged
+            assert path.name not in logged  # the stability wait logs a file's name
         assert all(p.read_bytes() == b"bytes of " + p.relative_to(root).as_posix().encode()
                    for p in other + skipped)
 

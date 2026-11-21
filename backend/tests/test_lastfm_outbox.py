@@ -43,6 +43,7 @@ from tests.lastfm_routes import (
 )
 from tests.lastfm_sender_rig import execute
 from tests.pending_deletion import mark_pending_deletion
+from tests.track_removal import delete_track
 
 
 @pytest.fixture(autouse=True)
@@ -292,7 +293,7 @@ def test_a_deleted_track_is_not_queued(open_app_client, tmp_path):
         _opted_in(rig, owner)
         gone = add_catalog_track(rig, tmp_path / "g", owner)
         kept = add_catalog_track(rig, tmp_path / "k", owner)
-        assert rig.db.delete_track(gone, owner_id=owner)
+        assert delete_track(rig.db, gone, owner_id=owner)
         events = [listen(gone, rig.wall.ms - 300_000), listen(kept, rig.wall.ms - 200_000)]
 
         post(rig, events)

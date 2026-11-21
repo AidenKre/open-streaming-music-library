@@ -196,22 +196,6 @@ void main() {
   });
 
   group('more items ready', () {
-    // 7-R2-05: a ready item the server refuses to import is not news.
-    test('7-R2-05 a ready item the server refuses to import is not', () {
-      expect(
-        moreItemsReady(
-          snapshot: {'a'},
-          batchUuid: 'b-1',
-          intents: [
-            _intent('review_ready', uuid: 'a'),
-            _intent('review_ready',
-                uuid: 'c', code: 'upload_library_links_unsupported'),
-          ],
-        ),
-        isFalse,
-      );
-    });
-
     test('a ready item of this batch outside the snapshot is news', () {
       expect(
         moreItemsReady(

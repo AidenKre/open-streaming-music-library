@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.core.internal_dirs import is_internal_path
+from app.core.operator_log import operator_logger
 from app.database.database import CoverArtGone, TrackPathTaken, _fold_path, effective_artist
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
@@ -158,6 +159,8 @@ class OrganizerContext:
     # hash (Database.track_identities_in_folder rows). None: only the disk is
     # consulted when a library name is taken, and no stored hash is known.
     folder_tracks: Callable[[Path], list[dict]] | None = None
+    # Whose import it is (a user id), only for log lines; None: not known.
+    owner_id: int | None = None
 
     def __post_init__(self):
         if not self.should_organize_files and self.should_copy_files:
@@ -170,9 +173,6 @@ class OrganizerContext:
 class Organizer:
     def __init__(self, ctx: OrganizerContext):
         self.ctx = ctx
-
-    def organize_file(self, file_path: Path) -> bool:
-        return self.organize(file_path) is ImportOutcome.IMPORTED
 
     def _compute_identity(self, file_path: Path, codec: str | None) -> Any:
         """The exact layer of the source file, or None (left pending for the
@@ -203,11 +203,16 @@ class Organizer:
             with probe_unavailable_raises(), probes_killed_by(self.ctx.probe_registry):
                 trackmetadata = get_track_metadata(file_path=file_path)
         except ProbeUnavailable:
-            print(f"ffprobe unavailable for {file_path}")
+            operator_logger.warning(
+                "ffprobe unavailable for %s of user %s", file_path.name, self.ctx.owner_id
+            )
             return ImportOutcome.TOOL_UNAVAILABLE
 
         if trackmetadata is None or trackmetadata.is_empty():
-            print(f"{file_path} does not result in a TrackMetaData")
+            operator_logger.warning(
+                "%s of user %s does not result in a TrackMetaData",
+                file_path.name, self.ctx.owner_id,
+            )
             return ImportOutcome.FAILS_CHECK
         # Before the destination is computed, so the folders and the database agree.
         trackmetadata = nfc_track_metadata(trackmetadata)
@@ -215,7 +220,9 @@ class Organizer:
         try:
             safe_name = sanitize_file_name(file_path.name)
         except UnsafePathComponent:
-            print(f"{file_path} has an unusable file name")
+            operator_logger.warning(
+                "%s of user %s has an unusable file name", file_path.name, self.ctx.owner_id
+            )
             return ImportOutcome.FAILS_CHECK
 
         destination_path = sanitized_destination_path(
@@ -228,7 +235,10 @@ class Organizer:
 
         # Internal dirs (.staging, .uploads, ...) are never a library home.
         if is_internal_path(destination_path, self.ctx.music_library_dir):
-            print(f"Destination {destination_path} is inside an internal directory.")
+            operator_logger.warning(
+                "Destination %s is inside an internal directory.",
+                os.path.relpath(destination_path, self.ctx.music_library_dir),
+            )
             return ImportOutcome.FAILS_CHECK
 
         trackmetadata, cover_art_result, art_bytes = self._register_cover_art(
@@ -287,7 +297,10 @@ class Organizer:
             except TrackPathTaken:
                 if rollback_move(destination_path=destination_path, original_path=file_path):
                     continue
-                print(f"Failed to add track to database after move: {destination_path}")
+                operator_logger.warning(
+                    "Failed to add track to database after move: %s",
+                    os.path.relpath(destination_path, self.ctx.music_library_dir),
+                )
                 self._cleanup_cover_art(cover_art_result)
                 return ImportOutcome.DATABASE_ERROR
             break
@@ -296,7 +309,10 @@ class Organizer:
             return ImportOutcome.MOVE_FAILED
 
         if not was_added:
-            print(f"Failed to add track to database after move: {destination_path}")
+            operator_logger.warning(
+                "Failed to add track to database after move: %s",
+                os.path.relpath(destination_path, self.ctx.music_library_dir),
+            )
             rollback_move(destination_path=destination_path, original_path=file_path)
             self._cleanup_cover_art(cover_art_result)
             return ImportOutcome.DATABASE_ERROR
@@ -356,7 +372,7 @@ class Organizer:
                         update={"cover_art_id": cover_art_result.cover_art_id}
                     )
                 except ValueError as e:
-                    print(f"Failed to add cover art for {file_path}: {e}")
+                    operator_logger.warning("Failed to add cover art for %s: %s", file_path.name, e)
         return metadata, cover_art_result, art_bytes
 
     def _add_track(
@@ -379,7 +395,11 @@ class Organizer:
                 except CoverArtGone:
                     pass
                 except Exception as e:
-                    print(f"Retry after vanished cover art failed for {track.file_path}: {e}")
+                    operator_logger.warning(
+                        "Retry after vanished cover art failed for %s: %s",
+                        track.file_path.name,
+                        getattr(e, "strerror", None) or type(e).__name__,
+                    )
             return False, cover_art_result
 
     def _choose_destination(self, base: Path, source: Path, incoming: Any) -> Path | ImportOutcome:
@@ -510,7 +530,10 @@ class Organizer:
         try:
             self.ctx.release_cover_art(cover_art_result.cover_art_id)
         except ValueError as e:
-            print(f"Failed to remove cover art {cover_art_result.cover_art_id}: {e}")
+            operator_logger.warning(
+                "Failed to remove cover art %s: %s",
+                cover_art_result.cover_art_id, e,
+            )
 
 
 def final_is_own_link(row) -> bool:

@@ -17,10 +17,14 @@ final credentialsProvider = Provider<Credentials?>((ref) => null);
 /// overrides it; [credentialsProvider] is then null.
 final credentialsUnavailableProvider = Provider<bool>((ref) => false);
 
-/// The seam the 401 hook calls (spec 7.2). M.3d implements it to set the
-/// signed-out reason. It must only set in-memory state and never delete
-/// stored credentials.
-final onUnauthorizedProvider = Provider<void Function()>((ref) => () {});
+/// The seam the 401 hook calls (spec 7.2), with the 401's server stamp
+/// (null without one). The session implements it: the stamp of the bound
+/// server means signed out, another server's the different-server block, no
+/// stamp an identity read. It must only set in-memory state and never
+/// delete stored credentials.
+final onUnauthorizedProvider = Provider<void Function(String? servedBy)>(
+  (ref) => (_) {},
+);
 
 /// The scope's API client (SC-27 invariant 14, spec 7.2).
 ///
@@ -45,7 +49,7 @@ final Provider<ApiClient> apiClientProvider = Provider<ApiClient>((ref) {
       inner,
       credentials,
       permit: _ScopeTokenPermit(ref),
-      onUnauthorized: () => ref.read(onUnauthorizedProvider)(),
+      onUnauthorized: (servedBy) => ref.read(onUnauthorizedProvider)(servedBy),
     );
     final route = ref.read(scopeTokenRouteProvider);
     route.attach(auth);

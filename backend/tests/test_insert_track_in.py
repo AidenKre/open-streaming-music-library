@@ -92,6 +92,36 @@ def test_the_helper_inserts_the_track_its_metadata_search_row_and_identity(db, t
     assert ident == {"exact_state": "current", "exact_digest": DIGEST}
 
 
+def test_adding_a_track_leaves_another_users_tombstone_alone(db, tmp_path):
+    """A re-added track clears its own tombstone (the delete would otherwise be
+    sent to clients again); a tombstone another user holds for the same id is
+    that user's, and stays."""
+    from tests.owned_database import add_test_user
+
+    other = add_test_user(db, "other")
+    track = _track(_master(tmp_path))
+    sql(db, "INSERT INTO track_tombstones (uuid_id, deleted_at, revision, owner_id) "
+            "VALUES (?, 0, 1, ?)", (track.uuid_id, other))
+
+    with db._connection(commit=True) as conn:
+        db._insert_track_in(conn, track, owner_id=db.owner_id, fingerprinter_present=False, stat=STAT)
+
+    assert sql(db, "SELECT owner_id FROM track_tombstones WHERE uuid_id = ?", (track.uuid_id,)) == [
+        {"owner_id": other}
+    ]
+
+
+def test_adding_a_track_clears_its_owners_own_tombstone(db, tmp_path):
+    track = _track(_master(tmp_path))
+    sql(db, "INSERT INTO track_tombstones (uuid_id, deleted_at, revision, owner_id) "
+            "VALUES (?, 0, 1, ?)", (track.uuid_id, db.owner_id))
+
+    with db._connection(commit=True) as conn:
+        db._insert_track_in(conn, track, owner_id=db.owner_id, fingerprinter_present=False, stat=STAT)
+
+    assert sql(db, "SELECT owner_id FROM track_tombstones WHERE uuid_id = ?", (track.uuid_id,)) == []
+
+
 def test_a_none_stat_is_stored_as_unknown_never_zero(db, tmp_path):
     track = _track(_master(tmp_path))
 

@@ -104,6 +104,21 @@ void main() {
       expect(session().connectError, isNull);
     });
 
+    test('one connect at a time: a second tap while one runs sends nothing',
+        () async {
+      await session().start();
+      service.connectGate = Completer<void>();
+      final first = session().connect('http://ok');
+      final second = session().connect('http://ok');
+      service.connectGate!.complete();
+      await Future.wait([first, second]);
+      expect(service.connects, 1);
+      expect(session().phase, SessionPhase.logIn);
+
+      await session().connect('http://ok'); // the next one runs again
+      expect(service.connects, 2);
+    });
+
     test(
       'disconnect: resetting, then complete with an honest failure',
       () async {

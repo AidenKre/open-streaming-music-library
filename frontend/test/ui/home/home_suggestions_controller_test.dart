@@ -805,9 +805,12 @@ void main() {
         () async {
       await start();
       await land();
+      final captures = service.captures.length;
       service.last.staleness.addError(StateError('db closed'));
       await settle();
       expect(shown(_rd), ['R1-0', 'R1-1', 'R1-2']);
+      expect(service.captures, hasLength(captures),
+          reason: 'the error starts no refresh that would replace them');
     });
   });
 
@@ -819,6 +822,10 @@ void main() {
       pending.complete();
       await settle();
       expect(notifications, 0);
+      // Dropped, not applied silently: no rail left loading turned ready, and
+      // nothing listens for the late snapshot's freshness.
+      expect(stateOf(_rd), isA<SuggestionRailLoading>());
+      expect(pending.staleness.hasListener, isFalse);
     });
   });
 }

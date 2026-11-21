@@ -10,6 +10,7 @@ import pytest
 
 import app.services.organizer as organizer
 from app.services.cover_art_manager import CoverArtAddResult
+from app.services.import_outcome import ImportOutcome
 from app.models.track_meta_data import TrackMetaData
 from app.services.path_sanitize import PathEscapesRoot
 
@@ -176,18 +177,18 @@ class TestOrganizer:
         )
         return organizer.Organizer(ctx)
     
-    def test_organize_file__organizing_moving_source_does_not_exist__does_not_organize(self, tmp_path: Path):
+    def test_organize__organizing_moving_source_does_not_exist__does_not_organize(self, tmp_path: Path):
         music_dir = Path(tmp_path / "music")
         organize = self._create_organizing_moving_organizer(music_dir=music_dir)
         file_path = tmp_path / "input/fake_file.mp3"
 
-        result = organize.organize_file(file_path=file_path)
+        result = organize.organize(file_path=file_path) is ImportOutcome.IMPORTED
 
         assert result is False
         assert not music_dir.exists()
         assert not (tmp_path / "input").exists()
     
-    def test_organize_file__organizing_moving_empty_song__does_not_organize(self, tmp_path: Path):
+    def test_organize__organizing_moving_empty_song__does_not_organize(self, tmp_path: Path):
         music_dir = Path(tmp_path / "music")
         organize = self._create_organizing_moving_organizer(music_dir=music_dir)
 
@@ -200,7 +201,7 @@ class TestOrganizer:
                 trackmetadata = TrackMetaData()
                 get_track_metadata.return_value = trackmetadata
 
-                result = organize.organize_file(file_path=file_path)
+                result = organize.organize(file_path=file_path) is ImportOutcome.IMPORTED
 
                 assert result is False
                 assert not music_dir.exists()
@@ -221,7 +222,7 @@ class TestOrganizer:
             "album-artist"
         ]
     )
-    def test_organize_file__organizing_moving_various_scenarios(self, tmp_path: Path, trackmeta_kwargs, expected_subdir):
+    def test_organize__organizing_moving_various_scenarios(self, tmp_path: Path, trackmeta_kwargs, expected_subdir):
         music_dir = Path(tmp_path / "music")
         organize = self._create_organizing_moving_organizer(music_dir=music_dir)
         
@@ -233,7 +234,7 @@ class TestOrganizer:
             trackmetadata = TrackMetaData(**trackmeta_kwargs)
             get_track_metadata.return_value = trackmetadata
 
-            result = organize.organize_file(file_path=file_path)
+            result = organize.organize(file_path=file_path) is ImportOutcome.IMPORTED
 
             assert result is True
 
@@ -246,7 +247,7 @@ class TestOrganizer:
             organized_file_path = Path(organized_dir / "file.mp3")
             assert organized_file_path.is_file()
 
-    def test_organize_file__move_failure__cleans_up_new_cover_art(self, tmp_path: Path):
+    def test_organize__move_failure__cleans_up_new_cover_art(self, tmp_path: Path):
         music_dir = Path(tmp_path / "music")
         add_cover_art = Mock(return_value=CoverArtAddResult(cover_art_id=7, was_created=True))
         release_cover_art = Mock(return_value=True)
@@ -271,13 +272,13 @@ class TestOrganizer:
                 has_album_art=True,
             )
 
-            result = organize.organize_file(file_path=file_path)
+            result = organize.organize(file_path=file_path) is ImportOutcome.IMPORTED
 
         assert result is False
         add_cover_art.assert_called_once_with(b"art")
         release_cover_art.assert_called_once_with(7)
 
-    def test_organize_file__database_failure__rolls_back_file_and_cover_art(self, tmp_path: Path):
+    def test_organize__database_failure__rolls_back_file_and_cover_art(self, tmp_path: Path):
         music_dir = Path(tmp_path / "music")
         add_cover_art = Mock(return_value=CoverArtAddResult(cover_art_id=11, was_created=True))
         release_cover_art = Mock(return_value=True)
@@ -302,7 +303,7 @@ class TestOrganizer:
                 has_album_art=True,
             )
 
-            result = organize.organize_file(file_path=file_path)
+            result = organize.organize(file_path=file_path) is ImportOutcome.IMPORTED
 
         destination_path = music_dir / "artist" / "file.mp3"
         assert result is False
@@ -310,7 +311,7 @@ class TestOrganizer:
         assert not destination_path.exists()
         release_cover_art.assert_called_once_with(11)
 
-    def test_organize_file__re_registration_failure__rolls_back_the_move(self, tmp_path: Path):
+    def test_organize__re_registration_failure__rolls_back_the_move(self, tmp_path: Path):
         # Review r1 #2: the art vanished before the insert (CoverArtGone) and
         # re-registering it fails too: the file must not be stranded in the library.
         from app.database.database import CoverArtGone
@@ -346,13 +347,13 @@ class TestOrganizer:
             get_track_metadata.return_value = TrackMetaData(
                 duration=1.0, artist="artist", has_album_art=True,
             )
-            result = organize.organize_file(file_path=file_path)
+            result = organize.organize(file_path=file_path) is ImportOutcome.IMPORTED
 
         assert result is False
         assert file_path.read_bytes() == b"dataaaaaaaaaa"
         assert not (music_dir / "artist" / "file.mp3").exists()
 
-    def test_organize_file__database_failure__does_not_remove_reused_cover_art(self, tmp_path: Path):
+    def test_organize__database_failure__does_not_remove_reused_cover_art(self, tmp_path: Path):
         music_dir = Path(tmp_path / "music")
         release_cover_art = Mock(return_value=True)
         organize = self._create_organizing_moving_organizer(
@@ -376,7 +377,7 @@ class TestOrganizer:
                 has_album_art=True,
             )
 
-            result = organize.organize_file(file_path=file_path)
+            result = organize.organize(file_path=file_path) is ImportOutcome.IMPORTED
 
         assert result is False
         release_cover_art.assert_not_called()
@@ -418,7 +419,7 @@ class TestOrganizeFileHostileNames:
             add_to_database=lambda t: added.append(t) or True,
         )
         with patch("app.services.organizer.get_track_metadata", return_value=meta):
-            result = organizer.Organizer(ctx).organize_file(file_path=source)
+            result = organizer.Organizer(ctx).organize(file_path=source) is ImportOutcome.IMPORTED
         return result, music_dir, source, added
 
     @pytest.mark.parametrize(
@@ -539,7 +540,7 @@ class TestOrganizeFileContainment:
             patch("app.services.organizer.extract_cover_art_bytes", return_value=b"art"),
             pytest.raises(PathEscapesRoot),
         ):
-            organize.organize_file(file_path=source)
+            organize.organize(file_path=source)
 
         assert list(outside.iterdir()) == []
         assert source.read_bytes() == b"audio"
@@ -554,7 +555,7 @@ class TestOrganizeFileContainment:
             patch("app.services.organizer.get_track_metadata", return_value=meta),
             pytest.raises(PathEscapesRoot),
         ):
-            organize.organize_file(file_path=source)
+            organize.organize(file_path=source)
 
         assert list(outside.iterdir()) == []
         assert source.is_file()
@@ -578,7 +579,7 @@ class TestOrganizeFileContainment:
         meta = TrackMetaData(duration=1.0, artist="A")
 
         with patch("app.services.organizer.get_track_metadata", return_value=meta):
-            assert organizer.Organizer(ctx).organize_file(file_path=source) is True
+            assert organizer.Organizer(ctx).organize(file_path=source) is ImportOutcome.IMPORTED
 
         assert (real_root / "A" / "t.mp3").is_file()
 
@@ -1057,7 +1058,7 @@ class TestAHashFailureOnATakenNameIsRetried:
 
         outcome = rig.organize(incoming)
 
-        assert outcome is ImportOutcome.TOOL_UNAVAILABLE and outcome.environmental
+        assert outcome is ImportOutcome.TOOL_UNAVAILABLE and not outcome.belongs_to_file
         assert rig.names() == ["song.flac"]
         assert incoming.read_bytes() == b"two|t"
         assert rig.track_names() == []

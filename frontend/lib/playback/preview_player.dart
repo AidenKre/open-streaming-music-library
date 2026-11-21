@@ -170,8 +170,8 @@ final previewPlayerProvider =
 /// it holds focus: it acquires from the library first, which pauses and
 /// acknowledges, and it stops and acknowledges when the library takes the
 /// output back. Closing after it sounded leaves the library paused for the
-/// user to resume; closed or paused before it sounded, it hands the output
-/// back and the library plays on.
+/// user to resume; closed or paused before it sounded, or failing to load,
+/// it hands the output back and the library plays on.
 class PreviewPlayer extends Notifier<PreviewState>
     implements AudioFocusOwner, FocusRelinquisher {
   late AudioFocus _focus;
@@ -186,11 +186,11 @@ class PreviewPlayer extends Notifier<PreviewState>
   bool _loaded = false;
   bool _engineReportsPlaying = false;
 
-  /// Whether a pause or a close by the person gives the output back to the
-  /// library, so that the music is never left paused for a preview that
-  /// never sounded: true from a hand-over by the library until this preview
-  /// produces sound, or until an OS interruption or unplugged headphones
-  /// reach it (the library must not start by itself after those).
+  /// Whether a pause or a close by the person, or a failed load, gives the
+  /// output back to the library, so that the music is never left paused for
+  /// a preview that never sounded: true from a hand-over by the library until
+  /// this preview produces sound, or until an OS interruption or unplugged
+  /// headphones reach it (the library must not start by itself after those).
   bool _handsBack = false;
 
   /// Set when an OS interruption paused playing preview; any later command
@@ -281,7 +281,11 @@ class PreviewPlayer extends Notifier<PreviewState>
     try {
       duration = await engine.load(resolution.uri!);
     } catch (_) {
-      if (_current(generation)) _set(source, PreviewStatus.failed);
+      if (_current(generation)) {
+        _set(source, PreviewStatus.failed);
+        // Nothing sounded: the music the hand-over paused plays on.
+        if (_handsBack) _focus.handBack(AudioOutput.preview);
+      }
       return;
     }
     if (!_current(generation)) return;

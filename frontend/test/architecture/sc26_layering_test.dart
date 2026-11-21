@@ -77,6 +77,32 @@ void main() {
     expect(scanned, isNot(contains('ui')));
   });
 
+  // The test above compares folder names the scan helper itself produces; this
+  // one checks the helper against a walk of its own, file by file, so a scan
+  // that skipped nested folders or some files would be seen.
+  test('the model scan holds every Dart file under lib/ outside ui/, at any '
+      'depth', () {
+    final expected = <String>{};
+    void walk(Directory dir) {
+      for (final entry in dir.listSync()) {
+        final rel = entry.path.substring('lib/'.length);
+        if (entry is Directory) {
+          if (rel != 'ui') walk(entry);
+        } else if (entry is File &&
+            rel.endsWith('.dart') &&
+            !rel.endsWith('.g.dart')) {
+          expected.add(rel);
+        }
+      }
+    }
+
+    walk(Directory('lib'));
+    final scanned = {for (final f in _modelFiles()) _libPath(f)};
+    expect(scanned, expected);
+    // Files in nested folders, so the walk itself is not shallow.
+    expect(expected.where((p) => p.split('/').length > 2), isNotEmpty);
+  });
+
   test('the session controller does no I/O of its own', () {
     final source = File('lib/ui/session_controller.dart').readAsStringSync();
     const names = [

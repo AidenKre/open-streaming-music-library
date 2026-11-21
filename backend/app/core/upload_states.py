@@ -17,3 +17,9 @@ SOURCE_GIVEN_BACK_STATES: tuple[str, ...] = ("cancelled", "expired", "imported",
 SOURCE_RELEASE_STATES: tuple[str, ...] = (
     "cancelled", "failed", "expanded", "imported", "duplicate", "expired",
 )
+
+# The states in which a staged upload is a possible duplicate of another: the
+# validation worker compares a new upload with the owner's items in these
+# states, and the duplicate report shows such a match as available. Nothing
+# can be imported from an upload that has ended.
+STAGED_MATCH_STATES: tuple[str, ...] = ("review_ready", "committing", "duplicate_conflict")

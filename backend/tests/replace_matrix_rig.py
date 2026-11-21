@@ -17,8 +17,9 @@ What is faked, and only that: the media tools. A file's bytes are
 and recovery reader derive everything from those bytes (``AUDIO`` gives each
 audio its codec, bitrate and sample rate), so "the old audio or the new audio,
 never a mixture" is an exact byte comparison. The two encoded caches are
-recording stand-ins, and the start-up sweep of left-over encoder processes
-lists none (as for the suite's app fixtures). Each fake media tool first binds
+recording stand-ins (the start-up steps the rig runs list no processes: the
+sweep of left-over encoder processes is main.py's own, before them). Each fake
+media tool first binds
 its call to the real tool's signature (``tests/tool_call_capture.py``), so it
 cannot swallow an argument the real tool does not take.
 
@@ -71,7 +72,7 @@ from app.library import Library
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
 from app.services import conversion as conversion_module
-from app.services import audio_identity, ffmpeg_runner, file_ops, metadata, transcoder
+from app.services import audio_identity, file_ops, metadata, transcoder
 from app.services import track_editor as track_editor_module
 from app.services.audio_identity import AudioIdentity, ExactAudioHash
 from app.services.conversion import (
@@ -761,6 +762,13 @@ class World:
     def staged(self) -> list[Path]:
         return sorted(self.staging.iterdir()) if self.staging.is_dir() else []
 
+    def empty_folders(self) -> list[str]:
+        """The folders under the music folder that hold nothing (staging apart,
+        which the server keeps)."""
+        return [str(path.relative_to(self.music)) for path in sorted(self.music.rglob("*"))
+                if path.is_dir() and not path.is_symlink() and path != self.staging
+                and not any(path.iterdir())]
+
     def library(self) -> Library:
         return Library(self.db, self.owner, root=self.root)
 
@@ -1167,9 +1175,6 @@ def build_world(tmp_path: Path, monkeypatch, writer: Writer) -> World:
     monkeypatch.setattr(conversion_module, "transcode", fake_transcode)
     monkeypatch.setattr(conversion_module, "ffprobe_for_metadata", fake_ffprobe)
     monkeypatch.setattr(conversion_module, "build_track_metadata", fake_build_track_metadata)
-    # The start-up sweep of left-over encoder processes lists none, as for the
-    # suite's app fixtures (no child process is started by these tests).
-    monkeypatch.setattr(ffmpeg_runner, "_list_processes", lambda: [])
     for rel, uuid_id in world.bystander_uuids.items():
         world.bystander_rows[rel] = world.track(uuid_id)
         st = os.lstat(world.music / rel)
@@ -1307,6 +1312,8 @@ def _check_final(world: World, expect: Expect) -> None:
     files.update(dict(expect.extra_files))
     found = world.files()
     assert found == files, (found, files)
+    # No folder is left behind for a file that never arrived or has gone.
+    assert world.empty_folders() == [], world.empty_folders()
     codec, bitrate, rate = AUDIO[audio]
     track = world.track()
     wanted = {

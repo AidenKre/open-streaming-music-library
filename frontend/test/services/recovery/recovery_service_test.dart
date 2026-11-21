@@ -4,6 +4,15 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:frontend/services/app_info_service.dart';
+import 'package:frontend/services/background/backoff_schedule.dart';
+import 'package:frontend/services/background/single_flight_runner.dart';
+import 'package:frontend/services/deletion/delete_jobs_manager.dart';
+import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
+import 'package:frontend/services/download_manager.dart';
+import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/history/history_providers.dart';
+import 'package:frontend/services/server_binding_gate.dart';
+import 'package:frontend/services/uploads/upload_manager.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 
@@ -28,6 +37,40 @@ class _Recording implements RecoverableService {
   Future<void> recover(RecoveryTrigger trigger) async {
     log.add(label);
   }
+}
+
+/// A gate that only answers whether it is verified now.
+class _Gate extends Fake implements ServerBindingGate {
+  bool verified = true;
+  @override
+  bool get isVerifiedNow => verified;
+}
+
+/// Records what a recovery adapter asks of its subsystem.
+class _Uploads extends Fake implements UploadManager {
+  final log = <String>[];
+  @override
+  void resumeAfterBoundServerBack() => log.add('resume');
+  @override
+  void request(String reason, {bool bypassBackoff = false}) =>
+      log.add('request $reason');
+}
+
+class _Deletions extends Fake implements DeleteJobsManager {
+  final log = <String>[];
+  @override
+  void resumeAfterBoundServerBack() => log.add('resume');
+  @override
+  void request(String reason, {bool bypassBackoff = false}) =>
+      log.add('request $reason');
+}
+
+class _Downloads extends Fake implements DownloadManager {
+  final log = <String>[];
+  @override
+  void resumeAfterBoundServerBack() => log.add('resume');
+  @override
+  void resumeIfPaused() => log.add('resumeIfPaused');
 }
 
 /// Throws on recover to verify per-member try/catch isolation.
@@ -277,6 +320,135 @@ void main() {
         );
       },
     );
+
+    // The bound server is verified again after a different-server block:
+    // the four runners a 401 from the other server can park resume.
+    test('the bound server back resumes downloads, history, uploads and '
+        'deletions', () {
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final members = container
+          .read(recoverablesProvider)
+          .where((r) => r.triggers.contains(RecoveryTrigger.boundServerBack))
+          .map((r) => r.recoveryPriority)
+          .toSet();
+      expect(members, {
+        RecoveryPriority.resumeDownloads,
+        RecoveryPriority.history,
+        RecoveryPriority.uploads,
+        RecoveryPriority.deleteJobs,
+      });
+    });
+
+    test('the bound server back reopens a history runner a 401 parked, and '
+        'its pass runs', () async {
+      final passes = <Set<String>>[];
+      PassOutcome outcome = const PassParked();
+      final runner = SingleFlightRunner(
+        name: 'history',
+        backoff: BackoffSchedule(jitter: 0),
+        pass: (reasons) async {
+          passes.add({...reasons});
+          return outcome;
+        },
+      );
+      final gate = _Gate();
+      final container = ProviderContainer(
+        overrides: [
+          historyRunnerProvider.overrideWithValue(runner),
+          serverBindingGateProvider.overrideWithValue(gate),
+        ],
+      );
+      addTearDown(container.dispose);
+      runner.request('timer');
+      await pumpEventQueue();
+      expect(passes, hasLength(1)); // parked by the 401
+
+      outcome = const PassDone();
+      final history = container
+          .read(recoverablesProvider)
+          .singleWhere((r) => r.recoveryPriority == RecoveryPriority.history);
+      await history.recover(RecoveryTrigger.networkRecovered);
+      await pumpEventQueue();
+      expect(passes, hasLength(1), reason: 'an ordinary edge does not reopen');
+
+      gate.verified = false; // signed out before this member's turn
+      await history.recover(RecoveryTrigger.boundServerBack);
+      await pumpEventQueue();
+      expect(passes, hasLength(1), reason: 'not verified: stays parked');
+
+      gate.verified = true;
+      await history.recover(RecoveryTrigger.boundServerBack);
+      await pumpEventQueue();
+      expect(passes, hasLength(2));
+      expect(passes.last, {'boundServerBack'});
+    });
+
+    group('the bound server back: each adapter resumes its subsystem only '
+        'then, and only while the server is verified', () {
+      late _Gate gate;
+      late _Uploads uploads;
+      late _Deletions deletions;
+      late _Downloads downloads;
+      late ProviderContainer container;
+
+      setUp(() {
+        gate = _Gate();
+        uploads = _Uploads();
+        deletions = _Deletions();
+        downloads = _Downloads();
+        container = ProviderContainer(
+          overrides: [
+            serverBindingGateProvider.overrideWithValue(gate),
+            uploadManagerProvider.overrideWithValue(uploads),
+            deleteJobsManagerProvider.overrideWithValue(deletions),
+            downloadManagerProvider.overrideWithValue(downloads),
+          ],
+        );
+      });
+      tearDown(() => container.dispose());
+
+      RecoverableService member(int priority) => container
+          .read(recoverablesProvider)
+          .singleWhere((r) => r.recoveryPriority == priority);
+
+      test('uploads', () async {
+        final m = member(RecoveryPriority.uploads);
+        await m.recover(RecoveryTrigger.networkRecovered);
+        await m.recover(RecoveryTrigger.boundServerBack);
+        gate.verified = false; // signed out meanwhile
+        await m.recover(RecoveryTrigger.boundServerBack);
+        expect(uploads.log, [
+          'request networkRecovered',
+          'resume',
+          'request boundServerBack',
+          'request boundServerBack',
+        ]);
+      });
+
+      test('deletions', () async {
+        final m = member(RecoveryPriority.deleteJobs);
+        await m.recover(RecoveryTrigger.networkRecovered);
+        await m.recover(RecoveryTrigger.boundServerBack);
+        gate.verified = false;
+        await m.recover(RecoveryTrigger.boundServerBack);
+        expect(deletions.log, [
+          'request networkRecovered',
+          'resume',
+          'request boundServerBack',
+          'request boundServerBack',
+        ]);
+      });
+
+      test('downloads', () async {
+        final m = member(RecoveryPriority.resumeDownloads);
+        await m.recover(RecoveryTrigger.networkRecovered);
+        await m.recover(RecoveryTrigger.boundServerBack);
+        gate.verified = false;
+        await m.recover(RecoveryTrigger.boundServerBack);
+        expect(downloads.log, ['resumeIfPaused', 'resume', 'resumeIfPaused']);
+      });
+    });
 
     test('network recovery re-fetches app capabilities', () async {
       // After an offline cold start appInfoProvider holds the cached/default

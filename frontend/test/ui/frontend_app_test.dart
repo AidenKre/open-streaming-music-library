@@ -11,10 +11,15 @@ import 'package:drift/native.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:frontend/api/api_client_provider.dart';
+import 'package:frontend/api/server_identity_api.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/main.dart';
 import 'package:frontend/playback/audio_service_bridge.dart';
+import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/background/backoff_schedule.dart';
+import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/recovery/recoverable.dart';
 import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/services/credential_store.dart';
@@ -26,6 +31,7 @@ import 'package:frontend/ui/startup_gate.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/fake_secure_backend.dart';
+import '../helpers/server_binding.dart';
 import 'fake_player_controls.dart';
 import 'fake_session_controls.dart';
 import 'browse_harness.dart' show teardownTree;
@@ -68,6 +74,7 @@ void main() {
   Widget app({
     Future<Credentials?> Function()? loadCredentials,
     SessionEventLogFile? sessionEventLog,
+    List<Override> extraOverrides = const [],
   }) =>
       FrontendApp(
         db: db,
@@ -88,6 +95,7 @@ void main() {
                   )),
           recoveryServiceProvider.overrideWith(_NoRecovery.new),
           playerControlsProvider.overrideWithValue(FakePlayerControls()),
+          ...extraOverrides,
         ],
       );
 
@@ -340,11 +348,28 @@ void main() {
   });
 
   // Phase M §7.2/§7.7 (M-U24): the scope's 401 hook is the session's
-  // signed-out reason.
+  // signed-out reason, once the bound server's identity is read again.
   testWidgets("the scope's 401 hook sets the session's signed-out reason",
       (tester) async {
-    await tester.runAsync(() => store.save(alice));
-    await tester.pumpWidget(app());
+    await tester.runAsync(() async {
+      await store.save(alice);
+      await seedTestBinding(db,
+          baseUrl: 'http://saved:1', instanceId: 'inst-1', userId: alice.userId);
+    });
+    await tester.pumpWidget(app(extraOverrides: [
+      // The bound server answers the identity read.
+      serverBindingGateProvider.overrideWith((ref) {
+        final gate = ServerBindingGate(
+          repository: ref.read(serverBindingRepositoryProvider),
+          signedInUserId: alice.userId,
+          probe: ({required String baseUrl, required bool reportOffline}) async =>
+              const ServerIdentity('inst-1'),
+          backoff: BackoffSchedule(jitter: 0),
+        );
+        ref.onDispose(gate.dispose);
+        return gate;
+      }),
+    ]));
     loads.single.complete('http://saved:1');
     await tester.runAsync(() => Future<void>.delayed(Duration.zero));
     await tester.pump();
@@ -353,7 +378,10 @@ void main() {
     final scope = scopeOf(tester);
     final session = scope.read(sessionServiceProvider);
     expect(session.serverBlocked.value, ServerBlockedReason.none);
-    scope.read(onUnauthorizedProvider)();
+    await tester.runAsync(() async {
+      scope.read(onUnauthorizedProvider)(null); // no stamp: the identity read
+      await pumpEventQueue();
+    });
     expect(session.serverBlocked.value, ServerBlockedReason.signedOut);
     await teardownTree(tester);
   });

@@ -51,6 +51,7 @@ void main() {
       s.container.read(cover).download(1),
       completion(isFalse),
     );
+    await pumpEventQueue(); // the bound server's identity is read again first
     expect(s.session.serverBlocked.value, ServerBlockedReason.signedOut);
   }
 
@@ -66,6 +67,7 @@ void main() {
     await s.container.read(settingsProvider.notifier).debugBackendSyncDone;
 
     expect(s.server.private, ['GET /settings/quality']);
+    await pumpEventQueue(); // the bound server's identity is read again first
     expect(s.session.serverBlocked.value, ServerBlockedReason.signedOut);
     expect(s.container.read(settingsProvider).value, local);
     final prefs = await SharedPreferences.getInstance();
@@ -107,9 +109,10 @@ void main() {
     final sub = s.container.listen(conversionJobsProvider, (_, _) {});
     addTearDown(sub.close);
     await s.container.read(conversionJobsProvider.notifier).refreshAll();
-    expect(s.session.serverBlocked.value, ServerBlockedReason.signedOut);
     final polls = s.server.private.length;
     expect(polls, 1);
+    await pumpEventQueue(); // the bound server's identity is read again first
+    expect(s.session.serverBlocked.value, ServerBlockedReason.signedOut);
 
     // A reschedule would have fired by now; a recovery refresh too.
     await pumpEventQueue();

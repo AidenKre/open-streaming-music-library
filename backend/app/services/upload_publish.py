@@ -18,7 +18,7 @@ from app.services import audio_identity, metadata, organizer, upload_placement
 from app.services.audio_identity import identity_from_columns
 from app.services.media_input import item_demuxer
 from app.services.path_sanitize import assert_within
-from app.services.upload_errors import commit_disk_full, upload_commit_failed
+from app.services.upload_errors import commit_disk_full, upload_commit_failed, upload_library_changed
 from app.services.upload_receipt import ReceiptFiles, owner_dir, remove_then_release, remove_verified
 
 log = logging.getLogger(__name__)
@@ -124,8 +124,16 @@ class UploadPublisher:
             except organizer.LinkUnknown as e:  # unknown, not "not ours": record nothing
                 log.warning("upload commit final name not examined: %s", type(e).__name__)
                 return "error"
-        return self._fail_safely(
-            prepared, final if placed else None, False, RuntimeError("recovered file invalid"))
+        # A library changed outside the server is why the file is missing or
+        # invalid: recorded as such, for good, instead of an invalid file.
+        cause = RuntimeError("recovered file invalid")
+        try:
+            upload_placement.assert_final_within(final, self._library_root(prepared["owner_id"]))
+        except upload_placement.LibraryChanged as e:
+            cause = e
+        except Exception:
+            pass
+        return self._fail_safely(prepared, final if placed else None, False, cause)
 
     def _fail_safely(self, prepared: dict, final, work_removed: bool, exc) -> str:
         try:
@@ -140,7 +148,7 @@ class UploadPublisher:
         owner = prepared["owner_id"]
         final = Path(prepared["final_path"])
         work = Path(prepared["work_path"])
-        assert_within(final, self._library_root(owner))
+        upload_placement.assert_final_within(final, self._library_root(owner))
         assert_within(work, owner_dir(self._uploads_root, owner))
         progress["final"] = final
         progress["work_removed"] = remove_verified(ReceiptFiles(), work)
@@ -223,7 +231,7 @@ class UploadPublisher:
         db = self._database
         final = Path(prepared["final_path"])
         work = Path(prepared["work_path"])
-        assert_within(final, self._library_root(owner))
+        upload_placement.assert_final_within(final, self._library_root(owner))
         assert_within(work, owner_dir(self._uploads_root, owner))
 
         measured = {}  # a copy hashes the work file before its temp exists
@@ -291,12 +299,20 @@ class UploadPublisher:
                 log.warning("upload commit final name not examined: %s", type(e).__name__)
                 return "error"
         disk_full = isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT)
-        error = commit_disk_full() if disk_full else upload_commit_failed()
+        library_changed = isinstance(exc, upload_placement.LibraryChanged)
+        # A changed library folder refuses every retry the same way: final, and
+        # only the operator can fix it, so the line names what was found.
+        if library_changed:
+            error = upload_library_changed()
+        else:
+            error = commit_disk_full() if disk_full else upload_commit_failed()
         if not self._database.fail_upload_publish(
                 owner_id=owner, operation_uuid=op, error_code=error.code,
                 error_message=error.message, now=int(self._clock()), placed=final is not None,
                 retryable=error.retryable):
             return "error"
+        if library_changed:
+            upload_placement.log_library_changed(owner, exc)
         self._at("after_failure_journal")
         try:
             if final is not None:
@@ -319,9 +335,8 @@ class UploadPublisher:
             library_root=self._library_root(prepared["owner_id"]))
 
     def _library_root(self, owner: int) -> Path:
-        from app.library import library_root  # deferred: app.library imports the services
-
-        return library_root(self._music_library_dir, self._database.get_user(owner))
+        return upload_placement.owner_library_root(
+            self._music_library_dir, self._database.get_user(owner))
 
     def _conflict_before_move(self, prepared: dict, track_uuids) -> str:
         """Step 3: record the conflict, then remove this operation's work copy
@@ -355,7 +370,7 @@ class UploadPublisher:
         """Remove the final file this operation placed, unless a track now
         references that path, then prune its empty directories."""
         try:
-            assert_within(final, self._library_root(owner))
+            upload_placement.assert_final_within(final, self._library_root(owner))
             if self._database.track_path_in_use(str(final), owner_id=ANY_OWNER):
                 return
             if remove_verified(ReceiptFiles(), final):

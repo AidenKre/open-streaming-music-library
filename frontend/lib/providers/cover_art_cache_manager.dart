@@ -126,7 +126,6 @@ class CoverArtCacheManager implements LocalResettable {
         ? NetworkImage(url)
         : CoverArtImageProvider(
             url,
-            cache,
             () => _fetch(cache, url),
             retry: retry,
           );
@@ -210,7 +209,6 @@ class CoverArtCacheManager implements LocalResettable {
 @visibleForTesting
 class CoverArtImageProvider extends ImageProvider<CoverArtImageProvider> {
   final String url;
-  final BaseCacheManager cache;
 
   /// Loads the file (decides per call whether the token may be sent). Not
   /// part of identity ([==], [hashCode]), so the image cache key stays
@@ -220,8 +218,7 @@ class CoverArtImageProvider extends ImageProvider<CoverArtImageProvider> {
   /// Part of identity: a new value is a new image-cache key (a retry).
   final int retry;
 
-  const CoverArtImageProvider(this.url, this.cache, this.load,
-      {this.retry = 0});
+  const CoverArtImageProvider(this.url, this.load, {this.retry = 0});
 
   @override
   ImageStreamCompleter loadImage(

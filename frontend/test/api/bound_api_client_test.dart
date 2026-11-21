@@ -227,7 +227,7 @@ void main() {
   });
 
   test('an unbound row (no instance id yet) accepts any stamp', () async {
-    await seedTestBinding(db, baseUrl: 'http://s');
+    await seedTestBinding(db, baseUrl: 'http://s', instanceId: null);
     answer = (_) => stamped({'ok': true}, 200, _other);
 
     expect(await bound().postJson(['x'], body: {}), {'ok': true});

@@ -21,10 +21,6 @@ final audioDurationProvider = Provider<Duration?>(
   (ref) => ref.watch(queuePlayerProvider.select((s) => s.playback.duration)),
 );
 
-final audioStatusProvider = Provider<PlayerStatus>(
-  (ref) => ref.watch(queuePlayerProvider.select((s) => s.playback.status)),
-);
-
 /// Desired transport: what the play/pause control shows and toggles.
 final audioPlayWhenReadyProvider = Provider<bool>(
   (ref) => ref.watch(queuePlayerProvider.select((s) => s.playback.playWhenReady)),

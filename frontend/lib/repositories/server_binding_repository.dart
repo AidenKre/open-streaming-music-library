@@ -53,11 +53,11 @@ class ServerBindingRepository {
   Future<ServerBindingRecord?> current() async =>
       _toRecord(await _select().getSingleOrNull());
 
-  /// Returns the binding row, creating a provisional one (NULL instance id,
-  /// fresh token) for [baseUrl] if none exists. A login passes both
-  /// [userId] and [instanceId] (M.3c); launch and connect callers pass none
-  /// for now, leaving them NULL (unknown). An existing row is returned
-  /// unchanged: its user and instance are never overwritten.
+  /// Returns the binding row, creating one (fresh token) for [baseUrl] if
+  /// none exists. Its one caller, the sign-in, passes both [userId] and
+  /// [instanceId] (M.3c); a NULL one would be unknown (tests seed such rows).
+  /// An existing row is returned unchanged: its user and instance are never
+  /// overwritten.
   Future<ServerBindingRecord> ensureProvisional(String baseUrl,
       {int? userId, String? instanceId}) {
     return _db.transaction(() async {

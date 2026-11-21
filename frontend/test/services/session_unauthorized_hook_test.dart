@@ -43,6 +43,7 @@ void main() {
       c.read(apiClientProvider).getJson(['tracks']),
       throwsA(anything),
     );
+    await pumpEventQueue(); // the bound server's identity is read again first
     expect(service().serverBlocked.value, ServerBlockedReason.signedOut);
     expect(networkFailures, 0, reason: 'offline comes from the reason only');
     expect(c.read(offlineModeProvider), isTrue);

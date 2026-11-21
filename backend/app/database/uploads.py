@@ -11,7 +11,7 @@ import uuid
 from app.core import job_runtime
 from app.core.owner import _require_owner
 from app.core.storage_purposes import UPLOAD_SOURCE, UPLOAD_WORK
-from app.core.upload_states import ENDED_STATES, SOURCE_RELEASE_STATES
+from app.core.upload_states import ENDED_STATES, SOURCE_RELEASE_STATES, STAGED_MATCH_STATES
 from app.database.core import DatabaseCore
 from app.database.operation_receipts import Replay as OpReplay
 
@@ -148,9 +148,9 @@ class UploadsPart(DatabaseCore):
                 "SELECT i.* FROM upload_item_audio_identity i JOIN upload_items u"
                 " ON u.owner_id = i.owner_id AND u.item_uuid = i.item_uuid"
                 " WHERE i.owner_id = ? AND i.item_uuid <> ?"
-                " AND u.state IN ('review_ready', 'committing', 'duplicate_conflict')"
+                f" AND u.state IN ({', '.join('?' * len(STAGED_MATCH_STATES))})"
                 " ORDER BY i.item_uuid",
-                (owner, key),
+                (owner, key, *STAGED_MATCH_STATES),
             ).fetchall()
             report_json = check(conn, own, extra)
             conn.execute(
@@ -769,13 +769,14 @@ class UploadsPart(DatabaseCore):
     def fail_upload_commit(
         self, *, owner_id: int, operation_uuid: str, boot_id: str, error_code: str,
         error_message: str, item_state: str, reservation_id: int | None, now: int,
-        keep_reservation: bool = False,
+        keep_reservation: bool = False, retryable: bool = True,
     ) -> bool:
         """End a commit that failed before ``prepared`` in one transaction,
         guarded by journal state ``committing`` and this boot's lease (False,
         nothing written, otherwise). The journal becomes ``failed``; the item
         goes to ``item_state`` (``review_ready`` or ``failed``) with a new
-        review version and a retryable error; the work reservation row is
+        review version and the error (retryable unless ``retryable`` is False:
+        a refusal every retry would meet again); the work reservation row is
         deleted, or, with ``keep_reservation`` (the work copy could not be removed),
         settled into the durable ``upload_work`` row so it stays counted. The staged source and its quota row are never touched."""
         if item_state not in ("review_ready", "failed"):
@@ -798,9 +799,9 @@ class UploadsPart(DatabaseCore):
             )
             cursor = conn.execute(
                 "UPDATE upload_items SET state = ?, review_version = review_version + 1,"
-                " error_code = ?, error_message = ?, error_retryable = 1, lease_boot_id = NULL,"
+                " error_code = ?, error_message = ?, error_retryable = ?, lease_boot_id = NULL,"
                 " updated_at = ? WHERE owner_id = ? AND item_uuid = ? AND state = 'committing'",
-                (item_state, error_code, error_message, now, owner, item),
+                (item_state, error_code, error_message, 1 if retryable else 0, now, owner, item),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("commit item left committing under the write lock")
@@ -815,11 +816,12 @@ class UploadsPart(DatabaseCore):
             return True
 
     def record_upload_commit_art(
-        self, *, owner_id: int, operation_uuid: str, boot_id: str, cover_art_id: int,
+        self, *, owner_id: int, operation_uuid: str, boot_id: str, cover_art_id: int | None,
         cover_art_created: bool, now: int,
     ) -> bool:
         """Journal the registered cover art and whether this operation created
-        it, guarded by state ``committing`` and this boot's lease."""
+        it, guarded by state ``committing`` and this boot's lease; with no art
+        (None) both columns are cleared, as in a journal that never had art."""
         owner = _require_owner(owner_id)
         key = str(uuid.UUID(str(operation_uuid)))
         with self._connection(commit=True, immediate=True) as conn:
@@ -827,7 +829,8 @@ class UploadsPart(DatabaseCore):
                 "UPDATE upload_commit_journal SET cover_art_id = ?, cover_art_created = ?,"
                 " updated_at = ? WHERE owner_id = ? AND operation_uuid = ?"
                 " AND state = 'committing' AND lease_boot_id = ?",
-                (cover_art_id, 1 if cover_art_created else 0, now, owner, key, boot_id),
+                (cover_art_id, None if cover_art_id is None else 1 if cover_art_created else 0,
+                 now, owner, key, boot_id),
             )
             return cursor.rowcount == 1
 
@@ -852,6 +855,23 @@ class UploadsPart(DatabaseCore):
             )
             return cursor.rowcount == 1
 
+    def upload_commit_art_named_elsewhere(
+        self, *, owner_id: int, operation_uuid: str, cover_art_id: int
+    ) -> bool:
+        """Whether a commit journal other than this operation's names
+        ``cover_art_id`` (the same test ``adopt_upload_commit_art`` makes): a
+        commit re-run then keeps such art instead of giving it back at its start,
+        since only tracks are checked when art is released."""
+        owner = _require_owner(owner_id)
+        key = str(uuid.UUID(str(operation_uuid)))
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM upload_commit_journal WHERE cover_art_id = ?"
+                " AND NOT (owner_id = ? AND operation_uuid = ?) LIMIT 1",
+                (cover_art_id, owner, key),
+            ).fetchone()
+            return row is not None
+
     @staticmethod
     def _exact_library_matches_in(
         conn, *, owner_id: int, item_uuid: str, identity, acknowledged: dict,
@@ -859,20 +879,20 @@ class UploadsPart(DatabaseCore):
     ) -> tuple[list[str], list[str]]:
         """SC-16a helper (never opens, commits or closes a connection): the
         owner's live library tracks with ``identity``'s exact audio identity
-        (``find_duplicates`` exact layer only, uncapped, finder order), split
+        (``find_matches``, the exact layer only, uncapped, finder order), split
         into (acknowledged, unacknowledged) for the committing ``item_uuid``.
         Acknowledged: listed in ``acknowledged['library_tracks']``; published
         by an imported item listed in ``['staged_items']``; or published by an
         imported item whose persisted acknowledgements list ``item_uuid``."""
         # Local import: app.services' package init imports this module (cycle).
-        from app.services.duplicate_detection import TrackRef, find_duplicates
+        from app.services.duplicate_detection import TrackRef, find_matches
 
-        report = find_duplicates(
+        found = find_matches(  # the matches only: the coverage counts are not used here
             conn, dataclasses.replace(identity, fingerprint=None),
             owner_id=owner_id, exclude=frozenset(exclude),
         )
         matches = [
-            m.subject.uuid_id for m in report.matches
+            m.subject.uuid_id for m in found
             if isinstance(m.subject, TrackRef) and m.kind == "exact"
         ]
         listed = set(acknowledged.get("library_tracks", ()))
@@ -994,7 +1014,7 @@ class UploadsPart(DatabaseCore):
         one transaction guarded on journal state ``prepared`` or ``moved`` (False,
         nothing written, otherwise): journal ``failed`` (``final_path`` NULL unless this
         operation placed a file there: ``placed``, or a ``moved`` journal), item back to ``review_ready``
-        with a new review version and a retryable error. Reservations, the
+        with a new review version and the error (retryable unless ``retryable`` is False). Reservations, the
         source and its quota row are untouched."""
         owner = _require_owner(owner_id)
         key = str(uuid.UUID(str(operation_uuid)))
@@ -1684,18 +1704,6 @@ class UploadsPart(DatabaseCore):
                     (int(keep_part), owner, key, part_path),
                 )
             return changed
-
-    def transition_upload_item(
-        self, item_uuid, *, owner_id: int, from_states, to_state: str, now: int,
-        fields: dict | None = None,
-    ) -> tuple[bool, dict | None]:
-        with self._connection(commit=True, immediate=True) as conn:
-            changed = self._transition_upload_item_in(
-                conn, owner_id=owner_id, item_uuid=item_uuid, from_states=from_states,
-                to_state=to_state, now=now, fields=fields,
-            )
-            row = self._upload_item_in(conn, owner_id=owner_id, item_uuid=item_uuid)
-        return changed, row
 
     @staticmethod
     def _upload_item_dict(row) -> dict:

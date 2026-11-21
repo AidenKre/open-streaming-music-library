@@ -903,7 +903,7 @@ def test_delete_just_after_the_last_chunk_wins_and_removes_the_source_too(client
         results = []
         async with anyio.create_task_group() as tg:
             await start_put(tg, client, it, [DATA], results)
-            await anyio.to_thread.run_sync(files.paused.wait)
+            assert await anyio.to_thread.run_sync(files.paused.wait, HANG_GUARD_S)
             deleted = await thread_delete(client, f"/tracks/uploads/items/{it}")
             files.resume.set()
         return results, deleted

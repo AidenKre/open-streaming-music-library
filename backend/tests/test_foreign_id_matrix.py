@@ -31,6 +31,7 @@ from app.services.encoder_coordinator import PrefetchOutcome
 from tests.auth_helpers import create_session
 from tests.conftest import bearer
 from tests.owned_database import add_test_user
+from tests.track_removal import delete_track
 
 # Spec §5.4: the query and body parameters that carry IDs.
 LISTED_QUERY_IDS = {
@@ -426,6 +427,7 @@ def _post_job(w):
 
 
 def _warm(w):
+    w.client.app.state.encoder_coordinator.shutdown()  # stop the real pool before replacing it
     for outcome in (PrefetchOutcome.QUEUED, PrefetchOutcome.ALREADY_CACHED):
         coordinator = _RecordingCoordinator(outcome)
         w.client.app.state.encoder_coordinator = coordinator
@@ -738,7 +740,7 @@ def _preview_deletion_body(w):
     _deletion_switch_on(w)
     gone = _track(Path(str(w.theirs.file_path)).parent / "Gone.flac", "Gone")
     assert w.sam.add_track(gone)
-    assert w.sam.delete_track(gone.uuid_id)
+    assert delete_track(w.sam, gone.uuid_id)
     revision = w.theirs.revision
     r = w.request("POST", "/tracks/deletions/preview", json={"targets": [
         {"uuid_id": w.theirs.uuid_id, "base_revision": revision},

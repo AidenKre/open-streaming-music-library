@@ -21,6 +21,18 @@ String? retryOutcomeText(RetryOutcome outcome) => switch (outcome) {
 /// name.
 const uploadActionFailedText = 'Something went wrong. Try again.';
 
+/// A review action on an item this device holds no upload record of: the
+/// app sent nothing.
+const reviewItemNotHereText =
+    "This file isn't in this device's list of uploads, so nothing was sent.";
+
+/// An unpacked archive whose file list the server no longer keeps (its
+/// retention ended); nothing can bring the list back. Hedged: none of its
+/// files may have been imported, or an imported one deleted since.
+const archiveFileListGoneText =
+    'The server no longer keeps the list of files from this archive. Check '
+    'your library for the files it imported.';
+
 /// The status of an adopted item whose bytes another device is sending.
 const otherDeviceSendingStatus = 'Uploading from another device';
 
@@ -89,7 +101,7 @@ String uploadStatusText(
         paused ? 'Paused' : 'Uploading',
       (ServerItemState.validating, _) => 'Checking',
       (UploadIntentState.reviewSubmitted, _) => 'Sending',
-      (ServerItemState.reviewReady, 'upload_library_links_unsupported') =>
+      (ServerItemState.reviewReady, 'upload_library_changed') =>
         "Can't be imported",
       (ServerItemState.reviewReady, _) => 'Ready for review',
       (ServerItemState.committing, _) => 'Importing',
@@ -240,9 +252,17 @@ String? uploadDetailText(
       },
       ServerItemState.reviewReady => switch (errorCode) {
         null => null,
-        'upload_library_links_unsupported' =>
-          "This server's music library can't accept uploads. Ask whoever "
-              'runs the server to check its storage.',
+        // The refused copy stays on the server until cancelled. A file of an
+        // archive has no Cancel in the archive's row or file list: the
+        // archive is added again.
+        'upload_library_changed' when fromArchive =>
+          "This file could not be imported: the server's library folder was "
+              "changed outside the server. After the server's admin fixes "
+              'it, add the archive again.',
+        'upload_library_changed' =>
+          "This file could not be imported: the server's library folder was "
+              "changed outside the server. After the server's admin fixes "
+              'it, cancel this upload and add the file again.',
         'upload_review_version_conflict' =>
           'This file changed on the server since you opened it. Check it and '
               'confirm again.',

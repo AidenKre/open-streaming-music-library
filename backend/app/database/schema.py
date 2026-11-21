@@ -266,7 +266,7 @@ class SchemaPart(DatabaseCore):
         try:
             return self.read_setting(key)
         except Exception as e:
-            print(f"Error reading setting {key!r}: {e}")
+            operator_logger.error("Error reading setting %r: %s", key, e)
             return None
 
     def set_setting(self, key: str, value: str) -> None:

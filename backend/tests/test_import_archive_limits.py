@@ -164,7 +164,8 @@ def test_a_refused_archive_stays_with_one_operator_line(db, tmp_path, owner, cap
 def test_the_outcome_of_a_refused_archive_is_refused(db, tmp_path, owner):
     archive = _too_many_audio(_folder(tmp_path))
 
-    assert _ingestor(db, tmp_path, owner).ingest(archive) is ImportOutcome.REFUSED
+    assert _ingestor(db, tmp_path, owner).ingest(
+        archive, imported_dir=archive.parent / ".imported") is ImportOutcome.REFUSED
 
 
 def test_an_unchanged_refused_archive_is_neither_inspected_nor_logged_again(db, tmp_path, owner, caplog):

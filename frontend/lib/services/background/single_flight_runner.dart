@@ -19,7 +19,9 @@ final class PassMoreWork extends PassOutcome {
 }
 
 /// The pass hit a wait that only a scope rebuild ends (a 401): the runner
-/// parks for good, with no retry and no backoff change.
+/// parks, with no retry and no backoff change, until the scope ends or
+/// [SingleFlightRunner.resumeParked] reopens it (the 401 came from another
+/// server at the address, and the bound server is verified again).
 final class PassParked extends PassOutcome {
   const PassParked();
 }
@@ -37,8 +39,8 @@ final class PassFailed extends PassOutcome {
 /// failure backs off. A budgeted pass that reports [PassMoreWork] runs again
 /// after a yield; a [PassFailed] (or a pass that throws) schedules one
 /// retry paced by the [BackoffSchedule]; [PassDone] resets the backoff.
-/// [PassParked] ends the runner's work for its life: later requests are
-/// ignored (a new scope builds a new runner).
+/// [PassParked] ends the runner's work: later requests are ignored (a new
+/// scope builds a new runner) unless [resumeParked] reopens it.
 /// Generic: it knows nothing about the subsystem it runs.
 class SingleFlightRunner {
   SingleFlightRunner({
@@ -60,6 +62,9 @@ class SingleFlightRunner {
   bool _running = false;
   bool _bypassPending = false;
   bool _closed = false;
+
+  /// Closed by a [PassParked], not by [quiesce]: [resumeParked] may reopen.
+  bool _parked = false;
   Timer? _retry;
   Future<void>? _loop;
   final _idleWaiters = <Completer<void>>[];
@@ -83,6 +88,14 @@ class SingleFlightRunner {
 
   bool get isRunning => _running;
 
+  /// Reopens a runner a [PassParked] closed; the next [request] runs a pass.
+  /// Never reopens a quiesced runner; a no-op when not parked.
+  void resumeParked() {
+    if (!_parked) return;
+    _parked = false;
+    _closed = false;
+  }
+
   /// Completes when no pass is running or queued to run without waiting
   /// (a pending backoff retry does not count).
   Future<void> whenIdle() {
@@ -96,6 +109,7 @@ class SingleFlightRunner {
   /// once the pass in flight (if any) has finished. Idempotent.
   Future<void> quiesce() async {
     _closed = true;
+    _parked = false;
     _retry?.cancel();
     _retry = null;
     _reasons.clear();
@@ -133,6 +147,7 @@ class SingleFlightRunner {
             if (_reasons.isEmpty) return;
           case PassParked():
             _closed = true;
+            _parked = true;
             _retry?.cancel();
             _retry = null;
             _reasons.clear();

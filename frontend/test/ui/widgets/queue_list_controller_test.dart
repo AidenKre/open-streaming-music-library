@@ -290,6 +290,79 @@ void main() {
     expect(l.error, isNull);
   });
 
+  // The view's Retry repeats the read that failed: a re-read of the rows on
+  // screen in place, an initial load around the playing track.
+  test('a failed re-read of the rows on screen says so until a re-read '
+      'succeeds; a failed first load and a failed page read never do',
+      () async {
+    final flaky = _FailNextPageRepository(db);
+    final l = QueueListController(
+        repository: flaky, player: player, isOffline: () => false);
+    addTearDown(l.dispose);
+    final s = await session(300);
+    expect(l.failedVisibleReload, isFalse, reason: 'no error yet');
+
+    // A first load that fails.
+    l.plan(sessionId: s, queueVersion: 1, currentPlayPosition: 100,
+        totalCount: 300);
+    flaky.failNextPage = true;
+    await l.loadInitial(sessionId: s, expectedQueueVersion: 1,
+        currentPlayPosition: 100, totalCount: 300);
+    expect(l.error, isA<StateError>());
+    expect(l.failedVisibleReload, isFalse, reason: 'a first load');
+    await l.loadInitial(sessionId: s, expectedQueueVersion: 1,
+        currentPlayPosition: 100, totalCount: 300);
+    expect(l.error, isNull);
+
+    // A page read that fails.
+    flaky.failNextPage = true;
+    await l.loadAfter(totalCount: 300);
+    expect(l.failedPage, QueuePage.after);
+    expect(l.failedVisibleReload, isFalse, reason: 'a page read');
+    await l.loadAfter(totalCount: 300);
+    expect(l.error, isNull);
+
+    // A re-read of the rows on screen that fails.
+    l.plan(sessionId: s, queueVersion: 2, currentPlayPosition: 100,
+        totalCount: 300);
+    flaky.failNextPage = true;
+    await l.reloadVisible(sessionId: s, expectedQueueVersion: 2,
+        currentPlayPosition: 100, totalCount: 300, anchorLocalIndex: 30);
+    expect(l.error, isA<StateError>());
+    expect(l.failedPage, isNull);
+    expect(l.failedVisibleReload, isTrue);
+    await l.loadAfter(totalCount: 300);
+    expect(l.failedVisibleReload, isTrue,
+        reason: 'more rows loaded; the rows on screen are still the old ones');
+
+    // Retry: the same read again, which succeeds.
+    final anchor = await l.reloadVisible(sessionId: s, expectedQueueVersion: 2,
+        currentPlayPosition: 100, totalCount: 300, anchorLocalIndex: 30);
+    expect(anchor, 30, reason: 'the row the person was at keeps its place');
+    expect(l.error, isNull);
+    expect(l.failedVisibleReload, isFalse);
+
+    // A failed re-read followed by a failed first load (the playing track
+    // left the loaded rows): the newest failure is the first load's, so
+    // Retry loads around the playing track.
+    l.plan(sessionId: s, queueVersion: 3, currentPlayPosition: 100,
+        totalCount: 300);
+    flaky.failNextPage = true;
+    await l.reloadVisible(sessionId: s, expectedQueueVersion: 3,
+        currentPlayPosition: 100, totalCount: 300, anchorLocalIndex: 30);
+    expect(l.failedVisibleReload, isTrue);
+    expect(
+        l.plan(sessionId: s, queueVersion: 3, currentPlayPosition: 10,
+            totalCount: 300),
+        QueueReloadKind.initial);
+    flaky.failNextPage = true;
+    await l.loadInitial(sessionId: s, expectedQueueVersion: 3,
+        currentPlayPosition: 10, totalCount: 300);
+    expect(l.error, isA<StateError>());
+    expect(l.failedPage, isNull);
+    expect(l.failedVisibleReload, isFalse, reason: 'a first load failed last');
+  });
+
   // Section 6 #7 (U20-FE-QUEUE-B-11): a slow read cannot overwrite a newer
   // one. A skip can move the current item out of the window at an
   // unchanged queue version while a visible reload is still reading.

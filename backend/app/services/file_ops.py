@@ -14,6 +14,7 @@ import errno
 import hashlib
 import logging
 import os
+import re
 import shutil
 import stat
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import Optional
 
 from app.core.durable_fs import fsync_dir, fsync_file
 from app.core.internal_dirs import is_internal_path
+from app.core.operator_log import operator_logger
 from app.database.database import _fold_path
 from app.services.keyed_locks import KeyedLocks
 
@@ -151,6 +153,14 @@ def temp_name_for(destination: Path) -> Path:
     from the final name, a fixed 43 bytes, so it fits wherever the final does."""
     digest = hashlib.sha256(destination.name.encode("utf-8", "surrogateescape")).hexdigest()
     return destination.parent / f".{digest[:32]}.osml-part"
+
+
+_TEMP_NAME = re.compile(r"\.[0-9a-f]{32}\.osml-part")
+
+
+def is_temp_name(name: str) -> bool:
+    """True for a name ``temp_name_for`` makes."""
+    return _TEMP_NAME.fullmatch(name) is not None
 
 
 def place_no_replace(source: Path, destination: Path, *, in_use, before_fallback=None,
@@ -327,14 +337,18 @@ def rollback_move(destination_path: Path, original_path: Path) -> bool:
     if not destination_path.exists():
         return False
     if original_path.exists():
-        print(f"Cannot roll back move because original path already exists: {original_path}")
+        operator_logger.warning(
+            "Cannot roll back move because the original name is taken: %s",
+            original_path.name,
+        )
         return False
     try:
         original_path.parent.mkdir(parents=True, exist_ok=True)
         destination_path.replace(original_path)
         return True
     except (PermissionError, FileExistsError, OSError) as e:
-        print(
-            f"Exception trying to roll back move from {destination_path} to {original_path}: {e}"
+        operator_logger.warning(
+            "Could not roll back the move of %s: %s",
+            destination_path.name, getattr(e, "strerror", None) or type(e).__name__,
         )
         return False

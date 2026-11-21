@@ -97,7 +97,10 @@ void main() {
 
   setUp(() => transport = _Transport());
 
-  ProviderContainer scope(Credentials? credentials, {void Function()? hook}) {
+  ProviderContainer scope(
+    Credentials? credentials, {
+    void Function(String? servedBy)? hook,
+  }) {
     return ProviderContainer(
       overrides: [
         httpClientProvider.overrideWithValue(transport),
@@ -207,7 +210,7 @@ void main() {
 
     transport.status = 401;
     var hookCalls = 0;
-    final a = scope(_alice, hook: () => hookCalls++);
+    final a = scope(_alice, hook: (_) => hookCalls++);
     addTearDown(a.dispose);
     await expectLater(
       a.read(apiClientProvider).getJson(['tracks']),
@@ -224,7 +227,7 @@ void main() {
       ..status = 401
       ..held.add('/tracks');
     var hookCalls = 0;
-    final a = scope(_alice, hook: () => hookCalls++);
+    final a = scope(_alice, hook: (_) => hookCalls++);
     final pending = a.read(apiClientProvider).getJson(['tracks']);
     a.dispose();
     transport.release.complete();
@@ -238,7 +241,7 @@ void main() {
       () async {
     transport.status = 401;
     var hookCalls = 0;
-    final a = scope(_alice, hook: () => hookCalls++);
+    final a = scope(_alice, hook: (_) => hookCalls++);
     addTearDown(a.dispose);
     final bare = a.read(apiClientProvider).withoutToken();
     await expectLater(bare.getJson(['app', 'info']), throwsA(anything));
@@ -289,7 +292,7 @@ void main() {
       "calls the scope's hook", () async {
     transport.status = 401;
     var hookCalls = 0;
-    final a = scope(_alice, hook: () => hookCalls++);
+    final a = scope(_alice, hook: (_) => hookCalls++);
     addTearDown(a.dispose);
     final pre = a.read(unauthenticatedApiClientProvider)('http://other:2');
     await expectLater(pre.getJson(['app', 'info']), throwsA(anything));

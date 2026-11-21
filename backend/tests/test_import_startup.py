@@ -65,7 +65,7 @@ def test_a_file_that_fails_is_logged_and_retried_at_the_next_startup(
 ):
     bad = tmp_path / "import-users" / "sam" / "broken.mp3"
     with TestClient(configure_app().app) as c:
-        add_test_user(c.app.state.database, "sam")
+        sam = add_test_user(c.app.state.database, "sam")
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_bytes(b"not audio")
 
@@ -74,7 +74,11 @@ def test_a_file_that_fails_is_logged_and_retried_at_the_next_startup(
         with caplog.at_level(logging.INFO):
             with TestClient(configure_app(env=WATCH).app) as c:
                 _drain_imports(c)
-        assert str(bad) in caplog.text
+        # Logged at each start: the file by its name in the import folder and
+        # the user it belongs to, never by its full path.
+        messages = [r.getMessage() for r in caplog.records if "broken.mp3" in r.getMessage()]
+        assert f"import failed: broken.mp3 of user {sam} (fails_check)" in messages, messages
+        assert not any(str(tmp_path) in m or str(tmp_path.resolve()) in m for m in messages)
         assert bad.exists()
 
 

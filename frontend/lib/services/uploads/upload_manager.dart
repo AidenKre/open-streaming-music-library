@@ -293,7 +293,8 @@ class UploadManager {
   /// Items the user cancelled in this scope; their transfer writes nothing.
   final _cancelRequested = <String>{};
 
-  /// A 401 answered a transfer: nothing more is sent in this scope.
+  /// A 401 answered a transfer: nothing more is sent until the scope ends or
+  /// [resumeAfterBoundServerBack] (another server had sent the 401).
   bool _authParked = false;
 
   /// Another server answered: every running PUT was stopped and leaves its
@@ -318,12 +319,14 @@ class UploadManager {
   /// Cancels one file. A rejected item (the server never had it) is just
   /// marked cancelled; any other unfinished item becomes `cancelling`, its
   /// running transfer is aborted, and the runner sends the DELETE.
+  /// An item this device holds no intent for throws [UploadIntentMissing].
   Future<void> cancel(String itemUuid) async {
     if (isClosed) return;
     final token = (await _binding.current())?.localBindingId;
     if (token == null) return;
     final intent = await _intents.find(token, itemUuid);
-    if (intent == null || endedStates.contains(intent.lastState)) return;
+    if (intent == null) throw const UploadIntentMissing();
+    if (endedStates.contains(intent.lastState)) return;
     if (intent.lastState == UploadIntentState.rejected) {
       await _setItems(token, [intent], ServerItemState.cancelled, null);
       return;
@@ -407,6 +410,7 @@ class UploadManager {
   /// the review version it reports now. An item back at `allocated` gets a
   /// fresh transfer operation id (a deliberate new send, SC-14). Any other
   /// error, including a changed server, is rethrown with nothing written.
+  /// An item this device holds no intent for throws [UploadIntentMissing].
   Future<RetryOutcome> retry(String itemUuid) async {
     if (isClosed || _isOffline()) throw const UploadsUnavailable();
     if (featureForNetwork(await _feature()) == null) {
@@ -415,7 +419,7 @@ class UploadManager {
     final token = (await _binding.current())?.localBindingId;
     if (token == null) throw const UploadsUnavailable();
     final intent = await _intents.find(token, itemUuid);
-    if (intent == null) throw const UploadsUnavailable();
+    if (intent == null) throw const UploadIntentMissing();
 
     Future<void> store(UploadItem item, {bool fresh = false}) =>
         _intents.update(
@@ -461,6 +465,7 @@ class UploadManager {
   /// operation id per review version and asks the runner to send it. The
   /// same version reuses its id; a new version mints a new one (SC-14).
   /// A [SubmissionConflict] (same id, different body) goes to the caller.
+  /// An item this device holds no intent for throws [UploadIntentMissing].
   Future<void> submitReviewAction(
     String itemUuid,
     ReviewActionKind kind, {
@@ -471,7 +476,7 @@ class UploadManager {
     final token = (await _binding.current())?.localBindingId;
     if (token == null) throw const UploadsUnavailable();
     final intent = await _intents.find(token, itemUuid);
-    if (intent == null) return;
+    if (intent == null) throw const UploadIntentMissing();
     final state = intent.operationUuid == null
         ? null
         : (await _submissions.find(intent.operationUuid!))?.state;
@@ -647,6 +652,15 @@ class UploadManager {
     }
   }
 
+  /// The bound server is verified again after another server's 401: the
+  /// 401 park ends, this device's own commits still in flight are followed
+  /// again (as from the start), and the next request runs a pass.
+  void resumeAfterBoundServerBack() {
+    _authParked = false;
+    _followUntil = _clock.nowUtcMs() + followLimit.inMilliseconds;
+    _runner.resumeParked();
+  }
+
   /// A wait for auth: nothing is followed until a new pass gets through.
   PassOutcome _parked() {
     _followUntil = null;
@@ -817,12 +831,14 @@ class UploadManager {
       String? batchCursor;
       // A repeated cursor would loop forever.
       final seenBatchCursors = <String>{};
+      final listed = <String>{};
       do {
         final batches = await _api.listBatches(
           after: batchCursor,
           abortTrigger: _closing.future,
         );
         for (final batch in batches.batches) {
+          listed.add(batch.batchUuid);
           String? cursor;
           final seenCursors = <String>{};
           do {
@@ -840,6 +856,39 @@ class UploadManager {
         }
         batchCursor = batches.nextAfter;
       } while (batchCursor != null && seenBatchCursors.add(batchCursor));
+      // A failed row of a batch the listing left out: the server may have
+      // forgotten that batch (retention). Read it once to tell. An unpacked
+      // archive is finished on the server and stays as it is.
+      const failed = ServerItemState.failed;
+      final unlisted = <String, List<String>>{};
+      for (final i in await _intents.forBinding(token)) {
+        if (i.lastState == failed && !listed.contains(i.batchUuid)) {
+          (unlisted[i.batchUuid] ??= []).add(i.itemUuid);
+        }
+      }
+      for (final MapEntry(key: batch, value: rows) in unlisted.entries) {
+        try {
+          await _api.getBatch(batch, abortTrigger: _closing.future);
+        } catch (e) {
+          if (await _endIfBatchForgotten(
+            token,
+            e,
+            rows,
+            onlyIfStateIn: const {failed},
+          )) {
+            continue;
+          }
+          final failure = _stepFailure(e);
+          if (e is ServerInstanceChangedException ||
+              e is UploadTransferAborted ||
+              failure == null ||
+              failure is _StepParked) {
+            rethrow;
+          }
+          // Any other failure leaves this batch's rows as they are; the next
+          // page entry reads it again.
+        }
+      }
     } catch (e) {
       final failure = _stepFailure(e);
       if (failure == null) rethrow;
@@ -882,6 +931,8 @@ class UploadManager {
     for (final batch in batches) {
       try {
         String? cursor;
+        // A repeated cursor would loop forever.
+        final seenCursors = <String>{};
         do {
           final page = await _api.listItems(
             batch,
@@ -912,25 +963,20 @@ class UploadManager {
             );
           }
           cursor = page.nextAfter;
-        } while (cursor != null);
+        } while (cursor != null && seenCursors.add(cursor));
       } catch (e) {
-        if (e is ApiException &&
-            e.statusCode == 404 &&
-            e.errorCode == 'upload_batch_not_found') {
-          // The batch ended and the server forgot it: its rows end here.
-          await _intents.update(
-            token,
-            [
-              for (final i in [...local.values, ...waiting.values])
-                if (i.batchUuid == batch) i.itemUuid,
-            ],
-            lastState: const Value(ServerItemState.expired),
-            lastErrorCode: const Value('upload_batch_not_found'),
-            onlyIfStateIn: {
-              ...serverDrivenStates,
-              UploadIntentState.onOtherDevice,
-            },
-          );
+        if (await _endIfBatchForgotten(
+          token,
+          e,
+          [
+            for (final i in [...local.values, ...waiting.values])
+              if (i.batchUuid == batch) i.itemUuid,
+          ],
+          onlyIfStateIn: {
+            ...serverDrivenStates,
+            UploadIntentState.onOtherDevice,
+          },
+        )) {
           continue;
         }
         final failure = _stepFailure(e);
@@ -940,6 +986,26 @@ class UploadManager {
       }
     }
     return retry ?? const _StepDone();
+  }
+
+  /// When [e] says the batch ended and the server forgot it, its rows
+  /// [itemUuids] in [onlyIfStateIn] end here as expired; returns whether it
+  /// did.
+  Future<bool> _endIfBatchForgotten(
+    String token,
+    Object e,
+    List<String> itemUuids, {
+    required Set<String> onlyIfStateIn,
+  }) async {
+    if (!isBatchForgotten(e)) return false;
+    await _intents.update(
+      token,
+      itemUuids,
+      lastState: const Value(ServerItemState.expired),
+      lastErrorCode: const Value('upload_batch_not_found'),
+      onlyIfStateIn: onlyIfStateIn,
+    );
+    return true;
   }
 
   /// While Uploads is hidden: keeps reading the batches that hold this
@@ -1205,8 +1271,10 @@ class UploadManager {
             fetched = null; // the PUT's answer makes this stale
             // The source is opened only now: a file the server already
             // holds settles by status even when the local file is gone.
-            final descriptor = intent.descriptor!; // _openChecked checked it
+            // Opened first: _openChecked throws UploadSourceUnavailable for a
+            // descriptor that cannot be read, so it is non-null after it.
             final source = opened ?? await _openChecked(intent);
+            final descriptor = intent.descriptor!;
             await _intents.update(
               token,
               [intent.itemUuid],

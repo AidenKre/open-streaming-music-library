@@ -652,11 +652,8 @@ class DuplicatesController extends ChangeNotifier
 
   @override
   bool get canDeleteCopy {
-    final feature = _ref.read(libraryToolsFeatureProvider);
-    return serverDeleteAvailability(
-          loading: !feature.hasValue && !feature.hasError,
-          failed: feature.hasError && !feature.hasValue,
-          advertised: feature.hasValue ? feature.value : null,
+    return serverDeleteAvailabilityOf(
+          _ref.read(libraryToolsFeatureProvider),
           offline: _ref.read(offlineModeProvider),
         ) ==
         ServerDeleteAvailability.enabled;
@@ -828,8 +825,9 @@ class DuplicatesController extends ChangeNotifier
         pair.pair,
         jobs: _jobs,
         submitted: _ops,
-        // Without a manager nothing can be deleted from here.
-        unfinishedKnown: _unfinishedKnown || _manager == null,
+        // A manager that cannot be built leaves this false: whether a copy
+        // is already on its way out is unknown, so nothing is offered.
+        unfinishedKnown: _unfinishedKnown,
       );
 
   @override

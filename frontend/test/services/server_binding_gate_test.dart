@@ -3,10 +3,11 @@
 // Each connection (session activation, networkRecovered, appResume) starts a
 // verification that fetches /app/info DIRECTLY (never the prefs-cached blob).
 // Network participants await `awaitVerified()` before their first request.
-// Outcomes: same instance -> update URL; NULL row -> fill in place; legacy
-// server (no `server` block) -> verified, row stays NULL; different instance
-// -> blocked (no change, awaiters keep waiting); fetch failure -> unverified,
-// retried with BackoffSchedule, never "verified" from a cache.
+// Outcomes: same instance -> update URL; a row without an instance id (never
+// written: the sign-in stores it) -> never verified, no probe; a server
+// without an instance id -> unverified; different instance -> blocked (no
+// change, awaiters keep waiting); fetch failure -> unverified, retried with
+// BackoffSchedule, never "verified" from a cache.
 import 'dart:async';
 import 'dart:convert';
 
@@ -134,7 +135,9 @@ void main() {
       timers = _FakeTimers();
       probes = [];
       offline = false;
-      token = (await repo.ensureProvisional('http://a', userId: 1)).localBindingId;
+      token = (await repo.ensureProvisional('http://a',
+              userId: 1, instanceId: 'inst-1'))
+          .localBindingId;
       gate = makeGate();
     });
 
@@ -154,8 +157,7 @@ void main() {
       expect(probes, isEmpty);
     });
 
-    test('NULL row + instance id: filled in place, verified with the token',
-        () async {
+    test('the bound instance answers: verified with the token', () async {
       final verified = gate.awaitVerified();
       unawaited(gate.startConnection('http://a'));
       await settle();
@@ -170,6 +172,25 @@ void main() {
       expect(row.localBindingId, token);
     });
 
+    // A row without an instance id is never written (the sign-in stores
+    // it); if one were found, no server may adopt it: unknown is never "any
+    // server".
+    test('a row without an instance id never verifies: no probe, no token',
+        () async {
+      await repo.fence();
+      await repo.ensureProvisional('http://a', userId: 1);
+      var released = false;
+      unawaited(gate.awaitVerified().then((_) => released = true,
+          onError: (_) {}));
+      unawaited(gate.startConnection('http://a'));
+      await settle();
+      expect(gate.state, isA<BindingNoSession>());
+      expect(gate.isVerifiedNow, isFalse);
+      expect(probes, isEmpty);
+      expect(released, isFalse);
+      expect((await repo.current())!.instanceId, isNull);
+    });
+
     test('same instance at a new URL: verified, only the URL changes', () async {
       await repo.recordVerified(token, instanceId: 'inst-1', baseUrl: 'http://a');
       unawaited(gate.startConnection('http://alias:9'));
@@ -179,22 +200,6 @@ void main() {
       final row = (await repo.current())!;
       expect(row.lastBaseUrl, 'http://alias:9');
       expect(row.localBindingId, token);
-    });
-
-    test('legacy server: verified, row stays NULL; later block fills it',
-        () async {
-      unawaited(gate.startConnection('http://a'));
-      await settle();
-      probes.single.complete(const ServerIdentity(null));
-      expect(await gate.awaitVerified(), token);
-      expect((await repo.current())!.instanceId, isNull);
-
-      unawaited(gate.startConnection('http://a')); // e.g. appResume after upgrade
-      await settle();
-      probes.last.complete(const ServerIdentity('inst-1'));
-      await settle();
-      expect((await repo.current())!.instanceId, 'inst-1');
-      expect((await repo.current())!.localBindingId, token);
     });
 
     test('different instance: blocked, nothing changes, awaiters keep waiting',
@@ -324,7 +329,7 @@ void main() {
       probes.single.complete(const ServerIdentity('inst-9'));
       await settle();
       expect(gate.state, isA<BindingIdle>());
-      expect((await repo.current())!.instanceId, isNull);
+      expect((await repo.current())!.instanceId, 'inst-1');
       expect((await repo.current())!.lastBaseUrl, 'http://a');
     });
 
@@ -605,6 +610,21 @@ void main() {
         expect(await settledNow(), isTrue);
       });
 
+      test('verified under a sub-path: yes inside that path only, not for a '
+          'sibling path that shares its prefix', () async {
+        unawaited(gate.startConnection('http://h/osml/'));
+        await settle();
+        probes.last.complete(const ServerIdentity('inst-1'));
+        await settle();
+        expect(gate.state, isA<BindingVerified>());
+
+        expect(gate.allowsTokenTo(Uri.parse('http://h/osml/tracks')), isTrue);
+        expect(gate.allowsTokenTo(Uri.parse('http://h/osml')), isTrue);
+        expect(gate.allowsTokenTo(Uri.parse('http://h/osmlx/tracks')), isFalse);
+        expect(gate.allowsTokenTo(Uri.parse('http://h/tracks')), isFalse);
+        expect(gate.allowsTokenTo(Uri.parse('http://h/')), isFalse);
+      });
+
       test('idle (never started): no, and nothing to wait for', () async {
         expect(gate.allowsTokenTo(Uri.parse('http://a/tracks')), isFalse);
         expect(await settledNow(), isTrue);
@@ -823,7 +843,8 @@ void main() {
       });
       final api = testApiClient('http://srv', MockClient((req) async => appInfo));
       db = AppDatabase(NativeDatabase.memory());
-      await ServerBindingRepository(db).ensureProvisional('http://srv', userId: 1);
+      await ServerBindingRepository(db)
+          .ensureProvisional('http://srv', userId: 1, instanceId: 'inst-7');
       c = ProviderContainer(overrides: [
         databaseProvider.overrideWithValue(db),
         apiClientProvider.overrideWithValue(api),
@@ -841,10 +862,11 @@ void main() {
       final gate = await gateWith(http.Response('boom', 500));
       await gate.startConnection('http://srv');
       expect(gate.state, isA<BindingUnverified>());
-      expect((await ServerBindingRepository(db).current())!.instanceId, isNull);
+      expect(
+          (await ServerBindingRepository(db).current())!.instanceId, 'inst-7');
     });
 
-    test('a server block verifies and fills the row', () async {
+    test('a server block of the bound instance verifies', () async {
       final gate = await gateWith(http.Response(
         jsonEncode({
           'server': {'instance_id': 'inst-7'},

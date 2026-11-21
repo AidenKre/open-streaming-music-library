@@ -57,12 +57,14 @@ class DeleteJobsRecoverable implements RecoverableService {
 
   @override
   Future<void> recover(RecoveryTrigger trigger) async {
-    _ref
-        .read(deleteJobsManagerProvider)
-        .request(
-          trigger.name,
-          bypassBackoff: trigger != RecoveryTrigger.coldStart,
-        );
+    final deletions = _ref.read(deleteJobsManagerProvider);
+    if (resumesParkedWork(trigger, _ref.read(serverBindingGateProvider))) {
+      deletions.resumeAfterBoundServerBack();
+    }
+    deletions.request(
+      trigger.name,
+      bypassBackoff: trigger != RecoveryTrigger.coldStart,
+    );
   }
 }
 

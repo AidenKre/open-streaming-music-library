@@ -1,10 +1,12 @@
 // Phase M §7.7 (M-U24): `serverBlocked` carries a reason,
 // `none | differentServer | signedOut`, on the one blocked mechanism.
 //  * a 401 (the authenticated client's synchronous hook ->
-//    `SessionService.onUnauthorized`) sets `signedOut`: it closes the gate,
-//    turns offline on through the reason (polling stops, so a healthy server
-//    can't flip it back), and only sets in-memory state (the stored
-//    credentials stay);
+//    `SessionService.onUnauthorized`) makes the gate read the server's
+//    identity again; the bound server answering sets `signedOut`: the gate
+//    closes, offline turns on through the reason (polling stops, so a
+//    healthy server can't flip it back), and only in-memory state is set
+//    (the stored credentials stay). Another server answering is the
+//    different-server block (`session_replaced_server_test.dart`);
 //  * `BindingVerified` clears only `differentServer`; `signedOut` clears only
 //    through a scope rebuild; `differentServer` wins when both apply.
 import 'dart:async';
@@ -22,6 +24,8 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/background/backoff_schedule.dart';
 import 'package:frontend/services/credential_store.dart';
+import 'package:frontend/services/recovery/recoverable.dart';
+import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/session_service.dart';
 import 'package:http/http.dart' as http;
@@ -38,7 +42,7 @@ http.Client _healthy() => MockClient(
 
 /// A gate whose published states the test scripts (to drive a
 /// `BindingVerified` after the sign-out, which a real closed gate never
-/// sends), recording each close.
+/// sends), recording each identity check a 401 asks for.
 class _ScriptedGate extends ServerBindingGate {
   _ScriptedGate(AppDatabase db)
     : super(
@@ -51,7 +55,7 @@ class _ScriptedGate extends ServerBindingGate {
       );
 
   final script = StreamController<BindingGateState>.broadcast();
-  int closes = 0;
+  final checks = <String>[];
 
   @override
   Stream<BindingGateState> get states => script.stream;
@@ -61,7 +65,8 @@ class _ScriptedGate extends ServerBindingGate {
       Future.value();
 
   @override
-  void closeSignedOut() => closes++;
+  void checkAfterUnauthorized(String baseUrl, {String? servedBy}) =>
+      checks.add(servedBy == null ? baseUrl : '$baseUrl $servedBy');
 
   @override
   void dispose() {
@@ -70,12 +75,23 @@ class _ScriptedGate extends ServerBindingGate {
   }
 }
 
+/// Records the recovery runs the session asks for, and runs nothing.
+class _RecordingRecovery extends RecoveryService {
+  _RecordingRecovery(super.ref, this.runs);
+  final List<RecoveryTrigger> runs;
+
+  @override
+  Future<void> runFor(RecoveryTrigger trigger) async => runs.add(trigger);
+}
+
 void main() {
   late AppDatabase db;
+  late List<RecoveryTrigger> recoveries;
   late FakeSecureBackend secure;
   late CredentialStore store;
 
   setUp(() async {
+    recoveries = [];
     db = AppDatabase(NativeDatabase.memory());
     secure = FakeSecureBackend();
     store = CredentialStore(
@@ -107,6 +123,9 @@ void main() {
         credentialStoreProvider.overrideWithValue(store),
         databaseProvider.overrideWithValue(db),
         serverBindingGateProvider.overrideWithValue(gate),
+        recoveryServiceProvider.overrideWith(
+          (ref) => _RecordingRecovery(ref, recoveries),
+        ),
       ],
     );
     addTearDown(c.dispose);
@@ -130,11 +149,30 @@ void main() {
       expect(service().serverBlocked.value, ServerBlockedReason.none);
     });
 
-    test('a 401 sets signedOut, closes the gate and turns offline on',
-        () async {
+    /// The 401, then the bound server's answer to the identity read.
+    Future<void> unauthorizedByBoundServer() async {
       service().onUnauthorized();
-      expect(service().serverBlocked.value, ServerBlockedReason.signedOut,
+      await pumpEventQueue();
+      controlled.respond('inst-1');
+      await pumpEventQueue();
+    }
+
+    test('a 401 withholds the token at once and decides nothing before the '
+        "server's identity is read", () async {
+      service().onUnauthorized();
+      expect(controlled.gate.isVerifiedNow, isFalse,
           reason: 'set synchronously, before the response is returned');
+      expect(controlled.gate.allowsTokenTo(Uri.parse('http://s/tracks')),
+          isFalse);
+      await pumpEventQueue();
+      expect(controlled.pendingProbes, 1);
+      expect(service().serverBlocked.value, ServerBlockedReason.none);
+    });
+
+    test('the bound server answering: signedOut, the gate closed, offline on',
+        () async {
+      await unauthorizedByBoundServer();
+      expect(service().serverBlocked.value, ServerBlockedReason.signedOut);
       expect(controlled.gate.state, isA<BindingSignedOut>());
       expect(c.read(offlineModeProvider), isTrue);
       expect(c.read(offlineModeProvider.notifier).isPolling, isFalse,
@@ -148,7 +186,7 @@ void main() {
       OfflineModeNotifier.pollInterval = const Duration(hours: 1);
       final offline = c.read(offlineModeProvider.notifier)..enterOffline();
       expect(offline.isPolling, isTrue);
-      service().onUnauthorized();
+      await unauthorizedByBoundServer();
       expect(c.read(offlineModeProvider), isTrue);
       expect(offline.isPolling, isFalse,
           reason: 'no health poll may bring a signed-out app back online');
@@ -156,14 +194,14 @@ void main() {
 
     test('a healthy health poll does not bring a signed-out app online',
         () async {
-      service().onUnauthorized();
+      await unauthorizedByBoundServer();
       await pumpEventQueue(times: 50);
       expect(c.read(offlineModeProvider), isTrue);
       expect(service().serverBlocked.value, ServerBlockedReason.signedOut);
     });
 
     test('a later connection edge does not clear signedOut', () async {
-      service().onUnauthorized();
+      await unauthorizedByBoundServer();
       unawaited(controlled.gate.startConnection('http://s'));
       await pumpEventQueue();
       expect(controlled.pendingProbes, 0);
@@ -172,14 +210,24 @@ void main() {
     });
 
     test('a 401 keeps the stored credentials (memory only)', () async {
-      service().onUnauthorized();
-      await pumpEventQueue();
+      await unauthorizedByBoundServer();
       expect(await store.read(), isNotNull);
     });
 
-    test('repeated 401s are idempotent', () async {
+    test('repeated 401s are idempotent: one identity read, one sign-out',
+        () async {
       service().onUnauthorized();
+      await pumpEventQueue();
+      expect(controlled.pendingProbes, 1);
       service().onUnauthorized();
+      await pumpEventQueue();
+      expect(controlled.pendingProbes, 1);
+      controlled.respond('inst-1');
+      await pumpEventQueue();
+      expect(service().serverBlocked.value, ServerBlockedReason.signedOut);
+      service().onUnauthorized();
+      await pumpEventQueue();
+      expect(controlled.pendingProbes, 0);
       expect(service().serverBlocked.value, ServerBlockedReason.signedOut);
     });
 
@@ -192,6 +240,9 @@ void main() {
       expect(service().serverBlocked.value,
           ServerBlockedReason.differentServer);
       service().onUnauthorized();
+      await pumpEventQueue();
+      expect(controlled.pendingProbes, 0,
+          reason: 'the other server explains the 401: nothing to check');
       expect(service().serverBlocked.value,
           ServerBlockedReason.differentServer);
       expect(c.read(offlineModeProvider), isTrue);
@@ -228,15 +279,18 @@ void main() {
       serverInstanceId: 'inst-2',
     );
 
-    test('the 401 closes the gate', () {
+    const signedOut = BindingSignedOut();
+
+    test("the 401 asks the gate to decide, with the 401's stamp", () {
       service().onUnauthorized();
-      expect(gate.closes, 1);
+      service().onUnauthorized('inst-2');
+      expect(gate.checks, ['http://s', 'http://s inst-2']);
     });
 
-    test('a second 401 does not close the gate again', () {
+    test('once signed out, a 401 asks for no check', () async {
+      await publish(signedOut);
       service().onUnauthorized();
-      service().onUnauthorized();
-      expect(gate.closes, 1);
+      expect(gate.checks, isEmpty);
     });
 
     test('a disposed scope no longer watches the gate', () async {
@@ -246,7 +300,7 @@ void main() {
     });
 
     test('BindingVerified does not clear signedOut', () async {
-      service().onUnauthorized();
+      await publish(signedOut);
       await publish(verified);
       expect(service().serverBlocked.value, ServerBlockedReason.signedOut);
       expect(c.read(offlineModeProvider), isTrue,
@@ -260,17 +314,20 @@ void main() {
       await publish(verified);
       expect(service().serverBlocked.value, ServerBlockedReason.none);
       expect(c.read(offlineModeProvider), isFalse);
+      expect(recoveries, [RecoveryTrigger.boundServerBack],
+          reason: 'work parked by the other server resumes');
     });
 
     test('both apply: differentServer wins; verified leaves signedOut',
         () async {
-      service().onUnauthorized();
+      await publish(signedOut);
       await publish(different);
       expect(service().serverBlocked.value,
           ServerBlockedReason.differentServer);
       await publish(verified);
       expect(service().serverBlocked.value, ServerBlockedReason.signedOut);
       expect(c.read(offlineModeProvider), isTrue);
+      expect(recoveries, isEmpty, reason: 'signed out: nothing resumes');
     });
   });
 }

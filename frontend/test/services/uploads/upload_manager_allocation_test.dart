@@ -149,6 +149,26 @@ void main() {
     expect(_allocations(h.api), ['allocate u-1']);
   });
 
+  // Another server at the address answered the 401. Once the bound server
+  // is verified again, the session resumes the manager: an upload pass runs
+  // in this scope and the allocation is asked about again.
+  test('a 401 park is lifted when resumed: the next pass works', () async {
+    final defaultAllocate = h.api.onAllocate;
+    h.api.onAllocate = (_) async =>
+        throw apiError(401, 'auth_required', retryable: false);
+    await h.verify();
+    await h.manager.addFiles([await h.file('a.flac', 'abc')]);
+    await h.pump();
+    final calls = h.api.calls.length;
+
+    h.api.onAllocate = defaultAllocate;
+    h.manager.resumeAfterBoundServerBack();
+    h.manager.request('boundServerBack', bypassBackoff: true);
+    await h.pump();
+    expect(h.api.calls.length, greaterThan(calls),
+        reason: 'the upload pass runs again');
+  });
+
   // Sign-off OPEN-M-11 (E8): a withheld token means nothing was sent: the
   // rows stay as they were (not "ambiguous"), and the next pass allocates
   // with no status query first.

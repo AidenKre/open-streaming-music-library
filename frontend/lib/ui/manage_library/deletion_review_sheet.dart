@@ -170,6 +170,15 @@ class _CloseWhenNothingToReviewState extends State<_CloseWhenNothingToReview> {
   }
 
   @override
+  void didUpdateWidget(_CloseWhenNothingToReview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.review, widget.review)) {
+      oldWidget.review.removeListener(_check);
+      widget.review.addListener(_check);
+    }
+  }
+
+  @override
   void dispose() {
     widget.review.removeListener(_check);
     super.dispose();

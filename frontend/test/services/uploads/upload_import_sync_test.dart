@@ -2,11 +2,15 @@
 // request normal track sync". The library sync follows an item becoming
 // imported or duplicate in the local intents, whoever wrote it (the status
 // poll, a review answer, a review re-read) and whether or not a review page
-// shows the item. Model code, no page involved.
+// shows the item. Model code, no page involved. A sync that fails, or does
+// not run (offline, no verified connection), is tried again on the shared
+// background runner's backoff, a bounded number of times; it never changes
+// the import's row.
 import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/services/background/backoff_schedule.dart';
 import 'package:frontend/services/uploads/upload_import_sync.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/providers/providers.dart'
@@ -17,6 +21,7 @@ import 'package:frontend/services/uploads/upload_manager.dart'
     show uploadIntentStoreProvider;
 
 import '../../helpers/upload_intent_record.dart';
+import '../../helpers/upload_manager_harness.dart' show ManualTimers;
 
 UploadIntentRecord _intent(String uuid, String state) => intentRecord(
   uuid,
@@ -34,18 +39,36 @@ void main() {
   late int syncs;
   late Completer<void>? gate;
   late Object? error;
+  late bool ran;
+  late ManualTimers timers;
   late UploadImportSync sync;
 
   setUp(() {
     syncs = 0;
     gate = null;
     error = null;
-    sync = UploadImportSync(() async {
-      syncs++;
-      await gate?.future;
-      if (error != null) throw error!;
-    });
+    ran = true;
+    timers = ManualTimers();
+    sync = UploadImportSync(
+      () async {
+        syncs++;
+        await gate?.future;
+        if (error != null) throw error!;
+        return ran;
+      },
+      timer: timers.call,
+      backoff: BackoffSchedule(jitter: 0),
+    );
   });
+  tearDown(() => sync.close());
+
+  /// An item turning imported (a new item each time).
+  var n = 0;
+  void anImport() {
+    final uuid = 'x-${n++}';
+    sync.onIntents(_list({uuid: 'committing'}));
+    sync.onIntents(_list({uuid: 'imported'}));
+  }
 
   test('rows already ended when first seen ask for nothing', () async {
     sync.onIntents(_list({'a': 'imported', 'b': 'duplicate'}));
@@ -110,8 +133,8 @@ void main() {
     expect(syncs, 2);
   });
 
-  test('a failed sync is not thrown and the next import still syncs',
-      () async {
+  test('a failed sync is not thrown and the next import still syncs, at '
+      'the retry', () async {
     error = Exception('offline');
     sync.onIntents(_list({'a': 'committing', 'b': 'committing'}));
     sync.onIntents(_list({'a': 'imported', 'b': 'committing'}));
@@ -121,7 +144,79 @@ void main() {
     error = null;
     sync.onIntents(_list({'a': 'imported', 'b': 'imported'}));
     await pumpEventQueue();
+    expect(syncs, 1, reason: 'the import waits for the pending retry');
+    timers.fire();
+    await pumpEventQueue();
     expect(syncs, 2);
+  });
+
+  group('a sync that did not happen is tried again', () {
+    test('one that did not run (false) is tried again after the first '
+        'backoff step, and not again once one ran', () async {
+      ran = false;
+      anImport();
+      await pumpEventQueue();
+      expect(syncs, 1);
+      expect([for (final t in timers.active) t.duration],
+          [const Duration(seconds: 1)]);
+
+      ran = true;
+      timers.fire();
+      await pumpEventQueue();
+      expect(syncs, 2);
+      expect(timers.active, isEmpty);
+    });
+
+    test('one that threw is tried again the same way', () async {
+      error = Exception('server error');
+      anImport();
+      await pumpEventQueue();
+      expect(syncs, 1);
+      error = null;
+      timers.fire();
+      await pumpEventQueue();
+      expect(syncs, 2);
+      expect(timers.active, isEmpty);
+    });
+
+    test('the waits grow, and after five tries again it stops until the '
+        'next import', () async {
+      ran = false;
+      anImport();
+      await pumpEventQueue();
+      final waits = <Duration>[];
+      while (timers.active.isNotEmpty) {
+        waits.add(timers.active.single.duration);
+        timers.fire();
+        await pumpEventQueue();
+      }
+      expect(syncs, 6);
+      expect(waits, const [
+        Duration(seconds: 1),
+        Duration(seconds: 2),
+        Duration(seconds: 4),
+        Duration(seconds: 8),
+        Duration(seconds: 16),
+      ]);
+
+      // A later import asks again, at once.
+      anImport();
+      await pumpEventQueue();
+      expect(syncs, 7);
+    });
+
+    test('closing cancels a pending retry and ignores later imports',
+        () async {
+      ran = false;
+      anImport();
+      await pumpEventQueue();
+      expect(timers.active, hasLength(1));
+      await sync.close();
+      expect(timers.active, isEmpty);
+      anImport();
+      await pumpEventQueue();
+      expect(syncs, 1);
+    });
   });
 
   // review r1 (rev-1 #1): the sync must not hang on Riverpod listeners
@@ -136,7 +231,10 @@ void main() {
       overrides: [
         uploadIntentStoreProvider.overrideWithValue(_Store(intents.stream)),
         serverBindingRepositoryProvider.overrideWithValue(_Binding()),
-        uploadLibrarySyncProvider.overrideWithValue(() async => wired++),
+        uploadLibrarySyncProvider.overrideWithValue(() async {
+          wired++;
+          return true;
+        }),
       ],
     );
     addTearDown(() async {
@@ -153,6 +251,34 @@ void main() {
     expect(wired, 1);
   });
 
+  test('a sync that did not run leaves the upload rows alone', () async {
+    final intents = StreamController<List<UploadIntentRecord>>.broadcast();
+    final store = _Store(intents.stream);
+    var wired = 0;
+    final container = ProviderContainer(
+      overrides: [
+        uploadIntentStoreProvider.overrideWithValue(store),
+        serverBindingRepositoryProvider.overrideWithValue(_Binding()),
+        uploadLibrarySyncProvider.overrideWithValue(() async {
+          wired++;
+          return false;
+        }),
+      ],
+    );
+    addTearDown(() async {
+      container.dispose();
+      await intents.close();
+    });
+    container.read(uploadImportSyncProvider);
+    await pumpEventQueue();
+    intents.add(_list({'a': 'committing'}));
+    await pumpEventQueue();
+    intents.add(_list({'a': 'imported'}));
+    await pumpEventQueue();
+    expect(wired, 1);
+    expect(store.other, isEmpty, reason: 'only watched, never written');
+  });
+
   test('disposing the scope stops it', () async {
     final intents = StreamController<List<UploadIntentRecord>>.broadcast();
     var wired = 0;
@@ -160,7 +286,10 @@ void main() {
       overrides: [
         uploadIntentStoreProvider.overrideWithValue(_Store(intents.stream)),
         serverBindingRepositoryProvider.overrideWithValue(_Binding()),
-        uploadLibrarySyncProvider.overrideWithValue(() async => wired++),
+        uploadLibrarySyncProvider.overrideWithValue(() async {
+          wired++;
+          return true;
+        }),
       ],
     );
     container.read(uploadImportSyncProvider);
@@ -228,6 +357,9 @@ class _RecordingSync extends TrackSyncNotifier {
 class _Store implements UploadIntentStore {
   _Store(this.stream);
   final Stream<List<UploadIntentRecord>> stream;
+
+  /// Every call other than [watch].
+  final other = <Symbol>[];
   @override
   Stream<List<UploadIntentRecord>> watch(String bindingToken) {
     expect(bindingToken, 'bind');
@@ -235,7 +367,10 @@ class _Store implements UploadIntentStore {
   }
 
   @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+  dynamic noSuchMethod(Invocation invocation) {
+    other.add(invocation.memberName);
+    return super.noSuchMethod(invocation);
+  }
 }
 
 class _Binding implements ServerBindingRepository {

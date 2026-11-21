@@ -54,7 +54,7 @@ def test_a_file_is_never_moved_to_a_path_another_tracks_row_names(
             world.run_writer()
     else:
         world.run_writer()
-        assert world.job() == ("failed", "conversion failed (TargetPathTaken)")
+        assert world.job() == ("failed", "The conversion failed. The original was kept.")
 
     assert not os.path.lexists(world.new)
     assert world.track(a)["file_path"] == str(a_path)

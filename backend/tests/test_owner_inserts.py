@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from app.models import Track, TrackMetaData
 from tests.database_fixtures import plain_database
 from tests.sqlite_helpers import sql_rows
+from tests.track_removal import delete_track
 
 
 @pytest.fixture
@@ -119,7 +120,7 @@ def test_a_tombstone_keeps_the_deleted_tracks_owner(db):
     track = _track()
     assert db.add_track(track, owner_id=sam)
 
-    assert db.delete_track(track.uuid_id, owner_id=sam)
+    assert delete_track(db, track.uuid_id, owner_id=sam)
 
     assert sql_rows(
         db, "SELECT owner_id FROM track_tombstones WHERE uuid_id = ?", (track.uuid_id,)

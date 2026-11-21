@@ -204,7 +204,7 @@ class _LoopTickGate:
 
     def wrap(self, lookup):
         def gated(*args, **kwargs):
-            self.released.wait()
+            assert self.released.wait(10)  # a stalled loop fails the lookup, not the suite
             return lookup(*args, **kwargs)
 
         return gated
@@ -264,7 +264,7 @@ def test_a_request_cancelled_mid_lookup_logs_no_token_anywhere(app_client, monke
             "Host: testserver\r\nConnection: close\r\n\r\n".encode()
         )
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, entered.wait)  # the lookup is in its thread
+        assert await loop.run_in_executor(None, entered.wait, 10)  # the lookup is in its thread
         protocol.connection_lost(None)
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in tasks:

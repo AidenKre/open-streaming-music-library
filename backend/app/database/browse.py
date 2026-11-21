@@ -9,6 +9,7 @@ from enum import auto, Flag
 from typing import List, Literal, Optional
 
 from app.core.owner import Owner, _owner_predicate, _require_owner
+from app.core.operator_log import operator_logger
 from app.database.core import DatabaseCore, _row_to_track, _track_select_columns
 from app.models.album import Album
 from app.models.artist import Artist
@@ -432,8 +433,9 @@ class BrowsePart(DatabaseCore):
             raise ValueError("Cannot filter by album without artist")
 
         if limit <= 0 or limit > 1000 or offset < 0:
-            print(
-                f"Limit {limit} or Offset {offset} was set incorrectly for database.get_tracks"
+            operator_logger.warning(
+                "Limit %s or Offset %s was set incorrectly for database.get_tracks",
+                limit, offset,
             )
             raise ValueError
 
@@ -444,14 +446,16 @@ class BrowsePart(DatabaseCore):
         invalid_order_columns = order_columns - allowed_columns
 
         if invalid_search_columns:
-            print(
-                f"columns {invalid_search_columns} are not allowed as a search parameter"
+            operator_logger.warning(
+                "columns %s are not allowed as a search parameter",
+                invalid_search_columns,
             )
             raise ValueError
 
         if invalid_order_columns:
-            print(
-                f"columns {invalid_order_columns} are not allowed as a search parameter"
+            operator_logger.warning(
+                "columns %s are not allowed as a search parameter",
+                invalid_order_columns,
             )
             raise ValueError
 
@@ -517,8 +521,9 @@ class BrowsePart(DatabaseCore):
                     conn.cursor().execute(search_query, tuple(search_values)).fetchall()
                 )
         except Exception as e:
-            print(
-                f"Failed to search database. search_parameters: {search_parameters}. Exception: {e}"
+            operator_logger.error(
+                "Failed to search database. search_parameters: %s. Exception: %s",
+                search_parameters, e,
             )
             return []
 
@@ -635,7 +640,7 @@ class BrowsePart(DatabaseCore):
             # Re-raise so the endpoint surfaces a 5xx. Swallowing here would
             # return an empty page, which the client reads as "caught up" and
             # silently stops syncing — masking a transient DB failure.
-            print(f"Failed to get changes after revision {after_revision}: {e}")
+            operator_logger.error("Failed to get changes after revision %s: %s", after_revision, e)
             raise
 
     def get_tracks_count(
@@ -710,7 +715,7 @@ class BrowsePart(DatabaseCore):
                 )
             return count
         except Exception as e:
-            print(f"Failed to get count from database while executing query: {e}")
+            operator_logger.error("Failed to get count from database while executing query: %s", e)
             return None
 
     def get_artists(
@@ -728,8 +733,9 @@ class BrowsePart(DatabaseCore):
         if row_filter_parameters is None:
             row_filter_parameters = []
         if limit <= 0 or limit > 1000 or offset < 0:
-            print(
-                f"Limit {limit} or Offset {offset} was set incorrectly for database.get_artists"
+            operator_logger.warning(
+                "Limit %s or Offset %s was set incorrectly for database.get_artists",
+                limit, offset,
             )
             raise ValueError
         parameters: list = []
@@ -771,7 +777,7 @@ class BrowsePart(DatabaseCore):
                 rows = conn.cursor().execute(query, tuple(parameters)).fetchall()
             return [Artist(id=row["id"], name=row["name"]) for row in rows]
         except Exception as e:
-            print(f"Error executing artist query: {e}")
+            operator_logger.error("Error executing artist query: %s", e)
             return None
 
     def get_artists_count(
@@ -810,7 +816,7 @@ class BrowsePart(DatabaseCore):
                 )
             return artist_count
         except Exception as e:
-            print(f"Unable to fetch artist counts. {e}")
+            operator_logger.error("Unable to fetch artist counts. %s", e)
             return None
 
     def get_albums(
@@ -829,8 +835,9 @@ class BrowsePart(DatabaseCore):
         if row_filter_parameters is None:
             row_filter_parameters = []
         if limit <= 0 or limit > 1000 or offset < 0:
-            print(
-                f"Limit {limit} or Offset {offset} was set incorrectly for database.get_albums"
+            operator_logger.warning(
+                "Limit %s or Offset %s was set incorrectly for database.get_albums",
+                limit, offset,
             )
             raise ValueError
 
@@ -885,7 +892,7 @@ class BrowsePart(DatabaseCore):
                     conn.cursor().execute(query, tuple(parameters)).fetchall()
                 )
         except Exception as e:
-            print(f"Failed to retrieve albums: {e}")
+            operator_logger.error("Failed to retrieve albums: %s", e)
             return None
 
         return [
@@ -946,7 +953,7 @@ class BrowsePart(DatabaseCore):
                 )
             return album_count
         except Exception as e:
-            print(f"Failed to retrieve album counts: {e}")
+            operator_logger.error("Failed to retrieve album counts: %s", e)
             return None
 
     def get_search_results(
@@ -1059,7 +1066,7 @@ class BrowsePart(DatabaseCore):
                         ]
 
         except Exception as e:
-            print(f"Search failed: {e}")
+            operator_logger.error("Search failed: %s", e)
 
         return SearchResults(
             tracks=result_tracks, artists=result_artists, albums=result_albums

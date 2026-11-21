@@ -21,10 +21,12 @@ export 'package:frontend/models/credential_storage_status.dart';
 ///   -34018 (errSecMissingEntitlement: unsigned or ad-hoc build) or -25291
 ///   (errSecNotAvailable: no keychain). The status is `details` when an int,
 ///   else the first `-\d+` after `Code:` in the message.
-/// - Linux `PlatformException('Libsecret error')` whose D-Bus error says
+/// - Linux `PlatformException('Libsecret error')` whose D-Bus error is
+///   `org.freedesktop.DBus.Error.ServiceUnknown` for
+///   `org.freedesktop.secrets` (no Secret Service installed), or that says
 ///   "The name org.freedesktop.secrets was not provided by any .service
-///   files" (ServiceUnknown: no Secret Service installed). A timeout or a
-///   crash while it starts is transient.
+///   files". A ServiceUnknown for another service or a unique connection
+///   (`:1.42`), and a timeout or a crash while it starts, are transient.
 /// - [MissingPluginException] (no plugin on this platform).
 ///
 /// Everything else (darwin -25308 on a locked device, `KeyringLocked`, other
@@ -44,14 +46,29 @@ bool secureStorageIsUnusable(Object error) {
   }
   if (error.code == 'Libsecret error') {
     // D-Bus ServiceUnknown for the Secret Service: nothing on this machine
-    // provides it. Activation timeouts and crashes name the same service but
-    // are transient (m-R2-11).
-    return (error.message ?? '').contains(
-      'The name org.freedesktop.secrets was not provided by any .service files',
-    );
+    // provides it. Matched on the D-Bus error name together with the Secret
+    // Service's own name (dbus-broker words the sentence differently from
+    // dbus-daemon), and on dbus-daemon's sentence for a message without the
+    // error name. A ServiceUnknown for another service (the keyring's
+    // prompter) or for a unique connection name (`:1.42`, a connection that
+    // went away), and activation timeouts and crashes, are transient
+    // (m-R2-11).
+    final message = error.message ?? '';
+    if (message.contains(_noSecretServiceSentence)) return true;
+    return message.contains(_serviceUnknownErrorName) &&
+        message.contains(_secretServiceName) &&
+        !_uniqueBusName.hasMatch(message);
   }
   return false;
 }
+
+const _serviceUnknownErrorName = 'org.freedesktop.DBus.Error.ServiceUnknown';
+const _secretServiceName = 'org.freedesktop.secrets';
+const _noSecretServiceSentence =
+    'The name org.freedesktop.secrets was not provided by any .service files';
+
+/// A unique D-Bus connection name such as `:1.42`, bare or quoted.
+final _uniqueBusName = RegExp(r'''(^|[\s'"]):\d+\.\d+''');
 
 /// The signed-in session's credentials (spec §7.1): immutable, scope-bound.
 @immutable

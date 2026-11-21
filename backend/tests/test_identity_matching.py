@@ -301,6 +301,23 @@ def test_a_match_raced_by_a_writer_is_discarded_and_redone(db, music, monkeypatc
     assert set(pairs(db)) == canonical([x, y])
 
 
+def test_a_match_step_does_not_count_the_librarys_coverage(db, music, monkeypatch):
+    """The step stores only the matches; the coverage counts read every live
+    track of the owner, which made a backfill read N rows N times."""
+    from app.services import duplicate_detection
+
+    def coverage(*args, **kwargs):
+        raise AssertionError("a match step counted the library's coverage")
+
+    monkeypatch.setattr(duplicate_detection, "_coverage", coverage)
+    x, y = copy(db, music, "x"), copy(db, music, "y")
+
+    outcomes = drain(worker_for(db))
+
+    assert "error" not in outcomes and outcomes.count("matched") == 2
+    assert set(pairs(db)) == canonical([x, y])
+
+
 # --- review F1: a settled exact layer that comes back is matched again ------------------------
 
 

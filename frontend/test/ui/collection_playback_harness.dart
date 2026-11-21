@@ -10,6 +10,7 @@ import 'package:flutter_riverpod/misc.dart' show Override;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/app_info.dart';
+import 'package:frontend/models/history_intent.dart';
 import 'package:frontend/playback/audio_dependencies.dart';
 import 'package:frontend/playback/audio_providers.dart';
 import 'package:frontend/playback/audio_state.dart';
@@ -24,6 +25,8 @@ import 'package:frontend/services/clock.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/history/click_recorder.dart';
+import 'package:frontend/services/history/history_providers.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
 
 import '../helpers/fake_clock.dart';
@@ -95,6 +98,7 @@ Widget collectionPlaybackScope({
       conversionJobsProvider.overrideWith(EmptyConversionJobs.new),
       queuePlayerProvider.overrideWith(() => player),
       clockProvider.overrideWithValue(FakeClock()),
+      clickRecorderProvider.overrideWith(SpyClickRecorder.new),
       ...overrides,
     ],
     child: MaterialApp(home: Scaffold(body: child)),
@@ -113,3 +117,37 @@ Future<List<(String, String)>> recordedClicks(
   });
   return [for (final r in rows!) (r.entityType, r.entityRef)];
 }
+
+/// Whether a click row has been written. Reads the database directly, so it
+/// runs in real async (inside `runAsyncUntil`'s condition).
+Future<bool> clickRecorded(AppDatabase db) async =>
+    (await (db.select(db.historyEvents)
+              ..where((e) => e.kind.equals('clicked')))
+            .get())
+        .isNotEmpty;
+
+/// The app's click recorder, also counting each click at the moment it is
+/// submitted. The write itself is not awaited by playback, so a check that
+/// no click was recorded reads [submitted], which is exact once the request
+/// has an outcome, instead of racing the database write.
+class SpyClickRecorder extends ClickRecorder {
+  SpyClickRecorder(Ref ref)
+      : super(
+          history: ref.read(historyRepositoryProvider),
+          binding: ref.read(serverBindingRepositoryProvider),
+          clock: ref.read(clockProvider),
+        );
+
+  final submitted = <HistoryIntent>[];
+
+  @override
+  Future<void> record(HistoryIntent intent) {
+    submitted.add(intent);
+    return super.record(intent);
+  }
+}
+
+/// The scope's [SpyClickRecorder].
+SpyClickRecorder clickSpy(WidgetTester tester) =>
+    ProviderScope.containerOf(tester.element(find.byType(MaterialApp)))
+        .read(clickRecorderProvider) as SpyClickRecorder;

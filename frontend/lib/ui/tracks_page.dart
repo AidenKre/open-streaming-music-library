@@ -137,6 +137,17 @@ class _TracksPageState extends ConsumerState<TracksPage>
     final notSyncedYet =
         catalogSynced == false &&
         ref.watch(librarySyncStatusProvider) == LibrarySyncStatus.idle;
+    // Offline after a library sync failed: the status line shows nothing
+    // offline (no sync can run), so the area says the sync failed. No
+    // button: a sync starts by itself once the server is reachable.
+    final syncFailedOffline =
+        rows.isOffline &&
+        ref.watch(
+          trackSyncProvider.select((a) {
+            final s = a.value;
+            return s != null && !s.librarySyncing && s.libraryError != null;
+          }),
+        );
 
     final body = Column(
       children: [
@@ -159,6 +170,10 @@ class _TracksPageState extends ConsumerState<TracksPage>
                     : notSyncedYet
                     ? const ListStatusMessage(
                         'Your library has not synced to this device yet.',
+                      )
+                    : syncFailedOffline
+                    ? const ListStatusMessage(
+                        LibrarySyncStatusView.failedMessage,
                       )
                     // A running or failed sync: the device list may not be
                     // the server's library.

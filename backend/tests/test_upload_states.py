@@ -6,13 +6,16 @@ import re
 
 import pytest
 
-from app.core.upload_states import ENDED_STATES, SOURCE_GIVEN_BACK_STATES, SOURCE_RELEASE_STATES
+from app.core.upload_states import (
+    ENDED_STATES, SOURCE_GIVEN_BACK_STATES, SOURCE_RELEASE_STATES, STAGED_MATCH_STATES,
+)
 from tests.schema_fixtures import INIT_SQL
 
 SETS = {
     "ENDED_STATES": ENDED_STATES,
     "SOURCE_GIVEN_BACK_STATES": SOURCE_GIVEN_BACK_STATES,
     "SOURCE_RELEASE_STATES": SOURCE_RELEASE_STATES,
+    "STAGED_MATCH_STATES": STAGED_MATCH_STATES,
 }
 
 
@@ -43,3 +46,10 @@ def test_a_state_that_gives_its_source_back_is_ended_and_releasable():
     # then releases each with its own state as from_states.
     assert set(SOURCE_GIVEN_BACK_STATES) <= set(ENDED_STATES)
     assert set(SOURCE_GIVEN_BACK_STATES) <= set(SOURCE_RELEASE_STATES)
+
+
+def test_a_staged_match_is_compared_and_shown_only_while_its_upload_has_not_ended():
+    # The validation worker compares a new upload with the other items in
+    # STAGED_MATCH_STATES, and the duplicate report shows such a match as
+    # available: nothing can be imported from an upload that has ended.
+    assert not set(STAGED_MATCH_STATES) & set(ENDED_STATES)

@@ -50,7 +50,8 @@ void main() {
       MockClient((_) async => fail('unexpected request')),
     );
     db = AppDatabase(NativeDatabase.memory());
-    await ServerBindingRepository(db).ensureProvisional('http://a', userId: 1);
+    await ServerBindingRepository(db)
+        .ensureProvisional('http://a', userId: 1, instanceId: 'inst-1');
     probes = [];
     log = [];
     gate = ServerBindingGate(

@@ -5,7 +5,12 @@ import 'package:frontend/services/uploads/upload_manager.dart'
 import 'package:frontend/services/uploads/upload_source_picker.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart';
 import 'package:frontend/services/uploads/upload_types.dart'
-    show LeftOutReason, ReselectOutcome, UploadsUnavailable;
+    show
+        LeftOutReason,
+        ReselectOutcome,
+        UploadIntentMissing,
+        UploadsUnavailable,
+        isBatchForgotten;
 import 'package:frontend/services/uploads/upload_zip_children.dart';
 import 'package:frontend/services/uploads/uploads_overview.dart';
 import 'package:frontend/services/uploads/uploads_overview_provider.dart';
@@ -32,6 +37,14 @@ class ChildListLoading extends ChildListState {
 
 class ChildListFailed extends ChildListState {
   const ChildListFailed();
+}
+
+/// The server no longer keeps the archive's record (its retention ended).
+class ChildListGone extends ChildListState {
+  const ChildListGone();
+
+  /// What the page says instead of the list.
+  String get text => archiveFileListGoneText;
 }
 
 class ChildListLoaded extends ChildListState {
@@ -116,9 +129,13 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
   void _fail(Object error) {
     // The type only: never the message, which can carry paths.
     debugPrint('Uploads action failed: ${error.runtimeType}');
-    _notice = error is UploadsUnavailable
-        ? const UploadsNotice("Uploads aren't available right now")
-        : const UploadsNotice(uploadActionFailedText);
+    _notice = switch (error) {
+      UploadsUnavailable() => const UploadsNotice(
+        "Uploads aren't available right now",
+      ),
+      UploadIntentMissing() => const UploadsNotice(reviewItemNotHereText),
+      _ => const UploadsNotice(uploadActionFailedText),
+    };
   }
 
   @override
@@ -254,8 +271,11 @@ class UploadsController extends ChangeNotifier implements UploadsControls {
             .read(uploadZipChildrenProvider)
             .load(batchUuid, parentItemUuid),
       );
-    } catch (_) {
-      result = keep ? shown : const ChildListFailed();
+    } catch (e) {
+      // A list the server no longer keeps is gone, also on a quiet reload.
+      result = isBatchForgotten(e)
+          ? const ChildListGone()
+          : (keep ? shown : const ChildListFailed());
     }
     // A newer request for this archive owns the answer.
     if (_disposed || _childLoads[parentItemUuid] != generation) return;

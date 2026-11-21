@@ -20,6 +20,7 @@ import 'package:frontend/providers/providers.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/server_binding_gate.dart';
+import '../helpers/run_async_until.dart';
 import '../helpers/server_binding.dart';
 import '../helpers/test_offline.dart';
 
@@ -1529,7 +1530,10 @@ void main() {
       expect(_patchCalls, isEmpty, reason: 'no connection verified yet');
 
       unawaited(controlled.gate.startConnection('http://localhost:8000'));
-      await pumpEventQueue();
+      for (var i = 0; i < 100 && controlled.pendingProbes == 0; i++) {
+        await pumpEventQueue(times: 1);
+      }
+      expect(controlled.pendingProbes, 1, reason: 'the server is probed');
       controlled.respond('inst-1');
       await flush;
       expect(_patchCalls, hasLength(1));
@@ -1581,17 +1585,16 @@ void main() {
           .read(editOutboxProvider);
       unawaited(outbox.flush()); // waits on the unverified gate
       await pumpEventQueue();
-      var enqueued = false;
-      unawaited(outbox
-          .enqueue(
+      // The gate never verifies here: an edit that waited for it would
+      // never finish.
+      await withinTurns(
+          outbox.enqueue(
             uuidId: 'u1',
             edit: const MetadataEdit.empty().set('title', 'Mine'),
             writeMode: EditWriteMode.dbOnly,
             baseRevision: 5,
-          )
-          .then((_) => enqueued = true));
-      await pumpEventQueue();
-      expect(enqueued, isTrue, reason: 'the edit did not wait for the gate');
+          ),
+          reason: 'the edit is saved while the flush waits for the gate');
       expect(await db.select(db.pendingEdits).get(), hasLength(1));
     });
 

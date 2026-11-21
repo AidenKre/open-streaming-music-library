@@ -794,6 +794,60 @@ void main() {
     await teardownTree(tester);
   });
 
+  // The sheet built again with another review follows that review.
+  testWidgets('a sheet rebuilt for another review closes when that review '
+      'has nothing left', (tester) async {
+    fake
+      ..stage = ReviewStage.ready
+      ..preview = readyPreview(['a']);
+    final second = FakeDeletionReviewControls()
+      ..stage = ReviewStage.ready
+      ..preview = readyPreview(['b']);
+    addTearDown(second.dispose);
+    final which = ValueNotifier<DeletionReviewControls>(fake);
+    addTearDown(which.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () => showModalBottomSheet<bool>(
+                context: context,
+                builder: (_) => ValueListenableBuilder(
+                  valueListenable: which,
+                  builder: (_, review, _) =>
+                      DeletionReviewSheet(review: review),
+                ),
+              ),
+              child: const Text('open review'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open review'));
+    await tester.pumpAndSettle();
+    which.value = second;
+    await tester.pumpAndSettle();
+    // The review it was first built with no longer closes it.
+    fake
+      ..stage = ReviewStage.idle
+      ..preview = null
+      ..nothingToReview = true
+      ..notify();
+    await tester.pumpAndSettle();
+    expect(find.byType(DeletionReviewSheet), findsOneWidget);
+
+    second
+      ..stage = ReviewStage.idle
+      ..preview = null
+      ..nothingToReview = true
+      ..notify();
+    await tester.pumpAndSettle();
+    expect(find.byType(DeletionReviewSheet), findsNothing);
+    await teardownTree(tester);
+  });
+
   testWidgets('removing the last target closes the sheet', (tester) async {
     final c = ProviderContainer(
       overrides: [

@@ -20,6 +20,7 @@ import 'package:frontend/ui/widgets/album_card.dart';
 import 'package:frontend/ui/widgets/artist_card.dart';
 
 import '../helpers/no_server_api.dart';
+import '../helpers/run_async_until.dart';
 import '../helpers/server_binding.dart';
 import 'browse_harness.dart';
 import 'collection_playback_harness.dart';
@@ -76,7 +77,8 @@ void main() {
     await tester.longPress(card);
     await tester.pumpAndSettle();
     await tester.tap(find.text(entry));
-    await tester.runAsync(() => pumpEventQueue(times: 50));
+    await runAsyncUntil(tester, () => clickRecorded(db),
+        reason: 'the menu entry records its click');
     await tester.pumpAndSettle();
   }
 
@@ -110,6 +112,8 @@ void main() {
             expect(player.activated, hasLength(1),
                 reason: 'the no-session fallback started a queue');
           }
+          expect(clickSpy(tester).submitted, hasLength(1),
+              reason: 'one click submitted, no member click after it');
           final recorded = await clicks(tester);
           expect(recorded, [click]);
           expect(recorded.where((c) => c.$1 == 'track'), isEmpty);

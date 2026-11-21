@@ -3,9 +3,11 @@
     uv run python scripts/identity_benchmark.py --workdir DIR [--tracks 50000] [--queries 200]
 
 Builds a fresh production-schema database inside an empty --workdir with seeded
-synthetic prints and planted near-duplicates, times the real ``find_duplicates``
-per query, and measures storage (size, backup, WAL checkpoint, VACUUM). Touches
-nothing outside --workdir and the optional --json path.
+synthetic prints and planted near-duplicates, and times per query the real
+``find_matches`` (the identity worker's match step) and, separately, the full
+``find_duplicates`` report with its coverage count (the upload check). Measures
+storage (size, backup, WAL checkpoint, VACUUM). Touches nothing outside
+--workdir and the optional --json path.
 """
 
 from __future__ import annotations
@@ -87,34 +89,41 @@ def _build(db_path: Path, n: int, items: int, seed: int):
 
 def _queries(db_path, owner, uuids, durations, prints, planted, n_queries, seed, params):
     from app.services.audio_identity import AudioIdentity, ExactUnavailable, FingerprintIdentity
-    from app.services.duplicate_detection import TrackRef, duration_window, find_duplicates
+    from app.services.duplicate_detection import TrackRef, duration_window, find_duplicates, find_matches
 
     rng = random.Random(seed + 1)
     copies = sorted(planted)
     chosen = rng.sample(copies, min(len(copies), max(1, n_queries // 4)))
     rest = [i for i in range(len(uuids)) if i not in planted]
     chosen += rng.sample(rest, min(len(rest), n_queries - len(chosen)))
-    times, cands, planted_queries, planted_found = [], [], 0, 0
+    times, report_times, cands, planted_queries, planted_found = [], [], [], 0, 0
     conn = sqlite3.connect(db_path)
     try:
         for i in chosen:
             fp = FingerprintIdentity("current", "bench", ALGO, durations[i], prints[i])
             identity = AudioIdentity(exact=ExactUnavailable("pending", None), tool_versions=None,
                                      computed_at=0, fingerprint=fp)
+            exclude = frozenset({uuids[i]})
             t = time.perf_counter()
-            report = find_duplicates(conn, identity, owner_id=owner, exclude=frozenset({uuids[i]}), params=params)
+            matches = find_matches(conn, identity, owner_id=owner, exclude=exclude, params=params)
             times.append(time.perf_counter() - t)
+            t = time.perf_counter()
+            find_duplicates(conn, identity, owner_id=owner, exclude=exclude, params=params)
+            report_times.append(time.perf_counter() - t)
             lo, hi = duration_window(durations[i], params)
             cands.append(conn.execute("SELECT COUNT(*) FROM track_audio_fingerprint WHERE duration_s BETWEEN ? AND ?",
                                       (lo, hi)).fetchone()[0])
             if i in planted:
                 planted_queries += 1
-                planted_found += TrackRef(uuids[planted[i]]) in {m.subject for m in report.matches}
+                planted_found += TrackRef(uuids[planted[i]]) in {m.subject for m in matches}
     finally:
         conn.close()
     return {
         "queries": len(chosen), "p50_s": _pct(times, 0.5), "p95_s": _pct(times, 0.95), "max_s": max(times),
-        "mean_s": sum(times) / len(times), "candidates_p50": _pct(cands, 0.5),
+        "mean_s": sum(times) / len(times),
+        "report_p50_s": _pct(report_times, 0.5), "report_p95_s": _pct(report_times, 0.95),
+        "report_max_s": max(report_times), "report_mean_s": sum(report_times) / len(report_times),
+        "candidates_p50": _pct(cands, 0.5),
         "candidates_p95": _pct(cands, 0.95), "candidates_max": max(cands),
         "planted_queries": planted_queries, "planted_found": planted_found,
     }

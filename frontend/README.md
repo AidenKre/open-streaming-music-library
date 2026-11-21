@@ -81,9 +81,12 @@ nothing upgrades it.
   reading (for example a locked keyring or a timeout) is treated as
   temporary: the app shows "Your sign-in could not be read." with **Try
   again** and **Log in again** instead of signing you out. The app recognises
-  a missing Secret Service by the message dbus-daemon gives; another D-Bus
-  implementation may word it differently, and the app then treats it as such
-  a temporary problem.
+  a missing Secret Service by the D-Bus error
+  `org.freedesktop.DBus.Error.ServiceUnknown` naming
+  `org.freedesktop.secrets`, or by the sentence dbus-daemon gives for it; any
+  message that carries neither (for example another D-Bus implementation's
+  wording with the error name stripped) is treated as such a temporary
+  problem.
 - **iOS:** the sign-in goes into the Keychain (`keychain-access-groups`
   entitlement in `ios/Runner/Runner.entitlements`).
 - **macOS:** the project carries no keychain entitlement, so the app stores

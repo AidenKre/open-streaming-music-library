@@ -5,6 +5,8 @@ import errno
 import os
 
 from app.core.operator_log import operator_logger
+from app.library import library_root
+from app.library_folders import matching_import_dirs
 
 
 def device_of(path) -> int:
@@ -33,9 +35,6 @@ def warn_other_filesystems(database, *, music_library_dir, import_dir, user_impo
 
 
 def _warn(database, music_library_dir, import_dir, user_import_dir) -> None:
-    from app.library import library_root  # deferred: app.library imports the services
-    from app.library_folders import matching_import_dirs
-
     try:
         library_device = device_of(music_library_dir)
     except Exception as e:

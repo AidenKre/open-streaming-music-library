@@ -786,7 +786,10 @@ def reconcile_upload_receipts(
             source_path = reservation["source_path"]
             if reservation["state"] in SOURCE_GIVEN_BACK_STATES and source_path is not None:
                 # An ended item that still records its source (a removal failed):
-                # the bytes stay counted until the file is verifiably gone.
+                # the bytes stay counted until the file is verifiably gone. A
+                # recorded path outside the owner's own folder is not their
+                # file and keeps nothing counted (the raise releases the row).
+                assert_within(Path(source_path), owner_dir(uploads_root, reservation["owner_id"]))
                 try:
                     os.lstat(source_path)
                     keep = True

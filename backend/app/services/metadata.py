@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
+from app.core.operator_log import operator_logger
 from app.models.edit_fields import EDIT_FIELD_SPECS
 from app.models.track_meta_data import TrackMetaData
 from app.services import audio_identity
@@ -278,7 +279,7 @@ def ffprobe_for_metadata(
         return _probe_unavailable("ffprobe timed out", e)
     except FfmpegError as e:  # not found, or cannot start
         if isinstance(e.__cause__, FileNotFoundError):
-            print("ffprobe not found")
+            operator_logger.warning("ffprobe not found")
         return _probe_unavailable(str(e), e)
     except OSError as e:  # setting up the pipes failed (e.g. EMFILE): cannot run now
         return _probe_unavailable(f"ffprobe cannot run: {e.strerror or type(e).__name__}", e)
@@ -384,6 +385,11 @@ def extract_cover_art_bytes(file_path: Path, input_format: str | None = None) ->
                 max_stdout_bytes=COVER_ART_MAX_BYTES,
                 options=registration,
             )
+    except CaptureOverflow:
+        logger.warning(
+            "embedded cover art not used: the picture is larger than %d bytes", COVER_ART_MAX_BYTES
+        )
+        return None
     except (FfmpegError, OSError):
         return None
 

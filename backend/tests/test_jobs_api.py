@@ -227,9 +227,9 @@ class TestPostJobsRefusalAnswers:
             ("flac", 1000.0, "song.flac", "wav", None,
              "unsupported or unavailable target codec: wav"),
             ("flac", 1000.0, "song.flac", "aac", None,
-             "aac requires a target bitrate of one of [320, 256, 192, 128]"),
+             "aac requires a target bitrate of 320, 256, 192 or 128 kbps"),
             ("flac", 1000.0, "song.flac", "mp3", 999,
-             "mp3 requires a target bitrate of one of [320, 256, 192, 128]"),
+             "mp3 requires a target bitrate of 320, 256, 192 or 128 kbps"),
             ("mp3", 320.0, "song.mp3", "flac", 320,
              "flac is lossless and takes no target bitrate"),
             # U06-B-06: a same-codec lossy request at the same or a higher bitrate.
@@ -274,13 +274,45 @@ class TestPostJobsRefusalAnswers:
             422, {"detail": "unsupported or unavailable target codec: mp3"}
         )
 
-    def test_a_taken_target_path_answers_409_target_exists(self, held_client, tmp_path):
+    def test_a_file_at_the_target_path_answers_409_target_exists_taken_by_a_file(
+        self, held_client, tmp_path
+    ):
         track = _add_track_with_file(held_client, tmp_path, codec="flac")
         (Path(track.file_path).with_suffix(".mp3")).write_bytes(b"someone else")
 
         r = _post_job(held_client, track.uuid_id, "mp3", track.revision, 320)
 
-        assert (r.status_code, r.json()) == (409, {"detail": {"error": "target_exists"}})
+        assert (r.status_code, r.json()) == (
+            409, {"detail": {"error": "target_exists", "taken_by": "file"}}
+        )
+
+    def test_a_target_path_only_another_tracks_row_names_answers_taken_by_a_track(
+        self, held_client, tmp_path
+    ):
+        """No file is at the path (the other track's master is missing): the
+        client must not be told that a file exists there."""
+        track = _add_track_with_file(held_client, tmp_path, codec="flac")
+        other = _add_track_with_file(held_client, tmp_path, codec="mp3", filename="song.mp3")
+        Path(other.file_path).unlink()
+
+        r = _post_job(held_client, track.uuid_id, "mp3", track.revision, 320)
+
+        assert (r.status_code, r.json()) == (
+            409, {"detail": {"error": "target_exists", "taken_by": "track"}}
+        )
+        assert held_client.held.submitted == []
+
+    def test_a_file_at_a_target_path_another_tracks_row_names_answers_taken_by_a_file(
+        self, held_client, tmp_path
+    ):
+        track = _add_track_with_file(held_client, tmp_path, codec="flac")
+        _add_track_with_file(held_client, tmp_path, codec="mp3", filename="song.mp3")
+
+        r = _post_job(held_client, track.uuid_id, "mp3", track.revision, 320)
+
+        assert (r.status_code, r.json()) == (
+            409, {"detail": {"error": "target_exists", "taken_by": "file"}}
+        )
 
     def test_a_kept_journal_row_answers_409_pending_recovery_before_the_request_checks(
         self, held_client, tmp_path
@@ -468,7 +500,7 @@ class TestPostJobsConflicts:
         r = _post_job(client, track.uuid_id, "aac", track.revision, 192)
 
         assert r.status_code == 409, r.text
-        assert r.json() == {"detail": {"error": "target_exists"}}
+        assert r.json() == {"detail": {"error": "target_exists", "taken_by": "file"}}
         assert client.held.submitted == []
         assert client.get("/jobs").json()["data"] == []
         assert squatter.read_bytes() == b"another track"

@@ -123,9 +123,9 @@ void main() {
 
   group('resumeSavedSession', () {
     // Launch no longer creates the row (review r1 m-R1-18: login does); the
-    // signed-in user's provisional row is verified and filled in.
-    test("online: the user's provisional row is verified, ready after the "
-        'verdict', () async {
+    // signed-in user's row is verified.
+    test("online: the user's row is verified, ready after the verdict",
+        () async {
       await seedTestBinding(db, baseUrl: 'http://s');
       SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
       useClient(_health(200));
@@ -133,7 +133,6 @@ void main() {
       expect(start.kind, SessionStartKind.online);
       final row = (await repo().current())!;
       expect(row.lastBaseUrl, 'http://s');
-      expect(row.instanceId, isNull);
       await pumpEventQueue();
       expect(controlled.pendingProbes, 1);
       expect(ready(), isFalse, reason: 'restore waits for bindingVerified');
@@ -150,7 +149,7 @@ void main() {
       useClient(_health(200));
       await service().resumeSavedSession();
       await pumpEventQueue();
-      controlled.respond(null); // legacy server
+      controlled.respond('inst-1'); // the bound server at a new address
       await pumpEventQueue();
       final row = (await repo().current())!;
       expect(row.localBindingId, token);

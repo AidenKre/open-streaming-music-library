@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from app.core.owner import _and_owner, ANY_OWNER, Owner, _require_owner
+from app.core.operator_log import operator_logger
 from app.database.core import DatabaseCore, _row_to_track, _track_select_columns
 from app.models.cover_art import CoverArt
 from app.models.track import Track
@@ -46,7 +47,7 @@ class CoverArtPart(DatabaseCore):
         try:
             return self._find_cover_art_by_id(cover_art_id)
         except Exception as e:
-            print(f"Failed to get cover art by id {cover_art_id}: {e}")
+            operator_logger.error("Failed to get cover art by id %s: %s", cover_art_id, e)
             return None
 
     def get_cover_art_by_sha256(self, sha256: str) -> CoverArt | None:
@@ -60,7 +61,7 @@ class CoverArtPart(DatabaseCore):
                     return None
                 return self._cover_art_from_row(row)
         except Exception as e:
-            print(f"Failed to get cover art by sha256: {e}")
+            operator_logger.error("Failed to get cover art by sha256: %s", e)
             return None
 
     def get_cover_arts_by_phash_prefix(self, prefix: str) -> list[CoverArt]:
@@ -72,7 +73,7 @@ class CoverArtPart(DatabaseCore):
                 ).fetchall()
                 return [self._cover_art_from_row(row) for row in rows]
         except Exception as e:
-            print(f"Failed to get cover arts by phash prefix: {e}")
+            operator_logger.error("Failed to get cover arts by phash prefix: %s", e)
             return []
 
     def insert_cover_art(self, sha256: str, phash: str, phash_prefix: str, file_path: str) -> int:
@@ -84,7 +85,7 @@ class CoverArtPart(DatabaseCore):
                 )
                 return cursor.lastrowid  # type: ignore[return-value]
         except Exception as e:
-            print(f"Error inserting cover art: {e}")
+            operator_logger.error("Error inserting cover art: %s", e)
             raise
 
     def delete_cover_art(
@@ -137,7 +138,7 @@ class CoverArtPart(DatabaseCore):
                 ).fetchall()
                 return [_row_to_track(row) for row in rows]
         except Exception as e:
-            print(f"Failed to get tracks missing cover art: {e}")
+            operator_logger.error("Failed to get tracks missing cover art: %s", e)
             return []
 
     def update_track_cover_art_id(
@@ -164,5 +165,5 @@ class CoverArtPart(DatabaseCore):
                     self._bump_track_revision(conn, uuid_id)
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Failed to update cover_art_id for track {uuid_id}: {e}")
+            operator_logger.error("Failed to update cover_art_id for track %s: %s", uuid_id, e)
             return False

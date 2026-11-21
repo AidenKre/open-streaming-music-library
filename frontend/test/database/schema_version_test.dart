@@ -1308,6 +1308,64 @@ void main() {
         'CREATE statements: index idx_genre_nocase: in the live database, not '
             'in the snapshot',
       ),
+      (
+        'a table removed from the tables',
+        (s) => (s['fixed_sql']! as List).add({
+          'name': 'ghost_table',
+          'sql': [
+            {
+              'dialect': 'sqlite',
+              'sql': 'CREATE TABLE IF NOT EXISTS "ghost_table" '
+                  '("id" INTEGER NOT NULL);',
+            },
+          ],
+        }),
+        'CREATE statements: table ghost_table: in the snapshot, not in the '
+            'live database',
+      ),
+      (
+        'an index removed from the tables',
+        (s) => (s['fixed_sql']! as List).add({
+          'name': 'idx_ghost',
+          'sql': [
+            {'dialect': 'sqlite', 'sql': 'CREATE INDEX idx_ghost ON albums (year);'},
+          ],
+        }),
+        'CREATE statements: index idx_ghost: in the snapshot, not in the live '
+            'database',
+      ),
+      (
+        'a column removed from the tables',
+        (s) => sql(s, 'tracks', '"damaged_file_path" TEXT NULL',
+            '"damaged_file_path" TEXT NULL, "ghost_column" TEXT NULL'),
+        'CREATE statements: table tracks, column ghost_column: in the snapshot, '
+            'not in the live database',
+      ),
+      (
+        'a column type',
+        (s) => sql(s, 'tracks', '"revision" INTEGER NULL', '"revision" TEXT NULL'),
+        'CREATE statements: table tracks, column revision, type: snapshot '
+            '`TEXT`, live `INTEGER`',
+      ),
+      (
+        'the column order',
+        (s) => sql(s, 'sync_cursors', '"stream" TEXT NOT NULL, "value" INTEGER NOT NULL',
+            '"value" INTEGER NOT NULL, "stream" TEXT NOT NULL'),
+        'CREATE statements: table sync_cursors, column order: snapshot value, '
+            'stream; live stream, value',
+      ),
+      (
+        'the table options',
+        (s) => sql(s, 'sync_cursors', 'PRIMARY KEY ("stream"));',
+            'PRIMARY KEY ("stream")) WITHOUT ROWID;'),
+        'CREATE statements: table sync_cursors, table options: snapshot '
+            '`WITHOUT ROWID`, live ``',
+      ),
+      (
+        'a snapshot without CREATE statements',
+        (s) => s.remove('fixed_sql'),
+        'CREATE statements: the snapshot has none (no `fixed_sql`)',
+      ),
       // The element model.
       (
         'an entity column default',
@@ -1397,6 +1455,48 @@ void main() {
             (e) => ((e as Map)['data'] as Map)['name'] == 'idx_genre_nocase'),
         'entities: index idx_genre_nocase: in the live database, not in the '
             'snapshot',
+      ),
+      (
+        'an entity table missing from the live database',
+        (s) => (s['entities']! as List).add({
+          'id': 100000,
+          'references': [],
+          'type': 'table',
+          'data': {'name': 'ghost_table', 'columns': []},
+        }),
+        'entities: table ghost_table: in the snapshot, not in the live database',
+      ),
+      (
+        'an entity column missing from the live database',
+        (s) => (data(s, 'sync_cursors')['columns']! as List).add({
+          'name': 'ghost_column',
+          'moor_type': 'string',
+          'nullable': true,
+          'dsl_features': [],
+        }),
+        'entities: table sync_cursors, column ghost_column: in the snapshot, not '
+            'in the live database',
+      ),
+      (
+        'an entity column missing from the snapshot',
+        (s) => (data(s, 'sync_cursors')['columns']! as List)
+            .removeWhere((c) => (c as Map)['name'] == 'value'),
+        'entities: table sync_cursors, column value: in the live database, not '
+            'in the snapshot',
+      ),
+      (
+        'the entity column order',
+        (s) {
+          final columns = data(s, 'sync_cursors')['columns']! as List;
+          columns.add(columns.removeAt(0));
+        },
+        'entities: table sync_cursors, column order: snapshot value, stream; '
+            'live stream, value',
+      ),
+      (
+        'an entity virtual table',
+        (s) => data(s, 'sync_cursors')['is_virtual'] = true,
+        'entities: table sync_cursors, virtual: snapshot true, live false',
       ),
     ];
     for (final (what, edit, expected) in cases) {

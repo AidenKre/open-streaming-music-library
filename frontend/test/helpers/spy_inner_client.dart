@@ -6,8 +6,11 @@ import 'package:http/http.dart' as http;
 /// (after [gate], when set), records every request it is handed and whether
 /// anyone closed it (moved here from two API tests, APP-TEST stage 2).
 class SpyInnerClient extends http.BaseClient {
-  SpyInnerClient({this.status = 200, this.gate});
+  SpyInnerClient({this.status = 200, this.gate, this.headers = const {}});
   int status;
+
+  /// The answer's headers (a server's instance stamp, for example).
+  final Map<String, String> headers;
   final Completer<void>? gate;
   final List<http.BaseRequest> requests = [];
   bool closed = false;
@@ -21,6 +24,7 @@ class SpyInnerClient extends http.BaseClient {
       Stream.value('{}'.codeUnits),
       status,
       request: request,
+      headers: headers,
     );
   }
 

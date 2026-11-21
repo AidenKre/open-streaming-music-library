@@ -26,6 +26,7 @@ from tests.upload_validation_fixtures import (
     print_of,
     stage_item,
 )
+from tests.track_removal import delete_track
 
 NOW = 1_700_000_000
 EMPTY = {"library_pending": 0, "library_failed": 0, "library_not_comparable": 0}
@@ -185,7 +186,7 @@ def test_a_track_deleted_after_validation_reads_as_unavailable(env):
     track = env.track(b"audio-A")
     staged = env.stage(content=b"audio-A")
     env.validate()
-    assert Library(env.db, env.admin).delete_track(track)
+    assert delete_track(Library(env.db, env.admin), track)
 
     [match] = env.get(staged)["duplicate_check"]["matches"]
 
@@ -234,9 +235,8 @@ def test_a_staged_match_that_was_cancelled_reads_as_unavailable(env):
 
 @pytest.mark.parametrize(("state", "fields"), [
     ("expired", ""),
-    ("imported", ", result_track_uuid = 'planted-track', result_revision = 1"),
     ("failed", ", error_code = 'upload_interrupted'"),
-], ids=["expired", "imported", "failed"])
+], ids=["expired", "failed"])
 def test_a_staged_match_that_ended_reads_as_unavailable(env, state, fields):
     first = env.stage(content=b"same", progress_at=1)
     later = env.stage(content=b"same", progress_at=2)
@@ -246,6 +246,41 @@ def test_a_staged_match_that_ended_reads_as_unavailable(env, state, fields):
     [match] = env.get(later)["duplicate_check"]["matches"]
 
     assert (match["item_uuid"], match["available"], match["staged_item"]) == (first["item_uuid"], False, None)
+
+
+def _imported_as(env, item, track):
+    sql(env.db, "UPDATE upload_items SET state = 'imported', result_track_uuid = ?, result_revision = 1"
+                " WHERE item_uuid = ?", (track, item["item_uuid"]))
+
+
+def test_a_staged_match_since_imported_reads_as_a_library_match_of_its_track(env):
+    """The upload it matched was imported meanwhile: the match is that upload's
+    track in the library, with its summary, under the same kind of match."""
+    first = env.stage(content=b"same", progress_at=1)
+    later = env.stage(content=b"same", progress_at=2)
+    env.validate(runs=2)
+    track = env.track(b"same", title="Imported")
+    _imported_as(env, first, track)
+
+    [match] = env.get(later)["duplicate_check"]["matches"]
+
+    assert (match["subject_kind"], match["track_uuid"], match["available"]) == ("library_track", track, True)
+    assert (match["item_uuid"], match["staged_item"]) == (None, None)
+    assert (match["kind"], match["track"]["title"]) == ("exact", "Imported")
+
+
+def test_a_staged_match_imported_into_a_track_since_deleted_reads_as_an_unavailable_library_match(env):
+    first = env.stage(content=b"same", progress_at=1)
+    later = env.stage(content=b"same", progress_at=2)
+    env.validate(runs=2)
+    track = env.track(b"same", title="Imported")
+    _imported_as(env, first, track)
+    assert delete_track(Library(env.db, env.admin), track)
+
+    [match] = env.get(later)["duplicate_check"]["matches"]
+
+    assert (match["subject_kind"], match["track_uuid"], match["available"], match["track"]) == (
+        "library_track", track, False, None)
 
 
 @pytest.mark.parametrize("state", ["review_ready", "committing", "duplicate_conflict"])

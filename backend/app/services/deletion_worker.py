@@ -16,7 +16,7 @@ from app.database.database import ANY_OWNER, DeletionRecheckFailed
 from app.library import Library, library_root
 from app.services import file_ops
 from app.services.encoded_cache import evict_track_caches
-from app.services.journal_recovery import finish_track_journal_rows
+from app.services.journal_recovery import finish_track_journal_rows, reached_durable_point
 # The master-path judgements live in master_paths.py; they are still
 # importable from here.
 from app.services.master_paths import (  # noqa: F401
@@ -106,12 +106,9 @@ class DeletionExecutor:
         return self._track_locks
 
     def durable_point(self) -> bool:
-        """True when every committed catalog transaction is on disk."""
-        try:
-            return bool(self._database.make_durable())
-        except Exception as exc:  # never BaseException: a simulated kill escapes
-            logger.warning("deletion durable point failed: %s", type(exc).__name__)
-            return False
+        """True when every committed catalog transaction is on disk (the one
+        durable-point rule of the file operations: a failure counts as no)."""
+        return reached_durable_point(self._database)
 
     def flush_cleanups(self) -> None:
         """Run the deferred cleanups after one durable point. Without it they are

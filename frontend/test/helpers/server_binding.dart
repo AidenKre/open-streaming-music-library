@@ -13,6 +13,11 @@ import 'package:frontend/repositories/server_binding_repository.dart';
 /// 7.4) passes as in a real signed-in session.
 const testUserId = 1;
 
+/// The bound server of test sessions: the instance id [seedTestBinding]
+/// stores and [autoVerifiedGateOverride] answers by default. The gate never
+/// verifies a row without one.
+const testInstanceId = 'inst-1';
+
 /// A live session's binding row (SC-01). Every fenced writer (catalog sync,
 /// edit outbox, queue writes) is a no-op without one, exactly as after a
 /// reset, so tests that exercise those writers outside the real session flow
@@ -22,7 +27,7 @@ const testUserId = 1;
 Future<String> seedTestBinding(
   AppDatabase db, {
   String baseUrl = 'http://test',
-  String? instanceId,
+  String? instanceId = testInstanceId,
   int? userId = testUserId,
   bool reconciled = false,
 }) async {
@@ -109,7 +114,7 @@ Timer boundOnlyGateTimer(Duration delay, void Function() fire) => Timer(
 /// session starts its own connections.
 Override autoVerifiedGateOverride({
   String baseUrl = 'http://test',
-  String instanceId = 'test-instance',
+  String instanceId = testInstanceId,
   bool startOnRead = true,
 }) => serverBindingGateProvider.overrideWith((ref) {
   final gate = ServerBindingGate(

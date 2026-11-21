@@ -23,8 +23,11 @@ import stat
 from pathlib import Path
 
 from app.core.durable_fs import fsync_dir, fsync_file
+from app.core.operator_log import operator_logger
+from app.library import is_plain_folder_name, library_root as _library_root
 from app.services import organizer
-from app.services.path_sanitize import assert_within
+from app.services.master_paths import check_master_in_root
+from app.services.path_sanitize import PathEscapesRoot, assert_within
 from app.services.upload_receipt import owner_dir
 
 log = logging.getLogger(__name__)
@@ -121,6 +124,119 @@ def _remove(path: Path) -> tuple[bool, bool]:
     return removed, False
 
 
+_NOT_PLAIN = "journaled final name is not a plain file inside the library root"
+
+
+class LibraryChanged(PathEscapesRoot):
+    """A folder on the way to the journaled final name, below the owner's
+    library folder, or the library folder itself, was proven replaced outside
+    the server (a symbolic link below the library folder, not a folder, or a
+    library folder ``app.library.library_root`` refuses). A retry builds the
+    same folders and is refused again, so the refusal is final. (The final
+    name itself is not covered: each commit names its file after a new track
+    id, so a retry uses another name.) ``found`` names the entry relative to
+    the music folder, the library folder's own name first (``owner/Artist``,
+    or ``owner`` for the library folder itself, or the fixed text
+    ``(library folder)`` when the stored name is not a plain folder name),
+    with "/" separators: never absolute, never empty. The message holds no
+    path."""
+
+    def __init__(self, found: str):
+        super().__init__(_NOT_PLAIN)
+        self.found = found
+
+
+def owner_library_root(music_library_dir, user) -> Path:
+    """The owner's library root (``app.library.library_root``) for an upload
+    already accepted. A library folder the server refuses (a link leading
+    outside the music folder, or not a plain folder name) refuses every retry
+    the same way, so it is ``LibraryChanged``, named by the folder's own name
+    (a fixed word when that name is not a plain one)."""
+    try:
+        return _library_root(music_library_dir, user)
+    except PathEscapesRoot:
+        folder = user["library_folder"]
+        raise LibraryChanged(folder if is_plain_folder_name(folder) else "(library folder)") from None
+
+
+def log_library_changed(owner_id, exc: "LibraryChanged") -> None:
+    """The one operator line for an upload refused for good because its owner's
+    library was changed outside the server; ``found`` is relative to the music
+    folder, never absolute."""
+    operator_logger.warning(
+        "An upload of user %s was not imported: %s in their music library was changed"
+        " outside the server (a symbolic link, or not a plain file or folder).",
+        owner_id, exc.found)
+
+
+def _proven_changed(resolved_root: Path, parts, root_name: str) -> str | None:
+    """Walk once from the resolved library root through the folders on the way
+    to the final name and return the first folder proven wrong (a symbolic
+    link, or not a folder), named relative to the music folder as
+    ``root_name/...``. None when nothing is proven: an entry that cannot be
+    examined or is now missing, or nothing wrong found any more. The final
+    name itself is never named here. It decides nothing; the judgement is
+    ``check_master_in_root``."""
+    current = resolved_root
+    for index, part in enumerate(parts[:-1]):
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return "/".join((root_name, *parts[:index + 1]))
+    return None
+
+
+def assert_final_within(final, library_root) -> None:
+    """Raise ``PathEscapesRoot`` unless the journaled final name lies inside the
+    owner's library root with no symbolic link below it, the name itself
+    included (``master_paths.check_master_in_root``); a name not there yet
+    passes. The journal's path is the server's own, but the name or a folder
+    on the way can be swapped for a link after it was written, and a link is
+    never a file this operation placed.
+
+    The library folder itself (and the music folder above it) may be a link,
+    as far as ``app.library.library_root`` accepts one: the path below it is
+    judged from the resolved folder. The refusal is ``LibraryChanged`` only
+    when the library folder is proven not a folder or a folder below it is
+    proven changed; anything unknown (an entry that cannot be examined, a
+    dangling link) or a wrong entry at the final name itself gets the plain
+    ``PathEscapesRoot``, which a retry may get past."""
+    root = Path(library_root)
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        # A root not made yet holds nothing, so nothing on the way can be a link.
+        assert_within(final, root)
+        return
+    except OSError:
+        raise PathEscapesRoot(_NOT_PLAIN)
+    try:
+        resolved = Path(os.path.realpath(root, strict=True))
+        st = os.lstat(resolved)
+    except (OSError, RuntimeError):  # a dangling link or a loop: unknown
+        raise PathEscapesRoot(_NOT_PLAIN)
+    if not stat.S_ISDIR(st.st_mode):
+        raise LibraryChanged(root.name)
+    path = Path(final)
+    for base in (root, resolved):
+        if path.is_relative_to(base):
+            parts = path.relative_to(base).parts
+            break
+    else:
+        raise PathEscapesRoot(_NOT_PLAIN)
+    verdict, _ = check_master_in_root(resolved, resolved.joinpath(*parts))
+    if verdict == "rejected":
+        found = None
+        if parts and not any(part in ("", ".", "..") for part in parts):
+            found = _proven_changed(resolved, parts, root.name)
+        if found is None:  # refused, but nothing proven changed for good: retryable
+            raise PathEscapesRoot(_NOT_PLAIN)
+        raise LibraryChanged(found)
+
+
 def _within(path, root) -> bool:
     try:
         assert_within(path, root)
@@ -171,7 +287,7 @@ def write_record(row, *, uploads_root, library_root, temp: bool, measured=None) 
     without it the work file is hashed here. Raises when a path is outside its
     root or anything fails."""
     record = _record_path(row, uploads_root)
-    assert_within(Path(row["final_path"]), library_root)
+    assert_final_within(Path(row["final_path"]), library_root)
     size, sha256 = measured if measured is not None else measure(row)
     data = json.dumps({"v": 1, "sha256": sha256, "size": size, "final": row["final_path"],
                        "temp": bool(temp)})

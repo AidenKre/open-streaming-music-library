@@ -187,25 +187,25 @@ void main() {
         '1 valid · 0 failed · 0 skipped · 2 still checking · 1 cancelled');
   });
 
-  // 7-R2-05: the refused-review rule (UI-01) holds for a ZIP child as for a
-  // top-level row: a ready child the server refuses to import offers no
-  // Review tags, needs attention, and is not counted as valid.
-  test('7-R2-05 a child the server refuses to import offers no review and '
-      'needs attention', () async {
+  // A ready child carrying an error code the app does not know is a ready
+  // child like the others, as for a top-level row: it offers Review tags,
+  // needs no attention, and counts as valid.
+  test('a ready child with an error code the app does not know offers '
+      'review and counts as valid', () async {
     api.onListItems = (batch, after) async => _page([
       _child('c1', 'review_ready',
           error: {'code': 'upload_library_links_unsupported'}),
       _child('c2', 'review_ready'),
     ]);
     final result = await UploadZipChildren(api).load('b-1', 'zip');
-    final [refused, ready] = result.children;
+    final [coded, ready] = result.children;
 
-    expect(refused.offersReviewTags, isFalse);
-    expect(refused.needsAttention, isTrue);
+    expect(coded.offersReviewTags, isTrue);
+    expect(coded.needsAttention, isFalse);
     expect(ready.offersReviewTags, isTrue);
     expect(ready.needsAttention, isFalse);
-    expect(result.valid, 1);
-    expect(result.failed, 1);
+    expect(result.valid, 2);
+    expect(result.failed, 0);
   });
 
   // Refactor APP-UPLOAD (sign-off s7-app-texts review-8 #2): a file of an

@@ -8,6 +8,7 @@ import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart' show StateProvider;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/api/api_client.dart' show NetworkException;
 import 'package:frontend/services/uploads/upload_manager.dart';
 import 'package:frontend/services/uploads/upload_source.dart';
 import 'package:frontend/services/uploads/upload_source_picker.dart';
@@ -16,6 +17,8 @@ import 'package:frontend/services/uploads/uploads_overview.dart';
 import 'package:frontend/services/uploads/uploads_overview_provider.dart';
 import 'package:frontend/services/uploads/uploads_visibility.dart';
 import 'package:frontend/ui/uploads/uploads_controller.dart';
+
+import '../../helpers/fake_uploads_api.dart' show apiError;
 
 class _FakeManager implements UploadManager {
   final calls = <String>[];
@@ -453,6 +456,39 @@ void main() {
       c.dispose();
     });
 
+    // The server keeps an archive's record for its retention time, then
+    // removes it: the read answers 404 `upload_batch_not_found`.
+    test('a list the server no longer keeps shows as gone, also on a quiet '
+        'reload; any other failure stays failed', () async {
+      final c = create();
+      final done = c.loadChildren('b-1', 'zip');
+      children.answer.completeError(
+          apiError(404, 'upload_batch_not_found', retryable: false));
+      await done;
+      expect(c.childrenOf('zip'), isA<ChildListGone>());
+
+      children.answer = Completer()..complete(_zip);
+      await c.loadChildren('b-1', 'zip');
+      final shown = c.childrenOf('zip');
+      children.answer = Completer()
+        ..completeError(
+            apiError(404, 'upload_batch_not_found', retryable: false));
+      await c.loadChildren('b-1', 'zip', quiet: true);
+      expect(c.childrenOf('zip'), isA<ChildListGone>());
+      expect(shown, isA<ChildListLoaded>());
+
+      for (final other in <Object>[
+        apiError(404, 'upload_item_not_found', retryable: false),
+        apiError(503, 'server_busy', retryable: true),
+        NetworkException('down', attemptsMade: 1),
+      ]) {
+        children.answer = Completer()..completeError(other);
+        await c.loadChildren('b-1', 'zip');
+        expect(c.childrenOf('zip'), isA<ChildListFailed>(), reason: '$other');
+      }
+      c.dispose();
+    });
+
     test('a quiet reload of a list that never loaded shows its progress',
         () async {
       final c = create();
@@ -540,6 +576,17 @@ void main() {
       picker.gate!.complete();
       await first;
       expect(picker.picks, 1);
+      c.dispose();
+    });
+
+    test('a cancel for an item this device has no record of says so',
+        () async {
+      final c = create();
+      manager.cancelError = const UploadIntentMissing();
+      await c.cancel('i-1');
+      expect(c.notice?.title,
+          "This file isn't in this device's list of uploads, so nothing "
+          'was sent.');
       c.dispose();
     });
 

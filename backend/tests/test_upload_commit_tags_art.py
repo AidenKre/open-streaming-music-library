@@ -210,19 +210,38 @@ def test_unreadable_artwork_imports_without_a_cover(db, music, data, raises):
     assert json.loads(row["final_metadata"])["cover_art_id"] is None
 
 
-def test_a_rerun_keeps_ownership_of_art_this_operation_created(db, music):
-    """A crash after the art was journaled: the rerun dedupes onto the same art
-    (was_created false) and still owns it."""
+class _ReleasingCoverArt(FakeCoverArt):
+    """Gives a released image back, as the real manager does for art no track uses."""
+
+    def release_if_unreferenced(self, cover_art_id: int) -> bool:
+        super().release_if_unreferenced(cover_art_id)
+        self.ids = {image: i for image, i in self.ids.items() if i != cover_art_id}
+        return True
+
+
+def test_a_rerun_gives_back_the_art_its_operation_created_before_registering_its_own(db, music):
+    """A crash after the art was journaled: the rerun first gives back the art
+    the earlier run created and forgets it, then registers the image again and
+    owns what it registered."""
     commit = accept(db, _ready(db, music), lease=DEAD_BOOT)
     sql(db, "UPDATE upload_commit_journal SET cover_art_id = 500, cover_art_created = 1")
-    covers = FakeCoverArt(first_id=500)
-    covers.ids[b"img"] = 500  # it exists now: the rerun's add is a dedupe
+    covers = _ReleasingCoverArt(first_id=501)
+    covers.ids[b"img"] = 500  # the earlier run's art
+    seen = []
+    real_add = covers.add_album_art_with_status
+
+    def add(image):
+        seen.append((list(covers.released), journal(db, commit)["cover_art_id"]))
+        return real_add(image)
+
+    covers.add_album_art_with_status = add
 
     assert make_commit_worker(db, music, probe=FakeProbe(_art_meta()), art=FakeArt(b"img"),
                               cover_art=covers).process_one() == "prepared"
 
+    assert seen == [([500], None)]  # given back and forgotten before the new registration
     row = journal(db, commit)
-    assert (row["cover_art_id"], row["cover_art_created"]) == (500, 1)
+    assert (row["cover_art_id"], row["cover_art_created"]) == (501, 1)
 
 
 def test_a_rerun_onto_different_art_takes_the_new_answer(db, music):
@@ -234,6 +253,21 @@ def test_a_rerun_onto_different_art_takes_the_new_answer(db, music):
     make_commit_worker(db, music, probe=FakeProbe(_art_meta()), art=FakeArt(b"img"),
                        cover_art=covers).process_one()
 
+    row = journal(db, commit)
+    assert (row["cover_art_id"], row["cover_art_created"]) == (500, 0)
+    assert covers.released == [499]
+
+
+def test_a_rerun_never_gives_back_art_its_operation_did_not_create(db, music):
+    commit = accept(db, _ready(db, music), lease=DEAD_BOOT)
+    sql(db, "UPDATE upload_commit_journal SET cover_art_id = 500, cover_art_created = 0")
+    covers = FakeCoverArt(first_id=501)
+    covers.ids[b"img"] = 500  # another track's cover
+
+    make_commit_worker(db, music, probe=FakeProbe(_art_meta()), art=FakeArt(b"img"),
+                       cover_art=covers).process_one()
+
+    assert covers.released == []
     row = journal(db, commit)
     assert (row["cover_art_id"], row["cover_art_created"]) == (500, 0)
 

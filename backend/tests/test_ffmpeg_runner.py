@@ -189,11 +189,15 @@ class TestFfmpegProcessRegistry:
 
     def test_discard__removes_entry(self):
         registry = FfmpegProcessRegistry()
-        registry.register("job-1", MagicMock())
+        fake_proc = MagicMock(pid=555)
+        fake_proc.poll.return_value = None  # still running: a kill would signal it
+        registry.register("job-1", fake_proc)
 
         registry.discard("job-1")
 
-        assert registry.kill("job-1") is False
+        with patch("app.services.ffmpeg_runner.os.killpg") as killpg:
+            assert registry.kill("job-1") is False
+        killpg.assert_not_called()
 
     def test_kill_before_register__later_register_kills_on_arrival(self):
         registry = FfmpegProcessRegistry()
@@ -425,25 +429,31 @@ class TestRunFfmpegEndsTheWholeGroup:
             child = tool.child_pid() if tool.ready() else None
             child_gone = child is not None and _wait_gone(child)
         finally:
+            # What run_ffmpeg left, read before the clean-up below reaps anything.
+            exit_codes = [proc.returncode for proc in spawned]
             tool.cleanup(seen_gone=child_gone)
+            for proc in spawned:  # a tool run_ffmpeg failed to end
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(5)
             worker.join(timeout=10)
-        return outcome.get("result"), spawned, returned, child_gone
+        return outcome.get("result"), exit_codes, returned, child_gone
 
     def test_a_time_out_kills_the_tool_and_the_child_it_started(self, tmp_path):
         tool = _ToolWithChild(tmp_path)
 
-        result, [proc], returned, child_gone = self._run(
+        result, [exit_code], returned, child_gone = self._run(
             tmp_path, tool, subprocess.TimeoutExpired(cmd="tool", timeout=60))
 
         assert returned
         assert isinstance(result, FfmpegError)
-        assert proc.returncode == -signal.SIGKILL
+        assert exit_code == -signal.SIGKILL
         assert child_gone, "the tool's child outlived the time-out"
 
     def test_a_time_out_returns_even_when_the_child_holds_the_output_pipe(self, tmp_path):
         tool = _ToolWithChild(tmp_path, child_keeps_stderr=True)
 
-        result, [proc], returned, child_gone = self._run(
+        result, [_exit_code], returned, child_gone = self._run(
             tmp_path, tool, subprocess.TimeoutExpired(cmd="tool", timeout=60))
 
         assert returned, "run_ffmpeg waited on the child after the time-out"
@@ -454,11 +464,11 @@ class TestRunFfmpegEndsTheWholeGroup:
     def test_a_failure_while_reading_the_output_kills_the_child_too(self, tmp_path, exc_type):
         tool = _ToolWithChild(tmp_path)
 
-        result, [proc], returned, child_gone = self._run(tmp_path, tool, exc_type("interrupted"))
+        result, [exit_code], returned, child_gone = self._run(tmp_path, tool, exc_type("interrupted"))
 
         assert returned
         assert isinstance(result, exc_type)
-        assert proc.returncode == -signal.SIGKILL
+        assert exit_code == -signal.SIGKILL
         assert child_gone, "the tool's child outlived the failure"
 
     def test_a_stop_through_the_registry_kills_the_child_too(self, tmp_path):
@@ -513,6 +523,21 @@ def _spawn_fake(binary: Path, target: Path) -> subprocess.Popen:
     )
 
 
+def _wait_listed(procs: list[subprocess.Popen], timeout: float = 5.0) -> bool:
+    """Wait until every process is listed with its full command line (the
+    spawned shell has exec'd), instead of sleeping a fixed time."""
+    from app.services import ffmpeg_runner
+
+    want = {p.pid: p.args[-1] for p in procs}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        listed = {pid: cmd for pid, _, cmd in ffmpeg_runner._list_processes()}
+        if all(target in listed.get(pid, "") for pid, target in want.items()):
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def _wait_dead(proc: subprocess.Popen, timeout: float = 5.0) -> bool:
     try:
         proc.wait(timeout=timeout)
@@ -535,7 +560,7 @@ class TestKillOrphanedFfmpeg:
         staging.mkdir(parents=True)
         proc = _spawn_fake(fake_ffmpeg, staging / "u.1.convert.m4a.partial")
         try:
-            time.sleep(0.2)
+            assert _wait_listed([proc])
             killed = kill_orphaned_ffmpeg(staging)
             assert proc.pid in killed
             assert _wait_dead(proc)
@@ -556,12 +581,13 @@ class TestKillOrphanedFfmpeg:
             # A sibling directory that merely shares the prefix.
             _spawn_fake(fake_ffmpeg, tmp_path / ".staging-old" / "u.1.convert.m4a"),
         ]
+        ours = _spawn_fake(fake_ffmpeg, staging / "u.2.convert.m4a")  # the control: matched
         try:
-            time.sleep(0.2)
-            assert kill_orphaned_ffmpeg(staging) == []
+            assert _wait_listed([*procs, ours])
+            assert kill_orphaned_ffmpeg(staging) == [ours.pid]
             assert all(p.poll() is None for p in procs)
         finally:
-            for p in procs:
+            for p in [*procs, ours]:
                 p.kill()
                 p.wait()
 
@@ -574,6 +600,9 @@ class TestKillOrphanedFfmpegMatching:
     whose path merely ends the same way is never touched."""
 
     def _killed(self, monkeypatch, work_dir, cmdlines):
+        return self._killed_in(monkeypatch, [work_dir], cmdlines)
+
+    def _killed_in(self, monkeypatch, work_dirs, cmdlines):
         import app.services.ffmpeg_runner as runner
 
         procs = [(800000 + i, "/usr/bin/ffmpeg", c) for i, c in enumerate(cmdlines)]
@@ -582,7 +611,31 @@ class TestKillOrphanedFfmpegMatching:
         monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid)
         monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: sent.append(pid))
         monkeypatch.setattr(runner.os, "kill", lambda pid, sig: sent.append(pid))
-        return runner.kill_orphaned_ffmpeg(work_dir), sent
+        return runner.kill_orphaned_ffmpeg(*work_dirs), sent
+
+    def test_several_work_dirs_are_swept_with_one_listing(self, tmp_path, monkeypatch):
+        import app.services.ffmpeg_runner as runner
+
+        staging, uploads = tmp_path / "music" / ".staging", tmp_path / "music" / ".uploads"
+        procs = [
+            (800000, "/usr/bin/ffmpeg", f"ffmpeg -i x -y {staging}/u.1.convert.m4a"),
+            (800001, "/usr/bin/ffmpeg", f"ffmpeg -i x -y {uploads}/b/work.flac"),
+            (800002, "/usr/bin/ffmpeg", f"ffmpeg -i x -y {tmp_path}/music/admin/song.flac"),
+        ]
+        listings, sent = [], []
+        monkeypatch.setattr(runner, "_list_processes", lambda: listings.append(1) or procs)
+        monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: sent.append(pid))
+
+        assert runner.kill_orphaned_ffmpeg(staging, uploads) == [800000, 800001]
+        assert sent == [800000, 800001] and listings == [1]
+
+    def test_no_work_dir_kills_nothing(self, tmp_path, monkeypatch):
+        """With no folder to look in, no ffmpeg is "writing into one of them":
+        an empty list of folders must never read as "every ffmpeg"."""
+        killed, sent = self._killed_in(monkeypatch, [], ["ffmpeg -i x -y /srv/music/.staging/a.m4a"])
+
+        assert killed == [] and sent == []
 
     def test_a_relative_work_dir_never_matches_another_library(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import threading
 import unicodedata
@@ -29,6 +30,7 @@ from app.database.database import (
     prepare_fts_query,
 )
 from tests.owned_database import OwnedTestDatabase
+from tests.track_removal import tombstone_uuids
 from app.database import ANY_OWNER
 from app.models.album import Album
 from app.models.artist import Artist
@@ -501,34 +503,10 @@ class TestDatabaseAddTrack:
 
 
 class TestDatabaseDeleteTrack:
-    def test_delete_track__db_not_initialized__returns_false(self, tmp_path: Path):
-        database_path = tmp_path / "database.db"
-        database = set_up_database(database_path)
-
-        # Never initialized, so no owner was seeded: pass one explicitly.
-        track_deleted = database.delete_track(uuid_id="missing", owner_id=1)
-        assert track_deleted is False
-
-    def test_delete_track__missing_uuid__returns_false(self, tmp_path: Path):
-        database_path = tmp_path / "database.db"
-        database = set_up_database(database_path)
-        database.initialize()
-
-        track_deleted = database.delete_track(uuid_id="missing")
-        assert track_deleted is False
-
-    def test_delete_track__db_busy__returns_false(self, tmp_path: Path):
-        database_path = tmp_path / "database.db"
-        database = set_up_database(database_path)
-        database.initialize()
-
-        blocking_conn = sqlite3.connect(database_path)
-        blocking_conn.execute("BEGIN EXCLUSIVE")
-
-        track_deleted = database.delete_track(uuid_id="missing", timeout=0.05)
-        assert track_deleted is False
-
-        blocking_conn.close()
+    """What deleting a track's rows does to the catalog. ``database.delete_track``
+    is the test adapter's set-up helper (``tests/track_removal.py``): it runs
+    the product's ``_delete_track_in``, the statements a committed deletion
+    runs."""
 
     def test_delete_track__valid_uuid__deletes_tracks_and_trackmetadata(
         self, tmp_path: Path
@@ -676,7 +654,7 @@ class TestDatabaseTombstones:
 
         assert database.delete_track(uuid_id="tomb_uuid")
 
-        tombstones = database.get_track_tombstones()
+        tombstones = tombstone_uuids(database)
         assert "tomb_uuid" in tombstones
 
     def test_delete_track__missing_uuid__no_tombstone(self, tmp_path: Path):
@@ -684,25 +662,7 @@ class TestDatabaseTombstones:
         assert database.initialize()
 
         assert database.delete_track(uuid_id="never_existed") is False
-        assert database.get_track_tombstones() == []
-
-    def test_get_track_tombstones__returns_all(self, tmp_path: Path):
-        database = set_up_database(database_path=tmp_path / "database.db")
-        assert database.initialize()
-
-        with database._connection(commit=True) as conn:
-            conn.execute(
-                "INSERT INTO track_tombstones (uuid_id, deleted_at, owner_id) "
-                "VALUES (?, ?, ?)",
-                ("old_uuid", 100, database.owner_id),
-            )
-            conn.execute(
-                "INSERT INTO track_tombstones (uuid_id, deleted_at, owner_id) "
-                "VALUES (?, ?, ?)",
-                ("new_uuid", 200, database.owner_id),
-            )
-
-        assert sorted(database.get_track_tombstones()) == ["new_uuid", "old_uuid"]
+        assert tombstone_uuids(database) == []
 
     def test_delete_track__re_delete__bumps_tombstone_timestamp(self, tmp_path: Path):
         database = set_up_database(database_path=tmp_path / "database.db")
@@ -994,26 +954,24 @@ class TestDatabaseGetTracks:
         row_filter_parameters: List[RowFilterParameter] = []
         for column in columns:
             if column in ALLOWED_METADATA_COLUMNS:
-                param = RowFilterParameter(
-                    column=column, value=str(getattr(last_track.metadata, column))
-                )
+                raw = getattr(last_track.metadata, column)
             else:
-                param = RowFilterParameter(
-                    column=column, value=str(getattr(last_track, column))
-                )
-
-            row_filter_parameters.append(param)
+                raw = getattr(last_track, column)
+            # An unknown disc or track number is a NULL cursor value, not "None".
+            value = None if raw is None else str(raw)
+            row_filter_parameters.append(RowFilterParameter(column=column, value=value))
 
         returned_tracks = database.get_tracks(
             order_parameters=order_parameters,
             row_filter_parameters=row_filter_parameters,
         )
 
-        for track in returned_tracks:
-            assert track.uuid_id not in all_returned_uuids
-
         returned_uuids = [track.uuid_id for track in returned_tracks]
-        assert len(returned_uuids) == len(set(returned_uuids))
+        assert not set(returned_uuids) & all_returned_uuids
+        # The second page holds every remaining track, each once.
+        assert len(returned_uuids) == len(set(returned_uuids)) == 12 - 4
+        everything = database.get_tracks(order_parameters=order_parameters)
+        assert all_returned_uuids | set(returned_uuids) == {t.uuid_id for t in everything}
 
     def test_get_tracks__artist_filter__returns_matching_tracks(self, tmp_path):
         database_path = tmp_path / "database.db"
@@ -2114,26 +2072,32 @@ class TestGetAlbums:
         assert regular[1].name == "Album No Year"
         assert regular[1].year is None
 
-    def test_get_albums__null_artist_sorts_last(self, tmp_path):
+    def test_get_albums__ordered_by_artist_ignoring_case(self, tmp_path):
+        # An album always has an artist (albums join their artist), so this
+        # checks the artist order the nulls-last option keeps.
         database = set_up_database(database_path=tmp_path / "database.db")
         database.initialize()
 
-        # Album with an artist
-        track1 = create_track(tmp_path / "s1.mp3", "song_1", "Artist A")
-        track1.metadata.album = "Album A"
+        # One artist in lower case: the order is by artist name, ignoring case.
+        track2 = create_track(tmp_path / "s2.mp3", "song_2", "Artist B")
+        track2.metadata.album = "Album A"
+        assert database.add_track(track=track2)
+        track1 = create_track(tmp_path / "s1.mp3", "song_1", "artist a")
+        track1.metadata.album = "Album B"
         assert database.add_track(track=track1)
 
-        returned_albums = database.get_albums(
-            artist_id=None,
-            order_parameters=[
-                AlbumOrderParameter("is_single_grouping", True),
-                AlbumOrderParameter("artist", True, nullsLast=True),
-            ],
-        )
-        assert returned_albums is not None
-        regular = [a for a in returned_albums if not a.is_single_grouping]
-        assert len(regular) == 1
-        assert regular[0].artist == "Artist A"
+        def artists(ascending):
+            returned_albums = database.get_albums(
+                artist_id=None,
+                order_parameters=[
+                    AlbumOrderParameter("is_single_grouping", True),
+                    AlbumOrderParameter("artist", ascending, nullsLast=True),
+                ],
+            )
+            return [a.artist for a in returned_albums if not a.is_single_grouping]
+
+        assert artists(True) == ["artist a", "Artist B"]
+        assert artists(False) == ["Artist B", "artist a"]
 
     def test_get_albums__cursor_pagination(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
@@ -2686,18 +2650,23 @@ class TestGetSearchResults:
         results = database.get_search_results("OrphanArtist", return_types=SearchEntityType.ARTISTS)
         assert len(results.artists) == 0
 
-    def test_search_special_characters__does_not_crash(self, tmp_path):
+    def test_search_special_characters__does_not_crash(self, tmp_path, caplog):
         database = set_up_database(database_path=tmp_path / "database.db")
         assert database.initialize()
 
         track = create_track(tmp_path / "t.mp3", "Normal Song", "Normal Artist")
         assert database.add_track(track=track)
+        quoted = create_track(tmp_path / "q.mp3", 'Don\'t "Stop" (Live)', "Quoted Artist")
+        assert database.add_track(track=quoted)
+        operators = create_track(tmp_path / "o.mp3", "test:value a*b", "Operator Artist")
+        assert database.add_track(track=operators)
 
         special_queries = [
             '"quotes"',
             "it's",
             "test & test",
             "hello (world)",
+            'a"b',
             "a*b",
             "a OR b",
             "test:value",
@@ -2705,10 +2674,23 @@ class TestGetSearchResults:
             "   ",
         ]
 
-        for query in special_queries:
-            # Should not raise an exception
-            results = database.get_search_results(query)
-            assert results is not None
+        with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+            for query in special_queries:
+                # A query the full-text engine rejects is swallowed and logged,
+                # so the log line is what shows a query was not escaped.
+                database.get_search_results(query)
+        assert not [r for r in caplog.records if r.getMessage().startswith("Search failed")]
+        assert [t.metadata.title for t in database.get_search_results("Normal").tracks] == [
+            "Normal Song"
+        ]
+        # Quotes, apostrophes and brackets in a query still find the track.
+        for query in ['"Stop', '"stop"', "don't", "(live)"]:
+            found = database.get_search_results(query).tracks
+            assert [t.metadata.title for t in found] == ['Don\'t "Stop" (Live)'], query
+        # So do the engine's own operators: a column filter and a prefix star.
+        for query in ["test:value", "a*b"]:
+            found = database.get_search_results(query).tracks
+            assert [t.metadata.title for t in found] == ["test:value a*b"], query
 
     def test_get_search_results__after_album_orphan_cleanup__album_not_in_results(self, tmp_path):
         database = set_up_database(database_path=tmp_path / "database.db")
@@ -3254,6 +3236,24 @@ class TestApplyTrackMetadataEditConcurrency:
         t_a.start()
         assert a_paused.wait(timeout=5), "A never reached its paused write step"
 
+        # While A holds its edit, another caller cannot even read the revision:
+        # its transaction waits for A's write lock (here it gives up after a
+        # short timeout) and never reaches the write. Without the up-front
+        # lock it would read the old revision, pass the check and get there.
+        reached_write = []
+        original_write = Database._update_track_metadata
+
+        def recording_write(self, *args, **kwargs):
+            reached_write.append(threading.current_thread())
+            return original_write(self, *args, **kwargs)
+
+        monkeypatch.setattr(Database, "_update_track_metadata", recording_write)
+        with pytest.raises(sqlite3.OperationalError):
+            database.apply_track_metadata_edit(
+                track.uuid_id, {"title": "TitleC"}, base_rev, timeout=0.05
+            )
+        assert threading.current_thread() not in reached_write
+
         t_b = threading.Thread(target=call_b)
         t_b.start()
         assert b_started.wait(timeout=5), "B's thread never started"
@@ -3261,6 +3261,7 @@ class TestApplyTrackMetadataEditConcurrency:
         release_a.set()
         t_a.join(timeout=5)
         t_b.join(timeout=5)
+        assert not t_a.is_alive() and not t_b.is_alive()
 
         successes = [v for v in results.values() if isinstance(v, int)]
         conflicts = [v for v in results.values() if isinstance(v, RevisionConflict)]

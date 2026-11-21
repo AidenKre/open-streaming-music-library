@@ -130,7 +130,7 @@ def test_a_loose_file_is_not_organized_once_stopping(tmp_path):
     )
 
     with patch("app.services.ingestion.does_music_pass_quick_check", return_value=True):
-        assert ingestor.ingest(song) is ImportOutcome.STOPPED
+        assert ingestor.ingest(song, imported_dir=song.parent / ".imported") is ImportOutcome.STOPPED
 
     organize.assert_not_called()
     assert song.read_bytes() == b"audio"

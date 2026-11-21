@@ -7,8 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
-from app.services.import_outcome import file_signature
-from app.services.ingestion import is_archive, is_macos_companion, is_music_file
+from app.core.operator_log import operator_logger
+from app.services.import_outcome import (
+    EntryMemory, entry_key, expected_special_entry, file_signature, open_regular_file,
+)
+from app.services.ingestion import _in_folder, is_archive, is_macos_companion, is_music_file
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -48,6 +51,8 @@ class FileWatcher(FileSystemEventHandler):
         self._submit_lock = threading.Lock()
         # path -> signature of a file an attempt left in the folder unchanged
         self._left_behind: dict[Path, tuple[int, int]] = {}
+        # Entries that are no regular file, handed over once (by their entry_key).
+        self._skipped = EntryMemory()
 
     def on_created(self, event):
         if event.is_directory:
@@ -77,9 +82,14 @@ class FileWatcher(FileSystemEventHandler):
         (``scan_existing`` shares that name rule) and, for modify/move events,
         a file an earlier attempt left behind that has not changed since
         (the scan does not apply that rule). A create event is a new file at
-        the path, so it is always attempted."""
+        the path, so it is always attempted. An entry that is no regular file,
+        handed over before and still the same entry, is not attempted again."""
         if not is_import_candidate(path):
             return
+        if path in self._skipped:
+            if self._skipped.knows(path, entry_key(path)):
+                return
+            self._skipped.forget(path)
         left = self._left_behind.get(path)
         if left is not None:
             if not created and file_signature(path) == left:
@@ -112,13 +122,14 @@ class FileWatcher(FileSystemEventHandler):
         return True
 
     def scan_existing(self, directory: Path | None = None) -> None:
-        """Feed every existing file under ``directory`` (default: the import
-        dir) through the same path as a newly created file; names that are
+        """Feed every existing entry but a folder under ``directory`` (default:
+        the import dir) through the same path as a newly created file (a FIFO
+        or a link too: the ingest says once why it is skipped); names that are
         neither audio nor archives are skipped."""
         root = directory or self.import_dir
         if not root.is_dir():
             return
-        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        for path in sorted(p for p in root.rglob("*") if not p.is_dir()):
             if is_import_candidate(path):
                 self._submit_new(path)
 
@@ -129,7 +140,7 @@ class FileWatcher(FileSystemEventHandler):
             observer.start()
             # Kept only once it runs: stopping never meets an observer that never started.
             self.observer = observer
-            print(f"File watcher started for {self.import_dir}")
+            operator_logger.info("File watcher started")
 
     def stop_file_watcher(self, timeout: float = 30.0):
         return stop_watchers([self], timeout)
@@ -138,6 +149,25 @@ class FileWatcher(FileSystemEventHandler):
         return self.on_file(path)
 
     def process_file_after_stable(self, path: Path) -> bool:
+        key = entry_key(path)
+        if _is_special(key):
+            # A FIFO, a link, a socket or a device: handed to the ingest at once,
+            # never waited on or opened (a FIFO would hold this worker).
+            token = expected_special_entry.set(key)
+            try:
+                self.handle_new_file(path)
+            except Exception as exc:
+                self._log_raised(path, exc)
+                self.processed.discard(path)
+                return False
+            finally:
+                expected_special_entry.reset(token)
+            self.processed.discard(path)
+            if entry_key(path) == key:
+                self._skipped.remember(path, key)
+            elif not self._stopping.is_set():
+                self._submit_new(path)  # another entry now (a new file): the normal path, with its wait
+            return True
         if not wait_until_ready(path, stop=self._stopping):
             # Not handled: forget it so a later scan feeds it again.
             self.processed.discard(path)
@@ -150,8 +180,8 @@ class FileWatcher(FileSystemEventHandler):
         stable = file_signature(path)
         try:
             self.handle_new_file(path)
-        except Exception:
-            logger.exception("import of %s raised", path)
+        except Exception as exc:
+            self._log_raised(path, exc)
             self.processed.discard(path)
             return False
         # Modify events during the attempt were dropped while the path was in
@@ -169,7 +199,24 @@ class FileWatcher(FileSystemEventHandler):
         ):
             return True
         self.processed.discard(path)
+        # A modify event between that look and the discard was dropped: look once more.
+        if file_signature(path) != after and not self._stopping.is_set():
+            self._left_behind.pop(path, None)
+            self._submit_new(path)
         return True
+
+    def _log_raised(self, path: Path, exc: Exception) -> None:
+        # Relative to the watched folder (it begins with the user's folder);
+        # the traceback, whose error text may hold full paths, only at DEBUG.
+        name = _in_folder(path, self.import_dir)
+        logger.warning("import of %s raised %s", name, type(exc).__name__)
+        logger.debug("import of %s raised %s", name, type(exc).__name__, exc_info=True)
+
+
+def _is_special(key) -> bool:
+    """Whether an ``entry_key`` is of something neither a regular file nor a
+    folder (a link is not followed). A missing path (None) is False."""
+    return key is not None and not (stat.S_ISREG(key[2]) or stat.S_ISDIR(key[2]))
 
 
 # A file is complete only after its size and mtime stay unchanged this long
@@ -194,7 +241,7 @@ def wait_until_stable(
 ) -> bool:
     if quiet_window is None:
         quiet_window = STABILITY_QUIET_WINDOW_S
-    print(f"Starting stable check for {path}")
+    operator_logger.debug("Starting stable check for %s", Path(path).name)
 
     start_time = clock()
     signature = None
@@ -216,7 +263,7 @@ def wait_until_stable(
             signature = current
             first_seen = now
         elif now - first_seen >= quiet_window:
-            print(f"File {path} is stable")
+            operator_logger.debug("File %s is stable", Path(path).name)
             return True
 
         if stop is not None:
@@ -228,13 +275,11 @@ def wait_until_stable(
     return False
 
 
-def can_open_for_read(path: Path):
-    if os.path.isdir(path):
-        return False
-    if not os.path.exists(path):
-        return False
+def can_open_for_read(path: Path) -> bool:
+    """Whether ``path`` is a regular file that opens for reading, found
+    without waiting: never a FIFO, a device, a socket, a link or a folder."""
     try:
-        with open(path, "rb"):
+        with open_regular_file(path):
             return True
     except Exception:
         return False
@@ -250,7 +295,7 @@ def stop_watchers(watchers, timeout: float = 30.0) -> set:
             watcher.observer.stop()
             watcher.observer.join()
             watcher.observer = None
-            print("File watcher stopped")
+            operator_logger.info("File watcher stopped")
         watcher.executor.shutdown(wait=False, cancel_futures=True)
     pending = {f for w in watchers for f in list(w._futures) if not f.done()}
     not_done: set = set()

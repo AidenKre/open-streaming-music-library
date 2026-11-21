@@ -372,11 +372,19 @@ class DurableSubmission implements Quiescable {
     // The status GET would go out under the current session: check the
     // row's binding first (throws BindingFencedException when it is gone).
     await _binding.runFenced(row.localBindingId, () async {});
+    if (_closed) throw SubmissionClosed(); // quiesced: ask nothing
     SubmissionStatus? answer;
     Object? failure;
     StackTrace? failureTrace;
     try {
-      answer = await status(row.operationUuid);
+      // A quiesce (sign-out, reset) stops the wait: a status read that hangs
+      // must not hold it. The row stays as it is, and nothing is sent.
+      answer = await Future.any([
+        status(row.operationUuid),
+        _abort.future.then<SubmissionStatus>((_) => throw SubmissionClosed()),
+      ]);
+    } on SubmissionClosed {
+      rethrow;
     } catch (e, st) {
       failure = e;
       failureTrace = st;
@@ -544,8 +552,9 @@ class DurableSubmission implements Quiescable {
   @override
   String get quiesceName => 'submissions';
 
-  /// SC-15: closes admission, aborts every send in flight and waits for the
-  /// submits to settle. Idempotent.
+  /// SC-15: closes admission, aborts every send in flight, stops waiting for
+  /// every status query in flight (that submit throws [SubmissionClosed]) and
+  /// waits for the submits to settle. Idempotent.
   @override
   Future<void> quiesce() async {
     _closed = true;

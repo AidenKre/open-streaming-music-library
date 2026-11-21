@@ -214,6 +214,29 @@ def test_a_failure_releases_artwork_this_operation_created(db, music):
     _assert_back_to_review(db, commit, "upload_commit_failed")
 
 
+def test_a_rerun_whose_release_of_earlier_art_fails_keeps_that_art_named(db, music):
+    """The re-run gives back the art an earlier run created before it registers
+    its own; when that release fails, the step fails and the journal still
+    names the earlier art, so a later pass can release it."""
+    commit = accept(db, _ready(db, music), lease=DEAD_BOOT)
+    sql(db, "UPDATE upload_commit_journal SET cover_art_id = 499, cover_art_created = 1")
+    covers = FakeCoverArt(first_id=500)
+
+    def refuse(cover_art_id):
+        covers.released.append(cover_art_id)
+        raise OSError("busy")
+
+    covers.release_if_unreferenced = refuse
+
+    assert make_commit_worker(db, music, probe=FakeProbe(_art_meta()), art=FakeArt(b"img"),
+                              cover_art=covers).process_one() == "failed"
+
+    assert covers.calls == []  # nothing registered
+    row = journal(db, commit)
+    assert (row["state"], row["cover_art_id"], row["cover_art_created"]) == ("failed", 499, 1)
+    _assert_back_to_review(db, commit, "upload_commit_failed")
+
+
 def test_a_failure_never_releases_shared_artwork(db, music):
     commit = accept(db, _ready(db, music))
     covers, exact = FakeCoverArt(first_id=500), FakeExact()

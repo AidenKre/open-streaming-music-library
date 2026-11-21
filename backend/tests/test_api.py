@@ -18,6 +18,7 @@ from app.models import (
 from app.models.client_track import ClientTrack
 from app.database.database import EDITABLE_METADATA_COLUMNS
 from tests.track_paths import PATH_COLUMNS, PATH_MARKS, path_values
+from tests.track_removal import delete_track
 
 
 @pytest.fixture
@@ -420,7 +421,7 @@ class TestGetChanges:
     def test_changes__interleaves_upserts_and_deletes_by_revision(self, client):
         tracks = add_tracks_to_client(client=client, amount_to_add=2)
         # Delete the first track so its tombstone gets the newest revision.
-        assert client.app.state.admin_library.delete_track(uuid_id=tracks[0].uuid_id)
+        assert delete_track(client.app.state.admin_library, uuid_id=tracks[0].uuid_id)
 
         entries = _drain_changes(client)
         # Strictly increasing revisions across the whole interleaved stream.
@@ -435,7 +436,7 @@ class TestGetChanges:
         # Regression for the old design where deletes only rode page 1: with
         # limit=1 the delete lands on a later page and must still surface.
         tracks = add_tracks_to_client(client=client, amount_to_add=3)
-        assert client.app.state.admin_library.delete_track(uuid_id=tracks[0].uuid_id)
+        assert delete_track(client.app.state.admin_library, uuid_id=tracks[0].uuid_id)
 
         entries = _drain_changes(client, limit=1)
         delete_entries = [e for e in entries if e["type"] == "delete"]
@@ -1174,16 +1175,24 @@ class TestSearch:
         assert any(a.name == "Dark Side of the Moon" for a in response.albums)
 
     def test_search__types_filter__works(self, client, tmp_path):
+        # "Song" names the track, its artist and its album, so only the filter
+        # keeps the artist and the album out.
         metadata = TrackMetaData(
-            title="Song", artist="Artist", album="Album", duration=1.0,
+            title="Song", artist="Song Artist", album="Song Album", duration=1.0,
         )
         track = Track(file_path=tmp_path / "s.mp3", metadata=metadata)
         assert client.app.state.admin_library.add_track(track=track)
+
+        unfiltered = GetSearchResponse.model_validate(
+            client.get("/search", params={"q": "Song"}).json())
+        assert [a.name for a in unfiltered.artists] == ["Song Artist"]
+        assert [a.name for a in unfiltered.albums] == ["Song Album"]
 
         r = client.get("/search", params={"q": "Song", "types": "tracks"})
         assert r.status_code == 200, r.text
 
         response = GetSearchResponse.model_validate(r.json())
+        assert [t.metadata.title for t in response.tracks] == ["Song"]
         assert len(response.artists) == 0
         assert len(response.albums) == 0
 

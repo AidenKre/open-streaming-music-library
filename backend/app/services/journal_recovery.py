@@ -14,8 +14,11 @@ recoveries settle such rows, with different rules:
 
 Both read the same facts, defined here once: whether a path is a regular file,
 whether it is the track's current master, the identity mark, the replay of a
-staged copy, and the job of a same-file conversion (its id in the staged file's
-name, its texts, whether its own swap failed).
+staged copy, and the job a same-file conversion's row belongs to (its id in the
+staged file's name). What only start-up recovery needs (the texts it ends such
+a job with, and how it ends it) is in ``journal_settle``. ``file_identity``
+(which file a name is, with its size and times) is read here and by the
+conversion's undo of a refused swap.
 
 These functions used to live in ``track_editor.py``; that module still exports
 the public names (``PendingOldMasters``, ``finish_track_journal_rows``,
@@ -36,7 +39,7 @@ from app.core.internal_dirs import STAGING
 from app.database import ANY_OWNER
 from app.database.database import Database
 from app.library import Library, library_root
-from app.services.organizer import flush_move, prune_empty_dirs
+from app.services.file_ops import flush_move, prune_empty_dirs
 from app.services.path_sanitize import assert_within
 
 # The lines these functions log keep the logger name they had in track_editor.py.
@@ -54,7 +57,7 @@ def finish_track_journal_rows(
             continue
         try:
             reconcile_one(
-                library.database, entry, music_library_dir, identity_signal,
+                library.unbound_database, entry, music_library_dir, identity_signal,
                 pending_old_masters=pending_old_masters,
             )
         except Exception as e:
@@ -143,7 +146,7 @@ class PendingOldMasters:
         self._files: dict[tuple, tuple] = {}
 
     def remember(self, entry: dict, path) -> None:
-        identity = _file_identity(path)
+        identity = file_identity(path)
         if identity is not None:
             with self._lock:
                 self._files[_row_key(entry)] = identity
@@ -155,18 +158,19 @@ class PendingOldMasters:
     def is_same_file(self, entry: dict, path) -> bool:
         with self._lock:
             identity = self._files.get(_row_key(entry))
-        return identity is not None and _file_identity(path) == identity
+        return identity is not None and file_identity(path) == identity
 
     def forget(self, entry: dict) -> None:
         with self._lock:
             self._files.pop(_row_key(entry), None)
 
 
-def _file_identity(path) -> Optional[tuple]:
+def file_identity(path, *, follow: bool = False) -> Optional[tuple]:
     """A regular file's or a symbolic link's own (lstat) device, inode, size,
-    mtime, ctime; None otherwise. Removing a link removes only its name."""
+    mtime, ctime; None otherwise. Removing a link removes only its name.
+    ``follow``: those of the file the path reads as (a link's target) instead."""
     try:
-        st = os.lstat(path)
+        st = os.stat(path) if follow else os.lstat(path)
     except OSError:
         return None
     if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
@@ -268,9 +272,22 @@ def _reconcile_relocate(
                 raise JournalOwnershipUnproven(
                     f"cannot show that the file at the new location is the output of journal entry {entry['id']}"
                 )
+    # A folder the operation left with nothing in it goes (the old master's, when
+    # an interrupted finish removed the file and not the folder; the new path's,
+    # when the move is taken back after its folder was made). Only an empty
+    # folder is ever removed, and it goes while the row still exists: after the
+    # row nothing would tell the next start about it.
+    for path in (old_path, new_path):
+        if path and not os.path.lexists(path):
+            prune_empty_dirs(Path(path).parent, root)
+    # Then the row, then its staged copy. Killed between the two, a staged copy
+    # no row names is left, which the next start removes. The other order would
+    # leave a row without its copy, which recovery reads as "the move happened":
+    # a file that later appears at the new path would be removed as this row's
+    # own.
+    database.delete_journal_entry(entry["id"], owner_id=entry["owner_id"])
     if temp_path:
         Path(temp_path).unlink(missing_ok=True)
-    database.delete_journal_entry(entry["id"], owner_id=entry["owner_id"])
     if pending_old_masters is not None:
         pending_old_masters.forget(entry)
 
@@ -293,17 +310,6 @@ def is_current_master(path: str, current: Optional[str]) -> bool:
         return os.path.samefile(path, current)
     except OSError:
         return False
-
-
-# Job texts startup recovery stores when it settles a same-file conversion whose
-# own swap failed (U06-B-06). TRACK_CHANGED_TEXT equals
-# conversion.TRACK_CHANGED_ERROR (not imported: conversion imports this module on
-# later phases).
-TRACK_CHANGED_TEXT = "track changed since the conversion was requested"
-SWAP_LOST_TEXT = "The converted file was lost, so the original was kept. Convert it again."
-SWAP_UNPROVEN_TEXT = "could not place the converted master"
-# The probe of a swap that happened earlier: bitrates are compared within this.
-_SWAP_BITRATE_TOLERANCE_KBPS = 0.5
 
 
 def _reconcile_inplace(database: Database, entry: dict, identity_signal=None) -> None:
@@ -360,12 +366,6 @@ def replay_staged_copy(temp: Path, target: Path) -> None:
     flush_move(target, temp)
 
 
-def same_bitrate(a: Optional[float], b: Optional[float]) -> bool:
-    if a is None or b is None:
-        return a is None and b is None
-    return abs(a - b) <= _SWAP_BITRATE_TOLERANCE_KBPS
-
-
 _TAGGED_JOB_ID_RE = re.compile(r"(\d+)\.tagged\.")
 
 
@@ -400,34 +400,8 @@ def swap_waits_for_start(library: Library, uuid_id: str) -> bool:
     """Whether a kept row of this track is one ``_swap_job_failed`` leaves to
     the next start."""
     return any(
-        entry["uuid_id"] == uuid_id and _swap_job_failed(library.database, entry)
+        entry["uuid_id"] == uuid_id and _swap_job_failed(library.unbound_database, entry)
         for entry in library.list_journal_entries()
-    )
-
-
-def job_settled_lost(database: Database, entry: dict) -> bool:
-    """Whether this row's job was already ended "lost" (a crash came after it)."""
-    job_id = conversion_job_id_of(entry)
-    if job_id is None:
-        return False
-    job = database.get_conversion_job(job_id, owner_id=entry["owner_id"])
-    return (
-        job is not None and job["uuid_id"] == entry["uuid_id"]
-        and job["status"] == "failed" and job["error_text"] == SWAP_LOST_TEXT
-    )
-
-
-def end_swap_job(database: Database, entry: dict, error_text: Optional[str]) -> None:
-    """Settle a convert row's job: done when ``error_text`` is None, else failed
-    with that final text. Not a convert row, or a name with no job id: nothing.
-    A failing update raises (the row is kept)."""
-    if entry["intent"] != "convert":
-        return
-    job_id = conversion_job_id_of(entry)
-    if job_id is None:
-        return
-    database.settle_swapped_conversion_job(
-        job_id, entry["uuid_id"], owner_id=entry["owner_id"], error_text=error_text
     )
 
 

@@ -130,6 +130,70 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  // After a queue edit the rows on screen are read again where the person
+  // is. When that read failed, Retry loaded around the playing track
+  // instead and jumped there.
+  testWidgets('Retry after a failed re-read of the rows on screen reads them '
+      'again in place: no jump to the playing track', (tester) async {
+    final uuids = [
+      for (var i = 0; i < 200; i++) 't${i.toString().padLeft(3, '0')}',
+    ];
+    await _seedQueueTracks(db, uuids);
+    final sessionId = await repo.createSessionFromExplicitList(
+      sourceType: 'test', trackUuids: uuids,
+    );
+    final snapshot = (await repo.getSessionSnapshot(sessionId))!;
+    final failingRepo = _FailNextPageQueueRepository(db);
+    final notifier = _MutableTestQueuePlayer(_audioStateFor(
+      sessionId: sessionId,
+      currentItemId: snapshot.currentItem!.itemId,
+      currentPlayPosition: 0,
+      totalCount: 200,
+      currentTrack: _track('t000'),
+    ));
+    final container = ProviderContainer(overrides: [
+      databaseProvider.overrideWithValue(db),
+      coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
+      queueRepositoryProvider.overrideWithValue(failingRepo),
+      playerControlsProvider.overrideWithValue(FakePlayerControls()),
+      queuePlayerProvider.overrideWith(() => notifier),
+    ]);
+    addTearDown(container.dispose);
+    await tester.pumpWidget(UncontrolledProviderScope(
+      container: container,
+      child: const MaterialApp(home: Scaffold(body: FullPlayer())),
+    ));
+    await tester.tap(find.text('Queue'));
+    await tester.pumpAndSettle();
+    final position = tester
+        .state<ScrollableState>(find.descendant(
+            of: find.byKey(const ValueKey('queue rows')),
+            matching: find.byType(Scrollable)))
+        .position;
+    position.jumpTo(2000); // reading rows around the 30th
+    await tester.pumpAndSettle();
+    expect(find.text('Track T000'), findsNothing,
+        reason: 'precondition: the playing track is out of view');
+
+    // A queue edit re-reads the rows on screen; that read fails.
+    failingRepo.failNextPage = true;
+    notifier.setQueueState(notifier.state.queue
+        .copyWith(queueVersion: notifier.state.queue.queueVersion + 1));
+    await tester.pumpAndSettle();
+    expect(find.text('Error loading queue'), findsOneWidget);
+    expect(position.pixels, closeTo(2000, 1),
+        reason: 'precondition: the rows stay where they were');
+
+    await tester.tap(find.text('Retry'));
+    await tester.pumpAndSettle();
+    expect(find.text('Error loading queue'), findsNothing,
+        reason: 'the rows on screen were read again');
+    expect(position.pixels, closeTo(2000, 1),
+        reason: 'no jump back to the playing track');
+    expect(find.text('Track T000'), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   // Pre-merge R2-L-01 (second live run): the open Queue tab lost the playing
   // track in a burst of skips. It scrolled to the playing track only when a
   // load of new rows completed, and such a load starts when the playing track

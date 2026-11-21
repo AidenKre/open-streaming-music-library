@@ -93,6 +93,14 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
   /// that play is still the latest.
   int _playToken = 0;
 
+  /// Set when the plugin took its playing flag back by itself while a play
+  /// was issued (a reverted play): the play token and the playlist revision
+  /// then. If the plugin then reaches its end with nothing asked of the
+  /// engine since (no play, pause, stop, seek, seed or edit of the playlist),
+  /// it was playing to its end, and the play is given back before the end is
+  /// reported ([_onPluginState]). A play that failed is not given back.
+  ({int playToken, int playlistRevision})? _playTakenBack;
+
   /// The loop mode last asked of the plugin (it explains an index wrap).
   EngineLoopMode _requestedLoopMode = EngineLoopMode.off;
   int _generation = 0;
@@ -769,6 +777,9 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
     if (_indexOf(_issued, itemId) == null) {
       throw StateError('Cannot seek to an item that has not been hydrated');
     }
+    // The position moved: a later end is not the one a play taken back by
+    // the plugin was running into.
+    _playTakenBack = null;
     // A failure held for the item being left is not the target's (review
     // 2026-11-07): the core has moved on, and at the seek's settle it would
     // be blamed on the wrong source.
@@ -830,6 +841,7 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
           if (token != _playToken || !_live(generation)) return;
           _wantPlaying = false;
           _playIssued = false;
+          _playTakenBack = null;
           _emitTransport();
           _emitFailure(_NativeStepError(
               EngineCommand.play, _currentTarget(), error), null,
@@ -852,6 +864,9 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
   @override
   Future<void> seek(Duration position) async {
     if (_isDisposed) return;
+    // The position moved: a later end is not the one a play taken back by
+    // the plugin was running into.
+    _playTakenBack = null;
     _enqueue((_) {
       final current = _committedCurrentItemId;
       final at = current == null ? null : _indexOf(_issued, current);
@@ -1147,7 +1162,12 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
   /// The desired transport is the engine's own (a queued play waits behind
   /// the load, so the plugin reports `playing` late) and changes with the
   /// engine's commands; the processing state is the plugin's. A play the
-  /// plugin reverted (audio-session activation failed) clears it.
+  /// plugin reverted (audio-session activation failed) clears it. If the
+  /// plugin then reaches its end with nothing asked of the engine in
+  /// between, it was playing to its end rather than refusing to start: the
+  /// play is given back before the end is reported, so the end report never
+  /// depends on whether the plugin publishes its playing flag going false
+  /// before or together with its completed state.
   void _onPluginState(ja.PlayerState state) {
     _processing = _processingFrom(state.processingState);
     if (_processing == EngineProcessingState.ready) _failedSinceLoad = false;
@@ -1157,6 +1177,24 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
       // replacement: the native playlist can briefly end while the engine
       // edits it. Not the queue's end; rechecked when the edit settles.
       _processing = EngineProcessingState.buffering;
+    }
+    final takenBack = _playTakenBack;
+    if (_processing == EngineProcessingState.completed &&
+        !_wantPlaying &&
+        takenBack != null) {
+      _playTakenBack = null;
+      // An edit of the playlist since then makes it stale: an end after an
+      // edit can be the edit's doing (a source removed), not the plugin
+      // running to its end.
+      if (takenBack.playToken == _playToken &&
+          takenBack.playlistRevision == _playlistRevision) {
+        // Nothing was asked of the engine since the plugin took the play
+        // back: it was playing to this end. Play was desired up to it, and
+        // the report before the end report says so.
+        _wantPlaying = true;
+        _emitTransport(
+            _lastTransport?.processingState ?? EngineProcessingState.ready);
+      }
     }
     if (_processing == EngineProcessingState.completed && _wantPlaying) {
       // The queue ended. just_audio keeps `playing` true at completion (a
@@ -1171,14 +1209,18 @@ class JustAudioEngine implements PlaybackEngine, MediaTokenSources {
         _processing != EngineProcessingState.completed) {
       _playIssued = false;
       _wantPlaying = false;
+      _playTakenBack =
+          (playToken: _playToken, playlistRevision: _playlistRevision);
     }
     _emitTransport();
     _observe();
     _releaseHeldIfStopped();
   }
 
-  void _emitTransport() {
-    final next = EngineTransportState(_wantPlaying, _processing);
+  /// Publishes the desired transport with [processing], or the plugin's
+  /// processing state when it is not given.
+  void _emitTransport([EngineProcessingState? processing]) {
+    final next = EngineTransportState(_wantPlaying, processing ?? _processing);
     if (next == _lastTransport || _transportController.isClosed) return;
     _lastTransport = next;
     _transportController.add(next);

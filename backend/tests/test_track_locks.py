@@ -1,5 +1,4 @@
 import threading
-import time
 
 from app.services.track_locks import TrackLocks
 
@@ -21,11 +20,11 @@ def test_lock_serializes_same_uuid():
         with locks.lock("x"):
             t1_in.set()
             events.append("t1_enter")
-            release.wait(1)
+            assert release.wait(5)
             events.append("t1_exit")
 
     def second():
-        t1_in.wait(1)  # ensure the first holder is inside the lock
+        assert t1_in.wait(5)  # ensure the first holder is inside the lock
         with locks.lock("x"):
             events.append("t2_enter")
 
@@ -34,13 +33,16 @@ def test_lock_serializes_same_uuid():
     th1.start()
     th2.start()
 
-    t1_in.wait(1)
-    time.sleep(0.05)  # give the second thread a chance to (wrongly) enter
-    assert events == ["t1_enter"]  # it is blocked on the same uuid
+    assert t1_in.wait(5)
+    # The uuid's one lock is held while the first holder is inside, so the
+    # second caller, which takes the same lock, waits (a check, not a window).
+    assert not locks.lock_for("x").acquire(blocking=False)
+    assert events == ["t1_enter"]
 
     release.set()
-    th1.join(1)
-    th2.join(1)
+    th1.join(5)
+    th2.join(5)
+    assert not th1.is_alive() and not th2.is_alive()
     assert events == ["t1_enter", "t1_exit", "t2_enter"]
 
 

@@ -367,8 +367,9 @@ void main() {
   });
 
   // Review r1 m-R1-36: credentials for another user than the binding row's
-  // (or a row whose user is unknown) never stall silently: Log in with a
-  // notice, the credentials deleted, nothing sent. The next login goes
+  // never stall silently: Log in with a notice, the credentials deleted,
+  // nothing sent. A row without a user is never written (the sign-in stores
+  // the user's id); if one were found, it counts as another user's. The next login goes
   // through the user-switch confirm-and-wipe sheet (session_login_test:
   // "same instance, a different user" and "a row with an unknown (NULL) user
   // also needs the switch").
@@ -376,7 +377,7 @@ void main() {
     for (final (name, rowUser, reason) in [
       ('a row for another user', testCredentials.userId + 1,
           'binding_other_user'),
-      ('a row with an unknown (NULL) user', null, 'binding_without_user'),
+      ('a row with an unknown (NULL) user', null, 'binding_other_user'),
     ]) {
       test('$name: Log in with a notice, nothing sent, credentials deleted',
           () async {

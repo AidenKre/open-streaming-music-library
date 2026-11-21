@@ -145,7 +145,7 @@ void main() {
         inner,
         _alice,
         permit: _allowAll,
-        onUnauthorized: () => seenByHook.add(callerHasResponse),
+        onUnauthorized: (_) => seenByHook.add(callerHasResponse),
       );
       final response = await client.send(
         http.Request('GET', Uri.parse('http://srv:1/tracks')),
@@ -161,13 +161,30 @@ void main() {
       var calls = 0;
       final api = testApiClient(
         'http://srv:1',
-        AuthenticatedClient(inner, _alice, permit: _allowAll, onUnauthorized: () => calls++),
+        AuthenticatedClient(inner, _alice, permit: _allowAll, onUnauthorized: (_) => calls++),
       );
       await expectLater(
         api.getJson(['tracks']),
         throwsA(isA<ApiException>().having((e) => e.statusCode, 'status', 401)),
       );
       expect(calls, 1);
+    });
+
+    test("hands over the 401's server stamp, or null without one", () async {
+      final seen = <String?>[];
+      for (final headers in [
+        {'X-Server-Instance-Id': ' inst-9 '},
+        <String, String>{},
+      ]) {
+        final client = AuthenticatedClient(
+          SpyInnerClient(status: 401, headers: headers),
+          _alice,
+          permit: _allowAll,
+          onUnauthorized: seen.add,
+        );
+        await client.send(http.Request('GET', Uri.parse('http://srv:1/x')));
+      }
+      expect(seen, ['inst-9', null]);
     });
 
     test('is not called for other statuses', () async {
@@ -178,7 +195,7 @@ void main() {
           inner,
           _alice,
           permit: _allowAll,
-          onUnauthorized: () => calls++,
+          onUnauthorized: (_) => calls++,
         );
         await client.send(http.Request('GET', Uri.parse('http://srv:1/x')));
         expect(calls, 0, reason: 'status $status');
@@ -192,7 +209,7 @@ void main() {
         inner,
         _alice,
         permit: _allowAll,
-        onUnauthorized: () => calls++,
+        onUnauthorized: (_) => calls++,
       )..dispose();
       final response = await client.send(
         http.Request('GET', Uri.parse('http://srv:1/tracks')),
@@ -210,7 +227,7 @@ void main() {
         inner,
         _alice,
         permit: _allowAll,
-        onUnauthorized: () => calls++,
+        onUnauthorized: (_) => calls++,
       );
       final pending = client.send(
         http.Request('GET', Uri.parse('http://srv:1/tracks')),

@@ -3,7 +3,8 @@ storage note, §8 6.5B.2 row; review 6.5-U12 performance half).
 
 The script builds a fresh database in an empty work directory (production
 schema), fills it with N synthetic tracks with stored prints (seeded), plants
-known near-duplicates, times ``find_duplicates`` per query (p50/p95/max), and
+known near-duplicates, times ``find_matches`` (the identity worker's match
+step) and the full ``find_duplicates`` report per query (p50/p95/max), and
 measures storage: database size, the fingerprint blobs' share, an online
 backup, a WAL checkpoint and VACUUM. The full run (50k) is made by hand; this
 test runs a small version and checks the report's shape and its correctness
@@ -45,6 +46,9 @@ def test_a_small_run_reports_query_latency(small_run):
     assert q["tracks"] == 300 and q["queries"] == 6
     assert 0 < q["p50_s"] <= q["p95_s"] <= q["max_s"]
     assert q["candidates_p50"] >= 0 and q["candidates_max"] >= q["candidates_p50"]
+    # The full report (with its coverage count, as the upload check runs it) is
+    # timed apart from the identity worker's matches-only step.
+    assert 0 < q["report_p50_s"] <= q["report_p95_s"] <= q["report_max_s"]
     assert report["machine"]  # the named machine the numbers came from
 
 

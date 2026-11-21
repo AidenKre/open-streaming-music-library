@@ -271,8 +271,8 @@ class ServerBinding extends Table {
       // ignore: recursive_getters
       integer().withDefault(const Constant(1)).check(id.equals(1))();
 
-  /// The server's persistent instance id. Null = provisional/legacy binding
-  /// (not yet learned from `/app/info`).
+  /// The server's persistent instance id. The sign-in, the row's one writer,
+  /// always stores it; null would mean unknown, never "any server".
   TextColumn get instanceId => text().nullable()();
 
   /// Random UUID minted when the row is created.

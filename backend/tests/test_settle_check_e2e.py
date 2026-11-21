@@ -25,6 +25,7 @@ from app.services.settle_check import SETTLE_WINDOW_S, SettleCheck
 from tests.owned_database import add_test_user
 from tests.quality_fixtures import _store_quality
 from tests.track_paths import set_track_path
+from tests.track_removal import delete_track
 
 pytestmark = [
     pytest.mark.usefixtures("fast_stability_poll"),
@@ -111,7 +112,7 @@ def test_a_partial_import_is_corrected_after_the_copy_resumes(app):
 
     # Reference imports of the whole file (another name: not a duplicate).
     (tmp / "import" / "ref.flac").write_bytes(whole)
-    assert c.app.state.ingestor.ingest(tmp / "import" / "ref.flac") is ImportOutcome.IMPORTED
+    assert c.app.state.ingestor.ingest(tmp / "import" / "ref.flac", imported_dir=tmp / "import" / ".imported") is ImportOutcome.IMPORTED
     (tmp / "import-users" / "sam" / "ref.flac").write_bytes(whole)
     c.app.state.user_file_watcher.on_file(tmp / "import-users" / "sam" / "ref.flac")
     admin_ref = _only_track(admin, "ref.flac")
@@ -119,7 +120,7 @@ def test_a_partial_import_is_corrected_after_the_copy_resumes(app):
 
     # The copy pauses after a quarter: the partial file is imported.
     (tmp / "import" / "loose.flac").write_bytes(whole[:cut])
-    assert c.app.state.ingestor.ingest(tmp / "import" / "loose.flac") is ImportOutcome.IMPORTED
+    assert c.app.state.ingestor.ingest(tmp / "import" / "loose.flac", imported_dir=tmp / "import" / ".imported") is ImportOutcome.IMPORTED
     (tmp / "import-users" / "sam" / "loose.flac").write_bytes(whole[:cut])
     c.app.state.user_file_watcher.on_file(tmp / "import-users" / "sam" / "loose.flac")
     admin_partial = _only_track(admin, "loose.flac")
@@ -170,11 +171,11 @@ def test_a_track_deleted_during_the_window_is_skipped(app):
     c, sam, clock, tmp = app
     whole = _noisy_flac(tmp / "fixtures" / "lucky.flac")
     (tmp / "import" / "loose.flac").write_bytes(whole[: len(whole) // 4])
-    assert c.app.state.ingestor.ingest(tmp / "import" / "loose.flac") is ImportOutcome.IMPORTED
+    assert c.app.state.ingestor.ingest(tmp / "import" / "loose.flac", imported_dir=tmp / "import" / ".imported") is ImportOutcome.IMPORTED
     track = _only_track(c.app.state.admin_library, "loose.flac")
     with open(track.file_path, "ab") as f:
         f.write(whole[len(whole) // 4:])
-    assert c.app.state.admin_library.delete_track(track.uuid_id)
+    assert delete_track(c.app.state.admin_library, track.uuid_id)
 
     clock.now += SETTLE_WINDOW_S + 1
     c.app.state.settle_check.run_due()
@@ -188,7 +189,7 @@ def test_a_track_relocated_by_an_edit_during_the_window_is_skipped(app, monkeypa
     c, sam, clock, tmp = app
     whole = _noisy_flac(tmp / "fixtures" / "lucky.flac")
     (tmp / "import" / "loose.flac").write_bytes(whole[: len(whole) // 4])
-    assert c.app.state.ingestor.ingest(tmp / "import" / "loose.flac") is ImportOutcome.IMPORTED
+    assert c.app.state.ingestor.ingest(tmp / "import" / "loose.flac", imported_dir=tmp / "import" / ".imported") is ImportOutcome.IMPORTED
     track = _only_track(c.app.state.admin_library, "loose.flac")
     old_path = Path(track.file_path)
     # The row now points elsewhere (as after an edit that re-organized it),

@@ -8,10 +8,15 @@ inside the test's ``tmp_path``. The CLI is always invoked in-process through
 """
 
 import io
+import os
 import sqlite3
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import pytest
 
 from app.config import Settings
 from app.database.database import Database, DatabaseContext
@@ -20,6 +25,7 @@ from app.models import Track, TrackMetaData
 from tests.schema_fixtures import INIT_SQL
 
 ADMIN = "admin"
+BACKEND = Path(__file__).resolve().parents[1]
 
 
 def cli_settings(tmp_path: Path, **overrides) -> Settings:
@@ -36,6 +42,37 @@ def cli_settings(tmp_path: Path, **overrides) -> Settings:
     )
     values.update(overrides)
     return Settings(_env_file=None, **values)
+
+
+def child_env(settings: Settings) -> dict:
+    """The environment of the real tool started in a child process: every
+    folder passed explicitly, nothing else of this process's environment but
+    ``PATH``."""
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(BACKEND),
+        "APP_DATA_DIR": str(settings.app_data_dir),
+        "MUSIC_LIBRARY_DIR": str(settings.music_library_dir),
+        "IMPORT_DIR": str(settings.import_dir),
+        "USER_IMPORT_DIR": str(settings.user_import_dir),
+        "OSML_INSECURE_FAST_PASSWORD_HASHING": "true",
+        "ENABLE_FILE_WATCHER": "false",
+    }
+
+
+@pytest.fixture(scope="session")
+def interpreter_noise(tmp_path_factory) -> str:
+    """What the interpreter itself writes to standard error while the tool's
+    modules load (a Python built without some hash code logs that at every
+    start), measured once: it is the machine's, the same at every start and
+    whatever the folders, so a test strips it instead of starting a second
+    interpreter to measure it again."""
+    home = tmp_path_factory.mktemp("cli-noise")
+    return subprocess.run(
+        [sys.executable, "-c", "import app.cli"],
+        cwd=home, env=child_env(cli_settings(home)), stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=60,
+    ).stderr
 
 
 def database_file(settings: Settings) -> Path:

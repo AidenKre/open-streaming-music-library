@@ -13,6 +13,10 @@ class _ServerBlockWatch {
   );
   bool _differentServer = false;
   bool _signedOut = false;
+
+  /// A 401 that did not sign this session out: work it parked resumes at
+  /// the next verified contact.
+  bool _parkedBy401 = false;
   StreamSubscription<BindingGateState>? _gateWatch;
 
   /// Why the session is blocked; [ServerBlockedReason.none] when it is not.
@@ -83,26 +87,52 @@ class _ServerBlockWatch {
         _differentServer = true;
         _publishBlocked();
         offline.enterOffline(poll: false);
-      } else if (state is BindingVerified && _differentServer) {
-        _differentServer = false;
+      } else if (state is BindingVerified) {
+        final wasBlocked = _differentServer;
+        final resume = (wasBlocked || _parkedBy401) && !_signedOut;
+        _parkedBy401 = false;
+        if (wasBlocked) {
+          _differentServer = false;
+          _publishBlocked();
+          if (!_signedOut) offline.exitOffline();
+        }
+        // Work a 401 parked (another server's, or one whose sender was
+        // never known) resumes in this scope with the same sign-in; a real
+        // sign-out never verifies again, so never gets here.
+        if (resume) {
+          unawaited(
+            _ref
+                .read(recoveryServiceProvider)
+                .runFor(RecoveryTrigger.boundServerBack),
+          );
+        }
+      } else if (state is BindingSignedOut && !_signedOut) {
+        // Signed out (Phase M 7.7): offline with polling stopped. Memory
+        // only (stored credentials stay); cleared only by a scope rebuild.
+        _signedOut = true;
         _publishBlocked();
-        if (!_signedOut) offline.exitOffline();
+        offline.enterOffline(poll: false);
       }
     });
   }
 
-  /// The authenticated client got a 401 (Phase M 7.7): signed out. Closes
-  /// the binding gate and turns offline on with polling stopped. Memory
-  /// only (stored credentials stay); cleared only by a scope rebuild.
-  /// Idempotent. [SessionService.onUnauthorized] checks first that the scope
-  /// is not disposed.
-  void onUnauthorized() {
+  /// The authenticated client got a 401 (Phase M 7.7); [servedBy] is the
+  /// answer's server stamp. The binding gate withholds the token at once and
+  /// decides who sent it ([ServerBindingGate.checkAfterUnauthorized]): the
+  /// bound server means signed out, another server the different-server
+  /// block, both through [watchServerBlock]. Idempotent.
+  /// [SessionService.onUnauthorized] checks first that the scope is not
+  /// disposed.
+  void onUnauthorized(String? servedBy) {
     if (_signedOut) return;
-    _signedOut = true;
-    _publishBlocked();
-    _ref.read(serverBindingGateProvider).closeSignedOut();
-    final offline = _ref.read(offlineModeProvider.notifier);
-    offline.enterOffline(poll: false);
+    watchServerBlock();
+    _parkedBy401 = true;
+    _ref
+        .read(serverBindingGateProvider)
+        .checkAfterUnauthorized(
+          _ref.read(apiClientProvider).baseUrl,
+          servedBy: servedBy,
+        );
   }
 
   /// A different server wins over signed out when both apply.

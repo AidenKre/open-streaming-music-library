@@ -521,6 +521,24 @@ void main() {
     await teardownTree(tester);
   });
 
+  // The archive's own row keeps its state: upload_manager_adoption_test,
+  // 'an unpacked archive whose batch the server forgot keeps its state'.
+  testWidgets('a list the server no longer keeps says so, with no Try again',
+      (tester) async {
+    await openZip(tester);
+    fake.setChildren('zip', const ChildListGone());
+    await tester.pump();
+    expect(
+      find.text('The server no longer keeps the list of files from this '
+          'archive. Check your library for the files it imported.'),
+      findsOneWidget,
+    );
+    expect(find.text("Couldn't load the files in this archive."), findsNothing);
+    expect(find.widgetWithText(TextButton, 'Try again'), findsNothing);
+    expect(fake.calls, ['loadChildren b-1/zip']);
+    await teardownTree(tester);
+  });
+
   testWidgets('offline, Try again is disabled with the reason', (tester) async {
     await openZip(tester);
     fake.setChildren('zip', const ChildListFailed());

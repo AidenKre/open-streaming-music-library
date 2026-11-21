@@ -166,6 +166,28 @@ void main() {
       expect(states['c-2'], 'validating');
     });
 
+    test('a cursor the server already gave ends the read: each page is read '
+        'once', () async {
+      var reads = 0;
+      h.api.onListItems = (batch, after) async {
+        // Without the guard the read would never end; fail instead.
+        if (++reads > 10) throw StateError('the same page read for ever');
+        return UploadItemPage.fromJson({
+          'items': [
+            after == null
+                ? _ready('a', index: 0)
+                : _ready('b', index: 1),
+          ],
+          'next_after': 'x',
+        });
+      };
+
+      final snap = await review.snapshot('u-1');
+
+      expect([for (final i in snap) i.itemUuid], ['a', 'b']);
+      expect(reads, 2);
+    });
+
     test('a refused page is the caller\'s error', () async {
       h.api.onListItems = (_, _) async =>
           throw apiError(404, 'upload_batch_not_found', retryable: false);

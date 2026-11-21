@@ -41,6 +41,7 @@ import 'package:frontend/ui/uploads/upload_review_controller.dart';
 
 import '../../helpers/duplicate_check_fixtures.dart';
 import '../../helpers/fake_uploads_api.dart' show itemJson;
+import '../../helpers/sync_tombstone.dart';
 import '../../helpers/upload_intent_record.dart';
 import '../../repositories/catalog_seed.dart';
 import '../fake_uploads_controls.dart';
@@ -176,7 +177,12 @@ class _Review implements UploadReview {
   }
 
   @override
-  Future<void> cancel(String itemUuid) async => calls.add('cancel $itemUuid');
+  Future<void> cancel(String itemUuid) async {
+    calls.add('cancel $itemUuid');
+    if (cancelError != null) throw cancelError!;
+  }
+
+  Object? cancelError;
 
   @override
   Future<List<String>> suggestions(String key, String query) async {
@@ -647,6 +653,68 @@ void main() {
       expect(preview.calls, contains('close'));
     });
 
+    // The preview stops when the person asks to move on, before the next
+    // item's draft is read: a preview that starts to sound during that read
+    // would leave the music paused once it is closed.
+    for (final (name, from, to) in [('Next', 'a', 'b'), ('Previous', 'b', 'a')]) {
+      test('$name stops the preview before the item\'s draft is read',
+          () async {
+        final c = await started(at: from);
+        final gate = review.draftGates[to] = Completer<void>();
+        final moving = name == 'Next' ? c.next() : c.previous();
+        await settle();
+        expect(c.current!.itemUuid, from,
+            reason: 'precondition: the draft is still being read');
+        expect(preview.calls, ['close']);
+        gate.complete();
+        await moving;
+        expect(c.current!.itemUuid, to);
+        c.dispose();
+      });
+    }
+
+    for (final name in ['Import', 'Skip']) {
+      test('the move after $name stops the preview before the next item\'s '
+          'draft is read', () async {
+        final c = await started();
+        if (name == 'Import') {
+          await confirmShown(c, writeTags: false);
+        } else {
+          await c.skip();
+        }
+        local({'a': ('review_submitted', null), 'b': ('review_ready', null)});
+        await settle();
+        preview.calls.clear();
+        final gate = review.draftGates['b'] = Completer<void>();
+        review.server['a'] = _item('a', state: 'imported', result: 't-1');
+        local({'a': ('imported', null), 'b': ('review_ready', null)});
+        await settle();
+        expect(c.current!.itemUuid, 'a',
+            reason: 'precondition: the next draft is still being read');
+        expect(preview.calls, ['close']);
+        gate.complete();
+        await settle();
+        expect(c.current!.itemUuid, 'b');
+        c.dispose();
+      });
+    }
+
+    test('a preview started while the next item\'s draft is read is stopped '
+        'when the item changes', () async {
+      final c = await started();
+      final gate = review.draftGates['b'] = Completer<void>();
+      final moving = c.next();
+      await settle();
+      // The item on screen is still a: its Play preview can be tapped.
+      await preview.playStaged('a');
+      gate.complete();
+      await moving;
+      expect(c.current!.itemUuid, 'b');
+      expect(preview.calls.last, 'close',
+          reason: 'a\'s preview does not play on over b');
+      c.dispose();
+    });
+
     test('the form fields are the server\'s editable track fields, else '
         'the built-in list', () async {
       final c = await started();
@@ -760,10 +828,55 @@ void main() {
       c.dispose();
     });
 
+    // The item has no upload record on this device: nothing was sent, so
+    // nothing is reported as done; the list is read again from the server
+    // (which records a file of a local archive again; a top-level item gets
+    // its record when Uploads is entered again) and the review says why
+    // nothing happened, without a Try again.
+    for (final action in ['confirm', 'skip']) {
+      test('$action for an item this device has no record of: nothing is '
+          'reported done, the list reloads, and the reason is shown',
+          () async {
+        review.submitError = const UploadIntentMissing();
+        final c = await started();
+        final snapshots = review.calls.where((x) => x.startsWith('snapshot'))
+            .length;
+        action == 'confirm'
+            ? await confirmShown(c, writeTags: false)
+            : await c.skip();
+        await settle();
+        expect(c.notice,
+            "This file isn't in this device's list of uploads, so nothing "
+            'was sent.');
+        expect(review.calls.where((x) => x.startsWith('snapshot')).length,
+            snapshots + 1);
+        expect(c.lastImported, isNull);
+        expect(c.busy, isFalse);
+        expect(c.current!.itemUuid, 'a');
+        c.dispose();
+      });
+    }
+
     test('Cancel this item cancels the current item', () async {
       final c = await started(at: 'c');
       await c.cancelItem();
       expect(review.calls, contains('cancel c'));
+      c.dispose();
+    });
+
+    test('Cancel for an item this device has no record of: the list '
+        'reloads and the reason is shown', () async {
+      review.cancelError = const UploadIntentMissing();
+      final c = await started();
+      final snapshots =
+          review.calls.where((x) => x.startsWith('snapshot')).length;
+      await c.cancelItem();
+      await settle();
+      expect(c.notice,
+          "This file isn't in this device's list of uploads, so nothing "
+          'was sent.');
+      expect(review.calls.where((x) => x.startsWith('snapshot')).length,
+          snapshots + 1);
       c.dispose();
     });
   });
@@ -984,11 +1097,7 @@ void main() {
       expect(c.lastImported?.track?.uuidId, 't-3');
       final status = c.current!.statusText;
 
-      // What `SyncService._deleteTracks` does to the row (child first).
-      await (db.delete(db.trackmetadata)
-            ..where((t) => t.uuidId.equals('t-3')))
-          .go();
-      await (db.delete(db.tracks)..where((t) => t.uuidId.equals('t-3'))).go();
+      await applySyncTombstone(db, ['t-3']);
       await drain();
 
       expect(c.currentTrack, isNull, reason: 'no View track on the item');
@@ -1691,6 +1800,24 @@ void main() {
         expect(review.calls, ['backToReview a', 'item a']);
         expect(c.current!.reviewVersion, 4);
         expect(c.notice, isNull);
+        c.dispose();
+      });
+
+      test('Back to review for an item this device has no record of: the '
+          'list reloads and the reason is shown, no Try again', () async {
+        review.snap = [conflicted()];
+        final c = await started(local: [_intent('a', 'duplicate_conflict')]);
+        final snapshots =
+            review.calls.where((x) => x.startsWith('snapshot')).length;
+        review.retryError = const UploadIntentMissing();
+        await c.backToReview();
+        await settle();
+        expect(c.notice,
+            "This file isn't in this device's list of uploads, so nothing "
+            'was sent.');
+        expect(review.calls.where((x) => x.startsWith('snapshot')).length,
+            snapshots + 1);
+        expect(c.busy, isFalse);
         c.dispose();
       });
 

@@ -10,6 +10,7 @@ import pytest
 
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator, PrefetchOutcome
+from tests.encoder_pool_fixtures import stop_every_encoder_pool  # noqa: F401  (autouse fixture)
 
 ADMIN = 1
 SAM = 2

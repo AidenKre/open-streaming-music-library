@@ -147,6 +147,8 @@ def test_an_unexpected_os_error_naming_a_path_is_not_stored(tmp_path, monkeypatc
     _assert_pathless(job["error_text"], tmp_path)
     _assert_log_pathless(caplog, tmp_path)
     assert "conversion job failed: PermissionError" in caplog.text
+    # The class name is for the server's log only: a person reads one plain sentence.
+    assert job["error_text"] == "The conversion failed. The original was kept."
     assert source.exists()
 
 
@@ -179,3 +181,81 @@ def test_a_target_path_taken_while_the_job_runs_logs_no_path(tmp_path, monkeypat
     assert db.get_conversion_job(job_id)["status"] == "failed"
     _assert_log_pathless(caplog, tmp_path)
     assert "conversion job failed: TargetPathTaken" in caplog.text
+
+
+@pytest.mark.parametrize("error", [conv_mod.ConversionFailed(), conv_mod.PendingRecovery()])
+def test_a_named_failure_without_a_text_shows_no_class_name(error):
+    """A failure the job has a sentence for carries that sentence; one raised
+    without any still reads as a sentence, never as its class name."""
+    assert conv_mod.ConversionOrchestrator._job_error_text(error) == (
+        "The conversion failed. The original was kept."
+    )
+
+
+# A job's text is shown to a person after "Failed: ". No text may carry a Python
+# value ("None", a list in brackets), a class name, an id or a path.
+PLAIN_FAILURE = "The conversion failed. The original was kept."
+
+
+@pytest.mark.parametrize(
+    "read_as, logged",
+    [(None, "nothing readable"), ("mp3", "mp3")],
+    ids=["no audio could be read", "another codec"],
+)
+def test_a_converted_file_that_is_not_the_requested_codec_fails_with_the_plain_text(
+    tmp_path, monkeypatch, caplog, read_as, logged
+):
+    """What the converted file reads as goes to the log; the job says one plain
+    sentence (it used to say "... expected aac, got None")."""
+    from types import SimpleNamespace
+
+    staged = tmp_path / "u.1.tagged.m4a"
+    staged.write_bytes(b"x")
+    monkeypatch.setattr(conv_mod, "ffprobe_for_metadata", lambda path: {"streams": []})
+    monkeypatch.setattr(
+        conv_mod, "build_track_metadata",
+        lambda raw: None if read_as is None else SimpleNamespace(codec=read_as),
+    )
+
+    with caplog.at_level(logging.WARNING), pytest.raises(conv_mod.ConversionFailed) as failure:
+        conv_mod._probe_intrinsic_fields(staged, "aac")
+
+    assert conv_mod.ConversionOrchestrator._job_error_text(failure.value) == PLAIN_FAILURE
+    lines = [r.getMessage() for r in caplog.records if r.name == CONVERSION_LOGGER]
+    assert lines == [f"the converted file reads as {logged}, not as aac"]
+    _assert_log_pathless(caplog, tmp_path)
+
+
+@requires_ffmpeg
+def test_a_job_whose_converted_file_cannot_be_read_as_audio_says_the_plain_sentence(
+    tmp_path, monkeypatch
+):
+    db, orch, coordinator, source, job_id = _flac_job(tmp_path)
+    original = source.read_bytes()
+    monkeypatch.setattr(conv_mod, "build_track_metadata", lambda raw: None)
+
+    conv._run_submitted(coordinator)
+
+    job = db.get_conversion_job(job_id)
+    assert (job["status"], job["error_text"]) == ("failed", PLAIN_FAILURE)
+    assert source.read_bytes() == original
+
+
+def test_a_queued_job_whose_bitrate_is_no_longer_offered_fails_in_plain_words(tmp_path):
+    """The refusal a request gets (422) is stored as the job's text when the
+    job meets it only when it runs: no Python list in it."""
+    db, orch, coordinator = conv._make_orchestrator(tmp_path)
+    source = conv._root(tmp_path) / "song.flac"
+    source.write_bytes(b"fake")
+    track = conv._add_track(db, source, codec="flac")
+    job_id = orch.enqueue(conv._lib(orch), track.uuid_id, "mp3", 320, track.revision)
+    with db._connection(commit=True) as conn:
+        conn.execute("UPDATE conversion_jobs SET target_bitrate = 96 WHERE id = ?", (job_id,))
+
+    conv._run_submitted(coordinator)
+
+    job = db.get_conversion_job(job_id)
+    assert (job["status"], job["error_text"]) == (
+        "failed", "mp3 requires a target bitrate of 320, 256, 192 or 128 kbps"
+    )
+    assert source.read_bytes() == b"fake"

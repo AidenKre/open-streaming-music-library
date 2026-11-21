@@ -390,6 +390,45 @@ void main() {
       expect(prefs.containsKey('audioVolume'), isTrue);
     });
 
+    // A key that cannot be removed does not keep the rest: every other key
+    // goes, the failure is still reported and the marker kept, so the next
+    // launch tries the refused key again.
+    for (final throws in [false, true]) {
+      test('the preferences step goes on past a key it cannot remove '
+          '(${throws ? 'the removal throws' : 'the platform refuses'})',
+          () async {
+        final first = prefs
+            .getKeys()
+            .firstWhere((k) => k != LocalResetService.resetPendingKey);
+        final refusing =
+            _RefusingRemovePrefs(prefs, refuse: first, throws: throws);
+        final c = ProviderContainer(overrides: [
+          databaseProvider.overrideWithValue(db),
+          sharedPreferencesProvider.overrideWith((_) async => refusing),
+          localCoverArtStoreProvider.overrideWithValue(coverStore),
+          downloadManagerProvider.overrideWithValue(downloadManager),
+          coverArtCacheProvider.overrideWithValue(CoverArtCacheManager.noop()),
+          queuePlayerProvider.overrideWith(() => audio),
+          offlineModeProvider.overrideWith(() => TestOffline(true)),
+          credentialStoreProvider.overrideWithValue(credentials),
+        ]);
+        addTearDown(c.dispose);
+
+        final error = await c
+            .read(localResetServiceProvider)
+            .reset()
+            .then<Object?>((_) => null, onError: (Object e) => e);
+
+        final failures = (error! as LocalResetException).failures;
+        expect(failures, hasLength(1));
+        expect('${failures.single.error}', contains('"$first"'));
+        expect(prefs.getKeys(), {first, LocalResetService.resetPendingKey},
+            reason: 'every key after the refused one is removed too');
+        expect(await c.read(localResetServiceProvider).hasPendingReset(),
+            isTrue);
+      });
+    }
+
     test('a clean wipe: the preferences step leaves the reset marker; only '
         'the end of the wipe removes it', () async {
       final recording = _RefusingRemovePrefs(prefs, refuse: '');
@@ -862,11 +901,13 @@ class _FailingFence extends ServerBindingRepository {
 }
 
 /// The real preferences, except that removing [refuse] is refused (the
-/// platform answers false). Records every key asked to be removed.
+/// platform answers false, or throws when [throws]). Records every key asked
+/// to be removed.
 class _RefusingRemovePrefs implements SharedPreferences {
-  _RefusingRemovePrefs(this._real, {required this.refuse});
+  _RefusingRemovePrefs(this._real, {required this.refuse, this.throws = false});
   final SharedPreferences _real;
   final String refuse;
+  final bool throws;
   final removed = <String>[];
   @override
   Object? get(String key) => _real.get(key);
@@ -881,6 +922,7 @@ class _RefusingRemovePrefs implements SharedPreferences {
   @override
   Future<bool> remove(String key) async {
     removed.add(key);
+    if (key == refuse && throws) throw StateError('platform channel failed');
     return key == refuse ? false : _real.remove(key);
   }
 

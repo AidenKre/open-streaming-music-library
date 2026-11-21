@@ -94,9 +94,7 @@ def clean_finished_journal(database, row: dict, *, uploads_root, music_library_d
     state = row["state"]
     if state not in ("imported", "duplicate_conflict", "failed"):
         return False
-    from app.library import library_root  # deferred: app.library imports the services
-
-    root = library_root(music_library_dir, database.get_user(owner))
+    root = upload_placement.owner_library_root(music_library_dir, database.get_user(owner))
     stage = owner_dir(uploads_root, owner)
     files = ReceiptFiles()
     clean = True
@@ -152,7 +150,7 @@ def _remove_placed_final(database, row: dict, root: Path, files) -> bool:
     if not row.get("final_path"):
         return True
     final = Path(row["final_path"])
-    assert_within(final, root)
+    upload_placement.assert_final_within(final, root)
     if database.track_path_in_use(str(final), owner_id=ANY_OWNER):
         return True
     if not remove_verified(files, final):
@@ -293,11 +291,10 @@ def advance_if_placed(database, row: dict, *, uploads_root, music_library_dir, a
     audio cannot be examined."""
     if row["state"] != "prepared" or not row.get("work_path") or not row.get("final_path"):
         return row
-    from app.library import library_root  # deferred: app.library imports the services
-
     placed = upload_placement.final_is_placed(
         row, uploads_root=uploads_root,
-        library_root=library_root(music_library_dir, database.get_user(row["owner_id"])),
+        library_root=upload_placement.owner_library_root(
+            music_library_dir, database.get_user(row["owner_id"])),
         audio=audio)
     if placed and database.mark_upload_commit_moved(
             owner_id=row["owner_id"], operation_uuid=row["operation_uuid"], now=int(time.time())):

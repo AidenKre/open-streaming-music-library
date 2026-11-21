@@ -171,7 +171,7 @@ class SessionController extends ChangeNotifier implements SessionControls {
   String? _authError;
   String? _pendingUserSwitch;
   bool _signingIn = false;
-  bool _loggingOut = false;
+  bool _connecting = false;
   LocalResetException? _resetFailure;
   String? _pendingServerSwitch;
   bool _started = false;
@@ -276,12 +276,11 @@ class SessionController extends ChangeNotifier implements SessionControls {
   Future<void> logout() => _logout(keepUnsent: false);
 
   Future<void> _logout({required bool keepUnsent}) async {
-    if (_loggingOut ||
+    if (_phase == SessionPhase.signingOut ||
         _phase == SessionPhase.resetting ||
         _phase == SessionPhase.resetComplete) {
       return;
     }
-    _loggingOut = true;
     _set(SessionPhase.signingOut);
     try {
       await _service.logout(keepUnsent: keepUnsent);
@@ -290,8 +289,6 @@ class SessionController extends ChangeNotifier implements SessionControls {
         'Sign-out did not finish cleanly: ${e.runtimeType}',
         name: 'SessionController',
       );
-    } finally {
-      _loggingOut = false;
     }
     // Without a rebuild hook (tests) nothing disposes this controller.
     if (!_disposed) _set(SessionPhase.logIn);
@@ -394,8 +391,11 @@ class SessionController extends ChangeNotifier implements SessionControls {
     });
   }
 
+  /// One connect at a time: a second tap while one runs does nothing.
   @override
   Future<void> connect(String url) async {
+    if (_connecting) return;
+    _connecting = true;
     final ConnectOutcome outcome;
     try {
       outcome = await _service.connect(url);
@@ -411,6 +411,8 @@ class SessionController extends ChangeNotifier implements SessionControls {
       _connectError = connectSaveFailedMessage;
       if (!_disposed) _set(SessionPhase.serverAddress);
       return;
+    } finally {
+      _connecting = false;
     }
     if (_disposed) return;
     switch (outcome) {

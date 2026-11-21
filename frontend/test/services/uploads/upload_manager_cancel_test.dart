@@ -10,6 +10,8 @@ import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/uploads/upload_item_rules.dart';
+import 'package:frontend/services/uploads/upload_types.dart'
+    show UploadIntentMissing;
 import 'package:frontend/services/uploads/uploads_overview.dart';
 
 import '../../helpers/fake_uploads_api.dart';
@@ -37,6 +39,21 @@ void main() {
     ]);
     await h.pump();
   }
+
+  test('cancelling an item this device has no record of is refused to the '
+      'caller: nothing is sent', () async {
+    await addTwoVerified();
+    final calls = h.api.calls.length;
+    final before = await h.states();
+    await expectLater(
+      h.manager.cancel('no-such-item'),
+      throwsA(isA<UploadIntentMissing>()),
+    );
+    await h.pump();
+    expect(h.api.calls.skip(calls).where((c) => c.contains('no-such-item')),
+        isEmpty);
+    expect(await h.states(), before);
+  });
 
   test('cancelling a transferring file stops its PUT, gives the slot to the '
       'next file and cancels it on the server', () async {

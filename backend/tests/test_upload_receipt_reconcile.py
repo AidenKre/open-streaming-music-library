@@ -290,6 +290,27 @@ def test_a_quota_row_whose_item_no_longer_holds_its_source_is_released(world):
     ]
 
 
+@pytest.mark.parametrize("where", ["outside the uploads tree", "another owner's folder"])
+def test_an_ended_items_source_recorded_outside_its_owners_folder_keeps_no_quota_row(
+        world, tmp_path, where):
+    """An ended item's recorded source is counted only while it is a file in
+    the item's own owner's folder, as for an item that still holds it: a path
+    anywhere else is not this upload's, and the file there is never touched."""
+    elsewhere = (tmp_path / "precious.flac" if where == "outside the uploads tree"
+                 else world.root / str(world.owner + 1000) / BATCH / "source")
+    elsewhere.parent.mkdir(parents=True, exist_ok=True)
+    elsewhere.write_bytes(b"keep me")
+    _staged(world, 2, state="expired", source=False)
+    sql(world, "UPDATE upload_items SET source_path = ? WHERE item_uuid = ?",
+        (str(elsewhere), world.items[2]))
+    _staged(world, 3, state="expired")  # its own source, still on disk: stays counted
+
+    reconcile(world)
+
+    assert reservations(world) == [("upload_source", world.items[3], len(CONTENTS[3]), None)]
+    assert elsewhere.read_bytes() == b"keep me"
+
+
 def test_a_recorded_path_outside_the_uploads_tree_is_never_touched(world, tmp_path):
     """A tampered or corrupt row cannot make the reconcile delete elsewhere."""
     outside = tmp_path / "precious.part"

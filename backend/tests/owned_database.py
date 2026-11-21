@@ -16,6 +16,7 @@ import functools
 import sqlite3
 
 from app.database.database import Database
+from tests.track_removal import delete_track
 
 TEST_OWNER_USERNAME = "owner"
 
@@ -33,8 +34,6 @@ OWNER_METHODS: tuple[str, ...] = (
     "get_track_by_uuid",
     "apply_track_metadata_edit",
     "get_track_file_path",
-    "delete_track",
-    "get_track_tombstones",
     "get_all_track_uuids",
     "get_changes",
     "get_artists",
@@ -50,7 +49,6 @@ OWNER_METHODS: tuple[str, ...] = (
     "mark_conversion_job_failed",
     "mark_conversion_job_cancelled",
     "settle_swapped_conversion_job",
-    "bump_track_revision",
     "complete_conversion_job",
     "undo_inplace_conversion",
     "list_journal_entries",
@@ -96,6 +94,14 @@ class OwnedTestDatabase(Database):
         result = super().initialize()
         self.owner_id = self._seed_test_owner()
         return result
+
+    def delete_track(
+        self, uuid_id: str, timeout: float = 5, *, owner_id: int | None = None
+    ) -> bool:
+        """Test set-up, not a method of the product's ``Database`` (the server
+        deletes a track only through a deletion job): see
+        ``tests.track_removal.delete_track``."""
+        return delete_track(self, uuid_id, owner_id=owner_id, timeout=timeout)
 
     def _seed_test_owner(self) -> int:
         conn = sqlite3.connect(self.context.database_path)

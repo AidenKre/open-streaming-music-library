@@ -15,6 +15,7 @@ import sqlite3
 
 import pytest
 
+from app.database import ANY_OWNER
 from app.database.database import Database, TrackAlreadyDeleted, TrackNotFound
 from app.models.track import Track
 from app.models.track_meta_data import TrackMetaData
@@ -256,16 +257,17 @@ def test_an_own_tombstone_reports_already_deleted_with_its_revision_and_no_bump(
     assert counter(db) == before
 
 
-def test_the_wrapper_keeps_its_bool_and_never_bumps_a_tombstone(library):
+@pytest.mark.parametrize("owner", [ANY_OWNER, None, True, "1"])
+def test_it_needs_a_real_owner_and_deletes_nothing_without_one(library, owner):
+    """A delete names its owner: "any owner" is for by-id reads only."""
     db = library
-    assert db.delete_track(uuid_id="lonely") is True
-    stone = tombstone(db, "lonely")
     before = counter(db)
 
-    assert db.delete_track(uuid_id="lonely") is False
-    assert db.delete_track(uuid_id="never-existed") is False
+    with db._connection(commit=True, immediate=True) as conn:
+        with pytest.raises(TypeError):
+            db._delete_track_in(conn, "lonely", owner_id=owner)
 
-    assert tombstone(db, "lonely") == stone
+    assert track_present(db, "lonely")
     assert counter(db) == before
 
 

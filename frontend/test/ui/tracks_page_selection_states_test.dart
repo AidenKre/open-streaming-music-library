@@ -244,9 +244,12 @@ void main() {
     });
 
     // A complete sync finished earlier; a later one failed, then offline.
-    // The library did sync to this device, so the sentence would be untrue.
+    // The library did sync to this device, so "has not synced" would be
+    // untrue, and so would "is empty" (the failed sync may have had more).
+    // The area says the sync failed (it was blank); nothing to press, since
+    // a sync cannot run offline and starts by itself once back online.
     testWidgets('offline after a later sync failed, with a complete sync '
-        'before it, Downloaded off: no "has not synced" sentence',
+        'before it, Downloaded off: it says the sync failed, with no button',
         (tester) async {
       await tester.runAsync(() => seedTestBinding(db, reconciled: true));
       await pump(
@@ -257,6 +260,27 @@ void main() {
       await tester.tap(find.text('Downloaded'));
       await tester.pumpAndSettle();
       expect(find.text(_notSynced), findsNothing);
+      expect(find.text('Your library is empty.'), findsNothing);
+      expect(find.text("Couldn't sync your library."), findsOneWidget);
+      expect(find.byType(TextButton), findsNothing);
+      await teardownTree(tester);
+    });
+
+    // A sync still running when the device went offline has not failed.
+    testWidgets('offline while a sync still runs, with a complete sync before '
+        'it, Downloaded off: it does not say the sync failed', (tester) async {
+      await tester.runAsync(() => seedTestBinding(db, reconciled: true));
+      await pump(
+        tester,
+        offline: true,
+        sync: const TrackSyncState(isSyncing: true, librarySyncing: true),
+      );
+      await tester.tap(find.text('Downloaded'));
+      for (var i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: 10));
+      }
+      expect(find.text("Couldn't sync your library."), findsNothing);
+      expect(find.text('Your library is empty.'), findsNothing);
       await teardownTree(tester);
     });
 

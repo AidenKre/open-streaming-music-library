@@ -19,6 +19,8 @@ that starts the work down to the runner: never as loose keywords.
 the same process-group kill/registry semantics.
 """
 
+import errno
+import logging
 import os
 import re
 import selectors
@@ -32,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+
+logger = logging.getLogger(__name__)
 
 # Exit codes `nice` returns when it cannot exec the tool: 126 not executable, 127 not found.
 TOOL_CANNOT_RUN_EXITS = frozenset({126, 127})
@@ -190,22 +194,28 @@ class ToolOptions:
 NO_OPTIONS = ToolOptions()
 
 
-def kill_orphaned_ffmpeg(work_dir: Path) -> list[int]:
-    """Startup: SIGKILL any ffmpeg still writing into ``work_dir``; returns
-    the pids killed.
+def kill_orphaned_ffmpeg(*work_dirs: Path) -> list[int]:
+    """Startup: SIGKILL any ffmpeg still writing into one of ``work_dirs``;
+    returns the pids killed. The processes are listed once, however many
+    folders are given.
 
     ``run_ffmpeg`` starts each ffmpeg in its own session so a cancel can kill
     its process group -- which also means a hard-killed server (SIGKILL, OOM
     kill) leaves them running, burning CPU on temps the startup sweep is
     about to delete. A process matches only if its binary is ffmpeg AND its
-    command line names a path inside ``work_dir``, so nothing else is
+    command line names a path inside one of ``work_dirs``, so nothing else is
     touched. Must run before this server starts any ffmpeg of its own there.
     Best-effort: returns [] where processes can't be listed.
     """
     # Absolute prefixes only, and only at the start of the command line or an
     # argument (after whitespace, "=" or a "file:"-style colon), so another
     # server's path that merely contains ours never matches.
-    prefixes = {str(work_dir.absolute()) + os.sep, str(work_dir.resolve()) + os.sep}
+    prefixes = {
+        str(path) + os.sep
+        for work_dir in work_dirs for path in (work_dir.absolute(), work_dir.resolve())
+    }
+    if not prefixes:
+        return []
     matcher = re.compile(
         r"(?:^|(?<=[\s=:]))(?:" + "|".join(re.escape(p) for p in prefixes) + ")"
     )
@@ -365,17 +375,81 @@ _STDERR_KEEP_BYTES = 64 * 1024
 _READ_CHUNK = 64 * 1024
 
 
+# Path of ionice -> whether ``ionice -c3`` can start a command here. Where the
+# system refuses the I/O priority (some containers), ionice exits 1 without
+# starting the command, which a caller would read as the tool failing. Only a
+# definite answer is kept: ionice ran and exited 0 (usable), ionice ran and
+# exited non-zero, or the program cannot be executed at all (both unusable).
+# A check that gave no answer (it timed out, or the system was short of
+# processes, files or memory) is not kept, but the next check waits a minute:
+# the check can take up to 10 seconds on a busy disk, and a busy server must
+# not wait for it on every tool start. _IONICE_RECHECK_AT holds, per path, the
+# monotonic time before which no new check is made; until then tools run
+# without ionice. Both dicts are guarded by _IONICE_LOCK.
+_IONICE_USABLE: dict[str, bool] = {}
+_IONICE_RECHECK_AT: dict[str, float] = {}
+_IONICE_RECHECK_S = 60.0
+_IONICE_LOCK = threading.Lock()
+_ionice_clock = time.monotonic
+
+_CANNOT_EXECUTE = (errno.ENOENT, errno.EACCES)
+
+
+def _ionice_usable(ionice: str) -> bool:
+    """Whether ``ionice -c3`` can start a command here, checked by starting a
+    do-nothing Python through it. Not ``ionice -t``, which not every ionice
+    accepts.
+
+    A definite answer is remembered for this path for the life of the
+    process: True when ionice exited 0; False (with one warning) when ionice
+    ran and exited non-zero, or when the program cannot be executed (missing
+    or not permitted). Any other failure of the check (a timeout, a system
+    short of processes, files or memory) is not remembered and gives no
+    warning: this call answers False, so this one tool runs without ionice
+    (an ionice that cannot be shown to work never fails a tool). The next
+    check waits a minute, because the check can take up to 10 seconds on a
+    busy disk and a busy server must not wait for it on every tool start:
+    calls within that minute answer False at once, and the first call after
+    it checks again."""
+    with _IONICE_LOCK:
+        known = _IONICE_USABLE.get(ionice)
+        if known is not None:
+            return known
+        if _ionice_clock() < _IONICE_RECHECK_AT.get(ionice, float("-inf")):
+            return False
+        try:
+            completed = subprocess.run(
+                [ionice, "-c3", sys.executable, "-I", "-S", "-c", ""],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10, check=False,
+            )
+            known = completed.returncode == 0
+        except OSError as exc:
+            if exc.errno not in _CANNOT_EXECUTE:
+                _IONICE_RECHECK_AT[ionice] = _ionice_clock() + _IONICE_RECHECK_S
+                return False
+            known = False
+        except (subprocess.SubprocessError, ValueError):
+            _IONICE_RECHECK_AT[ionice] = _ionice_clock() + _IONICE_RECHECK_S
+            return False
+        _IONICE_RECHECK_AT.pop(ionice, None)
+        _IONICE_USABLE[ionice] = known
+        if not known:
+            logger.warning("ionice could not start a command at low disk priority; tools run without it")
+        return known
+
+
 def _low_priority_prefix() -> list[str]:
-    """``nice -n 10`` (plus ``ionice -c3`` on Linux) for whichever tools
-    exist. A command prefix, never ``preexec_fn`` (unsafe in a multithreaded
-    server)."""
+    """``nice -n 10`` (plus ``ionice -c3`` on Linux where it can set the
+    priority) for whichever tools exist. A command prefix, never
+    ``preexec_fn`` (unsafe in a multithreaded server)."""
     prefix: list[str] = []
     nice = shutil.which("nice")
     if nice:
         prefix += [nice, "-n", "10"]
     if sys.platform.startswith("linux"):
         ionice = shutil.which("ionice")
-        if ionice:
+        if ionice and _ionice_usable(ionice):
             prefix += [ionice, "-c3"]
     return prefix
 
@@ -401,7 +475,8 @@ def run_capture(
     with ``-SIGKILL``.
 
     ``options.low_priority`` prefixes the command with ``nice -n 10`` (and
-    ``ionice -c3`` on Linux) when those tools exist. The target tool is
+    ``ionice -c3`` on Linux where it can set the priority) when those tools
+    exist. The target tool is
     resolved first, so a missing tool is reported as "not found" rather than
     as ``nice`` exiting 127.
     """

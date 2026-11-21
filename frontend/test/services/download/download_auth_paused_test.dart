@@ -174,6 +174,29 @@ void main() {
     expect(queue.state.jobs.where((j) => j.isQueued), hasLength(n + 1));
   });
 
+  // Another server at the address answered the 401. Once the bound server
+  // is verified again, the session resumes the pool: the queued jobs go out
+  // again in this scope.
+  test('resumed after the bound server is back: the queued jobs are tried '
+      'again', () async {
+    await _insertTrack(db, 'a');
+    final pool = WorkerPool(
+      queue: queue,
+      downloader: await downloader(401),
+      isOffline: () => offline,
+      onCompleted: () {},
+    );
+    queue.addAll([_job('a')]);
+    pool.pump();
+    await settle();
+    expect(pool.authPaused, isTrue);
+    expect(requests, 1);
+
+    pool.resumeAfterBoundServerBack();
+    await settle();
+    expect(requests, 2, reason: 'the queued download proceeds');
+  });
+
   test('authPaused is its own flag, not the offline flag', () async {
     await _insertTrack(db, 'a');
     final pool = WorkerPool(

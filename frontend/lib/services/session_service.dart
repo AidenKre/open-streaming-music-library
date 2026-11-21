@@ -20,6 +20,8 @@ import 'package:frontend/services/dead_sign_in_records.dart';
 import 'package:frontend/services/download/track_downloader.dart'
     show DownloadsLeftByReset, downloadsLeftByResetMessage;
 import 'package:frontend/services/logout_losses.dart';
+import 'package:frontend/services/recovery/recoverable.dart';
+import 'package:frontend/services/recovery/recovery_service.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/session/session_outcomes.dart';
 import 'package:frontend/services/session_event_log.dart';
@@ -158,12 +160,13 @@ class SessionService {
   /// discard it, and change nothing else. A no-op when nothing is held.
   Future<void> cancelPendingSignIn() => _signInFlow.cancelPendingSignIn();
 
-  /// The authenticated client got a 401 (Phase M 7.7): signed out
-  /// ([_ServerBlockWatch.onUnauthorized]). Idempotent, and a no-op once this
-  /// scope is disposed.
-  void onUnauthorized() {
+  /// The authenticated client got a 401 (Phase M 7.7); [servedBy] is the
+  /// answer's server stamp. Who sent it decides between signed out and a
+  /// different server ([_ServerBlockWatch.onUnauthorized]). Idempotent, and
+  /// a no-op once this scope is disposed.
+  void onUnauthorized([String? servedBy]) {
     if (_disposed) return;
-    _block.onUnauthorized();
+    _block.onUnauthorized(servedBy);
   }
 
   bool _activated = false;

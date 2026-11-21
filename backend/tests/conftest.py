@@ -381,15 +381,15 @@ def configure_app(tmp_path, monkeypatch):
       processes (``ps`` / ``/proc``) instead of the default empty list.
 
     Explicit default (SF-BE-1c): app starts see an empty foreign-process
-    list, so start-up's orphan-ffmpeg sweep (three process listings per start)
-    finds nothing, unless the test patches ``ffmpeg_runner._list_processes``
-    itself (its patch wins, also when made by an earlier fixture) or passes
-    ``real_process_list=True``. The real path stays covered by
-    ``test_ffmpeg_runner.py::TestKillOrphanedFfmpeg`` (real processes),
-    ``test_internal_dirs.py`` S7 (start-up sweeps every internal dir) and
+    list, so start-up's orphan-ffmpeg sweep (one process listing per start,
+    for all internal dirs) finds nothing, unless the test patches
+    ``ffmpeg_runner._list_processes`` itself (its patch wins, also when made by
+    an earlier fixture) or passes ``real_process_list=True``. The real path
+    stays covered by ``test_ffmpeg_runner.py::TestKillOrphanedFfmpeg`` (real
+    processes), ``test_internal_dirs.py`` S7 (start-up sweeps every internal
+    dir, with one listing, before it sweeps staged files) and
     ``test_startup_real_process_sweep.py`` (a real start-up and real listing).
-    ``test_conversion.py`` replaces the conversion reconcile's own call to
-    ``kill_orphaned_ffmpeg`` with a fake, so it covers no real listing.
+    The conversion reconcile lists no processes itself.
     """
     # Installed at fixture setup, and only over the real function, so a patch
     # made earlier by another fixture or later in the test body wins.

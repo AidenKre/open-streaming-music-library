@@ -13,6 +13,7 @@ import pytest
 from app.database import DatabaseContext
 from app.models import TrackMetaData
 from app.services.cover_art_manager import CoverArtContext, CoverArtManager
+from app.services.import_outcome import ImportOutcome
 from app.services.pipeline import make_pipeline
 from tests.owned_database import OwnedTestDatabase, add_test_user
 from tests.schema_fixtures import INIT_SQL
@@ -60,7 +61,7 @@ def _organize(organizer, tmp, name):
         get_track_metadata.return_value = TrackMetaData(
             title=name, artist="Radiohead", duration=1.0,
         )
-        return organizer.organize_file(file_path=source)
+        return organizer.organize(file_path=source) is ImportOutcome.IMPORTED
 
 
 def test_an_ingested_file_lands_in_the_owners_library_and_root(env):

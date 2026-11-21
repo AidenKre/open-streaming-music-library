@@ -31,6 +31,7 @@ from tests.conversion_fixtures import (
 )
 from tests.owned_database import add_test_user
 from tests.sqlite_helpers import sql_rows
+from tests.track_removal import delete_track
 
 UNKNOWN_UUID = "6b1f6b39-5d0d-4a4a-9d3c-0d6c5d6f0001"
 
@@ -80,7 +81,7 @@ def world(app_client, tmp_path):
     assert Library(database, sam).add_track(theirs)
     gone = flac_track(tmp_path / "music" / "admin" / "Gone.flac", "Gone")
     assert admin.add_track(gone)
-    assert admin.delete_track(gone.uuid_id)
+    assert delete_track(admin, gone.uuid_id)
     return {
         "client": app_client,
         "database": database,

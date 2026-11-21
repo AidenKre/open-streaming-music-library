@@ -13,6 +13,9 @@ from app.auth.passwords import AuthBusy, WeakPassword, hash_password, validate_p
 from app.auth.usernames import username_key
 from app.config import Settings
 from app.core.instance_lock import InstanceLockHeld, acquire_instance_lock
+from app.services.library_check import (
+    ReportNotWritten, ReportOutput, check_library, files_tracks_reach,
+)
 from app.services.user_delete import (
     RECORDED_ROOT_KEYS,
     DeletePaths,
@@ -40,16 +43,38 @@ class _Parser(argparse.ArgumentParser):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = _Parser(prog="app.cli")
+    parser = _Parser(prog="app.cli", description="The OSML server's admin tool.")
     sub = parser.add_subparsers(dest="group", required=True, parser_class=_Parser)
-    users = sub.add_parser("users")
+
+    def command(group, name, text):  # one sentence: in the group's list and its own help
+        return group.add_parser(name, help=text, description=text)
+
+    users = command(sub, "users", "Manage user accounts.")
     cmds = users.add_subparsers(dest="command", required=True, parser_class=_Parser)
-    cmds.add_parser("list")
-    for name in ("reset-password", "disable", "enable", "delete"):
-        cmds.add_parser(name).add_argument("name")
-    lastfm = sub.add_parser("lastfm")
+    command(cmds, "list", "List every user with their role, folder and track count.")
+    for name, text in (
+        ("reset-password", "Set a new password for a user and sign them out everywhere."),
+        ("disable", "Stop a user from signing in and sign them out (their data stays)."),
+        ("enable", "Let a disabled user sign in again."),
+        ("delete", "Delete a user and all their data; the server must be stopped."),
+    ):
+        command(cmds, name, text).add_argument("name", help="the username")
+    lastfm = command(sub, "lastfm", "Manage the Last.fm data of every user.")
     lastfm_cmds = lastfm.add_subparsers(dest="command", required=True, parser_class=_Parser)
-    lastfm_cmds.add_parser("purge")
+    command(
+        lastfm_cmds, "purge",
+        "Delete every user's Last.fm connection and queued scrobbles; "
+        "the server must be stopped.",
+    )
+    library = command(sub, "library", "Check users' music folders against their tracks.")
+    library_cmds = library.add_subparsers(dest="command", required=True, parser_class=_Parser)
+    command(
+        library_cmds, "check",
+        # The promise first, so help's line wrapping never splits it.
+        "A report: it writes no library file and no database row, and runs beside "
+        "the server. It lists the files no track uses, the tracks whose file is "
+        "missing and what could not be read, for one user or every user.",
+    ).add_argument("name", nargs="?", help="the username (default: every user)")
     return parser
 
 
@@ -59,6 +84,19 @@ _LOCKED_COMMANDS = {
     ("users", "delete"): "stop it before deleting a user.",
     ("lastfm", "purge"): "stop it before purging Last.fm data.",
 }
+
+
+_NO_CONFIRMATION = "No confirmation was read; nothing was deleted."
+_NO_PASSWORD = "No answer was read at the prompt; the password was not changed."
+
+
+def _ask(ask, text):
+    """The answer to one prompt, or None on Ctrl-C or end of input. Only around
+    the prompts: every one comes before any write."""
+    try:
+        return ask(text)
+    except (KeyboardInterrupt, EOFError):
+        return None
 
 
 def _iso(ts) -> str:
@@ -127,6 +165,9 @@ def _schema_ok(db, err) -> bool:
     except (DatabaseMissing, SchemaVersionRefused, DatabaseUnreadable) as exc:
         print(str(exc), file=err)
         return False
+    except KeyboardInterrupt:  # it runs before anything else in every command
+        print("Stopped before anything was done.", file=err)
+        return False
     return True
 
 
@@ -140,7 +181,7 @@ def _folder_bytes(folder: Path) -> int:
     return total
 
 
-def _roots_match_server(db, settings, err) -> bool:
+def _roots_match_server(db, settings, err, *, ending="nothing was deleted") -> bool:
     """Fails closed: recorded roots that cannot be read or parsed refuse the
     delete. Nothing recorded at all (the server never started) proceeds."""
     for key in RECORDED_ROOT_KEYS:
@@ -148,7 +189,7 @@ def _roots_match_server(db, settings, err) -> bool:
             recorded = db.read_setting(key)
         except (sqlite3.Error, OSError) as exc:
             print(
-                f"could not read the server's recorded folders ({exc}); nothing was deleted",
+                f"could not read the server's recorded folders ({exc}); {ending}",
                 file=err,
             )
             return False
@@ -161,7 +202,7 @@ def _roots_match_server(db, settings, err) -> bool:
         except (ValueError, OSError) as exc:
             print(
                 f"could not read the server's recorded folders: {key} is {recorded!r} "
-                f"({exc}); nothing was deleted",
+                f"({exc}); {ending}",
                 file=err,
             )
             return False
@@ -188,7 +229,10 @@ def _delete(db, user, settings, out, err, confirm) -> int:
         tracks = next(u["track_count"] for u in listing if u["id"] == user["id"])
         folder = paths.music_library_dir / user["library_folder"]
         print(f"{name}: {tracks} tracks, {_folder_bytes(folder)} bytes in {folder}", file=out)
-        answer = confirm(f"Type the username ({name}) to delete it and all its data: ")
+        answer = _ask(confirm, f"Type the username ({name}) to delete it and all its data: ")
+        if answer is None:
+            print(_NO_CONFIRMATION, file=err)
+            return 1
         if answer != name:
             print("Confirmation did not match; nothing was deleted.", file=err)
             return 1
@@ -207,7 +251,12 @@ def _delete(db, user, settings, out, err, confirm) -> int:
 
 
 def _lastfm_purge(db, out, err, confirm) -> int:
-    answer = confirm("Type purge to delete every user's Last.fm connection and queued scrobbles: ")
+    answer = _ask(
+        confirm, "Type purge to delete every user's Last.fm connection and queued scrobbles: "
+    )
+    if answer is None:
+        print(_NO_CONFIRMATION, file=err)
+        return 1
     if answer != "purge":
         print("Confirmation did not match; nothing was deleted.", file=err)
         return 1
@@ -236,12 +285,75 @@ def _lastfm_purge(db, out, err, confirm) -> int:
     return 0
 
 
+def _library_check(db, settings, name, out, err) -> int:
+    """Read-only; runs beside the server. Findings are not an error; a user not
+    checked in full (not checked, or something unreadable) is: exit 1. It
+    never ends in a traceback: Ctrl-C, a database error and an output that
+    cannot be written each end it in one line on ``err`` (a closed pipe in
+    none)."""
+    try:
+        if not _roots_match_server(db, settings, err, ending="nothing was checked"):
+            return 1
+        return _check_users(db, settings, name, ReportOutput(out), err)
+    except KeyboardInterrupt:
+        print("The check was stopped.", file=err)
+        return 1
+    except sqlite3.Error as exc:  # its text holds no path
+        print(
+            f"The check stopped: the database could not be read ({exc}); "
+            "run library check again.",
+            file=err,
+        )
+        return 1
+    except ReportNotWritten as exc:
+        if isinstance(exc.error, BrokenPipeError):  # the reader went away (`| head`)
+            if out is sys.stdout:  # so the flush at exit is silent too
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            return 1
+        reason = exc.error.strerror or type(exc.error).__name__
+        print(f"The check stopped: the report could not be written ({reason}).", file=err)
+        return 1
+
+
+def _check_users(db, settings, name, out, err) -> int:
+    if name is None:
+        everyone = db.list_user_folders()
+        users = sorted(everyone, key=lambda u: u["id"])
+    else:
+        user = db.get_user_by_username_key(username_key(name))
+        if user is None:
+            print(f"No user named '{name}'", file=err)
+            return 1
+        users = [user]
+        everyone = db.list_user_folders()
+    out.write(
+        "The library is read while the server runs: a file imported or removed "
+        "during the check may be listed; run the check again before acting on a "
+        "finding.\n"
+    )
+    # Every user's tracks, once, before any walk: a file any of them reaches,
+    # directly or through symbolic links, is never listed as unused.
+    reached = files_tracks_reach(db, settings, everyone, users)
+    if reached is None:  # once per run, no name and no path
+        out.write(
+            "Files no track uses are not listed in this run: a track's path could "
+            "not be followed (a link loop, or a folder that cannot be read).\n"
+        )
+    in_full = True
+    for user in users:  # one user not checked does not stop the others
+        in_full = check_library(db, settings, user, out, reached) and in_full
+    out.flush()  # a closed pipe shows here, not at exit
+    return 0 if in_full else 1
+
+
 def _run(args, settings, out, err, prompt, confirm) -> int:
     db = server_database(settings.app_data_dir)
     if not _schema_ok(db, err):
         return 1
     if args.group == "lastfm":
         return _lastfm_purge(db, out, err, confirm)
+    if args.group == "library":
+        return _library_check(db, settings, args.name, out, err)
     if args.command == "list":
         return _list(db, out)
     user = db.get_user_by_username_key(username_key(args.name))
@@ -261,8 +373,12 @@ def _run(args, settings, out, err, prompt, confirm) -> int:
         print(f"{name} {args.command}d", file=out)
         return 0
     if args.command == "reset-password":
-        password = prompt("New password: ")
-        if password != prompt("Repeat new password: "):
+        password = _ask(prompt, "New password: ")
+        repeated = None if password is None else _ask(prompt, "Repeat new password: ")
+        if repeated is None:
+            print(_NO_PASSWORD, file=err)
+            return 1
+        if password != repeated:
             print("Passwords do not match", file=err)
             return 1
         try:

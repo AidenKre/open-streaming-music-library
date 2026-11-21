@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/repositories/recently_played_repository.dart';
+import 'package:frontend/repositories/server_binding_repository.dart';
 
 import '../helpers/server_binding.dart';
 import 'catalog_seed.dart';
@@ -211,7 +212,10 @@ void main() {
 
     test('a binding without an instance id resolves no collection', () async {
       await db.delete(db.serverBinding).go();
-      await seedTestBinding(db, reconciled: true);
+      await seedTestBinding(db, instanceId: null, reconciled: true);
+      expect((await ServerBindingRepository(db).current())?.instanceId, isNull,
+          reason: 'precondition: the row has no instance id');
+      // An empty instance part must not match the missing id.
       await seed.click('album', ':1', at: 300);
       await seed.click('album', '$instance:1', at: 200);
       await seed.click('track', 't1', at: 100);

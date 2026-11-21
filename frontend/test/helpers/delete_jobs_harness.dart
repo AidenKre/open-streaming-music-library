@@ -33,7 +33,8 @@ class DeleteJobsHarness {
   }) async {
     final db = database ?? AppDatabase(NativeDatabase.memory());
     final binding = ServerBindingRepository(db);
-    final token = await seedTestBinding(db, reconciled: true);
+    final token =
+        await seedTestBinding(db, instanceId: instanceId, reconciled: true);
     final gate = ControlledGate(db);
     final h = DeleteJobsHarness._(db, binding, token, gate);
     h.instanceId = instanceId;

@@ -14,6 +14,7 @@ Covers two bugs:
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ import pytest
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator, SourceUnavailable
 from app.services.transcoder import ORIGINAL_QUALITY
+from tests.encoder_pool_fixtures import stop_every_encoder_pool  # noqa: F401  (autouse fixture)
 
 # The master admin's id: only its tracks are routed to default_cache (M.2a).
 ADMIN_OWNER = 1
@@ -284,12 +286,15 @@ class TestKeyLockDedup:
         transcode_calls = []
         transcode_lock = threading.Lock()
 
+        at_lock = []
+
         def slow_transcode(src: Path, dst: Path, bitrate: int) -> bool:
             with transcode_lock:
                 transcode_calls.append(1)
-            # Hold here long enough that every other thread queues on the
-            # per-key lock before this one finishes writing the cache.
-            gate.wait(timeout=5)
+            # Hold here until every other thread has reached the per-key lock
+            # (a condition, not a sleep): without the lock they would all be
+            # in here too.
+            assert gate.wait(timeout=5)
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"encoded" * 10)
             return True
@@ -297,6 +302,16 @@ class TestKeyLockDedup:
         c = _make_coordinator(
             tmp_path, default_quality="192", transcode_fn=slow_transcode
         )
+        key_lock = c._key_lock
+
+        def counting_key_lock(*key):
+            with transcode_lock:
+                at_lock.append(key)
+                if len(at_lock) == 8:
+                    gate.set()
+            return key_lock(*key)
+
+        c._key_lock = counting_key_lock
 
         results: list[object | None] = [None] * 8
 
@@ -308,13 +323,9 @@ class TestKeyLockDedup:
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
         for t in threads:
             t.start()
-        # Give all workers time to queue on the per-key lock.
-        import time as _time
-        _time.sleep(0.1)
-        gate.set()
-
         for t in threads:
-            t.join()
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads)
         c.drain()
 
         # Exactly one transcode, despite 8 concurrent callers.
@@ -393,8 +404,11 @@ class TestKeyLockDedup:
         with pytest.raises(RuntimeError):
             c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
 
-        # If the lock were stuck held, this second call would hang. The test
-        # framework will time out; if it returns, the lock was released.
+        # A lock stuck held would hang the second call, so try it with a
+        # timeout first.
+        key_lock = c._key_lock("uuid-boom", "192")
+        assert key_lock.acquire(timeout=2)
+        key_lock.release()
         result = c.encode_for_stream("uuid-boom", "192", source_bitrate_kbps=500, owner_id=ADMIN_OWNER)
         assert result is not None
 
@@ -461,39 +475,62 @@ class TestPersistAndSetDefaultQuality:
         c.drain()
 
     def test_concurrent_puts__persisted_matches_live(self, tmp_path):
-        """Final persisted value and live default_quality must agree after
-        many concurrent persist_and_set_default_quality calls."""
+        """A second caller cannot persist and go live in the middle of the
+        first one's persist and live update, so the persisted value and the
+        live default agree afterwards."""
         c = _make_coordinator(tmp_path, default_quality="192")
         c.all_uuids_fn = lambda: []
-
         persisted_store: dict[str, str] = {}
-        store_lock = threading.Lock()
+        # Set once the second caller is blocked on the update lock, or (when
+        # nothing serializes the callers) once it has finished outright.
+        second_waits_or_is_done = threading.Event()
+
+        class _SpyLock:
+            def __init__(self, real):
+                self._real = real
+
+            def __enter__(self):
+                if not self._real.acquire(blocking=False):
+                    second_waits_or_is_done.set()
+                    self._real.acquire()
+
+            def __exit__(self, *exc):
+                self._real.release()
+
+        c._default_quality_update_lock = _SpyLock(c._default_quality_update_lock)
+
+        persist_calls: list[str] = []
 
         def persist(q: str) -> None:
-            # Mirror the DB's serialized write semantics.
-            with store_lock:
-                persisted_store["q"] = q
+            persisted_store["q"] = q
+            persist_calls.append(q)
+            if q == "256":  # the first caller holds here until the second has tried
+                assert second_waits_or_is_done.wait(5)
 
-        qualities = [str(96 + 8 * i) for i in range(32)]
-        barrier = threading.Barrier(len(qualities))
+        def second() -> None:
+            c.persist_and_set_default_quality("320", persist)
+            second_waits_or_is_done.set()
 
-        def worker(q: str) -> None:
-            barrier.wait()
-            c.persist_and_set_default_quality(q, persist)
-
-        threads = [threading.Thread(target=worker, args=(q,)) for q in qualities]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        first_result = []
+        first = threading.Thread(
+            target=lambda: first_result.append(c.persist_and_set_default_quality("256", persist)))
+        first.start()
+        deadline = time.monotonic() + 5
+        while persisted_store.get("q") != "256":  # the first caller is in its persist
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        later = threading.Thread(target=second)
+        later.start()
+        for t in (first, later):
+            t.join(timeout=10)
+        assert not first.is_alive() and not later.is_alive()
         c.drain()
 
-        # Whichever caller serialized last, the persisted value MUST match the
-        # in-memory default. The interleaving "persist A, persist B, live=B,
-        # live=A" — where the live state diverges from what's on disk — must
-        # be impossible.
-        assert persisted_store["q"] == c.default_quality
-        assert c.default_quality in qualities
+        # The interleaving "persist A, persist B, live=B, live=A", where the
+        # live state diverges from what is on disk, must be impossible.
+        assert [changed for changed, _warming in first_result] == [True]  # the first call ended normally
+        assert persist_calls == ["256", "320"]
+        assert (persisted_store["q"], c.default_quality) == ("320", "320")
 
 
 class TestEvictionDuringEncode:

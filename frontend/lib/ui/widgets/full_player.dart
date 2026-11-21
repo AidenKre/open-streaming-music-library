@@ -504,33 +504,47 @@ class _QueueViewState extends ConsumerState<_QueueView> {
       case QueueReloadKind.visible:
         WidgetsBinding.instance.addPostFrameCallback((_) async {
           if (!mounted) return;
-          final rowCount = _list.rows.length;
-          final previousOffset = _scrollController.hasClients
-              ? _scrollController.offset
-              : 0.0;
-          final anchorLocalIndex = rowCount == 0
-              ? 0
-              : (previousOffset / _itemExtent).floor().clamp(0, rowCount - 1);
-          final anchorOffsetWithinItem =
-              previousOffset - (anchorLocalIndex * _itemExtent);
-          final newAnchorIndex = await _list.reloadVisible(
+          await _reloadVisibleRows(
             sessionId: sessionId,
-            expectedQueueVersion: queueVersion,
-            currentPlayPosition: ref.read(queueCurrentPlayPositionProvider),
+            queueVersion: queueVersion,
             totalCount: totalCount,
-            anchorLocalIndex: anchorLocalIndex,
           );
-          if (!mounted) return;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (!_scrollController.hasClients) return;
-            final rawOffset = newAnchorIndex == null
-                ? previousOffset
-                : (newAnchorIndex * _itemExtent) + anchorOffsetWithinItem;
-            final maxScrollExtent = _scrollController.position.maxScrollExtent;
-            _scrollController.jumpTo(rawOffset.clamp(0.0, maxScrollExtent));
-          });
         });
     }
+  }
+
+  /// Reads the rows on screen again where the person is: anchored on the
+  /// row at the current scroll offset, which keeps its place afterwards.
+  Future<void> _reloadVisibleRows({
+    required int sessionId,
+    required int queueVersion,
+    required int totalCount,
+  }) async {
+    final rowCount = _list.rows.length;
+    final previousOffset = _scrollController.hasClients
+        ? _scrollController.offset
+        : 0.0;
+    final anchorLocalIndex = rowCount == 0
+        ? 0
+        : (previousOffset / _itemExtent).floor().clamp(0, rowCount - 1);
+    final anchorOffsetWithinItem =
+        previousOffset - (anchorLocalIndex * _itemExtent);
+    final newAnchorIndex = await _list.reloadVisible(
+      sessionId: sessionId,
+      expectedQueueVersion: queueVersion,
+      currentPlayPosition: ref.read(queueCurrentPlayPositionProvider),
+      totalCount: totalCount,
+      anchorLocalIndex: anchorLocalIndex,
+    );
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      final rawOffset = newAnchorIndex == null
+          ? previousOffset
+          : (newAnchorIndex * _itemExtent) + anchorOffsetWithinItem;
+      final maxScrollExtent = _scrollController.position.maxScrollExtent;
+      _scrollController.jumpTo(rawOffset.clamp(0.0, maxScrollExtent));
+    });
   }
 
   void _scrollToCurrentTrack(int currentPlayPosition, int rowCount) {
@@ -637,11 +651,17 @@ class _QueueViewState extends ConsumerState<_QueueView> {
                 style: textTheme.bodyMedium?.copyWith(color: colors.onSurfaceVariant),
               ),
               TextButton(
-                // A failed read of more rows is repeated where the person
-                // is; any other failed read reloads around the current track.
+                // A failed read of more rows, or of the rows on screen, is
+                // repeated where the person is; a failed initial load
+                // reloads around the current track.
                 onPressed: () => switch (_list.failedPage) {
                   QueuePage.before => _loadBefore(),
                   QueuePage.after => _list.loadAfter(totalCount: totalCount),
+                  null when _list.failedVisibleReload => _reloadVisibleRows(
+                    sessionId: sessionId,
+                    queueVersion: queueVersion,
+                    totalCount: totalCount,
+                  ),
                   null => _list.loadInitial(
                     sessionId: sessionId,
                     expectedQueueVersion: queueVersion,

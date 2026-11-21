@@ -37,8 +37,10 @@ class HistorySyncStatus {
 /// One server-scoped history pass: upload, then pull (Phase 5 §5). The body
 /// of the history [SingleFlightRunner].
 ///
-/// A 401 (signed out) parks the runner without quarantining or recording
-/// anything; the events stay pending until a login rebuilds the scope.
+/// A 401 parks the runner without quarantining or recording anything; the
+/// events stay pending until a login rebuilds the scope, or, when the 401
+/// came from another server at the address, until the bound server is
+/// verified again (`RecoveryTrigger.boundServerBack` reopens the runner).
 ///
 /// Never blocks on the binding gate (it would hold a quiesce): without a
 /// verified connection the pass fails with the offline wait and the next

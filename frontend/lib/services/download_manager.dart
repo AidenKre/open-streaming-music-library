@@ -521,6 +521,10 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
   /// (sign-off OPEN-M-11); it does not clear the signed-out (401) pause.
   void resumeIfPaused() => _pool.resumeAfterVerified();
 
+  /// The bound server is verified again after another server's 401: the 401
+  /// pause ends too ([WorkerPool.resumeAfterBoundServerBack]).
+  void resumeAfterBoundServerBack() => _pool.resumeAfterBoundServerBack();
+
   /// Stable, paginated view used by the downloading page.
   UnmodifiableListView<DownloadJob> snapshot() => _queue.snapshot();
 }

@@ -28,14 +28,8 @@ from app.core.operator_log import operator_logger
 from app.database import ANY_OWNER
 from app.database.database import Database, TrackPathTaken
 from app.services import recovery_audio
-from app.services.organizer import (
-    Organizer,
-    OrganizerContext,
-    flush_move,
-    move_back,
-    move_file,
-    prune_empty_dirs,
-)
+from app.services.file_ops import flush_move, move_back, move_file, prune_empty_dirs
+from app.services.organizer import Organizer, OrganizerContext
 from app.services.path_sanitize import PathEscapesRoot, assert_name_within
 from app.services.recovery_audio import (
     LEAVE,
@@ -48,25 +42,27 @@ from app.services.recovery_audio import (
     leftover_verdict,
 )
 from app.services.journal_recovery import (
-    SWAP_LOST_TEXT,
-    SWAP_UNPROVEN_TEXT,
-    TRACK_CHANGED_TEXT,
     JournalOwnershipUnproven,
     conversion_job_id_of,
-    end_swap_job,
     is_current_master,
     is_regular_file,
-    job_settled_lost,
     mark_identity_stale,
     reached_durable_point,
     replay_staged_copy,
     row_root,
-    same_bitrate,
 )
 
 # U06-B-06: the job of a same-file conversion whose swap this row settles ends
 # done (the converted file is the track's file now) or failed with a final text.
 SWAP_DONE = "done"
+# The job texts stored when such a row is settled and its own swap had failed.
+# TRACK_CHANGED_TEXT is conversion.TRACK_CHANGED_ERROR, word for word (a test
+# compares them; start-up recovery does not import the conversion module).
+TRACK_CHANGED_TEXT = "track changed since the conversion was requested"
+SWAP_LOST_TEXT = "The converted file was lost, so the original was kept. Convert it again."
+SWAP_UNPROVEN_TEXT = "could not place the converted master"
+# The probe of a swap that happened earlier: bitrates are compared within this.
+_SWAP_BITRATE_TOLERANCE_KBPS = 0.5
 
 
 logger = logging.getLogger(__name__)
@@ -176,7 +172,7 @@ class _Row:
         self.deletes: list[tuple[Path, str]] = []  # library files, rule a/b/c
         self.delete_temp = False
         self.temp_unreadable = False  # the staged copy goes by rule c
-        self.prune: list[Path] = []  # folders of files already gone (today's finish)
+        self.prune: list[Path] = []  # folders of files already gone, or that never arrived
         self.old_by_adoption: Optional[Path] = None  # P-old that rests on our own move
         self.mark = False
         self.phrases: list[str] = []
@@ -327,6 +323,11 @@ class _Row:
         p_new_own = (
             D != str(N) and self.T is not None and not self.t_present and self.usable(N, D)
         )
+        if N is not None and D != str(N):
+            # The unfinished move may have made this folder for a file that never
+            # arrived (a kill between the two): it goes if it is empty when the
+            # row is settled, like the folder of any file that has gone.
+            self.prune.append(N.parent)
         if D is None:  # M7: nothing to compare with
             self._plan_gone([O, N])
             return
@@ -694,6 +695,38 @@ class _Row:
             release_cover_art=cover_art.release_if_unreferenced if cover_art is not None else None,
             path_in_use=lambda path: self.db.track_path_in_use(str(path), owner_id=ANY_OWNER),
         ))
+
+
+def same_bitrate(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= _SWAP_BITRATE_TOLERANCE_KBPS
+
+
+def job_settled_lost(database: Database, entry: dict) -> bool:
+    """Whether this row's job was already ended "lost" (a crash came after it)."""
+    job_id = conversion_job_id_of(entry)
+    if job_id is None:
+        return False
+    job = database.get_conversion_job(job_id, owner_id=entry["owner_id"])
+    return (
+        job is not None and job["uuid_id"] == entry["uuid_id"]
+        and job["status"] == "failed" and job["error_text"] == SWAP_LOST_TEXT
+    )
+
+
+def end_swap_job(database: Database, entry: dict, error_text: Optional[str]) -> None:
+    """Settle a convert row's job: done when ``error_text`` is None, else failed
+    with that final text. Not a convert row, or a name with no job id: nothing.
+    A failing update raises (the row is kept)."""
+    if entry["intent"] != "convert":
+        return
+    job_id = conversion_job_id_of(entry)
+    if job_id is None:
+        return
+    database.settle_swapped_conversion_job(
+        job_id, entry["uuid_id"], owner_id=entry["owner_id"], error_text=error_text
+    )
 
 
 def _stat_regular(path: str) -> bool:

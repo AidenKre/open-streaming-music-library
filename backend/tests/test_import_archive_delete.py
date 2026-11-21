@@ -76,10 +76,9 @@ def _lines(caplog):
     return [r.getMessage() for r in caplog.records if r.name == OPERATOR]
 
 
-def _ingest(tmp_path, archive, caplog, organize=None, imported=True):
+def _ingest(tmp_path, archive, caplog, organize=None):
     with caplog.at_level(logging.INFO):
-        return _ingestor(tmp_path, organize).ingest(
-            archive, imported_dir=archive.parent / ".imported" if imported else None)
+        return _ingestor(tmp_path, organize).ingest(archive, imported_dir=archive.parent / ".imported")
 
 
 # --- the rule ---------------------------------------------------------------------
@@ -167,28 +166,22 @@ def test_g3_the_identity_is_checked_again_right_before_the_unlink(tmp_path, capl
     real_identity, real_unlink = ingestion.file_identity, os.unlink
 
     def unlink(path, *args, **kwargs):  # os.unlink is global: rmtree uses it too
-        if Path(path) == archive:
-            events.append(("unlink", archive))
+        if os.path.basename(os.fspath(path)) == archive.name:
+            events.append(("unlink", archive.name))
         return real_unlink(path, *args, **kwargs)
 
+    # By name: the removal names the file relative to its opened folder. The
+    # check before the unpack is made by path, the one before the unlink
+    # inside the opened folder, which tells the two apart.
     monkeypatch.setattr(ingestion, "file_identity",
-                        lambda p: events.append(("identity", Path(p))) or real_identity(p))
+                        lambda p, **kw: events.append(("identity", Path(p).name, "dir_fd" in kw))
+                        or real_identity(p, **kw))
     monkeypatch.setattr(ingestion.os, "unlink", unlink)
 
     assert _ingest(tmp_path, archive, caplog) is ImportOutcome.IMPORTED
 
-    assert events[-2:] == [("identity", archive), ("unlink", archive)]
-    assert [e for e in events if e[0] == "unlink"] == [("unlink", archive)]
-
-
-def test_g4_only_an_import_folder_call_deletes(tmp_path, caplog):
-    folder = _folder(tmp_path)
-    archive = _album_zip(folder)
-
-    assert _ingest(tmp_path, archive, caplog, imported=False) is ImportOutcome.IMPORTED
-
-    assert archive.exists()
-    assert _lines(caplog) == []
+    assert events[-2:] == [("identity", archive.name, True), ("unlink", archive.name)]
+    assert [e for e in events if e[0] == "unlink"] == [("unlink", archive.name)]
 
 
 def test_g5_a_planned_audio_file_missing_from_the_unpack_keeps_the_archive(tmp_path, caplog):
@@ -252,7 +245,7 @@ def _refuse_unlink(monkeypatch, archive):
     real_unlink = os.unlink
 
     def refuse(path, *args, **kwargs):  # os.unlink is global: rmtree uses it too
-        if Path(path) == archive:
+        if os.path.basename(os.fspath(path)) == archive.name:  # by name: maybe relative to its folder
             raise PermissionError(errno.EACCES, "Permission denied", str(path))
         return real_unlink(path, *args, **kwargs)
 
@@ -295,6 +288,212 @@ def test_a_failed_deletion_is_not_retried_in_the_same_run(tmp_path, caplog, monk
         assert file_identity(archive) is not None
     finally:
         watcher.executor.shutdown(wait=True)
+
+
+
+def test_a_folder_swapped_between_the_check_and_the_removal_never_costs_another_archive(
+        tmp_path, caplog, monkeypatch):
+    """After the last identity check and before the removal, the archive's
+    folder is swapped for a link to another user's folder, which holds an
+    archive of the same name. The removal goes to the folder that was checked
+    (wherever it is now), never through the name: the other archive stays."""
+    folder = _folder(tmp_path)
+    albums = folder / "albums"
+    albums.mkdir()
+    archive = _album_zip(albums)
+    alices = tmp_path / "import-users" / "alice"
+    alices.mkdir(parents=True)
+    theirs = _album_zip(alices)
+    theirs_bytes = theirs.read_bytes()
+    real_unlink = os.unlink
+    swapped = []
+
+    def swap_then_unlink(path, *args, **kwargs):  # os.unlink is global: rmtree uses it too
+        if not swapped and os.path.basename(os.fspath(path)) == archive.name:
+            swapped.append(path)
+            os.rename(albums, folder / "albums-moved-away")
+            os.symlink(alices, albums, target_is_directory=True)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(ingestion.os, "unlink", swap_then_unlink)
+
+    with caplog.at_level(logging.INFO):
+        outcome = _ingestor(tmp_path).ingest(archive, imported_dir=folder / ".imported")
+
+    assert swapped, "the archive was never removed"
+    assert theirs.read_bytes() == theirs_bytes
+    assert not (folder / "albums-moved-away" / archive.name).exists()
+    assert outcome is ImportOutcome.IMPORTED and _lines(caplog) == [DELETED]
+
+
+def _alices_archive(tmp_path):
+    """Another user's folder with an archive of the same name, other bytes."""
+    alices = tmp_path / "import-users" / "alice"
+    alices.mkdir(parents=True)
+    return alices, _zip(alices / "album.zip", {"x.txt": b"alice's"})
+
+
+def test_a_folder_swapped_right_before_the_set_aside_never_moves_another_archive(
+        tmp_path, caplog, monkeypatch):
+    """The archive is set aside (one track is already in the library). Its
+    folder is swapped for a link to another user's folder, holding an archive
+    of the same name, at the very move. The move takes the file from the
+    folder that was checked, never through the name."""
+    folder = _folder(tmp_path)
+    albums = folder / "albums"
+    albums.mkdir()
+    archive = _album_zip(albums)
+    ours = archive.read_bytes()
+    alices, theirs = _alices_archive(tmp_path)
+    theirs_bytes = theirs.read_bytes()
+    real_rename = os.rename
+    swapped = []
+
+    def swap_then_rename(src, dst, *args, **kwargs):
+        if not swapped and os.path.basename(os.fspath(src)) == archive.name:
+            swapped.append(src)
+            real_rename(albums, folder / "albums-moved-away")
+            os.symlink(alices, albums, target_is_directory=True)
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(ingestion.os, "rename", swap_then_rename)
+
+    outcome = _ingestor(tmp_path, _by_name({"b.flac": ImportOutcome.DUPLICATE})).ingest(
+        archive, imported_dir=folder / ".imported")
+
+    assert swapped, "the archive was never moved"
+    assert theirs.read_bytes() == theirs_bytes
+    assert (folder / ".imported" / "album.zip").read_bytes() == ours
+    assert outcome is ImportOutcome.IMPORTED
+
+
+def test_a_folder_swapped_before_the_set_aside_opens_it_is_a_changed_file(tmp_path, caplog, monkeypatch):
+    """The swap comes after the last look by name and before the move opens
+    the archive's folder: the folder it opens is the other user's, the file of
+    that name there is not the one that was imported, and nothing is moved."""
+    folder = _folder(tmp_path)
+    albums = folder / "albums"
+    albums.mkdir()
+    archive = _album_zip(albums)
+    alices, theirs = _alices_archive(tmp_path)
+    theirs_bytes = theirs.read_bytes()
+    real_open = os.open
+    swapped = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if not swapped and Path(os.fspath(path)) == albums:
+            swapped.append(path)
+            os.rename(albums, folder / "albums-moved-away")
+            os.symlink(alices, albums, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(ingestion.os, "open", swap_then_open)
+
+    with caplog.at_level(logging.INFO):
+        outcome = _ingestor(tmp_path, _by_name({"b.flac": ImportOutcome.DUPLICATE})).ingest(
+            archive, imported_dir=folder / ".imported")
+
+    assert swapped, "the archive's folder was never opened"
+    assert outcome is ImportOutcome.CHANGED
+    assert theirs.read_bytes() == theirs_bytes
+    assert (folder / "albums-moved-away" / "album.zip").exists()
+    assert not (folder / ".imported").exists() or list((folder / ".imported").iterdir()) == []
+    assert _lines(caplog) == []
+
+
+def test_an_archive_gone_at_its_set_aside_is_a_changed_file_not_a_kept_one(tmp_path, caplog, monkeypatch):
+    """Removed by someone between the last look and the move: nothing is kept,
+    so no line says it stays, and nothing is remembered."""
+    folder = _folder(tmp_path)
+    archive = _album_zip(folder)
+    real_rename = os.rename
+
+    def removed_then_rename(src, dst, *args, **kwargs):
+        if os.path.basename(os.fspath(src)) == archive.name and archive.exists():
+            archive.unlink()
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(ingestion.os, "rename", removed_then_rename)
+    ingestor = _ingestor(tmp_path, _by_name({"b.flac": ImportOutcome.DUPLICATE}))
+
+    with caplog.at_level(logging.INFO):
+        outcome = ingestor.ingest(archive, imported_dir=folder / ".imported")
+
+    assert outcome is ImportOutcome.CHANGED
+    assert _lines(caplog) == []
+    assert not ingestor._archives.remembered(archive)
+
+
+# --- a set-aside that fails ---------------------------------------------------------
+
+def _kept_line(reason):
+    return (f"An archive in an import folder of user {OWNER} could not be set aside in .imported"
+            f" ({reason}); it stays in the folder and is tried again when it changes or when the"
+            " server restarts.")
+
+
+def _set_aside_twice(tmp_path, caplog):
+    """An archive the server sets aside (one track is already in the library),
+    offered twice; how often its members were handed to the organizer."""
+    folder = _folder(tmp_path)
+    archive = _album_zip(folder)
+    organize = _by_name({"b.flac": ImportOutcome.DUPLICATE})
+    ingestor = _ingestor(tmp_path, organize)
+    with caplog.at_level(logging.INFO):
+        first = ingestor.ingest(archive, imported_dir=folder / ".imported")
+        again = ingestor.ingest(archive, imported_dir=folder / ".imported")
+    return folder, archive, ingestor, organize, (first, again)
+
+
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EROFS, errno.ENOSPC, errno.EXDEV],
+                         ids=["EACCES", "EROFS", "ENOSPC", "EXDEV"])
+def test_a_refused_set_aside_keeps_the_archive_with_one_line_and_is_not_unpacked_again(
+        tmp_path, caplog, monkeypatch, err):
+    def refuse(src, dst, **kwargs):
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(ingestion.os, "rename", refuse)
+
+    folder, archive, _, organize, outcomes = _set_aside_twice(tmp_path, caplog)
+
+    assert outcomes == (ImportOutcome.MOVE_FAILED, ImportOutcome.REFUSED)
+    assert organize.call_count == 2  # the two audio files of one unpack, not of a second
+    assert archive.exists() and list((folder / ".imported").iterdir()) == []
+    assert _lines(caplog) == [_kept_line(errno.errorcode[err])]
+    assert str(tmp_path) not in _lines(caplog)[0]
+
+
+def test_an_imported_folder_that_cannot_be_made_keeps_the_archive_the_same_way(
+        tmp_path, caplog, monkeypatch):
+    real_mkdir = Path.mkdir
+
+    def no_permission(self, *args, **kwargs):
+        if self.name == ".imported":
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", no_permission)
+
+    folder, archive, _, organize, outcomes = _set_aside_twice(tmp_path, caplog)
+
+    assert outcomes == (ImportOutcome.MOVE_FAILED, ImportOutcome.REFUSED)
+    assert organize.call_count == 2
+    assert archive.exists() and not (folder / ".imported").exists()
+    assert _lines(caplog) == [_kept_line("EACCES")]
+
+
+def test_an_archive_kept_after_a_refused_set_aside_is_tried_again_once_it_changes(
+        tmp_path, caplog, monkeypatch):
+    def refuse(src, dst, **kwargs):
+        raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+
+    monkeypatch.setattr(ingestion.os, "rename", refuse)
+    folder, archive, ingestor, organize, _ = _set_aside_twice(tmp_path, caplog)
+    st = archive.stat()
+    os.utime(archive, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    assert ingestor.ingest(archive, imported_dir=folder / ".imported") is ImportOutcome.MOVE_FAILED
+    assert organize.call_count == 4
 
 
 # --- review r1 #2: songs in formats the server does not import ------------------------

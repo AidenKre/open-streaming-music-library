@@ -459,6 +459,10 @@ def test_dismiss_takes_the_pair_in_reverse_order_and_is_idempotent(lib):
     assert first.json() == {"uuid_a": lo, "uuid_b": hi, "status": "dismissed"}
     changed = stored(lib, a, b)
     assert changed["status"] == "dismissed" and changed["status_changed_at"] is not None
+    # Back-date the change: a rewrite in the same second would keep the time.
+    sql(lib.db, "UPDATE track_duplicate_candidates SET status_changed_at = 1 "
+                "WHERE uuid_a = ? AND uuid_b = ?", (lo, hi))
+    changed = stored(lib, a, b)
     again = post(lib, "dismiss", lo, hi)
     assert (again.status_code, again.json()) == (200, first.json())
     assert stored(lib, a, b) == changed  # nothing rewritten

@@ -225,10 +225,10 @@ class AudioIdentityWorker(WorkerThread):
         if subject["fp_state"] == "current":
             fingerprint = self.database.get_identity_fingerprint(uuid_id, owner_id=owner)
         identity = AudioIdentity(exact=exact, tool_versions=None, computed_at=now, fingerprint=fingerprint)
-        report = self.database.find_duplicates_for_track(uuid_id, identity, owner_id=owner)
+        matches = self.database.find_duplicates_for_track(uuid_id, identity, owner_id=owner)
         if self.database.store_duplicate_candidates(
             uuid_id, generation=subject["generation"], exact_state=subject["exact_state"],
-            fp_state=subject["fp_state"], matches=report.matches,
+            fp_state=subject["fp_state"], matches=matches,
             matcher_version=self._matcher_version, now=now, owner_id=owner,
         ):
             self._undefer(uuid_id)

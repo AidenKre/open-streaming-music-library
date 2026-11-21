@@ -3495,6 +3495,165 @@ void main() {
       expect(controller!.sourceKindOf(1), PlaybackSourceKind.remote);
     });
   });
+
+  // The queue player decides whether the advance after an end plays from the
+  // desired play this engine published just before its end report. So the
+  // end report must be the first report that says "not playing", in
+  // whatever order the plugin publishes its own playing flag and its
+  // completed state; a pause that was asked for is the only thing that says
+  // "not playing" earlier.
+  group('desired play up to the end report', () {
+    late StreamController<ja.PlayerState> states;
+    late JustAudioEngine engine;
+    late List<EngineTransportState> seen;
+
+    /// The plugin's play future (it lives as long as playback).
+    late Completer<void> pluginPlay;
+
+    const ended = EngineTransportState(false, EngineProcessingState.completed);
+
+    /// The plugin publishes a state; its getters agree with it.
+    void plugin(bool playing, ja.ProcessingState state) {
+      when(() => player.playing).thenReturn(playing);
+      when(() => player.processingState).thenReturn(state);
+      states.add(ja.PlayerState(playing, state));
+    }
+
+    /// One track seeded with autoplay and reported playing by the plugin.
+    Future<void> playing() async {
+      states = StreamController<ja.PlayerState>.broadcast();
+      addTearDown(states.close);
+      when(() => player.playerStateStream).thenAnswer((_) => states.stream);
+      pluginPlay = Completer<void>();
+      when(() => player.play()).thenAnswer((_) => pluginPlay.future);
+      engine = JustAudioEngine(player);
+      addTearDown(engine.dispose);
+      seen = [];
+      final sub = engine.transportStateStream.listen(seen.add);
+      addTearDown(sub.cancel);
+      await engine.setSeed([_entry(itemId: 1, playPosition: 0)],
+          currentItemId: 1, autoPlay: true);
+      await pumpEventQueue();
+      plugin(true, ja.ProcessingState.ready);
+      await pumpEventQueue();
+      verify(() => player.play()).called(1);
+      expect(seen.last,
+          const EngineTransportState(true, EngineProcessingState.ready),
+          reason: 'precondition: playing');
+    }
+
+    for (final (order, events) in [
+      (
+        'its playing flag stays true at completed, then the echo of the '
+            'engine\'s own pause',
+        [
+          (true, ja.ProcessingState.completed),
+          (false, ja.ProcessingState.completed),
+        ],
+      ),
+      (
+        'its playing flag goes false in a state of its own just before '
+            'completed',
+        [
+          (false, ja.ProcessingState.ready),
+          (false, ja.ProcessingState.completed),
+        ],
+      ),
+      (
+        'its playing flag goes false together with completed',
+        [(false, ja.ProcessingState.completed)],
+      ),
+    ]) {
+      test('a natural end with nobody pausing, the plugin publishing that '
+          '$order: play is desired in the report before the end report, and '
+          'the end is reported once', () async {
+        await playing();
+        for (final (flag, state) in events) {
+          plugin(flag, state);
+        }
+        await pumpEventQueue();
+        expect(seen.last, ended);
+        expect(seen.where((s) => s == ended), hasLength(1));
+        final before = seen[seen.indexOf(ended) - 1];
+        expect(before.playing, isTrue,
+            reason: 'what the queue player reads as "was playing desired '
+                'when the engine reported the end": $seen');
+      });
+    }
+
+    test('a pause the plugin acknowledged before the end: play is not '
+        'desired in the report before the end report', () async {
+      await playing();
+      await engine.pause();
+      plugin(false, ja.ProcessingState.ready); // the acknowledgement
+      await pumpEventQueue();
+      plugin(false, ja.ProcessingState.completed);
+      await pumpEventQueue();
+      expect(seen.sublist(seen.length - 2), const [
+        EngineTransportState(false, EngineProcessingState.ready),
+        ended,
+      ]);
+    });
+
+    test('a play the plugin took back, with no end following, stays taken '
+        'back (unchanged)', () async {
+      await playing();
+      plugin(false, ja.ProcessingState.ready);
+      await pumpEventQueue();
+      expect(seen.last,
+          const EngineTransportState(false, EngineProcessingState.ready));
+    });
+
+    test('a play the plugin took back, then a seek to the end by the person: '
+        'the end is reported with play not desired', () async {
+      await playing();
+      plugin(false, ja.ProcessingState.ready);
+      await pumpEventQueue();
+      await engine.seek(const Duration(minutes: 3));
+      await pumpEventQueue();
+      plugin(false, ja.ProcessingState.completed);
+      await pumpEventQueue();
+      expect(seen.sublist(seen.length - 2), const [
+        EngineTransportState(false, EngineProcessingState.ready),
+        ended,
+      ]);
+    });
+
+    // An end that follows an edit of the playlist, or a play that failed,
+    // is not the plugin running to its end: the play it took back stays
+    // taken back.
+    test('a play the plugin took back, then an edit of the playlist, then '
+        'completed: the end is reported with play not desired', () async {
+      await playing();
+      plugin(false, ja.ProcessingState.ready);
+      await pumpEventQueue();
+      final taken = seen.length;
+      await engine.addEntries([_entry(itemId: 2, playPosition: 1)]);
+      await pumpEventQueue();
+      plugin(false, ja.ProcessingState.completed);
+      await pumpEventQueue();
+      expect(seen.last, ended);
+      expect(seen.sublist(taken).where((s) => s.playing), isEmpty,
+          reason: 'nothing says "playing" after the plugin took the play '
+              'back: $seen');
+    });
+
+    test('a play the plugin took back and then failed, then completed: the '
+        'end is reported with play not desired', () async {
+      await playing();
+      plugin(false, ja.ProcessingState.ready);
+      await pumpEventQueue();
+      final taken = seen.length;
+      pluginPlay.completeError(ja.PlayerException(1, 'play failed', 0));
+      await pumpEventQueue();
+      plugin(false, ja.ProcessingState.completed);
+      await pumpEventQueue();
+      expect(seen.last, ended);
+      expect(seen.sublist(taken).where((s) => s.playing), isEmpty,
+          reason: 'nothing says "playing" after the plugin took the play '
+              'back: $seen');
+    });
+  });
 }
 
 QueuePlaybackEntry _entry({

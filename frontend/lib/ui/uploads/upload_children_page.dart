@@ -35,6 +35,12 @@ class UploadChildrenPage extends StatelessWidget {
               parent: parent,
             ),
             ChildListFailed() => _failed(),
+            ChildListGone(:final text) => Center(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(text, textAlign: TextAlign.center),
+              ),
+            ),
             // Not asked for yet (a single frame: Show files asks first).
             ChildListLoading() || null => _loading(),
           },

@@ -81,9 +81,17 @@ class _Review implements UploadReview {
   Future<UploadItem> item(String itemUuid) async =>
       snap.firstWhere((i) => i.itemUuid == itemUuid);
 
+  /// When set, the next read of an item's draft waits for it (a slow
+  /// local read).
+  Completer<void>? draftGate;
+
   @override
-  Future<MetadataEdit> draftOf(String itemUuid) async =>
-      const MetadataEdit.empty();
+  Future<MetadataEdit> draftOf(String itemUuid) async {
+    final gate = draftGate;
+    draftGate = null;
+    await gate?.future;
+    return const MetadataEdit.empty();
+  }
 
   @override
   Future<void> saveDraft(String itemUuid, MetadataEdit edit) async {}
@@ -130,6 +138,7 @@ void main() {
   late AudioFocus focus;
   late FakePlaybackEngine library;
   late List<FakePreviewEngine> previews;
+  late _Review review;
   late StreamController<List<UploadIntentRecord>> intents;
   late StreamController<int> downloads;
   late ProviderContainer container;
@@ -143,6 +152,7 @@ void main() {
     focus = AudioFocus(sessionPort, timer: FakeTimers().create);
     library = FakePlaybackEngine();
     previews = [];
+    review = _Review();
     intents = StreamController<List<UploadIntentRecord>>.broadcast();
     downloads = StreamController<int>.broadcast();
   });
@@ -187,7 +197,7 @@ void main() {
       audioSessionPortProvider.overrideWithValue(sessionPort),
       audioServiceProvider.overrideWithValue(_Bridge()),
       downloadStatusVersionProvider.overrideWith((ref) => downloads.stream),
-      uploadReviewProvider.overrideWithValue(_Review()),
+      uploadReviewProvider.overrideWithValue(review),
       uploadIntentsProvider.overrideWith((ref) => intents.stream),
       uploadsOverviewProvider
           .overrideWith((ref) => fakeUploadsOverview(const [])),
@@ -328,6 +338,58 @@ void main() {
     await tester.pumpAndSettle();
     await settle(tester);
     expectMusicPlaysOn(playsBefore: plays);
+    await teardownTree(tester);
+  });
+
+  // A preview that sounds while the next item is being read would leave the
+  // music paused for good: once it has sounded, closing it hands nothing
+  // back. So the preview is closed when the person asks to move on, before
+  // the next item's draft is read.
+  testWidgets('going to the next item while the preview loads, and its load '
+      'completes while the next item is still being read: the preview never '
+      'sounds and the music plays on', (tester) async {
+    await musicPlayingOnReviewPage(tester);
+    final plays = library.playCalls;
+    await tester.tap(find.text('Play preview'));
+    await settle(tester);
+    expect(focus.holder, AudioOutput.preview, reason: 'precondition: granted');
+    final draft = review.draftGate = Completer<void>();
+    await tester.tap(find.text('Next'));
+    await settle(tester);
+    expect(review.draftGate, isNull,
+        reason: 'precondition: the next item\'s draft is being read');
+    previews.single.finishLoad(const Duration(seconds: 30));
+    await settle(tester);
+    draft.complete();
+    await settle(tester);
+    await tester.pumpAndSettle();
+    await settle(tester);
+    expect(find.text('2/2'), findsOneWidget,
+        reason: 'precondition: the review moved to the next item');
+    expectMusicPlaysOn(playsBefore: plays);
+    await teardownTree(tester);
+  });
+
+  testWidgets('the preview cannot load after the music was paused for it: '
+      'the music plays on while the page stays open, and the page says the '
+      'preview could not play', (tester) async {
+    await musicPlayingOnReviewPage(tester);
+    final plays = library.playCalls;
+    await tester.tap(find.text('Play preview'));
+    await settle(tester);
+    expect(focus.holder, AudioOutput.preview, reason: 'precondition: granted');
+    expect(library.wantsPlaying, isFalse, reason: 'the hand-over paused it');
+    previews.single.failLoad();
+    await settle(tester);
+    expect(find.byType(UploadReviewPage), findsOneWidget);
+    expect(find.text("Preview couldn't play"), findsOneWidget);
+    expect(library.wantsPlaying, isTrue, reason: 'the music plays again');
+    expect(library.playCalls, plays + 1);
+    expect(container.read(audioPlayWhenReadyProvider), isTrue);
+    expect(container.read(currentTrackProvider)?.uuidId, 'a');
+    expect(library.seekedItems, isEmpty, reason: 'same track, same position');
+    expect(focus.holder, AudioOutput.queue);
+    expect(previews.single.plays, 0);
     await teardownTree(tester);
   });
 

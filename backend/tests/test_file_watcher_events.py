@@ -197,13 +197,16 @@ def test_an_import_that_raises_is_logged_and_its_path_forgotten(make_watcher, ca
     watcher = make_watcher(on_file)
     path = _file(watcher.import_dir / "h.zip")
 
-    with caplog.at_level(logging.ERROR, logger="app.services.file_watcher"):
+    with caplog.at_level(logging.WARNING, logger="app.services.file_watcher"):
         watcher.dispatch(FileCreatedEvent(str(path)))
         _settle(watcher)
 
     assert path not in watcher.processed
-    assert any(str(path) in r.getMessage() for r in caplog.records)
-    assert "PermissionError" in caplog.text
+    # Logged by its name in the watched folder and the error's kind, never by
+    # its full path (the traceback, whose text may hold it, only at DEBUG).
+    messages = [r.getMessage() for r in caplog.records]
+    assert "import of h.zip raised PermissionError" in messages, messages
+    assert not any(str(path) in m for m in messages)
 
     watcher.dispatch(FileCreatedEvent(str(path)))  # dropped again: handled again
     _settle(watcher)
@@ -220,8 +223,7 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
     watcher = make_watcher(on_file)
     path = _file(watcher.import_dir / "i.flac")
     calls: list[int] = []
-    first_in, second_in, release = threading.Event(), threading.Event(), threading.Event()
-    attempted = threading.Event()
+    first_in, release, contended = threading.Event(), threading.Event(), threading.Event()
     entered: list[int] = []
 
     class _SlowMembership(set):
@@ -231,8 +233,6 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
             if len(calls) == 1:
                 first_in.set()
                 release.wait(5)  # hold the first check open until the second had its chance
-            else:
-                second_in.set()
             return found
 
     class _SpyLock:
@@ -241,9 +241,9 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
 
         def __enter__(self):
             entered.append(1)
-            if first_in.is_set():
-                attempted.set()  # the second submitter is now trying to enter
-            self._real.acquire()
+            if not self._real.acquire(blocking=False):
+                contended.set()  # someone holds the lock: this submitter now waits
+                self._real.acquire()
 
         def __exit__(self, *exc):
             self._real.release()
@@ -255,11 +255,10 @@ def test_two_threads_submitting_one_path_queue_it_once(make_watcher, monkeypatch
     assert first_in.wait(5)
     t2 = threading.Thread(target=watcher._submit_new, args=(path,))
     t2.start()
-    # Unset only if the product stopped taking the lock at all.
-    assert attempted.wait(5)
-    # Without the lock the second thread reaches the membership check within
-    # microseconds of attempting; with it, it stays blocked for this window.
-    second_in.wait(0.1)
+    # The second submitter finds the lock held while the first is inside its
+    # membership check: a condition, not a time window. Unset if the product
+    # takes no lock, or checks membership outside it.
+    assert contended.wait(5)
     release.set()
     for t in (t1, t2):
         t.join(5)

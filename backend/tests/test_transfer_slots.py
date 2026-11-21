@@ -49,7 +49,7 @@ def test_a_slot_is_given_back_exactly_once():
 
 def test_concurrent_takers_never_get_more_than_the_count():
     slots = TransferSlots(total=2)
-    start = threading.Barrier(16)
+    start = threading.Barrier(16, timeout=10)
     got = []
 
     def take(owner):
@@ -62,8 +62,9 @@ def test_concurrent_takers_never_get_more_than_the_count():
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=10)
 
+    assert not any(thread.is_alive() for thread in threads)
     assert len(got) == 2
     assert slots.in_use() == 2
 

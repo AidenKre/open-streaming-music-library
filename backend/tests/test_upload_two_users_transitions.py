@@ -54,9 +54,11 @@ def _cancel(db, music, mine):
 
 
 def _transition(db, music, mine):
-    return db.transition_upload_item(ITEM, owner_id=mine["owner_id"], from_states=("review_ready",),
-                                     to_state="failed", now=NOW,
-                                     fields={"error_code": "probe_failed"})[0]
+    # The central compare-and-swap itself, as every public transition calls it.
+    with db._connection(commit=True, immediate=True) as conn:
+        return db._transition_upload_item_in(
+            conn, owner_id=mine["owner_id"], item_uuid=ITEM, from_states=("review_ready",),
+            to_state="failed", now=NOW, fields={"error_code": "probe_failed"})
 
 
 def _expire(db, music, mine):

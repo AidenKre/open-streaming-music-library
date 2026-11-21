@@ -13,6 +13,7 @@ from app.services import track_source
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator
 from tests.pending_deletion import mark_pending_deletion
+from tests.track_removal import delete_track
 
 
 @pytest.fixture
@@ -88,7 +89,7 @@ def test_a_queued_prefetch_skips_a_tombstoned_track(client, tmp_path):
     calls: list[Path] = []
     c = _recording_coordinator(client, calls)
     uuid_id, _ = _add(client, tmp_path)
-    assert client.app.state.admin_library.delete_track(uuid_id)
+    assert delete_track(client.app.state.admin_library, uuid_id)
 
     c._prefetch_one(uuid_id, "128", None)
 
@@ -124,7 +125,7 @@ def test_the_owner_resolved_form_answers_only_for_live_tracks(client, tmp_path):
     pending, _ = _add(client, tmp_path, "pending.mp3")
     gone, _ = _add(client, tmp_path, "gone.mp3")
     mark_pending_deletion(_db_path(client), pending)
-    assert client.app.state.admin_library.delete_track(gone)
+    assert delete_track(client.app.state.admin_library, gone)
     admin = client.app.state.admin_user_id
 
     assert track_source.live_track_owner(database, live) == admin

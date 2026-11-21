@@ -2,7 +2,6 @@
 
 import errno
 import fcntl
-import logging
 import os
 from pathlib import Path
 
@@ -34,8 +33,9 @@ def acquire_instance_lock(app_data_dir: Path) -> InstanceLock:
     except OSError as exc:
         os.close(fd)
         if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-            message = f"Another instance holds {lock_path}; run with --workers 1"
-            logging.getLogger(__name__).error(message)
-            raise InstanceLockHeld(message) from exc
+            # The caller says it once: the server logs it, the admin tool prints its own line.
+            raise InstanceLockHeld(
+                f"Another instance holds {lock_path}; run with --workers 1"
+            ) from exc
         raise
     return InstanceLock(fd)

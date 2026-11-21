@@ -26,6 +26,7 @@ from app.library import Library
 from app.models import Track, TrackMetaData
 from tests.owned_database import OwnedTestDatabase, add_test_user
 from tests.schema_fixtures import INIT_SQL
+from tests.track_removal import delete_track, tombstone_uuids
 
 
 def _track(title, artist="Radiohead", album="OK Computer", n=1):
@@ -160,20 +161,20 @@ def test_a_file_path_lookup_sees_only_the_owners_track(users):
 def test_deleting_another_owners_track_is_a_no_op(users):
     theirs = users.tracks["sam"][0]
 
-    assert users.alex.delete_track(theirs) is False
+    assert delete_track(users.alex, theirs) is False
 
     assert users.sam.get_track_by_uuid(theirs) is not None
-    assert users.sam.get_track_tombstones() == []
-    assert users.alex.get_track_tombstones() == []
+    assert tombstone_uuids(users.sam) == []
+    assert tombstone_uuids(users.alex) == []
 
 
 def test_tombstones_are_per_owner(users):
     mine = users.tracks["sam"][0]
 
-    assert users.sam.delete_track(mine) is True
+    assert delete_track(users.sam, mine) is True
 
-    assert users.sam.get_track_tombstones() == [mine]
-    assert users.alex.get_track_tombstones() == []
+    assert tombstone_uuids(users.sam) == [mine]
+    assert tombstone_uuids(users.alex) == []
 
 
 def test_all_track_uuids_are_per_owner(users):
@@ -185,7 +186,7 @@ def test_all_track_uuids_are_per_owner(users):
 
 def test_the_change_stream_carries_only_the_owners_upserts_and_deletes(users):
     gone = users.tracks["alex"][0]
-    assert users.alex.delete_track(gone)
+    assert delete_track(users.alex, gone)
 
     sam_changes, _, _ = users.sam.get_changes(after_revision=0, limit=100)
     alex_changes, _, _ = users.alex.get_changes(after_revision=0, limit=100)
@@ -214,7 +215,7 @@ def test_latest_revision_is_the_owners_own(users):
     sam_latest = max(users.sam.get_track_by_uuid(u).revision for u in users.uuids("sam"))
     # alex writes after sam: the global counter moves past sam's rows.
     users.add("alex", _track("Newer", n=7))
-    users.alex.delete_track(users.tracks["alex"][0])
+    delete_track(users.alex, users.tracks["alex"][0])
 
     _, latest, _ = users.sam.get_changes(after_revision=0, limit=100)
 

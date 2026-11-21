@@ -104,6 +104,22 @@ void main() {
     expect(h.dup.deleteBlocked(h.row('a2|b2')), isFalse);
   });
 
+  // The session's deletion jobs cannot be read at all (their manager cannot
+  // be built): whether a copy is already on its way out is unknown, so
+  // Delete stays blocked, as when the server's list could not be read.
+  test('when the deletion jobs cannot be read at all, Delete is not '
+      'offered', () async {
+    await h.open(extra: [
+      deleteJobsManagerProvider.overrideWith(
+        (ref) => throw StateError('the scope is closed'),
+      ),
+    ]);
+    expect(h.dup.canDeleteCopy, isTrue);
+    expect(h.dup.deleteBlocked(h.row('a2|b2')), isTrue);
+    expect(h.dup.startDeleteCopy(h.row('a2|b2'), 'b2'), isNull);
+    expect(h.dup.deleteStatus(h.row('a2|b2')), isNull);
+  });
+
   test('a finished deletion elsewhere does not block anything', () async {
     jobs.api.serverJobs['op-old'] = deletionJobJson('op-old', [
       deletionItemJson('a1', baseRevision: 3, status: 'conflict',

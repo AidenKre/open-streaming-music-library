@@ -54,9 +54,10 @@ class WorkerPool {
   // immediate re-enqueue that callers like enqueueTracksAtQuality rely on.
   final Set<String> _fencedUuids = {};
 
-  /// Set by a 401 (signed out): [pump] schedules nothing. Not the offline
-  /// flag; nothing clears it, the scope rebuild after the next login drops
-  /// the pool.
+  /// Set by a 401: [pump] schedules nothing. Not the offline flag. Cleared
+  /// only by [resumeAfterBoundServerBack] (the 401 came from another server
+  /// at the address); after a real sign-out the scope rebuild after the next
+  /// login drops the pool.
   bool get authPaused => _authPaused;
 
   bool _authPaused = false;
@@ -71,6 +72,13 @@ class WorkerPool {
   void resumeAfterVerified() {
     _verifyPaused = false;
     pump();
+  }
+
+  /// The bound server is verified again after another server's 401: the
+  /// 401 pause ends too, and the queued jobs are scheduled.
+  void resumeAfterBoundServerBack() {
+    _authPaused = false;
+    resumeAfterVerified();
   }
 
   /// True iff [uuidId] is currently being fenced by [fenceUuid]. Workers
@@ -328,8 +336,8 @@ class WorkerPool {
             where: (j) => j.isActive,
           );
         case DownloadOutcomeKind.authRequired:
-          // Signed out: back to queued, and stop scheduling so the job
-          // can't hot-loop on 401s.
+          // A 401 (a sign-out, or another server at the address): back to
+          // queued, and stop scheduling so the job can't hot-loop on 401s.
           _queue.markJobByUuid(
             uuidId,
             (j) => j.withStatus(const Queued()),

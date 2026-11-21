@@ -635,12 +635,23 @@ class _PrefsClearResettable implements LocalResettable {
   Future<void> resetLocalState() async {
     final prefs = await _ref.read(sharedPreferencesProvider.future);
     // Everything but the pending-reset marker, which only a completed wipe
-    // removes (LocalResetService._wipe).
+    // removes (LocalResetService._wipe). A key that cannot be removed does
+    // not keep the rest: they go, and the step still fails (the marker
+    // stays, so the next launch tries again).
+    final failed = <String>[];
     for (final key in prefs.getKeys().toList()) {
       if (key == LocalResetService.resetPendingKey) continue;
-      if (!await prefs.remove(key)) {
-        throw StateError('preference "$key" could not be cleared');
+      try {
+        if (!await prefs.remove(key)) failed.add(key);
+      } catch (_) {
+        failed.add(key);
       }
+    }
+    if (failed.isNotEmpty) {
+      throw StateError(
+        'preferences ${failed.map((k) => '"$k"').join(', ')} '
+        'could not be cleared',
+      );
     }
   }
 }

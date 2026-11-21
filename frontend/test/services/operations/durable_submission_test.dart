@@ -19,6 +19,7 @@ import 'package:frontend/services/local_reset_service.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
 
 import '../../helpers/fake_clock.dart';
+import '../../helpers/run_async_until.dart';
 import '../../helpers/server_binding.dart';
 
 /// A frozen body with deliberate whitespace, key order and a float written
@@ -763,18 +764,21 @@ void main() {
         'instead of a second send', () async {
       await prepared();
       final response = Completer<Map<String, dynamic>>();
+      final sent = Completer<void>();
       var sends = 0;
       Future<SubmissionOutcome> tap() => submissions.submit(
         'op-1',
         send: (_) {
           sends++;
+          if (!sent.isCompleted) sent.complete();
           return response.future;
         },
         status: (_) async => const StatusAbsent(),
       );
 
       final first = tap();
-      await pumpEventQueue();
+      await withinTurns(sent.future,
+          reason: "the first tap's request is sent");
       final second = tap();
       response.completeError(NetworkException('lost', attemptsMade: 1));
 
@@ -1025,6 +1029,67 @@ void main() {
 
       await expectLater(outcome, throwsA(isA<SubmissionClosed>()));
       expect(sends, 0);
+      expect((await _rows(db)).single['state'], 'ambiguous');
+    });
+
+    test('a status query that never answers does not hold the quiesce; '
+        'the row stays as it was and nothing is sent', () async {
+      await prepared();
+      await submissions.submit(
+        'op-1',
+        send: (_) async => throw NetworkException('down', attemptsMade: 1),
+        status: _noStatus,
+      );
+      final queried = Completer<void>();
+      var sends = 0;
+      final outcome = submissions.submit(
+        'op-1',
+        send: (_) async {
+          sends++;
+          return const {};
+        },
+        status: (_) {
+          queried.complete();
+          return Completer<SubmissionStatus>().future; // never answers
+        },
+      );
+      await withinTurns(queried.future,
+          reason: 'the retry asks the server for the status');
+      final rowBefore = (await _rows(db)).single;
+
+      var quiesced = false;
+      unawaited(submissions.quiesce().then((_) => quiesced = true));
+      await pumpEventQueue();
+
+      expect(quiesced, isTrue,
+          reason: 'a sign-out or reset must not wait for a hung status read');
+      await withinTurns(expectLater(outcome, throwsA(isA<SubmissionClosed>())),
+          reason: 'the quiesce ends the submission waiting on the status');
+      expect(sends, 0);
+      expect((await _rows(db)).single, rowBefore);
+    });
+
+    test('a quiesce that starts before the status query goes out asks '
+        'nothing', () async {
+      await prepared();
+      await submissions.submit(
+        'op-1',
+        send: (_) async => throw NetworkException('down', attemptsMade: 1),
+        status: _noStatus,
+      );
+      var queries = 0;
+      final outcome = submissions.submit(
+        'op-1',
+        send: (_) async => const {},
+        status: (_) async {
+          queries++;
+          return const StatusAbsent();
+        },
+      );
+      await submissions.quiesce();
+
+      await expectLater(outcome, throwsA(isA<SubmissionClosed>()));
+      expect(queries, 0);
       expect((await _rows(db)).single['state'], 'ambiguous');
     });
 

@@ -282,6 +282,12 @@ void main() {
       final result = await repo.removeTrackUuidsFromQueues(const ['a', 'b']);
 
       expect(await currentUuid(id), isNull);
+      // The row itself, not only the read through the items: a pointer to the
+      // deleted item would also read as no current track.
+      final row = await (db.select(db.queueSessions)
+            ..where((s) => s.id.equals(id)))
+          .getSingle();
+      expect(row.currentItemId, isNull);
       expect(result.affectedSessionIds, {id});
       expect(result.endedSessionIds, isEmpty);
     });
@@ -1116,7 +1122,14 @@ void main() {
       final next = await repo.createSessionFromExplicitList(
           sourceType: 'search', trackUuids: const ['y'], activate: false);
       await repo.activateSession(next);
-      await repo.removeTrackUuidsFromQueues(const ['a']); // previous's current
+      // No current item (a removal would land on the next track instead).
+      await db.customStatement(
+          'UPDATE queue_sessions SET current_item_id = NULL WHERE id = ?',
+          [previous]);
+      final row = await (db.select(db.queueSessions)
+            ..where((s) => s.id.equals(previous)))
+          .getSingle();
+      expect(row.currentItemId, isNull, reason: 'precondition');
       await repo.activateSession(previous);
       expect((await repo.getActiveSession())?.id, previous);
     });
@@ -1373,18 +1386,26 @@ void main() {
       test('$name: sticky shuffle keeps the played part and the current '
           'track in place and shuffles only what follows', () async {
         await fixture.insertSingles(uuids);
+        // Seeded, so whether some run leaves the future in canonical order
+        // is fixed; a set alone would also pass with no shuffle at all.
+        final seeded = QueueRepository(db, random: Random(3));
+        final tails = <List<String>>[];
         for (var run = 0; run < 5; run++) {
-          final id = await create(repo, shuffle: true, activate: true);
+          final id = await create(seeded, shuffle: true, activate: true);
           final rows = await _orderRows(db, id);
           expect(rows.map((r) => r.$1), [0, 1, 2, 3, 4, 5]);
           expect(rows.take(3).map((r) => r.$3), ['a', 'b', 'c']);
-          expect(rows.skip(3).map((r) => r.$3).toSet(), {'d', 'e', 'f'});
+          final tail = [for (final r in rows.skip(3)) r.$3];
+          expect(tail.toSet(), {'d', 'e', 'f'});
+          tails.add(tail);
           final snapshot = (await repo.getSessionSnapshot(id))!;
           expect(snapshot.currentItem?.uuidId, 'c');
           expect(snapshot.currentItem?.playPosition, 2);
           expect(snapshot.session.shuffleEnabled, isTrue);
           expect(snapshot.session.isActive, isTrue);
         }
+        expect(tails.any((t) => t.join() != 'def'), isTrue,
+            reason: 'what follows the current track is shuffled');
       });
 
       test('$name: without shuffle the play order is canonical', () async {

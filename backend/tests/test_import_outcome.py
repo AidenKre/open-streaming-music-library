@@ -78,18 +78,18 @@ def _library_files(tmp):
     return sorted(p for p in root.rglob("*") if p.is_file()) if root.exists() else []
 
 
-def test_the_classes_are_disjoint_and_cover_every_failure():
-    for outcome in ImportOutcome:
-        assert not (outcome.belongs_to_file and outcome.environmental), outcome
+def test_only_the_files_own_reasons_belong_to_the_file():
+    """An archive is set aside only for a member refused for its own reasons;
+    an environmental failure keeps it for a retry."""
     assert {o for o in ImportOutcome if o.belongs_to_file} == FILES_OWN
-    assert {o for o in ImportOutcome if o.environmental} == ENVIRONMENTAL
+    for outcome in ENVIRONMENTAL:
+        assert not outcome.belongs_to_file, outcome
     assert not ImportOutcome.IMPORTED.belongs_to_file
-    assert not ImportOutcome.IMPORTED.environmental
     # REFUSED is an archive's outcome, never a member's: the archive stays in
     # place (not set aside like a member's own refusal, not retried like an
     # environmental one).
     for abandoned in (ImportOutcome.CHANGED, ImportOutcome.STOPPED, ImportOutcome.REFUSED):
-        assert not abandoned.belongs_to_file and not abandoned.environmental
+        assert not abandoned.belongs_to_file
 
 
 def test_an_imported_file_says_so(env):
@@ -132,7 +132,7 @@ def test_add_track_giving_up_on_a_locked_database_is_environmental(env):
         outcome = organizer.organize(source)
 
     assert outcome is ImportOutcome.DATABASE_ERROR
-    assert outcome.environmental
+    assert not outcome.belongs_to_file
     # Rolled back: the file is where it was and nothing is left in the library.
     assert source.read_bytes() == b"audio"
     assert _library_files(tmp) == []
@@ -154,17 +154,10 @@ def test_a_rename_refused_across_mounts_is_environmental(env, monkeypatch):
         outcome = organizer.organize(source)
 
     assert outcome is ImportOutcome.MOVE_FAILED
-    assert outcome.environmental
+    assert not outcome.belongs_to_file
     assert source.read_bytes() == b"audio"
     assert _library_files(tmp) == []
     assert db.get_tracks(owner_id=sam) == []
-
-
-def test_organize_file_stays_a_boolean(env):
-    _, _, organizer, tmp = env
-    with _tags():
-        assert organizer.organize_file(_source(tmp)) is True
-        assert organizer.organize_file(_source(tmp)) is False
 
 
 def test_a_file_that_changes_after_it_was_read_is_left_untouched(tmp_path):

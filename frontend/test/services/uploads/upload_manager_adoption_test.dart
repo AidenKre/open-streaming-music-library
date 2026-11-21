@@ -477,6 +477,78 @@ void main() {
       expect((await row('u-2'))!['last_state'], 'cancelled');
       expect((await overviewRow()).offersChildren, isFalse);
     });
+
+    // The server lists no batch u-1: it forgot it (retention).
+    void forgotten() {
+      h.api.onListBatches = (after) async =>
+          UploadBatchPage.fromJson({'batches': [], 'next_after': null});
+      h.api.onGetBatch = (batch) async =>
+          throw apiError(404, 'upload_batch_not_found', retryable: false);
+    }
+
+    const forgottenText =
+        'The server no longer has a record of this upload. Check your '
+        "library, and add the file again if it isn't there.";
+
+    test('a failed row whose batch the server forgot ends as expired, '
+        'without Retry', () async {
+      await local('failed');
+      forgotten();
+      await enter();
+
+      expect(h.api.calls, contains('getBatch u-1'));
+      final after = await row('u-2');
+      expect(after!['last_state'], 'expired');
+      expect(after['last_error_code'], 'upload_batch_not_found');
+      final shown = await overviewRow();
+      expect(shown.statusText, 'Expired');
+      expect(shown.detailText, forgottenText);
+      expect(shown.offersRetry, isFalse);
+    });
+
+    // An unpacked archive is finished on the server: its row stays as it is
+    // (what it should show once its file list is gone is not decided).
+    test('an unpacked archive whose batch the server forgot keeps its state, '
+        'and its batch is not read', () async {
+      await local('expanded');
+      forgotten();
+      await enter();
+
+      expect(h.api.calls.where((c) => c.startsWith('getBatch')), isEmpty);
+      final after = await row('u-2');
+      expect(after!['last_state'], 'expanded');
+      expect(after['last_error_code'], isNull);
+    });
+
+    test('a batch missing from the listing that the server still has, or '
+        'whose read fails, leaves the row as it is', () async {
+      await local('failed');
+      forgotten();
+      h.api.onGetBatch = (batch) async =>
+          UploadBatch.fromJson(batchJson(batch));
+      await enter();
+      expect((await row('u-2'))!['last_state'], 'failed');
+
+      h.api.onGetBatch = (batch) async =>
+          throw apiError(503, 'server_busy', retryable: true);
+      visible.value = false;
+      await enter();
+      expect((await row('u-2'))!['last_state'], 'failed');
+      expect((await row('u-2'))!['last_error_code'], 'probe_timeout');
+      // The failed check does not fail the listing: it is not listed again
+      // until the next page entry.
+      final listings = h.api.calls.where((c) => c == 'listBatches').length;
+      h.manager.request('again', bypassBackoff: true);
+      await h.pump();
+      expect(h.api.calls.where((c) => c == 'listBatches'), hasLength(listings));
+    });
+
+    test('a listed batch is not read again on its own', () async {
+      await local('failed');
+      listed('failed');
+      await enter();
+      expect(h.api.calls.where((c) => c.startsWith('getBatch')), isEmpty);
+    });
   });
 
   // 7-R2-02: a sign-out rotates the binding and keeps the rows; a sign-in as

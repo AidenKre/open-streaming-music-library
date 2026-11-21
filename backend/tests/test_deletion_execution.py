@@ -37,6 +37,7 @@ from tests.deletion_world import (
 )
 from tests.pending_deletion import mark_pending_deletion
 from tests.track_paths import set_track_path
+from tests.track_removal import delete_track
 
 UNKNOWN = "eeeeeeee-0000-4000-8000-00000000000e"
 
@@ -101,7 +102,7 @@ def test_the_lock_is_released_after_a_target(world):
 def test_an_own_tombstone_is_already_deleted_with_its_revision_and_no_bump(world):
     uuid_id = add_master(world, "Radiohead/OK Computer/01 Lucky.flac")
     rev = revision(world, uuid_id)
-    assert world.db.delete_track(uuid_id, owner_id=world.owner)
+    assert delete_track(world.db, uuid_id, owner_id=world.owner)
     tomb_rev = tombstone(world, uuid_id)[0]
     op = accept_job(world, (uuid_id, rev))
     before_counter = counter(world)
@@ -145,7 +146,7 @@ def test_another_users_live_track_is_not_found_and_untouched(world):
 
 def test_another_users_tombstone_is_not_found_like_an_unknown_uuid(world):
     theirs = add_master(world, "Radiohead/OK Computer/01 Lucky.flac", owner=world.sam)
-    assert world.db.delete_track(theirs, owner_id=world.sam)
+    assert delete_track(world.db, theirs, owner_id=world.sam)
     op = accept_job(world, (theirs, 1))
     before_counter = counter(world)
 

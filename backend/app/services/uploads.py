@@ -20,6 +20,7 @@ from app.core.keyset_cursor import (
     invalid_cursor,
     page_rows,
 )
+from app.core.upload_states import STAGED_MATCH_STATES
 from app.database.database import UploadItemsInUse
 from app.services.duplicate_detection import TrackRef
 from app.services.path_sanitize import assert_within
@@ -117,12 +118,6 @@ def _conflict_matches(library, row: dict) -> list[DuplicateMatchOut] | None:
         return None
 
 
-# A staged match is live only in the states the validation worker compares
-# against; once its upload ended (cancelled, expired, imported, failed...)
-# nothing can be published from it, so it reads like a gone one.
-_LIVE_STAGED_MATCH_STATES = ("review_ready", "committing", "duplicate_conflict")
-
-
 def _build_check(library, report) -> DuplicateCheckOut:
     matches = []
     for m in report.matches:
@@ -132,7 +127,12 @@ def _build_check(library, report) -> DuplicateCheckOut:
             matches.append(_library_track_match(library, m.subject.uuid_id, **base))
         else:
             item = library.get_upload_item(m.subject.item_uuid)
-            if item is not None and item["state"] not in _LIVE_STAGED_MATCH_STATES:
+            if item is not None and item["state"] == "imported":
+                # The matched upload has become a track in the library since:
+                # the duplicate now lives there, so report that track.
+                matches.append(_library_track_match(library, item["result_track_uuid"], **base))
+                continue
+            if item is not None and item["state"] not in STAGED_MATCH_STATES:
                 item = None
             summary = None
             if item is not None:

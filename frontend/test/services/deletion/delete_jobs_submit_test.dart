@@ -188,6 +188,46 @@ void main() {
     });
   });
 
+  // A stored request this app cannot read back (a damaged row) does not
+  // stop the pass: its job shows with no known tracks, it is sent as
+  // stored (the server's answer settles it), and the rows after it are
+  // sent too.
+  test('a stored request that cannot be read is sent as stored and does not '
+      'stop the other submissions', () async {
+    final store = DurableSubmission(db: h.db, binding: h.binding, clock: h.clock);
+    const damaged = '{"operation_uuid":"op-bad","targets":[{"uuid_id":7}],'
+        '"confirmed_count":1}';
+    await store.prepare(
+      kind: 'track_deletion',
+      operationUuid: 'op-bad',
+      frozenBodyJson: damaged,
+      bindingToken: h.token,
+    );
+    h.clock.advance(const Duration(milliseconds: 10));
+    await store.prepare(
+      kind: 'track_deletion',
+      operationUuid: 'op-good',
+      frozenBodyJson:
+          '{"operation_uuid":"op-good","targets":[{"uuid_id":"a",'
+          '"base_revision":1}],"confirmed_count":1}',
+      bindingToken: h.token,
+    );
+    await h.manager.quiesce();
+    final accept = h.api.onCreateJob;
+    h.api.onCreateJob = (body) async => body == damaged
+        ? throw apiError(422, 'invalid', retryable: false)
+        : accept(body);
+    h.manager = h.build();
+    h.manager.request('coldStart');
+    await h.pump();
+
+    expect(h.api.createBodies, contains(damaged));
+    expect(h.job('op-bad')!.phase, DeleteJobPhase.rejected);
+    expect(h.job('op-bad')!.targets, isEmpty);
+    expect(h.job('op-good')!.phase, DeleteJobPhase.accepted);
+    expect(h.job('op-good')!.targets.single.uuidId, 'a');
+  });
+
   // Deletion history orders a job the server has not dated by when this
   // device submitted it: the time stored with the submission.
   group('the time this device submitted the job', () {

@@ -1,3 +1,5 @@
+import 'package:frontend/services/server_binding_gate.dart';
+
 /// What kind of "the app can catch up now" edge triggered a recovery run.
 ///
 /// A subsystem registers for the subset of edges it actually cares about, so
@@ -14,7 +16,21 @@ enum RecoveryTrigger {
   /// Local-only mode just cleared — the backend is reachable again
   /// (`offlineModeProvider` went `true → false`).
   networkRecovered,
+
+  /// The bound server is verified again, with the session still signed in,
+  /// after a different-server block or a 401 that did not sign it out
+  /// (another server's, or one whose sender could not be read): work that
+  /// 401 parked resumes in this scope (a real sign-out never verifies again,
+  /// so it never fires this).
+  boundServerBack,
 }
+
+/// Whether a member reopens work a 401 parked: only for
+/// [RecoveryTrigger.boundServerBack], and only while [gate] is still
+/// verified (a real sign-out between the edge and the member's turn keeps
+/// it parked).
+bool resumesParkedWork(RecoveryTrigger trigger, ServerBindingGate gate) =>
+    trigger == RecoveryTrigger.boundServerBack && gate.isVerifiedNow;
 
 /// Contract for any subsystem with "catch up after a gap" work — sync,
 /// resume paused downloads, reconcile local files against the DB.

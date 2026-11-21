@@ -166,6 +166,17 @@ void main() {
       c.dispose();
     });
 
+    test('an item this device has no record of: said so, no Try again',
+        () async {
+      manager.error = const UploadIntentMissing();
+      final c = create();
+      await c.retry('i');
+      expect(c.notice?.title,
+          "This file isn't in this device's list of uploads, so nothing "
+          'was sent.');
+      c.dispose();
+    });
+
     test('a failure is explained, never thrown', () async {
       manager.error = NetworkException('lost', attemptsMade: 1);
       final c = create();

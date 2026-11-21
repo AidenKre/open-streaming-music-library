@@ -209,7 +209,8 @@ class _FrontendAppState extends State<FrontendApp> {
         ),
         credentialStoreProvider.overrideWithValue(widget.credentialStore),
         onSessionChangedProvider.overrideWithValue(_onSessionChanged),
-        // A 401 signs this scope out (spec 7.7): memory only.
+        // A 401 (spec 7.7): signed out if the bound server sent it, the
+        // different-server block if another server did. Memory only.
         onUnauthorizedProvider.overrideWith(
           (ref) => ref.read(sessionServiceProvider).onUnauthorized,
         ),

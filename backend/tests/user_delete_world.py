@@ -16,6 +16,7 @@ from app.library import Library
 from app.models.history import HistoryEvent
 from tests.auth_helpers import create_session
 from tests.cli_fixtures import ADMIN, add_track, add_user, open_server_database, sql
+from tests.track_removal import delete_track
 
 # Per-user rows, written independently of the production delete code.
 USER_ROWS = {
@@ -209,7 +210,7 @@ def build_world(settings) -> World:
     revision = lib.get_track_by_uuid(zebra.uuid_id).revision
     lib.apply_track_metadata_edit(zebra.uuid_id, {"title": "Renamedtitle"}, revision)
     _deletion_rows(world, world.sam, gone.uuid_id)
-    assert lib.delete_track(gone.uuid_id)  # leaves a tombstone
+    assert delete_track(lib, gone.uuid_id)  # leaves a tombstone
     world.sam_uuids = [lucky.uuid_id, zebra.uuid_id]
     _candidate_pair(world, world.sam, world.sam_uuids)
     _per_user_rows(world, world.sam, lucky.uuid_id, "sam")
@@ -223,7 +224,7 @@ def build_world(settings) -> World:
     a_gone = add_track(db, settings, world.alex, title="Alexgone", album="Amnesiac",
                        track_number=9)
     _deletion_rows(world, world.alex, a_gone.uuid_id)
-    assert Library(db, world.alex).delete_track(a_gone.uuid_id)
+    assert delete_track(Library(db, world.alex), a_gone.uuid_id)
     a_gone.file_path.unlink()  # delete_track removes rows only
     world.alex_uuids = [a_lucky.uuid_id, a_kid.uuid_id]
     _candidate_pair(world, world.alex, world.alex_uuids)

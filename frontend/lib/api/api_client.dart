@@ -230,22 +230,30 @@ class ApiClient {
   final String baseUrl;
   final http.Client _http;
 
+  /// A client on the same URL over [transport], with this client's test
+  /// seams; its network failures reach THIS client's listeners, so there is
+  /// one offline path. The one place a derived client is built.
+  ApiClient _sibling(http.Client transport) {
+    final sibling = ApiClient(baseUrl, transport);
+    sibling._delay = _delay;
+    sibling._random = _random;
+    sibling._perAttemptTimeoutOverride = _perAttemptTimeoutOverride;
+    sibling._logSink = _logSink;
+    sibling.addNetworkFailureListener(_fireNetworkFailure);
+    return sibling;
+  }
+
   /// A client on the same URL and transport that never carries the token (an
   /// [AuthenticatedClient]'s shared inner client is used bare) and has no 401
   /// hook, for public paths. Its network failures reach THIS client's
-  /// listeners, so there is one offline path. Holds nothing to dispose.
+  /// listeners, so there is one offline path. Holds nothing to dispose. Any
+  /// other transport is used as it is: only [AuthenticatedClient] adds a
+  /// token.
   ApiClient withoutToken() {
     final transport = _http;
-    final bare = ApiClient(
-      baseUrl,
+    return _sibling(
       transport is AuthenticatedClient ? transport.withoutToken() : transport,
     );
-    bare._delay = _delay;
-    bare._random = _random;
-    bare._perAttemptTimeoutOverride = _perAttemptTimeoutOverride;
-    bare._logSink = _logSink;
-    bare.addNetworkFailureListener(_fireNetworkFailure);
-    return bare;
   }
 
   /// A sibling client (same URL, same transport, token kept) that runs
@@ -280,16 +288,8 @@ class ApiClient {
   ///
   /// Any new transport method added to [ApiClient] (e.g. a streamed PUT) must
   /// run [_checkStamp] too.
-  ApiClient withInstanceCheck(InstanceStampCheck check) {
-    final sibling = ApiClient(baseUrl, _http);
-    sibling._delay = _delay;
-    sibling._random = _random;
-    sibling._perAttemptTimeoutOverride = _perAttemptTimeoutOverride;
-    sibling._logSink = _logSink;
-    sibling._instanceCheck = check;
-    sibling.addNetworkFailureListener(_fireNetworkFailure);
-    return sibling;
-  }
+  ApiClient withInstanceCheck(InstanceStampCheck check) =>
+      _sibling(_http).._instanceCheck = check;
 
   InstanceStampCheck? _instanceCheck;
 
@@ -300,16 +300,7 @@ class ApiClient {
   ApiClient? revokeOnceClient() {
     final transport = _http;
     if (transport is! AuthenticatedClient) return null;
-    final once = ApiClient(
-      baseUrl,
-      transport.revokeExemption(_buildUri(['auth', 'logout'])),
-    );
-    once._delay = _delay;
-    once._random = _random;
-    once._perAttemptTimeoutOverride = _perAttemptTimeoutOverride;
-    once._logSink = _logSink;
-    once.addNetworkFailureListener(_fireNetworkFailure);
-    return once;
+    return _sibling(transport.revokeExemption(_buildUri(['auth', 'logout'])));
   }
 
   /// The one place the stamp rule runs: no check or no stamp, nothing happens;

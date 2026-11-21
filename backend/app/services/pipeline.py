@@ -79,6 +79,7 @@ def make_pipeline(
             folder_tracks=lambda folder: database.track_identities_in_folder(
                 str(folder), owner_id=ANY_OWNER
             ),
+            owner_id=user["id"],
         )
     )
     workspace = workspace_root / f"u{user['id']}"

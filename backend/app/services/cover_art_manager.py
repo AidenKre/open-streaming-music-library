@@ -8,6 +8,7 @@ from threading import Lock
 import imagehash
 from PIL import Image, UnidentifiedImageError
 
+from app.core.operator_log import operator_logger
 from app.database import ANY_OWNER
 from app.database.database import Database
 from app.services.metadata import extract_cover_art_bytes
@@ -153,16 +154,22 @@ class CoverArtManager:
             return
 
         total = len(tracks)
-        print(f"Backfilling cover art for {total} tracks...")
+        operator_logger.info("Backfilling cover art for %d tracks...", total)
 
         for i, track in enumerate(tracks, 1):
             if not track.file_path.exists():
-                print(f"  [{i}/{total}] Skipping {track.file_path} (file not found)")
+                operator_logger.warning(
+                    "  [%d/%d] Skipping track %s (file not found)",
+                    i, total, track.uuid_id,
+                )
                 continue
 
             art_bytes = extract_cover_art_bytes(track.file_path)
             if not art_bytes:
-                print(f"  [{i}/{total}] No art extracted from {track.file_path}")
+                operator_logger.warning(
+                    "  [%d/%d] No art extracted for track %s",
+                    i, total, track.uuid_id,
+                )
                 continue
 
             try:
@@ -172,19 +179,31 @@ class CoverArtManager:
                     track.uuid_id, cover_art_id, owner_id=track.owner_id
                 )
                 if updated:
-                    print(f"  [{i}/{total}] Updated {track.uuid_id} -> cover_art_id={cover_art_id}")
+                    operator_logger.debug(
+                        "  [%d/%d] Updated %s -> cover_art_id=%s",
+                        i, total, track.uuid_id, cover_art_id,
+                    )
                 else:
-                    print(f"  [{i}/{total}] Failed to update DB for {track.uuid_id}")
+                    operator_logger.warning(
+                        "  [%d/%d] Failed to update DB for %s",
+                        i, total, track.uuid_id,
+                    )
                     if result.was_created:
                         # Art created for this track only: release it, not an orphan.
                         try:
                             self.release_if_unreferenced(cover_art_id)
                         except (ValueError, OSError) as e:
-                            print(f"  [{i}/{total}] Could not release cover_art_id={cover_art_id}: {type(e).__name__}")
+                            operator_logger.warning(
+                                "  [%d/%d] Could not release cover_art_id=%s: %s",
+                                i, total, cover_art_id, type(e).__name__,
+                            )
             except ValueError as e:
-                print(f"  [{i}/{total}] Invalid art in {track.file_path}: {e}")
+                operator_logger.warning(
+                    "  [%d/%d] Invalid art in track %s: %s",
+                    i, total, track.uuid_id, e,
+                )
 
-        print("Cover art backfill complete.")
+        operator_logger.info("Cover art backfill complete.")
 
     def _find_candidate_by_phash(
         self,

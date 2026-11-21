@@ -920,16 +920,21 @@ void main() {
 
     test('SQLITE_CORRUPT_VTAB from a search-table statement takes the '
         'fallback', () async {
+      final recorder = _FtsRecorder();
       final db = _ThrowingSearchDb(SqliteException(
           267, 'database disk image is malformed', null,
-          "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) VALUES('delete', ?, ?, ?, ?)"));
-      h = _Harness(db);
+          "INSERT INTO fts_tracks(fts_tracks, rowid, title, artist_name, album_name) VALUES('delete', ?, ?, ?, ?)"),
+          NativeDatabase.memory().interceptWith(recorder));
+      h = _Harness._recorded(db, recorder);
       await h.init();
       addTearDown(h.db.close);
+      recorder.reset();
       h.serve([
         [_Up(t1)],
       ]);
       await h.service().syncChanges();
+      expect(recorder.fullTrackRebuilds, 1,
+          reason: 'the fallback is the full rebuild, not a retry of the page');
       expect(await cursor(h.db), h.revision);
       expect(await _trackHits(h.db, 'blue'), ['t1']);
     });
@@ -973,7 +978,8 @@ Future<void> _writeUnindexed(AppDatabase db, List<_T> tracks) async {
 /// The real database, except that a page's search update throws [error]
 /// (once) before doing anything.
 class _ThrowingSearchDb extends AppDatabase {
-  _ThrowingSearchDb(this.error) : super(NativeDatabase.memory());
+  _ThrowingSearchDb(this.error, [QueryExecutor? executor])
+      : super(executor ?? NativeDatabase.memory());
 
   Object? error;
 

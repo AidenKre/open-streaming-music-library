@@ -37,18 +37,6 @@ class _SwapClient extends BaseClient {
   Future<StreamedResponse> send(BaseRequest request) => inner.send(request);
 }
 
-/// An offline flag the test flips (8-R1-12).
-class _ToggleOffline extends OfflineModeNotifier {
-  _ToggleOffline(this._initial);
-
-  final bool _initial;
-
-  @override
-  bool build() => _initial;
-
-  void setOffline(bool value) => state = value;
-}
-
 Future<int> _playOrderCount(AppDatabase db, int sessionId) async {
   final row = await db
       .customSelect(
@@ -237,7 +225,7 @@ void main() {
     bool offline = false,
     LocalCoverArtStore? localCoverArtStore,
     Directory? downloadDirectory,
-    _ToggleOffline? toggleOffline,
+    TestOffline? toggleOffline,
   }) {
     container = ProviderContainer(
       overrides: [
@@ -529,7 +517,6 @@ void main() {
         'http://localhost:8000',
         MockClient((req) async {
           callCount++;
-          await Future<void>.delayed(const Duration(milliseconds: 50));
           return _changesResponse([_upsert(1, _trackJson('uuid-1'))]);
         }),
       );
@@ -538,6 +525,7 @@ void main() {
       await waitForBuild(c);
       final notifier = c.read(trackSyncProvider.notifier);
 
+      // Both calls are made before either has awaited anything.
       final f1 = notifier.sync();
       final f2 = notifier.sync();
       await Future.wait([f1, f2]);
@@ -1220,7 +1208,7 @@ void main() {
               _upsert(2, _trackJson('uuid-drop')),
             ])),
       );
-      final offline = _ToggleOffline(false);
+      final offline = TestOffline(false);
       final c = createContainer(
           downloadDirectory: tempDir, toggleOffline: offline);
       await waitForBuild(c);
@@ -1249,7 +1237,7 @@ void main() {
           return _changesResponse([_delete(3, 'uuid-drop')]);
         }),
       );
-      offline.setOffline(true);
+      offline.set(true);
       await notifier.sync();
 
       expect(requests, 0);
@@ -1261,7 +1249,7 @@ void main() {
               .map((e) => e.uuidId),
           ['uuid-keep', 'uuid-drop']);
 
-      offline.setOffline(false);
+      offline.set(false);
       await notifier.sync();
 
       expect(requests, 1);
@@ -2177,7 +2165,7 @@ void main() {
         freshDone = true;
         return ok;
       });
-      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await pumpEventQueue();
       expect(freshDone, isFalse, reason: 'must wait for the in-flight pull');
       expect(call, 1, reason: 'no overlapping pull was started');
 
@@ -2255,7 +2243,8 @@ void main() {
           call++;
           inFlight++;
           maxInFlight = inFlight > maxInFlight ? inFlight : maxInFlight;
-          await Future<void>.delayed(const Duration(milliseconds: 10));
+          // Held across several turns, so an overlapping pull would start.
+          await pumpEventQueue();
           inFlight--;
           return _changesResponse(const []);
         }),

@@ -365,6 +365,15 @@ void main() {
             'name org.freedesktop.secrets was not provided by any .service '
             'files',
       ),
+      // Matched on the D-Bus error name with the Secret Service's own name,
+      // not on dbus-daemon's sentence: dbus-broker (Fedora, Arch) words it
+      // differently. (This wording is a made-up example, not a quote.)
+      'Linux: ServiceUnknown for the Secret Service in another wording':
+          PlatformException(
+        code: 'Libsecret error',
+        message: 'GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The '
+            'name org.freedesktop.secrets is not activatable',
+      ),
       'no secure-storage plugin on this platform':
           MissingPluginException('No implementation found for method read'),
     };
@@ -395,6 +404,28 @@ void main() {
         code: 'Libsecret error',
         message: 'GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The '
             'name :1.42 was not provided by any .service files',
+      ),
+      'Linux: ServiceUnknown for another bus name, quoted': PlatformException(
+        code: 'Libsecret error',
+        message: 'GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The '
+            "name ':1.42' was not provided by any .service files",
+      ),
+      // The keyring is there; only its prompter is missing.
+      'Linux: ServiceUnknown for the keyring\'s prompter': PlatformException(
+        code: 'Libsecret error',
+        message: 'GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The '
+            'name org.gnome.keyring.SystemPrompter was not provided by any '
+            '.service files',
+      ),
+      'Linux: ServiceUnknown naming no service': PlatformException(
+        code: 'Libsecret error',
+        message: 'GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The '
+            'name is not activatable',
+      ),
+      'Linux: another D-Bus error from the Secret Service': PlatformException(
+        code: 'Libsecret error',
+        message: 'GDBus.Error:org.freedesktop.DBus.Error.NoReply: Did not '
+            'receive a reply',
       ),
       'an error of unknown shape': StateError('something else'),
     };

@@ -37,6 +37,12 @@ abstract interface class QueueListControls implements Listenable {
   /// with no error, or when it came from an initial or visible load.
   QueuePage? get failedPage;
 
+  /// Whether [error] came from a re-read of the rows on screen
+  /// ([reloadVisible]): the rows shown are the old ones, and Retry reads them
+  /// again in place. False with no error, and for a failed initial load or
+  /// page read.
+  bool get failedVisibleReload;
+
   /// Set after an initial load: the view should centre the current item.
   bool get shouldScrollToCurrent;
   void scrolledToCurrent();
@@ -123,6 +129,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
   bool _shouldScrollToCurrent = false;
   Object? _error;
   QueuePage? _errorPage;
+  bool _errorFromVisibleReload = false;
   (int, int, int, int)? _failedInitialLoad;
   bool _disposed = false;
 
@@ -171,6 +178,8 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
   Object? get error => _error;
   @override
   QueuePage? get failedPage => _error == null ? null : _errorPage;
+  @override
+  bool get failedVisibleReload => _error != null && _errorFromVisibleReload;
   @override
   bool get shouldScrollToCurrent => _shouldScrollToCurrent;
   @override
@@ -288,6 +297,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       }
       _error = error;
       _errorPage = null;
+      _errorFromVisibleReload = false;
       _failedInitialLoad =
           (sessionId, expectedQueueVersion, currentPlayPosition, totalCount);
       _isInitialLoad = false;
@@ -359,6 +369,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       }
       _error = error;
       _errorPage = null;
+      _errorFromVisibleReload = true;
       _isViewportReload = false;
       _notify();
       return null;
@@ -405,6 +416,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       if (generation != _loadGeneration) return 0; // superseded
       _error = error;
       _errorPage = QueuePage.before;
+      _errorFromVisibleReload = false;
       _notify();
       return 0;
     }
@@ -449,6 +461,7 @@ class QueueListController extends ChangeNotifier implements QueueListControls {
       if (generation != _loadGeneration) return; // superseded
       _error = error;
       _errorPage = QueuePage.after;
+      _errorFromVisibleReload = false;
       _notify();
     }
   }

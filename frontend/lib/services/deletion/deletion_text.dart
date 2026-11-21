@@ -32,9 +32,9 @@ String deleteItemOutcomeText(DeleteJobItem item) => switch (item.status) {
   DeleteItemStatus.pending => 'Waiting to be deleted',
   DeleteItemStatus.running => 'Deleting',
   DeleteItemStatus.deleted =>
-    item.details.contains('storage_cleanup_pending')
+    item.storageCleanupPending
         ? 'Deleted; storage cleanup pending'
-        : item.details.contains('master_missing')
+        : item.masterMissing
         ? 'Deleted; the file was already missing'
         : 'Deleted',
   DeleteItemStatus.alreadyDeleted => 'Already deleted',
@@ -71,6 +71,7 @@ String jobPhaseText(DeleteJobPhase phase) => switch (phase) {
   DeleteJobPhase.completed => 'Deleted',
   DeleteJobPhase.partial => 'Some tracks were not deleted',
   DeleteJobPhase.failed => 'Nothing was deleted',
+  DeleteJobPhase.unknown => 'Status unknown',
 };
 
 /// Why the server refused a request (or could not run it). Never echoes

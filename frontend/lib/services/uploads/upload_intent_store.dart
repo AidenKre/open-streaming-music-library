@@ -251,12 +251,14 @@ class UploadIntentStore {
   /// are never written, and an `on_other_device` row is not flipped back by a
   /// read that still waits for bytes (allocated, receiving, transferring).
   /// Over a reviewable row only an ended state (imported, duplicate,
-  /// cancelled, expired) is mirrored, never one reviewable state over the
-  /// other (reads are not ordered against local writes). A `failed` row
-  /// takes any other state that does not wait for bytes (a retry, cancel or
-  /// expiry done elsewhere), never one that does: this device writes
-  /// `failed` over a refused send the server still waits for. An unpacked
-  /// archive (`expanded`) takes only an ended state.
+  /// cancelled, expired) or `failed` is mirrored, never one reviewable state
+  /// over the other (reads are not ordered against local writes). A `failed`
+  /// row takes any other state that does not wait for bytes (a retry, cancel
+  /// or expiry done elsewhere), never one that does: this device writes
+  /// `failed` over a refused send the server still waits for. Between
+  /// `failed` and a reviewable state the read that lands last wins, so a
+  /// late read (also one that began before a retry) is taken back by the
+  /// next read. An unpacked archive (`expanded`) takes only an ended state.
   Future<void> mirrorReviewStates(
     String bindingToken,
     List<UploadItem> items,
@@ -267,7 +269,8 @@ class UploadIntentStore {
         item.rawState,
       );
       final from = {
-        if (ended) ...reviewableStates,
+        if (ended || item.rawState == ServerItemState.failed)
+          ...reviewableStates,
         if (ended) ServerItemState.expanded,
         if (!waitsForBytes) ...{
           UploadIntentState.onOtherDevice,

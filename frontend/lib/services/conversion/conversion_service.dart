@@ -283,6 +283,8 @@ String conversionErrorMessage(Object error) {
     case 409:
       return switch (error.errorCode) {
         'job_active' => 'A conversion for this track is already in progress.',
+        'target_exists' when error.details?['taken_by'] == 'track' =>
+          "Another track is recorded at the converted file's location.",
         'target_exists' =>
           "A file already exists at the converted file's location.",
         'pending_recovery' => _pendingRecoveryMessage(error),

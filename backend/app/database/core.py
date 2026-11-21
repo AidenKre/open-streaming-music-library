@@ -631,12 +631,13 @@ class DatabaseCore:
         )
         self._assert_parents_owned(conn, owner_id, artist_id, album_id)
 
-        # Clear any stale tombstone so a re-added uuid is not also
+        # Clear the owner's own stale tombstone so a re-added uuid is not also
         # streamed as a delete; the fresh row's higher revision would
         # supersede it anyway, but dropping it keeps the stream clean.
+        # Never another user's tombstone: that one is theirs.
         conn.execute(
-            "DELETE FROM track_tombstones WHERE uuid_id = ?",
-            (track.uuid_id,),
+            "DELETE FROM track_tombstones WHERE uuid_id = ? AND owner_id = ?",
+            (track.uuid_id, owner_id),
         )
 
         # Insert track with a freshly allocated monotonic revision.

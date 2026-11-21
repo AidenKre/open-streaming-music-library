@@ -19,6 +19,7 @@ from app.services import track_source
 from app.services.encoder_coordinator import EncoderCoordinator
 from tests.pending_deletion import mark_pending_deletion
 from tests.sqlite_helpers import sql_rows
+from tests.track_removal import delete_track
 
 UNKNOWN = "00000000-0000-4000-8000-000000000000"
 
@@ -132,7 +133,7 @@ def test_a_pending_track_answers_410_and_opens_nothing(client, tmp_path, opened)
 
 def test_a_tombstoned_track_answers_exactly_like_an_unknown_one(client, tmp_path, opened):
     uuid_id, _ = _add(client, tmp_path)
-    assert client.app.state.admin_library.delete_track(uuid_id)
+    assert delete_track(client.app.state.admin_library, uuid_id)
 
     r = client.get(f"/tracks/{uuid_id}/stream")
 
@@ -146,7 +147,7 @@ def test_a_tombstoned_track_answers_exactly_like_an_unknown_one(client, tmp_path
 
 def test_a_deletion_committed_after_the_row_read_answers_404(client, tmp_path, monkeypatch, opened):
     uuid_id, _ = _add(client, tmp_path)
-    _on_row_read(monkeypatch, lambda t: client.app.state.admin_library.delete_track(uuid_id))
+    _on_row_read(monkeypatch, lambda t: delete_track(client.app.state.admin_library, uuid_id))
 
     r = client.get(f"/tracks/{uuid_id}/stream")
 
@@ -184,7 +185,7 @@ def test_a_master_moved_to_quarantine_is_never_opened(client, tmp_path, monkeypa
 
     assert r.status_code == 410
     assert r.json()["detail"]["error"] == "track_pending_deletion"
-    assert quarantine not in [p for p, _ in opened]
+    assert opened == []  # nothing at all was opened, the moved master included
     assert str(tmp_path) not in r.text
 
 
@@ -216,7 +217,7 @@ def test_a_late_encode_for_a_deleted_track_answers_404_not_500(client, tmp_path,
     uuid_id, _ = _add(client, tmp_path)
 
     def delete(track):
-        client.app.state.admin_library.delete_track(uuid_id)
+        delete_track(client.app.state.admin_library, uuid_id)
         _evict(client, uuid_id)
 
     _on_row_read(monkeypatch, delete)
@@ -593,7 +594,7 @@ def test_an_open_error_on_a_track_tombstoned_meanwhile_answers_like_an_unknown_o
     uuid_id, _ = _add(client, tmp_path)
 
     def failing(path):
-        client.app.state.admin_library.delete_track(uuid_id)  # the deletion committed
+        delete_track(client.app.state.admin_library, uuid_id)  # the deletion committed
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(track_source, "_open_source", failing)

@@ -405,7 +405,8 @@ void main() {
       final db = AppDatabase(NativeDatabase.memory());
       addTearDown(db.close);
       final repository = ServerBindingRepository(db);
-      await repository.ensureProvisional('http://srv:1', userId: _alice.userId);
+      await repository.ensureProvisional('http://srv:1',
+          userId: _alice.userId, instanceId: 'inst-1');
       final bounds = <Duration>[];
       final gate = ServerBindingGate(
         repository: repository,

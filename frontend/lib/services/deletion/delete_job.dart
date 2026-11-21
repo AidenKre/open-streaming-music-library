@@ -27,7 +27,12 @@ enum DeleteJobPhase {
   partial,
 
   /// Finished; no target was deleted.
-  failed;
+  failed,
+
+  /// Accepted, but the server no longer knows the job (its database was
+  /// restored from an older backup): what happened to it is unknown. Not
+  /// polled again; not finished, so it still holds a duplicate's other copy.
+  unknown;
 
   bool get isTerminal =>
       this == rejected || this == completed || this == partial || this == failed;

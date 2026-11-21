@@ -5,8 +5,11 @@ from pathlib import Path
 import pytest
 
 from app.models import Track, TrackMetaData
+from app.services import track_source
 from app.services.encoded_cache import EncodedCache, EncodedCacheContext
 from app.services.encoder_coordinator import EncoderCoordinator, EncodeResult
+from app.services.transcoder import ORIGINAL_QUALITY
+from tests.encoder_pool_fixtures import stop_every_encoder_pool  # noqa: F401  (autouse fixture)
 
 # The master admin's id: only its tracks are routed to default_cache (M.2a).
 ADMIN_OWNER = 1
@@ -30,8 +33,12 @@ def _fake_transcode_factory(payload_for_quality):
     return fake_transcode
 
 
-def _install_fake_coordinator(client, payload_for_quality, max_size_bytes=10 * 1024 * 1024):
-    """Replace the app's encoder coordinator with a fake-driven one."""
+def _install_fake_coordinator(
+    client, payload_for_quality, max_size_bytes=10 * 1024 * 1024, *, default_cache=None,
+    default_quality=ORIGINAL_QUALITY,
+):
+    """Replace the app's encoder coordinator with a fake-driven one (with a
+    default-quality cache only when one is given)."""
     cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
     new_cache = EncodedCache(
         ctx=EncodedCacheContext(cache_dir=cache_dir, max_size_bytes=max_size_bytes)
@@ -43,6 +50,8 @@ def _install_fake_coordinator(client, payload_for_quality, max_size_bytes=10 * 1
         source_lookup=client.app.state.encoder_coordinator.source_lookup,
         workers=2,
         transcode_fn=_fake_transcode_factory(payload_for_quality),
+        default_cache=default_cache,
+        default_quality=default_quality,
     )
     client.app.state.encoded_cache = new_cache
     client.app.state.encoder_coordinator.shutdown()
@@ -462,28 +471,56 @@ class TestStreamCacheRace:
             return byte * size
         return payload
 
+    @staticmethod
+    def _prune_once_opened(monkeypatch, prune):
+        """Run ``prune`` inside the request, right after the stream opened its
+        file and before the first byte is read. (The test client reads the
+        whole body before ``client.stream`` returns, so a prune inside the
+        ``with`` block would come after the last byte.)"""
+        real = track_source._open_source
+
+        def open_then_prune(path):
+            handle = real(path)
+            prune()
+            return handle
+
+        monkeypatch.setattr(track_source, "_open_source", open_then_prune)
+
+    @staticmethod
+    def _unlink_every_file(client):
+        cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
+        for entry in cache_dir.iterdir():
+            if entry.is_file():
+                entry.unlink()
+
+    @staticmethod
+    def _cache_files(client):
+        cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
+        return [entry for entry in cache_dir.iterdir() if entry.is_file()]
+
     def test_stream_survives_cache_clear_after_response_opens(
-        self, client, tmp_path
+        self, client, tmp_path, monkeypatch
     ):
         track = _add_track_with_file(client, tmp_path)
         expected = b"K" * 4096
         _install_fake_coordinator(
             client, payload_for_quality=self._payload_for(b"K", 4096)
         )
+        # Wipe the entire encoded cache once the file is open. The open file
+        # descriptor must keep the data alive.
+        self._prune_once_opened(monkeypatch, client.app.state.encoded_cache.clear)
 
         with client.stream(
             "GET", f"/tracks/{track.uuid_id}/stream?quality=192"
         ) as resp:
             assert resp.status_code == 200
-            # Mid-stream: wipe the entire encoded cache directory. The open
-            # file descriptor must keep the data alive.
-            client.app.state.encoded_cache.clear()
             body = b"".join(resp.iter_bytes())
 
         assert body == expected
+        assert self._cache_files(client) == []
 
     def test_stream_survives_path_unlink_before_first_read(
-        self, client, tmp_path
+        self, client, tmp_path, monkeypatch
     ):
         """Unlink the cache file after the endpoint returns but before any
         bytes are read off the response. Demonstrates the fix: with eager
@@ -493,27 +530,26 @@ class TestStreamCacheRace:
         _install_fake_coordinator(
             client, payload_for_quality=self._payload_for(b"Z", 2048)
         )
+        # Unlink every encoded cache file directly via Path.unlink, the same
+        # mechanism EncodedCache._prune_locked uses.
+        self._prune_once_opened(monkeypatch, lambda: self._unlink_every_file(client))
 
         with client.stream(
             "GET", f"/tracks/{track.uuid_id}/stream?quality=128"
         ) as resp:
             assert resp.status_code == 200
-            # Unlink every encoded cache file directly via Path.unlink, the
-            # same mechanism EncodedCache._prune_locked uses.
-            cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
-            for entry in cache_dir.iterdir():
-                if entry.is_file():
-                    entry.unlink()
             body = b"".join(resp.iter_bytes())
 
         assert body == expected
+        assert self._cache_files(client) == []
 
-    def test_range_stream_survives_unlink(self, client, tmp_path):
+    def test_range_stream_survives_unlink(self, client, tmp_path, monkeypatch):
         track = _add_track_with_file(client, tmp_path)
         encoded = b"R" * 1000
         _install_fake_coordinator(
             client, payload_for_quality=lambda br: encoded
         )
+        self._prune_once_opened(monkeypatch, lambda: self._unlink_every_file(client))
 
         with client.stream(
             "GET",
@@ -521,41 +557,47 @@ class TestStreamCacheRace:
             headers={"Range": "bytes=100-299"},
         ) as resp:
             assert resp.status_code == 206
-            cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
-            for entry in cache_dir.iterdir():
-                if entry.is_file():
-                    entry.unlink()
             body = b"".join(resp.iter_bytes())
 
         assert body == encoded[100:300]
+        assert self._cache_files(client) == []
 
     def test_stream_survives_default_quality_change_cleanup(
-        self, client, tmp_path
+        self, client, tmp_path, monkeypatch
     ):
         """A default-quality change wipes the old-quality default-cache
         directory via Path.unlink; an active stream off that cache must
         continue to read successfully."""
-        track = _add_track_with_file(client, tmp_path)
+        track = _add_track_with_file(client, tmp_path)  # the master admin's
         expected = b"D" * 3000
-        _install_fake_coordinator(
-            client, payload_for_quality=self._payload_for(b"D", 3000)
+        default_dir = tmp_path / "default-cache"
+        coordinator = _install_fake_coordinator(
+            client, payload_for_quality=self._payload_for(b"D", 3000),
+            default_cache=EncodedCache(
+                ctx=EncodedCacheContext(cache_dir=default_dir, max_size_bytes=10**9)),
+            default_quality="256",
         )
+        served_from = []
+
+        def change_the_default():
+            # The stream's file is in the default cache; the change's own
+            # clean-up (queued, then run here by draining the pool) deletes it.
+            served_from.extend(p.name for p in default_dir.iterdir() if p.is_file())
+            coordinator.set_default_quality("320")
+            coordinator.drain()
+
+        self._prune_once_opened(monkeypatch, change_the_default)
 
         with client.stream(
             "GET", f"/tracks/{track.uuid_id}/stream?quality=256"
         ) as resp:
             assert resp.status_code == 200
-            # Simulate the coordinator's default-quality cleanup loop which
-            # iterates the cache dir and unlinks every matching file.
-            cache_dir = Path(client.app.state.encoded_cache.ctx.cache_dir)
-            for entry in cache_dir.iterdir():
-                try:
-                    entry.unlink()
-                except OSError:
-                    pass
             body = b"".join(resp.iter_bytes())
 
         assert body == expected
+        assert len(served_from) == 1  # the file was there when the stream opened it
+        assert [p for p in default_dir.iterdir() if p.is_file()] == []
+        assert self._cache_files(client) == []  # never in the stream cache
 
 
 class TestRangeParsing:
@@ -735,25 +777,35 @@ class TestWarmEndpoint:
 
     def test_warm__idempotent(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
-        _install_fake_coordinator(client, payload_for_quality=lambda br: b"x" * 10)
+        encoded = {"calls": 0}
 
-        r = client.post("/tracks/warm", json={
+        def payload(bitrate: int) -> bytes:
+            encoded["calls"] += 1
+            return b"x" * 10
+
+        coordinator = _install_fake_coordinator(client, payload_for_quality=payload)
+        body = {
             "session_id": "sess-1",
             "current_index": 0,
             "quality": "192",
             "track_uuids": [track.uuid_id],
-        })
-        assert r.status_code == 200
+        }
 
-        # Second call with different index is also accepted.
-        r = client.post("/tracks/warm", json={
-            "session_id": "sess-1",
-            "current_index": 5,
-            "quality": "256",
-            "track_uuids": [track.uuid_id],
-        })
+        r = client.post("/tracks/warm", json=body)
+        assert r.status_code == 200
+        assert r.json()["prefetch_queued"] == 1
+        deadline = time.monotonic() + 5  # the pool keeps running: wait for the encode
+        while not client.app.state.encoded_cache.has(track.uuid_id, "192"):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+
+        # The same request again is accepted and encodes nothing more.
+        r = client.post("/tracks/warm", json=body)
         assert r.status_code == 200
         assert r.json()["accepted"] is True
+        assert (r.json()["prefetch_queued"], r.json()["prefetch_skipped"]) == (0, 1)
+        coordinator.drain()
+        assert encoded["calls"] == 1
 
     def test_warm__invalid_quality__rejected(self, client, tmp_path):
         track = _add_track_with_file(client, tmp_path)
@@ -1041,7 +1093,11 @@ class TestBitratePassthrough:
         )
         assert first is not None and first.transcoded is False
 
-        # If the passthrough return path left the lock held, this would hang.
+        # The passthrough return released the key's lock (a held lock would
+        # hang the second call, so it is checked with a timeout first).
+        key_lock = coordinator._key_lock("uuid-a", "320")
+        assert key_lock.acquire(timeout=2)
+        key_lock.release()
         second = coordinator.encode_for_stream(
             "uuid-a", "320", source_bitrate_kbps=64, owner_id=ADMIN_OWNER
         )
@@ -1124,9 +1180,14 @@ class TestEncoderCoordinatorLocks:
             )
         )
 
+        all_at_lock = threading.Event()
+        at_lock = []
+
         def slow_transcode(src: Path, dst: Path, bitrate: int) -> bool:
             encode_count["n"] += 1
-            time.sleep(0.05)  # Hold the lock briefly so other threads pile up.
+            # Hold the lock until every caller has reached it (a condition,
+            # not a sleep): without the lock they would all be in here too.
+            assert all_at_lock.wait(5)
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"encoded" * 10)
             return True
@@ -1141,6 +1202,16 @@ class TestEncoderCoordinatorLocks:
 
         results = []
         lock = threading.Lock()
+        key_lock = coordinator._key_lock
+
+        def counting_key_lock(*key):
+            with lock:
+                at_lock.append(key)
+                if len(at_lock) == 8:
+                    all_at_lock.set()
+            return key_lock(*key)
+
+        coordinator._key_lock = counting_key_lock
 
         def call():
             r = coordinator.encode_for_stream("uuid-x", "192", owner_id=ADMIN_OWNER)
@@ -1151,9 +1222,11 @@ class TestEncoderCoordinatorLocks:
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            t.join(timeout=10)
 
+        assert not any(t.is_alive() for t in threads)
         assert encode_count["n"] == 1
+        assert len(results) == 8
         assert all(r is not None for r in results)
 
     def test_second_thread_finds_cache_after_waiting_on_lock(self, tmp_path):
@@ -1166,7 +1239,7 @@ class TestEncoderCoordinatorLocks:
 
         encode_count = {"n": 0}
         ready = threading.Event()
-        proceed = threading.Event()
+        second_at_lock = threading.Event()
 
         cache = EncodedCache(
             ctx=EncodedCacheContext(
@@ -1178,7 +1251,8 @@ class TestEncoderCoordinatorLocks:
         def gating_transcode(src: Path, dst: Path, bitrate: int) -> bool:
             encode_count["n"] += 1
             ready.set()    # Signal that encoding has started.
-            proceed.wait() # Wait for second thread to be queued on the lock.
+            # Wait until the second thread missed the cache and reached the lock.
+            assert second_at_lock.wait(5)
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"encoded" * 10)
             return True
@@ -1190,6 +1264,14 @@ class TestEncoderCoordinatorLocks:
             workers=2,
             transcode_fn=gating_transcode,
         )
+        key_lock = coordinator._key_lock
+
+        def signalling_key_lock(*key):
+            if threading.current_thread() is t2:
+                second_at_lock.set()
+            return key_lock(*key)
+
+        coordinator._key_lock = signalling_key_lock
 
         result1 = [None]
         result2 = [None]
@@ -1198,17 +1280,17 @@ class TestEncoderCoordinatorLocks:
             result1[0] = coordinator.encode_for_stream("uuid-y", "192", owner_id=ADMIN_OWNER)
 
         def second():
-            ready.wait()   # Wait until first thread is inside transcode.
-            proceed.set()  # Let first thread finish encoding.
+            assert ready.wait(5)  # Wait until first thread is inside transcode.
             result2[0] = coordinator.encode_for_stream("uuid-y", "192", owner_id=ADMIN_OWNER)
 
         t1 = threading.Thread(target=first)
         t2 = threading.Thread(target=second)
         t1.start()
         t2.start()
-        t1.join()
-        t2.join()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
 
+        assert not t1.is_alive() and not t2.is_alive()
         assert encode_count["n"] == 1
         assert result1[0] is not None
         assert result2[0] is not None

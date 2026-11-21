@@ -17,6 +17,8 @@ import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/download/download_queue.dart';
 import 'package:frontend/services/download/track_downloader.dart';
 import 'package:frontend/services/local_cover_art_store.dart';
+import 'package:frontend/services/background/single_flight_runner.dart'
+    show PassDone;
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:frontend/api/token_permit.dart';
 
@@ -1318,6 +1320,62 @@ void main() {
       expect(tracks.existsSync(), isFalse);
     });
 
+    test('when the reset\'s database step fails, a real downloads folder '
+        'still goes with what is in it and the failure is reported', () async {
+      final recorded = fileIn(tracks, 'u1.m4a');
+      await setPaths('u1', file: recorded.path);
+      await db.customStatement(
+          'CREATE TRIGGER fail_reset BEFORE UPDATE ON tracks '
+          "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END");
+
+      final error = await reset(
+          buildDownloader(MockClient((_) async => http.Response('', 404))));
+
+      expect(error, isNotNull);
+      expect(error, isNot(isA<DownloadsLeftByReset>()));
+      expect(tracks.existsSync(), isFalse);
+    });
+
+    // Only a linked folder turns a failed database step into a report of
+    // files left: with a real folder the failure itself is reported, even
+    // when a recorded file outside the folder is still on the device.
+    test('when the reset\'s database step fails with a real folder, a recorded '
+        'file outside it stays and the failure itself is reported', () async {
+      final outside = fileIn(elsewhere, 'u1.m4a', [4, 4]);
+      await setPaths('u1', file: outside.path);
+      await db.customStatement(
+          'CREATE TRIGGER fail_reset BEFORE UPDATE ON tracks '
+          "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END");
+
+      final error = await reset(
+          buildDownloader(MockClient((_) async => http.Response('', 404))));
+
+      expect(error, isNotNull);
+      expect(error, isNot(isA<DownloadsLeftByReset>()));
+      expect(outside.readAsBytesSync(), [4, 4]);
+      expect(tracks.existsSync(), isFalse);
+    });
+
+    // A directory provider that fails ends the step after the database step,
+    // as it always did: the download columns are cleared first.
+    test('a downloads folder that cannot be found fails the reset after the '
+        'download records are cleared', () async {
+      final recorded = fileIn(tracks, 'u1.m4a');
+      await setPaths('u1', file: recorded.path);
+      final downloader = TrackDownloader(
+        db: db,
+        coverArtStore: coverStore,
+        apiClient: api,
+        directoryProvider: () async =>
+            throw const FileSystemException('Not found', '/gone'),
+      );
+
+      final error = await reset(downloader);
+
+      expect(error, isA<FileSystemException>());
+      expect(await recordedPaths(), everyElement(isNull));
+    });
+
     // A downloads folder the reset could not remove is reported,
     // so the reset reads "Reset incomplete" and keeps its marker.
     test('a downloads folder the removal leaves in place fails the reset; '
@@ -1383,6 +1441,86 @@ void main() {
 
       setUp(() => tracks.deleteSync());
 
+      // The folder could not be looked at before the database step (the
+      // app's files folder was not available for a moment). Nothing behind
+      // the folder is deleted until a look that succeeded says it is not a
+      // link.
+      TrackDownloader flakyFolder({required int failures}) {
+        var calls = 0;
+        return TrackDownloader(
+          db: db,
+          coverArtStore: coverStore,
+          apiClient: api,
+          directoryProvider: () async {
+            if (++calls <= failures) {
+              throw const FileSystemException('Not available', '/support');
+            }
+            return tempDir;
+          },
+        );
+      }
+
+      test('a linked folder whose first look fails is not cleaned through: '
+          'what is behind it stays and is reported', () async {
+        final drive = Directory(p.join(elsewhere.path, 'drive'))..createSync();
+        Link(tracks.path).createSync(drive.path);
+        final recorded = fileIn(drive, 'u1.m4a', [1, 1]);
+        await setPaths('u1', file: p.join(tracks.path, 'u1.m4a'));
+
+        final error = await reset(flakyFolder(failures: 1));
+
+        expect(error, isA<DownloadsLeftByReset>());
+        expect((error as DownloadsLeftByReset).count, 1);
+        expect(recorded.readAsBytesSync(), [1, 1]);
+        expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        expect(await db.select(db.ownedFileCleanupEntries).get(), isEmpty);
+      });
+
+      test('a linked folder that cannot be looked at at all: nothing behind '
+          'it is deleted, the link stays and the step fails', () async {
+        final drive = Directory(p.join(elsewhere.path, 'drive'))..createSync();
+        Link(tracks.path).createSync(drive.path);
+        final recorded = fileIn(drive, 'u1.m4a', [1, 1]);
+        await setPaths('u1', file: p.join(tracks.path, 'u1.m4a'));
+
+        final error = await reset(flakyFolder(failures: 1000));
+
+        expect(error, isA<FileSystemException>());
+        expect(error, isNot(isA<DownloadsLeftByReset>()));
+        expect(recorded.readAsBytesSync(), [1, 1]);
+        expect(typeOf(tracks.path), FileSystemEntityType.link);
+        // The database step ran as for a real folder: the record is cleared
+        // and a clean-up row is queued for the path through the link.
+        expect(await recordedPaths(), everyElement(isNull));
+        expect(
+            [for (final r in await db.select(db.ownedFileCleanupEntries).get())
+              r.path],
+            [p.join(tracks.path, 'u1.m4a')]);
+
+        // Until the reset finishes no binding exists (a pending reset runs
+        // before anything binds), and a clean-up pass without one attempts
+        // nothing: the queued row does not reach the file behind the link.
+        final pass = await OwnedFileCleanup(
+          db: db,
+          documentsDirectory: () async => tempDir,
+          locks: OwnedPathLocks(),
+        ).runPass(const {'coldStart'});
+        expect(pass, isA<PassDone>());
+        expect(recorded.readAsBytesSync(), [1, 1]);
+        expect(await db.select(db.ownedFileCleanupEntries).get(), hasLength(1));
+
+        // The next run, whose look works, finds the link: the queued row is
+        // dropped, the file behind the link stays and is reported, the link
+        // goes.
+        final next = await reset(flakyFolder(failures: 0));
+
+        expect(next, isA<DownloadsLeftByReset>());
+        expect((next as DownloadsLeftByReset).count, 1);
+        expect(recorded.readAsBytesSync(), [1, 1]);
+        expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        expect(await db.select(db.ownedFileCleanupEntries).get(), isEmpty);
+      });
+
       test('a dangling link is removed as a link and the reset completes',
           () async {
         Link(tracks.path).createSync(p.join(elsewhere.path, 'unmounted'));
@@ -1395,28 +1533,144 @@ void main() {
             FileSystemEntityType.notFound);
       });
 
+      // A reset deletes nothing behind a link: not even a file a track row
+      // records through the linked folder. It stays and is reported once.
       test('a link to a folder outside the app\'s folder goes as a link; '
-          'what is behind it stays', () async {
+          'what is behind it stays, recorded downloads reported once',
+          () async {
         final drive = Directory(p.join(elsewhere.path, 'drive'))..createSync();
         final kept = fileIn(drive, 'not-recorded.m4a', [9, 9]);
         final nested = Directory(p.join(drive.path, 'sub'))..createSync();
         final keptNested = fileIn(nested, 'u7.m4a', [7]);
         Link(tracks.path).createSync(drive.path);
-        // A regular file at a path a track row records (through the link):
-        // the owned-file clean-up removes it before the folder goes, as it
-        // does for every recorded file. Only the folder's removal never
-        // follows the link.
         final recorded = fileIn(drive, 'u1.m4a', [1, 1]);
         await setPaths('u1', file: p.join(tracks.path, 'u1.m4a'));
+        final d = downloader();
 
-        final error = await reset(downloader());
+        final error = await reset(d);
 
-        expect(error, isNull);
+        expect(error, isA<DownloadsLeftByReset>());
+        expect((error as DownloadsLeftByReset).count, 1);
         expect(typeOf(tracks.path), FileSystemEntityType.notFound);
         expect(kept.readAsBytesSync(), [9, 9]);
         expect(keptNested.readAsBytesSync(), [7]);
-        expect(recorded.existsSync(), isFalse);
+        expect(recorded.readAsBytesSync(), [1, 1]);
         expect(await recordedPaths(), everyElement(isNull));
+        expect(await db.select(db.ownedFileCleanupEntries).get(), isEmpty);
+        // The next launch finishing the reset has nothing to report.
+        expect(await reset(d), isNull);
+        expect(recorded.readAsBytesSync(), [1, 1]);
+      });
+
+      test('a recorded download behind a link to a folder inside the app\'s '
+          'folder stays and is reported', () async {
+        final other = Directory(p.join(tempDir.path, 'other'))..createSync();
+        final recorded = fileIn(other, 'u1.m4a', [2, 2]);
+        final damaged = fileIn(other, 'u1.damaged.m4a', [3]);
+        Link(tracks.path).createSync(other.path);
+        await setPaths('u1',
+            file: p.join(tracks.path, 'u1.m4a'),
+            damaged: p.join(tracks.path, 'u1.damaged.m4a'));
+
+        final error = await reset(downloader());
+
+        expect(error, isA<DownloadsLeftByReset>());
+        expect((error as DownloadsLeftByReset).count, 2);
+        expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        expect(recorded.readAsBytesSync(), [2, 2]);
+        expect(damaged.readAsBytesSync(), [3]);
+      });
+
+      test('a file an earlier delete queued behind the linked folder stays '
+          'and is reported once', () async {
+        final drive = Directory(p.join(elsewhere.path, 'drive'))..createSync();
+        Link(tracks.path).createSync(drive.path);
+        final queued = fileIn(drive, 'old.m4a', [5, 5]);
+        await db.transaction(() => OwnedFileCleanup(
+              db: db,
+              documentsDirectory: () async => tempDir,
+            ).enqueueInTransaction([p.join(tracks.path, 'old.m4a')],
+                localBindingId: null));
+        final d = downloader();
+
+        final error = await reset(d);
+
+        expect(error, isA<DownloadsLeftByReset>());
+        expect(queued.readAsBytesSync(), [5, 5]);
+        expect(await db.select(db.ownedFileCleanupEntries).get(), isEmpty);
+        expect(await reset(d), isNull);
+        expect(queued.readAsBytesSync(), [5, 5]);
+      });
+
+      // The reset's database step fails (the rows stay as they were).
+      group('when the reset\'s database step fails', () {
+        Future<void> failTrackWrites() => db.customStatement(
+            'CREATE TRIGGER fail_reset BEFORE UPDATE ON tracks '
+            "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END");
+
+        test('what is behind the link stays and is reported; the link goes',
+            () async {
+          final drive = Directory(p.join(elsewhere.path, 'drive'))
+            ..createSync();
+          Link(tracks.path).createSync(drive.path);
+          final recorded = fileIn(drive, 'u1.m4a', [1, 1]);
+          await setPaths('u1', file: p.join(tracks.path, 'u1.m4a'));
+          await failTrackWrites();
+
+          final error = await reset(downloader());
+
+          expect(error, isA<DownloadsLeftByReset>());
+          expect((error as DownloadsLeftByReset).count, 1);
+          expect(recorded.readAsBytesSync(), [1, 1]);
+          expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        });
+
+        test('nothing recorded behind the link: the failure itself is '
+            'reported; the link goes', () async {
+          final drive = Directory(p.join(elsewhere.path, 'drive'))
+            ..createSync();
+          final kept = fileIn(drive, 'not-recorded.m4a', [9]);
+          Link(tracks.path).createSync(drive.path);
+          await setPaths('u1', file: p.join(elsewhere.path, 'gone.m4a'));
+          await failTrackWrites();
+
+          final error = await reset(downloader());
+
+          expect(error, isNot(isA<DownloadsLeftByReset>()));
+          expect(error, isNotNull);
+          expect(kept.readAsBytesSync(), [9]);
+          expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        });
+
+        test('when the recorded downloads cannot be read either, the link '
+            'stays, so the next run finds and reports them', () async {
+          final drive = Directory(p.join(elsewhere.path, 'drive'))
+            ..createSync();
+          Link(tracks.path).createSync(drive.path);
+          final recorded = fileIn(drive, 'u1.m4a', [1, 1]);
+          await setPaths('u1', file: p.join(tracks.path, 'u1.m4a'));
+          final table = (await db
+                  .customSelect("SELECT sql FROM sqlite_master "
+                      "WHERE name = 'owned_file_cleanup'")
+                  .getSingle())
+              .read<String>('sql');
+          await db.customStatement('DROP TABLE owned_file_cleanup');
+          final d = downloader();
+
+          final error = await reset(d);
+
+          expect(error, isNotNull);
+          expect(error, isNot(isA<DownloadsLeftByReset>()));
+          expect(typeOf(tracks.path), FileSystemEntityType.link);
+          expect(recorded.readAsBytesSync(), [1, 1]);
+
+          // The next launch, with the database readable again.
+          await db.customStatement(table);
+          final next = await reset(d);
+          expect(next, isA<DownloadsLeftByReset>());
+          expect(recorded.readAsBytesSync(), [1, 1]);
+          expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        });
       });
 
       test('a link to a folder inside the app\'s folder goes as a link; '

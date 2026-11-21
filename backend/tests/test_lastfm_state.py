@@ -91,7 +91,7 @@ def test_off_never_becomes_stopped(caplog):
 def test_concurrent_stops_change_the_state_once_and_log_once(caplog):
     caplog.set_level(logging.DEBUG)
     state = LastfmState(LastfmService.RUNNING, _config())
-    barrier = threading.Barrier(32)
+    barrier = threading.Barrier(32, timeout=10)
     results = []
     lock = threading.Lock()
 
