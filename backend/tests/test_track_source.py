@@ -658,6 +658,100 @@ def test_a_pruned_cache_file_on_a_transcoded_stream_answers_503_not_404(
     assert client.get(f"/tracks/{uuid_id}").status_code == 200
 
 
+# ── a master that is a symbolic link is not served ───────────────────────────
+
+
+@pytest.mark.parametrize("quality", [None, "128"], ids=["original", "transcoded"])
+def test_a_master_that_is_a_symbolic_link_answers_404_and_serves_nothing(
+    client, tmp_path, opened, quality
+):
+    """Imports refuse links; a master put in place by hand as a link to a real
+    audio file is neither streamed nor downloaded, at the original or a preset."""
+    calls: list[Path] = []
+    _install_coordinator(client, _fake_transcode(calls))
+    target = tmp_path / "elsewhere" / "real.mp3"
+    target.parent.mkdir()
+    target.write_bytes(b"someone-elses-audio" * 50)
+    uuid_id, master = _add(client, tmp_path)
+    master.unlink()
+    master.symlink_to(target)
+
+    r = client.get(f"/tracks/{uuid_id}/stream", params={"quality": quality} if quality else {})
+
+    assert r.status_code == 404
+    assert r.json() == {"detail": f"Source file for track {uuid_id} is no longer available"}
+    assert str(tmp_path) not in r.text
+    assert opened == []
+    assert calls == []
+
+
+@pytest.mark.parametrize("quality", [None, "128"], ids=["original", "transcoded"])
+def test_a_master_under_a_linked_library_folder_still_streams(
+    client, tmp_path, opened, quality
+):
+    """Only the last component is checked: a library folder that is itself a
+    link (or a mounted disk) keeps working."""
+    calls: list[Path] = []
+    _install_coordinator(client, _fake_transcode(calls))
+    disk = tmp_path / "disk"
+    disk.mkdir()
+    folder = tmp_path / "library"
+    folder.symlink_to(disk, target_is_directory=True)
+    uuid_id, master = _add(client, folder)
+
+    r = client.get(f"/tracks/{uuid_id}/stream", params={"quality": quality} if quality else {})
+
+    assert r.status_code == 200
+    if quality is None:
+        assert r.content == master.read_bytes()
+        assert [p for p, _ in opened] == [master]
+    else:
+        assert calls == [master]
+        assert r.content == b"aac:" + master.read_bytes()[:32]
+
+
+def test_a_cached_preset_is_not_served_once_the_master_is_a_link(client, tmp_path, opened):
+    """A preset cached while the master was a real file is not served after
+    the master was replaced by hand with a link: the link check comes before
+    the cache is consulted."""
+    calls: list[Path] = []
+    _install_coordinator(client, _fake_transcode(calls))
+    target = tmp_path / "elsewhere" / "real.mp3"
+    target.parent.mkdir()
+    target.write_bytes(b"someone-elses-audio" * 50)
+    uuid_id, master = _add(client, tmp_path)
+    first = client.get(f"/tracks/{uuid_id}/stream", params={"quality": "128"})
+    assert first.status_code == 200 and calls == [master]  # the preset is now cached
+    master.unlink()
+    master.symlink_to(target)
+
+    r = client.get(f"/tracks/{uuid_id}/stream", params={"quality": "128"})
+
+    assert r.status_code == 404
+    assert r.json() == {"detail": f"Source file for track {uuid_id} is no longer available"}
+    assert calls == [master]  # no new encode either
+
+
+def test_a_master_under_a_linked_library_folder_is_still_served_from_the_cache(
+    client, tmp_path, opened
+):
+    calls: list[Path] = []
+    _install_coordinator(client, _fake_transcode(calls))
+    disk = tmp_path / "disk"
+    disk.mkdir()
+    folder = tmp_path / "library"
+    folder.symlink_to(disk, target_is_directory=True)
+    uuid_id, master = _add(client, folder)
+    first = client.get(f"/tracks/{uuid_id}/stream", params={"quality": "128"})
+    assert first.status_code == 200
+
+    r = client.get(f"/tracks/{uuid_id}/stream", params={"quality": "128"})
+
+    assert r.status_code == 200
+    assert r.content == first.content == b"aac:" + master.read_bytes()[:32]
+    assert calls == [master]  # the second answer came from the cache
+
+
 # ── review r1 8-R1-15: one name per meaning ────────────────────────────────
 
 

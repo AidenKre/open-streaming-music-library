@@ -73,7 +73,7 @@ Widget _offlineTooltip({required bool canChange, required Widget child}) {
 
 /// Shown when the settings model could not load (it reads only this
 /// device's saved preferences). The same sentence as the session's
-/// unreadable-preferences notice; proposed to the owner, not yet approved.
+/// unreadable-preferences notice.
 const settingsUnreadableMessage =
     "This device's saved settings could not be read.";
 
@@ -329,29 +329,45 @@ class _LogOutRow extends ConsumerWidget {
   }
 }
 
-class _DisconnectRow extends ConsumerWidget {
+class _DisconnectRow extends ConsumerStatefulWidget {
   const _DisconnectRow();
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_DisconnectRow> createState() => _DisconnectRowState();
+}
+
+class _DisconnectRowState extends ConsumerState<_DisconnectRow> {
+  /// One sheet at a time: a second tap while the losses are read or the
+  /// sheet is open does nothing.
+  bool _asking = false;
+
+  Future<void> _disconnect() async {
+    if (_asking) return;
+    _asking = true;
+    try {
+      final session = ref.read(sessionControlsProvider);
+      final losses = await session.pendingLossSummaries();
+      if (!mounted) return;
+      final confirmed = await showDisconnectConfirmSheet(
+        context,
+        losses: losses,
+      );
+      if (!confirmed || !mounted) return;
+      // Success ends the session: the session host and every session
+      // route go with it. A partial reset is shown honestly first.
+      unawaited(session.disconnect());
+    } finally {
+      _asking = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return ListTile(
       leading: const Icon(Icons.logout),
       title: const Text('Disconnect'),
       subtitle: const Text('Reset this device and return to the server address screen'),
-      onTap: () async {
-        final session = ref.read(sessionControlsProvider);
-        final losses = await session.pendingLossSummaries();
-        if (!context.mounted) return;
-        final confirmed = await showDisconnectConfirmSheet(
-          context,
-          losses: losses,
-        );
-        if (!confirmed || !context.mounted) return;
-        // Success ends the session: the session host and every session
-        // route go with it. A partial reset is shown honestly first.
-        unawaited(session.disconnect());
-      },
+      onTap: _disconnect,
     );
   }
-
 }

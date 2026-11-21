@@ -3,10 +3,12 @@
 Bug guide A1, sign-off OPEN-6.5-05 (decision of 2026-11-16), Part 1. After a tag
 edit that moves the file, or a conversion that changes its path, the database
 commit that points the track at the new file is followed by the deletion of the
-old master. At ``synchronous=NORMAL`` in WAL mode that commit is on disk only
-after the next checkpoint, so a power cut could keep the deletion and lose the
-commit. The writers now call ``Database.make_durable()`` first, as the deletion
-worker does, and delete the old master only when it answers True.
+old master. When this was decided, a commit at ``synchronous=NORMAL`` in WAL
+mode was on disk only after the next checkpoint, so a power cut could keep the
+deletion and lose the commit. The writers call ``Database.make_durable()``
+first, as the deletion worker does, and delete the old master only when it
+answers True. Every commit is now flushed when it returns, so the durable point
+is a second line of defence.
 
 When the flush answers False (or raises), the operation has still succeeded and
 answers success; the old master and the journal row stay, and the old file's
@@ -419,6 +421,45 @@ def test_an_in_place_conversion_whose_flush_failed_still_replaces_and_logs_once(
     assert db.list_journal_entries() == []
     [line] = _operator_lines(caplog)
     assert track.uuid_id in line and str(tmp_path) not in line
+    assert IN_PLACE_LINE in line
+
+
+# Said before the replace, which can still be refused: "about to be", never "is".
+IN_PLACE_LINE = (
+    "its file is about to be replaced although it could not be confirmed just now that "
+    "database.db holds every saved change (the conversion itself is already on disk)"
+)
+
+
+def test_an_in_place_conversion_whose_flush_failed_and_whose_replace_is_refused_says_nothing_untrue(
+    tmp_path, monkeypatch, caplog
+):
+    """The line is written before the replace. When the replace is then
+    refused, the conversion fails and the original stays: the line must not
+    have said the file was replaced."""
+    import app.services.conversion as conversion_module
+
+    db, orch, coordinator, source, track = _in_place(tmp_path)
+    original = source.read_bytes()
+    _durable(monkeypatch, db, [False])
+    real_replace = os.replace
+
+    def replace(src, dst, *args, **kwargs):
+        if ".tagged." in str(src):
+            raise OSError("simulated rename failure")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(conversion_module.os, "replace", replace)
+    job_id = orch.enqueue(conv._lib(orch), track.uuid_id, "mp3", 128, track.revision)
+
+    with caplog.at_level(logging.WARNING, logger=OPERATOR):
+        conv._run_submitted(coordinator)
+
+    assert db.get_conversion_job(job_id)["status"] == "failed"
+    assert source.read_bytes() == original
+    lines = [line for line in _operator_lines(caplog) if track.uuid_id in line]
+    assert [IN_PLACE_LINE in line for line in lines] == [True]
+    assert not any("is replaced" in line or "was replaced" in line for line in _operator_lines(caplog))
 
 
 # --- durability review (s8-recovery-settle-review-durability.md) ------------------------------------

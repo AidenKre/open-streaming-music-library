@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import ValidationError
 
 from app.auth import accounts
 from app.auth.principal import Principal, auth_error, current_principal
@@ -12,7 +11,7 @@ from app.auth.passwords import (
 from app.auth.sessions import revoke_session_hash
 from app.auth.signup_policy import SignupDisabled, UserLimitReached
 from app.core.api_errors import api_error
-from app.core.bounded_body import bounded_body, validation_error_422
+from app.core.bounded_body import json_body
 from app.database.database import UsernameTaken
 from app.services.import_folders import prepare_signup_import_folder
 from app.models.auth import AuthResponse, AuthUser, Credentials, MeResponse
@@ -43,11 +42,7 @@ def _refusal(exc: Exception):
     return api_error(status, code, message, retryable=retryable)
 
 
-def _credentials(raw: bytes) -> Credentials:
-    try:
-        return Credentials.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from None
+_credentials = json_body(Credentials, 16 * 1024)
 
 
 def _auth_user(user) -> AuthUser:
@@ -68,8 +63,7 @@ def _auth_response(database, result: accounts.AuthResult) -> AuthResponse:
     )
 
 
-def _run(database, settings, raw: bytes, action, after=None) -> AuthResponse:
-    credentials = _credentials(raw)
+def _run(database, settings, credentials: Credentials, action, after=None) -> AuthResponse:
     try:
         result = action(database, settings, credentials.username, credentials.password)
     except tuple(_REFUSALS) as exc:
@@ -80,7 +74,7 @@ def _run(database, settings, raw: bytes, action, after=None) -> AuthResponse:
 
 
 @router.post("/register", status_code=201, response_model=AuthResponse)
-def register(request: Request, raw: bytes = Depends(bounded_body(16 * 1024))):
+def register(request: Request, credentials: Credentials = Depends(_credentials)):
     database = request.app.state.database
     state = request.app.state
 
@@ -92,14 +86,14 @@ def register(request: Request, raw: bytes = Depends(bounded_body(16 * 1024))):
         )
 
     return _run(
-        database, state.settings, raw, accounts.register, prepare_import_folder
+        database, state.settings, credentials, accounts.register, prepare_import_folder
     )
 
 
 @router.post("/login", response_model=AuthResponse)
-def login(request: Request, raw: bytes = Depends(bounded_body(16 * 1024))):
+def login(request: Request, credentials: Credentials = Depends(_credentials)):
     database = request.app.state.database
-    return _run(database, request.app.state.settings, raw, accounts.login)
+    return _run(database, request.app.state.settings, credentials, accounts.login)
 
 
 @router.post("/logout", status_code=204)

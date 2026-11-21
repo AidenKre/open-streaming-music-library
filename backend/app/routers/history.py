@@ -1,10 +1,9 @@
 import sqlite3
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import ValidationError
 
 from app.core.api_errors import api_error
-from app.core.bounded_body import bounded_body, validation_error_422
+from app.core.bounded_body import json_body
 from app.database.database import HistoryEventConflict
 from app.library import Library, current_library
 from app.models.history import GetHistoryChangesResponse, PostHistoryRequest
@@ -35,13 +34,8 @@ def get_history_changes(
 @router.post("")
 def post_history(
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(256 * 1024)),
+    body: PostHistoryRequest = Depends(json_body(PostHistoryRequest, 256 * 1024)),
 ):
-    try:
-        body = PostHistoryRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
-
     try:
         acknowledged = library.insert_history_events(body.events)
     except HistoryEventConflict as exc:

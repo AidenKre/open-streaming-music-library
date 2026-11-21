@@ -2,13 +2,12 @@
 // SC-26 view: it renders DeletionReviewControls and forwards input; every
 // rule and every model word comes from the model layer.
 import 'package:flutter/material.dart';
-import 'package:frontend/models/id_hints.dart';
+import 'package:frontend/models/track_names.dart';
 import 'package:frontend/services/deletion/deletion_preview.dart';
 import 'package:frontend/services/deletion/deletion_text.dart';
 import 'package:frontend/services/deletion/server_delete_availability.dart';
 import 'package:frontend/ui/manage_library/deletion_review_controller.dart';
 
-const _unknownTrack = 'Unknown track';
 const _missingFileEntry = 'Remove missing-file catalog entry';
 
 /// Opens the review over [review]; true when a deletion was confirmed and
@@ -75,7 +74,6 @@ class DeletionReviewSheet extends StatelessWidget {
                 _TargetRow(
                   review,
                   t,
-                  _hintsOf(preview)[t.uuid],
                   details[t.uuid] ?? const [],
                 ),
             ],
@@ -202,12 +200,6 @@ class _CloseWhenNothingToReviewState extends State<_CloseWhenNothingToReview> {
   Widget build(BuildContext context) => widget.child;
 }
 
-/// The id hint per uuid for look-alike targets of [preview].
-Map<String, String> _hintsOf(DeletionPreview preview) => idHints([
-  for (final t in preview.targets)
-    (uuid: t.uuid, title: t.title, artist: t.artist, album: t.album),
-]);
-
 /// "Artist · Album" with whatever is known; null when neither is.
 String? _byline(PreviewedTarget t) {
   final line = [t.artist, t.album].whereType<String>().join(' · ');
@@ -215,11 +207,10 @@ String? _byline(PreviewedTarget t) {
 }
 
 class _TargetRow extends StatelessWidget {
-  const _TargetRow(this.review, this.target, this.idHint, this.details);
+  const _TargetRow(this.review, this.target, this.details);
 
   final DeletionReviewControls review;
   final PreviewedTarget target;
-  final String? idHint;
   final List<String> details;
 
   @override
@@ -232,11 +223,10 @@ class _TargetRow extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            target.title ?? _unknownTrack,
+            trackTitleOrUnknown(target.title),
             style: Theme.of(context).textTheme.titleMedium,
           ),
           if (byline != null) Text(byline),
-          if (idHint != null) Text('ID $idHint'),
           for (final line in details) Text(line),
           Text(previewVerdictText(target.verdict)),
           Wrap(
@@ -303,7 +293,6 @@ class _ConfirmationDialogState extends State<_ConfirmationDialog> {
     final needsTyping = n > 1;
     // Judged against the preview this dialog shows, not a newer one.
     final typedOk = !needsTyping || typedCountMatches(_typed.text, n);
-    final hints = _hintsOf(shown);
     return PopScope(
       canPop: false,
       child: AlertDialog(
@@ -323,9 +312,8 @@ class _ConfirmationDialogState extends State<_ConfirmationDialog> {
               ),
               const SizedBox(height: 12),
               for (final t in shown.targets) ...[
-                Text(t.title ?? _unknownTrack),
+                Text(trackTitleOrUnknown(t.title)),
                 if (_byline(t) != null) Text(_byline(t)!),
-                if (hints[t.uuid] != null) Text('ID ${hints[t.uuid]}'),
                 for (final line in widget.details[t.uuid] ?? const <String>[])
                   Text(line),
                 if (t.verdict == PreviewVerdict.missingMaster)
@@ -334,8 +322,8 @@ class _ConfirmationDialogState extends State<_ConfirmationDialog> {
               ],
               const SizedBox(height: 8),
               const Text(
-                "This removes the server's master files and the downloads "
-                'synced to your devices.',
+                'This removes these tracks from the server. Each device '
+                'removes its downloads of these tracks when it next syncs.',
               ),
               const SizedBox(height: 8),
               const Text(
@@ -344,8 +332,8 @@ class _ConfirmationDialogState extends State<_ConfirmationDialog> {
               ),
               const SizedBox(height: 8),
               const Text(
-                'Tracks currently playing on any device will stop at the next '
-                'buffer refill.',
+                'Tracks streaming on any device will stop at the next buffer '
+                'refill.',
               ),
               const SizedBox(height: 8),
               const Text("This can't be undone."),

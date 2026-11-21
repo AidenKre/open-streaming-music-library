@@ -8,9 +8,8 @@ forever, and it discarded stderr). Fixes here land for every caller.
 Runs via ``Popen`` (not the simpler blocking ``subprocess.run``) so a caller
 whose ``ToolOptions`` name a ``registry`` and a ``job_id`` can cancel a running
 invocation from another thread — this is what Phase 2's conversion
-cancellation is built on. Every other caller (the tag writer, the streaming
-transcoder) passes no options and sees identical externally-observable
-behavior to before.
+cancellation is built on. A caller whose options name no registry sees
+identical externally-observable behavior to before.
 
 The per-run options travel as one frozen ``ToolOptions`` value, from the code
 that starts the work down to the runner: never as loose keywords.

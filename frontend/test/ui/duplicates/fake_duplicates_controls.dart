@@ -14,7 +14,7 @@ DuplicatePairView pairView(DuplicatePairDto p) {
     fields: {
       for (final f in DuplicateField.values) f: duplicateFieldText(t, f),
     },
-    identityLines: [...copyIdentityLines(t), copyIdLine(t.uuidId)],
+    identityLines: copyIdentityLines(t),
   );
   return DuplicatePairView(
     pair: p,
@@ -44,6 +44,8 @@ class FakeDuplicatesControls extends ChangeNotifier
   bool hasMore = false;
   @override
   String unreachableText = 'Possible duplicates needs a connection';
+  @override
+  bool connectionRetryHelps = true;
   @override
   String? message;
   @override

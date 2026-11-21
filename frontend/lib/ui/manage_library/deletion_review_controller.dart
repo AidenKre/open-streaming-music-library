@@ -237,7 +237,13 @@ class DeletionReviewController extends ChangeNotifier
       _set(ReviewStage.failed, message: unavailableText(e.reason));
     } on ApiException catch (e) {
       if (_disposed || seq != _seq) return;
-      _set(ReviewStage.failed, message: deletionErrorText(e.errorCode));
+      _set(
+        ReviewStage.failed,
+        message: deletionPreviewErrorText(e.statusCode, e.errorCode),
+      );
+    } on FormatException {
+      if (_disposed || seq != _seq) return;
+      _set(ReviewStage.failed, message: unexpectedAnswerText());
     } catch (_) {
       if (_disposed || seq != _seq) return;
       _set(ReviewStage.failed, message: couldNotReachServerText());

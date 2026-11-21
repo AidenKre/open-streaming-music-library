@@ -4,12 +4,8 @@ import json
 
 from app.core.keyset_cursor import decode_cursor, page_rows
 from app.database.operation_receipts import OperationConflict
-from app.services.deletion_errors import (
-    ITEM_DETAIL_CODES,
-    ITEM_ERROR_CODES,
-    deletion_job_not_found,
-    operation_conflict,
-)
+from app.core.deletion_states import ITEM_DETAIL_CODES, ITEM_ERROR_CODES
+from app.services.deletion_errors import deletion_job_not_found, operation_conflict
 from app.services.master_paths import master_exists_in_root
 from app.models.deletions import (
     DeletionJobItemOut,

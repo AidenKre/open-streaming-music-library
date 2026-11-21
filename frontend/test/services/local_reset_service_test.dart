@@ -522,6 +522,29 @@ void main() {
           throwsA(isA<LocalResetException>()));
       expect(markerPrefs.getBool('resetPending'), isTrue);
     });
+
+    // The app only ever saves `true`, so a marker of another type
+    // still means a reset was started. It reads as pending, never as an
+    // unreadable marker that stops every connect and sign-in.
+    test('a marker of another type reads as pending, and finishing the '
+        'reset clears it', () async {
+      final log = <String>[];
+      final c = containerWith([_Recording('wipe', 10, log)]);
+      await markerPrefs.setString('resetPending', 'x');
+      final service = c.read(localResetServiceProvider);
+      expect(await service.hasPendingReset(), isTrue);
+      await service.completePendingReset();
+      expect(log, ['wipe']);
+      expect(markerPrefs.get('resetPending'), isNull);
+      expect(await service.hasPendingReset(), isFalse);
+    });
+
+    test('a marker saved as false is not pending', () async {
+      final c = containerWith([]);
+      await markerPrefs.setBool('resetPending', false);
+      expect(await c.read(localResetServiceProvider).hasPendingReset(),
+          isFalse);
+    });
   });
 
   group('LocalResetService priority ordering', () {
@@ -846,6 +869,8 @@ class _RefusingRemovePrefs implements SharedPreferences {
   final String refuse;
   final removed = <String>[];
   @override
+  Object? get(String key) => _real.get(key);
+  @override
   bool? getBool(String key) => _real.getBool(key);
   @override
   Future<bool> setBool(String key, bool value) => _real.setBool(key, value);
@@ -869,6 +894,8 @@ class _RefusingMarkerPrefs implements SharedPreferences {
   _RefusingMarkerPrefs(this._real);
   final SharedPreferences _real;
   bool refusedMarker = false;
+  @override
+  Object? get(String key) => _real.get(key);
   @override
   bool? getBool(String key) => _real.getBool(key);
   @override

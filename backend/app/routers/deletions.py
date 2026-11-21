@@ -6,10 +6,9 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 
 from app.core.api_errors import answer_errors
-from app.core.bounded_body import bounded_body, validation_error_422
+from app.core.bounded_body import json_body
 from app.library import Library, current_library
 from app.models.deletions import (
     DeletionJobOut,
@@ -63,12 +62,10 @@ def require_library_delete_enabled(request: Request) -> None:
 )
 def preview_deletion(
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(DELETION_BODY_LIMIT)),
+    body: DeletionPreviewRequest = Depends(
+        json_body(DeletionPreviewRequest, DELETION_BODY_LIMIT)
+    ),
 ):
-    try:
-        body = DeletionPreviewRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
     return deletion_rules.preview(library, body)
 
 
@@ -76,13 +73,9 @@ def preview_deletion(
 def create_deletion(
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(DELETION_BODY_LIMIT)),
+    body: DeletionJobRequest = Depends(json_body(DeletionJobRequest, DELETION_BODY_LIMIT)),
     now: int = Depends(deletion_clock),
 ):
-    try:
-        body = DeletionJobRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
     with _api_errors():
         created, job = deletion_rules.create_job(library, body, now=now)
     if created:

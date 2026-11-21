@@ -35,8 +35,8 @@ class SearchPage extends ConsumerStatefulWidget {
 }
 
 class SearchPageState extends ConsumerState<SearchPage> {
-  // Debounce, immediate clear, generation guard, retry and download patching
-  // all live in the shared controller.
+  // Debounce, immediate clear, generation guard, retry and re-reading rows
+  // after a download all live in the shared controller.
   late final LibrarySearchControls _search;
 
   // The page owns the text and focus (one owner, reused by the field).
@@ -121,7 +121,7 @@ class SearchPageState extends ConsumerState<SearchPage> {
   @override
   Widget build(BuildContext context) {
     // A results snapshot needs help after a download/delete (the controller
-    // patches or re-searches; no-op while inactive).
+    // reads the listed rows again or re-searches; no-op while inactive).
     ref.listen(downloadStatusVersionProvider, (_, _) {
       _search.onDownloadStatusChanged();
     });

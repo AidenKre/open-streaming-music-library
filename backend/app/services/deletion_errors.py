@@ -1,18 +1,11 @@
-"""SC-22 errors of Phase 8 deletion. The one home for deletion error codes (O9, O12)."""
+"""SC-22 errors of Phase 8 deletion. The one home for deletion error codes (O9, O12).
+The item code lists of the job read model are in ``app/core/deletion_states.py``."""
 
 from fastapi import HTTPException
 
 from app.core.api_errors import ApiError
 
 TRACK_PENDING_DELETION = "track_pending_deletion"
-
-# Closed vocabularies of the deletion job read model (plan O12): nothing outside
-# these lists is ever echoed to a client.
-ITEM_ERROR_CODES = (
-    "not_found", "conflict", "busy", "path_rejected", "rename", "recovery_required",
-    "internal_error",
-)
-ITEM_DETAIL_CODES = ("master_missing", "storage_cleanup_pending")
 
 
 class DeletionError(ApiError):

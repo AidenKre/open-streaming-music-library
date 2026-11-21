@@ -171,6 +171,36 @@ def test_backup_is_taken_before_the_rebuild(tmp_path, recording_connect):
         conn.close()
 
 
+def test_the_backup_is_one_file(tmp_path):
+    """The backup is a file of its own, not the server's database: making it
+    leaves no ``-wal`` / ``-shm`` beside it that would have to be kept with it
+    (its connection is a plain one; a backup into a connection in WAL mode is
+    also refused when the page sizes differ). The copy itself is faithful: it
+    is a WAL database like its source, so it is read here without a log. The
+    database is a WAL database, as the server's is, and the rebuild runs on
+    the helper's own default connection."""
+    db = tmp_path / "db.sqlite"
+    backup = tmp_path / "backups" / "backup.sqlite"
+    backup.parent.mkdir()
+    _make_db(db)
+    conn = sqlite3.connect(db)
+    assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    conn.close()
+
+    assert rebuild_tables(
+        db, target_version=2, rebuild=_rebuild_parent_autoincrement, backup_path=backup
+    ) is True
+
+    assert sorted(p.name for p in backup.parent.iterdir()) == ["backup.sqlite"]
+    conn = sqlite3.connect(f"file:{backup}?mode=ro&immutable=1", uri=True)
+    try:
+        assert conn.execute("SELECT id, name FROM parent ORDER BY id").fetchall() == [(3, "a"), (7, "b")]
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1  # the state before the rebuild
+    finally:
+        conn.close()
+    assert sorted(p.name for p in backup.parent.iterdir()) == ["backup.sqlite"]
+
+
 def test_failure_rolls_back_ddl_keeps_version_and_restores_fks(tmp_path, recording_connect):
     db = tmp_path / "db.sqlite"
     _make_db(db)

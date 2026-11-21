@@ -108,6 +108,7 @@ class DeleteJob {
     this.items = const [],
     this.rejectionCode,
     this.createdAt,
+    this.submittedAtMs,
   });
 
   final String operationUuid;
@@ -124,4 +125,9 @@ class DeleteJob {
 
   /// Unix seconds, from the server's receipt.
   final int? createdAt;
+
+  /// When this device stored the submission (UTC milliseconds, from
+  /// `durable_submissions.created_at`); null for a job built from the
+  /// server's answer.
+  final int? submittedAtMs;
 }

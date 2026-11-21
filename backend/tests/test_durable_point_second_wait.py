@@ -144,7 +144,7 @@ def test_after_a_failed_first_point_a_second_that_fails_without_waiting_keeps_ev
     assert len(w.db.list_journal_entries()) == 1 and _registered(w)
     lines = _operator_lines(caplog)
     assert len(lines) == 2
-    assert "moves before a database flush" in lines[0]
+    assert "is about to move although it could not be confirmed just now that database.db holds" in lines[0]
     assert "old file waits for a database flush" in lines[1]
     for line in lines:
         assert w.track.uuid_id in line

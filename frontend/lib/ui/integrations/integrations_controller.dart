@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:frontend/models/dto/lastfm_dtos.dart';
+import 'package:frontend/models/track_names.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/services/lastfm/lastfm_errors.dart';
 import 'package:frontend/services/lastfm/lastfm_links.dart';
@@ -202,8 +203,8 @@ class IntegrationsController extends ChangeNotifier
         problems: [
           for (final row in status.recentProblems)
             IntegrationsProblemView(
-              artist: row.artist,
-              track: row.track,
+              artist: row.artist ?? unknownArtistName,
+              track: trackTitleOrUnknown(row.track),
               listenedAt: row.listenedAt,
               reason: lastfmProblemReason(row),
             ),
@@ -226,13 +227,11 @@ class IntegrationsController extends ChangeNotifier
     _ref.invalidate(lastfmServiceProvider);
   }
 
-  /// [tooSoon]: this action's own words for the server's too-soon answer;
-  /// [unreachable]: for an unreachable server.
+  /// [tooSoon]: this action's own words for the server's too-soon answer.
   Future<void> _act(
     bool Function(LastfmPageOffer o) allowed,
     Future<void> Function() run, {
     String? tooSoon,
-    String? unreachable,
   }) async {
     final offer = _view.offer;
     if (_disposed || _busy || offer == null || !allowed(offer)) return;
@@ -248,7 +247,6 @@ class IntegrationsController extends ChangeNotifier
         LastfmProblem.differentServer ||
         LastfmProblem.signedOut => _nothingChangedMessage,
         LastfmProblem.tooSoon when tooSoon != null => tooSoon,
-        LastfmProblem.unreachable when unreachable != null => unreachable,
         _ => _words(problem),
       };
     }
@@ -298,11 +296,6 @@ class IntegrationsController extends ChangeNotifier
   Future<void> disconnect() => _act(
     (o) => o.canDisconnect,
     () async => _service.disconnect(),
-    // The owner's words (DEV-9-13, 2026-11-14). Not for a timeout: a
-    // disconnect that timed out may have been applied.
-    unreachable:
-        '${lastfmProblemText(LastfmProblem.unreachable)} '
-        '$_nothingChangedMessage',
   );
 
   Future<void> _link(Future<bool> Function(LastfmLinks l) open) async {

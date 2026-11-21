@@ -324,21 +324,78 @@ void main() {
       final text = dialogText(tester);
       expect(text, contains('Title a'));
       expect(text, contains('Title b'));
-      expect(text, contains('master files'));
-      expect(text, contains('downloads synced to your devices'));
-      expect(text, contains('this device'));
+      // A device playing a downloaded copy reads nothing from the
+      // server; it keeps its copy until its next sync applies the deletion.
+      final lines = text.split('\n');
       expect(
-        text,
+        lines,
         contains(
-          'Tracks currently playing on any device will stop at the next buffer refill.',
+          'This removes these tracks from the server. Each device removes '
+          'its downloads of these tracks when it next syncs.',
         ),
       );
-      expect(text, contains('undone'));
+      expect(
+        lines,
+        contains(
+          'This is different from removing a download from this device only.',
+        ),
+      );
+      expect(
+        lines,
+        contains(
+          'Tracks streaming on any device will stop at the next buffer refill.',
+        ),
+      );
+      expect(lines, contains("This can't be undone."));
+      expect(text, isNot(contains('downloads synced to your devices')));
+      expect(text, isNot(contains('currently playing')));
       expect(text, contains('Remove missing-file catalog entry'));
       expect(find.byKey(_cancel), findsOne);
       expect(fake.calls, isEmpty, reason: 'opening the dialog sends nothing');
       await teardownTree(tester);
     });
+
+    // A missing-file entry has no master file: the sentence about what is
+    // removed must hold for it too.
+    testWidgets(
+      'a confirmation of missing-file entries only does not promise to remove '
+      'master files',
+      (tester) async {
+        final preview = previewOf([
+          (
+            uuid: 'a',
+            base: 1,
+            json: previewTargetJson('a', 1, missingMaster: true),
+          ),
+          (
+            uuid: 'b',
+            base: 1,
+            json: previewTargetJson('b', 1, missingMaster: true),
+          ),
+        ]);
+        fake.canConfirm = true;
+        await openReady(tester, preview);
+        await openDialog(tester);
+        final text = dialogText(tester);
+        expect(text, contains('Remove missing-file catalog entry'));
+        expect(text, isNot(contains('master files')));
+        expect(
+          text.split('\n'),
+          contains(
+            'This removes these tracks from the server. Each device removes '
+            'its downloads of these tracks when it next syncs.',
+          ),
+        );
+        expect(
+          text.split('\n'),
+          contains(
+            'Tracks streaming on any device will stop at the next buffer '
+            'refill.',
+          ),
+        );
+        await teardownTree(tester);
+      },
+    );
 
     testWidgets('lists an unknown title as Unknown track', (tester) async {
       final preview = previewOf([
@@ -348,6 +405,24 @@ void main() {
       await openReady(tester, preview);
       await openDialog(tester);
       expect(dialogText(tester), contains('Unknown track'));
+      await teardownTree(tester);
+    });
+
+    // An empty title is not a blank line, in the review or in the
+    // confirmation.
+    testWidgets('lists an empty title as Unknown track', (tester) async {
+      final preview = previewOf([
+        (uuid: 'a', base: 1, json: {...previewTargetJson('a', 1), 'title': ''}),
+      ]);
+      fake.canConfirm = true;
+      await openReady(tester, preview);
+      expect(
+        find.descendant(of: target('a'), matching: find.text('Unknown track')),
+        findsOne,
+      );
+      await openDialog(tester);
+      expect(dialogText(tester).split('\n'), contains('Unknown track'));
+      expect(dialogText(tester).split('\n'), isNot(contains('')));
       await teardownTree(tester);
     });
 
@@ -599,8 +674,10 @@ void main() {
       await teardownTree(tester);
     });
 
-    // R1-4: look-alike copies can be told apart where it matters most.
-    testWidgets('look-alike targets show their album and a short id in the '
+    // R1-4: look-alike copies show their album, and no ID, in the review
+    // or in the confirmation (owner, 2026-11-17: "We should never reveal
+    // track ids to users.").
+    testWidgets('look-alike targets show their album and no ID in the '
         'review and in the confirmation', (tester) async {
       Map<String, dynamic> twin(String uuid) => {
         ...previewTargetJson(uuid, 1),
@@ -624,22 +701,20 @@ void main() {
           findsWidgets,
         );
         expect(
-          find.descendant(
-            of: target(u),
-            matching: find.textContaining(u.substring(0, 8)),
-          ),
+          find.descendant(of: target(u), matching: find.text('Same')),
           findsOneWidget,
         );
       }
-      expect(
-        find.descendant(of: target('c'), matching: find.textContaining('ID ')),
-        findsNothing,
-      );
+      expect(find.textContaining('ID '), findsNothing);
+      expect(find.textContaining('aaaa1111'), findsNothing);
+      expect(find.textContaining('bbbb2222'), findsNothing);
       await openDialog(tester);
       final text = dialogText(tester);
-      expect(text, contains('aaaa1111'));
-      expect(text, contains('bbbb2222'));
+      expect(text, isNot(contains('ID ')));
+      expect(text, isNot(contains('aaaa1111')));
+      expect(text, isNot(contains('bbbb2222')));
       expect(text, contains('Record'));
+      expect('Same'.allMatches(text).length, 2);
       await teardownTree(tester);
     });
 

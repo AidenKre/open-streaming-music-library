@@ -21,17 +21,19 @@ from dataclasses import dataclass
 import shutil
 
 from app.core.operator_log import operator_logger
-from app.database.database import StorageTotals, _require_owner
+from app.core.storage_purposes import (
+    CONVERSION,
+    IMPORT_UNPACK,
+    UPLOAD_EXPAND,
+    UPLOAD_RECEIVE,
+    UPLOAD_SOURCE,
+    UPLOAD_WORK,
+    UPLOAD_WORK_RESERVE,
+)
+from app.core.owner import _require_owner
+from app.database.database import StorageTotals
 
 logger = logging.getLogger(__name__)
-
-CONVERSION = "conversion"
-UPLOAD_RECEIVE = "upload_receive"
-UPLOAD_SOURCE = "upload_source"
-UPLOAD_WORK_RESERVE = "upload_work_reserve"
-UPLOAD_WORK = "upload_work"
-UPLOAD_EXPAND = "upload_expand"
-IMPORT_UNPACK = "import_unpack"
 
 
 @dataclass(frozen=True)

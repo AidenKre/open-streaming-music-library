@@ -11,7 +11,7 @@ class _ManualConnect {
 
   /// The server-address screen's sentences when the address cannot be used
   /// (other-issues row 66: fixed sentences; the detail goes to the session
-  /// log). The second is proposed to the owner, not yet approved.
+  /// log).
   static const _unreachable = 'Could not reach the server.';
   static const _identityUnreadable = "Could not read the server's identity.";
 

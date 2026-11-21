@@ -104,6 +104,9 @@ class TrackDownloader {
 
   Directory? _downloadDir;
 
+  /// An `X-Audio-Extension` value this downloader puts in a file name.
+  static final RegExp _usableExtension = RegExp(r'^[A-Za-z0-9]{1,16}$');
+
   /// Test seam fired immediately before the partial→destination rename. Lets
   /// a test deterministically interleave a reset with the commit step so the
   /// rename-race fix can be regressed. Surface via
@@ -205,9 +208,15 @@ class TrackDownloader {
     // Always use the server's X-Audio-Extension header for the saved extension.
     // The backend may return passthrough bytes even for a transcoded-quality
     // request (e.g. source is already at or below the requested bitrate), so
-    // assuming `.m4a` for non-original would mislabel the file. Fall back to
-    // 'audio' only when the header is missing.
-    final ext = response.headers['x-audio-extension'] ?? 'audio';
+    // assuming `.m4a` for non-original would mislabel the file. The header
+    // becomes part of the file name, so only a plain extension is used; a
+    // missing or unusable one (a separator, `..`, empty) falls back to
+    // 'audio'. Lower-cased: on a case-insensitive disk `.M4A` and `.m4a`
+    // are one file, while the clean-up compares paths as strings.
+    final header = response.headers['x-audio-extension'];
+    final ext = header != null && _usableExtension.hasMatch(header)
+        ? header.toLowerCase()
+        : 'audio';
 
     // For replacement jobs we write to a distinct filename so a same-extension
     // replacement cannot disturb the old file before the DB swap commits.
@@ -644,7 +653,7 @@ class TrackDownloader {
   /// when ALL hold: [dir] is a real directory (not a link); the entry is a
   /// regular file (not a link) listed non-recursively; its basename matches
   /// the patterns above; and no track row names it, by full path or by
-  /// basename (the documents folder can move). Rows are read once, first; if
+  /// basename (the app's files folder can move). Rows are read once, first; if
   /// that fails nothing is done. Never fails the download.
   Future<void> _sweepLeftovers(Directory dir) async {
     try {
@@ -735,6 +744,12 @@ class TrackDownloader {
   /// (outside the folder, by path or through a link) is left where it is
   /// and reported once: this throws [DownloadsLeftByReset]. Its row no longer names it,
   /// so a rerun of the reset finds nothing to report.
+  ///
+  /// A downloads folder, or a link in its place, still there after its
+  /// removal throws a [FileSystemException], so the reset is incomplete and
+  /// runs again at the next launch. Where this run also throws
+  /// [DownloadsLeftByReset], that is reported first and the folder at the
+  /// next run. A plain file in the folder's place is left and not reported.
   Future<void> deleteDownloadsForReset() async {
     final String? token;
     final List<String> paths;
@@ -771,10 +786,14 @@ class TrackDownloader {
     // file itself not followed), read before the folder goes. Whatever the
     // clean-up decided, every one is looked for again below.
     final recorded = [for (final path in paths) await _realLocation(path)];
-    final root = await _realLocation(
-      p.join((await _directoryProvider()).path, 'tracks'),
-    );
+    final folder = p.join((await _directoryProvider()).path, 'tracks');
+    final root = await _realLocation(folder);
     await deleteDownloadDirectory();
+    // Left: the folder, or a link in its place, is still there. A plain
+    // file named like the folder is not the app's and is never removed.
+    final folderLeft = _removableFolderTypes.contains(
+      await FileSystemEntity.type(folder, followLinks: false),
+    );
     var left = 0;
     for (final path in recorded) {
       // A file the folder's removal took was the app's own.
@@ -785,6 +804,12 @@ class TrackDownloader {
       }
     }
     if (left > 0) throw DownloadsLeftByReset(left);
+    if (folderLeft) {
+      throw FileSystemException(
+        'The downloads folder could not be removed',
+        folder,
+      );
+    }
   }
 
   /// [path] with its folder's links resolved; the last part is not followed.
@@ -798,16 +823,30 @@ class TrackDownloader {
     }
   }
 
-  /// Removes the entire downloads directory (including any partials).
+  /// What [deleteDownloadDirectory] removes in the downloads folder's place:
+  /// the folder itself, or a link there (as a link).
+  static const _removableFolderTypes = {
+    FileSystemEntityType.directory,
+    FileSystemEntityType.link,
+  };
+
+  /// Removes the entire downloads directory (including any partials). A link
+  /// in its place (to a drive that is not mounted, say) is removed as a
+  /// link, never followed: nothing behind it goes. Anything else there (a
+  /// plain file) is not the app's folder and is left.
   Future<void> deleteDownloadDirectory() async {
-    final dir =
-        _downloadDir ??
-        Directory(p.join((await _directoryProvider()).path, 'tracks'));
+    final path =
+        _downloadDir?.path ??
+        p.join((await _directoryProvider()).path, 'tracks');
     _downloadDir = null;
     _dirPreparation = null;
     try {
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
+      final type = await FileSystemEntity.type(path, followLinks: false);
+      if (type == FileSystemEntityType.directory) {
+        // Links inside are removed as links, never followed.
+        await Directory(path).delete(recursive: true);
+      } else if (type == FileSystemEntityType.link) {
+        await Link(path).delete();
       }
     } catch (_) {}
   }
@@ -851,8 +890,7 @@ class _CommitStep {
 }
 
 /// What the reset says about downloaded files it left on the device
-/// (shown in the "Reset incomplete" dialog). Proposed wording, for the
-/// owner.
+/// (shown in the "Reset incomplete" dialog).
 const downloadsLeftByResetMessage =
     'Downloaded files outside this app’s downloads folder were left where '
     'they are. The app will not delete them.';

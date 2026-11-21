@@ -515,11 +515,11 @@ def test_review_r1_f1_a_bind_on_a_tokenless_unbound_row_binds_nothing(db, sam):
 def test_review_r1_f2_the_summary_is_one_consistent_read(db, sam, monkeypatch):
     """A row the sender settles while the summary is being read appears in
     all of its parts or in none."""
-    from app.database import database as database_module
+    from app.database import lastfm as lastfm_module
 
     _queue(db, sam.owner_id, "f1", "failed", "13", NOW)
     _queue(db, sam.owner_id, "p1")
-    real_loads = database_module.json.loads
+    real_loads = lastfm_module.json.loads
     settled = []
 
     def loads_then_settle(text, *args, **kwargs):
@@ -532,7 +532,7 @@ def test_review_r1_f2_the_summary_is_one_consistent_read(db, sam, monkeypatch):
             conn.close()
         return real_loads(text, *args, **kwargs)
 
-    monkeypatch.setattr(database_module.json, "loads", loads_then_settle)
+    monkeypatch.setattr(lastfm_module.json, "loads", loads_then_settle)
 
     summary = sam.get_lastfm_outbox_summary(WINDOW)
 

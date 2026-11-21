@@ -20,7 +20,7 @@ from anyio import to_thread
 from app.core.operator_log import operator_logger
 from app.core.bounded_body import BodyTooLarge, capped_chunks
 from app.core.durable_fs import fsync_dir
-from app.core.upload_states import ENDED_STATES, SOURCE_GIVEN_BACK_STATES
+from app.core.upload_states import SOURCE_GIVEN_BACK_STATES
 from app.services import job_runtime
 from app.services.path_sanitize import assert_within
 from app.services.storage_ledger import (
@@ -55,13 +55,6 @@ CHUNK_SIZE = 1024 * 1024
 IDLE_TIMEOUT_S = 30
 PROGRESS_INTERVAL_S = 1.0
 BUSY_RETRY_AFTER_S = 5
-
-job_runtime.register_job_table(
-    "upload_items",
-    key_columns=("owner_id", "item_uuid"),
-    state_column="state",
-    terminal_states=ENDED_STATES,
-)
 
 
 class TransferSlot:

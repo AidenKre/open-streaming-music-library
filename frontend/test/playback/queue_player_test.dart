@@ -4730,6 +4730,90 @@ void main() {
       expect(c.read(currentTrackProvider)?.uuidId, 'c');
     });
 
+    // The OPEN-8-11 rule for the other resume, a preview
+    // that took the output and hands it back without having played
+    // (AudioFocus.handBack). An end landing rests paused; a landing that
+    // plays on keeps resuming as before.
+    Future<(ProviderContainer, AudioFocus)> previewHolds(
+        _ScriptedSync sync, List<String> uuids, String current) async {
+      final timers = FakeTimers();
+      final focus = AudioFocus(sessionPort, timer: timers.create);
+      addTearDown(focus.dispose);
+      await fixture.insertSingles(uuids);
+      final c = createContainer(sync: sync, focus: focus);
+      await playFromTrackList(c, uuids, await fixture.track(current),
+          sourceType: 'test');
+      // The fake engine never asks for the output: take it as play() would.
+      expect(await focus.beforePlay(AudioOutput.queue), isTrue);
+      focus.bind(AudioOutput.preview, RelinquishingOwner('preview'));
+      fakePlayer.emitPlayerState(
+          const EngineTransportState(true, EngineProcessingState.ready));
+      await pumpEventQueue();
+      expect(c.read(currentTrackProvider)?.uuidId, current);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+
+      bool? granted;
+      unawaited(focus.acquire(AudioOutput.preview).then((g) => granted = g));
+      await pumpEventQueue();
+      expect(granted, isTrue);
+      expect(focus.holder, AudioOutput.preview);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+      return (c, focus);
+    }
+
+    test('a preview took the output, then the playing last track is '
+        'deleted: the output coming back unused does not start the new '
+        'last track', () async {
+      final sync = _ScriptedSync();
+      final (c, focus) = await previewHolds(sync, const ['a', 'b', 'c'], 'c');
+
+      await tombstone(sync, const ['c']);
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+      final plays = fakePlayer.playCalls;
+
+      focus.handBack(AudioOutput.preview);
+      await pumpEventQueue();
+      expect(fakePlayer.playCalls, plays, reason: 'rests paused (DEV-8-09)');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse);
+      expect(c.read(currentTrackProvider)?.uuidId, 'b');
+    });
+
+    test('as before: a preview took the output, then the playing '
+        'middle track is deleted: the next track plays when the output '
+        'comes back unused', () async {
+      final sync = _ScriptedSync();
+      final (c, focus) = await previewHolds(sync, const ['a', 'b', 'c'], 'b');
+
+      await tombstone(sync, const ['b']);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isFalse,
+          reason: 'the preview still holds the output');
+      final plays = fakePlayer.playCalls;
+
+      focus.handBack(AudioOutput.preview);
+      await pumpEventQueue();
+      expect(fakePlayer.playCalls, plays + 1);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
+    test('as before: a preview took the output, then a track that is '
+        'not playing is deleted: the same track plays when the output comes '
+        'back unused', () async {
+      final sync = _ScriptedSync();
+      final (c, focus) = await previewHolds(sync, const ['a', 'b', 'c'], 'c');
+
+      await tombstone(sync, const ['a']);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+      final plays = fakePlayer.playCalls;
+
+      focus.handBack(AudioOutput.preview);
+      await pumpEventQueue();
+      expect(fakePlayer.playCalls, plays + 1);
+      expect(c.read(queuePlayerProvider).playback.playWhenReady, isTrue);
+      expect(c.read(currentTrackProvider)?.uuidId, 'c');
+    });
+
     test('F903-B-03: the playing last track is deleted and the landing\'s '
         'queue read fails: nothing changes, the engine is not paused',
         () async {

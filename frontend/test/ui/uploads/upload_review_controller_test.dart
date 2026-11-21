@@ -17,12 +17,18 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart' show StateProvider;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/authenticated_client.dart'
+    show TokenWithheldException;
+import 'package:frontend/api/gated_send.dart'
+    show BindingNotVerified, BindingRefusal;
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/metadata_edit.dart';
+import 'package:frontend/models/server_blocked_reason.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/providers.dart' show databaseProvider;
 import 'package:frontend/services/app_info_service.dart';
+import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/services/operations/durable_submission.dart';
 import 'package:frontend/services/uploads/upload_duplicate_decisions.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
@@ -236,6 +242,7 @@ void main() {
   late StreamController<List<UploadIntentRecord>> intents;
   late StateProvider<UploadsOverview?> overview;
   late Map<String, StreamController<TrackUI?>> tracks;
+  late StateProvider<ServerBlockedReason> blocked;
   late ProviderContainer container;
 
   setUp(() {
@@ -248,8 +255,14 @@ void main() {
       (ref) => fakeUploadsOverview(const []),
     );
     tracks = {};
+    blocked = StateProvider<ServerBlockedReason>(
+      (ref) => ServerBlockedReason.none,
+    );
     container = ProviderContainer(
       overrides: [
+        libraryToolsServerBlockedProvider.overrideWith(
+          (ref) => ref.watch(blocked),
+        ),
         uploadReviewProvider.overrideWithValue(review),
         appInfoProvider.overrideWith((ref) async => defaultAppInfo()),
         previewControlsProvider.overrideWithValue(preview),
@@ -353,6 +366,222 @@ void main() {
       expect(c.total, 0);
       expect(c.current, isNull);
       expect(c.positionText, '');
+      c.dispose();
+    });
+  });
+
+  // A failed load says why, and offers Try again only where it
+  // can help (a different server or a sign-out is cleared by the banner).
+  group('a failed load names its reason', () {
+    Future<UploadReviewControls> failedWith(Object error,
+        {ServerBlockedReason block = ServerBlockedReason.none,
+        String? at}) async {
+      container.read(blocked.notifier).state = block;
+      review.snapshotError = error;
+      final c = container.read(uploadReviewControllerFactoryProvider)();
+      await c.start('b-1', startAt: at);
+      expect(c.load, ReviewLoad.failed);
+      return c;
+    }
+
+    test('a different server: that reason, Try again does not help',
+        () async {
+      final c = await failedWith(
+        const BindingNotVerified(BindingRefusal.differentServer),
+        block: ServerBlockedReason.differentServer,
+      );
+      expect(c.loadUnreachable, LibraryToolsUnreachable.differentServer);
+      expect(c.loadRetryHelps, isFalse);
+      c.dispose();
+    });
+
+    test('signed out: that reason, Try again does not help', () async {
+      final c = await failedWith(
+        const BindingNotVerified(BindingRefusal.noSession),
+        block: ServerBlockedReason.signedOut,
+      );
+      expect(c.loadUnreachable, LibraryToolsUnreachable.signedOut);
+      expect(c.loadRetryHelps, isFalse);
+      c.dispose();
+    });
+
+    test('not verified yet, a withheld token or a network error: needs a '
+        'connection, Try again helps', () async {
+      for (final error in <Object>[
+        const BindingNotVerified(),
+        const TokenWithheldException(),
+        NetworkException('down', attemptsMade: 1),
+      ]) {
+        final c = await failedWith(error);
+        expect(c.loadUnreachable, LibraryToolsUnreachable.needsConnection,
+            reason: '$error');
+        expect(c.loadRetryHelps, isTrue, reason: '$error');
+        c.dispose();
+      }
+    });
+
+    test('any other failure: no reason, Try again helps', () async {
+      final c = await failedWith(StateError('broken'));
+      expect(c.loadUnreachable, isNull);
+      expect(c.loadRetryHelps, isTrue);
+      c.dispose();
+    });
+
+    // While the session is blocked, the banner's reason is the page's
+    // reason, whatever made the load fail: Try again cannot clear a block.
+    test('any other failure while the session is blocked: the block\'s '
+        'reason, Try again does not help', () async {
+      final c = await failedWith(
+        StateError('broken'),
+        block: ServerBlockedReason.signedOut,
+      );
+      expect(c.loadUnreachable, LibraryToolsUnreachable.signedOut);
+      expect(c.loadRetryHelps, isFalse);
+      c.dispose();
+    });
+
+    test('any other failure, then the session signs out: the block\'s '
+        'reason, Try again does not help', () async {
+      final c = await failedWith(StateError('broken'));
+      var notified = 0;
+      c.addListener(() => notified++);
+      container.read(blocked.notifier).state = ServerBlockedReason.signedOut;
+      await settle();
+      expect(notified, greaterThan(0));
+      expect(c.loadUnreachable, LibraryToolsUnreachable.signedOut);
+      expect(c.loadRetryHelps, isFalse);
+      c.dispose();
+    });
+
+    test('the session blocking after the failure changes the reason and '
+        'takes Try again away; a load that then succeeds has no reason',
+        () async {
+      final c = await failedWith(const BindingNotVerified());
+      var notified = 0;
+      c.addListener(() => notified++);
+      container.read(blocked.notifier).state = ServerBlockedReason.signedOut;
+      await settle();
+      expect(notified, greaterThan(0));
+      expect(c.loadUnreachable, LibraryToolsUnreachable.signedOut);
+      expect(c.loadRetryHelps, isFalse);
+
+      container.read(blocked.notifier).state = ServerBlockedReason.none;
+      review.snapshotError = null;
+      await c.start('b-1');
+      expect(c.load, ReviewLoad.ready);
+      expect(c.loadUnreachable, isNull);
+      c.dispose();
+    });
+  });
+
+  // The review: a load refused while the session shows a different
+  // server does not keep the different-server sentence once the bound
+  // server answers again (the block clears): the page then shows the
+  // generic failure with Try again. It does not reload by itself.
+  group('the review forgets a different-server reason when the '
+      'server block clears', () {
+    int snapshots() =>
+        review.calls.where((c) => c.startsWith('snapshot')).length;
+
+    Future<UploadReviewControls> refusedAsDifferentServer(
+        {Object error =
+            const BindingNotVerified(BindingRefusal.differentServer)}) async {
+      container.read(blocked.notifier).state =
+          ServerBlockedReason.differentServer;
+      review.snapshotError = error;
+      final c = container.read(uploadReviewControllerFactoryProvider)();
+      await c.start('b-1', startAt: 'b');
+      expect(c.loadUnreachable, LibraryToolsUnreachable.differentServer);
+      expect(c.loadRetryHelps, isFalse);
+      return c;
+    }
+
+    /// The bound server answers again: the session's block clears.
+    Future<void> blockClears() async {
+      container.read(blocked.notifier).state = ServerBlockedReason.none;
+      await settle();
+    }
+
+    test('the block clears: the generic failure with Try again, nothing read',
+        () async {
+      final c = await refusedAsDifferentServer();
+      var notified = 0;
+      c.addListener(() => notified++);
+      await blockClears();
+      expect(notified, greaterThan(0));
+      expect(c.load, ReviewLoad.failed);
+      expect(c.loadUnreachable, isNull);
+      expect(c.loadRetryHelps, isTrue);
+      expect(snapshots(), 1);
+      c.dispose();
+    });
+
+    test('also when the load had failed for want of a connection while the '
+        'block showed', () async {
+      final c = await refusedAsDifferentServer(
+        error: NetworkException('down', attemptsMade: 1),
+      );
+      await blockClears();
+      expect(c.loadUnreachable, isNull);
+      expect(c.loadRetryHelps, isTrue);
+      c.dispose();
+    });
+
+    test('then Try again shows the files, at the item asked for', () async {
+      final c = await refusedAsDifferentServer();
+      await blockClears();
+      review.snapshotError = null;
+      await c.start('b-1', startAt: 'b');
+      expect(c.load, ReviewLoad.ready);
+      expect(c.current!.itemUuid, 'b');
+      c.dispose();
+    });
+
+    test('while the server is still different, the reason stays', () async {
+      final c = await refusedAsDifferentServer();
+      await settle();
+      expect(c.loadUnreachable, LibraryToolsUnreachable.differentServer);
+      expect(c.loadRetryHelps, isFalse);
+      c.dispose();
+    });
+
+    test('a closed page hears nothing when the block clears', () async {
+      final c = await refusedAsDifferentServer();
+      var notified = 0;
+      c.addListener(() => notified++);
+      c.dispose();
+      await blockClears();
+      expect(notified, 0);
+      expect(snapshots(), 1);
+    });
+
+    test('a block that returns after clearing takes Try again away again',
+        () async {
+      final c = await refusedAsDifferentServer();
+      await blockClears();
+      expect(c.loadRetryHelps, isTrue);
+      container.read(blocked.notifier).state = ServerBlockedReason.signedOut;
+      await settle();
+      expect(c.loadUnreachable, LibraryToolsUnreachable.signedOut);
+      expect(c.loadRetryHelps, isFalse);
+      expect(snapshots(), 1);
+      c.dispose();
+    });
+
+    test('a failure that needed a connection while signed out: once the '
+        'sign-out clears, the generic failure with Try again, and nothing '
+        'reloads by itself', () async {
+      container.read(blocked.notifier).state = ServerBlockedReason.signedOut;
+      review.snapshotError = const BindingNotVerified();
+      final c = container.read(uploadReviewControllerFactoryProvider)();
+      await c.start('b-1');
+      expect(c.loadUnreachable, LibraryToolsUnreachable.signedOut);
+      expect(c.loadRetryHelps, isFalse);
+      await blockClears();
+      expect(snapshots(), 1);
+      expect(c.load, ReviewLoad.failed);
+      expect(c.loadUnreachable, isNull);
+      expect(c.loadRetryHelps, isTrue);
       c.dispose();
     });
   });

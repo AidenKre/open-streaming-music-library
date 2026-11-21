@@ -634,7 +634,25 @@ void main() {
       expect(p2.downloadedCodec, 'aac');
       expect(p2.staleDismissedAtRevision, 7);
       expect(p2.damagedFilePath, '/dl/p2.m4a');
-      expect(p2.title, before[1].title, reason: 'metadata untouched');
+    });
+
+    // Pre-Phase-10 download-state tidy (A2-5 (c)): the listed rows are read
+    // again whole, so a tag that changed since the list was read shows too.
+    test('re-reads the whole row: a changed tag shows with the download',
+        () async {
+      final before = await loadTracks();
+      await (db.update(db.trackmetadata)..where((t) => t.uuidId.equals('p2')))
+          .write(const TrackmetadataCompanion(
+              title: Value('Renamed'), coverArtId: Value(77)));
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('p2'))).write(
+        const TracksCompanion(filePath: Value('/dl/p2.m4a')),
+      );
+
+      final p2 = (await repo.withFreshDownloadState(before))[1];
+      expect(p2.uuidId, 'p2');
+      expect(p2.isDownloaded, isTrue);
+      expect(p2.title, 'Renamed');
+      expect(p2.coverArtId, 77);
     });
 
     test('preserves order and length, matching each row by uuid', () async {

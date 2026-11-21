@@ -46,7 +46,9 @@ class DownloadReconciliationService {
   /// Walks `tracks.file_path IS NOT NULL`, clears the download columns for
   /// rows whose file is missing, and bumps the download-status version when
   /// at least one row changed. Concurrent calls dedupe onto the running run
-  /// so app startup and a quick resume can't double-scan.
+  /// so app startup and a quick resume can't double-scan. A damaged download
+  /// (decision 6) is its `file_path`, so it is checked here too, and clearing
+  /// it drops its mark.
   ///
   /// Returns true iff any rows were updated.
   Future<bool> reconcile() {
@@ -69,24 +71,15 @@ class DownloadReconciliationService {
   /// Under the path lock (the downloader holds it from rename to DB write),
   /// re-checks that [path] is still missing and clears the download columns
   /// only if the row still points at that exact path. A download committed
-  /// meanwhile wins. [damagedOnly] forgets just a damaged-only copy's path.
-  /// Returns true iff the row changed. Never deletes a file.
-  Future<bool> _clearIfStillMissing(
-    String uuid,
-    String path, {
-    bool damagedOnly = false,
-  }) => _locks.withLock(path, () async {
-    if (await _fileExists(path)) return false;
-    final changed = damagedOnly
-        ? await (_db.update(_db.tracks)
-              ..where((t) =>
-                  t.uuidId.equals(uuid) & t.damagedFilePath.equals(path)))
-            .write(const TracksCompanion(damagedFilePath: Value(null)))
-        : await (_db.update(_db.tracks)
+  /// meanwhile wins. Returns true iff the row changed. Never deletes a file.
+  Future<bool> _clearIfStillMissing(String uuid, String path) =>
+      _locks.withLock(path, () async {
+        if (await _fileExists(path)) return false;
+        final changed = await (_db.update(_db.tracks)
               ..where((t) => t.uuidId.equals(uuid) & t.filePath.equals(path)))
             .write(clearedDownloadColumns);
-    return changed > 0;
-  });
+        return changed > 0;
+      });
 
   /// Marks a download that is on disk but failed to play as damaged
   /// (decision 6; playback marks only with evidence). `file_path` and the
@@ -128,24 +121,7 @@ class DownloadReconciliationService {
       }
     }
 
-    // A damaged file (decision 6) is its `file_path`, checked above. A store
-    // from before 2026-11-09 may hold a damaged path with `file_path`
-    // cleared; one removed outside the app is forgotten too.
-    final damaged = await _db
-        .customSelect(
-          'SELECT uuid_id, damaged_file_path FROM tracks '
-          'WHERE damaged_file_path IS NOT NULL AND file_path IS NULL',
-        )
-        .get();
-    final damagedGone = <(String, String)>[];
-    for (final r in damaged) {
-      final path = r.read<String>('damaged_file_path');
-      if (!await _fileExists(path)) {
-        damagedGone.add((r.read<String>('uuid_id'), path));
-      }
-    }
-
-    if (missing.isEmpty && damagedGone.isEmpty) return false;
+    if (missing.isEmpty) return false;
 
     // Per row: path lock, re-check, then the guarded write (no lock is taken
     // inside a transaction).
@@ -154,11 +130,6 @@ class DownloadReconciliationService {
     try {
       for (final (uuid, path) in missing) {
         if (await _clearIfStillMissing(uuid, path)) changed = true;
-      }
-      for (final (uuid, path) in damagedGone) {
-        if (await _clearIfStillMissing(uuid, path, damagedOnly: true)) {
-          changed = true;
-        }
       }
     } finally {
       if (changed) _statusReader.bumpVersion();

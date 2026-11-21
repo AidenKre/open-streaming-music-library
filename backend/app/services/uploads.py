@@ -1,9 +1,9 @@
 """Upload rules layer (Phase 7 spec §4).
 
 Lives here: allocation with its limit checks, the DTO builders (item_out,
-_batch_out; later GET routes reuse them), the read services over the shared
-keyset cursors (app.core.keyset_cursor), and cancel
-(CANCELLABLE is where later pieces register the states a cancel may leave).
+_batch_out; every route that returns a batch or an item builds it with them),
+the read services over the shared keyset cursors (app.core.keyset_cursor), and
+cancel (CANCELLABLE lists the states a cancel may leave).
 Routes stay thin and turn UploadError into HTTP; the database only stores.
 """
 
@@ -292,8 +292,9 @@ def list_items(library, batch_uuid: str, after: str | None, limit: int) -> Uploa
     return UploadItemPage(items=[item_out(r, library) for r in page], next_after=next_after)
 
 
-# Later pieces extend this: receiving (7A.2b), validating/review_ready (7A.2c),
-# duplicate_conflict (7A.3b) and the ZIP-parent rule (7A.2d).
+# The states a cancel may leave. A cancelled or expanded ZIP parent also
+# cancels its children that are in one of these states
+# (Database.cancel_upload_item).
 CANCELLABLE = frozenset(
     {"allocated", "receiving", "validating", "review_ready", "duplicate_conflict", "failed"})
 

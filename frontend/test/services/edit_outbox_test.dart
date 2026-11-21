@@ -887,6 +887,52 @@ void main() {
     expect(row.rejectionReason, 'Rejected by the server (invalid or locked field)');
   });
 
+  // The server refuses a body over its size cap with 413, and answers the
+  // same body the same way every time. Left pending, the edit was sent on
+  // every flush and later edits of the track merged into it, so none of
+  // them reached the server.
+  test('flush 413 (too large) reverts the optimistic write and is a '
+      'rejection that is not sent again', () async {
+    final db = await _boundDb();
+    addTearDown(db.close);
+    await _seedTrack(db, title: 'Old', revision: 5);
+    final outbox = _container(
+      db,
+      onPatch: (_) async => http.Response(
+        jsonEncode({
+          'detail': {
+            'error': 'request_too_large',
+            'message': 'Request body exceeds the size limit.',
+            'retryable': false,
+          },
+        }),
+        413,
+        headers: {'content-type': 'application/json'},
+      ),
+    ).read(editOutboxProvider);
+
+    await outbox.enqueue(
+      uuidId: 'u1',
+      edit: const MetadataEdit.empty().set('title', 'Very long'),
+      writeMode: EditWriteMode.dbOnly,
+      baseRevision: 5,
+    );
+    await outbox.flush(); // -> 413
+    final sent = _patchCalls.length;
+
+    final meta = await db
+        .customSelect("SELECT title FROM trackmetadata WHERE uuid_id='u1'")
+        .getSingle();
+    expect(meta.read<String>('title'), 'Old');
+    final row = await db.select(db.pendingEdits).getSingle();
+    expect(row.status, 'rejected');
+    expect(row.rejectionReason,
+        'The server did not accept this edit. It was too large.');
+
+    await outbox.flush();
+    expect(_patchCalls.length, sent, reason: 'a rejected edit is not resent');
+  });
+
   test('flush 422 must not revert over newer server truth pulled while pending',
       () async {
     final db = await _boundDb();
@@ -1407,6 +1453,12 @@ void main() {
       '410': () => http.Response('{"detail":"gone"}', 410,
           headers: {'content-type': 'application/json'}),
       '422': () => http.Response(jsonEncode({'detail': 'locked field'}), 422,
+          headers: {'content-type': 'application/json'}),
+      '413': () => http.Response(
+          jsonEncode({
+            'detail': {'error': 'request_too_large', 'retryable': false},
+          }),
+          413,
           headers: {'content-type': 'application/json'}),
     };
 

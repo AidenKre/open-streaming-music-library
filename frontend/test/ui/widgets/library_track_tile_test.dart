@@ -1,3 +1,4 @@
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -106,7 +107,11 @@ void main() {
   testWidgets('a download in an undecodable codec says so and is inert '
       'offline', (tester) async {
     var tapped = false;
-    final track = tracks['local']!.copyWith(downloadedCodec: 'alac');
+    final track = (await tester.runAsync(() async {
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('local')))
+          .write(const TracksCompanion(downloadedCodec: Value('alac')));
+      return BrowseRepository(db).getTrack('local');
+    }))!;
     await tester.pumpWidget(harness.wrap(
       Scaffold(
           body: LibraryTrackTile(track: track, onTap: () => tapped = true)),

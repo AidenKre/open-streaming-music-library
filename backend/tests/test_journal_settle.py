@@ -715,6 +715,33 @@ def test_f3_the_unreadable_line_is_written_only_when_the_file_was_removed(tmp_pa
     assert not any("unreadable" in line for line in lines)
 
 
+def test_the_settle_summary_names_an_unreadable_file_it_removed(tmp_path, caplog):
+    """A row whose only leftover is removed by rule c never reads as
+    "nothing was left to do"."""
+    w = world(tmp_path, intent="relocate", db_at="O", o=1, n=1, t=1, contents={"N": b"X|junk"})
+
+    run(w, caplog)
+
+    assert not w.paths["N"].exists() and _rows(w) == []
+    lines = [r.getMessage() for r in caplog.records if r.name == OPERATOR]
+    [summary] = [line for line in lines if "settled:" in line]
+    assert "an unreadable leftover file was removed" in summary
+    assert "nothing was left to do" not in summary
+
+
+def test_the_settle_summary_names_an_unreadable_staged_copy_it_removed(tmp_path, caplog):
+    """The staged copy's own removal by rule c."""
+    w = world(tmp_path, intent="relocate", db_at="N", n=1, t=1, contents={"T": b"X|junk"})
+
+    run(w, caplog)
+
+    assert not os.path.lexists(w.paths["T"]) and _rows(w) == []
+    lines = [r.getMessage() for r in caplog.records if r.name == OPERATOR]
+    [summary] = [line for line in lines if "settled:" in line]
+    assert "an unreadable leftover file was removed" in summary
+    assert "nothing was left to do" not in summary
+
+
 def test_f4_an_in_place_redo_waits_for_the_durable_point(tmp_path, monkeypatch):
     """The redo replaces the old bytes: like any deletion it comes after the
     durable point, so a failed point keeps the row and both files."""

@@ -142,5 +142,12 @@ class AuthMiddleware:
             is_master_admin=session.is_master_admin,
             session_hash=session.session_hash,
         )
-        scope = {**scope, "state": {**scope.get("state", {}), "principal": principal}}
+        scope = {
+            **scope,
+            "state": {
+                **scope.get("state", {}),
+                "principal": principal,
+                "library_folder": session.library_folder,
+            },
+        }
         await self.app(scope, receive, send)

@@ -3,6 +3,8 @@
 // review flow and the duplicate banners say the same thing. Plain words: no
 // error codes, paths, IDs, and never the server's raw `message`. Model code:
 // nothing from ui/.
+import 'package:frontend/services/uploads/upload_item_rules.dart'
+    show ServerItemState, UploadIntentState;
 import 'package:frontend/services/uploads/upload_types.dart'
     show LeftOutReason, ReselectOutcome, RetryOutcome;
 
@@ -46,7 +48,7 @@ const archiveFileSourceMissingText =
   bool fromArchive = false,
 }) => (
   // Only the row being received is uploading; a waiting one still waits.
-  status: fromOtherDevice && state == 'receiving'
+  status: fromOtherDevice && state == ServerItemState.receiving
       ? otherDeviceSendingStatus
       : uploadStatusText(state, errorCode: errorCode, paused: paused),
   detail: fromOtherDevice
@@ -68,37 +70,41 @@ String uploadStatusText(
   bool paused = false,
 }) =>
     switch ((state, errorCode)) {
-      ('allocated', 'upload_slots_busy' || 'upload_write_failed') =>
+      (
+        ServerItemState.allocated,
+        'upload_slots_busy' || 'upload_write_failed',
+      ) =>
         'Waiting for the server',
       (
-        'allocated',
+        ServerItemState.allocated,
         'user_staged_quota_exceeded' ||
             'staged_quota_exceeded' ||
             'insufficient_storage' ||
             'free_space_unknown',
       ) =>
         'Waiting for space',
-      ('allocating', _) => 'Preparing',
-      ('allocated', _) => 'Queued',
-      ('transferring' || 'receiving', _) => paused ? 'Paused' : 'Uploading',
-      ('validating', _) => 'Checking',
-      ('review_submitted', _) => 'Sending',
-      ('review_ready', 'upload_library_links_unsupported') =>
+      (UploadIntentState.allocating, _) => 'Preparing',
+      (ServerItemState.allocated, _) => 'Queued',
+      (UploadIntentState.transferring || ServerItemState.receiving, _) =>
+        paused ? 'Paused' : 'Uploading',
+      (ServerItemState.validating, _) => 'Checking',
+      (UploadIntentState.reviewSubmitted, _) => 'Sending',
+      (ServerItemState.reviewReady, 'upload_library_links_unsupported') =>
         "Can't be imported",
-      ('review_ready', _) => 'Ready for review',
-      ('committing', _) => 'Importing',
-      ('imported', _) => 'Imported',
-      ('duplicate', _) => 'Already in your library',
-      ('expanded', _) => 'Archive unpacked',
-      ('failed', _) => 'Failed',
-      ('duplicate_conflict', _) => 'Needs a decision',
-      ('expired', _) => 'Expired',
-      ('cancelled', _) => 'Cancelled',
-      ('cancelling', _) => 'Cancelling',
-      ('source_changed', _) => 'File changed',
-      ('needs_reselect', _) => 'Reselect file to retry',
-      ('rejected', _) => 'Not accepted',
-      ('on_other_device', _) => 'Waiting for the file',
+      (ServerItemState.reviewReady, _) => 'Ready for review',
+      (ServerItemState.committing, _) => 'Importing',
+      (ServerItemState.imported, _) => 'Imported',
+      (ServerItemState.duplicate, _) => 'Already in your library',
+      (ServerItemState.expanded, _) => 'Archive unpacked',
+      (ServerItemState.failed, _) => 'Failed',
+      (ServerItemState.duplicateConflict, _) => 'Needs a decision',
+      (ServerItemState.expired, _) => 'Expired',
+      (ServerItemState.cancelled, _) => 'Cancelled',
+      (UploadIntentState.cancelling, _) => 'Cancelling',
+      (UploadIntentState.sourceChanged, _) => 'File changed',
+      (UploadIntentState.needsReselect, _) => 'Reselect file to retry',
+      (UploadIntentState.rejected, _) => 'Not accepted',
+      (UploadIntentState.onOtherDevice, _) => 'Waiting for the file',
       _ => 'Unknown status',
     };
 
@@ -113,7 +119,7 @@ String? uploadDetailText(
   bool fromArchive = false,
 }) =>
     switch (state) {
-      'allocated' => switch (errorCode) {
+      ServerItemState.allocated => switch (errorCode) {
         'upload_slots_busy' =>
           'The server is busy with other uploads. This one will start soon.',
         'user_staged_quota_exceeded' =>
@@ -141,16 +147,17 @@ String? uploadDetailText(
       // then); also reached on the device that added it, after it lost its
       // record (a sign-out and sign-in, a reset), so name no device
       // (sign-off s7-app-texts, owner 2026-11-17).
-      'on_other_device' =>
+      UploadIntentState.onOtherDevice =>
         "This device cannot find this file, so it can't send it. Cancel it "
             'and add it again.',
-      'needs_reselect' =>
+      UploadIntentState.needsReselect =>
         'This app can no longer open the file. Pick the same file again to '
             'continue.',
-      'source_changed' =>
+      UploadIntentState.sourceChanged =>
         'The file changed after it was picked. Pick the original file again, '
             'or cancel it and add it again.',
-      'failed' || 'rejected' => switch (errorCode) {
+      ServerItemState.failed ||
+      UploadIntentState.rejected => switch (errorCode) {
         'upload_too_large' => 'This file is larger than the server accepts.',
         'upload_limit_exceeded' =>
           'This upload is over a limit set by the server.',
@@ -158,13 +165,22 @@ String? uploadDetailText(
         'upload_length_mismatch' =>
           'The server received different bytes than the file you picked.',
         'upload_write_failed' => 'The server could not store the file.',
+        // An archive's file list offers no Retry or Cancel for a file.
+        'user_staged_quota_exceeded' when fromArchive =>
+          'Your upload space on the server is full.',
         'user_staged_quota_exceeded' =>
           'Your upload space on the server is full. Import or cancel other '
               'files, then try again.',
+        'staged_quota_exceeded' when fromArchive =>
+          "The server's upload space is full.",
         'staged_quota_exceeded' =>
           "The server's upload space is full. Try again later.",
+        'insufficient_storage' when fromArchive =>
+          "The server doesn't have enough free space.",
         'insufficient_storage' =>
           "The server doesn't have enough free space. Try again later.",
+        'free_space_unknown' when fromArchive =>
+          "The server can't check its free space right now.",
         'free_space_unknown' =>
           "The server can't check its free space right now. Try again later.",
         'upload_item_not_receivable' =>
@@ -173,10 +189,16 @@ String? uploadDetailText(
         'upload_invalid_audio' => "This file isn't readable audio.",
         'upload_unsupported_audio' =>
           "The server doesn't accept this audio format.",
+        'probe_timeout' when fromArchive =>
+          "The server couldn't check this file in time.",
         'probe_timeout' =>
           "The server couldn't check this file in time. Try again.",
+        'probe_unavailable' when fromArchive =>
+          "The server can't check files right now.",
         'probe_unavailable' =>
           "The server can't check files right now. Try again later.",
+        'upload_validation_failed' when fromArchive =>
+          "The server couldn't finish checking this file.",
         'upload_validation_failed' =>
           "The server couldn't finish checking this file. Try again.",
         // Retry needs the bytes again: only a device that has them can
@@ -216,7 +238,7 @@ String? uploadDetailText(
           'The server no longer has this upload. Add the file again.',
         _ => "The upload couldn't be completed.",
       },
-      'review_ready' => switch (errorCode) {
+      ServerItemState.reviewReady => switch (errorCode) {
         null => null,
         'upload_library_links_unsupported' =>
           "This server's music library can't accept uploads. Ask whoever "
@@ -254,12 +276,12 @@ String? uploadDetailText(
           "The server couldn't read the file after preparing it.",
         _ => "The import couldn't be finished. Try again.",
       },
-      'duplicate_conflict' =>
+      ServerItemState.duplicateConflict =>
         'A matching track was added to your library after review.',
-      'expired' when errorCode == 'upload_batch_not_found' =>
+      ServerItemState.expired when errorCode == 'upload_batch_not_found' =>
         'The server no longer has a record of this upload. Check your '
             "library, and add the file again if it isn't there.",
-      'expired' =>
+      ServerItemState.expired =>
         'This file was kept too long without being imported. Add it again '
             'to upload it.',
       _ => null,

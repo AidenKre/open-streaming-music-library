@@ -49,6 +49,7 @@ from app.services.journal_recovery import (
     finish_track_journal_rows,
     is_regular_file,
     reached_durable_point,
+    swap_waits_for_start,
 )
 from app.services.master_replace import MoveRefused, move_to_new_path
 from app.services.track_locks import TrackLocks
@@ -87,15 +88,19 @@ SWAP_REFUSED_ERROR = (
     "Convert it again."
 )
 # Only when that could not be taken back (U06-B-06): the committed conversion and
-# its journal row stay, and the next start puts the file in place.
+# its journal row stay, and every start reads the row again: it settles the job
+# from what it finds, or keeps the row (the rename may or may not have happened,
+# and may be refused again).
 SWAP_PENDING_ERROR = (
-    "The converted file could not replace the original. The server finishes it at its next start."
+    "The conversion could not be finished. The server checks this track at its next start."
 )
 # A lossy target whose codec the track already has, at a preset no lower than the
 # stored bitrate (less this tolerance: encoders land near, not on, their preset),
 # would only lose quality: re-encoding cannot add what the file lacks.
 SAME_FORMAT_BITRATE_TOLERANCE_KBPS = 8.0
-ALREADY_IN_FORMAT_ERROR = "The track is already in this format at this bitrate or higher"
+ALREADY_IN_FORMAT_ERROR = (
+    "The track is already in this format. Converting it again at this bitrate cannot improve it."
+)
 
 _INT_SAMPLE_FMT_BITS = {"u8": 8, "u8p": 8, "s16": 16, "s16p": 16, "s32": 32, "s32p": 32}
 
@@ -132,7 +137,15 @@ class TargetPathTaken(Exception):
 
 class PendingRecovery(Exception):
     """An earlier destructive step on this track (a journal row) is still
-    awaiting reconcile; converting now could clobber or orphan it."""
+    awaiting reconcile; converting now could clobber or orphan it.
+
+    ``message`` is the client-shown sentence when one fits the state (a swap
+    that waits for the next start: its job's own ``SWAP_PENDING_ERROR``), else
+    None."""
+
+    def __init__(self, *args, message: Optional[str] = None):
+        super().__init__(*args)
+        self.message = message
 
 
 class ConversionFailed(Exception):
@@ -381,10 +394,11 @@ class ConversionOrchestrator:
 
             self._finish_journal_rows(library, uuid_id)
             # Before the request's own checks: while an earlier file operation (e.g.
-            # a same-file swap the next start finishes, U06-B-06) is kept, the track's
-            # stored format may not be its file's yet.
+            # a same-file swap that only the next start settles, U06-B-06) is kept,
+            # the track's stored format may not be its file's yet.
             if library.has_journal_entry_for_uuid(uuid_id):
-                raise PendingRecovery(uuid_id)
+                waits = swap_waits_for_start(library, uuid_id)
+                raise PendingRecovery(uuid_id, message=SWAP_PENDING_ERROR if waits else None)
             _validate_request(track, target_codec, target_bitrate_kbps, self.available_encoders)
             _resolve_dest(source, target_codec, self._named_by_another_track(uuid_id))
 
@@ -497,7 +511,7 @@ class ConversionOrchestrator:
         with self.track_locks.lock(uuid_id):
             self._finish_journal_rows(library, uuid_id)
             if library.has_journal_entry_for_uuid(uuid_id):
-                raise PendingRecovery(f"{uuid_id} has an unfinished file operation awaiting recovery")
+                raise PendingRecovery("the track has an unfinished file operation awaiting recovery")
         if library.is_pending_deletion(uuid_id):
             raise TrackPendingDeletion(uuid_id)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
@@ -646,7 +660,9 @@ class ConversionOrchestrator:
                     # Best effort: the replace goes ahead either way (decision D10).
                     if not reached_durable_point(self.database):
                         operator_logger.warning(
-                            "conversion of track %s replaced its file before a database flush",
+                            "conversion of track %s: its file is about to be replaced although "
+                            "it could not be confirmed just now that database.db holds every "
+                            "saved change (the conversion itself is already on disk)",
                             uuid_id,
                         )
                     try:
@@ -714,7 +730,7 @@ class ConversionOrchestrator:
         staged copy is no longer there, so the rename may have happened) nothing
         is improvised: the committed conversion, its journal row and whatever is
         staged stay, as after a crash at this instant, the job says the next
-        start finishes it, and the next start does."""
+        start checks the track, and every start reads the row until it is settled."""
         undone = None
         if is_regular_file(staged):
             meta = before.metadata

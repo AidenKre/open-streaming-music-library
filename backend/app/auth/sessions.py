@@ -38,6 +38,7 @@ class LiveSession:
     user_id: int
     is_admin: bool
     is_master_admin: bool
+    library_folder: str
 
 
 def _live_session_from_row(row: dict | None) -> LiveSession | None:
@@ -48,6 +49,7 @@ def _live_session_from_row(row: dict | None) -> LiveSession | None:
         user_id=row["user_id"],
         is_admin=bool(row["is_admin"]),
         is_master_admin=bool(row["is_master_admin"]),
+        library_folder=row["library_folder"],
     )
 
 

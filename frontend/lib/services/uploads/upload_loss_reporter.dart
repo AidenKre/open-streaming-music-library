@@ -43,15 +43,6 @@ class UploadLossReporter implements LossReporter {
   final UploadIntentStore _intents;
   final ServerBindingRepository _binding;
 
-  static const _unsent = {
-    UploadIntentState.allocating,
-    UploadIntentState.allocated,
-    ServerItemState.receiving,
-    UploadIntentState.transferring,
-    UploadIntentState.needsReselect,
-    UploadIntentState.sourceChanged,
-  };
-
   /// The counts of every row on this device while a binding exists (rows kept
   /// by an ended sign-in included), or null with no binding. Throws when the
   /// binding or its intents cannot be read.
@@ -61,7 +52,7 @@ class UploadLossReporter implements LossReporter {
     var unsent = 0, drafts = 0, reviews = 0, cancels = 0;
     for (final i in await _intents.all()) {
       final state = i.lastState;
-      if (i.bytesOnThisDevice && _unsent.contains(state)) unsent++;
+      if (i.bytesOnThisDevice && unsentStates.contains(state)) unsent++;
       if (reviewableStates.contains(state) &&
           decodeDraft(i.draftJson).isNotEmpty) {
         drafts++;

@@ -280,8 +280,8 @@ SETS = r"\b{}\b\"?\s*="
 
 # Every place a statement writes ``tracks.file_path``: (file, function).
 PATH_WRITERS = {
-    ("app/database/database.py", "_insert_track_in"),
-    ("app/database/database.py", "_set_track_path_in"),
+    ("app/database/core.py", "_insert_track_in"),
+    ("app/database/tracks.py", "_set_track_path_in"),
     ("scripts/identity_benchmark.py", "_build"),
 }
 FOLDED_COLUMNS = ("file_path_fold", "file_folder_fold")

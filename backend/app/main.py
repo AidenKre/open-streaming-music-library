@@ -1,22 +1,17 @@
 import functools
-import json
 import logging
-import sqlite3
 import threading
 import time
-from uuid import UUID, uuid4
+from uuid import uuid4
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI
 
 from app.auth.passwords import prepare_dummy_hash
 from app.bootstrap import bootstrap_master_admin
 from app.config import ENV_FILE, settings
-from app.services.lastfm_accounts import build_lastfm_accounts, lastfm_available
+from app.services.lastfm_accounts import build_lastfm_accounts
 from app.services.lastfm_outbox import (
     install_scrobble_outbox,
     uninstall_scrobble_outbox,
@@ -25,7 +20,7 @@ from app.services.lastfm_sender import ScrobbleSender
 from app.services.lastfm_state import start_lastfm
 from app.auth.middleware import AuthMiddleware
 from app.core.access_log import install_access_log_redaction
-from app.library import Library, current_library, library_root
+from app.library import Library, library_root
 from app.core.instance_lock import acquire_instance_lock
 from app.core.operator_log import operator_logger
 from app.core.internal_dirs import STAGING, UPLOADS, ensure_internal_dirs, is_or_inside as _is_or_inside
@@ -36,69 +31,23 @@ from app.services.user_delete import (
 )
 from app.database import (
     ANY_OWNER,
-    AlbumOrderParameter,
-    AlbumRowFilterParameter,
-    ArtistOrderParameter,
-    ArtistRowFilterParameter,
-    ConversionJobActive,
     Database,
     DatabaseContext,
     server_database,
-    EmptyTrackEdit,
-    OrderParameter,
-    RevisionConflict,
-    RowFilterParameter,
-    SearchEntityType,
-    SearchParameter,
-    TrackNotFound,
-    TrackPendingDeletion,
 )
-from app.models import (
-    Album,
-    AppInfoResponse,
-    ChangeEntry,
-    ClientTrack,
-    ConversionCapabilities,
-    ConversionTargetInfo,
-    DeleteJobResponse,
-    EntityInfo,
-    FieldDescriptor,
-    GetAlbumsResponse,
-    GetArtistsResponse,
-    GetChangesResponse,
-    GetJobsResponse,
-    GetSearchResponse,
-    GetTracksResponse,
-    JobResponse,
-    PatchTrackResponse,
-    WarmRequest,
-    WarmResponse,
-    QualitySettingResponse,
-    SetQualityRequest,
-    SetQualityResponse,
-    Track,
-)
-from app.core.media_types import CODEC_MIME, MIME_EXTENSION, is_lossless
-from app.models.edit_fields import EDIT_FIELD_SPECS
-from app.models.api_return_models import (
-    AuthCapabilities,
-    HistoryCapabilities,
-    IntegrationsCapabilities,
-    LastfmCapability,
-    LibraryToolsCapabilities,
-    ServerInfo,
-    UploadLimitsInfo,
-    UploadsCapabilities,
-)
+from app.models import Track
 from app.services.upload_limits import effective_upload_limits
 from app.routers.auth import router as auth_router
+from app.routers.catalog import router as catalog_router
+from app.routers.streaming import router as streaming_router
+from app.routers.app_info import router as app_info_router
+from app.routers.tracks import router as tracks_router
+from app.routers.jobs import router as jobs_router
 from app.routers.history import router as history_router
 from app.routers.lastfm import router as lastfm_router
 from app.routers.deletions import router as deletions_router
 from app.routers.duplicates import router as duplicates_router
 from app.routers.uploads import router as uploads_router
-from app.core.api_errors import api_error
-from app.services.metadata import TagWriteError
 from app.services.job_runtime import CancelTokens
 from app.services.storage_ledger import StagedQuota, StorageLedger
 from app.services import deletion_recovery
@@ -106,27 +55,13 @@ from app.services import upload_commit, upload_janitor, upload_publish, upload_r
 from app.services import upload_receipt as upload_receipts
 from app.services import upload_validation, upload_zip
 from app.services import filesystem_check
-from app.core.byte_range import ranged_file_response
 from app.services.upload_receipt import ReceiptRuntime, TransferSlots
-from app.services.track_edit import (
-    TrackPatchRequest,
-    WriteMode,
-)
+from app.services.track_edit import WriteMode
 from app.services.conversion import (
-    ConversionJobStatus,
     ConversionOrchestrator,
-    ConversionRequestInvalid,
-    InsufficientDiskSpace,
-    MasterNotFound,
-    NoOpConversion,
-    PendingRecovery,
-    TargetPathTaken,
     reconcile_conversion_jobs,
 )
-from app.services.deletion_errors import track_pending_deletion_error
 from app.services.track_editor import (
-    MasterSwapPending,
-    MasterWriteError,
     PendingOldMasters,
     TrackEditor,
     finish_kept_journal_rows,
@@ -149,19 +84,13 @@ from app.services import (
     EncodedCacheContext,
     EncoderCoordinator,
     FileWatcher,
-    ORIGINAL_QUALITY,
-    QUALITY_BITRATES_KBPS,
-    normalize_quality,
     probe_available_encoders,
 )
-from app.services.encoder_coordinator import PrefetchOutcome
 from app.services.ffmpeg_runner import FfmpegProcessRegistry, kill_orphaned_ffmpeg
 from app.services import audio_identity
 from app.services.track_source import (
-    TrackSourceError,
     live_source_path,
     live_track_owner,
-    open_track_source,
 )
 from app.services.fingerprinter import detect_fingerprinter
 from app.services.startup_recovery import StartupStep, run_startup_recovery
@@ -175,30 +104,7 @@ from app.services.identity_worker import (
 from app.services.duplicate_detection import MatcherParams
 from app.services.identity_wakeup import IdentityWakeup
 from app.services.settle_check import SettleCheck, make_settle_refresh
-from app.services.job_request import PostJobRequest
-from app.services.transcoder import SUPPORTED_TARGET_CODECS
-
-
-def resolve_default_quality(stored: Optional[str]) -> str:
-    """Fallback chain stored (user_settings) -> env -> original; logs skipped values."""
-    for candidate, source_label in (
-        (stored, "persisted"),
-        (settings.default_streaming_quality, "env/config"),
-    ):
-        if candidate is None:
-            continue
-        try:
-            return normalize_quality(candidate)
-        except ValueError:
-            print(
-                f"Invalid {source_label} default_streaming_quality "
-                f"{candidate!r}; falling back."
-            )
-    print(
-        f"No valid default_streaming_quality configured; using "
-        f"{ORIGINAL_QUALITY!r}."
-    )
-    return ORIGINAL_QUALITY
+from app.services.transcoder import resolve_default_quality
 
 
 @asynccontextmanager
@@ -210,8 +116,7 @@ async def lifespan(_app: FastAPI):
         shutdown_event()
 
 
-# The POSIX instance lock guards startup before migrations; run with --workers 1.
-# TODO: Dependency inject depends on get_database into api endpoints (and make the new function needed for this)
+# The POSIX instance lock (taken in startup_event) lets one process own the data folder; run with --workers 1.
 app = FastAPI(lifespan=lifespan)
 app.include_router(uploads_router)
 app.include_router(deletions_router)
@@ -219,6 +124,11 @@ app.include_router(duplicates_router)
 app.include_router(history_router)
 app.include_router(auth_router)
 app.include_router(lastfm_router)
+app.include_router(catalog_router)
+app.include_router(streaming_router)
+app.include_router(app_info_router)
+app.include_router(tracks_router)
+app.include_router(jobs_router)
 # Spec §5.3: the auth boundary is the outermost user middleware. Starlette
 # wraps the last-added middleware outermost, so add any future middleware
 # before this line.
@@ -530,6 +440,10 @@ def _startup_locked():
         ),
     )
     app.state.database = database
+    # One idle connection for the life of the process, so no call's close is the
+    # last one (each would checkpoint the write-ahead log). Opened only once
+    # app.state.database is set, because the teardown closes what that name holds.
+    database.hold_open()
     # Post-commit wake-up for the audio-identity writers, and the registry that
     # lets shutdown kill the ingest hashes.
     app.state.identity_wakeup = IdentityWakeup()
@@ -603,7 +517,8 @@ def _startup_locked():
         )
     )
     default_quality = resolve_default_quality(
-        app.state.admin_library.get_user_setting("default_streaming_quality")
+        app.state.admin_library.get_user_setting("default_streaming_quality"),
+        settings.default_streaming_quality,
     )
 
     app.state.encoded_cache = encoded_cache
@@ -1059,6 +974,12 @@ def _teardown(state, *, before_lock_release=None):
         if orchestrator:
             step(orchestrator.shutdown)
         step(_close_lastfm_client_when_sender_ends, state)
+        # Last of the stop steps, after everything that was asked to stop, so this
+        # close is the last one and checkpoints the write-ahead log; a worker that
+        # outlived its join only makes a later close the last.
+        database = getattr(state, "database", None)
+        if database is not None:
+            step(database.close)
         if errors:
             raise errors[0]  # reported once everything was asked to stop
     finally:
@@ -1098,890 +1019,6 @@ def _release_lock_when_done(instance_lock, futures: set) -> None:
 
     for future in futures:
         future.add_done_callback(one_done)
-
-
-# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
-# the app keeps its own copy of the library through GET /changes. It stays live
-# for other clients.
-@app.get("/tracks", response_model=GetTracksResponse, deprecated=True)
-def get_tracks(
-    cursor: Optional[str] = None,
-    limit: int = Query(500, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    artist_id: Optional[int] = None,
-    album_id: Optional[int] = None,
-    library: Library = Depends(current_library),
-):
-    """Browse tracks in display order (artist/album/disc/track), optionally
-    scoped by artist/album, with keyset cursor pagination. Incremental sync
-    lives on ``GET /changes`` — this endpoint no longer windows by timestamp
-    or returns tombstones."""
-
-    # ``album_id`` is only meaningful when paired with ``artist_id`` — the
-    # query layer rejects album-only filters because album IDs are not
-    # globally unique across artists. Reject at the API boundary so the
-    # client gets a clear 422 instead of a 500 from a deeper layer.
-    if album_id is not None and artist_id is None and not cursor:
-        raise HTTPException(
-            status_code=422,
-            detail="album_id requires artist_id",
-        )
-
-    search_parameters: List[SearchParameter]
-    order_parameters: List[OrderParameter]
-    if not cursor:
-        order_parameters = [
-            OrderParameter(column="artist", isAscending=True),
-            OrderParameter(column="album", isAscending=True),
-            OrderParameter(column="disc_number", isAscending=True),
-            OrderParameter(column="track_number", isAscending=True),
-            OrderParameter(column="uuid_id", isAscending=True),
-        ]
-        search_parameters = []
-        row_filter_parameters = []
-
-    else:
-        try:
-            decoded = json.loads(cursor)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400, detail="Cursor could not be decoded for json"
-            )
-        if not isinstance(decoded, dict):
-            raise HTTPException(
-                status_code=400, detail="Cursor did not decode to a dict"
-            )
-
-        cursor_dict: Dict[str, Any] = decoded
-
-        if not cursor_dict:
-            raise HTTPException(
-                status_code=400, detail="Cursor could not be decoded for json"
-            )
-
-        valid_cursor_keys = sorted(
-            [
-                "order_parameters",
-                "row_filter_parameters",
-                "search_parameters",
-                "artist_id",
-                "album_id",
-            ]
-        )
-        if sorted(cursor_dict.keys()) != valid_cursor_keys:
-            raise HTTPException(
-                status_code=400, detail="Invalid dictionary keys for the cursor_dict"
-            )
-
-        order_parameters = [
-            OrderParameter(**item) for item in cursor_dict["order_parameters"]
-        ]
-        search_parameters = [
-            SearchParameter(**item) for item in cursor_dict["search_parameters"]
-        ]
-        row_filter_parameters = [
-            RowFilterParameter(**item) for item in cursor_dict["row_filter_parameters"]
-        ]
-        artist_id = cursor_dict["artist_id"]
-        album_id = cursor_dict["album_id"]
-
-    remaining_track_count = library.get_tracks_count(
-        search_parameters=search_parameters,
-        order_parameters=order_parameters,
-        row_filter_parameters=row_filter_parameters,
-        artist_id=artist_id,
-        album_id=album_id,
-    )
-    if remaining_track_count is None:
-        raise HTTPException(
-            status_code=500, detail="Unable to get count of remaining tracks"
-        )
-
-    if remaining_track_count == 0 or offset >= remaining_track_count:
-        return GetTracksResponse(data=[], nextCursor=None)
-
-    gotten_tracks = library.get_tracks(
-        search_parameters=search_parameters,
-        order_parameters=order_parameters,
-        row_filter_parameters=row_filter_parameters,
-        artist_id=artist_id,
-        album_id=album_id,
-        limit=limit,
-        offset=offset,
-    )
-
-    client_track_list = [ClientTrack.from_track(track=track) for track in gotten_tracks]
-    if len(client_track_list) == remaining_track_count:
-        nextCursor = None
-    else:
-        last_track: ClientTrack = client_track_list[-1]
-
-        new_row_filter_parameters: List[RowFilterParameter] = []
-        for order_param in order_parameters:
-            col = order_param.column
-            # Linked to allowed track columns in database.py.
-            if col in ["uuid_id", "created_at", "last_updated"]:
-                raw_value = getattr(last_track, col)
-            else:
-                raw_value = getattr(last_track.metadata, col)
-            value = str(raw_value) if raw_value is not None else None
-            new_row_filter_parameters.append(
-                RowFilterParameter(column=col, value=value)
-            )
-
-        nextCursor = json.dumps(
-            {
-                "order_parameters": [asdict(param) for param in order_parameters],
-                "row_filter_parameters": [
-                    asdict(param) for param in new_row_filter_parameters
-                ],
-                "search_parameters": [asdict(param) for param in search_parameters],
-                "artist_id": artist_id,
-                "album_id": album_id,
-            }
-        )
-
-    return GetTracksResponse(
-        data=client_track_list,
-        nextCursor=nextCursor,
-    )
-
-
-@app.get("/changes", response_model=GetChangesResponse)
-def get_changes(
-    after_revision: int = Query(0, ge=0),
-    limit: int = Query(500, ge=1, le=1000),
-    library: Library = Depends(current_library),
-):
-    """Revision-based incremental sync. Returns ordered upsert/delete entries
-    with ``revision > after_revision``; the client persists the last applied
-    entry's revision and pages until ``nextCursor`` is null. ``after_revision=0``
-    is a full resync."""
-    try:
-        changes, latest_revision, next_cursor = library.get_changes(
-            after_revision=after_revision, limit=limit
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail="Failed to fetch changes"
-        ) from e
-
-    entries = [
-        ChangeEntry(
-            type=change.type,
-            revision=change.revision,
-            uuid_id=change.uuid_id,
-            track=(
-                ClientTrack.from_track(track=change.track)
-                if change.track is not None
-                else None
-            ),
-        )
-        for change in changes
-    ]
-
-    return GetChangesResponse(
-        changes=entries,
-        nextCursor=next_cursor,
-        latestRevision=latest_revision,
-    )
-
-
-_IMAGE_MIME: dict[str, str] = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-    ".bmp": "image/bmp",
-    ".tiff": "image/tiff",
-}
-
-
-@app.get("/cover_art/{cover_art_id}")
-def get_cover_art(cover_art_id: int, library: Library = Depends(current_library)):
-    # Busy is a retryable 503, as PATCH answers (Phase 10 replaces it with its typed busy answer).
-    try:
-        art = library.get_owned_cover_art(cover_art_id)
-    except sqlite3.OperationalError as e:
-        if "locked" in str(e).lower():
-            raise HTTPException(status_code=503, detail="Database busy, retry")
-        raise
-    path = None if art is None else art.file_path
-    if path is None or not path.exists():
-        raise HTTPException(status_code=404, detail="Cover art not found")
-    media_type = _IMAGE_MIME.get(path.suffix.lower(), "image/jpeg")
-    return FileResponse(
-        path,
-        media_type=media_type,
-        headers={"Cache-Control": "private, max-age=31536000, immutable"},
-    )
-
-
-@app.get("/tracks/{uuid_id:uuid}/stream")
-def stream_track(
-    uuid_id: UUID,
-    request: Request,
-    quality: Optional[str] = None,
-    library: Library = Depends(current_library),
-):
-    uuid_id = str(uuid_id)
-    CHUNK_SIZE = 1024 * 1024
-    try:
-        quality_canonical = normalize_quality(quality)
-    except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported quality preset: {quality}",
-        )
-
-    try:
-        opened = open_track_source(
-            library,
-            uuid_id,
-            quality_canonical,
-            coordinator=app.state.encoder_coordinator,
-        )
-    except TrackSourceError as exc:
-        raise exc.http()
-    track = opened.track
-    encode_result = opened.encode
-    file_path = encode_result.path
-
-    # Use audio/mp4 only when we actually transcoded; for passthrough (including
-    # ORIGINAL_QUALITY and bitrate-based passthrough) use the source codec's type
-    # so the MIME header always matches what is actually being served.
-    if encode_result.transcoded:
-        media_type = "audio/mp4"
-    else:
-        media_type = CODEC_MIME.get(
-            track.metadata.codec or "", f"audio/{track.metadata.codec or 'octet-stream'}"
-        )
-
-    # For passthrough/original responses, the source's own file extension is
-    # a better fallback than the literal string "audio" when the codec is not
-    # in [MIME_EXTENSION] (e.g. opus, vorbis) — that name is what the client
-    # would have got had it downloaded the source directly.
-    extension = MIME_EXTENSION.get(media_type)
-    if extension is None:
-        source_suffix = file_path.suffix.lstrip(".").lower() if not encode_result.transcoded else ""
-        extension = source_suffix or "audio"
-
-    # Codec + revision of what is actually served, so a client that saves the
-    # bytes can record exactly what it has (the revision is read before the
-    # encode, so a conversion landing mid-request errs toward "stale").
-    # X-Audio-Bitrate-Kbps is omitted when the bitrate is unknown, so the
-    # client records "unknown" rather than a fabricated 0.
-    extra_headers = {
-        **(
-            {"X-Audio-Bitrate-Kbps": str(encode_result.bitrate_kbps)}
-            if encode_result.bitrate_kbps is not None else {}
-        ),
-        "X-Audio-Extension": extension,
-        "X-Audio-Codec": "aac" if encode_result.transcoded else (track.metadata.codec or ""),
-        "X-Track-Revision": str(track.revision),
-    }
-
-    return ranged_file_response(
-        opened.file,
-        media_type=media_type,
-        range_header=request.headers.get("range"),
-        headers=extra_headers,
-        chunk_size=CHUNK_SIZE,
-    )
-
-
-# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
-# the app keeps its own copy of the library through GET /changes. It stays live
-# for other clients.
-@app.get("/artists", response_model=GetArtistsResponse, deprecated=True)
-def get_artists(
-    cursor: Optional[str] = None,
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    library: Library = Depends(current_library),
-):
-    order_parameters: List[ArtistOrderParameter]
-    row_filter_parameters: List[ArtistRowFilterParameter]
-
-    if not cursor:
-        order_parameters = [
-            ArtistOrderParameter(column="name", isAscending=True),
-        ]
-        row_filter_parameters = []
-    else:
-        try:
-            decoded = json.loads(cursor)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400, detail="Cursor could not be decoded as JSON"
-            )
-        if not isinstance(decoded, dict):
-            raise HTTPException(
-                status_code=400, detail="Cursor did not decode to a dict"
-            )
-
-        cursor_dict: Dict[str, Any] = decoded
-        valid_cursor_keys = sorted(["order_parameters", "row_filter_parameters"])
-        if sorted(cursor_dict.keys()) != valid_cursor_keys:
-            raise HTTPException(
-                status_code=400, detail="Invalid dictionary keys for the cursor"
-            )
-
-        order_parameters = [
-            ArtistOrderParameter(**item) for item in cursor_dict["order_parameters"]
-        ]
-        row_filter_parameters = [
-            ArtistRowFilterParameter(**item)
-            for item in cursor_dict["row_filter_parameters"]
-        ]
-
-    remaining_count = library.get_artists_count(
-        order_parameters=order_parameters,
-        row_filter_parameters=row_filter_parameters,
-    )
-    if remaining_count is None:
-        raise HTTPException(
-            status_code=500, detail="Unable to get count of remaining artists"
-        )
-
-    if remaining_count == 0 or offset >= remaining_count:
-        return GetArtistsResponse(data=[], nextCursor=None)
-
-    returned_artists = library.get_artists(
-        order_parameters=order_parameters,
-        row_filter_parameters=row_filter_parameters,
-        limit=limit,
-        offset=offset,
-    )
-
-    if returned_artists is None:
-        raise HTTPException(
-            status_code=500, detail="Unable to fetch artists from the database"
-        )
-
-    if len(returned_artists) == remaining_count:
-        nextCursor = None
-    else:
-        last_artist = returned_artists[-1]
-        new_row_filter_parameters = [
-            ArtistRowFilterParameter(column="name", value=last_artist.name),
-        ]
-
-        nextCursor = json.dumps(
-            {
-                "order_parameters": [asdict(param) for param in order_parameters],
-                "row_filter_parameters": [
-                    asdict(param) for param in new_row_filter_parameters
-                ],
-            }
-        )
-
-    return GetArtistsResponse(data=returned_artists, nextCursor=nextCursor)
-
-
-# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
-# the app keeps its own copy of the library through GET /changes. It stays live
-# for other clients.
-@app.get("/albums", response_model=GetAlbumsResponse, deprecated=True)
-def get_albums(
-    cursor: Optional[str] = None,
-    limit: int = Query(500, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    artist_id: Optional[int] = None,
-    library: Library = Depends(current_library),
-):
-    order_parameters: List[AlbumOrderParameter]
-    row_filter_parameters: List[AlbumRowFilterParameter]
-
-    if not cursor:
-        if artist_id is not None:
-            order_parameters = [
-                AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
-                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
-                AlbumOrderParameter(column="name", isAscending=True, nullsLast=True),
-            ]
-        else:
-            order_parameters = [
-                AlbumOrderParameter(column="artist", isAscending=True, nullsLast=True),
-                AlbumOrderParameter(column="year", isAscending=False, nullsLast=True),
-                AlbumOrderParameter(column="is_single_grouping", isAscending=True),
-                AlbumOrderParameter(column="name", isAscending=True, nullsLast=True),
-            ]
-        row_filter_parameters = []
-    else:
-        try:
-            decoded = json.loads(cursor)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400, detail="Cursor could not be decoded as JSON"
-            )
-        if not isinstance(decoded, dict):
-            raise HTTPException(
-                status_code=400, detail="Cursor did not decode to a dict"
-            )
-
-        cursor_dict: Dict[str, Any] = decoded
-        valid_cursor_keys = sorted(
-            ["order_parameters", "row_filter_parameters", "artist_id"]
-        )
-        if sorted(cursor_dict.keys()) != valid_cursor_keys:
-            raise HTTPException(
-                status_code=400, detail="Invalid dictionary keys for the cursor"
-            )
-
-        order_parameters = [
-            AlbumOrderParameter(**item) for item in cursor_dict["order_parameters"]
-        ]
-        row_filter_parameters = [
-            AlbumRowFilterParameter(**item)
-            for item in cursor_dict["row_filter_parameters"]
-        ]
-        artist_id = cursor_dict["artist_id"]
-
-    remaining_count = library.get_albums_count(
-        artist_id=artist_id,
-        order_parameters=order_parameters,
-        row_filter_parameters=row_filter_parameters,
-    )
-    if remaining_count is None:
-        raise HTTPException(status_code=500, detail="Unable to get count")
-
-    if remaining_count == 0 or offset >= remaining_count:
-        return GetAlbumsResponse(data=[], nextCursor=None)
-
-    returned_albums: List[Album] | None = library.get_albums(
-        artist_id=artist_id,
-        order_parameters=order_parameters,
-        row_filter_parameters=row_filter_parameters,
-        limit=limit,
-        offset=offset,
-    )
-
-    if returned_albums is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to fetch albums from the backends database",
-        )
-
-    if len(returned_albums) == remaining_count:
-        nextCursor = None
-    else:
-        last_album: Album = returned_albums[-1]
-        new_row_filter_parameters: List[AlbumRowFilterParameter] = []
-        for order_param in order_parameters:
-            col = order_param.column
-            raw_value: Any
-            if col == "name":
-                raw_value = last_album.name
-            elif col == "artist":
-                raw_value = last_album.artist
-            elif col == "year":
-                raw_value = last_album.year
-            elif col == "is_single_grouping":
-                raw_value = 1 if last_album.is_single_grouping else 0
-            else:
-                raw_value = None
-            value = str(raw_value) if raw_value is not None else None
-            new_row_filter_parameters.append(
-                AlbumRowFilterParameter(column=col, value=value)
-            )
-
-        nextCursor = json.dumps(
-            {
-                "order_parameters": [asdict(param) for param in order_parameters],
-                "row_filter_parameters": [
-                    asdict(param) for param in new_row_filter_parameters
-                ],
-                "artist_id": artist_id,
-            }
-        )
-
-    return GetAlbumsResponse(data=returned_albums, nextCursor=nextCursor)
-
-
-# Deprecated (the owner's decision of 2026-11-14): no app code calls this route;
-# the app keeps its own copy of the library through GET /changes. It stays live
-# for other clients.
-@app.get("/search", response_model=GetSearchResponse, deprecated=True)
-def search(
-    q: str = Query(..., min_length=1),
-    types: str = Query("tracks,artists,albums"),
-    limit: int = Query(10, ge=1, le=50),
-    library: Library = Depends(current_library),
-):
-    return_types = SearchEntityType(0)
-    for t in types.split(","):
-        t = t.strip().lower()
-        if t == "tracks":
-            return_types |= SearchEntityType.TRACKS
-        elif t == "artists":
-            return_types |= SearchEntityType.ARTISTS
-        elif t == "albums":
-            return_types |= SearchEntityType.ALBUMS
-
-    if not return_types:
-        raise HTTPException(status_code=400, detail="No valid types specified")
-
-    results = library.get_search_results(
-        query=q,
-        return_types=return_types,
-        limit_per_type=limit,
-    )
-
-    return GetSearchResponse(
-        tracks=[ClientTrack.from_track(t) for t in results.tracks],
-        artists=results.artists,
-        albums=results.albums,
-    )
-
-
-_WARM_MAX_UUIDS = 500
-
-
-@app.post("/tracks/warm", response_model=WarmResponse)
-def warm_tracks(
-    request: WarmRequest, library: Library = Depends(current_library)
-):
-    if len(request.track_uuids) > _WARM_MAX_UUIDS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Too many track_uuids: max {_WARM_MAX_UUIDS}",
-        )
-    try:
-        quality_canonical = normalize_quality(request.quality)
-    except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported quality preset: {request.quality}",
-        )
-
-    coordinator: EncoderCoordinator = app.state.encoder_coordinator
-    window = request.count if request.count is not None else settings.prefetch_lookahead
-    start = request.current_index
-    end = min(start + window, len(request.track_uuids))
-    queued = 0
-    skipped = 0
-    # Foreign and unknown uuids are dropped uncounted, so ALREADY_CACHED can't
-    # reveal another user's streaming.
-    for uuid_id in library.filter_owned_track_uuids(
-        request.track_uuids[start:end]
-    ):
-        outcome = coordinator.enqueue_prefetch(uuid_id, quality_canonical)
-        if outcome == PrefetchOutcome.QUEUED:
-            queued += 1
-        elif outcome in (
-            PrefetchOutcome.ALREADY_CACHED,
-            PrefetchOutcome.SKIPPED_ORIGINAL,
-        ):
-            skipped += 1
-
-    return WarmResponse(
-        accepted=True, prefetch_queued=queued, prefetch_skipped=skipped
-    )
-
-
-@app.get("/settings/quality", response_model=QualitySettingResponse)
-def get_quality_setting(library: Library = Depends(current_library)):
-    return QualitySettingResponse(
-        quality=resolve_default_quality(
-            library.get_user_setting("default_streaming_quality")
-        )
-    )
-
-
-@app.put("/settings/quality", response_model=SetQualityResponse)
-def set_quality_setting(
-    request: SetQualityRequest, library: Library = Depends(current_library)
-):
-    try:
-        quality_canonical = normalize_quality(request.quality)
-    except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported quality preset: {request.quality}",
-        )
-
-    # EncoderCoordinator.default_quality is the master admin's; any other
-    # caller only changes their own user_settings row (spec 6.1).
-    is_master_admin = library.owner_id == app.state.admin_user_id
-
-    try:
-        if is_master_admin:
-            coordinator: EncoderCoordinator = app.state.encoder_coordinator
-            _, warming = coordinator.persist_and_set_default_quality(
-                quality_canonical,
-                lambda q: library.set_user_setting("default_streaming_quality", q),
-                read_stored=lambda: library.get_user_setting("default_streaming_quality"),
-            )
-        else:
-            library.set_user_setting("default_streaming_quality", quality_canonical)
-            warming = False
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to persist default quality setting",
-        )
-
-    return SetQualityResponse(quality=quality_canonical, warming=warming)
-
-
-@app.get("/app/info", response_model=AppInfoResponse)
-def get_app_info():
-    """App-level bootstrap: per-entity editable fields + actions, plus a
-    ``conversion`` block (Phase 2). Backed by the same allowlists that gate
-    PATCH/POST /jobs, so advertised == accepted. Cached client-side; later
-    phases extend this rather than add endpoints.
-
-    The per-track *allowed* target list (which of these the no-op guard
-    would reject for a given track's source codec) is deliberately NOT
-    computed here -- it's derived live, client-side, from this global list
-    + the track's own (already-synced) source codec, so it stays out of this
-    cached blob."""
-    track_fields = [
-        FieldDescriptor(key=spec.key, label=spec.label, valueType=spec.value_type)
-        for spec in EDIT_FIELD_SPECS
-    ]
-    available_encoders = getattr(app.state, "available_encoders", frozenset())
-    targets = [
-        ConversionTargetInfo(codec=codec, is_lossless=is_lossless(codec))
-        for codec in sorted(SUPPORTED_TARGET_CODECS & available_encoders)
-    ]
-    return AppInfoResponse(
-        server=ServerInfo(instance_id=app.state.server_instance_id),
-        history=HistoryCapabilities(),
-        auth=AuthCapabilities(signup_enabled=settings.osml_signup_enabled),
-        uploads=UploadsCapabilities(
-            limits=UploadLimitsInfo(
-                **asdict(effective_upload_limits(app.state.settings))
-            )
-        ),
-        library_tools=LibraryToolsCapabilities(
-            server_delete=app.state.settings.library_delete_enabled,
-            # 8A.4: the /tracks/duplicates endpoints exist; they need no switch.
-            duplicate_review=True,
-        ),
-        integrations=IntegrationsCapabilities(
-            lastfm=LastfmCapability(available=lastfm_available(app.state.lastfm))
-        ),
-        entities={
-            "track": EntityInfo(
-                fields=track_fields, actions=["convert"] if targets else []
-            )
-        },
-        conversion=ConversionCapabilities(
-            targets=targets,
-            bitrate_presets=sorted(
-                (int(b) for b in QUALITY_BITRATES_KBPS.values()), reverse=True
-            ),
-        ),
-    )
-
-
-@app.get("/tracks/{uuid_id:uuid}", response_model=ClientTrack)
-def get_track(uuid_id: UUID, library: Library = Depends(current_library)):
-    """Authoritative current state of a single track. Lets a client reconcile
-    one track to server truth without a watermark-driven `/changes` pull — used
-    by edit-conflict "take server" resolution, where the watermark may already
-    have advanced past the conflicting revision. 404 if the track is gone."""
-    uuid_id = str(uuid_id)
-    track = library.get_track_by_uuid(uuid_id)
-    if track is None:
-        raise HTTPException(status_code=404, detail="Track not found")
-    return ClientTrack.from_track(track=track)
-
-
-@app.patch("/tracks/{uuid_id:uuid}", response_model=PatchTrackResponse)
-def patch_track(
-    uuid_id: UUID,
-    request: TrackPatchRequest,
-    library: Library = Depends(current_library),
-):
-    """Partial track metadata edit. Non-allowlisted fields + type/range are
-    rejected by ``TrackPatchRequest`` (422). ``db_only`` writes the DB; the
-    confirmation-gated ``db_and_master`` also rewrites the file tags and
-    relocates the master when artist/album change (WAV / missing master degrade
-    to DB-only with ``master_written=False``). Per-uuid serialized; the DB
-    layer's typed conflicts map to HTTP status codes. A track pending deletion
-    is refused with 409 ``track_pending_deletion``."""
-    uuid_id = str(uuid_id)
-    track_editor: TrackEditor = app.state.track_editor
-    track_locks: TrackLocks = app.state.track_locks
-
-    try:
-        with track_locks.lock(uuid_id):
-            new_revision, master_written = track_editor.apply_edit(
-                library,
-                uuid_id=uuid_id,
-                fields=request.edit_fields(),
-                base_revision=request.base_revision,
-                write_mode=request.write_mode,
-            )
-    except TrackNotFound:
-        raise HTTPException(status_code=404, detail="Track not found")
-    except TrackPendingDeletion:
-        raise track_pending_deletion_error(409)
-    except RevisionConflict as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "revision_conflict",
-                "current_revision": e.current_revision,
-            },
-        )
-    except EmptyTrackEdit:
-        raise HTTPException(
-            status_code=422,
-            detail="Edit would leave the track with no title, artist, "
-            "album, or album artist",
-        )
-    # The edit is committed and its kept journal row finishes the swap; 503 lets
-    # the client retry, and the retry with the old base gets the usual revision_conflict.
-    except MasterSwapPending as e:
-        raise HTTPException(status_code=503, detail=f"Master file write failed: {e}")
-    except (TagWriteError, MasterWriteError) as e:
-        raise HTTPException(status_code=500, detail=f"Master file write failed: {e}")
-    except sqlite3.OperationalError as e:
-        if "locked" in str(e).lower():
-            raise HTTPException(
-                status_code=503, detail="Database busy, retry"
-            )
-        raise
-
-    return PatchTrackResponse(
-        uuid_id=uuid_id, revision=new_revision, master_written=master_written
-    )
-
-
-def _job_to_response(job: dict) -> JobResponse:
-    return JobResponse(
-        job_id=job["id"],
-        uuid_id=job["uuid_id"],
-        target_codec=job["target_codec"],
-        target_container=job["target_container"],
-        target_bitrate=job["target_bitrate"],
-        status=job["status"],
-        error_text=job["error_text"],
-        created_at=job["created_at"],
-        updated_at=job["updated_at"],
-    )
-
-
-@app.post("/jobs", response_model=JobResponse)
-def post_job(
-    request: PostJobRequest, library: Library = Depends(current_library)
-):
-    """Create an async job. Only ``type="conversion"`` exists today (the
-    generic ``/jobs`` resource is forward-looking per the doc so future
-    bulk job types add zero endpoints). Upload work is not a ``/jobs`` type:
-    since Phase 7 it lives under ``/tracks/uploads/...`` on the shared job
-    runtime. Non-idempotent (mints a job)
-    -> single-attempt; an orphaned job from a timed-out-but-succeeded POST is
-    recovered via ``GET /jobs``."""
-    orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
-
-    try:
-        job_id = orchestrator.enqueue(
-            library,
-            uuid_id=request.uuid_id,
-            target_codec=request.params.target_codec,
-            target_bitrate_kbps=request.params.target_bitrate_kbps,
-            base_revision=request.base_revision,
-        )
-    except TrackNotFound:
-        raise HTTPException(status_code=404, detail="Track not found")
-    except TrackPendingDeletion:
-        raise track_pending_deletion_error(409)
-    except MasterNotFound:
-        raise HTTPException(status_code=404, detail="Master file not found")
-    except RevisionConflict as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "revision_conflict",
-                "current_revision": e.current_revision,
-            },
-        )
-    except ConversionJobActive as e:
-        raise HTTPException(
-            status_code=409, detail={"error": "job_active", "job_id": e.job_id}
-        )
-    except TargetPathTaken:
-        raise HTTPException(status_code=409, detail={"error": "target_exists"})
-    except PendingRecovery:
-        raise HTTPException(status_code=409, detail={"error": "pending_recovery"})
-    except NoOpConversion:
-        raise HTTPException(
-            status_code=422,
-            detail="Target codec is the same lossless codec as the source",
-        )
-    except ConversionRequestInvalid as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except InsufficientDiskSpace as e:
-        raise api_error(
-            507, e.code, e.message, retryable=True, needed=e.needed
-        )
-    except sqlite3.OperationalError as e:
-        if "locked" in str(e).lower():
-            raise HTTPException(status_code=503, detail="Database busy, retry")
-        raise
-
-    job = library.get_conversion_job(job_id)
-    return _job_to_response(job)
-
-
-@app.get("/jobs", response_model=GetJobsResponse)
-def get_jobs(
-    uuid_id: Optional[str] = None,
-    status: Optional[str] = None,
-    type: Optional[str] = None,
-    batch_id: Optional[str] = None,
-    cursor: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
-    library: Library = Depends(current_library),
-):
-    """Filtered, cursored job collection -- replaces both a global and a
-    per-uuid conversion list (the per-uuid variant is just ``?uuid_id=``).
-    ``cursor``/``nextCursor`` are job ids (ascending), mirroring
-    ``GET /changes``' int-cursor convention. ``status`` takes one status or a
-    comma-separated list (``queued,running``). ``type`` only accepts
-    ``"conversion"`` today (the only job type that exists)."""
-    # TODO(bulk-jobs): a grouped-by-batch_id list shape for bulk conversion
-    # progress. Uploads never appear here (they are /tracks/uploads, Phase 7).
-    if type is not None and type != "conversion":
-        raise HTTPException(status_code=422, detail=f"unsupported job type: {type}")
-    statuses: Optional[List[str]] = None
-    if status is not None:
-        statuses = [s.strip() for s in status.split(",") if s.strip()]
-        valid = {s.value for s in ConversionJobStatus}
-        unknown = [s for s in statuses if s not in valid]
-        if unknown or not statuses:
-            raise HTTPException(
-                status_code=422, detail=f"unsupported job status: {status}"
-            )
-
-    try:
-        jobs, next_cursor = library.list_conversion_jobs(
-            uuid_id=uuid_id, statuses=statuses, batch_id=batch_id,
-            after_id=cursor, limit=limit,
-        )
-    except sqlite3.OperationalError as e:
-        if "locked" in str(e).lower():
-            raise HTTPException(status_code=503, detail="Database busy, retry")
-        raise
-    return GetJobsResponse(
-        data=[_job_to_response(job) for job in jobs], nextCursor=next_cursor
-    )
-
-
-@app.delete("/jobs/{job_id}", response_model=DeleteJobResponse)
-def delete_job(job_id: int, library: Library = Depends(current_library)):
-    """Cancel a queued or running job. Idempotent: a no-op (``cancelled:
-    false``) for an already-terminal or unknown job_id, never a 404 -- the
-    doc frames DELETE as remove-pending-work, not resource deletion."""
-    orchestrator: ConversionOrchestrator = app.state.conversion_orchestrator
-    cancelled = orchestrator.cancel(library, job_id)
-    return DeleteJobResponse(cancelled=cancelled)
 
 
 @app.get("/")

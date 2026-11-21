@@ -8,13 +8,37 @@
   second process (or a second uvicorn worker) on the same data directory
   refuses to start and logs the lock path.
 - **POSIX hosts only** (Linux, macOS): the instance lock uses `fcntl.flock`.
-- **Fresh schema (schema 1).** A database from an older (or newer)
-  server is refused at startup and its files are left untouched (the data
+- **Fresh schema (schema 1).** A database at an older (or newer) schema
+  number is refused at startup and its files are left untouched (the data
   directory and an empty `osml.lock` may be created before the check): back it
   up, start with a fresh `APP_DATA_DIR`, and re-import your music. Such a
   database stops the server (and the admin CLI) with: "This database has
   schema N; this server reads schema 1. Back it up and start with a fresh
-  APP_DATA_DIR."
+  APP_DATA_DIR." Start-up reads only the schema number stored in the file
+  and whether it holds any schema at all; it does not compare the tables.
+  Until the first release `app/database/init.sql` is still changed in place
+  at schema 1, so a data folder made by an earlier build is accepted as it
+  is, without the later changes, and nothing is logged: after updating the
+  server, start with a fresh `APP_DATA_DIR`.
+- **A saved change is flushed to the disk before the server confirms it.**
+  Every database write is flushed when it is committed (SQLite
+  `synchronous=FULL`; on macOS with `F_FULLFSYNC`, which also empties the
+  drive's own cache; on Linux with the system's ordinary flush, `fsync` or
+  `fdatasync`). A power cut or a crash of the operating system therefore loses
+  no committed change, as long as the disk really flushes when it is asked to
+  (some drives and some virtual or network disks report a flush they have not
+  done; no software can make up for that). On a macOS volume that does not
+  support `F_FULLFSYNC`, SQLite uses an ordinary `fsync` instead and gives no
+  message. While the server runs it keeps
+  `database.db-wal` and `database.db-shm` beside `database.db`, and the newest
+  changes are in the `-wal` file. Never delete those two files, also not
+  after a crash. Copy or back up the database only while the server is
+  stopped and no admin command is running. After a clean stop everything is
+  in `database.db`, and the `-wal` file is gone or empty. If a `-wal` file
+  that is not empty is still there (the server was killed, the machine lost
+  power, or a background task was still running when the server stopped), it
+  holds changes that `database.db` does not: copy all three files together,
+  or start the server and stop it again first.
 
 ## Prerequisites
 
@@ -387,4 +411,4 @@ Tests that skip by machine:
 
 Besides pytest's own temporary folders, the suite creates `osml-tests-import-*`, `osml-chmod-probe-*` and `osml-replace-matrix-*` folders in the system temporary folder and removes them again; a run that is killed can leave them behind.
 
-Test databases do not sync to disk: `tests/conftest.py` makes every SQLite connection opened in the test process issue `PRAGMA synchronous=OFF`; a child process a test starts is not covered and keeps SQLite's default. That only decides whether a committed transaction survives an operating-system crash or power loss. Atomicity, isolation, locking and WAL behaviour are unchanged, and the product's own setting is untouched; the one product path that reads the setting, `Database.make_durable`, skips its full flush of the database file when it is off. A test about durability settings must carry `@pytest.mark.real_sqlite_durability`, which gives it the unwrapped `sqlite3.connect`.
+Test databases do not sync to disk: `tests/conftest.py` makes every SQLite connection opened in the test process issue `PRAGMA synchronous=OFF`; a child process a test starts is not covered: it syncs as SQLite or, when it runs the server's code, the server sets it. That only decides whether a committed transaction survives an operating-system crash or power loss. Atomicity, isolation, locking and WAL behaviour are unchanged. The server itself sets `synchronous=FULL` on every connection it opens; in a test that code runs unchanged and `tests/conftest.py` switches the connection back to OFF afterwards. No server code reads the setting: with it off, SQLite's commits and checkpoints issue no sync. A test about durability settings must carry `@pytest.mark.real_sqlite_durability`, which gives it the unwrapped `sqlite3.connect` and the server's own setting.

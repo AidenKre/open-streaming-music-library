@@ -174,4 +174,50 @@ void main() {
     await pumpEventQueue();
     expect(m.receiptsUnreachableText, _needs);
   });
+
+  // Retry cannot clear a different server or a sign-out; only the
+  // banner's Reset, Disconnect or Log in can. A refusal alone, with the
+  // session not blocked, keeps its Retry (the session may not have caught up).
+  group('Retry helps only while the session is not blocked', () {
+    test('blocked as a different server: Retry does not help', () async {
+      blocked.value = ServerBlockedReason.differentServer;
+      await open(offline: true);
+      expect(m.receiptsUnreachableText, _different);
+      expect(m.receiptsRetryHelps, isFalse);
+    });
+
+    test('blocked as signed out: Retry does not help', () async {
+      blocked.value = ServerBlockedReason.signedOut;
+      await open(offline: true);
+      expect(m.receiptsUnreachableText, _signedOut);
+      expect(m.receiptsRetryHelps, isFalse);
+    });
+
+    test('the block arriving while open, then clearing: Retry follows',
+        () async {
+      await open(offline: true);
+      expect(m.receiptsRetryHelps, isTrue);
+      blocked.value = ServerBlockedReason.differentServer;
+      await pumpEventQueue();
+      expect(m.receiptsRetryHelps, isFalse);
+      blocked.value = ServerBlockedReason.none;
+      await pumpEventQueue();
+      expect(m.receiptsRetryHelps, isTrue);
+    });
+
+    for (final reason in BindingRefusal.values) {
+      test('only a refused read (${reason.name}): Retry helps', () async {
+        refuseWith(reason);
+        await open();
+        expect(m.receiptsLoad, ReceiptsLoad.needsConnection);
+        expect(m.receiptsRetryHelps, isTrue);
+      });
+    }
+
+    test('plain offline (needs a connection): Retry helps', () async {
+      await open(offline: true);
+      expect(m.receiptsUnreachableText, _needs);
+      expect(m.receiptsRetryHelps, isTrue);
+    });
+  });
 }

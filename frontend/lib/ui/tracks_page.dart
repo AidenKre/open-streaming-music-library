@@ -11,8 +11,8 @@ import 'package:frontend/services/app_info_service.dart';
 import 'package:frontend/services/conversion/conversion_jobs_provider.dart';
 import 'package:frontend/services/download_manager.dart';
 import 'package:frontend/models/library_scope.dart';
-import 'package:frontend/models/id_hints.dart';
 import 'package:frontend/services/download_providers.dart';
+import 'package:frontend/services/library_sync_status.dart';
 import 'package:frontend/ui/convert_flow.dart';
 import 'package:frontend/ui/library_actions.dart';
 import 'package:frontend/ui/browse_controller.dart';
@@ -20,6 +20,7 @@ import 'package:frontend/ui/mixins/cursor_pagination_mixin.dart';
 import 'package:frontend/ui/mixins/root_browse_mixin.dart';
 import 'package:frontend/ui/selection/track_selection_controller.dart';
 import 'package:frontend/ui/widgets/collection_action_header.dart';
+import 'package:frontend/ui/widgets/library_sync_status_view.dart';
 import 'package:frontend/ui/widgets/list_status_message.dart';
 import 'package:frontend/ui/widgets/playback_notice.dart';
 import 'package:frontend/ui/widgets/track_tile.dart';
@@ -118,6 +119,24 @@ class _TracksPageState extends ConsumerState<TracksPage>
       conversionJobs: ref.watch(conversionJobsProvider),
       appInfo: ref.watch(appInfoProvider).value,
     );
+    // No library sync running or failed; not loaded yet counts as settled.
+    final syncSettled = ref.watch(
+      trackSyncProvider.select((a) {
+        final s = a.value;
+        return s == null || (!s.librarySyncing && s.libraryError == null);
+      }),
+    );
+    // Only a device that finished a complete library sync while bound to
+    // this server and user (kept across a log-out, cleared by a reset or a
+    // restored server) knows that an empty device library is an empty
+    // library. Null while the marker is first read: unknown.
+    final catalogSynced = ref.watch(libraryCatalogSyncedProvider).value;
+    final libraryKnownEmpty = syncSettled && (catalogSynced ?? false);
+    // No complete library sync yet and none running or failed to show
+    // (offline, blocked, or before the first sync starts).
+    final notSyncedYet =
+        catalogSynced == false &&
+        ref.watch(librarySyncStatusProvider) == LibrarySyncStatus.idle;
 
     final body = Column(
       children: [
@@ -135,7 +154,18 @@ class _TracksPageState extends ConsumerState<TracksPage>
               : showDownloadedEmpty
               ? const ListStatusMessage('No downloaded tracks yet.')
               : widget.selection != null && _libraryEmpty
-              ? const ListStatusMessage('Your library is empty.')
+              ? libraryKnownEmpty
+                    ? const ListStatusMessage('Your library is empty.')
+                    : notSyncedYet
+                    ? const ListStatusMessage(
+                        'Your library has not synced to this device yet.',
+                      )
+                    // A running or failed sync: the device list may not be
+                    // the server's library.
+                    : const Align(
+                        alignment: Alignment.topCenter,
+                        child: LibrarySyncStatusView(),
+                      )
               : _buildBrowseList(rows),
         ),
       ],
@@ -150,16 +180,7 @@ class _TracksPageState extends ConsumerState<TracksPage>
       !filters.downloaded &&
       paginationLoadedEmpty;
 
-  /// Selection mode: the id hint per uuid for the rows listed.
-  Map<String, String> _idHints(List<TrackUI> listed) => widget.selection == null
-      ? const {}
-      : idHints([
-          for (final t in listed)
-            (uuid: t.uuidId, title: t.title, artist: t.artist, album: t.album),
-        ]);
-
   Widget _buildBrowseList(_RowContext rows) {
-    final hints = _idHints(paginatedItems);
     return ListView.builder(
       controller: scrollController,
       // Ends above the shell's floating bottom chrome (4B).
@@ -177,7 +198,6 @@ class _TracksPageState extends ConsumerState<TracksPage>
         return _buildTrackTile(
           track,
           rows,
-          idHint: hints[track.uuidId],
           onTap: () => showPlaybackOutcome(
             context,
             ref
@@ -195,7 +215,6 @@ class _TracksPageState extends ConsumerState<TracksPage>
   }
 
   Widget _buildSearchResults(_RowContext rows) {
-    final hints = _idHints(search.results.tracks);
     return buildSearchBody(
       results: search.results.tracks,
       noun: 'tracks',
@@ -209,7 +228,6 @@ class _TracksPageState extends ConsumerState<TracksPage>
           return _buildTrackTile(
             track,
             rows,
-            idHint: hints[track.uuidId],
             // Play the visible result list, like the global search.
             onTap: () => showPlaybackOutcome(
               context,
@@ -229,7 +247,6 @@ class _TracksPageState extends ConsumerState<TracksPage>
     TrackUI track,
     _RowContext rows, {
     required VoidCallback onTap,
-    String? idHint,
   }) {
     final selection = widget.selection;
     if (selection != null) {
@@ -240,7 +257,6 @@ class _TracksPageState extends ConsumerState<TracksPage>
           track: track,
           selected: selection.isSelected(track.uuidId),
           onToggle: () => selection.toggle(track),
-          idHint: idHint,
         ),
       );
     }

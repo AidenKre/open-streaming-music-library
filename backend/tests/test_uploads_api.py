@@ -873,16 +873,14 @@ def test_an_unknown_and_a_foreign_item_cancel_answer_the_same_404(client):
     assert snapshot(client) == stored
 
 
-# Later pieces make some of these cancellable (7A.2c validating / review_ready,
-# 7A.3b duplicate_conflict) and change their rows here. 7A.2b made receiving
-# cancellable (tests in test_upload_receipt_api.py).
-# 7A.2c: validating and review_ready are cancellable now (test_upload_validation_races).
-# 7A.2d: an expanded ZIP parent answers 200 and cancels its uncommitted children
-# (test_upload_zip_cancel), so it left this list.
+# The states a cancel refuses (409 upload_item_not_cancellable): committing,
+# expired, imported and duplicate. The cancellable states are tested where they
+# are cancelled: receiving in test_upload_receipt_api.py;
+# validating, review_ready and failed in test_upload_validation_races.py;
+# duplicate_conflict in test_upload_cancel_commit.py; an expanded ZIP parent in
+# test_upload_zip_cancel.py.
 OTHER_STATES = {
     "committing": "",
-    # failed became cancellable in review r1 7-R1-16 (test_upload_validation_races.py).
-    # duplicate_conflict became cancellable in 7A.3b (test_upload_cancel_commit.py).
     "expired": "",
     "imported": ", result_track_uuid = 'feedface-0000-4000-8000-000000000001', result_revision = 3",
     "duplicate": ", result_track_uuid = 'feedface-0000-4000-8000-000000000001', duplicate_kind = 'exact'",

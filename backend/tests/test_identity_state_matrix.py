@@ -316,15 +316,18 @@ UPDATE = re.compile(r"update\s+track_audio_identity\b", re.I)
 def test_every_identity_update_statement_has_a_writer_here():
     """A structural tripwire (it names methods on purpose): a new UPDATE of the
     identity rows fails here until it gets a writer row above."""
-    source = (Path(__file__).parent.parent / "app" / "database" / "database.py").read_text()
     found = {}
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.FunctionDef):
-            text = ast.get_source_segment(source, node)
-            count = len(UPDATE.findall(text))
-            nested = sum(len(UPDATE.findall(ast.get_source_segment(source, inner)))
-                         for inner in ast.walk(node) if inner is not node and isinstance(inner, ast.FunctionDef))
-            if count - nested:
-                found[node.name] = count - nested
+    # Every file of the package: the Database class is composed from them.
+    for path in sorted((Path(__file__).parent.parent / "app" / "database").glob("*.py")):
+        source = path.read_text()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.FunctionDef):
+                text = ast.get_source_segment(source, node)
+                count = len(UPDATE.findall(text))
+                nested = sum(len(UPDATE.findall(ast.get_source_segment(source, inner)))
+                             for inner in ast.walk(node) if inner is not node and isinstance(inner, ast.FunctionDef))
+                if count - nested:
+                    assert node.name not in found, node.name
+                    found[node.name] = count - nested
     assert found == STATEMENTS_BY_METHOD
     assert sum(found.values()) == 20

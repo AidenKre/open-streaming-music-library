@@ -16,11 +16,13 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/api/library_tools_api.dart';
 import 'package:frontend/models/dto/library_tools_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/services/deletion/delete_job.dart';
 import 'package:frontend/services/deletion/delete_jobs_manager.dart';
 import 'package:frontend/services/feature_providers.dart';
+import 'package:frontend/services/operations/durable_submission.dart';
 
 import '../../helpers/delete_jobs_harness.dart';
 
@@ -183,6 +185,113 @@ void main() {
       await h.pump();
       expect(await h.submissions(), isEmpty);
       expect(h.api.callsOf('createJob'), isEmpty);
+    });
+  });
+
+  // Deletion history orders a job the server has not dated by when this
+  // device submitted it: the time stored with the submission.
+  group('the time this device submitted the job', () {
+    test('a job being sent carries it', () async {
+      h.clock.advance(const Duration(milliseconds: 123));
+      final answer = Completer<DeletionJobDto>();
+      h.api.onCreateJob = (_) => answer.future;
+      await h.submitAll([('a', 1)]);
+      await h.pump();
+      expect(h.job('op-1')!.phase, DeleteJobPhase.submitting);
+      expect(h.job('op-1')!.submittedAtMs, 9123);
+      answer.complete(DeletionJobDto.fromJson(
+        deletionJobJson('op-1', [deletionItemJson('a')]),
+      ));
+      await h.pump();
+    });
+
+    test('a refused job keeps it', () async {
+      h.clock.advance(const Duration(milliseconds: 50));
+      h.api.onCreateJob =
+          (_) async => throw apiError(409, 'operation_conflict');
+      await h.submitAll([('a', 1)]);
+      h.clock.advance(const Duration(seconds: 5));
+      await h.pump();
+      expect(h.job('op-1')!.phase, DeleteJobPhase.rejected);
+      expect(h.job('op-1')!.submittedAtMs, 9050);
+    });
+
+    test('a job whose answer was lost keeps it', () async {
+      h.clock.advance(const Duration(milliseconds: 70));
+      final store = h.api.onCreateJob;
+      h.api.onCreateJob = (body) async {
+        await store(body);
+        throw TimeoutException('lost');
+      };
+      await h.submitAll([('a', 1)]);
+      h.clock.advance(const Duration(seconds: 5));
+      await h.pump();
+      expect(h.job('op-1')!.phase, DeleteJobPhase.unconfirmed);
+      expect(h.job('op-1')!.submittedAtMs, 9070);
+    });
+
+    test('an accepted job whose receipt could not be read keeps it',
+        () async {
+      h.clock.advance(const Duration(milliseconds: 80));
+      h.api.onCreateJob =
+          (_) async => throw const DeletionReceiptUnreadable();
+      h.api.onGetJob = (_) async => throw const FormatException('unreadable');
+      await h.submitAll([('a', 1)]);
+      h.clock.advance(const Duration(seconds: 5));
+      await h.pump();
+      expect(h.job('op-1')!.phase, DeleteJobPhase.accepted);
+      expect(h.job('op-1')!.createdAt, isNull);
+      expect(h.job('op-1')!.submittedAtMs, 9080);
+    });
+
+    test('after a relaunch, a stored submission being sent again carries '
+        'the time it was stored at', () async {
+      h.clock.advance(const Duration(milliseconds: 300));
+      await DurableSubmission(db: h.db, binding: h.binding, clock: h.clock)
+          .prepare(
+            kind: 'track_deletion',
+            operationUuid: 'op-old',
+            frozenBodyJson:
+                '{"operation_uuid":"op-old","targets":[{"uuid_id":"a",'
+                '"base_revision":1}],"confirmed_count":1}',
+            bindingToken: h.token,
+          );
+      await h.manager.quiesce();
+      h.clock.advance(const Duration(seconds: 60));
+      final answer = Completer<DeletionJobDto>();
+      h.api.onCreateJob = (_) => answer.future;
+      h.manager = h.build();
+      h.manager.request('coldStart');
+      await h.pump();
+      expect(h.job('op-old')!.phase, DeleteJobPhase.submitting);
+      expect(h.job('op-old')!.submittedAtMs, 9300);
+      answer.complete(DeletionJobDto.fromJson(
+        deletionJobJson('op-old', [deletionItemJson('a')]),
+      ));
+      await h.pump();
+    });
+
+    test('after a relaunch, a stored submission refused then keeps the time '
+        'it was stored at', () async {
+      h.clock.advance(const Duration(milliseconds: 400));
+      await DurableSubmission(db: h.db, binding: h.binding, clock: h.clock)
+          .prepare(
+            kind: 'track_deletion',
+            operationUuid: 'op-old',
+            frozenBodyJson:
+                '{"operation_uuid":"op-old","targets":[{"uuid_id":"a",'
+                '"base_revision":1}],"confirmed_count":1}',
+            bindingToken: h.token,
+          );
+      await h.manager.quiesce();
+      h.clock.advance(const Duration(seconds: 60));
+      h.api.onCreateJob =
+          (_) async => throw apiError(409, 'operation_conflict');
+      h.manager = h.build();
+      h.manager.request('coldStart');
+      await h.pump();
+      expect(h.job('op-old')!.phase, DeleteJobPhase.rejected);
+      expect(h.job('op-old')!.submittedAtMs, 9400);
     });
   });
 

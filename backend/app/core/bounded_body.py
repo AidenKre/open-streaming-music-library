@@ -1,10 +1,11 @@
 """SC-16b: bounded request bodies, and SC-22-safe validation errors.
 
-Routes that read their body through :func:`bounded_body` must NOT declare a
-Pydantic body parameter: FastAPI buffers the whole body (``await
-request.body()``) before it solves any dependency, which would defeat the
-cap. Such routes validate with ``Model.model_validate_json(raw)`` and map a
-``ValidationError`` through :func:`validation_error_422`.
+Routes must NOT declare a Pydantic body parameter: FastAPI buffers the whole
+body (``await request.body()``) before it solves any dependency, which would
+defeat the cap. A route takes its JSON body through :func:`json_body` instead,
+which reads it with :func:`bounded_body`, validates it with
+``Model.model_validate_json(raw)`` and maps a ``ValidationError`` through
+:func:`validation_error_422`.
 
 :func:`capped_chunks` is the one byte counter; ``bounded_body`` and the upload
 content stream both use it.
@@ -13,14 +14,21 @@ A client that disconnects while ``bounded_body`` is reading ends the request
 quietly: one INFO line, status 499, no traceback, and the route never runs.
 """
 
-from typing import AsyncIterator, Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable, TypeVar
 
-from fastapi import HTTPException, Request
-from pydantic import ValidationError
+from fastapi import Depends, HTTPException, Request
+from pydantic import BaseModel, ValidationError
 from starlette.requests import ClientDisconnect
 
 from app.core.api_errors import api_error
 from app.core.operator_log import operator_logger
+
+
+Model = TypeVar("Model", bound=BaseModel)
+
+# The cap on the JSON body of the warm-up, quality setting, track edit and job
+# routes (SC-16b).
+JSON_BODY_LIMIT = 64 * 1024
 
 
 class BodyTooLarge(Exception):
@@ -74,3 +82,17 @@ def validation_error_422(error: ValidationError) -> HTTPException:
     for item in details:
         item["loc"] = ("body", *item["loc"])
     return HTTPException(status_code=422, detail=details)
+
+
+def json_body(model: type[Model], max_bytes: int) -> Callable[..., Awaitable[Model]]:
+    """A dependency returning the request body as ``model``: read through
+    :func:`bounded_body` with a cap of ``max_bytes`` (413), then validated
+    (a 422 through :func:`validation_error_422`)."""
+
+    async def dependency(raw: bytes = Depends(bounded_body(max_bytes))) -> Model:
+        try:
+            return model.model_validate_json(raw)
+        except ValidationError as exc:
+            raise validation_error_422(exc) from None
+
+    return dependency

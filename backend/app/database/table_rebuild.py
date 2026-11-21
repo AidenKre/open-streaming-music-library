@@ -4,6 +4,8 @@ import sqlite3
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
+import app.database.core as database_core
+
 
 class RebuildForeignKeyViolation(RuntimeError):
     """``PRAGMA foreign_key_check`` found violations after the rebuild."""
@@ -28,13 +30,18 @@ def _table_snapshot(
     return count, ids
 
 
+def _connect(database_path, *, isolation_level=None) -> sqlite3.Connection:
+    """The product's opener, looked up in its module at call time."""
+    return database_core.open_connection(database_path, isolation_level=isolation_level)
+
+
 def rebuild_tables(
     db_path: Path,
     *,
     target_version: int,
     rebuild: Callable[[sqlite3.Connection], None],
     backup_path: Path,
-    connect: Callable[..., sqlite3.Connection] = sqlite3.connect,
+    connect: Callable[..., sqlite3.Connection] = _connect,
     verify_tables: Sequence[str] = (),
 ) -> bool:
     conn = connect(str(db_path), isolation_level=None)
@@ -44,8 +51,15 @@ def rebuild_tables(
             if conn.execute("PRAGMA user_version").fetchone()[0] >= target_version:
                 return False
 
+            # The backup is a file of its own, not the server's database: a plain
+            # connection, so that making it leaves no side files beside it (the
+            # opener would write it through a log of its own), with the opener's
+            # flush settings, so the copy is on disk before the rebuild begins.
+            # The copy keeps its source's journal mode in its header.
             backup = sqlite3.connect(str(backup_path), isolation_level=None)
             try:
+                backup.execute("PRAGMA synchronous=FULL")
+                backup.execute("PRAGMA fullfsync=ON")
                 conn.backup(backup)
             finally:
                 backup.close()
@@ -59,7 +73,7 @@ def rebuild_tables(
             # Phase 5 §3a step 5: verify at runtime, not only by construction.
             before = {table: _table_snapshot(conn, table) for table in verify_tables}
             rebuild(conn)
-            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            violations = [tuple(row) for row in conn.execute("PRAGMA foreign_key_check")]
             if violations:
                 raise RebuildForeignKeyViolation(
                     f"Table rebuild caused foreign key violations: {violations!r}"

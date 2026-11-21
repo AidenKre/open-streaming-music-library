@@ -101,6 +101,8 @@ class FakeManageLibraryControls extends ChangeNotifier
   @override
   String receiptsUnreachableText = 'Deletion history needs a connection.';
   @override
+  bool receiptsRetryHelps = true;
+  @override
   List<ReceiptView> receipts = const [];
   @override
   bool hasMoreReceipts = false;

@@ -4,9 +4,9 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
-import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client_provider.dart';
+import 'package:frontend/services/app_files_directory.dart';
 import 'package:frontend/services/storage/owned_file_cleanup_providers.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/playback_availability.dart';
@@ -40,7 +40,7 @@ final coverArtDirectoryProvider = Provider<Directory>((ref) {
 });
 
 final downloadDirectoryProvider = Provider<Future<Directory> Function()>((ref) {
-  return getApplicationDocumentsDirectory;
+  return appFilesDirectory;
 });
 
 final downloadManagerProvider = Provider<DownloadManager>((ref) {
@@ -162,18 +162,32 @@ final artistIsDownloadingProvider = Provider.family<bool, int>(
   (ref, artistId) => _isDownloading(ref, artistId, (j) => j.artistId),
 );
 
+/// Recomputes the calling count map when a sync or a single-track refresh
+/// finishes: the catalog it counts may have gained or lost tracks.
+/// Once per finished run, never per synced page.
+void _recomputeAfterSync(Ref ref) {
+  ref.listen<AsyncValue<TrackSyncState>>(trackSyncProvider, (prev, next) {
+    if (prev?.value?.isSyncing == true && next.value?.isSyncing == false) {
+      ref.invalidateSelf();
+    }
+  });
+}
+
 /// Download counts for every album, batched into ONE grouped query and
-/// recomputed once per download-status change. Cards read their own slice via
-/// [albumDownloadCountsProvider] instead of each issuing its own query.
+/// recomputed once per download-status change and once per finished sync.
+/// Cards read their own slice via [albumDownloadCountsProvider] instead of
+/// each issuing its own query.
 final _albumDownloadCountsMapProvider =
     FutureProvider<Map<int, ({int total, int downloaded})>>((ref) async {
       ref.watch(downloadStatusVersionProvider);
+      _recomputeAfterSync(ref);
       return ref.watch(databaseProvider).getAllAlbumDownloadCounts();
     });
 
 final _artistDownloadCountsMapProvider =
     FutureProvider<Map<int, ({int total, int downloaded})>>((ref) async {
       ref.watch(downloadStatusVersionProvider);
+      _recomputeAfterSync(ref);
       return ref.watch(databaseProvider).getAllArtistDownloadCounts();
     });
 
@@ -188,7 +202,8 @@ final _artistDownloadCountsMapProvider =
 }
 
 /// DB-backed (downloaded, total) counts for an album; refreshes on each
-/// completed/deleted download. Backed by the batched map provider.
+/// completed/deleted download and each finished sync. Backed by the batched
+/// map provider.
 final albumDownloadCountsProvider =
     Provider.family<AsyncValue<({int downloaded, int total})?>, int>(
       (ref, albumId) => ref
@@ -197,7 +212,8 @@ final albumDownloadCountsProvider =
     );
 
 /// DB-backed (downloaded, total) counts for an artist; refreshes on each
-/// completed/deleted download. Backed by the batched map provider.
+/// completed/deleted download and each finished sync. Backed by the batched
+/// map provider.
 final artistDownloadCountsProvider =
     Provider.family<AsyncValue<({int downloaded, int total})?>, int>(
       (ref, artistId) => ref
@@ -209,10 +225,9 @@ final artistDownloadCountsProvider =
 /// offer (SC-06): the one enablement predicate every surface reads.
 ///
 /// Album/artist scopes read the batched count maps above (one grouped query
-/// for every card, recomputed per download event), never a per-card
-/// resolution. Unknown is not zero: while the map loads, or when it has no
-/// entry for the scope (it is recomputed only on download events, so an
-/// album synced after it was built is absent), the result is `unknown`.
+/// for every card, recomputed per download event and per finished sync),
+/// never a per-card resolution. Unknown is not zero: while the map loads, or
+/// when it has no entry for the scope, the result is `unknown`.
 /// Track scopes are computed from the rows' own download state.
 ///
 /// Auto-dispose and keyed by value-equal scopes, so rebuilt cards reuse one

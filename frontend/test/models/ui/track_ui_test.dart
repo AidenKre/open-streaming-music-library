@@ -48,33 +48,46 @@ const _minimalMeta = TrackmetadataData(
   hasAlbumArt: false,
 );
 
+/// [track] and [meta] stored, then read back as the app reads a track
+/// (`TrackUI.fromQueryRow` over a track query's row).
+Future<TrackUI> _stored(Track track, TrackmetadataData meta) async {
+  final db = AppDatabase(NativeDatabase.memory());
+  try {
+    await db.into(db.tracks).insert(track.toCompanion(true));
+    await db.into(db.trackmetadata).insert(meta.toCompanion(true));
+    return TrackUI.fromQueryRow((await db.getTrackByUuid(track.uuidId)).single);
+  } finally {
+    await db.close();
+  }
+}
+
 void main() {
-  group('TrackUI.fromDrift', () {
+  group('TrackUI from a stored row', () {
     group('Track fields', () {
-      test('maps uuidId', () {
-        final ui = TrackUI.fromDrift(_track, _fullMeta);
+      test('maps uuidId', () async {
+        final ui = await _stored(_track, _fullMeta);
         expect(ui.uuidId, 'abc-123');
       });
 
-      test('maps filePath', () {
-        final ui = TrackUI.fromDrift(_track, _fullMeta);
+      test('maps filePath', () async {
+        final ui = await _stored(_track, _fullMeta);
         expect(ui.filePath, '/local/path/song.flac');
       });
 
-      test('maps createdAt', () {
-        final ui = TrackUI.fromDrift(_track, _fullMeta);
+      test('maps createdAt', () async {
+        final ui = await _stored(_track, _fullMeta);
         expect(ui.createdAt, 1700000000);
       });
 
-      test('maps lastUpdated', () {
-        final ui = TrackUI.fromDrift(_track, _fullMeta);
+      test('maps lastUpdated', () async {
+        final ui = await _stored(_track, _fullMeta);
         expect(ui.lastUpdated, 1700001000);
       });
     });
 
     group('Trackmetadata fields', () {
-      test('maps all metadata fields from full meta', () {
-        final ui = TrackUI.fromDrift(_track, _fullMeta);
+      test('maps all metadata fields from full meta', () async {
+        final ui = await _stored(_track, _fullMeta);
 
         expect(ui.title, 'My Song');
         expect(ui.artist, 'Artist Name');
@@ -93,8 +106,8 @@ void main() {
         expect(ui.hasAlbumArt, true);
       });
 
-      test('nullable fields are null when absent', () {
-        final ui = TrackUI.fromDrift(_track, _minimalMeta);
+      test('nullable fields are null when absent', () async {
+        final ui = await _stored(_track, _minimalMeta);
 
         expect(ui.title, isNull);
         expect(ui.artist, isNull);
@@ -108,8 +121,8 @@ void main() {
         expect(ui.codec, isNull);
       });
 
-      test('maps required fields from minimal meta', () {
-        final ui = TrackUI.fromDrift(_track, _minimalMeta);
+      test('maps required fields from minimal meta', () async {
+        final ui = await _stored(_track, _minimalMeta);
 
         expect(ui.duration, 100.0);
         expect(ui.bitrateKbps, 128.0);
@@ -121,52 +134,52 @@ void main() {
   });
 
   group('isDownloaded', () {
-    test('returns true when filePath is non-null', () {
-      final ui = TrackUI.fromDrift(_track, _fullMeta);
+    test('returns true when filePath is non-null', () async {
+      final ui = await _stored(_track, _fullMeta);
       expect(ui.isDownloaded, true);
     });
 
-    test('returns false when filePath is null', () {
-      final ui = TrackUI.fromDrift(_trackNoFile, _fullMeta);
+    test('returns false when filePath is null', () async {
+      final ui = await _stored(_trackNoFile, _fullMeta);
       expect(ui.isDownloaded, false);
     });
   });
 
   group('formattedDuration', () {
-    test('formats seconds only', () {
-      final ui = TrackUI.fromDrift(
+    test('formats seconds only', () async {
+      final ui = await _stored(
         _track,
         _fullMeta.copyWith(duration: Value(0.0)),
       );
       expect(ui.formattedDuration, '0:00');
     });
 
-    test('truncates fractional seconds', () {
-      final ui = TrackUI.fromDrift(
+    test('truncates fractional seconds', () async {
+      final ui = await _stored(
         _track,
         _fullMeta.copyWith(duration: Value(59.9)),
       );
       expect(ui.formattedDuration, '0:59');
     });
 
-    test('formats minutes and seconds', () {
-      final ui = TrackUI.fromDrift(
+    test('formats minutes and seconds', () async {
+      final ui = await _stored(
         _track,
         _fullMeta.copyWith(duration: Value(65.0)),
       );
       expect(ui.formattedDuration, '1:05');
     });
 
-    test('formats hours, minutes, and seconds', () {
-      final ui = TrackUI.fromDrift(
+    test('formats hours, minutes, and seconds', () async {
+      final ui = await _stored(
         _track,
         _fullMeta.copyWith(duration: Value(3661.0)),
       );
       expect(ui.formattedDuration, '1:01:01');
     });
 
-    test('formats days, hours, minutes, and seconds', () {
-      final ui = TrackUI.fromDrift(
+    test('formats days, hours, minutes, and seconds', () async {
+      final ui = await _stored(
         _track,
         _fullMeta.copyWith(duration: Value(90061.0)),
       );
@@ -301,7 +314,8 @@ void main() {
         () async {
       await db.customStatement(
         "INSERT INTO tracks (uuid_id, file_path, damaged_file_path, "
-        "created_at, last_updated) VALUES ('qr-dmg', NULL, '/f/qr-dmg', 1, 1)",
+        "created_at, last_updated) "
+        "VALUES ('qr-dmg', '/f/qr-dmg', '/f/qr-dmg', 1, 1)",
       );
       await db.customStatement(
         "INSERT INTO trackmetadata (uuid_id, has_album_art) "
@@ -323,14 +337,14 @@ void main() {
     });
   });
 
-  group('coverArtId fromDrift', () {
-    test('maps coverArtId from metadata', () {
-      final ui = TrackUI.fromDrift(_track, _fullMeta);
+  group('coverArtId from a stored row', () {
+    test('maps coverArtId from metadata', () async {
+      final ui = await _stored(_track, _fullMeta);
       expect(ui.coverArtId, 42);
     });
 
-    test('coverArtId is null from minimal metadata', () {
-      final ui = TrackUI.fromDrift(_track, _minimalMeta);
+    test('coverArtId is null from minimal metadata', () async {
+      final ui = await _stored(_track, _minimalMeta);
       expect(ui.coverArtId, isNull);
     });
   });

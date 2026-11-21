@@ -6,3 +6,6 @@ const unknownTrackName = 'Unknown track';
 /// has no title (null or empty), never the track's ID.
 String trackTitleOrUnknown(String? title) =>
     title == null || title.isEmpty ? unknownTrackName : title;
+
+/// Shown in place of an artist's name when it is not known.
+const unknownArtistName = 'Unknown artist';

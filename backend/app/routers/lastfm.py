@@ -1,10 +1,10 @@
 import uuid
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.core.api_errors import answer_errors
-from app.core.bounded_body import bounded_body, validation_error_422
+from app.core.bounded_body import json_body
 from app.library import Library, current_library
 from app.services.lastfm_errors import LastfmError
 
@@ -15,13 +15,6 @@ router = APIRouter(prefix="/settings/integrations/lastfm")
 
 class LastfmEmptyRequest(BaseModel):
     pass
-
-
-def _read_empty_body(raw: bytes) -> None:
-    try:
-        LastfmEmptyRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from None
 
 
 class LastfmEnableRequest(BaseModel):
@@ -54,9 +47,8 @@ def get_lastfm_status(request: Request, library: Library = Depends(current_libra
 def connect_lastfm(
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(LASTFM_BODY_LIMIT)),
+    _empty: LastfmEmptyRequest = Depends(json_body(LastfmEmptyRequest, LASTFM_BODY_LIMIT)),
 ):
-    _read_empty_body(raw)
     with answer_errors(LastfmError, keep_cause=False):
         return request.app.state.lastfm_accounts.connect(library)
 
@@ -65,9 +57,8 @@ def connect_lastfm(
 def complete_lastfm(
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(LASTFM_BODY_LIMIT)),
+    _empty: LastfmEmptyRequest = Depends(json_body(LastfmEmptyRequest, LASTFM_BODY_LIMIT)),
 ):
-    _read_empty_body(raw)
     with answer_errors(LastfmError, keep_cause=False):
         return request.app.state.lastfm_accounts.complete(library)
 
@@ -76,12 +67,8 @@ def complete_lastfm(
 def enable_lastfm(
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(LASTFM_BODY_LIMIT)),
+    body: LastfmEnableRequest = Depends(json_body(LastfmEnableRequest, LASTFM_BODY_LIMIT)),
 ):
-    try:
-        body = LastfmEnableRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from None
     with answer_errors(LastfmError, keep_cause=False):
         return request.app.state.lastfm_accounts.enable(library, body.connection_id)
 
@@ -90,12 +77,10 @@ def enable_lastfm(
 def lastfm_now_playing(
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(LASTFM_BODY_LIMIT)),
+    body: LastfmNowPlayingRequest = Depends(
+        json_body(LastfmNowPlayingRequest, LASTFM_BODY_LIMIT)
+    ),
 ):
-    try:
-        body = LastfmNowPlayingRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from None
     with answer_errors(LastfmError, keep_cause=False):
         request.app.state.lastfm_accounts.now_playing(library, str(uuid.UUID(body.track_uuid)))
     return Response(status_code=202)

@@ -126,6 +126,60 @@ class _RefusedAfterAuth extends ServerBindingRepository {
   }
 }
 
+/// The binding-row read, once the server has answered a sign-in, reads the
+/// row and then holds the answer until the test releases it: every held
+/// read then answers in the same turn. [reads] counts the held reads.
+class _GatedReadAfterAuth extends ServerBindingRepository {
+  _GatedReadAfterAuth(super.db);
+  final release = Completer<void>();
+  int reads = 0;
+  @override
+  Future<ServerBindingRecord?> current() async {
+    final row = await super.current();
+    if (_events.any((e) => e.startsWith('POST /auth/'))) {
+      reads++;
+      await release.future;
+    }
+    return row;
+  }
+}
+
+/// A transport whose n-th login (user 8, "bob", token `tok-<n>`) answers
+/// only once `answers[n]` completes; every request goes to [_events].
+class _GatedLogins {
+  _GatedLogins(this._answers);
+  final List<Completer<void>> _answers;
+
+  /// The logins received so far.
+  int requests = 0;
+
+  late final http.Client client = MockClient((req) async {
+    final auth = req.headers['Authorization'];
+    _events.add('${req.method} ${req.url.path}'
+        '${auth == null ? '' : ' [$auth]'}');
+    if (req.url.path == '/auth/login') {
+      final i = requests++;
+      await _answers[i].future;
+      return http.Response(
+        jsonEncode({
+          'token': 'tok-$i',
+          'media_token': 'med-$i',
+          'server_instance_id': 'inst-1',
+          'user': {
+            'id': 8,
+            'username': 'bob',
+            'is_admin': false,
+            'is_master_admin': false,
+          },
+        }),
+        200,
+      );
+    }
+    if (req.url.path == '/auth/logout') return http.Response('', 204);
+    return http.Response('{"message":"Healthy"}', 200);
+  });
+}
+
 class _FailingDbWipe extends AppDatabase {
   _FailingDbWipe() : super(NativeDatabase.memory());
   @override
@@ -598,6 +652,92 @@ void main() {
             'POST /auth/logout [Bearer tok-0]',
             'POST /auth/logout [Bearer tok-1]',
           ]));
+    });
+
+    // Two sign-ins whose binding reads answer in the same turn
+    // both reach the hold step before either is held. Exactly one is held;
+    // the other is revoked at once, and cancelling revokes the held one:
+    // each token is revoked once, none is dropped.
+    test('two sign-ins reaching the hold in the same turn: one held, the '
+        'other revoked', () async {
+      await seedAlice();
+      final login = _GatedLogins(
+          [Completer<void>()..complete(), Completer<void>()..complete()]);
+      final read = _GatedReadAfterAuth(db);
+      final c = scope(
+        repository: read,
+        unauthenticated: (url) => testApiClient(url, login.client),
+      );
+      final service = c.read(sessionServiceProvider);
+      final first = service.login('bob', 'pw-bob-123');
+      final second = service.login('bob', 'pw-bob-123');
+      await pumpEventQueue();
+      expect(read.reads, 2, reason: 'both sign-ins wait at the binding read');
+      read.release.complete();
+      expect(await first, isA<SignInNeedsUserSwitch>());
+      expect(await second, isA<SignInNeedsUserSwitch>());
+      await pumpEventQueue();
+      // The first sign-in reaches the hold first; the second replaces it.
+      expect(_events.where((e) => e.startsWith('POST /auth/logout')),
+          ['POST /auth/logout [Bearer tok-0]'],
+          reason: 'the sign-in that is not held is revoked at once');
+      await service.cancelPendingSignIn();
+      expect(
+          _events.where((e) => e.startsWith('POST /auth/logout')),
+          unorderedEquals([
+            'POST /auth/logout [Bearer tok-0]',
+            'POST /auth/logout [Bearer tok-1]',
+          ]));
+    });
+
+    // A sign-in still running when the scope is disposed. Nothing
+    // can take it over afterwards, so it revokes its own session. (Answered
+    // after the dispose, the binding read already fails and revokes; the
+    // next test has the read itself end after the dispose.)
+    test('a sign-in answered after the scope is disposed revokes its session',
+        () async {
+      await seedAlice();
+      final answers = [Completer<void>()];
+      final login = _GatedLogins(answers);
+      final c =
+          scope(unauthenticated: (url) => testApiClient(url, login.client));
+      final pending = c.read(sessionServiceProvider).login('bob', 'pw-bob-123');
+      await pumpEventQueue();
+      expect(login.requests, 1);
+      c.dispose();
+      answers[0].complete();
+      try {
+        await pending;
+      } catch (_) {
+        // The outcome reaches no one; only the revoke matters.
+      }
+      await pumpEventQueue();
+      expect(_events.where((e) => e == 'POST /auth/logout [Bearer tok-0]'),
+          hasLength(1));
+    });
+
+    test('a sign-in whose binding read ends after the scope is disposed '
+        'revokes its session', () async {
+      await seedAlice();
+      final login = _GatedLogins([Completer<void>()..complete()]);
+      final read = _GatedReadAfterAuth(db);
+      final c = scope(
+        repository: read,
+        unauthenticated: (url) => testApiClient(url, login.client),
+      );
+      final pending = c.read(sessionServiceProvider).login('bob', 'pw-bob-123');
+      await pumpEventQueue();
+      expect(read.reads, 1);
+      c.dispose();
+      read.release.complete();
+      try {
+        await pending;
+      } catch (_) {
+        // The outcome reaches no one; only the revoke matters.
+      }
+      await pumpEventQueue();
+      expect(_events.where((e) => e == 'POST /auth/logout [Bearer tok-0]'),
+          hasLength(1));
     });
 
     test('a connect while a sign-in is held revokes it once', () async {

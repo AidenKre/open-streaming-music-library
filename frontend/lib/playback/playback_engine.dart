@@ -8,8 +8,8 @@ enum PlaybackSourceKind { local, remote }
 /// lifecycle.
 enum EngineProcessingState { idle, loading, buffering, ready, completed }
 
-/// Native looping over the loaded window. (5B.0d moves logical end/wrap to
-/// the model; until then the core maps the queue repeat mode onto this.)
+/// Native looping over the loaded window. The model owns logical end and
+/// wrap; the core asks for [all] only when the window holds the whole queue.
 enum EngineLoopMode { off, all, one }
 
 /// Desired transport as the engine reports it plus its processing state.

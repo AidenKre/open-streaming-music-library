@@ -1,6 +1,8 @@
 // SC-01 rule 1 (blocked: different server): a persistent banner offers
 // Reset (keep the URL, bind to the server there) or Disconnect, each behind
 // a confirmation that names what will be lost (SC-15).
+import 'dart:async';
+
 import 'package:frontend/services/session_service.dart' show ServerBlockedReason;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -83,6 +85,39 @@ void main() {
     await tester.pumpAndSettle();
     expect(fake.calls, ['disconnect']);
   });
+
+  // One sheet per tap. A second tap on either button while the
+  // losses are read does nothing; once the sheet is closed, a tap asks
+  // again.
+  for (final (first, second) in [
+    ('Reset', 'Reset'),
+    ('Disconnect', 'Disconnect'),
+    ('Reset', 'Disconnect'),
+  ]) {
+    testWidgets('$first, then $second while the losses are read: one sheet',
+        (tester) async {
+      final fake = await pump(tester);
+      final gate = Completer<List<String>>();
+      fake.lossSummariesGate = gate;
+      await tester.tap(find.widgetWithText(TextButton, first));
+      await tester.pump();
+      await tester.tap(find.widgetWithText(TextButton, second));
+      await tester.pump();
+      gate.complete(['2 unsent metadata edits']);
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(fake.lossSummaryReads, 1);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(fake.calls, isEmpty);
+      await tester.tap(find.widgetWithText(TextButton, second));
+      await tester.pumpAndSettle();
+      expect(find.byType(BottomSheet), findsOneWidget,
+          reason: 'the guard is released once the sheet closes');
+      await teardownTree(tester);
+    });
+  }
 
   // Phase M §7.7 (M-U24): a 401 signed the session out. The banner says so;
   // its action is Log in, which performs logout first (user decision), so

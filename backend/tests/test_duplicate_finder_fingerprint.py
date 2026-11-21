@@ -22,6 +22,7 @@ s7-fingerprint-search: possible 0.70, window max(7 s, 2%)) on purpose.
 
 import sqlite3
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,7 +34,15 @@ from app.services.audio_identity import (
     FingerprintUnavailable,
 )
 from app.config import Settings
-from app.services.duplicate_detection import DuplicateMatch, MatcherParams, TrackRef, find_duplicates
+from app.services import duplicate_detection
+from app.services.duplicate_detection import (
+    DuplicateMatch,
+    MatcherParams,
+    StagedIdentity,
+    StagedRef,
+    TrackRef,
+    find_duplicates,
+)
 from tests.fingerprint_fixtures import ALGO, BASE, EXPLICIT, fp_track, noisy, pin_matcher_settings, random_print
 from tests.owned_database import add_test_user
 from tests.pending_deletion import mark_pending_deletion
@@ -103,6 +112,34 @@ def test_every_match_is_returned_uncapped(db, conn):
     copies = {fp_track(db, f"c{i}", noisy(BASE, i % 3)) for i in range(9)}
 
     assert set(fp_matches(find(db, conn))) == {TrackRef(u) for u in copies}
+
+
+def test_a_lookup_prepares_the_subject_once_for_every_candidate(db, conn, monkeypatch):
+    # The subject is the same for the whole lookup, so its print is packed
+    # and its diversity computed once, not once per candidate (library and staged).
+    library = {fp_track(db, f"c{i}", noisy(BASE, 2 + i % 3)) for i in range(4)}
+    fp_track(db, "unrelated", random_print(5))  # compared, below possible
+    staged = StagedIdentity(StagedRef("item-1"), AudioIdentity(
+        exact=ExactAudioHash(KIND_PCM, "ee" * 32, 44100, 2, 16), tool_versions="ffmpeg 9; fpcalc 1.6.2",
+        computed_at=T, fingerprint=FingerprintIdentity("current", "fpcalc", ALGO, 200.0, noisy(BASE, 2))))
+    with_subject = {"diversity": 0, "pack": 0}
+    real_diversity, real_pack = duplicate_detection._penalty_diversity, duplicate_detection.struct.pack
+
+    def diversity(items):
+        with_subject["diversity"] += tuple(items) == BASE
+        return real_diversity(items)
+
+    def pack(fmt, *items):
+        with_subject["pack"] += items == BASE
+        return real_pack(fmt, *items)
+
+    monkeypatch.setattr(duplicate_detection, "_penalty_diversity", diversity)
+    monkeypatch.setattr(duplicate_detection, "struct", SimpleNamespace(pack=pack))
+
+    report = find(db, conn, extra_subjects=[staged])
+
+    assert set(fp_matches(report)) == {TrackRef(u) for u in library} | {StagedRef("item-1")}
+    assert with_subject == {"diversity": 1, "pack": 1}
 
 
 # --- a lead-in beyond +-24 items inside the length window (s7-fingerprint-search) -------------

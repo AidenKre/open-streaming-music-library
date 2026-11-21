@@ -40,7 +40,7 @@ def _called_names(node: ast.AST) -> set[str]:
 
 
 def test_the_stream_route_reads_no_file_path_and_opens_nothing_itself():
-    route = _function(_tree("main.py"), "stream_track")
+    route = _function(_tree("routers/catalog.py"), "stream_track")
 
     assert "file_path" not in _attributes(route)
     assert {"open", "encode_for_stream", "get_tracks", "get_track_by_uuid"}.isdisjoint(

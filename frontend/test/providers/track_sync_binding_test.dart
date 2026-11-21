@@ -12,14 +12,17 @@ import 'package:frontend/api/api_client.dart';
 import 'package:frontend/api/api_client_provider.dart';
 import 'package:frontend/api/tracks_api.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/edit_outbox.dart';
 import 'package:frontend/services/server_binding_gate.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../helpers/server_binding.dart';
+import '../helpers/stamped_server.dart' show seedTrackRow;
 import '../helpers/test_offline.dart';
 
 void main() {
@@ -97,6 +100,66 @@ void main() {
     await sync;
     expect(changeRequests, 1);
     expect(c.read(trackSyncProvider).value!.libraryError, isNull);
+  });
+
+  // A.12 characterization: the "sync in flight" claim is taken before the
+  // sync waits for verification, so a second run asked meanwhile is refused
+  // at once instead of queueing at the gate behind it.
+  test('a refresh asked while a sync waits for verification is refused at '
+      'once and sends nothing', () async {
+    final notifier = c.read(trackSyncProvider.notifier);
+    final sync = notifier.sync(); // waits for verification
+    var done = false;
+    final refresh =
+        notifier.refreshTrack('u1').whenComplete(() => done = true);
+    await pumpEventQueue();
+    expect(done, isTrue, reason: 'refused without waiting for the verdict');
+    expect(await refresh, isFalse);
+    expect(changeRequests, 0);
+
+    unawaited(controlled.gate.startConnection('http://s'));
+    await pumpEventQueue();
+    controlled.respond('inst-1');
+    await sync;
+    expect(changeRequests, 1, reason: "only the sync's pull was sent");
+  });
+
+  // A.12 characterization: the wait for verification comes before "syncing"
+  // is published and is not made holding the edit lock, so nothing shows a
+  // sync and an edit is saved meanwhile.
+  test('while a sync waits for verification, nothing shows it syncing and '
+      'an edit is saved', () async {
+    await seedTrackRow(db, 'u1');
+    final published = <TrackSyncState>[];
+    c.listen<AsyncValue<TrackSyncState>>(trackSyncProvider, (_, next) {
+      final value = next.value;
+      if (value != null) published.add(value);
+    });
+    final sync = c.read(trackSyncProvider.notifier).sync(); // waits
+    await pumpEventQueue();
+    expect(published.where((s) => s.isSyncing || s.librarySyncing), isEmpty);
+
+    var saved = false;
+    unawaited(c
+        .read(editOutboxProvider)
+        .enqueue(
+          uuidId: 'u1',
+          edit: const MetadataEdit.empty().set('title', 'Mine'),
+          writeMode: EditWriteMode.dbOnly,
+          baseRevision: 5,
+        )
+        .then((_) => saved = true));
+    await pumpEventQueue();
+    expect(saved, isTrue,
+        reason: "the edit waited for the sync's verification");
+    expect(await db.select(db.pendingEdits).get(), hasLength(1));
+
+    unawaited(controlled.gate.startConnection('http://s'));
+    await pumpEventQueue();
+    controlled.respond('inst-1');
+    await sync;
+    expect(published.where((s) => s.librarySyncing), isNotEmpty);
+    expect(published.last.isSyncing, isFalse);
   });
 
   test('a different server never receives a sync request', () async {

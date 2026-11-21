@@ -239,7 +239,8 @@ def test_commits_are_prepared_oldest_first(db, music):
 
 
 def test_the_named_seam_runs_after_prepared(db, music):
-    """7A.3b plugs steps 3-6 in here; the journal it gets is already prepared."""
+    """The hand-over after prepare: the server passes an UploadPublisher here, which
+    runs steps 3-6 (move, insert, finish); the journal it gets is already prepared."""
     commit = accept(db, _ready(db, music))
     seen = []
 

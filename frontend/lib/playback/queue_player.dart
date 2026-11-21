@@ -936,9 +936,12 @@ class QueuePlayer extends Notifier<AudioState>
       final endLanding =
           !preservePosition && endedSessionIds.contains(sessionId);
       final autoPlay = wasPlaying && !endLanding;
-      // OPEN-8-11: an end landing rests paused, so an interruption's end
-      // does not resume it.
-      if (endLanding) _resumeAfterInterruption = false;
+      // OPEN-8-11: an end landing rests paused, so neither an interruption's
+      // end nor an unused output coming back resumes it.
+      if (endLanding) {
+        _resumeAfterInterruption = false;
+        _resumeWhenFocusReturns = false;
+      }
       await _startSession(
         sessionId,
         autoPlay: autoPlay,

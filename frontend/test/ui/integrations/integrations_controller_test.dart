@@ -184,6 +184,25 @@ void main() {
       );
     });
 
+    // A damaged listen (artist and track null) is a row
+    // with the app's words for unknown names, never "none".
+    test('a damaged problem row is shown with unknown names', () async {
+      final rig = _rig();
+      rig.api.onStatus = () async => lastfmStatus(
+        counts: {'pending': 0, 'sent': 0, 'ignored': 0, 'failed': 1,
+            'dropped': 0},
+        recentProblems: [
+          {'artist': null, 'track': null, 'listened_at': 3000,
+              'status': 'failed', 'code': null},
+        ],
+      );
+      final c = await rig.start();
+      expect(
+        c.view.problems.map((p) => (p.artist, p.track, p.listenedAt)),
+        [('Unknown artist', 'Unknown track', 3000)],
+      );
+    });
+
     test('going offline and back updates the offer and notifies', () async {
       final rig = _rig(state: 'not_connected');
       final c = await rig.start();
@@ -359,16 +378,17 @@ void main() {
       expect(c.view.status!.state, LastfmAccountState.notConnected);
     });
 
-    // DEV-9-13 (owner 2026-11-14): Disconnect while the server is
-    // unreachable also says that nothing was changed.
-    test('disconnect while the server is unreachable says nothing was '
-        'changed', () async {
+    // Not "Nothing was changed.": a connection that dropped after the
+    // request was sent may have disconnected Last.fm, and the app cannot
+    // tell, so nothing is promised.
+    test('disconnect while the server is unreachable promises nothing',
+        () async {
       final rig = _rig(state: 'enabled', needsReconnect: false);
       final c = await rig.start();
       rig.api.onDisconnect = () async =>
           throw NetworkException('refused', attemptsMade: 1);
       await c.disconnect();
-      expect(c.message, "Can't reach your server right now. Nothing was changed.");
+      expect(c.message, "Can't reach your server right now.");
     });
 
     test('a disconnect that timed out may have been applied: no "nothing '

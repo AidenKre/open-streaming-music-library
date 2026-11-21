@@ -244,7 +244,7 @@ def test_an_edit_waits_for_startup_while_a_converted_temp_is_not_in_place(tmp_pa
     _make_audio(converted, title="Old", artist="Art", comment="converted")
     db.insert_journal_entry("convert", track.uuid_id, str(audio), None, str(converted))
     cache = EncodedCache(EncodedCacheContext(cache_dir=tmp_path / "cache", max_size_bytes=10**9))
-    cache.path_for(track.uuid_id, "high").write_bytes(b"encode of the pre-conversion bytes")
+    cache.path_for(track.uuid_id, "320").write_bytes(b"encode of the pre-conversion bytes")
     original = audio.read_bytes()
 
     with pytest.raises(MasterWriteError):
@@ -261,7 +261,7 @@ def test_an_edit_waits_for_startup_while_a_converted_temp_is_not_in_place(tmp_pa
     reconcile_journal(db, library)
     for u in uuids:
         evict_track_caches(u, cache, None)
-    assert not cache.has(track.uuid_id, "high")
+    assert not cache.has(track.uuid_id, "320")
     # Putting the converted bytes in place bumps the revision (U06-B-06, review
     # finding 10), so the edit is made against the revision after the restart.
     restarted = db.get_track_by_uuid(track.uuid_id)

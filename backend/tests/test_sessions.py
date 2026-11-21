@@ -91,7 +91,22 @@ def test_a_live_api_token_resolves_to_its_user(db):
         user_id=user_id,
         is_admin=True,
         is_master_admin=False,
+        library_folder="sam",
     )
+
+
+def test_the_lookup_carries_the_folder_the_users_row_names_at_that_lookup(db):
+    # The request's library folder travels with the session
+    # read, so it must be read afresh each time, never remembered.
+    user_id = add_test_user(db, "sam")
+    tokens = create_session(db, user_id)
+    assert _lookup(db, tokens.token).library_folder == "sam"
+    assert _lookup_media(db, tokens.media_token).library_folder == "sam"
+
+    sql_rows(db, "UPDATE users SET library_folder = 'sam-2' WHERE id = ?", (user_id,))
+
+    assert _lookup(db, tokens.token).library_folder == "sam-2"
+    assert _lookup_media(db, tokens.media_token).library_folder == "sam-2"
 
 
 @pytest.mark.parametrize("token", ["", "unknown-token", "x" * 43])
@@ -201,6 +216,7 @@ def test_a_live_media_token_resolves_to_its_session_and_user(db):
         user_id=user_id,
         is_admin=True,
         is_master_admin=False,
+        library_folder="sam",
     )
 
 

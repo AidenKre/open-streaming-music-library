@@ -12,6 +12,7 @@ The words of the refusal are pinned in one place, ``test_the_refusal_sentences``
 every other test here checks the exception and the version it found.
 """
 
+import errno
 import hashlib
 import os
 import sqlite3
@@ -416,6 +417,29 @@ def test_an_unreadable_wal_file_is_refused_with_what_to_check(tmp_path):
     )
 
 
+@pytest.mark.requires_chmod_denial
+@pytest.mark.parametrize("check", ["require_current_schema", "initialize"])
+def test_a_database_in_a_folder_the_server_cannot_search_is_refused_with_what_to_check(
+    tmp_path, check
+):
+    """Looking for the file itself is denied (the folder has no search
+    permission). That is the same file-system problem, not a raw error."""
+    folder = tmp_path / "database"
+    folder.mkdir()
+    path = folder / "database.db"
+    open_database(path)
+    os.chmod(folder, 0)
+    try:
+        with pytest.raises(DatabaseUnreadable) as refused:
+            getattr(_database(path), check)()
+    finally:
+        os.chmod(folder, 0o700)
+
+    assert str(refused.value) == _permissions_hint(
+        path, f"[Errno 13] Permission denied: '{path}'"
+    )
+
+
 def test_a_directory_at_the_database_path_keeps_the_back_it_up_sentence(tmp_path):
     path = tmp_path / "database.db"
     path.mkdir()
@@ -429,21 +453,87 @@ def test_a_directory_at_the_database_path_keeps_the_back_it_up_sentence(tmp_path
     )
 
 
-def test_a_disk_error_while_reading_the_wal_keeps_the_back_it_up_sentence(tmp_path, monkeypatch):
-    """Review m1: only a permission problem gets the permissions advice; a full
-    disk while copying the -wal (no -shm) is not one."""
+def _temporary_folder_hint(path: Path, error: str, check: str) -> str:
+    """The server's start-up (``initialize``) says to start it again; the admin
+    tool (``require_current_schema``) is not the server, so it names the command
+    and says to run it again."""
+    hint = (
+        f"{path} could not be copied to the temporary folder ({error}) to check its "
+        "version. Set TMPDIR to a folder "
+    )
+    return hint + {
+        "initialize": "the server can write to that has room, then start the server again.",
+        "require_current_schema": "this command can write to that has room, then run it again.",
+    }[check]
+
+
+def _wal_without_shm(tmp_path) -> Path:
     path = _file_whose_wal_holds_its_version(tmp_path)
-    Path(f"{path}-shm").unlink()
+    Path(f"{path}-shm").unlink()  # so the version check reads a copy
+    return path
 
-    def full_disk(src, dst, *args, **kwargs):
-        raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr("app.database.database.shutil.copyfile", full_disk)
+@pytest.mark.parametrize("check", ["require_current_schema", "initialize"])
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
+def test_a_full_temporary_folder_while_copying_the_wal_says_to_set_tmpdir(
+    tmp_path, monkeypatch, code, check
+):
+    """The database is healthy; the copy for the version check could
+    not be written. Starting over with a fresh APP_DATA_DIR would be wrong advice."""
+    path = _wal_without_shm(tmp_path)
+    before = _snapshot_all(path)
+
+    def full(src, dst, *args, **kwargs):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr("app.database.schema.shutil.copyfile", full)
+
+    with pytest.raises(DatabaseUnreadable) as refused:
+        getattr(_database(path), check)()
+
+    assert str(refused.value) == _temporary_folder_hint(
+        path, f"[Errno {code}] {os.strerror(code)}", check
+    )
+    _assert_all_untouched(path, before)
+
+
+@pytest.mark.parametrize("check", ["require_current_schema", "initialize"])
+def test_a_temporary_folder_that_cannot_be_created_says_to_set_tmpdir(
+    tmp_path, monkeypatch, check
+):
+    """Creating the temporary folder is denied. That is no problem of
+    the database file, so it gets neither the permissions nor the back-it-up advice."""
+    path = _wal_without_shm(tmp_path)
+    before = _snapshot_all(path)
+
+    def denied(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "Permission denied", "/unwritable/tmp")
+
+    monkeypatch.setattr("app.database.schema.tempfile.TemporaryDirectory", denied)
+
+    with pytest.raises(DatabaseUnreadable) as refused:
+        getattr(_database(path), check)()
+
+    assert str(refused.value) == _temporary_folder_hint(
+        path, "[Errno 13] Permission denied: '/unwritable/tmp'", check
+    )
+    _assert_all_untouched(path, before)
+
+
+def test_a_read_error_while_copying_the_wal_keeps_the_back_it_up_sentence(tmp_path, monkeypatch):
+    """An input/output error while copying is not a full
+    temporary folder and not a permission problem; it keeps the back-it-up advice."""
+    path = _wal_without_shm(tmp_path)
+
+    def failing_disk(src, dst, *args, **kwargs):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr("app.database.schema.shutil.copyfile", failing_disk)
 
     with pytest.raises(DatabaseUnreadable) as refused:
         _database(path).require_current_schema()
 
     assert str(refused.value) == (
-        f"{path} cannot be read as a SQLite database ([Errno 28] No space left on device). "
+        f"{path} cannot be read as a SQLite database ([Errno 5] Input/output error). "
         "Back it up and start with a fresh APP_DATA_DIR."
     )

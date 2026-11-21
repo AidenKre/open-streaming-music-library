@@ -563,10 +563,13 @@ void main() {
       await pickAac192AndConfirm(tester);
 
       expect(
-        find.text('The server is still finishing a previous change to this '
-            'track. Try again later.'),
+        find.text('The server has not finished an earlier change to this '
+            'track. The server checks this track at its next start.'),
         findsOneWidget,
       );
+      // Trying again does not help: nothing offers it.
+      expect(find.byType(SnackBarAction), findsNothing);
+      expect(find.textContaining('Try again'), findsNothing);
       expect(jobs.refreshAllCalls, 0);
     });
 

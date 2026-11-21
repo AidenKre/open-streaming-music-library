@@ -6,11 +6,13 @@
 //  * the serverError path, which forgets the URL, also deletes the
 //    credentials; since sign-off OPEN-A-04 only a 4xx or a non-OSML JSON
 //    answer takes it, and a 5xx or 429 is "unreachable" (offline, all kept),
-//    as is a 2xx answer that is not JSON (a Wi-Fi sign-in page, A5-02);
+//    as is a 2xx answer that is not JSON (a Wi-Fi sign-in page, A5-02) or
+//    is empty, a bare `{}` included;
 //  * stored credentials without a binding row of their user are dropped
 //    (sign-off DEV-M-13): Log in with "You have been logged out.", nothing
 //    sent, and no row is created (login creates it, spec 7.4).
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:drift/native.dart';
@@ -29,6 +31,7 @@ import 'package:frontend/services/server_binding_gate.dart';
 import 'package:frontend/services/session_event_log.dart';
 import 'package:frontend/services/session_readiness.dart';
 import 'package:frontend/services/session_service.dart';
+import 'package:frontend/ui/session_controller.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -649,6 +652,22 @@ void main() {
       expect(await store.read(), testCredentials);
     });
 
+    // An empty 2xx answer (or a bare `{}`, which the client cannot
+    // tell from it) comes from something in front of the server too: the
+    // address and the sign-in are kept.
+    test('an empty 200 answer at launch keeps the address and the sign-in',
+        () async {
+      await store.save(testCredentials);
+      SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
+      server = (_) async => http.Response('', 200);
+      final c = scope(credentials: testCredentials);
+      final start = await c.read(sessionServiceProvider).resumeSavedSession();
+      expect(start.kind, SessionStartKind.offline);
+      expect((await SharedPreferences.getInstance()).getString('serverUrl'),
+          'http://s');
+      expect(await store.read(), testCredentials);
+    });
+
     // ... and the app is then exactly as offline at launch: the same start,
     // offline mode with its health poll, the session ready (the saved queue
     // may load), no identity probe, the binding row and the log as they were,
@@ -686,6 +705,8 @@ void main() {
           '<html>Wi-Fi</html>', 200, headers: {'content-type': 'text/html'})),
       ('a 202 plain-text page',
           (http.Request _) async => http.Response('Please sign in', 202)),
+      ('an empty 200 answer', (http.Request _) async => http.Response('', 200)),
+      ('a {} 200 answer', (http.Request _) async => http.Response('{}', 200)),
     ]) {
       test('$name at launch behaves exactly as an unreachable server',
           () async {
@@ -718,5 +739,37 @@ void main() {
       expect(start.kind, SessionStartKind.offline);
       expect(await store.read(), testCredentials);
     });
+  });
+
+  // A sign-in saved before the scope rebuild threw is kept (the
+  // next launch resumes signed in), so the sign-in's catch-all says it
+  // could not be finished, not that it failed.
+  test('a sign-in whose scope rebuild throws reads "Could not finish '
+      'signing in."; the sign-in is saved', () async {
+    SharedPreferences.setMockInitialValues({'serverUrl': 'http://s'});
+    server = (req) async => req.url.path == '/auth/login'
+        ? http.Response(
+            jsonEncode({
+              'token': 'tok',
+              'media_token': 'med',
+              'server_instance_id': 'inst-1',
+              'user': {
+                'id': testUserId,
+                'username': 'tester',
+                'is_admin': false,
+                'is_master_admin': false,
+              },
+            }),
+            200)
+        : http.Response('{"message":"Healthy"}', 200);
+    final c = scope(
+        onSessionChanged: () async => throw StateError('rebuild failed'));
+    final controls = c.read(sessionControlsProvider);
+    await controls.start();
+    expect(controls.phase, SessionPhase.logIn);
+    await controls.login('tester', 'pw-tester-1');
+    expect(controls.authError, 'Could not finish signing in.');
+    expect((await store.read())?.token, 'tok',
+        reason: 'the sign-in was saved before the rebuild threw');
   });
 }

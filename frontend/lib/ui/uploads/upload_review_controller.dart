@@ -5,17 +5,26 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:frontend/api/api_client.dart' show ApiException;
+import 'package:frontend/api/api_client.dart'
+    show ApiException, NetworkException;
+import 'package:frontend/api/authenticated_client.dart'
+    show TokenWithheldException;
+import 'package:frontend/api/gated_send.dart'
+    show BindingNotVerified, BindingRefusal;
 import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/models/metadata_edit.dart';
+import 'package:frontend/models/server_blocked_reason.dart';
 import 'package:frontend/services/app_info_service.dart';
+import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/operations/durable_submission.dart'
     show SubmissionConflict;
 import 'package:frontend/services/uploads/upload_duplicate_banners.dart';
 import 'package:frontend/services/uploads/upload_duplicate_summary.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart'
+    show ServerItemState;
 import 'package:frontend/services/uploads/uploads_overview.dart'
     show UploadsOverview;
 import 'package:frontend/services/uploads/upload_manager.dart'
@@ -34,6 +43,19 @@ import 'package:frontend/services/uploads/upload_review_rules.dart'
 
 enum ReviewLoad { loading, failed, ready }
 
+/// What the review page says when its load failed for [reason].
+String reviewLoadFailedText(LibraryToolsUnreachable? reason) =>
+    switch (reason) {
+      LibraryToolsUnreachable.needsConnection =>
+        'The files to review need a connection.',
+      LibraryToolsUnreachable.differentServer =>
+        'The files to review are not available: a different server answers '
+            'at this address.',
+      LibraryToolsUnreachable.signedOut =>
+        'The files to review are not available: you are signed out.',
+      null => "Couldn't load the files to review.",
+    };
+
 class ReviewImported {
   const ReviewImported(
     this.displayName,
@@ -49,6 +71,15 @@ class ReviewImported {
 
 abstract interface class UploadReviewControls implements Listenable {
   ReviewLoad get load;
+
+  /// Why the failed load could not reach the server: the session's block
+  /// while there is one, else the reason the load was refused (forgotten
+  /// once a block clears); null for any other failure, and while the load
+  /// has not failed.
+  LibraryToolsUnreachable? get loadUnreachable;
+
+  /// Whether Try again can help the failed load.
+  bool get loadRetryHelps;
   int get position;
   int get total;
   String get positionText;
@@ -135,6 +166,11 @@ class UploadReviewController extends ChangeNotifier
 
   String _batch = '';
   ReviewLoad _load = ReviewLoad.loading;
+
+  /// Why the last load could not reach the server; null for any other
+  /// failure.
+  BindingRefusal? _loadRefusal;
+  ProviderSubscription<Object?>? _blockedSub;
   var _items = <String, UploadItem>{};
   var _order = <String>[];
   int _position = 0;
@@ -164,6 +200,20 @@ class UploadReviewController extends ChangeNotifier
 
   @override
   ReviewLoad get load => _load;
+  @override
+  LibraryToolsUnreachable? get loadUnreachable {
+    if (_load != ReviewLoad.failed) return null;
+    final blocked = _ref.read(libraryToolsServerBlockedProvider);
+    if (_loadRefusal == null && blocked == ServerBlockedReason.none) {
+      return null;
+    }
+    return libraryToolsUnreachable(blocked: blocked, refusal: _loadRefusal);
+  }
+
+  @override
+  bool get loadRetryHelps =>
+      _load != ReviewLoad.failed ||
+      libraryToolsRetryHelps(_ref.read(libraryToolsServerBlockedProvider));
   @override
   int get position => _position;
   @override
@@ -232,6 +282,7 @@ class UploadReviewController extends ChangeNotifier
   Future<void> start(String batchUuid, {String? startAt}) async {
     _batch = batchUuid;
     _load = ReviewLoad.loading;
+    _loadRefusal = null;
     _notify();
     try {
       final ticket = _reads.begin();
@@ -253,8 +304,26 @@ class UploadReviewController extends ChangeNotifier
         (_, v) => _onIntents(v.value),
         fireImmediately: true,
       );
-    } catch (_) {
+    } catch (e) {
       _load = ReviewLoad.failed;
+      _loadRefusal = switch (e) {
+        BindingNotVerified(:final reason) => reason,
+        TokenWithheldException() || NetworkException() => BindingRefusal.notYet,
+        _ => null,
+      };
+      // Every failed load follows the block: while there is one, its reason
+      // is the page's and Try again cannot help.
+      if (_blockedSub == null && !_disposed) {
+        _blockedSub = _ref.listen(
+          libraryToolsServerBlockedProvider,
+          (_, blocked) {
+            // The block cleared: the stored refusal no longer says why.
+            if (blocked == ServerBlockedReason.none) _loadRefusal = null;
+            _notify();
+          },
+        );
+        _subs.add(_blockedSub!);
+      }
     }
     _notify();
   }
@@ -414,7 +483,7 @@ class UploadReviewController extends ChangeNotifier
       _importedItemUuid = uuid;
       _importedName = held.filename;
       _importedTrackUuid = held.resultTrackUuid;
-      _importedAlreadyInLibrary = after == 'duplicate';
+      _importedAlreadyInLibrary = after == ServerItemState.duplicate;
       if (canNext) {
         await _goTo(_position + 1);
         return;

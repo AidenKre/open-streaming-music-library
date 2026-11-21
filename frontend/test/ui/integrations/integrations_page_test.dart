@@ -173,8 +173,11 @@ void main() {
             account: null),
       );
       await pumpIntegrations(tester, fake);
+      // The approval page may be gone (its link is not kept), so
+      // the way out is said while Start again is offered.
       expect(find.text('Approve the access on last.fm, then come back and '
-          'tap Finish connecting.'), findsOneWidget);
+          'tap Finish connecting. If that page is no longer open, tap Start '
+          'again.'), findsOneWidget);
       expect(find.text('Finish connecting'), findsOneWidget);
       expect(find.text('Start again'), findsOneWidget);
       await tester.tap(byKey('integrations.finish'));
@@ -356,6 +359,9 @@ void main() {
       await pumpIntegrations(tester, fake);
       expect(find.text(awaitingNote), findsOneWidget);
       expect(find.text('Reconnect'), findsOneWidget);
+      // No Start again button here, so it is not asked for.
+      expect(find.text('Start again'), findsNothing);
+      expect(find.textContaining('tap Start again'), findsNothing);
       await tester.tap(byKey('integrations.finish'));
       await tester.pump();
       expect(fake.calls, ['finish']);

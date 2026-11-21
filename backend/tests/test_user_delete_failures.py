@@ -98,7 +98,7 @@ def test_a_failed_uuid_read_aborts_step_2(world, monkeypatch, table):
             return super().execute(statement, *args)
 
     monkeypatch.setattr(
-        "app.database.database.sqlite3.connect",
+        "app.database.core.sqlite3.connect",
         lambda *a, **k: real_connect(*a, factory=Locked, **k),
     )
 

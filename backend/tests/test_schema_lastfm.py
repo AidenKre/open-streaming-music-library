@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.schema_fixtures import make_two_user_database
+from app.database.database import Database, DatabaseContext
+from tests.schema_fixtures import INIT_SQL, make_two_user_database
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -350,12 +351,8 @@ def test_counters_flags_and_times_are_well_formed(fresh, column, value):
         conn.close()
 
 
-def _plan(path, sql, params=()):
-    conn = sqlite3.connect(path)
-    try:
-        return " ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql, params))
-    finally:
-        conn.close()
+# The plans of the product's outbox reads are pinned in
+# tests/test_lastfm_outbox_plans.py, on the SQL the product runs.
 
 
 def _index_columns(path, name):
@@ -366,29 +363,14 @@ def _index_columns(path, name):
         conn.close()
 
 
-def test_the_owner_index_leads_with_the_owner_and_serves_the_status_counts(fresh):
+def test_the_owner_index_leads_with_the_owner(fresh):
     assert _index_columns(fresh, "idx_scrobble_outbox_owner") == ["owner_id", "status", "listened_at_s"]
-    plan = _plan(
-        fresh,
-        "SELECT status, count(*) FROM scrobble_outbox WHERE owner_id = ? GROUP BY status",
-        (1,),
-    )
-    assert "idx_scrobble_outbox_owner" in plan and "TEMP B-TREE" not in plan
 
 
-def test_a_users_oldest_pending_rows_are_read_in_listen_order_from_the_owner_index(fresh):
-    plan = _plan(
-        fresh,
-        "SELECT event_uuid FROM scrobble_outbox WHERE owner_id = ? AND status = 'pending' "
-        "ORDER BY listened_at_s LIMIT 50",
-        (1,),
-    )
-    assert "idx_scrobble_outbox_owner" in plan and "TEMP B-TREE" not in plan
-
-
-def test_the_due_scan_reads_only_the_pending_index(fresh):
+def test_the_due_index_holds_only_pending_rows(fresh):
     """The sender's due scan (spec §7.8): per user, the earliest-queued
-    pending row whose listen time has arrived. The partial index covers it."""
+    pending row whose listen time has arrived. The partial index holds only
+    pending rows."""
     assert _index_columns(fresh, "idx_scrobble_outbox_due") == ["owner_id", "created_at", "listened_at_s"]
     conn = sqlite3.connect(fresh)
     try:
@@ -398,29 +380,59 @@ def test_the_due_scan_reads_only_the_pending_index(fresh):
     finally:
         conn.close()
     assert "WHERE status = 'pending'" in " ".join(partial.split())
-    plan = _plan(
-        fresh,
-        "SELECT owner_id, MIN(created_at) FROM scrobble_outbox "
-        "WHERE status = 'pending' AND listened_at_s <= ? GROUP BY owner_id",
-        (1_700_000_000,),
+
+
+def _index_sql(path, name):
+    conn = sqlite3.connect(path)
+    try:
+        return " ".join(
+            conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()[0].split()
+        )
+    finally:
+        conn.close()
+
+
+def test_the_index_of_rows_to_send_alone_holds_only_those_rows(fresh):
+    """The read of the next row to send alone walks only such rows; an index
+    of every outbox row would give the same plan text and walk them all."""
+    assert _index_columns(fresh, "idx_scrobble_outbox_alone") == [
+        "owner_id", "listened_at_s", "created_at", "event_uuid"
+    ]
+    assert _index_sql(fresh, "idx_scrobble_outbox_alone").endswith(
+        "WHERE status = 'pending' AND alone = 1"
     )
-    assert "COVERING INDEX idx_scrobble_outbox_due" in plan
-    assert "TEMP B-TREE" not in plan
+
+
+def test_the_index_of_done_rows_holds_only_rows_that_are_done(fresh):
+    """The prune reads only the done rows; an index of every outbox row would
+    give the same plan text and hold the pending rows too."""
+    assert _index_columns(fresh, "idx_scrobble_outbox_done") == ["done_at"]
+    assert _index_sql(fresh, "idx_scrobble_outbox_done").endswith("WHERE status <> 'pending'")
 
 
 def test_the_due_scan_finds_the_earliest_queued_row_per_user(fresh):
+    """``list_due_lastfm_owners`` (the product's query, not one written
+    here). A user is due once their earliest-queued pending row whose listen
+    time has arrived was queued by ``queued_by``; a future listen and a sent
+    row do not count."""
     conn = _connect(fresh)
     try:
+        for owner in (1, 2):
+            _connection(conn, owner, opted_in=1, **BOUND)
         _outbox(conn, 1, "a", created_at=300, listened_at_s=10)
         _outbox(conn, 1, "b", created_at=100, listened_at_s=20)
         _outbox(conn, 1, "c", created_at=50, listened_at_s=99)  # listen time not yet arrived
         _outbox(conn, 1, "d", created_at=10, listened_at_s=5, status="sent", done_at=11)
         _outbox(conn, 2, "e", created_at=400, listened_at_s=30)
-        rows = conn.execute(
-            "SELECT owner_id, MIN(created_at) FROM scrobble_outbox "
-            "WHERE status = 'pending' AND listened_at_s <= ? GROUP BY owner_id ORDER BY owner_id",
-            (40,),
-        ).fetchall()
+        conn.commit()
     finally:
         conn.close()
-    assert rows == [(1, 100), (2, 400)]
+    db = Database(DatabaseContext(database_path=fresh, init_sql_path=INIT_SQL))
+
+    def due(queued_by):
+        return db.list_due_lastfm_owners(listened_by_s=40, queued_by=queued_by)
+
+    assert due(99) == []  # "c" (future) or "d" (sent) would make user 1 due
+    assert due(100) == [1]
+    assert due(399) == [1]
+    assert due(400) == [1, 2]

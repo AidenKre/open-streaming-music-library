@@ -213,11 +213,11 @@ class LibrarySearchController extends ChangeNotifier
 
   /// Keep a snapshot of results honest after a download/delete. If the
   /// results are download-filtered, membership may have changed (a deleted
-  /// download must drop out), so re-search. Otherwise just patch the rows'
-  /// download state in place.
+  /// download must drop out), so re-search. Otherwise read the listed rows
+  /// again in place.
   ///
   /// A search already in flight may have read the old download state, and
-  /// patching the rows on screen would race it. Restarting it would starve
+  /// re-reading the rows on screen would race it. Restarting it would starve
   /// under a burst of events (each restart drops the last), so let it land
   /// and then handle this event once.
   @override

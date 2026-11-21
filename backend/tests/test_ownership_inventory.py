@@ -151,6 +151,10 @@ SERVER_WIDE = {
     # janitor pass, the moving edit and conversion writers, their runtime finish,
     # and startup journal recovery (sign-off OPEN-6.5-05, decision D12).
     "make_durable",
+    # The server's one idle connection, opened at
+    # start-up and closed at shutdown. They read and return no rows of any owner.
+    "hold_open",
+    "close",
 }
 
 # Global cover-art release (SC-16h): deletes a cover_arts row only when no
@@ -509,12 +513,32 @@ def test_an_owned_write_never_accepts_any_owner(db, call):
         call(db)
 
 
+# Where ANY_OWNER is defined (the owner checks) and where the Database class
+# applies it: not call sites.
+OWNER_CHECK_FILES = {
+    "core/owner.py",
+    "database/database.py",
+    "database/core.py",
+    "database/schema.py",
+    "database/users.py",
+    "database/lastfm.py",
+    "database/storage.py",
+    "database/history.py",
+    "database/uploads.py",
+    "database/identity.py",
+    "database/cover_art.py",
+    "database/tracks.py",
+    "database/deletion.py",
+    "database/browse.py",
+}
+
+
 def _any_owner_sites() -> set[tuple[str, str]]:
     sites = set()
     for path in sorted(APP_DIR.rglob("*.py")):
         relative = path.relative_to(APP_DIR).as_posix()
-        if relative == "database/database.py" or relative.endswith("__init__.py"):
-            continue  # the definition and its re-export
+        if relative in OWNER_CHECK_FILES or relative.endswith("__init__.py"):
+            continue  # the definition, the class that applies it, a re-export
         tree = ast.parse(path.read_text())
 
         def visit(node, scope):

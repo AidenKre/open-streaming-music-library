@@ -1,6 +1,6 @@
 part of 'database.dart';
 
-// ── Column allowlists (mirrors backend database.py) ─────────────────────
+// ── Column allowlists (mirrors backend app/database/browse.py) ──────────
 
 const allowedMetadataColumns = {
   'title',

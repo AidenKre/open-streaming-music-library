@@ -15,8 +15,11 @@ anything that may still write is alive:
 7. every listed worker is joined, in list order;
 8. the conversion orchestrator is shut down;
 9. the Last.fm client is closed, or, while the sender still runs, when it ends;
-10. the history hook is removed;
-11. the instance lock is released, or kept until the last worker or import ends.
+10. the database's held connection is closed (after
+    everything that was asked to stop, so that its close is the last one and
+    checkpoints; a worker that outlived its join only makes a later close the last);
+11. the history hook is removed;
+12. the instance lock is released, or kept until the last worker or import ends.
 
 Every worker is a recording fake; everything else is the real object with a
 recording wrapper installed after start-up. Nothing contacts Last.fm: the
@@ -77,6 +80,7 @@ NORMAL_SHUTDOWN = [
     "identity join",
     "conversion stop",
     "lastfm client close",
+    "database connection close",
     "history hook removed",
     "instance lock release",
 ]
@@ -179,6 +183,7 @@ def install_stop_spies(main, state, recorder: Recorder, monkeypatch) -> None:
         (state.settle_check, "join", "settle check join"),
         (state.conversion_orchestrator, "shutdown", "conversion stop"),
         (state.lastfm_accounts.client, "close", "lastfm client close"),
+        (state.database, "close", "database connection close"),
         (state.instance_lock, "release", "instance lock release"),
         (main, "stop_watchers", "watchers stop"),
         (main, "uninstall_scrobble_outbox", "history hook removed"),
@@ -439,6 +444,7 @@ RAISING_STEPS = {
     "settle check join": lambda main, state: (state.settle_check, "join"),
     "conversion stop": lambda main, state: (state.conversion_orchestrator, "shutdown"),
     "lastfm client close": lambda main, state: (state.lastfm_accounts.client, "close"),
+    "database connection close": lambda main, state: (state.database, "close"),
 }
 
 

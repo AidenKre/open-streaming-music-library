@@ -178,7 +178,6 @@ class _SelectedPanel extends StatelessWidget {
   Widget? _subtitle(SelectedItemView item) {
     final lines = [
       [item.artist, item.album].whereType<String>().join(' · '),
-      if (item.idHint != null) 'ID ${item.idHint}',
     ].where((l) => l.isNotEmpty).toList();
     if (lines.isEmpty) return null;
     return Column(

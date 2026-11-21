@@ -402,7 +402,7 @@ class DeleteJobsManager {
       targets: targets,
       confirmedCount: confirmedCount,
     ).toFrozenJson();
-    await _submissions.prepare(
+    final stored = await _submissions.prepare(
       kind: submissionKind,
       operationUuid: op,
       frozenBodyJson: body,
@@ -413,6 +413,7 @@ class DeleteJobsManager {
         operationUuid: op,
         phase: DeleteJobPhase.submitting,
         targets: targets,
+        submittedAtMs: stored.createdAtMs,
       ),
     );
     request('submit', bypassBackoff: true);
@@ -446,6 +447,7 @@ class DeleteJobsManager {
                     ? DeleteJobPhase.unconfirmed
                     : DeleteJobPhase.submitting,
                 targets: _targetsOf(row.frozenBodyJson),
+                submittedAtMs: row.createdAtMs,
               ),
             ),
           );
@@ -473,6 +475,7 @@ class DeleteJobsManager {
                     operationUuid: op,
                     phase: DeleteJobPhase.accepted,
                     targets: targets,
+                    submittedAtMs: row.createdAtMs,
                   ),
                 ),
               );
@@ -490,6 +493,7 @@ class DeleteJobsManager {
                   targets:
                       _jobs.value[op]?.targets ?? _targetsOf(row.frozenBodyJson),
                   rejectionCode: code,
+                  submittedAtMs: row.createdAtMs,
                 ),
               ),
             );
@@ -505,6 +509,7 @@ class DeleteJobsManager {
                     operationUuid: op,
                     phase: DeleteJobPhase.unconfirmed,
                     targets: j.targets,
+                    submittedAtMs: j.submittedAtMs,
                   ),
                 );
               }

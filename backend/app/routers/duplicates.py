@@ -2,11 +2,10 @@
 
 from typing import Literal
 
-from pydantic import ValidationError
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.core.api_errors import answer_errors
-from app.core.bounded_body import bounded_body, validation_error_422
+from app.core.bounded_body import json_body
 from app.library import Library, current_library
 from app.models.duplicates import DuplicatePairPage, DuplicateSummaryOut, PairRequest, PairStatusOut
 from app.services import duplicates as duplicate_rules
@@ -31,11 +30,7 @@ def list_possible_duplicates(
     return duplicate_rules.list_pairs(library, status, after, limit)
 
 
-def _set_status(library: Library, raw: bytes, status: str) -> PairStatusOut:
-    try:
-        body = PairRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
+def _set_status(library: Library, body: PairRequest, status: str) -> PairStatusOut:
     with answer_errors(DeletionError):
         return duplicate_rules.set_status(library, body, status)
 
@@ -43,18 +38,18 @@ def _set_status(library: Library, raw: bytes, status: str) -> PairStatusOut:
 @router.post("/dismiss", response_model=PairStatusOut)
 def dismiss_pair(
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(64 * 1024)),
+    body: PairRequest = Depends(json_body(PairRequest, 64 * 1024)),
 ):
-    return _set_status(library, raw, "dismissed")
+    return _set_status(library, body, "dismissed")
 
 
 @router.post("/restore", response_model=PairStatusOut)
 def restore_pair(
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(64 * 1024)),
+    body: PairRequest = Depends(json_body(PairRequest, 64 * 1024)),
 ):
-    out = _set_status(library, raw, "open")
+    out = _set_status(library, body, "open")
     # The restore sent both tracks back to matching: run it now.
     request.app.state.identity_wakeup.notify()
     return out

@@ -213,7 +213,7 @@ class ScrobbleSender(WorkerThread):
                     if not isinstance(row, dict):
                         raise RowRefused("a scrobble row is not an object")
                     check_scrobble_row(row)
-                except ValueError:  # RowRefused and JSON decode errors
+                except (ValueError, RecursionError):  # RowRefused, JSON decode errors, deep nesting
                     refused.append((event_uuid, "failed", RESULT_INVALID_ROW))
                     continue
                 uuids.append(event_uuid)

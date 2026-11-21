@@ -1,4 +1,6 @@
-"""Phase 6.5A.2d in-piece review fixes (temp/orchestration/phase-6-5/6.5A.2d-review.md).
+"""The identity worker's retry rules: what it records when a step fails, how it
+backs off and how it stops. The tests of each rule below start with its label
+(``test_f1_…`` for F1).
 
 F1 a failure the worker records carries the tool versions, so an unchanged
    tool never revives a failed row at the next start.

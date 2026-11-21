@@ -520,6 +520,41 @@ void main() {
   });
 
   group('conversionErrorMessage', () {
+    // The server tried to finish the earlier change before it answered, and
+    // looks again at its next start: trying again sooner does not help.
+    // Where it knows the job's own sentence, it sends it as `message`.
+    group('409 pending_recovery', () {
+      const fallback = 'The server has not finished an earlier change to '
+          'this track. The server checks this track at its next start.';
+      String forDetail(Map<String, Object?> detail) =>
+          conversionErrorMessage(_apiError(409, detail));
+
+      test("shows the server's own sentence", () {
+        expect(
+          forDetail({
+            'error': 'pending_recovery',
+            'message': 'The conversion could not be finished. The server '
+                'checks this track at its next start.',
+          }),
+          'The conversion could not be finished. The server checks this '
+          'track at its next start.',
+        );
+      });
+
+      test('without a message, the sentence for every such state', () {
+        expect(forDetail({'error': 'pending_recovery'}), fallback);
+      });
+
+      test('a message that is empty or not text is not shown', () {
+        expect(forDetail({'error': 'pending_recovery', 'message': ''}),
+            fallback);
+        expect(forDetail({'error': 'pending_recovery', 'message': 7}),
+            fallback);
+        expect(forDetail({'error': 'pending_recovery', 'message': null}),
+            fallback);
+      });
+    });
+
     test('maps each backend error to readable text', () {
       expect(
         conversionErrorMessage(_apiError(409, {'error': 'target_exists'})),
@@ -527,8 +562,8 @@ void main() {
       );
       expect(
         conversionErrorMessage(_apiError(409, {'error': 'pending_recovery'})),
-        'The server is still finishing a previous change to this track. '
-        'Try again later.',
+        'The server has not finished an earlier change to this track. '
+        'The server checks this track at its next start.',
       );
       expect(conversionErrorMessage(_apiError(404, 'Track not found')),
           'Track or its file was not found on the server.');

@@ -156,14 +156,15 @@ class _UploadReviewPageState extends ConsumerState<UploadReviewPage> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Text("Couldn't load the files to review."),
-              TextButton(
-                onPressed: () => _controls.start(
-                  widget.batchUuid,
-                  startAt: widget.startAt,
+              Text(reviewLoadFailedText(_controls.loadUnreachable)),
+              if (_controls.loadRetryHelps)
+                TextButton(
+                  onPressed: () => _controls.start(
+                    widget.batchUuid,
+                    startAt: widget.startAt,
+                  ),
+                  child: const Text('Try again'),
                 ),
-                child: const Text('Try again'),
-              ),
             ],
           ),
         );

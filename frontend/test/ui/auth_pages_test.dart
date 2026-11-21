@@ -109,7 +109,7 @@ void main() {
       final button =
           tester.widget<FilledButton>(find.widgetWithText(FilledButton, label));
       expect(button.onPressed, isNotNull, reason: 'the button is usable again');
-      expect(find.text('Could not sign in.'), findsOneWidget);
+      expect(find.text('Could not finish signing in.'), findsOneWidget);
       await teardownTree(tester);
     });
   }

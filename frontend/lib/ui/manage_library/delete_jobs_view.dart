@@ -1,7 +1,8 @@
 // Phase 8 spec §6 paras 2-3: deletion history (jobs and receipts). SC-26
 // view: it renders ManageLibraryControls and forwards input; every word comes
-// from the controller's views.
+// from the controller's views (an unknown title: `trackTitleOrUnknown`).
 import 'package:flutter/material.dart';
+import 'package:frontend/models/track_names.dart';
 import 'package:frontend/services/deletion/delete_job.dart';
 import 'package:frontend/ui/manage_library/manage_library_controller.dart';
 
@@ -73,13 +74,14 @@ class _DeleteJobsPageState extends State<DeleteJobsPage> {
               ],
               if (load == ReceiptsLoad.needsConnection) ...[
                 Text(controls.receiptsUnreachableText),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: TextButton(
-                    onPressed: controls.retryReceipts,
-                    child: const Text('Retry'),
+                if (controls.receiptsRetryHelps)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton(
+                      onPressed: controls.retryReceipts,
+                      child: const Text('Retry'),
+                    ),
                   ),
-                ),
               ],
               if (load == ReceiptsLoad.loaded &&
                   controls.receipts.isEmpty &&
@@ -131,9 +133,8 @@ class _JobCard extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(t.title ?? 'Unknown track'),
+                    Text(trackTitleOrUnknown(t.title)),
                     if (t.artist != null) Text(t.artist!),
-                    if (t.idHint != null) Text('ID ${t.idHint}'),
                     // A refused job never processed its targets: no per-target outcome.
                     if (job.phase != DeleteJobPhase.rejected) Text(t.outcome),
                   ],

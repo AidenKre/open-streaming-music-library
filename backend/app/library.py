@@ -152,12 +152,13 @@ def library_root(music_library_dir, user) -> Path:
 
 def current_library(request: Request) -> Library:
     principal = current_principal(request)
-    database = request.app.state.database
-    user = database.get_user(principal.user_id)
-    if user is None:
+    folder = (request.scope.get("state") or {}).get("library_folder")
+    if folder is None:
         raise auth_error("auth_required")
     return Library(
-        database,
+        request.app.state.database,
         principal.user_id,
-        root=library_root(request.app.state.settings.music_library_dir, user),
+        root=library_root(
+            request.app.state.settings.music_library_dir, {"library_folder": folder}
+        ),
     )

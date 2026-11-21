@@ -295,9 +295,25 @@ void main() {
       }
     });
 
+    // The server lists a damaged listen with artist and
+    // track null. Unknown is not "none": the row is kept, its names unknown.
+    test('a damaged row (artist and track null) is kept, its names unknown',
+        () {
+      final s = LastfmStatus.fromJson(_status(recentProblems: [
+        _problem(artist: null, track: null, status: 'failed', code: null),
+      ]));
+      expect(s.recentProblems, hasLength(1));
+      final p = s.recentProblems.single;
+      expect(p.artist, isNull);
+      expect(p.track, isNull);
+      expect(p.listenedAt, 1799990000000);
+      expect(p.status, 'failed');
+      expect(p.code, isNull);
+    });
+
     test('malformed problem rows are skipped; at most 20 are kept', () {
       final s = LastfmStatus.fromJson(_status(recentProblems: [
-        _problem(artist: null),
+        _problem(artist: 3),
         _problem(track: 3),
         _problem(listenedAt: '1'),
         _problem(status: null),

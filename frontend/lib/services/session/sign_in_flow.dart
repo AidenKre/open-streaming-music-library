@@ -34,9 +34,14 @@ class _SignInFlow {
     return held;
   }
 
+  /// Set when the scope is disposed: a sign-in still running afterwards
+  /// can be held by no one, so it revokes its own session.
+  bool _disposed = false;
+
   /// The scope is being disposed: a held sign-in is never dropped unrevoked.
   /// Reads no `ref`: the held sign-in carries the client it needs.
   void revokeHeldAtDispose() {
+    _disposed = true;
     final held = takeHeld();
     if (held != null) unawaited(revokeSignIn(held));
   }
@@ -100,6 +105,11 @@ class _SignInFlow {
       if (isDatabaseRefusal(e)) rethrow;
       return const SignInFailed(SignInNotSavedFailure.message);
     }
+    // Disposed while this sign-in ran: nothing can save or hold it now.
+    if (_disposed) {
+      await revokeSignIn(held);
+      return const SignInFailed(SignInNotSavedFailure.message);
+    }
     // A NULL row instance is unknown: only a login on the URL the row was
     // created for may count as the same server (and fill it in). On another
     // URL it could be any server, so the different-server sheet (m-R2-08).
@@ -124,8 +134,11 @@ class _SignInFlow {
       await _ref.read(onSessionChangedProvider)?.call();
       return const SignInSucceeded();
     }
-    await cancelPendingSignIn();
+    // Held in one step, with no await before it: another sign-in reaching
+    // this point at the same time is replaced and revoked, never dropped.
+    final replaced = _pendingSignIn;
     _pendingSignIn = held;
+    if (replaced != null) await revokeSignIn(replaced);
     if (instanceCompatible) {
       return SignInNeedsUserSwitch(session.user.username);
     }

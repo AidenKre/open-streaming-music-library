@@ -84,51 +84,6 @@ mixin _DownloadStateQueries on _$AppDatabase {
     }.toList();
   }
 
-  Future<
-    Map<
-      String,
-      ({
-        String? filePath,
-        int? downloadedBitrateKbps,
-        int? fileSizeBytes,
-        String? downloadedQuality,
-        int? revision,
-        int? downloadedAtRevision,
-        String? downloadedCodec,
-        int? staleDismissedAtRevision,
-        String? damagedFilePath,
-      })
-    >
-  >
-  getTrackDownloadStates(List<String> uuids) async {
-    if (uuids.isEmpty) return {};
-    final placeholders = List.filled(uuids.length, '?').join(', ');
-    final rows = await customSelect(
-      'SELECT uuid_id, file_path, downloaded_bitrate_kbps, file_size_bytes, '
-      'downloaded_quality, revision, downloaded_at_revision, downloaded_codec, '
-      'stale_dismissed_at_revision, damaged_file_path '
-      'FROM tracks WHERE uuid_id IN ($placeholders)',
-      variables: uuids.map(Variable.withString).toList(),
-      readsFrom: {tracks},
-    ).get();
-    return {
-      for (final r in rows)
-        r.read<String>('uuid_id'): (
-          filePath: r.readNullable<String>('file_path'),
-          downloadedBitrateKbps: r.readNullable<int>('downloaded_bitrate_kbps'),
-          fileSizeBytes: r.readNullable<int>('file_size_bytes'),
-          downloadedQuality: r.readNullable<String>('downloaded_quality'),
-          revision: r.readNullable<int>('revision'),
-          downloadedAtRevision: r.readNullable<int>('downloaded_at_revision'),
-          downloadedCodec: r.readNullable<String>('downloaded_codec'),
-          staleDismissedAtRevision: r.readNullable<int>(
-            'stale_dismissed_at_revision',
-          ),
-          damagedFilePath: r.readNullable<String>('damaged_file_path'),
-        ),
-    };
-  }
-
   Stream<({int count, int totalBytes})> watchDownloadedStats() {
     return customSelect(
       'SELECT COUNT(*) AS c, COALESCE(SUM(t.file_size_bytes), 0) AS total_bytes '

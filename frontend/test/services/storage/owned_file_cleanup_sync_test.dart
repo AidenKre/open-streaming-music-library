@@ -18,6 +18,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
+import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:frontend/services/sync_service.dart';
 import 'package:http/http.dart' as http;
@@ -74,7 +75,11 @@ void main() {
     if (docs.existsSync()) await docs.delete(recursive: true);
   });
 
-  Future<SyncService> service() async {
+  Future<SyncService> service({
+    LocalCoverArtStore? covers,
+    Future<void> Function(Iterable<int>, Future<bool> Function(int))?
+        removeCovers,
+  }) async {
     SharedPreferences.setMockInitialValues({});
     final api = testApiClient(
       'http://test:8080',
@@ -95,6 +100,7 @@ void main() {
       queueRepository: QueueRepository(db),
       bindingToken: token,
       ownedFileCleanup: cleanup,
+      removeUnusedCovers: removeCovers ?? covers?.removeEachIfUnused,
     );
   }
 
@@ -244,6 +250,139 @@ void main() {
     unlinkError = const FileSystemException('Cannot delete file');
     await (await service()).syncChanges();
     expect(await _cleanupRows(db), hasLength(1));
+  });
+
+  // A tombstone also removes the stored covers of the tracks it
+  // removes, when no remaining download uses them (the owner, 2026-11-17).
+  group('stored covers of tombstoned tracks', () {
+    late LocalCoverArtStore covers;
+
+    setUp(() async {
+      covers = await LocalCoverArtStore.create(
+        directoryProvider: () async => docs,
+        apiClient: testApiClient(
+            'http://test:8080', MockClient((_) async => http.Response('', 404))),
+      );
+    });
+
+    File storedCover(int id) =>
+        covers.fileFor(id)..writeAsBytesSync([7, 7]);
+
+    Future<void> track(String uuid, int cover,
+        {bool file = false, bool damaged = false}) async {
+      await insertTrack(uuid,
+          filePath: file ? download('$uuid.m4a').path : null,
+          damagedFilePath: damaged ? download('$uuid.damaged.m4a').path : null);
+      await db.into(db.trackmetadata).insert(TrackmetadataCompanion.insert(
+          uuidId: uuid,
+          hasAlbumArt: const Value(true),
+          coverArtId: Value(cover)));
+    }
+
+    test('a cover another downloaded track shares stays when one is '
+        'tombstoned', () async {
+      final cover = storedCover(5);
+      await track('u1', 5, file: true);
+      await track('u2', 5, file: true);
+      changes = _page([_delete('u1', 2)], 2);
+      await (await service(covers: covers)).syncChanges();
+      expect(await trackUuids(), ['u2']);
+      expect(cover.existsSync(), isTrue);
+    });
+
+    test('a cover goes when every downloaded track that used it is '
+        'tombstoned', () async {
+      final cover = storedCover(5);
+      final other = storedCover(6);
+      await track('u1', 5, file: true);
+      await track('u2', 5, file: true);
+      await track('u3', 6, file: true);
+      changes = _page([_delete('u1', 2), _delete('u2', 3)], 3);
+      await (await service(covers: covers)).syncChanges();
+      expect(await trackUuids(), ['u3']);
+      expect(cover.existsSync(), isFalse);
+      expect(other.existsSync(), isTrue, reason: 'another track\'s cover');
+    });
+
+    test('a cover a damaged copy of another track still uses stays',
+        () async {
+      final cover = storedCover(5);
+      await track('u1', 5, file: true);
+      await track('u2', 5, damaged: true);
+      changes = _page([_delete('u1', 2)], 2);
+      await (await service(covers: covers)).syncChanges();
+      expect(cover.existsSync(), isTrue);
+    });
+
+    test('a cover only a track that is not downloaded shows goes', () async {
+      final cover = storedCover(5);
+      await track('u1', 5, file: true);
+      await track('u2', 5);
+      changes = _page([_delete('u1', 2)], 2);
+      await (await service(covers: covers)).syncChanges();
+      expect(await trackUuids(), ['u2']);
+      expect(cover.existsSync(), isFalse);
+    });
+
+    test('a refetch that finds the track gone removes its unused cover',
+        () async {
+      final cover = storedCover(5);
+      await track('u1', 5, file: true);
+      await db.rebuildFtsIndexes(); // the refetch applies a search delta
+      await (await service(covers: covers)).refetchAndApplyTrack('u1');
+      expect(await trackUuids(), isEmpty);
+      expect(cover.existsSync(), isFalse);
+    });
+
+    test('a page arriving after a reset fence removes no cover', () async {
+      final cover = storedCover(5);
+      await track('u1', 5, file: true);
+      changes = _page([_delete('u1', 2)], 2);
+      holdResponses = Completer<void>();
+      final arrived = requestArrived = Completer<void>();
+      final sync = (await service(covers: covers)).syncChanges();
+      await arrived.future;
+      await db.customStatement('DELETE FROM server_binding'); // reset fence
+      holdResponses!.complete();
+      await expectLater(sync, throwsA(isA<BindingFencedException>()));
+      expect(cover.existsSync(), isTrue);
+    });
+
+    // A page whose transaction fails after its deletes ran
+    // (here the cursor write) is rolled back, and its covers stay.
+    test('a page that fails after its deletes ran removes no cover',
+        () async {
+      final cover = storedCover(5);
+      await track('u1', 5, file: true);
+      changes = _page([_delete('u1', 2)], 2);
+      holdResponses = Completer<void>();
+      final arrived = requestArrived = Completer<void>();
+      final sync = (await service(covers: covers)).syncChanges();
+      await arrived.future;
+      await db.customStatement('DROP TABLE sync_cursors');
+      holdResponses!.complete();
+      await expectLater(sync, throwsA(anything));
+      expect(await trackUuids(), ['u1'], reason: 'the page was rolled back');
+      expect(cover.existsSync(), isTrue);
+    });
+
+    // Removing covers is best effort; a failure there never
+    // fails a sync whose page is already committed.
+    test('a cover removal that fails does not fail the sync', () async {
+      final cover = storedCover(5);
+      await track('u1', 5, file: true);
+      changes = _page([_delete('u1', 2)], 2);
+      var asked = 0;
+      await (await service(removeCovers: (ids, inUse) async {
+        asked++;
+        throw const FileSystemException('Cannot delete file');
+      }))
+          .syncChanges();
+      expect(asked, 1);
+      expect(await trackUuids(), isEmpty);
+      expect(await SyncCursorStore(db).read(SyncStream.catalog), 2);
+      expect(cover.existsSync(), isTrue);
+    });
   });
 
   group('refetchAndApplyTrack on a 404', () {

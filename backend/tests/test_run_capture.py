@@ -85,10 +85,11 @@ def test_a_zombie_counts_as_gone_though_signal_zero_still_reaches_it():
         assert os.read(read_end, 1) == b""  # the pipe closes as the child exits
         state = None
         end = time.monotonic() + 5.0
-        for _ in range(20_000):  # no sleep; a hard cap and a deadline
+        for _ in range(1_000):  # a 5 ms sleep a pass; a hard cap and the deadline
             state = process_state(proc.pid)
             if (state is not None and state.startswith("Z")) or time.monotonic() > end:
                 break
+            time.sleep(0.005)
         assert state is not None and state.startswith("Z"), state
         assert _old_pid_alive(proc.pid) is True, "signal 0 reaches a zombie"
         assert pid_alive(proc.pid) is False

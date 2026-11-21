@@ -117,7 +117,7 @@ void main() {
       await teardownTree(tester);
     });
 
-    testWidgets('an unknown title reads Unknown track, with its id hint', (
+    testWidgets('an unknown title reads Unknown track, and no ID', (
       tester,
     ) async {
       fake.jobs = [
@@ -132,7 +132,6 @@ void main() {
               artist: null,
               outcome: 'Deleted',
               deleted: true,
-              idHint: 'ab12',
             ),
           ],
         ),
@@ -144,10 +143,38 @@ void main() {
         findsOne,
       );
       expect(
-        find.descendant(of: row, matching: find.textContaining('ab12')),
-        findsOne,
+        find.descendant(of: row, matching: find.textContaining('ID ')),
+        findsNothing,
       );
       expect(find.descendant(of: row, matching: find.text('Deleted')), findsOne);
+      await teardownTree(tester);
+    });
+
+    // An empty title is not a blank line.
+    testWidgets('an empty title reads Unknown track', (tester) async {
+      fake.jobs = [
+        DeleteJobView(
+          operationUuid: 'op1',
+          phase: DeleteJobPhase.completed,
+          phaseText: jobPhaseText(DeleteJobPhase.completed),
+          targets: const [
+            JobTargetView(
+              uuid: 'a',
+              title: '',
+              artist: 'Artist',
+              outcome: 'Deleted',
+              deleted: true,
+            ),
+          ],
+        ),
+      ];
+      await pumpPage(tester);
+      final row = jobTarget('op1', 'a');
+      expect(
+        find.descendant(of: row, matching: find.text('Unknown track')),
+        findsOne,
+      );
+      expect(find.descendant(of: row, matching: find.text('')), findsNothing);
       await teardownTree(tester);
     });
 
@@ -348,6 +375,20 @@ void main() {
       await pumpPage(tester);
       expect(find.text('Reason words.'), findsOne);
       expect(find.text('Deletion history needs a connection.'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    // Where Retry cannot help (a different server, signed out),
+    // the reason shows without a Retry.
+    testWidgets('a reason Retry cannot help: the reason, no Retry', (
+      tester,
+    ) async {
+      fake.receiptsLoad = ReceiptsLoad.needsConnection;
+      fake.receiptsUnreachableText = 'Reason words.';
+      fake.receiptsRetryHelps = false;
+      await pumpPage(tester);
+      expect(find.text('Reason words.'), findsOne);
+      expect(find.text('Retry'), findsNothing);
       await teardownTree(tester);
     });
 

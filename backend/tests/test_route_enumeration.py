@@ -162,3 +162,121 @@ def test_an_oversized_body_on_any_route_is_refused_before_it_is_read(app_client,
             read[(method, template)] = (len(receives), sent[0]["status"])
 
     assert read == {}
+
+
+# ── A signed-in caller's oversized body is refused while it is read ───
+
+_CHUNK = b"x" * (64 << 10)
+_CHUNKS = 128  # 8 MiB in all, far beyond every body cap
+_READ_AT_MOST = 1 << 20  # every cap is 256 KiB or less
+
+
+def _chunked_call(app, method, path, headers):
+    """Drive the ASGI app with the body in 64 KiB chunks and count the chunks
+    the server pulls."""
+    receives, sent = [], []
+
+    async def receive():
+        receives.append(1)
+        if len(receives) > _CHUNKS:
+            return {"type": "http.disconnect"}
+        return {"type": "http.request", "body": _CHUNK, "more_body": len(receives) < _CHUNKS}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
+        "root_path": "", "query_string": b"",
+        "headers": [
+            (b"content-length", str(len(_CHUNK) * _CHUNKS).encode()),
+            (b"content-type", b"application/json"),
+            *headers,
+        ],
+        "client": ("127.0.0.1", 5000), "server": ("testserver", 80), "state": {},
+    }
+    asyncio.run(app(scope, receive, send))
+    return len(receives) * len(_CHUNK), sent[0]["status"]
+
+
+def test_an_oversized_body_from_a_signed_in_caller_is_refused_while_it_is_read(open_app_client):
+    # The deletion switch is on, so the deletion routes reach their body too.
+    with open_app_client(env={"LIBRARY_DELETE_ENABLED": "true"}) as client:
+        auth = [(b"authorization", client.headers["Authorization"].encode())]
+        probes = sorted(
+            (p for p in _probes(client.app) if p[1] not in PUBLIC_PATHS),
+            key=lambda p: p[1] == "/auth/logout",  # logout ends the session: last
+        )
+        refused, wrong = set(), {}
+        for method, template, path in probes:
+            read, status = _chunked_call(client.app, method, path, auth)
+            assert status != 401, (method, template)  # the probe stayed signed in
+            if read == 0:
+                continue  # the route never reads a body
+            if status == 413 and read <= _READ_AT_MOST:
+                refused.add((method, template))
+            else:
+                wrong[(method, template)] = (read, status)
+
+    assert wrong == {}
+    # Every route that takes a JSON body was reached and refused, not skipped.
+    assert _json_body_routes(client.app) <= refused
+    assert {
+        ("POST", "/tracks/warm"),
+        ("PUT", "/settings/quality"),
+        ("PATCH", "/tracks/{uuid_id:uuid}"),
+        ("POST", "/jobs"),
+    } <= refused
+
+
+def _json_body_routes(app):
+    """(method, path) of every route whose dependencies include ``json_body``."""
+
+    def takes_json_body(dependant):
+        return any(
+            getattr(d.call, "__qualname__", "").startswith("json_body.")
+            or takes_json_body(d)
+            for d in dependant.dependencies
+        )
+
+    routes = {
+        (method, route.path)
+        for route in app.routes
+        if hasattr(route, "dependant") and takes_json_body(route.dependant)
+        for method in route.methods
+    }
+    assert len(routes) >= 19  # the four routes that moved out of main.py and the fifteen others
+    return routes - {(m, p) for m, p in routes if p in PUBLIC_PATHS}
+
+
+_SECRET = "SECRET-INPUT-NOT-ECHOED"
+
+
+@pytest.mark.parametrize(
+    "method, path, body",
+    [
+        ("POST", "/tracks/warm", {"current_index": _SECRET, "quality": "high", "track_uuids": []}),
+        ("PUT", "/settings/quality", {"quality": {_SECRET: 1}}),
+        ("PATCH", f"/tracks/{SAMPLE_ID}", {"base_revision": _SECRET}),
+        (
+            "POST",
+            "/jobs",
+            {"type": "conversion", "uuid_id": SAMPLE_ID,
+             "params": {"target_codec": {_SECRET: 1}}, "base_revision": _SECRET},
+        ),
+    ],
+    ids=["warm", "quality", "patch-track", "jobs"],
+)
+def test_a_body_of_the_wrong_type_is_a_422_that_does_not_repeat_the_input(
+    app_client, method, path, body
+):
+    response = app_client.request(method, path, json=body)
+
+    assert response.status_code == 422
+    items = response.json()["detail"]
+    assert isinstance(items, list) and items
+    for item in items:
+        assert "input" not in item
+        assert item["loc"][0] == "body"
+    assert _SECRET not in response.text

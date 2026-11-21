@@ -261,6 +261,17 @@ ConvertTargetChoice? _presetChoice(
   );
 }
 
+/// The text for a 409 `pending_recovery`. The server tried to finish the
+/// earlier change before it answered and looks again at its next start, so
+/// trying again sooner does not help. Where it knows the job's own sentence
+/// it sends it as `message`.
+String _pendingRecoveryMessage(ApiException error) {
+  final message = error.details?['message'];
+  if (message is String && message.isNotEmpty) return message;
+  return 'The server has not finished an earlier change to this track. '
+      'The server checks this track at its next start.';
+}
+
 /// User-facing text for a failed `POST /jobs`. Never shows the raw
 /// `ApiException(...)` string.
 String conversionErrorMessage(Object error) {
@@ -274,9 +285,7 @@ String conversionErrorMessage(Object error) {
         'job_active' => 'A conversion for this track is already in progress.',
         'target_exists' =>
           "A file already exists at the converted file's location.",
-        'pending_recovery' =>
-          'The server is still finishing a previous change to this track. '
-              'Try again later.',
+        'pending_recovery' => _pendingRecoveryMessage(error),
         _ => 'This track changed on the server. Try again.',
       };
     case 404:

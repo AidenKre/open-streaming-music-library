@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
-from app.services.deletion_errors import ITEM_DETAIL_CODES, ITEM_ERROR_CODES
+from app.core.deletion_states import ITEM_DETAIL_CODES, ITEM_ERROR_CODES
 
 ItemErrorCode = Literal[ITEM_ERROR_CODES]
 ItemDetailCode = Literal[ITEM_DETAIL_CODES]

@@ -1,8 +1,12 @@
+import 'package:drift/drift.dart' show Value;
+import 'package:drift/native.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/database/database.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
 import 'package:frontend/services/library_sync_status.dart';
+import '../helpers/server_binding.dart';
 import '../helpers/test_offline.dart';
 
 
@@ -85,5 +89,61 @@ void main() {
     expect(c.read(librarySyncStatusProvider), LibrarySyncStatus.idle);
     off.set(false);
     expect(c.read(librarySyncStatusProvider), LibrarySyncStatus.failed);
+  });
+
+  // An empty device library is an empty library only once a complete
+  // library sync has finished while this device is bound to this server
+  // and user (the stored marker; a log-out keeps it).
+  group('a complete library sync has finished on this device', () {
+    late AppDatabase db;
+    setUp(() => db = AppDatabase(NativeDatabase.memory()));
+    tearDown(() => db.close());
+
+    Future<(ProviderContainer, _ScriptedSync)> make(
+      TrackSyncState initial,
+    ) async {
+      final sync = _ScriptedSync(initial);
+      final c = ProviderContainer(
+        overrides: [
+          databaseProvider.overrideWithValue(db),
+          trackSyncProvider.overrideWith(() => sync),
+        ],
+      );
+      addTearDown(c.dispose);
+      c.listen(libraryCatalogSyncedProvider, (_, _) {});
+      await c.read(trackSyncProvider.future);
+      return (c, sync);
+    }
+
+    test('no binding: no', () async {
+      final (c, _) = await make(const TrackSyncState());
+      expect(await c.read(libraryCatalogSyncedProvider.future), isFalse);
+    });
+
+    test('signed in, no complete sync yet: no', () async {
+      await seedTestBinding(db);
+      final (c, _) = await make(const TrackSyncState());
+      expect(await c.read(libraryCatalogSyncedProvider.future), isFalse);
+    });
+
+    test('a complete sync finished: yes', () async {
+      await seedTestBinding(db, reconciled: true);
+      final (c, _) = await make(const TrackSyncState());
+      expect(await c.read(libraryCatalogSyncedProvider.future), isTrue);
+    });
+
+    test('read again when a library sync ends', () async {
+      await seedTestBinding(db);
+      final (c, sync) = await make(
+        const TrackSyncState(isSyncing: true, librarySyncing: true),
+      );
+      expect(await c.read(libraryCatalogSyncedProvider.future), isFalse);
+      // The sync's final page stores the marker; then the sync ends.
+      await db.update(db.serverBinding).write(
+        const ServerBindingCompanion(catalogReconciledAtBinding: Value(true)),
+      );
+      sync.set(const TrackSyncState());
+      expect(await c.read(libraryCatalogSyncedProvider.future), isTrue);
+    });
   });
 }

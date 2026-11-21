@@ -132,10 +132,10 @@ def test_a_row_that_keeps_failing_is_logged_once_not_on_every_pass(tmp_path, mon
     assert [e["intent"] for e in db.list_journal_entries()] == ["inplace"]  # still kept for later
 
 
-def test_a_new_failing_row_that_reuses_a_finished_rows_id_is_logged_again(tmp_path, monkeypatch, caplog):
-    """SQLite hands out a deleted row's id again (no AUTOINCREMENT). A row that
-    failed, was logged and was then finished must not silence a later failing row
-    that gets the same id, for another track."""
+def test_a_new_failing_row_after_a_finished_one_is_logged_again(tmp_path, monkeypatch, caplog):
+    """Journal ids are never reused (AUTOINCREMENT). A row that failed, was
+    logged and was then finished must not silence a later failing row, for
+    another track."""
     import app.services.journal_recovery as journal_recovery
     from tests.track_editor_fixtures import _add_track, _db
 
@@ -162,9 +162,32 @@ def test_a_new_failing_row_that_reuses_a_finished_rows_id_is_logged_again(tmp_pa
 
     failing.add(second.uuid_id)
     second_id = _lib(db).insert_journal_entry("inplace", second.uuid_id, old_path=str(library / "owner" / "b.m4a"))
-    assert second_id == first_id  # the id came back
+    assert second_id > first_id  # the finished row's id is not handed out again
     for _ in range(3):
         assert finish_kept_journal_rows(db, library, TrackLocks(), reported=reported) == 0
 
     warnings = [r for r in caplog.records if "journal finish failed" in r.getMessage()]
     assert len(warnings) == 2  # once for each failing row, not once in all
+    # The finished row is forgotten: the set kept across passes holds only
+    # rows still in the journal, so it does not grow for the server's life.
+    assert reported == {journal_recovery._row_key(e) for e in db.list_journal_entries()}
+    assert len(reported) == 1
+
+
+def test_a_journal_id_is_not_handed_out_again_after_the_table_empties_and_the_server_restarts(tmp_path):
+    """A row's "(recovered <id>)" file name carries its id, so a later row
+    must never get an earlier row's id. Without AUTOINCREMENT SQLite gives the
+    highest id in the table plus one, which is 1 again once the table is empty."""
+    from tests.track_editor_fixtures import _add_track, _db
+
+    db = _db(tmp_path)
+    old_path = str(tmp_path / "music" / "owner" / "a.m4a")
+    track = _add_track(db, tmp_path / "music" / "owner" / "a.m4a", "A", "Art")
+    first_id = _lib(db).insert_journal_entry("inplace", track.uuid_id, old_path=old_path)
+    _lib(db).delete_journal_entry(first_id)
+
+    restarted = _db(tmp_path)  # the next start opens the same file
+    assert restarted.list_journal_entries() == []
+    later_id = _lib(restarted).insert_journal_entry("inplace", track.uuid_id, old_path=old_path)
+
+    assert later_id > first_id

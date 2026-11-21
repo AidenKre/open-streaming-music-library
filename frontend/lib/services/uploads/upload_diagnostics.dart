@@ -25,19 +25,6 @@ class UploadDiagnostics {
   final int earlierSignIn;
 }
 
-const _pendingStates = {
-  UploadIntentState.allocating,
-  UploadIntentState.allocated,
-  UploadIntentState.transferring,
-  UploadIntentState.cancelling,
-};
-
-const _quarantinedStates = {
-  UploadIntentState.needsReselect,
-  UploadIntentState.sourceChanged,
-  UploadIntentState.rejected,
-};
-
 /// Emits on every change to the upload intents; zeros without a binding.
 final uploadDiagnosticsProvider = StreamProvider<UploadDiagnostics>((ref) async* {
   final db = ref.read(databaseProvider);
@@ -60,11 +47,9 @@ final uploadDiagnosticsProvider = StreamProvider<UploadDiagnostics>((ref) async*
           final n = r.read<int>('n');
           if (r.read<String>('local_binding_id') != token) {
             earlier += n;
-          } else if (_pendingStates.contains(r.read<String>('last_state'))) {
+          } else if (pendingStates.contains(r.read<String>('last_state'))) {
             pending += n;
-          } else if (_quarantinedStates.contains(
-            r.read<String>('last_state'),
-          )) {
+          } else if (quarantinedStates.contains(r.read<String>('last_state'))) {
             quarantined += n;
           }
         }

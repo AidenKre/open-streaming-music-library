@@ -635,7 +635,7 @@ class TestResumeQueued:
         _run_submitted(coordinator)
 
         job = db.get_conversion_job(job_id)
-        assert job["status"] == "failed"
+        assert (job["status"], job["error_text"]) == ("failed", "master file not found")
 
     def test_resume_queued__track_revision_moved__fails_track_changed(self, tmp_path):
         db, orch, coordinator = _make_orchestrator(tmp_path)
@@ -1336,8 +1336,10 @@ class TestPendingRecovery:
         _run_submitted(coordinator)
 
         job = db.get_conversion_job(job_id)
-        assert job["status"] == "failed"
-        assert "awaiting recovery" in job["error_text"]
+        assert (job["status"], job["error_text"]) == (
+            "failed", "the track has an unfinished file operation awaiting recovery"
+        )
+        assert track.uuid_id not in job["error_text"]  # a person never sees an internal ID
         assert owned.read_bytes() == b"owned"
 
     @requires_ffmpeg
@@ -1858,7 +1860,7 @@ class TestTagBake:
 # row reads as before the conversion (at a new revision), the journal row and the
 # staged copy go, and the job fails with a sentence that says so. Only when that
 # undo cannot be made does the state stay what a crash at that instant leaves:
-# the job is failed with the sentence that says the next start finishes it, its
+# the job is failed with the sentence that says the next start checks it, its
 # journal row and staged file are kept, the running server does not put the file
 # in place (Phase 6.5's rule stands), and the next start puts it in place, bumps
 # the track's revision and marks the job done, or ends it failed with a true
@@ -1869,7 +1871,7 @@ SWAP_REFUSED_TEXT = (
     "Convert it again."
 )
 SWAP_PENDING_TEXT = (
-    "The converted file could not replace the original. The server finishes it at its next start."
+    "The conversion could not be finished. The server checks this track at its next start."
 )
 SWAP_LOST_TEXT = "The converted file was lost, so the original was kept. Convert it again."
 # Existing wording until the owner's sentence (bug-fix-common: neutral existing text).
@@ -2476,6 +2478,75 @@ class TestSameFileSwapPhase8Recheck:
         job = db.get_conversion_job(job_id)
         assert (job["status"], job["error_text"]) == ("done", None)
         assert Path(db.get_track_by_uuid(track.uuid_id).file_path).read_bytes() == converted
+        assert db.list_journal_entries() == []
+
+    @pytest.mark.parametrize("staged_left", [False, True], ids=["staged-gone", "staged-left"])
+    def test_a_rerun_with_the_track_at_the_recovered_name_ends_by_the_staged_name(
+        self, tmp_path, monkeypatch, staged_left
+    ):
+        """An earlier start placed the converted copy under this row's
+        recovered name and pointed the track at it, then stopped before the row
+        went. With nothing left at the staged name that is the adoption: the job
+        ends done. A file still at the staged name proves no such move: the job
+        ends as today, "track changed"."""
+        db, orch, track, source, original, job_id, entry = self._not_undone(
+            tmp_path, monkeypatch)
+        staged = Path(entry["temp_path"])
+        converted = staged.read_bytes()
+        recovered = source.with_name(
+            f"{source.stem} (recovered {entry['id']}){staged.suffix}")
+        staged.rename(recovered)
+        set_track_path(db, track.uuid_id, recovered)
+        if staged_left:
+            staged.write_bytes(converted)
+        committed = db.get_track_by_uuid(track.uuid_id)
+
+        _start(db, tmp_path)
+
+        job = db.get_conversion_job(job_id)
+        after = db.get_track_by_uuid(track.uuid_id)
+        assert str(after.file_path) == str(recovered) and recovered.read_bytes() == converted
+        assert db.list_journal_entries() == []
+        if staged_left:
+            assert (job["status"], job["error_text"]) == ("failed", TRACK_CHANGED_ERROR)
+        else:
+            assert (job["status"], job["error_text"]) == ("done", None)
+            assert after.revision > committed.revision
+
+    @pytest.mark.parametrize(
+        "crash_at", ["bump_track_revision", "settle_swapped_conversion_job", "delete_journal_entry"])
+    def test_a_stop_after_adopting_at_the_recovered_name_still_ends_done(
+        self, tmp_path, monkeypatch, crash_at
+    ):
+        """The real way in: no ordinary name is free (the track's
+        recorded path has another suffix, something is at the old path), so the
+        first start adopts the converted copy under the recovered name and stops
+        before the row goes. The rerun ends the job done."""
+        db, orch, track, source, original, job_id, entry = self._not_undone(
+            tmp_path, monkeypatch)
+        staged = Path(entry["temp_path"])
+        converted = staged.read_bytes()
+        recovered = source.with_name(
+            f"{source.stem} (recovered {entry['id']}){staged.suffix}")
+        source.unlink()
+        source.symlink_to(tmp_path / "nowhere.mp3")  # the old path is taken, no file
+        set_track_path(db, track.uuid_id, source.with_name("moved.flac"))
+
+        def crash(*args, **kwargs):
+            raise Crash()
+
+        with monkeypatch.context() as m:
+            m.setattr(db, crash_at, crash)
+            with pytest.raises(Crash):
+                reconcile_journal(db, tmp_path)
+        assert str(db.get_track_by_uuid(track.uuid_id).file_path) == str(recovered)
+        assert not os.path.lexists(staged) and len(db.list_journal_entries()) == 1
+
+        _start(db, tmp_path)
+
+        job = db.get_conversion_job(job_id)
+        assert (job["status"], job["error_text"]) == ("done", None)
+        assert recovered.read_bytes() == converted
         assert db.list_journal_entries() == []
 
     def test_an_unreadable_master_with_a_lost_staged_file_ends_the_job(

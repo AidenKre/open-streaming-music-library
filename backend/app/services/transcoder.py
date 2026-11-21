@@ -51,6 +51,30 @@ def normalize_quality(quality: Optional[str]) -> str:
     return quality
 
 
+def resolve_default_quality(stored: Optional[str], configured: Optional[str]) -> str:
+    """Fallback chain stored (user_settings) -> env -> original; logs skipped values.
+
+    ``configured`` is ``settings.default_streaming_quality``."""
+    for candidate, source_label in (
+        (stored, "persisted"),
+        (configured, "env/config"),
+    ):
+        if candidate is None:
+            continue
+        try:
+            return normalize_quality(candidate)
+        except ValueError:
+            print(
+                f"Invalid {source_label} default_streaming_quality "
+                f"{candidate!r}; falling back."
+            )
+    print(
+        f"No valid default_streaming_quality configured; using "
+        f"{ORIGINAL_QUALITY!r}."
+    )
+    return ORIGINAL_QUALITY
+
+
 @dataclass(frozen=True)
 class TranscodeResult:
     ok: bool

@@ -8,11 +8,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.requests import ClientDisconnect
-from pydantic import ValidationError
 
 from app.core.api_errors import answer_errors
 from app.core.byte_range import ranged_file_response
-from app.core.bounded_body import bounded_body, validation_error_422
+from app.core.bounded_body import json_body
 from app.library import Library, current_library
 from app.models.uploads import (
     AllocationRequest,
@@ -47,13 +46,9 @@ def _api_errors():
 def post_allocation(
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(256 * 1024)),
+    body: AllocationRequest = Depends(json_body(AllocationRequest, 256 * 1024)),
     now: int = Depends(upload_clock),
 ):
-    try:
-        body = AllocationRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
     limits = effective_upload_limits(request.app.state.settings)
     with _api_errors():
         created, response = upload_rules.allocate(library, limits, body, now=now)
@@ -65,13 +60,9 @@ def retry_upload_item(
     item_uuid: UUID,
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(256 * 1024)),
+    body: RetryRequest = Depends(json_body(RetryRequest, 256 * 1024)),
     now: int = Depends(upload_clock),
 ):
-    try:
-        body = RetryRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
     with _api_errors():
         item = upload_rules.retry(
             library, str(item_uuid), body.expected_review_version, now=now,
@@ -88,13 +79,9 @@ def commit_upload_item(
     item_uuid: UUID,
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(256 * 1024)),
+    body: CommitRequest = Depends(json_body(CommitRequest, 256 * 1024)),
     now: int = Depends(upload_clock),
 ):
-    try:
-        body = CommitRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
     with _api_errors():
         status, item = upload_rules.commit(
             library, body, str(item_uuid), now=now,
@@ -111,13 +98,9 @@ def resolve_upload_duplicate(
     item_uuid: UUID,
     request: Request,
     library: Library = Depends(current_library),
-    raw: bytes = Depends(bounded_body(256 * 1024)),
+    body: ResolveDuplicateRequest = Depends(json_body(ResolveDuplicateRequest, 256 * 1024)),
     now: int = Depends(upload_clock),
 ):
-    try:
-        body = ResolveDuplicateRequest.model_validate_json(raw)
-    except ValidationError as exc:
-        raise validation_error_422(exc) from exc
     with _api_errors():
         return upload_rules.resolve_duplicate(
             library, body, str(item_uuid), now=now,

@@ -14,8 +14,8 @@ class _PendingResetCheck {
       'An earlier reset could not finish clearing local data, so no server '
       'can be connected yet. Connecting tries again.';
 
-  /// Proposed to the owner 2026-11-17, not yet approved: connect or sign-in
-  /// could not read whether an earlier reset is still pending.
+  /// Connect or sign-in could not read whether an earlier reset is still
+  /// pending.
   static const settingsUnreadable =
       "This device's saved settings could not be read.";
 
@@ -44,6 +44,10 @@ class _PendingResetCheck {
   }
 
   static String _notFinishedReason(Object e) => switch (e) {
+        // A database of another schema version the fence could not get past.
+        LocalResetAbortedException(:final cause)
+            when isDatabaseRefusal(cause) =>
+          'version_refused',
         LocalResetAbortedException() => 'fence_failed',
         // Every wipe step ran; only the marker could not be cleared.
         LocalResetException(:final failures)
@@ -207,7 +211,6 @@ class _SessionResets {
 /// review 2, F4): never a failure's own text. The steps that failed are in
 /// the session log ([_SessionResets._reset]).
 abstract final class ResetIncompleteNotice {
-  /// Proposed to the owner, not yet approved.
   static const generic = 'Some local data could not be cleared.';
 
   /// Null when nothing but stopping failed, or when the sign-in notice

@@ -234,14 +234,21 @@ class TestPostJobsRefusalAnswers:
              "flac is lossless and takes no target bitrate"),
             # U06-B-06: a same-codec lossy request at the same or a higher bitrate.
             ("mp3", 320.0, "song.mp3", "mp3", 320,
-             "The track is already in this format at this bitrate or higher"),
+             "The track is already in this format. "
+             "Converting it again at this bitrate cannot improve it."),
             ("aac", 190.0, "song.m4a", "aac", 192,
-             "The track is already in this format at this bitrate or higher"),
+             "The track is already in this format. "
+             "Converting it again at this bitrate cannot improve it."),
+            # Upward, far above the stored bitrate (32 -> 256).
+            ("mp3", 32.0, "song.mp3", "mp3", 256,
+             "The track is already in this format. "
+             "Converting it again at this bitrate cannot improve it."),
             ("flac", 1000.0, "song.flac", "flac", None,
              "Target codec is the same lossless codec as the source"),
         ],
         ids=["unsupported", "lossy-no-bitrate", "lossy-non-preset", "lossless-with-bitrate",
-             "same-lossy-same-bitrate", "same-lossy-higher-bitrate", "same-lossless"],
+             "same-lossy-same-bitrate", "same-lossy-higher-bitrate", "same-lossy-upward",
+             "same-lossless"],
     )
     def test_a_refused_request_answers_422_with_its_text(
         self, held_client, tmp_path, source_codec, source_bitrate, filename, target, bitrate,
@@ -351,6 +358,70 @@ class TestPostJobsConflicts:
         assert r.status_code == 409, r.text
         assert r.json() == {"detail": {"error": "pending_recovery"}}
         assert client.held.submitted == []
+
+    def test_a_conversion_whose_swap_waits_for_the_next_start_answers_with_the_jobs_own_sentence(
+        self, held_client, tmp_path
+    ):
+        """The failed job reads "The conversion could not be finished. The
+        server checks this track at its next start." and keeps its journal row,
+        which only the next start settles. A Retry before that start is refused
+        with the same sentence, not with one that says a later try helps."""
+        from app.services.conversion import SWAP_PENDING_ERROR
+
+        client = held_client
+        library = client.app.state.admin_library
+        track = _add_track_with_file(client, tmp_path, codec="flac")
+        job_id = library.insert_conversion_job(
+            track.uuid_id, "flac", "flac", None, base_revision=track.revision
+        )
+        assert library.mark_conversion_job_failed(job_id, SWAP_PENDING_ERROR)
+        staging = client.app.state.conversion_orchestrator.staging_dir
+        staging.mkdir(parents=True, exist_ok=True)
+        staged = staging / f"{track.uuid_id}.{job_id}.tagged.flac"
+        staged.write_bytes(b"converted-bytes")
+        library.insert_journal_entry(
+            "convert", track.uuid_id, old_path=str(track.file_path), temp_path=str(staged),
+        )
+
+        r = _post_job(client, track.uuid_id, "aac", track.revision, 192)
+
+        assert (r.status_code, r.json()) == (
+            409, {"detail": {"error": "pending_recovery", "message": SWAP_PENDING_ERROR}}
+        )
+        assert client.held.submitted == []
+        assert [e["uuid_id"] for e in library.list_journal_entries()] == [track.uuid_id]
+
+    def test_another_tracks_swap_that_waits_for_the_next_start_does_not_change_this_answer(
+        self, held_client, tmp_path
+    ):
+        """Only this track's own kept rows decide the sentence: a track whose
+        kept row is of another kind answers 409 without it, even while another
+        track waits for the next start."""
+        from app.services.conversion import SWAP_PENDING_ERROR
+
+        client = held_client
+        library = client.app.state.admin_library
+        waiting = _add_track_with_file(client, tmp_path, codec="flac", filename="waiting.flac")
+        job_id = library.insert_conversion_job(
+            waiting.uuid_id, "flac", "flac", None, base_revision=waiting.revision
+        )
+        assert library.mark_conversion_job_failed(job_id, SWAP_PENDING_ERROR)
+        staging = client.app.state.conversion_orchestrator.staging_dir
+        staging.mkdir(parents=True, exist_ok=True)
+        staged = staging / f"{waiting.uuid_id}.{job_id}.tagged.flac"
+        staged.write_bytes(b"converted-bytes")
+        library.insert_journal_entry(
+            "convert", waiting.uuid_id, old_path=str(waiting.file_path), temp_path=str(staged),
+        )
+        track = _add_track_with_file(client, tmp_path, codec="flac")
+        library.insert_journal_entry(
+            "convert", track.uuid_id, old_path=str(track.file_path),
+            temp_path=str(tmp_path / "pending.tagged.flac"),
+        )
+
+        r = _post_job(client, track.uuid_id, "aac", track.revision, 192)
+
+        assert (r.status_code, r.json()) == (409, {"detail": {"error": "pending_recovery"}})
 
     def test_post_jobs__after_active_job_cancelled__allowed(self, held_client, tmp_path):
         client = held_client

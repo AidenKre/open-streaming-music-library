@@ -8,13 +8,7 @@ import math
 from app.core.operator_log import operator_logger
 from app.database.database import Database
 from app.services.history_hooks import register_history_hook, unregister_history_hook
-# The pure rules live in lastfm_rules.py; lastfm_track_fields and MAX_FIELD_LENGTH
-# are still importable from here.
-from app.services.lastfm_rules import (  # noqa: F401
-    MAX_FIELD_LENGTH,
-    lastfm_track_fields,
-    long_enough_to_scrobble,
-)
+from app.services.lastfm_rules import lastfm_track_fields, long_enough_to_scrobble
 from app.services.lastfm_state import LastfmService, wall_ms
 
 HOOK_NAME = "lastfm_scrobble_outbox"

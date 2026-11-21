@@ -20,6 +20,7 @@ import 'package:frontend/services/local_cover_art_store.dart';
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
 import 'package:frontend/api/token_permit.dart';
 
+import '../../helpers/chmod_denial.dart';
 import '../../helpers/server_binding.dart';
 
 Future<void> _insertTrack(
@@ -248,6 +249,11 @@ void main() {
   });
 
   // Decision 6: a new download of a damaged track replaces the damaged file.
+  // The mark names the recorded file (`markDamaged` writes it only where
+  // `file_path` is that path). These jobs carry no `replacesFilePath`, as a
+  // job enqueued from a row listed before the mark does: the swap's own read
+  // of the mark is what supersedes the damaged file (a name other than the
+  // destination is never swept otherwise).
   group('a damaged download', () {
     test('a new download clears the mark and removes the damaged file',
         () async {
@@ -256,7 +262,9 @@ void main() {
       await damaged.parent.create(recursive: true);
       await damaged.writeAsBytes([9]);
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
-          .write(TracksCompanion(damagedFilePath: Value(damaged.path)));
+          .write(TracksCompanion(
+              filePath: Value(damaged.path),
+              damagedFilePath: Value(damaged.path)));
       final outcome = await run(
           buildDownloader(
               MockClient((_) async => http.Response.bytes([1, 2], 200))),
@@ -287,7 +295,8 @@ void main() {
       await damaged.parent.create(recursive: true);
       await damaged.writeAsBytes([9]);
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
-          .write(clearedDownloadColumns.copyWith(
+          .write(TracksCompanion(
+              filePath: Value(damaged.path),
               damagedFilePath: Value(damaged.path)));
       var n = 0;
       final outcome = await buildDownloader(
@@ -314,7 +323,7 @@ void main() {
       expect(first.kind, DownloadOutcomeKind.success);
       final path = (await _row(db, 'abc')).filePath!;
       await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
-          .write(clearedDownloadColumns.copyWith(damagedFilePath: Value(path)));
+          .write(TracksCompanion(damagedFilePath: Value(path)));
       await run(
           buildDownloader(
               MockClient((_) async => http.Response.bytes([1, 2, 3], 200))),
@@ -419,6 +428,111 @@ void main() {
       await run(downloader, _job('abc', quality: 'original'));
 
       expect((await _row(db, 'abc')).downloadedAtRevision, 4);
+    });
+  });
+
+  // The X-Audio-Extension header becomes part of the file name, so
+  // only a plain extension is used; anything else falls back to 'audio', as
+  // a missing header does, and nothing is written or deleted outside the
+  // downloads folder.
+  group('an unusable X-Audio-Extension header', () {
+    /// Every file under the test's temp root but outside `tracks/`, with its
+    /// bytes.
+    Map<String, List<int>> filesOutsideDownloads() {
+      final tracks = p.join(tempDir.path, 'tracks');
+      return {
+        for (final e in tempDir.listSync(recursive: true, followLinks: false))
+          if (e is File && !p.isWithin(tracks, e.path))
+            e.path: e.readAsBytesSync(),
+      };
+    }
+
+    Future<String?> downloadWith(String extension) async {
+      await _insertTrack(db, 'abc');
+      final downloader = buildDownloader(
+        MockClient(
+          (req) async => http.Response.bytes(
+            [1, 2, 3],
+            200,
+            headers: {'x-audio-extension': extension},
+          ),
+        ),
+      );
+      final outcome = await run(downloader, _job('abc'));
+      expect(outcome.kind, DownloadOutcomeKind.success);
+      return (await _row(db, 'abc')).filePath;
+    }
+
+    for (final extension in [
+      'm4a/../../escape',
+      r'm4a\..\..\x',
+      '..',
+      '',
+      'a.b',
+      'm4a:x',
+      'm4a ',
+      'abcdefghijklmnopq',
+    ]) {
+      test('"$extension" is saved as <uuid>.audio in the downloads folder',
+          () async {
+        // A folder that lets a traversal resolve, and a file it would reach.
+        Directory(p.join(tempDir.path, 'tracks', 'abc.m4a'))
+            .createSync(recursive: true);
+        File(p.join(tempDir.path, 'escape')).writeAsBytesSync([9]);
+        final before = filesOutsideDownloads();
+
+        final path = await downloadWith(extension);
+
+        expect(path, p.join(tempDir.path, 'tracks', 'abc.audio'));
+        expect(File(path!).readAsBytesSync(), [1, 2, 3]);
+        expect(filesOutsideDownloads(), before);
+        expect(
+          Directory(p.join(tempDir.path, 'tracks'))
+              .listSync()
+              .whereType<File>()
+              .map((f) => p.basename(f.path)),
+          ['abc.audio'],
+        );
+      });
+    }
+
+    test('a plain extension is kept', () async {
+      expect(
+        await downloadWith('m4a'),
+        p.join(tempDir.path, 'tracks', 'abc.m4a'),
+      );
+    });
+
+    // F3: on a case-insensitive disk `abc.M4A` and `abc.m4a` are one file,
+    // while the superseded set and the clean-up compare paths as strings.
+    test('an upper-case extension is saved in lower case', () async {
+      expect(
+        await downloadWith('M4A'),
+        p.join(tempDir.path, 'tracks', 'abc.m4a'),
+      );
+    });
+
+    test('an upper-case extension over a damaged copy of the same name keeps '
+        'the new file', () async {
+      await _insertTrack(db, 'abc');
+      final damaged = File(p.join(tempDir.path, 'tracks', 'abc.m4a'));
+      await damaged.parent.create(recursive: true);
+      await damaged.writeAsBytes([9]);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals('abc')))
+          .write(TracksCompanion(damagedFilePath: Value(damaged.path)));
+
+      final outcome = await run(
+          buildDownloader(MockClient((_) async => http.Response.bytes(
+              [1, 2, 3], 200,
+              headers: {'x-audio-extension': 'M4A'}))),
+          _job('abc'));
+
+      expect(outcome.kind, DownloadOutcomeKind.success);
+      final row = await _row(db, 'abc');
+      expect(File(row.filePath!).existsSync(), isTrue,
+          reason: 'the new download, not cleaned up as the damaged copy');
+      expect(File(row.filePath!).readAsBytesSync(), [1, 2, 3]);
+      expect((row.filePath, row.damagedFilePath), (damaged.path, null));
     });
   });
 
@@ -816,7 +930,7 @@ void main() {
 
     test('keeps a file whose name a track row gives in another folder',
         () async {
-      // The documents folder can move (a new app container); a row may
+      // The app's files folder can move (a new app container); a row may
       // still give the old absolute path of this very file.
       final named = await put('$u1.new-5.m4a');
       await _insertTrack(db, u1);
@@ -1202,6 +1316,148 @@ void main() {
       expect(error, isA<DownloadsLeftByReset>());
       expect(real.readAsBytesSync(), [3, 3]);
       expect(tracks.existsSync(), isFalse);
+    });
+
+    // A downloads folder the reset could not remove is reported,
+    // so the reset reads "Reset incomplete" and keeps its marker.
+    test('a downloads folder the removal leaves in place fails the reset; '
+        'the next run removes it', () async {
+      final locked = Directory(p.join(tracks.path, 'locked'))..createSync();
+      final stuck = fileIn(locked, 'u9.m4a.partial', [5]);
+      Process.runSync('chmod', ['555', locked.path]);
+      addTearDown(() => Process.runSync('chmod', ['-R', 'u+rwx', tracks.path]));
+      final recorded = fileIn(tracks, 'u1.m4a');
+      await setPaths('u1', file: recorded.path);
+      final downloader =
+          buildDownloader(MockClient((_) async => http.Response('', 404)));
+
+      final error = await reset(downloader);
+
+      expect(error, isNotNull,
+          reason: 'the folder and a file in it are still on the device');
+      expect(error, isNot(isA<DownloadsLeftByReset>()));
+      expect(tracks.existsSync(), isTrue);
+      expect(stuck.readAsBytesSync(), [5]);
+      expect(await recordedPaths(), everyElement(isNull));
+
+      // The next launch finishes the reset once the folder can go.
+      Process.runSync('chmod', ['-R', 'u+rwx', tracks.path]);
+      expect(await reset(downloader), isNull);
+      expect(tracks.existsSync(), isFalse);
+    }, skip: skipUnlessChmodDenies);
+
+    // A folder left in place must not hide the
+    // report of recorded files left outside it, whose rows this run retires.
+    test('files left outside the folder are still reported when the folder '
+        'stays too; the next run reports the folder', () async {
+      final locked = Directory(p.join(tracks.path, 'locked'))..createSync();
+      fileIn(locked, 'u9.m4a.partial', [5]);
+      Process.runSync('chmod', ['555', locked.path]);
+      addTearDown(() => Process.runSync('chmod', ['-R', 'u+rwx', tracks.path]));
+      final outside = fileIn(elsewhere, 'u1.m4a', [4, 5, 6]);
+      await setPaths('u1', file: outside.path);
+      final downloader =
+          buildDownloader(MockClient((_) async => http.Response('', 404)));
+
+      final first = await reset(downloader);
+      expect(first, isA<DownloadsLeftByReset>());
+      expect((first as DownloadsLeftByReset).count, 1);
+      expect(tracks.existsSync(), isTrue);
+
+      final second = await reset(downloader);
+      expect(second, isNotNull);
+      expect(second, isNot(isA<DownloadsLeftByReset>()));
+      expect(outside.readAsBytesSync(), [4, 5, 6]);
+    }, skip: skipUnlessChmodDenies);
+
+    // The downloads folder is a link (to a drive that is not mounted, say)
+    // or a plain file. A link is removed as a link and never followed:
+    // nothing behind it goes with it. A plain file is not the app's folder
+    // and is left as it is. Neither stops the reset from finishing, so a
+    // connect or sign-in is not refused at every launch.
+    group('when the downloads folder is not a folder', () {
+      FileSystemEntityType typeOf(String path) =>
+          FileSystemEntity.typeSync(path, followLinks: false);
+      TrackDownloader downloader() =>
+          buildDownloader(MockClient((_) async => http.Response('', 404)));
+
+      setUp(() => tracks.deleteSync());
+
+      test('a dangling link is removed as a link and the reset completes',
+          () async {
+        Link(tracks.path).createSync(p.join(elsewhere.path, 'unmounted'));
+
+        final error = await reset(downloader());
+
+        expect(error, isNull);
+        expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        expect(typeOf(p.join(elsewhere.path, 'unmounted')),
+            FileSystemEntityType.notFound);
+      });
+
+      test('a link to a folder outside the app\'s folder goes as a link; '
+          'what is behind it stays', () async {
+        final drive = Directory(p.join(elsewhere.path, 'drive'))..createSync();
+        final kept = fileIn(drive, 'not-recorded.m4a', [9, 9]);
+        final nested = Directory(p.join(drive.path, 'sub'))..createSync();
+        final keptNested = fileIn(nested, 'u7.m4a', [7]);
+        Link(tracks.path).createSync(drive.path);
+        // A regular file at a path a track row records (through the link):
+        // the owned-file clean-up removes it before the folder goes, as it
+        // does for every recorded file. Only the folder's removal never
+        // follows the link.
+        final recorded = fileIn(drive, 'u1.m4a', [1, 1]);
+        await setPaths('u1', file: p.join(tracks.path, 'u1.m4a'));
+
+        final error = await reset(downloader());
+
+        expect(error, isNull);
+        expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        expect(kept.readAsBytesSync(), [9, 9]);
+        expect(keptNested.readAsBytesSync(), [7]);
+        expect(recorded.existsSync(), isFalse);
+        expect(await recordedPaths(), everyElement(isNull));
+      });
+
+      test('a link to a folder inside the app\'s folder goes as a link; '
+          'that folder stays', () async {
+        final other = Directory(p.join(tempDir.path, 'other'))..createSync();
+        final kept = fileIn(other, 'u9.m4a', [6]);
+        Link(tracks.path).createSync(other.path);
+
+        final error = await reset(downloader());
+
+        expect(error, isNull);
+        expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+        expect(kept.readAsBytesSync(), [6]);
+      });
+
+      test('a plain file is left as it is and the reset completes', () async {
+        final file = File(tracks.path)..writeAsBytesSync([3, 1, 4]);
+
+        final error = await reset(downloader());
+
+        expect(error, isNull);
+        expect(typeOf(tracks.path), FileSystemEntityType.file);
+        expect(file.readAsBytesSync(), [3, 1, 4]);
+      });
+
+      test('a link the removal leaves in place fails the reset; the next run '
+          'removes it', () async {
+        Link(tracks.path).createSync(p.join(elsewhere.path, 'unmounted'));
+        Process.runSync('chmod', ['555', tempDir.path]);
+        addTearDown(() => Process.runSync('chmod', ['u+rwx', tempDir.path]));
+        final d = downloader();
+
+        final error = await reset(d);
+
+        expect(error, isA<FileSystemException>());
+        expect(typeOf(tracks.path), FileSystemEntityType.link);
+
+        Process.runSync('chmod', ['u+rwx', tempDir.path]);
+        expect(await reset(d), isNull);
+        expect(typeOf(tracks.path), FileSystemEntityType.notFound);
+      }, skip: skipUnlessChmodDenies);
     });
   });
 

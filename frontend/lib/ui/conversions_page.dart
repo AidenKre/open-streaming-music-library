@@ -125,6 +125,7 @@ class _ConversionTileState extends ConsumerState<_ConversionTile> {
     final subtitle = switch (status) {
       ConversionFailed(:final message) => 'Failed: $message',
       ConversionDone() => 'Converted to $targetLabel',
+      ConversionCancelled() => 'Cancelled',
       _ => 'Convert to $targetLabel',
     };
 

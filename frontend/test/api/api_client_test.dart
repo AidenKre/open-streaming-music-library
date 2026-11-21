@@ -250,4 +250,33 @@ void main() {
       expect(e.toString(), 'ApiException(422): Unprocessable Entity');
     });
   });
+
+  // An empty 2xx answer comes from something in front of the
+  // server, like a web page (owner 2026-11-18); a literal `{}` reads the
+  // same to the client, so it counts as empty (the sign-in is kept).
+  group('ApiClient.healthCheck', () {
+    Future<HealthResult> healthOf(Response answer) => testApiClient(
+          'http://localhost:8000',
+          MockClient((req) async => answer),
+        ).healthCheck(retry: false);
+
+    for (final (name, body) in [('an empty 200', ''), ('a {} 200', '{}')]) {
+      test('$name answer is a body that is not JSON', () async {
+        final result = await healthOf(Response(body, 200));
+        expect(result.status, HealthStatus.serverError);
+        expect(result.bodyNotJson, isTrue);
+      });
+    }
+
+    test("a JSON object that is not OSML's stays a JSON answer", () async {
+      final result = await healthOf(Response('{"x":1}', 200));
+      expect(result.status, HealthStatus.serverError);
+      expect(result.bodyNotJson, isFalse);
+    });
+
+    test('a healthy answer is ok', () async {
+      final result = await healthOf(Response('{"message":"Healthy"}', 200));
+      expect(result.isOk, isTrue);
+    });
+  });
 }

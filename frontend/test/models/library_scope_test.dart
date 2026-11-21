@@ -2,9 +2,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/models/library_scope.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 
-TrackUI _track(String uuid, {String? filePath}) => TrackUI(
+TrackUI _track(String uuid, {String? filePath, String? damagedFilePath}) =>
+    TrackUI(
   uuidId: uuid,
   filePath: filePath,
+  damagedFilePath: damagedFilePath,
   createdAt: 0,
   lastUpdated: 0,
   duration: 1,
@@ -63,7 +65,7 @@ void main() {
   test('a damaged download: TrackScope tells it from no download, TracksScope '
       'does not', () {
     final downloaded = _track('u1', filePath: '/f');
-    final damaged = downloaded.copyWith(damagedFilePath: '/f');
+    final damaged = _track('u1', filePath: '/f', damagedFilePath: '/f');
     final none = _track('u1');
     expect(damaged.isDownloaded, isFalse);
     // Marking the download damaged makes a new key for both scopes.

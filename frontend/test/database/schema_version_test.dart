@@ -124,6 +124,69 @@ class _NextVersionDb extends AppDatabase {
   }
 }
 
+/// The app's own database (version 1) creating a new file, made to fail at
+/// one point of the creation: at the first statement that starts with
+/// [failOn], or after the production onCreate has returned, before drift
+/// writes the version itself ([failBeforeOpen]).
+class _FailingCreationDb extends AppDatabase {
+  _FailingCreationDb(super.e, {this.failOn, this.failBeforeOpen = false});
+
+  final String? failOn;
+  final bool failBeforeOpen;
+
+  @override
+  Future<void> customStatement(String statement, [List<dynamic>? args]) async {
+    if (failOn != null && statement.trimLeft().startsWith(failOn!)) {
+      throw StateError('creation failed at `$failOn`');
+    }
+    await super.customStatement(statement, args);
+  }
+
+  @override
+  MigrationStrategy get migration {
+    final production = super.migration;
+    if (!failBeforeOpen) return production;
+    return MigrationStrategy(
+      onCreate: production.onCreate,
+      onUpgrade: production.onUpgrade,
+      beforeOpen: (_) async => throw StateError('beforeOpen failed'),
+    );
+  }
+}
+
+/// Runs [statements] on the file as it is, then reads its stored version and
+/// the names of its schema objects. Nothing is created or migrated: the open
+/// that follows is a [_Probe], which refuses a file at version 0 and opens a
+/// version-1 file without writing it.
+Future<(int, Set<String>)> _rawFile(
+  File file, [
+  List<String> statements = const [],
+]) async {
+  late int version;
+  late Set<String> names;
+  final probe = _Probe(
+    NativeDatabase(file, setup: (raw) {
+      for (final s in statements) {
+        raw.execute(s);
+      }
+      version = raw.userVersion;
+      names = {
+        for (final r in raw.select('SELECT name FROM sqlite_master'))
+          r['name']! as String,
+      };
+    }),
+    1,
+  );
+  try {
+    await probe.customSelect('SELECT 1').get();
+  } on StateError {
+    // The probe refuses a file at version 0; the reads above already ran.
+  } finally {
+    await probe.close();
+  }
+  return (version, names);
+}
+
 Future<void> _seed(AppDatabase db) async {
   Future<void> exec(String sql) => db.customStatement(sql);
   await exec("INSERT INTO artists (id, name) VALUES (1, 'Artist')");
@@ -922,6 +985,106 @@ void main() {
       final after = await _stateOf(file, version: 2);
       expect(after.$1, 2);
       expect([for (final o in after.$2) o.$2], contains('fake_v2'));
+    });
+  });
+
+  // A first launch stopped part-way through creating the database
+  // must not leave a file that never opens. The creation and its version
+  // stamp are one transaction: either nothing of it stays (the file is still
+  // at version 0 and the next launch creates it) or all of it does, stamped
+  // version 1 (the next launch opens it).
+  group('a first creation that fails part-way', () {
+    Future<List<(String, String, String, String?)>> freshSchema() async {
+      final fresh = AppDatabase(NativeDatabase.memory());
+      try {
+        return await _schema(fresh);
+      } finally {
+        await fresh.close();
+      }
+    }
+
+    /// The next launch opens [file] at version 1 with exactly a fresh
+    /// install's schema.
+    Future<void> expectNextLaunchOpens(File file) async {
+      final app = AppDatabase(NativeDatabase(file));
+      addTearDown(app.close);
+      expect(await _version(app), 1);
+      expect(await _snapshotDifferences(app, _readSnapshot()), isEmpty);
+      expect(await _schema(app), await freshSchema());
+    }
+
+    test('a statement that fails in SQLite leaves nothing of the creation',
+        () async {
+      final file = File('${dir.path}/app.db');
+      // A trigger that already has the name of one onCreate makes, so that
+      // statement fails after the tables and an earlier trigger were made.
+      const planted = [
+        'CREATE TABLE x(a)',
+        'CREATE TRIGGER catalog_attribution_insert AFTER INSERT ON x '
+            'BEGIN SELECT 1; END',
+      ];
+      final (plantedVersion, plantedNames) = await _rawFile(file, planted);
+      expect(plantedVersion, 0, reason: 'fixture sanity');
+      expect(plantedNames, {'x', 'catalog_attribution_insert'},
+          reason: 'fixture sanity');
+
+      final db = AppDatabase(NativeDatabase(file));
+      await expectLater(
+        db.customSelect('SELECT 1').get(),
+        throwsA(isA<SqliteException>()),
+      );
+      await db.close();
+
+      final (version, names) = await _rawFile(file);
+      expect(version, 0, reason: 'the version was not stamped');
+      expect(names, {'x', 'catalog_attribution_insert'},
+          reason: 'only what was there before: no trackmetadata, no trigger, '
+              'no search table');
+
+      await _rawFile(file, [
+        'DROP TRIGGER catalog_attribution_insert',
+        'DROP TABLE x',
+      ]);
+      await expectNextLaunchOpens(file);
+    });
+
+    for (final point in [
+      'CREATE TRIGGER history_content',
+      'CREATE TRIGGER catalog_attribution_update',
+      'CREATE VIRTUAL TABLE IF NOT EXISTS fts_albums',
+      'PRAGMA user_version',
+    ]) {
+      test('stopped at `$point`: nothing stays and the next launch creates it',
+          () async {
+        final file = File('${dir.path}/app.db');
+        final db = _FailingCreationDb(NativeDatabase(file), failOn: point);
+        await expectLater(
+          db.customSelect('SELECT 1').get(),
+          throwsA(isA<StateError>()),
+        );
+        await db.close();
+
+        final (version, names) = await _rawFile(file);
+        expect(version, 0, reason: 'the version was not stamped');
+        expect(names, isEmpty, reason: 'no schema object stayed');
+        await expectNextLaunchOpens(file);
+      });
+    }
+
+    test('stopped after onCreate returned: stamped version 1, and it opens',
+        () async {
+      // drift writes the version itself only after the open finished; the
+      // stamp must already be in onCreate's own transaction.
+      final file = File('${dir.path}/app.db');
+      final db = _FailingCreationDb(NativeDatabase(file), failBeforeOpen: true);
+      await expectLater(
+        db.customSelect('SELECT 1').get(),
+        throwsA(isA<StateError>()),
+      );
+      await db.close();
+
+      expect((await _rawFile(file)).$1, 1);
+      await expectNextLaunchOpens(file);
     });
   });
 

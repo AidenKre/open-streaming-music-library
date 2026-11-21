@@ -88,10 +88,12 @@ def reconcile_journal(
     (default ``recovery_audio.read_audio``), ``cover_art`` (a CoverArtManager or
     None) serves a leftover that becomes a track."""
     entries = database.list_journal_entries(owner_id=ANY_OWNER)
-    # A row may itself be only in the page cache; flush once before any file moves.
+    # One durable point before any file moves (each row was flushed when saved).
     if entries and not reached_durable_point(database):
         operator_logger.warning(
-            "edit journal recovery goes ahead before a database flush (%d entries)",
+            "edit journal recovery goes ahead although it could not be confirmed that "
+            "database.db holds every saved change (%d entries; the server flushes each "
+            "entry to disk when it saves it)",
             len(entries),
         )
     for entry in entries:
@@ -271,10 +273,10 @@ class _Row:
             self.swap_outcome = TRACK_CHANGED_TEXT
         elif self.in_place and D != str(O):
             # Moved on, unless a stop after this row adopted the converted copy:
-            # then the track's file is that copy (at the recovered name, or reading
-            # as the conversion committed it).
-            adopted = not self.t_present and (
-                D == str(self.R) or self._committed_columns(Path(D)) is True
+            # then the track's file is that copy (at the recovered name with nothing
+            # left at the staged name, or reading as the conversion committed it).
+            adopted = (D == str(self.R) and not self.t_lex) or (
+                not self.t_present and self._committed_columns(Path(D)) is True
             )
             self.swap_outcome = SWAP_DONE if adopted else TRACK_CHANGED_TEXT
         elif self.redo_in_place:
@@ -639,6 +641,7 @@ class _Row:
                 )
 
     def _unreadable_removed(self) -> None:
+        self.phrases.append("an unreadable leftover file was removed")
         operator_logger.warning(
             "journal entry %s for track %s: an unreadable leftover file was removed",
             self.entry["id"], self.uuid,

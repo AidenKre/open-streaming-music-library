@@ -205,9 +205,9 @@ def reader(world, monkeypatch):
     snapshot: the WAL cannot be truncated while it lasts."""
     import sqlite3
 
-    from app.database import database as database_module
+    from app.database import lastfm as lastfm_module
 
-    monkeypatch.setattr(database_module, "PURGE_BUSY_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(lastfm_module, "PURGE_BUSY_TIMEOUT_S", 0.05)
     conn = sqlite3.connect(world.db.context.database_path)
     conn.execute("BEGIN")
     conn.execute("SELECT count(*) FROM tracks").fetchone()
@@ -267,9 +267,9 @@ def writer(world, monkeypatch):
     """Another program holding the write lock."""
     import sqlite3
 
-    from app.database import database as database_module
+    from app.database import lastfm as lastfm_module
 
-    monkeypatch.setattr(database_module, "PURGE_BUSY_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(lastfm_module, "PURGE_BUSY_TIMEOUT_S", 0.05)
     conn = sqlite3.connect(world.db.context.database_path)
     conn.execute("BEGIN IMMEDIATE")
     yield conn

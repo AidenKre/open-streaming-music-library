@@ -59,13 +59,19 @@ const _meta = TrackmetadataData(
   hasAlbumArt: false,
 );
 
-TrackUI _unknownTrack() => TrackUI.fromDrift(
-  _track,
-  _meta.copyWith(
-    duration: const Value(null),
-    sampleRateHz: const Value(null),
-    channels: const Value(null),
-  ),
+/// [_track] with [_meta], its audio properties unknown (or [duration]).
+TrackUI _unknownTrack({double? duration}) => TrackUI(
+  uuidId: _track.uuidId,
+  createdAt: _track.createdAt,
+  lastUpdated: _track.lastUpdated,
+  title: _meta.title,
+  artist: _meta.artist,
+  codec: _meta.codec,
+  duration: duration,
+  bitrateKbps: _meta.bitrateKbps,
+  sampleRateHz: null,
+  channels: null,
+  hasAlbumArt: _meta.hasAlbumArt,
 );
 
 void main() {
@@ -125,13 +131,6 @@ void main() {
   });
 
   group('TrackUI', () {
-    test('fromDrift keeps unknown as null', () {
-      final ui = _unknownTrack();
-      expect(ui.duration, isNull);
-      expect(ui.sampleRateHz, isNull);
-      expect(ui.channels, isNull);
-    });
-
     test('fromQueryRow keeps unknown as null', () async {
       final db = AppDatabase(NativeDatabase.memory());
       addTearDown(db.close);
@@ -162,10 +161,7 @@ void main() {
     });
 
     test('a real zero duration is still formatted as 0:00', () {
-      final ui = TrackUI.fromDrift(
-        _track,
-        _meta.copyWith(duration: const Value(0.0)),
-      );
+      final ui = _unknownTrack(duration: 0.0);
       expect(ui.formattedDuration, '0:00');
     });
   });

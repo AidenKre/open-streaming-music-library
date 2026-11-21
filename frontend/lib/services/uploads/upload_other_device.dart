@@ -3,17 +3,12 @@
 // its own clock, never from the server's `updated_at` (it also moves on
 // validation, retries and commits). Pure model code: no I/O, no providers.
 import 'package:frontend/models/dto/upload_dtos.dart';
+import 'package:frontend/services/uploads/upload_item_rules.dart';
 
 /// How long after the last arrival this device saw an upload still counts
 /// as being sent: longer than two polls of the open page and than the gap
 /// between two files of a sending device.
 const otherDeviceArrivalWindow = Duration(minutes: 1);
-
-/// States of an item still waiting for its bytes.
-const _waiting = {'allocated', 'receiving', 'transferring'};
-
-/// Ends that are no arrival of bytes.
-const _notArrived = {'cancelled', 'cancelling', 'expired'};
 
 /// What this device saw of the uploads' items: each item's state at the
 /// previous read, and per batch the time of the last arrival seen.
@@ -45,13 +40,13 @@ class UploadArrivals {
       final now = item.rawState;
       final before = _states[item.itemUuid];
       final beforeAt = _readAtMs[item.itemUuid];
-      final arrived = now == 'receiving' ||
+      final arrived = now == ServerItemState.receiving ||
           (before != null &&
               beforeAt != null &&
               nowMs - beforeAt <= window &&
-              _waiting.contains(before) &&
-              !_waiting.contains(now) &&
-              !_notArrived.contains(now));
+              awaitingOrReceivingBytesStates.contains(before) &&
+              !awaitingOrReceivingBytesStates.contains(now) &&
+              !noArrivalStates.contains(now));
       if (arrived) arrivals[item.batchUuid] = nowMs;
       states[item.itemUuid] = now;
       readAt[item.itemUuid] = nowMs;

@@ -66,7 +66,10 @@ mixin _SearchIndex on _$AppDatabase {
   /// updates its own entries ([applySearchDeltaOfPage]). It is also for a
   /// migration step that renumbers trackmetadata's rowids (see
   /// [AppDatabase.schemaVersion]).
-  Future<void> rebuildFtsIndexes() async {
+  ///
+  /// One transaction (a savepoint inside a caller's): a failure leaves the
+  /// index as it was, never empty.
+  Future<void> rebuildFtsIndexes() => transaction(() async {
     await rebuildParentFtsIndexes();
 
     await customStatement(
@@ -77,12 +80,13 @@ mixin _SearchIndex on _$AppDatabase {
       "SELECT rowid, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(album, '') "
       "FROM trackmetadata",
     );
-  }
+  });
 
   /// Rebuild only the artist/album FTS indexes — small tables, cheap to
   /// re-derive. Single-track reconciliation pairs this with a per-row
   /// [applyTrackFtsDelta] so it never pays the O(library) fts_tracks rebuild.
-  Future<void> rebuildParentFtsIndexes() async {
+  /// One transaction, like [rebuildFtsIndexes].
+  Future<void> rebuildParentFtsIndexes() => transaction(() async {
     await customStatement(
       "INSERT INTO fts_artists(fts_artists) VALUES('delete-all')",
     );
@@ -99,7 +103,7 @@ mixin _SearchIndex on _$AppDatabase {
       "SELECT a.id, COALESCE(a.name, ''), ar.name "
       "FROM albums a JOIN artists ar ON a.artist_id = ar.id",
     );
-  }
+  });
 
   /// A track's FTS-relevant values, or null if the row doesn't exist. Capture
   /// BEFORE a write so [applyTrackFtsDelta] can delete the old contentless

@@ -17,6 +17,8 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/api/authenticated_client.dart' show TokenWithheldException;
+import 'package:frontend/api/library_tools_api.dart' show LibraryToolsRequestAborted;
 import 'package:frontend/models/dto/library_tools_dtos.dart';
 import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/models/ui/track_ui.dart';
@@ -262,6 +264,96 @@ void main() {
       expect(review.preview, isNull);
       expect(review.message, isNotNull);
       expect(review.message, isNot(contains('down')));
+    });
+
+    // Each preview failure says what is known about it.
+    group('why the preview failed', () {
+      const reach = "Couldn't reach the server. Nothing was deleted.";
+      const unexpected =
+          'The server sent an unexpected answer. Nothing was deleted.';
+      const couldNotCheck =
+          "The server couldn't check these tracks. Nothing was deleted.";
+      const refused = 'The server refused this request. Nothing was deleted.';
+
+      Future<String?> messageWhen(Object error) async {
+        h.api.onPreview = (_) async => throw error;
+        select('a', 1);
+        await review.requestPreview();
+        await h.pump();
+        expect(review.stage, ReviewStage.failed);
+        expect(review.preview, isNull);
+        return review.message;
+      }
+
+      test('an answer the app could not read', () async {
+        expect(
+          await messageWhen(const FormatException('targets missing')),
+          unexpected,
+        );
+      });
+
+      // A 2xx body that is not JSON (or not an object) reaches the preview
+      // as an ApiException with the 2xx status (ApiClient's JSON handling).
+      test('a success answer whose body could not be read', () async {
+        expect(
+          await messageWhen(ApiException(200, 'Malformed JSON: <html>')),
+          unexpected,
+        );
+      });
+
+      test('a server failure without a code', () async {
+        expect(await messageWhen(ApiException(500, '')), couldNotCheck);
+      });
+
+      test('a server failure with a code this app has no words for', () async {
+        expect(
+          await messageWhen(apiError(503, 'something_new', retryable: true)),
+          couldNotCheck,
+        );
+      });
+
+      test('a server failure with a known code keeps its words', () async {
+        expect(
+          await messageWhen(apiError(500, 'track_pending_deletion')),
+          'A track in this request is already being deleted. Nothing was '
+          'deleted.',
+        );
+      });
+
+      test('a known refusal keeps its words', () async {
+        expect(
+          await messageWhen(apiError(409, 'track_pending_deletion')),
+          'A track in this request is already being deleted. Nothing was '
+          'deleted.',
+        );
+      });
+
+      test('a 4xx without a known code is still a refusal', () async {
+        expect(await messageWhen(ApiException(400, '')), refused);
+      });
+
+      test('a network failure still could not reach the server', () async {
+        expect(
+          await messageWhen(NetworkException('down', attemptsMade: 3)),
+          reach,
+        );
+      });
+
+      test('a time-out still could not reach the server', () async {
+        expect(await messageWhen(TimeoutException('slow')), reach);
+      });
+
+      test('a withheld token still could not reach the server', () async {
+        expect(await messageWhen(const TokenWithheldException()), reach);
+      });
+
+      // Not an answer from the server: the session closed while the preview
+      // was waiting, so "unexpected answer" would be untrue; it keeps
+      // today's words (reported to the coordinator).
+      test('a request stopped as the session closed keeps today\'s words',
+          () async {
+        expect(await messageWhen(const LibraryToolsRequestAborted()), reach);
+      });
     });
   });
 

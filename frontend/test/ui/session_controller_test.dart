@@ -320,7 +320,8 @@ void main() {
         expect(session().authError, isNull);
       });
 
-      test('any other sign-in fault keeps "Could not sign in."', () async {
+      test('any other sign-in fault reads "Could not finish signing in."',
+          () async {
         service.start = const SessionStart(SessionStartKind.logIn,
             serverUrl: 'http://s');
         await session().start();
@@ -328,7 +329,7 @@ void main() {
         await session().login('alice', 'pw-alice-1');
         expect(session().phase, SessionPhase.logIn);
         expect(session().databaseRefused, isFalse);
-        expect(session().authError, 'Could not sign in.');
+        expect(session().authError, 'Could not finish signing in.');
       });
 
       test('Reset… resets like Disconnect', () async {

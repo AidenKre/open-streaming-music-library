@@ -204,6 +204,29 @@ void main() {
       await teardownTree(tester);
     });
 
+    // The same words as the deletion screens for a track with no
+    // title; an empty title is no title.
+    testWidgets('a copy with no title or an empty title reads Unknown track',
+        (tester) async {
+      fake.pairs = [
+        pairView(
+          dupPair(
+            'a',
+            'b',
+            trackA: dupTrack('a', title: null),
+            trackB: dupTrack('b', title: ''),
+          ),
+        ),
+      ];
+      await open(tester);
+      expect(
+        find.descendant(of: row('a|b'), matching: find.text('Unknown track')),
+        findsNWidgets(2),
+      );
+      expect(find.text('Unknown title'), findsNothing);
+      await teardownTree(tester);
+    });
+
     testWidgets('a copy whose file is missing on the server says so',
         (tester) async {
       fake.pairs = [
@@ -536,6 +559,33 @@ void main() {
     expect(find.text('Reason words.'), findsOne);
     expect(inHeader('Reason words.'), findsNothing);
     expect(find.text('Possible duplicates needs a connection'), findsNothing);
+    await teardownTree(tester);
+  });
+
+  // Where Retry cannot help (a different server, signed out), the
+  // reason shows without a Retry, in the header and in the list.
+  testWidgets('a reason Retry cannot help: the reason, no Retry, at both sites',
+      (tester) async {
+    fake.unreachableText = 'Reason words.';
+    fake.connectionRetryHelps = false;
+    fake.summaryLoad = DuplicatesLoad.needsConnection;
+    fake.listLoad = DuplicatesLoad.loaded;
+    await open(tester);
+    expect(inHeader('Reason words.'), findsOne);
+    expect(find.byKey(const Key('retry-connection')), findsNothing);
+
+    fake.summaryLoad = DuplicatesLoad.loaded;
+    fake.listLoad = DuplicatesLoad.needsConnection;
+    fake.notify();
+    await tester.pump();
+    expect(find.text('Reason words.'), findsOne);
+    expect(find.byKey(const Key('retry-connection')), findsNothing);
+
+    fake.summaryLoad = DuplicatesLoad.needsConnection;
+    fake.notify();
+    await tester.pump();
+    expect(find.text('Reason words.'), findsNWidgets(2));
+    expect(find.byKey(const Key('retry-connection')), findsNothing);
     await teardownTree(tester);
   });
 

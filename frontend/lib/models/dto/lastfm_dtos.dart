@@ -91,8 +91,11 @@ class LastfmProblemRow {
     required this.status,
     this.code,
   });
-  final String artist;
-  final String track;
+  /// Null when unknown: the server lists a damaged listen without names.
+  final String? artist;
+
+  /// Null when unknown, like [artist].
+  final String? track;
   final int listenedAt;
   final String status;
   final String? code;
@@ -103,8 +106,8 @@ class LastfmProblemRow {
     final track = row['track'];
     final listenedAt = row['listened_at'];
     final status = row['status'];
-    if (artist is! String ||
-        track is! String ||
+    if (artist is! String? ||
+        track is! String? ||
         listenedAt is! int ||
         status is! String) {
       return null;

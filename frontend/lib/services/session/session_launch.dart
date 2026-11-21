@@ -80,14 +80,14 @@ class _SessionLaunch {
   /// Launch reading of a health result: a 5xx or 429 answer counts as
   /// unreachable (sign-off OPEN-A-04, 2026-11-17), and so does a 2xx answer
   /// whose body is not JSON (a Wi-Fi sign-in page or another web page in
-  /// front of the server; pre-merge review A5-02, owner 2026-11-18); 4xx and
-  /// non-OSML JSON answers stay `serverError` (forget the URL and the
-  /// sign-in).
+  /// front of the server; pre-merge review A5-02, owner 2026-11-18) or is
+  /// empty; 4xx and non-OSML JSON answers stay `serverError`
+  /// (forget the URL and the sign-in).
   HealthStatus _launchHealth(HealthResult result) {
     final code = result.statusCode;
     if (result.status == HealthStatus.serverError &&
-        code != null &&
-        (code == 429 || code >= 500 || result.bodyNotJson)) {
+        (result.bodyNotJson ||
+            (code != null && (code == 429 || code >= 500)))) {
       return HealthStatus.unreachable;
     }
     return result.status;
@@ -97,8 +97,8 @@ class _SessionLaunch {
   /// hanging saved URL must not hold the splash for the retry budget):
   /// healthy -> online; unreachable -> offline session (the URL is still
   /// presumed valid, downloads stay usable); an HTTP 5xx or 429 answer, or a
-  /// 2xx answer that is not JSON, counts as unreachable here
-  /// ([_launchHealth]); a 4xx or a non-OSML JSON
+  /// 2xx answer that is not JSON or is empty (a bare `{}` included), counts
+  /// as unreachable here ([_launchHealth]); a 4xx or another non-OSML JSON
   /// answer forgets the URL and the sign-in and returns to the server-address
   /// screen with the error (the binding row is kept, so the next connection is
   /// verified against it, SC-01 rule 3).

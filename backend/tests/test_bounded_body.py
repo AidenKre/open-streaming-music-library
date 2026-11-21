@@ -12,7 +12,9 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from app.auth.principal import auth_error
 from app.core.bounded_body import bounded_body, validation_error_422
+from app.library import current_library
 
 CAP = 16
 SECRET = b"SECRET-PAYLOAD-SHOULD-NOT-ECHO"
@@ -174,3 +176,77 @@ def test_a_client_disconnect_while_the_body_is_read_ends_the_request_quietly(fir
     assert [r.levelno for r in operator] == [logging.INFO]
     assert "client went away" in operator[0].getMessage()
     assert "/" not in operator[0].getMessage()
+
+
+# ── the four routes that moved out of main.py and take their body through json_body ──
+
+SAMPLE_ID = "00000000-0000-4000-8000-000000000000"
+JSON_BODY_ROUTES = [
+    ("POST", "/tracks/warm"),
+    ("PUT", "/settings/quality"),
+    ("PATCH", f"/tracks/{SAMPLE_ID}"),
+    ("POST", "/jobs"),
+]
+ROUTE_IDS = ["warm", "quality", "patch-track", "jobs"]
+
+
+def _refuse_sign_in():
+    raise auth_error("auth_required")
+
+
+@pytest.mark.parametrize("body", [b"{", b"x" * (64 * 1024 + 1)], ids=["malformed", "oversized"])
+@pytest.mark.parametrize("method, path", JSON_BODY_ROUTES, ids=ROUTE_IDS)
+def test_a_refused_sign_in_answers_before_the_body_is_read(app_client, method, path, body):
+    # The token passes the middleware; the route's sign-in dependency then refuses
+    # (as for a user removed since). It answers first: 401, not 422 or 413.
+    app_client.app.dependency_overrides[current_library] = _refuse_sign_in
+    try:
+        response = app_client.request(
+            method, path, content=body, headers={"content-type": "application/json"}
+        )
+    finally:
+        app_client.app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    assert response.json()["detail"]["error"] == "auth_required"
+
+
+def _disconnecting_request(app, method, path, headers, first_chunks):
+    """Drive the ASGI app; after ``first_chunks`` the client disconnects."""
+    messages = [{"type": "http.request", "body": c, "more_body": True} for c in first_chunks]
+    sent = []
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+        "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+        "root_path": "", "headers": [(b"content-type", b"application/json"), *headers],
+        "client": ("127.0.0.1", 1), "server": ("testserver", 80), "state": {},
+    }
+    asyncio.run(app(scope, receive, send))  # an unhandled exception would raise here
+    return sent
+
+
+@pytest.mark.parametrize("first_chunks", [[], [b'{"quality": ']], ids=["before-any-byte", "mid-body"])
+@pytest.mark.parametrize("method, path", JSON_BODY_ROUTES, ids=ROUTE_IDS)
+def test_a_client_that_goes_away_while_a_json_body_is_read_ends_quietly(
+    app_client, method, path, first_chunks, caplog
+):
+    auth = [(b"authorization", app_client.headers["Authorization"].encode())]
+
+    with caplog.at_level(logging.DEBUG):
+        sent = _disconnecting_request(app_client.app, method, path, auth, first_chunks)
+
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert [m["status"] for m in starts] == [499]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [r for r in caplog.records if r.exc_info]
+    operator = [r for r in caplog.records if r.name == "uvicorn.error"]
+    assert [r.getMessage() for r in operator] == ["client went away before its request body was read"]

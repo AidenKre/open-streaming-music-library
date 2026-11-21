@@ -115,5 +115,5 @@ def test_committed_journals_the_janitor_keeps_are_counted(world, caplog):
 
     assert journal(world, uuid_id) is not None
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("1 " in m for m in warnings)
+    assert "1 committed deletion clean-up(s) could not be finished; their journals are kept." in warnings
     assert all(str(world.music) not in r.getMessage() for r in caplog.records)

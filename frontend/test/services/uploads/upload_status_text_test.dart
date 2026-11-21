@@ -298,6 +298,59 @@ void main() {
     });
   });
 
+  // The archive's file list offers no Retry or Cancel for a file,
+  // so a failed file of an unpacked archive is never told to try again; a
+  // single file keeps its text.
+  group('a failed file of an archive is not told to try again', () {
+    const texts = <String, (String, String)>{
+      'probe_timeout': (
+        "The server couldn't check this file in time. Try again.",
+        "The server couldn't check this file in time.",
+      ),
+      'probe_unavailable': (
+        "The server can't check files right now. Try again later.",
+        "The server can't check files right now.",
+      ),
+      'upload_validation_failed': (
+        "The server couldn't finish checking this file. Try again.",
+        "The server couldn't finish checking this file.",
+      ),
+      'insufficient_storage': (
+        "The server doesn't have enough free space. Try again later.",
+        "The server doesn't have enough free space.",
+      ),
+      'free_space_unknown': (
+        "The server can't check its free space right now. Try again later.",
+        "The server can't check its free space right now.",
+      ),
+      'staged_quota_exceeded': (
+        "The server's upload space is full. Try again later.",
+        "The server's upload space is full.",
+      ),
+      'user_staged_quota_exceeded': (
+        'Your upload space on the server is full. Import or cancel other '
+            'files, then try again.',
+        'Your upload space on the server is full.',
+      ),
+    };
+    for (final MapEntry(key: code, value: (single, archive)) in texts.entries) {
+      test(code, () {
+        for (final state in ['failed', 'rejected']) {
+          expect(
+            uploadDetailText(state, errorCode: code, fromArchive: true),
+            archive,
+            reason: '$state, a file of an archive',
+          );
+          expect(
+            uploadDetailText(state, errorCode: code),
+            single,
+            reason: '$state, a single file',
+          );
+        }
+      });
+    }
+  });
+
   // TR-UPLOAD-05 r4: a row whose batch the server pruned (404
   // `upload_batch_not_found`) ends as `expired`. Its real end is unknown (an
   // item left `committing` was most likely imported), so the detail must not

@@ -108,7 +108,7 @@ void signInGroup() {
             ? session().register('sam', '12345678', '12345678')
             : session().login('sam', 'secret-pw');
         await attempt();
-        expect(session().authError, 'Could not sign in.');
+        expect(session().authError, 'Could not finish signing in.');
         service.signInThrows = null;
         service.outcome = const SignInFailed('Wrong username or password.');
         await attempt();

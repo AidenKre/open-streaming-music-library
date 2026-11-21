@@ -489,6 +489,36 @@ void main() {
     expect(find.text('Reset and disconnect?'), findsOneWidget);
   });
 
+  // One sheet per tap. A second tap while the losses are read
+  // does nothing; once the sheet is closed, a tap asks again.
+  testWidgets('a double tap on Disconnect while the losses are read opens '
+      'one sheet', (tester) async {
+    final prefs = await SharedPreferences.getInstance();
+    final gate = Completer<List<String>>();
+    final session = FakeSessionControls(onDisconnect: () async {})
+      ..lossSummariesGate = gate;
+    await tester.pumpWidget(_wrap(prefs, session: session));
+    await tester.pumpAndSettle();
+    await _toBottom(tester, find.text('Disconnect'));
+    await tester.tap(find.text('Disconnect'));
+    await tester.pump();
+    await tester.tap(find.text('Disconnect'));
+    await tester.pump();
+    gate.complete(['2 unsent metadata edits']);
+    await tester.pumpAndSettle();
+    expect(find.byType(BottomSheet), findsOneWidget);
+    expect(session.lossSummaryReads, 1);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(find.byType(BottomSheet), findsNothing);
+    expect(session.calls, isEmpty);
+    await tester.tap(find.text('Disconnect'));
+    await tester.pumpAndSettle();
+    expect(find.byType(BottomSheet), findsOneWidget,
+        reason: 'the guard is released once the sheet closes');
+    await teardownTree(tester);
+  });
+
   // SC-15: the confirmation names what will be lost.
   testWidgets('the Disconnect confirmation lists what will be lost', (
     tester,

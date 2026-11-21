@@ -32,3 +32,15 @@ final librarySyncStatusProvider = Provider<LibrarySyncStatus>((ref) {
   if (state.libraryError != null) return LibrarySyncStatus.failed;
   return LibrarySyncStatus.idle;
 });
+
+/// Whether a complete library (catalog) sync has finished since this device
+/// was bound to this server and user: the stored marker
+/// `server_binding.catalog_reconciled_at_binding` (kept across a log-out,
+/// with the device library; cleared by a reset or a restored server).
+/// Only then does an empty device library mean an empty library. Read again
+/// whenever a library sync starts or ends; false with no binding.
+final libraryCatalogSyncedProvider = FutureProvider<bool>((ref) async {
+  ref.watch(trackSyncProvider.select((a) => a.value?.librarySyncing));
+  final binding = await ref.read(serverBindingRepositoryProvider).current();
+  return binding?.catalogReconciled ?? false;
+});

@@ -21,7 +21,8 @@ REASON_TOOL_MISSING = "tool_missing"
 REASON_TIMEOUT = "timeout"
 REASON_DECODE_ERROR = "decode_error"
 # A SIGKILL (registry/shutdown kill) is not a decode failure. The worker does
-# not count ``killed`` as an attempt.
+# not count ``killed`` as an attempt while it is stopping (its stop flag is set
+# or its kill registry is closed); otherwise it does.
 REASON_KILLED = "killed"
 REASON_PROBE_ERROR = "probe_error"
 REASON_OUTPUT_ERROR = "output_error"

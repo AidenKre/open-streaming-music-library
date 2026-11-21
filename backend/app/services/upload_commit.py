@@ -186,8 +186,9 @@ class UploadCommitWorker(PollingWorkerThread):
 
     ``process_one`` never raises; it returns ``idle``, ``prepared``,
     ``interrupted`` or ``error``, or, when ``after_prepared`` is set, that
-    callable's return value. ``after_prepared(journal_row)`` is the named seam
-    where 7A.3b plugs in steps 3-6 (move, insert, finish) on the prepared row."""
+    callable's return value. ``after_prepared(journal_row)`` runs steps 3-6
+    (move, insert, finish) on the prepared row; the server passes an
+    ``upload_publish.UploadPublisher``."""
 
     thread_name = "upload-commit-worker"
 

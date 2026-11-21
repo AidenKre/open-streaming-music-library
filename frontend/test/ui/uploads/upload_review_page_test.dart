@@ -16,6 +16,7 @@ import 'package:frontend/database/database.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/services/app_info_service.dart';
+import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/ui/feed/new_activity_notice.dart';
 import 'package:frontend/ui/get_info_page.dart';
@@ -432,6 +433,49 @@ void main() {
     expect(find.text('Nothing to review right now.'), findsOneWidget);
     await teardownTree(tester);
   });
+
+  // A failed load names its reason; Try again only where it helps.
+  for (final (reason, retry, text) in <(LibraryToolsUnreachable?, bool, String)>[
+    (
+      LibraryToolsUnreachable.needsConnection,
+      true,
+      'The files to review need a connection.',
+    ),
+    (
+      LibraryToolsUnreachable.differentServer,
+      false,
+      'The files to review are not available: a different server answers '
+          'at this address.',
+    ),
+    (
+      LibraryToolsUnreachable.signedOut,
+      false,
+      'The files to review are not available: you are signed out.',
+    ),
+    (null, true, "Couldn't load the files to review."),
+  ]) {
+    testWidgets('a failed load: ${reason?.name ?? 'other failure'}',
+        (tester) async {
+      fake.load = ReviewLoad.failed;
+      fake.loadUnreachable = reason;
+      fake.loadRetryHelps = retry;
+      await pump(tester);
+      expect(find.text(text), findsOneWidget);
+      for (final other in [
+        'The files to review need a connection.',
+        "Couldn't load the files to review.",
+      ]) {
+        if (other != text) expect(find.text(other), findsNothing);
+      }
+      expect(find.text('Try again'), retry ? findsOneWidget : findsNothing);
+      if (retry) {
+        await tester.tap(find.text('Try again'));
+        await tester.pump();
+        expect(fake.calls.where((c) => c.startsWith('start')), hasLength(2));
+      }
+      await teardownTree(tester);
+    });
+  }
 
   testWidgets('a notice is shown and can be dismissed', (tester) async {
     fake.show(fakeReviewView('a'));

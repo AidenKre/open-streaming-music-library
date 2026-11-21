@@ -11,11 +11,21 @@ import 'package:frontend/ui/widgets/reset_confirm_sheet.dart';
 /// Signed out (Phase M 7.7): Log in, which logs out first and keeps the unsent
 /// uploads and deletions for the same user's next login. Renders nothing
 /// when the session is not blocked.
-class ServerBlockedBanner extends ConsumerWidget {
+class ServerBlockedBanner extends ConsumerStatefulWidget {
   const ServerBlockedBanner({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<ServerBlockedBanner> createState() =>
+      _ServerBlockedBannerState();
+}
+
+class _ServerBlockedBannerState extends ConsumerState<ServerBlockedBanner> {
+  /// One sheet at a time: a second tap on Reset or Disconnect while the
+  /// losses are read or a sheet is open does nothing.
+  bool _asking = false;
+
+  @override
+  Widget build(BuildContext context) {
     final session = ref.watch(sessionControlsProvider);
     return ListenableBuilder(
       listenable: session,
@@ -96,31 +106,44 @@ class ServerBlockedBanner extends ConsumerWidget {
     );
   }
 
-  Future<void> _reset(BuildContext context, SessionControls session) async {
-    final losses = await session.pendingLossSummaries();
-    if (!context.mounted) return;
-    final confirmed = await showResetConfirmSheet(
-      context,
-      title: 'Reset for this server?',
-      body:
-          "This deletes this device's local library, downloads, queue and "
-          'settings, then reconnects to the server at the saved address.',
-      confirmLabel: 'Reset and reconnect',
-      losses: losses,
-    );
-    if (confirmed) unawaited(session.resetBlockedServer());
+  /// Runs [ask] unless another sheet is being asked for or is open.
+  Future<void> _oneAtATime(Future<void> Function() ask) async {
+    if (_asking) return;
+    _asking = true;
+    try {
+      await ask();
+    } finally {
+      _asking = false;
+    }
   }
+
+  Future<void> _reset(BuildContext context, SessionControls session) =>
+      _oneAtATime(() async {
+        final losses = await session.pendingLossSummaries();
+        if (!context.mounted) return;
+        final confirmed = await showResetConfirmSheet(
+          context,
+          title: 'Reset for this server?',
+          body:
+              "This deletes this device's local library, downloads, queue and "
+              'settings, then reconnects to the server at the saved address.',
+          confirmLabel: 'Reset and reconnect',
+          losses: losses,
+        );
+        if (confirmed) unawaited(session.resetBlockedServer());
+      });
 
   Future<void> _disconnect(
     BuildContext context,
     SessionControls session,
-  ) async {
-    final losses = await session.pendingLossSummaries();
-    if (!context.mounted) return;
-    final confirmed = await showDisconnectConfirmSheet(
-      context,
-      losses: losses,
-    );
-    if (confirmed) unawaited(session.disconnect());
-  }
+  ) =>
+      _oneAtATime(() async {
+        final losses = await session.pendingLossSummaries();
+        if (!context.mounted) return;
+        final confirmed = await showDisconnectConfirmSheet(
+          context,
+          losses: losses,
+        );
+        if (confirmed) unawaited(session.disconnect());
+      });
 }

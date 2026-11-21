@@ -2,17 +2,17 @@
 
 The user's decision of 2026-11-17: "Add the flush." A tag edit that moves the
 file and a conversion that changes its path insert their ``edit_journal`` row
-(a commit, not yet flushed to disk at ``synchronous=NORMAL`` in WAL mode), then
-move the staged copy to the new path. A power cut could keep the move and lose
-the row and the later commit: the track keeps its old file and a second copy
-sits at the new path with no row and no track. Both writers now take a durable
-point between the row insert and the move. Best effort, like decision D10: when
+(a commit), then move the staged copy to the new path. When the decision was
+made a commit was not yet flushed to disk (``synchronous=NORMAL`` in WAL
+mode), so a power cut could keep the move and lose the row and the later
+commit: the track keeps its old file and a second copy sits at the new path
+with no row and no track. Both writers take a durable point between the row
+insert and the move. Every commit is now flushed when it returns, so the point
+is a second line of defence. Best effort, like decision D10: when
 it answers False or raises, the operation goes ahead and one path-free operator
 line (entry id and track uuid) says so; it never fails the edit or the job.
 
-Startup recovery moves staged copies too, and a row it reads may itself be only
-in the page cache (the process was killed, then the power failed during
-recovery). It takes one durable point before the first row is settled, only when
+Startup recovery moves staged copies too. It takes one durable point before the first row is settled, only when
 rows exist; a failure does not keep any row by itself (the per-row point, K1,
 still guards every deletion).
 """
@@ -103,7 +103,7 @@ def test_a_moving_edit_whose_first_flush_failed_goes_ahead_and_logs_one_line(
     assert db.list_journal_entries() == []
     [entry_id] = seen[0]
     [line] = _operator_lines(caplog)
-    assert track.uuid_id in line and str(entry_id) in line and "flush" in line
+    assert track.uuid_id in line and str(entry_id) in line and "could not be confirmed just now" in line
     assert str(tmp_path) not in line and audio.name not in line and "Art" not in line
 
 
@@ -157,7 +157,7 @@ def test_a_conversion_whose_first_flush_failed_goes_ahead_and_logs_one_line(
     assert db.list_journal_entries() == []
     [entry_id] = seen[0]
     [line] = _operator_lines(caplog)
-    assert track.uuid_id in line and str(entry_id) in line and "flush" in line
+    assert track.uuid_id in line and str(entry_id) in line and "could not be confirmed just now" in line
     assert str(tmp_path) not in line and "song" not in line
 
 
@@ -215,6 +215,9 @@ def test_a_failed_startup_flush_lets_recovery_go_ahead_with_one_line(
     assert _rows(w) == []  # the failure keeps no row by itself
     assert _db_path(w) == str(w.paths["N"]) and w.paths["N"].read_bytes() == C_TEMP
     lines = _operator_lines(caplog)
-    assert len([line for line in lines if "flush" in line]) == 1
+    assert len([
+        line for line in lines
+        if "recovery goes ahead although it could not be confirmed that database.db holds" in line
+    ]) == 1
     for line in lines:
         assert str(tmp_path) not in line and "song" not in line and "two" not in line

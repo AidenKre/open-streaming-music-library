@@ -10,15 +10,15 @@ the database file. The power-cut cases themselves are in
 ``test_deletion_crash_matrix.py`` (the lost-commit variants).
 """
 
-import fcntl
+import builtins
 import os
 import shutil
 import sqlite3
-import sys
 
 import pytest
 
 from app.services.deletion_recovery import DeletionJanitor
+from tests.database_file_probes import log_bytes, setting_in_the_main_file_alone
 from tests.deletion_recovery_helpers import run_until_crash
 from tests.deletion_world import (
     accept_job,
@@ -179,8 +179,8 @@ def test_the_checkpoint_syncs_with_fullfsync_and_never_with_sync_off(world, monk
     """The guarantee rests on two settings of the checkpoint's connection: a
     synchronous level that is not OFF (SQLite's checkpoint syncs the WAL and
     the database file at NORMAL and above) and fullfsync (macOS F_FULLFSYNC).
-    The product sets no synchronous of its own (pinned in
-    test_sqlite_test_durability.py); this pins what the checkpoint runs with."""
+    The product sets synchronous=FULL on every connection (pinned in
+    test_database_durable_commits.py); this pins what the checkpoint runs with."""
     real_connect = sqlite3.connect
     _RecordingConnection.seen = []
 
@@ -199,35 +199,76 @@ def test_the_checkpoint_syncs_with_fullfsync_and_never_with_sync_off(world, monk
     assert seen["fullfsync"] == 1
 
 
+class _SettingsAtClose(sqlite3.Connection):
+    """Records the connection's own sync settings when it closes (the close of
+    the only connection is what checkpoints the log)."""
+
+    seen: list = []
+
+    def close(self):
+        _SettingsAtClose.seen.append(
+            {
+                "synchronous": super().execute("PRAGMA synchronous").fetchone()[0],
+                "fullfsync": super().execute("PRAGMA fullfsync").fetchone()[0],
+            }
+        )
+        return super().close()
+
+
 @pytest.mark.real_sqlite_durability
-def test_an_already_checkpointed_database_still_gets_a_full_flush(world, monkeypatch):
-    """Review finding (durable point r1 #1): with one connection per call the
-    last connection to close checkpoints the WAL itself, syncing with its own
-    plain settings (no F_FULLFSYNC on macOS). The durable point then finds no
-    work, so it must flush the database file itself: F_FULLFSYNC on macOS,
-    fsync elsewhere."""
-    _commit_a_row(world)  # no keeper: the close has already checkpointed
-    database_file = os.stat(world.db.context.database_path)
-    flushes = []
-    real_fcntl, real_fsync = fcntl.fcntl, os.fsync
-    full = getattr(fcntl, "F_FULLFSYNC", None)
+def test_an_already_checkpointed_database_was_flushed_by_the_checkpoint_that_emptied_its_log(
+        world, monkeypatch, tmp_path):
+    """A database with nothing left to checkpoint: the durable point finds no
+    work and SQLite issues no flush. What makes its True true is what happened
+    before: the commit was flushed when it returned, and the checkpoint that
+    emptied the log (here the close of the product connection that wrote) ran
+    with ``synchronous=FULL`` and ``fullfsync=ON``, so it flushed the database
+    file fully. Every connection the product opens has those settings
+    (``test_database_durable_commits.py``).
 
-    def spy_fcntl(fd, cmd, *args):
-        if full is not None and cmd == full:
-            flushes.append(("full", os.fstat(fd).st_ino))
-        return real_fcntl(fd, cmd, *args)
+    The durable point used to add a flush of its own on a descriptor it opened
+    and closed on the database file (review finding, durable point r1 #1, from
+    the time closes synced with plain settings). That is gone and must stay
+    gone: closing a descriptor of the file beside SQLite drops the process's
+    locks on it (audit AU3-01). So this pins both: the earlier checkpoint's
+    settings, and that the durable point opens nothing of its own on the
+    database's files."""
+    real_connect = sqlite3.connect
+    _SettingsAtClose.seen = []
 
-    def spy_fsync(fd):
-        flushes.append(("fsync", os.fstat(fd).st_ino))
-        return real_fsync(fd)
+    def connect(*args, **kwargs):
+        kwargs.setdefault("factory", _SettingsAtClose)
+        return real_connect(*args, **kwargs)
 
-    monkeypatch.setattr(fcntl, "fcntl", spy_fcntl)
-    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    world.db.set_setting("probe", "committed before the point")  # no keeper: its close checkpoints
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    assert _SettingsAtClose.seen  # at least the connection that wrote, whose close checkpointed
+    assert all(s == {"synchronous": 2, "fullfsync": 1} for s in _SettingsAtClose.seen)
+    path = world.db.context.database_path
+    assert log_bytes(path) == 0
+    assert setting_in_the_main_file_alone(path, tmp_path) == "committed before the point"
+
+    database_files = {str(path) + suffix for suffix in ("", "-wal", "-shm")}
+    opened_beside_sqlite = []
+    real_os_open, real_open = os.open, builtins.open
+
+    def spy_os_open(file, *args, **kwargs):
+        if str(file) in database_files:
+            opened_beside_sqlite.append(str(file))
+        return real_os_open(file, *args, **kwargs)
+
+    def spy_open(file, *args, **kwargs):
+        if str(file) in database_files:
+            opened_beside_sqlite.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_open)
 
     assert world.db.make_durable() is True
 
-    kind = "full" if sys.platform == "darwin" else "fsync"
-    assert (kind, database_file.st_ino) in flushes
+    assert opened_beside_sqlite == []
 
 
 # ── the executor: one durable point per job, before any cleanup ─────────────

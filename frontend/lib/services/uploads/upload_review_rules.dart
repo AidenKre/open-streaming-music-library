@@ -7,8 +7,11 @@ import 'package:frontend/services/uploads/upload_duplicate_banners.dart';
 import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/upload_item_rules.dart'
     show
+        ServerItemState,
         isServerRefusedReview,
         offersReview,
+        reviewInFlightStates,
+        reviewResolvedStates,
         reviewableStates,
         sentFromOtherDevice;
 import 'package:frontend/services/uploads/upload_status_text.dart';
@@ -41,9 +44,6 @@ class ReviewReadOrder {
     return true;
   }
 }
-
-const _inFlight = {'review_submitted', 'committing'};
-const _reviewResolved = {'imported', 'duplicate'};
 
 /// One item of the review as the page shows it. The local intent, when there
 /// is one, is the live mirror and wins for state and error code. "On submit
@@ -83,10 +83,10 @@ class ReviewItemView {
   }) {
     final state = intent?.lastState ?? item.rawState;
     final code = intent != null ? intent.lastErrorCode : item.error?.code;
-    final reviewable = state == 'review_ready';
+    final reviewable = state == ServerItemState.reviewReady;
     final cancellable = reviewableStates.contains(state) && online;
     final duplicates = DuplicateBanners.of(item, chosen: chosen);
-    final conflict = state == 'duplicate_conflict'
+    final conflict = state == ServerItemState.duplicateConflict
         ? DuplicateConflictView.of(item)
         : null;
     final canAct = reviewable && online;
@@ -115,8 +115,8 @@ class ReviewItemView {
       statusText: texts.status,
       errorText: texts.detail,
       reviewable: reviewable,
-      inFlight: _inFlight.contains(state),
-      done: _reviewResolved.contains(state),
+      inFlight: reviewInFlightStates.contains(state),
+      done: reviewResolvedStates.contains(state),
       canConfirm: canConfirm && !duplicates.needsChoice,
       canSkip: canConfirm && !duplicates.needsChoice,
       canCancel: cancellable,
@@ -130,7 +130,7 @@ class ReviewItemView {
           ? duplicates.useExistingTrackUuid
           : (conflict != null && online ? conflict.useExistingTrackUuid : null),
       dontImportTrackUuid: canAct ? duplicates.dontImportTrackUuid : null,
-      canBackToReview: state == 'duplicate_conflict' && online,
+      canBackToReview: state == ServerItemState.duplicateConflict && online,
       canPlayExisting: online && reviewableStates.contains(state),
     );
   }
@@ -163,9 +163,9 @@ class ReviewItemView {
 /// "Advance only after durable imported/duplicate result": true when [after]
 /// is such a result and [before] is known and was not one already.
 bool reviewAdvances({required String? before, required String after}) =>
-    _reviewResolved.contains(after) &&
+    reviewResolvedStates.contains(after) &&
     before != null &&
-    !_reviewResolved.contains(before);
+    !reviewResolvedStates.contains(before);
 
 /// "New arriving ready items appear through More items ready - Refresh":
 /// some intent of [batchUuid] is ready and not in the [snapshot].
@@ -176,7 +176,7 @@ bool moreItemsReady({
 }) => intents.any(
   (i) =>
       i.batchUuid == batchUuid &&
-      i.lastState == 'review_ready' &&
+      i.lastState == ServerItemState.reviewReady &&
       offersReview(i.lastState, i.lastErrorCode) &&
       !snapshot.contains(i.itemUuid),
 );

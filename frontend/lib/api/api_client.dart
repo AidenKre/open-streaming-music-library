@@ -133,8 +133,9 @@ typedef DelayFn = Future<void> Function(Duration);
 /// server is up but misbehaving, so the user should see an inline error
 /// rather than enter offline mode. At app launch only, an HTTP 5xx or 429
 /// answer, or a 2xx answer that is not JSON (a web page in front of the
-/// server), is treated like `unreachable` (sign-off OPEN-A-04, 2026-11-17;
-/// pre-merge review A5-02); see [HealthResult.statusCode] and
+/// server) or is empty, is treated like `unreachable` (sign-off OPEN-A-04,
+/// 2026-11-17; pre-merge review A5-02); see
+/// [HealthResult.statusCode], [HealthResult.bodyNotJson] and
 /// `SessionService.resumeSavedSession`.
 enum HealthStatus { ok, serverError, unreachable }
 
@@ -144,11 +145,13 @@ class HealthResult {
 
   /// The status of an `ApiException` answer: the HTTP status of a non-2xx
   /// answer, and the 2xx status of a body that is not valid JSON or not a
-  /// JSON object. Null for a well-formed JSON object that is not OSML's, and
-  /// for transport failures.
+  /// JSON object. Null for a well-formed JSON object that is not OSML's, for
+  /// an empty body, and for transport failures.
   final int? statusCode;
 
-  /// The answer was 2xx and its body is not JSON at all (a web page).
+  /// The answer was 2xx and its body is not JSON at all (a web page), or is
+  /// empty (a bare `{}` counts as empty: the client cannot tell the two
+  /// apart).
   final bool bodyNotJson;
   const HealthResult(
     this.status, [
@@ -930,6 +933,12 @@ class ApiClient {
       // failed manual connection attempt strand the app in offline mode.
       final data = await getJson([], retry: retry, triggerOfflineHook: false);
       if (data['message'] == 'Healthy') return const HealthResult(HealthStatus.ok);
+      // An empty 2xx body reads as `{}`, like a literal `{}`: either comes
+      // from something in front of the server, not from OSML.
+      if (data.isEmpty) {
+        return const HealthResult(
+            HealthStatus.serverError, 'Unexpected response from server', null, true);
+      }
       return const HealthResult(HealthStatus.serverError, 'Unexpected response from server');
     } on ApiException catch (e) {
       return HealthResult(

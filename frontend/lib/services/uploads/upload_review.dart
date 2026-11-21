@@ -123,9 +123,7 @@ class UploadReview {
 
   Future<MetadataEdit> draftOf(String itemUuid) async {
     final token = await _token();
-    final intent = (await _intents.forBinding(
-      token,
-    )).where((i) => i.itemUuid == itemUuid).firstOrNull;
+    final intent = await _intents.find(token, itemUuid);
     return decodeDraft(intent?.draftJson);
   }
 

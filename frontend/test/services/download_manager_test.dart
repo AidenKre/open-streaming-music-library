@@ -1106,14 +1106,13 @@ void main() {
       expect(firstRow.downloadedQuality, '320');
       final firstPath = firstRow.filePath!;
 
-      // Rehydrate the TrackUI from the DB so the second call sees the stored
-      // downloaded_quality (same path the UI uses).
-      final states = await db.getTrackDownloadStates(['abc']);
+      // Rehydrate the TrackUI from the stored row so the second call sees the
+      // stored downloaded_quality.
       final rehydrated = _track(
         'abc',
-        filePath: states['abc']!.filePath,
-        downloadedBitrateKbps: states['abc']!.downloadedBitrateKbps,
-        downloadedQuality: states['abc']!.downloadedQuality,
+        filePath: firstRow.filePath,
+        downloadedBitrateKbps: firstRow.downloadedBitrateKbps,
+        downloadedQuality: firstRow.downloadedQuality,
       );
       manager.clearFinished();
 

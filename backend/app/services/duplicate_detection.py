@@ -12,7 +12,7 @@ import struct
 from dataclasses import asdict, dataclass
 from typing import Literal, Sequence
 
-from app.database.database import _require_owner
+from app.core.owner import _require_owner
 from app.services.audio_identity import (
     AudioIdentity,
     ExactAudioHash,
@@ -117,6 +117,24 @@ def _search_offsets(max_offset: int, implied: int | None) -> list[int]:
     return offsets
 
 
+@dataclass(frozen=True)
+class PreparedFingerprint:
+    """A print packed and measured once, to compare with many others (one lookup's subject)."""
+
+    items: tuple[int, ...]
+    packed: bytes
+    diversity: float | None  # compare2 penalty diversity; None for an empty print
+
+
+def prepare_fingerprint(items) -> PreparedFingerprint:
+    items = tuple(items)
+    return PreparedFingerprint(
+        items=items,
+        packed=struct.pack(f"<{len(items)}I", *items),
+        diversity=_penalty_diversity(items) if items else None,
+    )
+
+
 def compare_fingerprints(
     a, b, params: MatcherParams, *, duration_a_s=None, duration_b_s=None
 ) -> FingerprintComparison | None:
@@ -133,10 +151,12 @@ def compare_fingerprints(
     positive one. ``score`` is ``1 - ber``, then, as in compare2, raised to
     ``8 - 7 * diversity`` when the less diverse side's whole-fingerprint
     diversity is below 1.0. ``alignments`` and ``items_compared`` count the
-    offsets compared and the items XORed over them.
+    offsets compared and the items XORed over them. ``a`` may be a
+    ``PreparedFingerprint`` (the same result, without repacking it).
     """
-    na, nb = len(a), len(b)
-    pa = struct.pack(f"<{na}I", *a)
+    prepared = a if isinstance(a, PreparedFingerprint) else prepare_fingerprint(a)
+    na, nb = len(prepared.items), len(b)
+    pa = prepared.packed
     pb = struct.pack(f"<{nb}I", *b)
     from_bytes = int.from_bytes
     best = None  # (ber, offset, overlap)
@@ -161,7 +181,7 @@ def compare_fingerprints(
         return None
     ber, offset, overlap = best
     score = 1 - ber
-    diversity = min(_penalty_diversity(a), _penalty_diversity(b))
+    diversity = min(prepared.diversity, _penalty_diversity(b))
     if diversity < 1.0:
         score = score ** (8 - 7 * diversity)
     return FingerprintComparison(
@@ -354,15 +374,17 @@ def within_duration_window(d1: float, d2: float, params: MatcherParams) -> bool:
 
 
 def _compare_prints(
-    subject: FingerprintIdentity, algorithm: str, duration_s: float, items, params: MatcherParams
+    subject: FingerprintIdentity, prepared: PreparedFingerprint, algorithm: str, duration_s: float,
+    items, params: MatcherParams,
 ) -> tuple[FingerprintBand, float] | None:
-    """THE fingerprint match rule: same algorithm, inside the window, comparable, banded."""
+    """THE fingerprint match rule: same algorithm, inside the window, comparable, banded.
+    ``prepared`` is ``subject.items`` prepared once for the lookup."""
     if algorithm != subject.algorithm:
         return None
     if not within_duration_window(subject.duration_s, duration_s, params):
         return None
     cmp = compare_fingerprints(
-        subject.items, items, params, duration_a_s=subject.duration_s, duration_b_s=duration_s
+        prepared, items, params, duration_a_s=subject.duration_s, duration_b_s=duration_s
     )
     if cmp is None:
         return None
@@ -392,17 +414,18 @@ def _fingerprint_matches(
         (owner, subject.algorithm, lo, hi),
     ).fetchall()
     found: list[DuplicateMatch] = []
+    prepared = prepare_fingerprint(subject.items)
     for uuid_id, algorithm, duration_s, blob in rows:
         if uuid_id in exclude:
             continue
-        hit = _compare_prints(subject, algorithm, duration_s, unpack_fingerprint(blob), params)
+        hit = _compare_prints(subject, prepared, algorithm, duration_s, unpack_fingerprint(blob), params)
         if hit is not None:
             found.append(DuplicateMatch(TrackRef(uuid_id), "fingerprint", hit[0], hit[1]))
     for staged in extra_subjects:
         other = staged.identity.fingerprint
         if not isinstance(other, FingerprintIdentity) or other.state != "current":
             continue
-        hit = _compare_prints(subject, other.algorithm, other.duration_s, other.items, params)
+        hit = _compare_prints(subject, prepared, other.algorithm, other.duration_s, other.items, params)
         if hit is not None:
             found.append(DuplicateMatch(staged.ref, "fingerprint", hit[0], hit[1]))
     return found

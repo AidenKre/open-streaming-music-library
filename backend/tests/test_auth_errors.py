@@ -6,6 +6,8 @@
 - The account result handed to routes carries no password hash.
 """
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 
@@ -18,7 +20,7 @@ PASSWORD = "a long enough password"
 def test_a_validation_failure_chains_no_exception_holding_the_body():
     raw = b'{"username": 5, "password": "' + PASSWORD.encode() + b'"}'
     with pytest.raises(HTTPException) as refused:
-        auth_router._credentials(raw)
+        asyncio.run(auth_router._credentials(raw))
 
     error = refused.value
     assert error.status_code == 422

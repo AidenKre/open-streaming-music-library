@@ -10,17 +10,25 @@ example the master-admin variables) goes into ``configure_app``; anything a
 started client needs before a test sends requests (for example logging in)
 goes into ``open_app_client``, so every client gets it.
 
-Test databases do not sync to disk (SF-BE-2): every ``sqlite3.connect`` made
-in the test process issues ``PRAGMA synchronous=OFF`` (``_connect_without_sync``
-below); a child process a test starts is not covered and keeps SQLite's
-default. That only decides whether a committed transaction survives an
-operating-system crash or power loss. Atomicity, isolation, locking, WAL
-behaviour and what other connections see are unchanged, and the product's own
-setting is untouched; the one product path that reads the setting,
-``Database.make_durable``, skips its full flush of the database file when it is
-off. A test about durability settings carries
-``@pytest.mark.real_sqlite_durability`` and gets the unwrapped
-``sqlite3.connect`` (``tests/test_sqlite_test_durability.py`` pins both sides).
+Test databases do not sync to disk: every ``sqlite3.connect`` made in the
+test process issues ``PRAGMA synchronous=OFF`` (``_connect_without_sync``
+below); a child process a test starts is not covered: it syncs as SQLite or,
+when it runs the product's code, the product sets it. That only decides
+whether a committed transaction survives an operating-system crash or power
+loss. Atomicity, isolation, locking, WAL behaviour and what other connections
+see are unchanged. The product sets ``synchronous=FULL`` itself on every
+connection it opens (``app.database.core.open_connection``; the durable
+point, the Last.fm purge and the table rebuild open through it too): its code
+runs unchanged, and ``_open_connection_without_sync`` below switches the
+connection it returns back to OFF. No product code reads the setting: with it
+off, SQLite's checkpoints and commits simply issue no sync. A test about
+durability settings carries ``@pytest.mark.real_sqlite_durability`` and gets
+the unwrapped ``sqlite3.connect`` and the product's own setting
+(``tests/test_sqlite_test_durability.py`` pins both sides).
+
+No product code opens a database file itself while a ``Database`` holds its
+connection to it (``_note_raw_database_open``, checked at every test's
+teardown; ``tests/test_database_files_only_through_sqlite.py`` pins it).
 
 No test reaches a host off this machine (9-R1-02: ``RealNetworkRefused``,
 checked at every test's teardown), and the suite's first ``app.config`` import
@@ -39,6 +47,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import weakref
 from collections.abc import Iterable, Mapping
 from types import ModuleType
 
@@ -46,13 +55,15 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-# SF-BE-2: installed before any ``app`` import, so a module that captures
-# ``sqlite3.connect`` at import time (``table_rebuild``'s default argument)
-# gets the wrapper too. Child processes a test starts are not affected.
+# Installed before any ``app`` import, so a module that captures
+# ``sqlite3.connect`` at import time gets the wrapper too (no product module
+# does today: every product connection goes through ``open_connection``, and
+# the schema check looks ``sqlite3.connect`` up at each call). Child processes
+# a test starts are not affected.
 _REAL_SQLITE_CONNECT = sqlite3.connect
 # Switched off for a test marked ``real_sqlite_durability``. A flag instead of
-# swapping the function, so a connect captured at import time (for example
-# ``table_rebuild.rebuild_tables``' default argument) honours the opt-out too.
+# swapping the function, so a connect captured at import time (by a test
+# module, for example) honours the opt-out too.
 _SYNC_OFF = {"enabled": True}
 
 
@@ -203,10 +214,100 @@ atexit.register(shutil.rmtree, _IMPORT_CWD, ignore_errors=True)
 with contextlib.chdir(_IMPORT_CWD):
     import app.config  # noqa: E402,F401
 
+import app.database.core as _database_core  # noqa: E402  (after the sqlite3 wrapper)
 import app.services as _services  # noqa: E402  (after the sqlite3 wrapper)
 from app.services import ffmpeg_runner as _ffmpeg_runner  # noqa: E402
 from app.services import transcoder as _transcoder  # noqa: E402
 from tests.database_fixtures import make_db  # noqa: E402
+
+# The product's one opener sets ``synchronous=FULL`` after the connect above
+# switched it off. Its connection goes back to OFF for an ordinary test, on the
+# same switch as the connect wrapper; the product looks the opener up in its
+# module at each call (``_connection``, the held connection, the Last.fm purge
+# and the table rebuild), so this wrapper is what it calls.
+_REAL_OPEN_CONNECTION = _database_core.open_connection
+
+
+@functools.wraps(_REAL_OPEN_CONNECTION)
+def _open_connection_without_sync(*args, **kwargs):
+    conn = _REAL_OPEN_CONNECTION(*args, **kwargs)
+    if _SYNC_OFF["enabled"]:
+        conn.execute("PRAGMA synchronous=OFF")
+    return conn
+
+
+_database_core.open_connection = _open_connection_without_sync
+
+# While a ``Database`` holds its idle connection (every started app does), no
+# code under ``backend/app`` may open that database file, its ``-wal`` or its
+# ``-shm`` itself: on a stock SQLite build, closing such a descriptor drops the
+# process's locks on the file. Python's ``open`` audit event reports every open
+# made from Python code (SQLite's own are made in C and raise none); the test
+# then fails at its end. A test's own tools may look: the nearest project frame
+# is under tests/. Seen: the file under its own name, through any spelling of
+# its folder. Not seen: a link with another name, or ``os.open`` with ``dir_fd``.
+_HOLDERS: dict = {}  # weak reference to a Database that has held -> its file's real path
+_RAW_DATABASE_OPENS: list[str] = []
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+_APP_DIR = os.path.join(os.path.dirname(_TESTS_DIR[:-1]), "app") + os.sep
+_REAL_HOLD_OPEN = _database_core.DatabaseCore.hold_open
+
+
+@functools.wraps(_REAL_HOLD_OPEN)
+def _hold_open_and_remember(self):
+    _REAL_HOLD_OPEN(self)
+    main = os.path.realpath(os.fsdecode(self.context.database_path))
+    _HOLDERS[weakref.ref(self, lambda gone: _HOLDERS.pop(gone, None))] = main
+
+
+_database_core.DatabaseCore.hold_open = _hold_open_and_remember
+
+
+def _note_raw_database_open(event, args):
+    if event != "open" or not _HOLDERS:
+        return
+    try:
+        path = args[0]
+        if not isinstance(path, (str, bytes, os.PathLike)):
+            return  # a descriptor number
+        path = os.fsdecode(path)
+        name = os.path.basename(path)
+        for holder, main in list(_HOLDERS.items()):
+            held = getattr(holder(), "_held", None)
+            if held is None or not held.alive:
+                continue
+            if name not in {os.path.basename(main) + s for s in ("", "-wal", "-shm")}:
+                continue
+            if os.path.realpath(path) != os.path.join(os.path.dirname(main), name):
+                continue
+            frame = sys._getframe(1)
+            while frame is not None and not frame.f_code.co_filename.startswith((_APP_DIR, _TESTS_DIR)):
+                frame = frame.f_back
+            if frame is not None and frame.f_code.co_filename.startswith(_APP_DIR):
+                _RAW_DATABASE_OPENS.append(os.path.join(os.path.dirname(main), name))
+    except Exception as error:  # a hook that raises would fail the open it was told of
+        _RAW_DATABASE_OPENS.append(f"(nothing known: the guard itself failed with {type(error).__name__})")
+
+
+sys.addaudithook(_note_raw_database_open)
+
+
+def check_no_raw_database_open() -> None:
+    """Fails the running test when product code opened a held database's file itself
+    (and empties the record)."""
+    opened = sorted(set(_RAW_DATABASE_OPENS))
+    del _RAW_DATABASE_OPENS[:]
+    if opened:
+        pytest.fail(
+            f"product code opened {', '.join(opened)} itself while a connection to that database was held",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_raw_open_of_a_held_database():
+    yield
+    check_no_raw_database_open()
 
 TEST_ADMIN_USERNAME = "admin"
 TEST_ADMIN_PASSWORD = "test-admin-password"

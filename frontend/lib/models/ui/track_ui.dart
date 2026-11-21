@@ -1,5 +1,4 @@
 import 'package:drift/drift.dart';
-import 'package:frontend/database/database.dart';
 import 'package:frontend/models/duration_text.dart';
 
 class TrackUI {
@@ -128,67 +127,6 @@ class TrackUI {
     this.damagedFilePath,
   });
 
-  static const Object _sentinel = Object();
-
-  TrackUI copyWith({
-    Object? filePath = _sentinel,
-    Object? revision = _sentinel,
-    Object? downloadedBitrateKbps = _sentinel,
-    Object? fileSizeBytes = _sentinel,
-    Object? downloadedQuality = _sentinel,
-    Object? downloadedAtRevision = _sentinel,
-    Object? downloadedCodec = _sentinel,
-    Object? staleDismissedAtRevision = _sentinel,
-    Object? damagedFilePath = _sentinel,
-  }) {
-    return TrackUI(
-      uuidId: uuidId,
-      filePath: filePath == _sentinel ? this.filePath : filePath as String?,
-      createdAt: createdAt,
-      lastUpdated: lastUpdated,
-      revision: revision == _sentinel ? this.revision : revision as int?,
-      title: title,
-      artist: artist,
-      album: album,
-      albumArtist: albumArtist,
-      artistId: artistId,
-      albumId: albumId,
-      year: year,
-      date: date,
-      genre: genre,
-      trackNumber: trackNumber,
-      discNumber: discNumber,
-      codec: codec,
-      duration: duration,
-      bitrateKbps: bitrateKbps,
-      sampleRateHz: sampleRateHz,
-      channels: channels,
-      hasAlbumArt: hasAlbumArt,
-      coverArtId: coverArtId,
-      downloadedBitrateKbps: downloadedBitrateKbps == _sentinel
-          ? this.downloadedBitrateKbps
-          : downloadedBitrateKbps as int?,
-      fileSizeBytes: fileSizeBytes == _sentinel
-          ? this.fileSizeBytes
-          : fileSizeBytes as int?,
-      downloadedQuality: downloadedQuality == _sentinel
-          ? this.downloadedQuality
-          : downloadedQuality as String?,
-      downloadedAtRevision: downloadedAtRevision == _sentinel
-          ? this.downloadedAtRevision
-          : downloadedAtRevision as int?,
-      downloadedCodec: downloadedCodec == _sentinel
-          ? this.downloadedCodec
-          : downloadedCodec as String?,
-      staleDismissedAtRevision: staleDismissedAtRevision == _sentinel
-          ? this.staleDismissedAtRevision
-          : staleDismissedAtRevision as int?,
-      damagedFilePath: damagedFilePath == _sentinel
-          ? this.damagedFilePath
-          : damagedFilePath as String?,
-    );
-  }
-
   /// `m:ss` (or longer), or '—' when the duration is unknown.
   String get formattedDuration {
     final duration = this.duration;
@@ -241,40 +179,5 @@ class TrackUI {
       throw StateError('track row without damaged_file_path');
     }
     return row.readNullable<String>('damaged_file_path');
-  }
-
-  factory TrackUI.fromDrift(Track track, TrackmetadataData meta) {
-    return TrackUI(
-      uuidId: track.uuidId,
-      filePath: track.filePath,
-      createdAt: track.createdAt,
-      lastUpdated: track.lastUpdated,
-      revision: track.revision,
-      title: meta.title,
-      artist: meta.artist,
-      album: meta.album,
-      albumArtist: meta.albumArtist,
-      artistId: meta.artistId,
-      albumId: meta.albumId,
-      year: meta.year,
-      date: meta.date,
-      genre: meta.genre,
-      trackNumber: meta.trackNumber,
-      discNumber: meta.discNumber,
-      codec: meta.codec,
-      duration: meta.duration,
-      bitrateKbps: meta.bitrateKbps,
-      sampleRateHz: meta.sampleRateHz,
-      channels: meta.channels,
-      hasAlbumArt: meta.hasAlbumArt,
-      coverArtId: meta.coverArtId,
-      downloadedBitrateKbps: track.downloadedBitrateKbps,
-      fileSizeBytes: track.fileSizeBytes,
-      downloadedQuality: track.downloadedQuality,
-      downloadedAtRevision: track.downloadedAtRevision,
-      downloadedCodec: track.downloadedCodec,
-      staleDismissedAtRevision: track.staleDismissedAtRevision,
-      damagedFilePath: track.damagedFilePath,
-    );
   }
 }

@@ -197,31 +197,20 @@ class BrowseRepository {
     });
   }
 
-  /// [tracks] with their local download state re-read from the DB, for lists
-  /// that are snapshots rather than live queries (search results). Order and
-  /// length are preserved; a row whose track has vanished is left as is.
+  /// [tracks] read again whole from the DB (one query, bounded by the list's
+  /// length), for lists that are snapshots rather than live queries (search
+  /// results), so download state and tags are current. Order and length are
+  /// kept; a row whose track has vanished is left as is. The name is kept for
+  /// the search controller.
   Future<List<TrackUI>> withFreshDownloadState(List<TrackUI> tracks) async {
     if (tracks.isEmpty) return tracks;
-    final states = await _db.getTrackDownloadStates(
-      tracks.map((t) => t.uuidId).toList(),
+    final fresh = await getTracksByUuids(
+      tracks.map((t) => t.uuidId).toList(growable: false),
     );
-    return tracks.map((t) {
-      final s = states[t.uuidId];
-      if (s == null) return t;
-      return t.copyWith(
-        filePath: s.filePath,
-        downloadedBitrateKbps: s.downloadedBitrateKbps,
-        fileSizeBytes: s.fileSizeBytes,
-        downloadedQuality: s.downloadedQuality,
-        // Staleness compares these against `revision`, so patch all four
-        // together or a re-download/dismiss would read inconsistently.
-        revision: s.revision,
-        downloadedAtRevision: s.downloadedAtRevision,
-        downloadedCodec: s.downloadedCodec,
-        staleDismissedAtRevision: s.staleDismissedAtRevision,
-        damagedFilePath: s.damagedFilePath,
-      );
-    }).toList(growable: false);
+    final byUuid = {for (final t in fresh) t.uuidId: t};
+    return tracks
+        .map((t) => byUuid[t.uuidId] ?? t)
+        .toList(growable: false);
   }
 
   // ── By-ID resolvers (SC-12) ─────────────────────────────────────────────

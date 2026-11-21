@@ -37,6 +37,11 @@ EditWriteMode _escalate(EditWriteMode a, EditWriteMode b) =>
         ? EditWriteMode.dbAndMaster
         : EditWriteMode.dbOnly;
 
+/// The reason a rejected edit shows when the server refused its body as too
+/// large (413).
+const editTooLargeRejectionReason =
+    'The server did not accept this edit. It was too large.';
+
 /// What a Get info save needs before it may be submitted.
 enum EditSavePlan { noChanges, confirmMasterWrite, ready }
 
@@ -380,6 +385,15 @@ class EditOutbox implements LossReporter {
             await _markRejected(row.uuidId, _rejectionReasonFrom(e));
           });
           ref.invalidate(appInfoProvider);
+        case 413:
+          // The body is over a size cap (the server's, or one in front of
+          // it): sending the same edit again would be refused again.
+          // Rejected like a 422, so it is not sent again and later edits of
+          // the track do not merge into it.
+          await binding.runFenced(bindingToken, () async {
+            await _revertToSnapshot(row);
+            await _markRejected(row.uuidId, editTooLargeRejectionReason);
+          });
         default:
           rethrow; // 5xx etc. — retry later
       }

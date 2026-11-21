@@ -4,14 +4,16 @@
 //    from "not offered"; a cached block or offline never enables it.
 //  * Spec §6 para 3: a selected-items panel with explicit Clear; "Leaving
 //    Manage library clears an unsubmitted selection"; rows show title /
-//    artist / album and UUID disambiguation if needed (a selected track
-//    that sync has since removed still counts and can be removed).
+//    artist / album (no ID: the owner's rule replaces "UUID disambiguation if
+//    needed"); a selected track that sync has since removed still counts
+//    and can be removed.
 //  * Spec §4 para 4 / §6 para 4: the job view shows partial success and
 //    each reason; "deleted; storage cleanup pending"; receipts are
 //    recoverable through `GET /tracks/deletions` (keyset) and hydrate
 //    titles for still-resolvable UUIDs.
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:frontend/api/api_client.dart';
@@ -21,7 +23,9 @@ import 'package:frontend/models/feature_blocks.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/repositories/browse_repository.dart';
 import 'package:frontend/services/deletion/delete_job.dart';
+import 'package:frontend/services/deletion/delete_jobs_manager.dart';
 import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
 import 'package:frontend/services/deletion/deletion_text.dart';
 import 'package:frontend/services/deletion/server_delete_availability.dart';
@@ -38,6 +42,30 @@ const _on = AdvertisedFeature(
   fromCache: false,
 );
 
+/// Only the manager's job map, set by the test.
+class _JobsOnly implements DeleteJobsManager {
+  final map = ValueNotifier<Map<String, DeleteJob>>(const {});
+
+  @override
+  ValueListenable<Map<String, DeleteJob>> get jobs => map;
+
+  void publish(DeleteJob job) =>
+      map.value = {...map.value, job.operationUuid: job};
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// A local library whose reads fail.
+class _FailingBrowse implements BrowseRepository {
+  @override
+  Future<List<TrackUI>> getTracksByUuids(List<String> uuids) async =>
+      throw StateError('hydrate boom');
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 void main() {
   late DeleteJobsHarness h;
   late ProviderContainer c;
@@ -47,12 +75,15 @@ void main() {
   Future<void> build({
     Future<AdvertisedFeature<LibraryToolsFeature>?> Function()? feature,
     bool isOffline = false,
+    DeleteJobsManager? manager,
+    BrowseRepository? browse,
   }) async {
     offline = TestOffline(isOffline);
     c = ProviderContainer(
       overrides: [
         databaseProvider.overrideWithValue(h.db),
-        deleteJobsManagerProvider.overrideWithValue(h.manager),
+        deleteJobsManagerProvider.overrideWithValue(manager ?? h.manager),
+        if (browse != null) browseRepositoryProvider.overrideWithValue(browse),
         libraryToolsApiProvider.overrideWithValue(h.api),
         trackSyncProvider.overrideWith(StubTrackSync.new),
         offlineModeProvider.overrideWith(() => offline),
@@ -196,19 +227,21 @@ void main() {
       expect(m.selectedItems.every((i) => i.inLocalLibrary), isTrue);
     });
 
-    test('two tracks that would read the same get distinct id hints; '
-        'others none', () async {
+    // No ID tells them apart (the page test shows none is shown);
+    // each is its own item, by its own uuid.
+    test('two tracks that would read the same are two items, each by its '
+        'own uuid', () async {
       await build();
       await select([
         await local('twin-aaaa1111'),
         await local('twin-bbbb2222'),
         await local('s1'),
       ]);
-      final hints = [for (final i in m.selectedItems) i.idHint];
-      expect(hints[0], isNotNull);
-      expect(hints[1], isNotNull);
-      expect(hints[0], isNot(hints[1]));
-      expect(hints[2], isNull);
+      expect(m.selectedItems.map((i) => (i.uuid, i.title, i.artist, i.album)), [
+        ('twin-aaaa1111', 'Same Name', 'Artist', 'Album'),
+        ('twin-bbbb2222', 'Same Name', 'Artist', 'Album'),
+        ('s1', 'First Song', 'Artist', 'Album'),
+      ]);
     });
 
     test('a selected track no longer in the local library still counts, '
@@ -333,6 +366,146 @@ void main() {
       await submitted(['s1']);
       expect(m.jobs.single.phase, DeleteJobPhase.unconfirmed);
       expect(m.jobs.single.phaseText, jobPhaseText(DeleteJobPhase.unconfirmed));
+    });
+
+    // One total order, whatever order the jobs became known in.
+    // Jobs still being sent or not yet confirmed come first; the others
+    // follow newest first, by the server's date, else by when this device
+    // submitted them.
+    group('order', () {
+      DeleteJob job(
+        String op,
+        int? createdAt, {
+        DeleteJobPhase phase = DeleteJobPhase.accepted,
+        int? submittedAtMs,
+      }) => DeleteJob(
+        operationUuid: op,
+        phase: phase,
+        targets: const [],
+        createdAt: createdAt,
+        submittedAtMs: submittedAtMs,
+      );
+      final a = job('A', 200),
+          b = job('B', null, phase: DeleteJobPhase.submitting),
+          cc = job('C', 100);
+      const insertions = [
+        ['A', 'B', 'C'],
+        ['A', 'C', 'B'],
+        ['B', 'A', 'C'],
+        ['B', 'C', 'A'],
+        ['C', 'A', 'B'],
+        ['C', 'B', 'A'],
+      ];
+      for (final order in insertions) {
+        test('undated first, then newest first: published ${order.join()}',
+            () async {
+          final jobs = _JobsOnly();
+          await build(manager: jobs);
+          for (final op in order) {
+            jobs.publish({'A': a, 'B': b, 'C': cc}[op]!);
+            await h.pump();
+          }
+          expect(m.jobs.map((j) => j.operationUuid), ['B', 'A', 'C']);
+        });
+      }
+
+      test('same date: the one that became known later comes first',
+          () async {
+        final jobs = _JobsOnly();
+        await build(manager: jobs);
+        for (final j in [
+          job('X', 100),
+          job('Y', 100),
+          job('U', null, phase: DeleteJobPhase.submitting),
+          job('V', null, phase: DeleteJobPhase.unconfirmed),
+        ]) {
+          jobs.publish(j);
+          await h.pump();
+        }
+        expect(m.jobs.map((j) => j.operationUuid), ['V', 'U', 'Y', 'X']);
+      });
+
+      test('a refused job stays below a later dated job', () async {
+        final jobs = _JobsOnly();
+        await build(manager: jobs);
+        jobs.publish(job('R', null,
+            phase: DeleteJobPhase.rejected, submittedAtMs: 150000));
+        await h.pump();
+        jobs.publish(job('A', 200));
+        await h.pump();
+        jobs.publish(job('C', 100));
+        await h.pump();
+        expect(m.jobs.map((j) => j.operationUuid), ['A', 'R', 'C']);
+      });
+
+      // A refused job and an accepted job whose receipt could not be read:
+      // neither has a server date.
+      final undated = {
+        'R': job('R', null,
+            phase: DeleteJobPhase.rejected, submittedAtMs: 250000),
+        'Q': job('Q', null, submittedAtMs: 150000),
+        'A': job('A', 200),
+      };
+      for (final order in const [
+        ['R', 'Q', 'A'],
+        ['A', 'Q', 'R'],
+        ['Q', 'A', 'R'],
+      ]) {
+        test('a job the server has not dated takes its place by when this '
+            'device submitted it: published ${order.join()}', () async {
+          final jobs = _JobsOnly();
+          await build(manager: jobs);
+          for (final op in order) {
+            jobs.publish(undated[op]!);
+            await h.pump();
+          }
+          expect(m.jobs.map((j) => j.operationUuid), ['R', 'A', 'Q']);
+        });
+      }
+
+      test('a job with neither date comes last', () async {
+        final jobs = _JobsOnly();
+        await build(manager: jobs);
+        jobs.publish(job('N', null, phase: DeleteJobPhase.rejected));
+        await h.pump();
+        jobs.publish(job('C', 100));
+        await h.pump();
+        expect(m.jobs.map((j) => j.operationUuid), ['C', 'N']);
+      });
+    });
+
+    // A failed local-library read logs the error itself, with
+    // its type.
+    group('a failed local-library read', () {
+      late List<String> printed;
+
+      void capture() {
+        printed = [];
+        final original = debugPrint;
+        debugPrint = (String? message, {int? wrapWidth}) =>
+            printed.add('$message');
+        addTearDown(() => debugPrint = original);
+      }
+
+      test('for a job change logs the error', () async {
+        capture();
+        final jobs = _JobsOnly();
+        await build(manager: jobs, browse: _FailingBrowse());
+        jobs.publish(const DeleteJob(
+          operationUuid: 'op1',
+          phase: DeleteJobPhase.accepted,
+          targets: [DeletionTargetDto(uuidId: 's1', baseRevision: 4)],
+        ));
+        await h.pump();
+        expect(printed, [allOf(contains('StateError'), contains('hydrate boom'))]);
+      });
+
+      test('for a selection change logs the error', () async {
+        capture();
+        await build(browse: _FailingBrowse());
+        await select([ghost('s1')]);
+        expect(printed, [allOf(contains('StateError'), contains('hydrate boom'))]);
+      });
     });
   });
 

@@ -182,7 +182,7 @@ class TestDatabaseInitialize:
         # Phase M: a failed initialization is fatal; it never returns False.
         database_path = tmp_path / "database.db"
 
-        with patch("app.database.database.sqlite3") as sqlite:
+        with patch("app.database.core.sqlite3") as sqlite:
             sqlite.connect.side_effect = Exception("Database error!")
 
             database = set_up_database(database_path=database_path)

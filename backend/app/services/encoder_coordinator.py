@@ -75,6 +75,13 @@ class SourceUnavailable(Exception):
     """
 
 
+def _refuse_a_linked_master(uuid_id: str, source: Path) -> None:
+    """A master that is itself a symbolic link is never served (imports refuse
+    links); only the last component: a linked library folder works. One lstat."""
+    if source.is_symlink():
+        raise SourceUnavailable(uuid_id)
+
+
 @dataclass(frozen=True)
 class EncodeResult:
     """Outcome of encode_for_stream.
@@ -366,8 +373,8 @@ class EncoderCoordinator:
     ) -> Optional[EncodeResult]:
         """Return an EncodeResult for streaming, transcoding if needed.
 
-        Raises :class:`SourceUnavailable` when the source file can't be found or
-        no longer exists; returns ``None`` only when transcoding fails.
+        Raises :class:`SourceUnavailable` when the source file can't be found,
+        is a symbolic link or no longer exists; returns ``None`` only when transcoding fails.
 
         ``source_bitrate_kbps`` is an optional hint used to skip transcoding
         when the source is already at or below the requested bitrate. Callers
@@ -387,7 +394,10 @@ class EncoderCoordinator:
         """
         if quality == ORIGINAL_QUALITY:
             source = source_path or self.source_lookup(uuid_id)
-            if source is None or not source.exists():
+            if source is None:
+                raise SourceUnavailable(uuid_id)
+            _refuse_a_linked_master(uuid_id, source)
+            if not source.exists():
                 raise SourceUnavailable(uuid_id)
             return EncodeResult(
                 path=source,
@@ -399,6 +409,11 @@ class EncoderCoordinator:
         if bitrate is None:
             return None
 
+        # A caller that serves (it passes the master's path) is refused a link
+        # master before any cached encode of it; the prefetch and warm-up pass
+        # none and serve nothing, so a cache hit reads no row for them.
+        if source_path is not None:
+            _refuse_a_linked_master(uuid_id, source_path)
         cached = self._lookup_cached(uuid_id, quality)
         if cached is not None:
             return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
@@ -412,6 +427,8 @@ class EncoderCoordinator:
         # by (track count × quality count), so the map can't grow without
         # bound; each entry is a small `threading.Lock`.
         with lock:
+            if source_path is not None:
+                _refuse_a_linked_master(uuid_id, source_path)
             cached = self._lookup_cached(uuid_id, quality)
             if cached is not None:
                 return EncodeResult(path=cached, bitrate_kbps=bitrate, transcoded=True)
@@ -426,7 +443,10 @@ class EncoderCoordinator:
                 # the master and evicts this uuid mid-encode invalidates it.
                 expected = target_cache.generation(uuid_id)
             source = source_path or self.source_lookup(uuid_id)
-            if source is None or not source.exists():
+            if source is None:
+                raise SourceUnavailable(uuid_id)
+            _refuse_a_linked_master(uuid_id, source)
+            if not source.exists():
                 raise SourceUnavailable(uuid_id)
 
             # Resolve source bitrate: use caller-supplied hint if available,

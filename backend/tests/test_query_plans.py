@@ -2,6 +2,14 @@
 
 Production opens connections without ``ANALYZE`` data, so the planner's choice
 here is the one a real server makes.
+
+The expected plan lines are SQLite's own wording; they pass with SQLite 3.51.0
+(Python 3.12.9's ``sqlite3.sqlite_version`` on the machine they were last
+checked on). Another SQLite version may word the same plan differently (``SCAN TABLE``
+instead of ``SCAN`` before 3.36, for example). When a test here fails on another
+version, take the statement's ``EXPLAIN QUERY PLAN`` there, check that it still
+reads through the same index with no full scan and no sort the test forbids, and
+only then change the expected text.
 """
 
 import re
@@ -51,7 +59,7 @@ def _vm_steps_of_get_changes(db, owner_id, after_revision):
         conn.set_progress_handler(tick, 10)
         return conn
 
-    with patch("app.database.database.sqlite3.connect", side_effect=counting_connect):
+    with patch("app.database.core.sqlite3.connect", side_effect=counting_connect):
         changes, latest, _ = db.get_changes(after_revision=after_revision, limit=100,
                                             owner_id=owner_id)
     return steps[0], changes, latest
@@ -121,7 +129,7 @@ def _traced(db):
         conn.set_trace_callback(statements.append)
         return conn
 
-    return statements, patch("app.database.database.sqlite3.connect", side_effect=tracing_connect)
+    return statements, patch("app.database.core.sqlite3.connect", side_effect=tracing_connect)
 
 
 def _seed_archive(db, owner_id, batch, parent, *, children=()):
@@ -268,7 +276,7 @@ def _vm_steps(db, call):
         conn.set_progress_handler(tick, 10)
         return conn
 
-    with patch("app.database.database.sqlite3.connect", side_effect=counting_connect):
+    with patch("app.database.core.sqlite3.connect", side_effect=counting_connect):
         answer = call()
     return steps[0], answer
 

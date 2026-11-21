@@ -15,6 +15,7 @@ from app.services.duplicate_detection import (
     band_for,
     coarse_diversity,
     compare_fingerprints,
+    prepare_fingerprint,
 )
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -515,3 +516,46 @@ def test_a_tie_still_goes_to_the_smallest_offset():
 
     assert result.ber == 0.0
     assert result.offset == 0
+
+
+# --- a subject prepared once per lookup ------------------------------------------
+# The finder prepares its subject once (items, packed bytes, diversity) and compares
+# it with every candidate. The prepared call must give exactly the plain call's
+# result, in both argument orders. The pairs are this file's fixtures. The plain
+# call prepares ``a`` itself, so this guards only against the two paths drifting
+# apart; that the results equal today's is pinned by the hand-computed values above.
+
+PAIRS = {
+    "identical": lambda: (rand_items(10, N), rand_items(10, N), BASE, None, None),
+    "shift inside the window": lambda: (*shifted(rand_items(11, N), 23, seed=12), BASE, None, None),
+    "shift beyond the window": lambda: (*shifted(rand_items(13, N), -25, seed=14), BASE, None, None),
+    "flipped bits": lambda: (rand_items(15, N), flip_bits(rand_items(15, N), 100, seed=16), BASE, None, None),
+    "unrelated": lambda: (rand_items(20, N), rand_items(21, N), BASE, None, None),
+    "minimum overlap": lambda: (rand_items(22, 130), rand_items(23, 10) + rand_items(22, 130)[:120],
+                                BASE, None, None),
+    "not comparable": lambda: (rand_items(24, 100), rand_items(24, 100), BASE, None, None),
+    "empty": lambda: ([], rand_items(25, N), BASE, None, None),
+    "low diversity": lambda: (low_diversity(400, 30, seed=30),
+                              flip_bits(low_diversity(400, 30, seed=30), 400, seed=31, low_only=True),
+                              BASE, None, None),
+    "one side less diverse": lambda: (low_diversity(400, 30, seed=32),
+                                      low_diversity(400, 30, seed=32)[:200] + rand_items(33, 200),
+                                      BASE, None, None),
+    "band edge": lambda: (rand_items(40, 128), flip_bits(rand_items(40, 128), 512, seed=41), EDGES, None, None),
+    "lead-in found by the lengths": lambda: (*shifted(rand_items(50, N), 40, seed=51), BASE,
+                                             200.0, 200.0 + seconds(40)),
+    "unknown duration": lambda: (*shifted(rand_items(57, N), 30, seed=58), BASE, float("nan"), 203.7),
+    "tie on a repeating print": lambda: (rand_items(72, 30) * 30, rand_items(72, 30) * 31,
+                                         replace(BASE, min_overlap=100), 100.0, 100.0 + seconds(30)),
+}
+
+
+@pytest.mark.parametrize("pair", PAIRS)
+def test_a_prepared_subject_compares_exactly_as_the_plain_print(pair):
+    a, b, params, da, db = PAIRS[pair]()
+
+    ab = compare_fingerprints(a, b, params, duration_a_s=da, duration_b_s=db)
+    ba = compare_fingerprints(b, a, params, duration_a_s=db, duration_b_s=da)
+
+    assert compare_fingerprints(prepare_fingerprint(a), b, params, duration_a_s=da, duration_b_s=db) == ab
+    assert compare_fingerprints(prepare_fingerprint(b), a, params, duration_a_s=db, duration_b_s=da) == ba

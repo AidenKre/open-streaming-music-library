@@ -8,16 +8,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:frontend/api/gated_send.dart';
 import 'package:frontend/api/uploads_api.dart';
 import 'package:frontend/services/uploads/upload_item_rules.dart'
-    show isServerRefusedReview, needsUserAttention, offersReview;
+    show
+        ServerItemState,
+        archiveChildValidStates,
+        isServerRefusedReview,
+        needsUserAttention,
+        offersReview;
 import 'package:frontend/services/uploads/upload_status_text.dart';
-
-const _validStates = {
-  'review_ready',
-  'committing',
-  'imported',
-  'duplicate',
-  'duplicate_conflict',
-};
 
 /// One file inside the archive.
 class UploadChildRow {
@@ -123,11 +120,12 @@ class UploadZipChildren {
         );
         if (isServerRefusedReview(state, code)) {
           failed++;
-        } else if (_validStates.contains(state)) {
+        } else if (archiveChildValidStates.contains(state)) {
           valid++;
-        } else if (state == 'failed') {
+        } else if (state == ServerItemState.failed) {
           failed++;
-        } else if (state == 'cancelled' || state == 'expired') {
+        } else if (state == ServerItemState.cancelled ||
+            state == ServerItemState.expired) {
           cancelled++;
         } else {
           checking++;

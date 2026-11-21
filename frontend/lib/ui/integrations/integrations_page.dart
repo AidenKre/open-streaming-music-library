@@ -108,9 +108,11 @@ class _IntegrationsPageState extends ConsumerState<IntegrationsPage> {
     final name = status.accountName;
     final state = status.state;
 
+    final startsAgain = !offer.showReconnect &&
+        state == LastfmAccountState.awaitingAuthorization;
     String connectLabel() => offer.showReconnect
         ? 'Reconnect'
-        : state == LastfmAccountState.awaitingAuthorization
+        : startsAgain
         ? 'Start again'
         : 'Connect Last.fm';
 
@@ -147,7 +149,10 @@ class _IntegrationsPageState extends ConsumerState<IntegrationsPage> {
       if (offer.canFinish)
         _note(
           'Approve the access on last.fm, then come back and tap Finish '
-          'connecting.',
+          'connecting.'
+          // Only while the Start again button is shown: it is the way out
+          // when the approval page is no longer open.
+          '${offer.canConnect && startsAgain ? ' If that page is no longer open, tap Start again.' : ''}',
         ),
       if (status.isConnected) ...[
         Wrap(

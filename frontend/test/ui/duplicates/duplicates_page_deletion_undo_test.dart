@@ -4,7 +4,8 @@
 //    offers "Delete this copy".
 //  * #5: Undo is offered only when the row was actually set aside.
 //  * #6: the Undo snackbar belongs to the page: it does not outlive it.
-//  * #9: each copy shows its short id (as the confirmation names it).
+//  * #9: each copy showed its short id; no track ID is shown any more
+//    (owner, 2026-11-17).
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -90,10 +91,14 @@ void main() {
     await teardownTree(tester);
   });
 
-  testWidgets('#9 each copy shows its short id', (tester) async {
+  // The owner, 2026-11-17: "We should never reveal track ids to users."
+  // Two copies that read the same show no ID.
+  testWidgets('#9 no copy shows an ID', (tester) async {
     await open(tester);
-    expect(inRow(find.text('ID 01234567')), findsOne);
-    expect(inRow(find.text('ID fedcba98')), findsOne);
+    expect(inRow(find.text('Song')), findsNWidgets(2));
+    expect(inRow(find.textContaining('ID ')), findsNothing);
+    expect(inRow(find.textContaining('01234567')), findsNothing);
+    expect(inRow(find.textContaining('fedcba98')), findsNothing);
     await teardownTree(tester);
   });
 }

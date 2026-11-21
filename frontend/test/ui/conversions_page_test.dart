@@ -230,6 +230,16 @@ void main() {
     expect(find.text('Convert to FLAC'), findsNothing);
   });
 
+  // A cancelled job does not read as if it will run.
+  testPage('a cancelled job reads "Cancelled", never "Convert to …"',
+      (tester) async {
+    await _insertTrack(db, 'abc', title: 'Cancelled song');
+    await tester.pumpWidget(wrap([_job(uuidId: 'abc', status: 'cancelled')]));
+    await tester.pumpAndSettle();
+    expect(find.text('Cancelled'), findsOneWidget);
+    expect(find.textContaining('Convert to'), findsNothing);
+  });
+
   testPage('a track not on this device reads "Unknown track", never its ID',
       (tester) async {
     const id = '3f2c9a00-0000-4000-8000-000000000001';

@@ -1,16 +1,26 @@
 // Phase 8 spec §3, §4 para 3, §6 (8B.1c, S7): the Manage library page renders
 // what ManageLibraryControls says and forwards every input to it (SC-26).
 import 'package:drift/native.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:frontend/api/library_tools_api.dart';
 import 'package:frontend/database/database.dart';
+import 'package:frontend/models/dto/library_tools_dtos.dart';
+import 'package:frontend/models/feature_blocks.dart';
+import 'package:frontend/models/server_blocked_reason.dart';
+import 'package:frontend/services/deletion/delete_job.dart';
 import 'package:frontend/services/deletion/delete_jobs_manager.dart';
+import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
+import 'package:frontend/services/feature_providers.dart';
+import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/services/deletion/deletion_text.dart';
 import 'package:frontend/services/deletion/server_delete_availability.dart';
 import 'package:frontend/ui/manage_library/deletion_review_controller.dart';
 import 'package:frontend/ui/manage_library/deletion_review_sheet.dart';
 import 'package:frontend/ui/manage_library/manage_library_controller.dart';
 import 'package:frontend/ui/manage_library/manage_library_page.dart';
+import 'package:frontend/ui/tracks_page.dart';
 
 import '../browse_harness.dart';
 import 'fake_manage_library_controls.dart';
@@ -94,7 +104,6 @@ void main() {
       artist: 'Alpha Artist',
       album: 'Alpha Album',
       inLocalLibrary: true,
-      idHint: 'ab12',
     ),
   ];
 
@@ -218,7 +227,7 @@ void main() {
       await teardownTree(tester);
     });
 
-    testWidgets('shows the count, each item, unknowns and the id hint', (
+    testWidgets('shows the count, each item and unknowns, and no ID', (
       tester,
     ) async {
       fake.select(items);
@@ -239,8 +248,8 @@ void main() {
         findsWidgets,
       );
       expect(
-        find.descendant(of: panel, matching: find.textContaining('ab12')),
-        findsOne,
+        find.descendant(of: panel, matching: find.textContaining('ID ')),
+        findsNothing,
       );
       await teardownTree(tester);
     });
@@ -345,4 +354,142 @@ void main() {
     expect(h.audio.intents, isEmpty);
     await teardownTree(tester);
   });
+
+  // The owner, 2026-11-17: "We should never reveal track ids to users."
+  // The real controller and the real page, with two tracks that read the
+  // same.
+  group('no track ID is shown', () {
+    const twinA = 'aaaa1111-0000-4000-8000-000000000001';
+    const twinB = 'bbbb2222-0000-4000-8000-000000000002';
+
+    Future<_JobsOnly> pumpReal(WidgetTester tester) async {
+      await seedLibrary(db, const [
+        SeedTrack(
+          uuid: twinA,
+          title: 'Same',
+          artistId: 1,
+          artist: 'Artist',
+          albumId: 10,
+          album: 'Record',
+        ),
+        SeedTrack(
+          uuid: twinB,
+          title: 'Same',
+          artistId: 1,
+          artist: 'Artist',
+          albumId: 10,
+          album: 'Record',
+          trackNumber: 2,
+        ),
+      ]);
+      final jobs = _JobsOnly();
+      tester.view.physicalSize = const Size(800, 1400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        h.wrap(
+          const ManageLibraryPage(),
+          overrides: [
+            deleteJobsManagerProvider.overrideWithValue(jobs),
+            libraryToolsApiProvider.overrideWithValue(_NoReceipts()),
+            libraryToolsServerBlockedProvider.overrideWithValue(
+              ServerBlockedReason.none,
+            ),
+            libraryToolsFeatureProvider.overrideWith(
+              (ref) async => const AdvertisedFeature(
+                LibraryToolsFeature(
+                  version: 1,
+                  serverDelete: true,
+                  duplicateReview: false,
+                ),
+                fromCache: false,
+              ),
+            ),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      return jobs;
+    }
+
+    testWidgets('the track picker and the selected panel', (tester) async {
+      await pumpReal(tester);
+      final picked = find.descendant(
+        of: find.byType(TracksPage),
+        matching: find.text('Same'),
+      );
+      expect(picked, findsNWidgets(2));
+      await tester.tap(picked.first);
+      await tester.pumpAndSettle();
+      await tester.tap(picked.last);
+      await tester.pumpAndSettle();
+      expect(find.byKey(_panel), findsOne);
+      expect(find.text('2 selected'), findsOne);
+      expect(
+        find.descendant(of: find.byKey(_panel), matching: find.text('Same')),
+        findsNWidgets(2),
+      );
+      expect(find.textContaining('ID '), findsNothing);
+      expect(find.textContaining('aaaa1111'), findsNothing);
+      expect(find.textContaining('bbbb2222'), findsNothing);
+      await teardownTree(tester);
+    });
+
+    testWidgets('Deletion history job targets', (tester) async {
+      final jobs = await pumpReal(tester);
+      jobs.publish(const DeleteJob(
+        operationUuid: 'op1',
+        phase: DeleteJobPhase.accepted,
+        targets: [
+          DeletionTargetDto(uuidId: twinA, baseRevision: 1),
+          DeletionTargetDto(uuidId: twinB, baseRevision: 1),
+        ],
+      ));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Deletion history'));
+      await tester.pumpAndSettle();
+      Finder target(String uuid) => find.byKey(Key('job-target-op1-$uuid'));
+      for (final u in [twinA, twinB]) {
+        expect(
+          find.descendant(of: target(u), matching: find.text('Same')),
+          findsOne,
+        );
+        expect(
+          find.descendant(of: target(u), matching: find.textContaining('ID ')),
+          findsNothing,
+        );
+      }
+      expect(find.textContaining('aaaa1111'), findsNothing);
+      expect(find.textContaining('bbbb2222'), findsNothing);
+      await teardownTree(tester);
+    });
+  });
+}
+
+/// Only the delete-jobs model's job map, set by the test.
+class _JobsOnly implements DeleteJobsManager {
+  final map = ValueNotifier<Map<String, DeleteJob>>(const {});
+
+  @override
+  ValueListenable<Map<String, DeleteJob>> get jobs => map;
+
+  void publish(DeleteJob job) =>
+      map.value = {...map.value, job.operationUuid: job};
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// A receipts list that is empty.
+class _NoReceipts implements LibraryToolsApi {
+  @override
+  Future<DeletionJobPageDto> listJobs({
+    String? after,
+    int? limit,
+    Future<void>? abortTrigger,
+    bool waitForBinding = true,
+  }) async => const DeletionJobPageDto(jobs: [], nextAfter: null);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }

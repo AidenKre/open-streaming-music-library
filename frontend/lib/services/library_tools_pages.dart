@@ -39,6 +39,13 @@ LibraryToolsUnreachable libraryToolsUnreachable({
   };
 }
 
+/// Reading again can help only while the session's server is not blocked: a
+/// different server or a sign-out is cleared by the banner's Reset,
+/// Disconnect or Log in, never by a Retry. A refused read alone keeps its
+/// Retry (the session may not have caught up yet).
+bool libraryToolsRetryHelps(ServerBlockedReason blocked) =>
+    blocked == ServerBlockedReason.none;
+
 /// What Possible duplicates says for [reason].
 String duplicatesUnreachableText(LibraryToolsUnreachable reason) =>
     switch (reason) {

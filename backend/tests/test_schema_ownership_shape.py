@@ -20,7 +20,9 @@ OWNED_TABLES = (
     "conversion_jobs", "edit_journal", "track_duplicate_candidates",
 )
 USER_ID_TABLES = ("user_settings", "auth_sessions", "user_delete_art_capture")
-AUTOINCREMENT_TABLES = ("users", "artists", "albums", "tracks", "cover_arts", "conversion_jobs")
+AUTOINCREMENT_TABLES = (
+    "users", "artists", "albums", "tracks", "cover_arts", "conversion_jobs", "edit_journal",
+)
 
 # (table, indexed columns in order) that the spec requires.
 REQUIRED_INDEXES = {

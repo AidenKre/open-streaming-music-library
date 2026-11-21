@@ -10,6 +10,20 @@ DELETE_ROUTES = ["/tracks/deletions/preview", "/tracks/deletions"]
 # The auth middleware's own session lookup is the only database access the
 # request may make before the switch answers.
 AUTH_LOOKUP = {"get_live_session"}
+# A valid body naming one track, per route: with the switch on, both routes
+# read the catalog for it, so the spy sees access past the auth lookup.
+# (The library resolution's own ``get_user`` read used to be
+# that sign; the folder now comes with the session lookup and resolving the
+# library reads nothing, so the body must make the route itself read.)
+_TARGETS = [{"uuid_id": "6b1f6b39-5d0d-4a4a-9d3c-0d6c5d6f0001", "base_revision": 0}]
+ONE_TARGET = {
+    "/tracks/deletions/preview": {"targets": _TARGETS},
+    "/tracks/deletions": {
+        "operation_uuid": "0e6f3c1a-8f2b-4c1d-9a7e-2b5d4c3a1f00",
+        "targets": _TARGETS,
+        "confirmed_count": 1,
+    },
+}
 
 
 class SpyDatabase:
@@ -54,7 +68,7 @@ def _assert_disabled(response):
 def test_switch_off_answers_403_before_any_database_access(app_client, spy_database, path):
     spy = spy_database(app_client)
 
-    response = app_client.post(path, json={"targets": []})
+    response = app_client.post(path, json=ONE_TARGET[path])
 
     _assert_disabled(response)
     assert set(spy.touched) <= AUTH_LOOKUP, spy.touched
@@ -81,9 +95,9 @@ def test_authentication_still_comes_first(app_client, path):
 def test_switch_on_passes_the_switch_and_reaches_the_route(open_app_client, spy_database, path):
     with open_app_client(env={"LIBRARY_DELETE_ENABLED": "true"}) as client:
         spy = spy_database(client)
-        response = client.post(path, json={"targets": []})
+        response = client.post(path, json=ONE_TARGET[path])
 
     assert response.status_code != 403, response.text
-    # The route resolves the caller's library: the spy sees access past the
-    # auth lookup, so the 403 test above would see it too.
-    assert "get_user" in spy.touched
+    # The route reads the catalog for the target: the spy sees access past
+    # the auth lookup, so the 403 test above, with the same body, would see it too.
+    assert set(spy.touched) - AUTH_LOOKUP, spy.touched

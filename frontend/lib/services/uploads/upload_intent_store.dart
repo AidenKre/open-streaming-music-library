@@ -263,11 +263,9 @@ class UploadIntentStore {
   ) async {
     for (final item in items) {
       final ended = endedStates.contains(item.rawState);
-      final waitsForBytes = const {
-        'allocated',
-        'receiving',
-        'transferring',
-      }.contains(item.rawState);
+      final waitsForBytes = awaitingOrReceivingBytesStates.contains(
+        item.rawState,
+      );
       final from = {
         if (ended) ...reviewableStates,
         if (ended) ServerItemState.expanded,
@@ -346,6 +344,18 @@ class UploadIntentStore {
   Future<List<UploadIntentRecord>> forBinding(String bindingToken) async => [
     for (final r in await _query(bindingToken).get()) UploadIntentRecord._fromRow(r),
   ];
+
+  /// The row of [itemUuid] in this binding, or null: one primary-key read.
+  Future<UploadIntentRecord?> find(String bindingToken, String itemUuid) async {
+    final query = _db.select(_db.uploadIntents)
+      ..where(
+        (t) =>
+            t.itemUuid.equals(itemUuid) &
+            t.localBindingId.equals(bindingToken),
+      );
+    final row = await query.getSingleOrNull();
+    return row == null ? null : UploadIntentRecord._fromRow(row);
+  }
 
   /// Every row of every binding, for counting what a log-out kept. Read-only.
   Future<List<UploadIntentRecord>> all() async => [

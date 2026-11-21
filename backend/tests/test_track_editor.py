@@ -131,15 +131,11 @@ class TestTrackEditorMaster:
         assert metadata_mod.get_track_metadata(new_path).artist == "New"
         assert db.list_journal_entries() == []  # journal cleared
 
-    def test_relocation_leaves_orphaned_empty_source_directory(self, tmp_path):
-        # When a track is the LAST one under its artist and gets renamed to a
-        # different artist, `_relocate` (track_editor.py) moves the file into
-        # the new artist's directory and unlinks the old file — but it never
-        # looks at whether that removal just emptied "Old"'s directory.
-        # `move_file`/`organizer.py` only ever creates destination
-        # directories; nothing in this codebase ever prunes a source
-        # directory. The empty "Old" folder is left behind on disk forever —
-        # no sync, no restart, nothing currently cleans it up.
+    def test_relocation_prunes_the_emptied_source_directory(self, tmp_path):
+        # The track is the last one under its artist and is renamed to another
+        # artist: once the old master is removed after the commit
+        # (`master_replace.settle_old_master`), its now-empty folder is pruned
+        # too (`prune_empty_dirs`), so no empty "Old" folder is left behind.
         library = tmp_path / "music"
         audio = library / "owner" / "Old" / "song.m4a"
         _make_audio(audio, title="T", artist="Old")
@@ -152,8 +148,8 @@ class TestTrackEditorMaster:
 
         new_path = library / "owner" / "New" / "song.m4a"
         assert new_path.exists()  # the track landed at its new home...
-        assert not audio.exists()  # ...and the old file itself is gone...
-        # ...but its now-empty parent directory should be too, and isn't.
+        assert not audio.exists()  # ...the old file itself is gone...
+        # ...and so is its now-empty parent directory.
         assert not (library / "owner" / "Old").exists(), (
             "orphaned empty artist directory left behind after relocation"
         )

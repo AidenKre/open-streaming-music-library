@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:drift/drift.dart' as drift
+    show ApplyInterceptor, QueryInterceptor;
 import 'package:drift/native.dart';
 import 'package:flutter/foundation.dart';
 import 'package:frontend/database/database.dart';
@@ -71,9 +73,13 @@ class UploadHarness {
     String instanceId = 'inst-1',
     ValueListenable<bool>? visible,
     UploadReviewTransport? review,
+    drift.QueryInterceptor? interceptor,
   }) async {
     final dir = Directory.systemTemp.createTempSync('osml_7b1d');
-    final db = AppDatabase(NativeDatabase.memory());
+    final memory = NativeDatabase.memory();
+    final db = AppDatabase(
+      interceptor == null ? memory : memory.interceptWith(interceptor),
+    );
     final binding = ServerBindingRepository(db);
     final token = await seedTestBinding(db, reconciled: true);
     final gate = ControlledGate(db);

@@ -246,7 +246,7 @@ class SessionController extends ChangeNotifier implements SessionControls {
           _showDatabaseRefused();
           return;
         }
-        outcome = const SignInFailed('Could not sign in.');
+        outcome = const SignInFailed('Could not finish signing in.');
       }
       await _applySignIn(outcome);
     } finally {

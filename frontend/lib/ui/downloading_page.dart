@@ -80,8 +80,7 @@ class _SectionHeader extends StatelessWidget {
 }
 
 /// A failed download's line (other-issues row 66: a fixed sentence, never
-/// the failure's own text, which stays on the job's status). Proposed to the
-/// owner, not yet approved.
+/// the failure's own text, which stays on the job's status).
 const downloadFailedMessage = "Couldn't download this track.";
 
 class _DownloadTile extends StatelessWidget {

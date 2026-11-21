@@ -100,6 +100,8 @@ class _MarkerKeepingPrefs implements SharedPreferences {
   _MarkerKeepingPrefs(this._real);
   final SharedPreferences _real;
   @override
+  Object? get(String key) => _real.get(key);
+  @override
   bool? getBool(String key) => _real.getBool(key);
   @override
   Future<bool> setBool(String key, bool value) => _real.setBool(key, value);

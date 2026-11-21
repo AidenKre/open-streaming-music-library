@@ -17,7 +17,6 @@ import 'package:frontend/services/deletion/delete_jobs_manager.dart';
 import 'package:frontend/services/deletion/delete_jobs_wiring.dart';
 import 'package:frontend/services/deletion/deletion_preview.dart';
 import 'package:frontend/services/deletion/deletion_text.dart';
-import 'package:frontend/models/id_hints.dart';
 import 'package:frontend/services/feature_providers.dart';
 import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/services/deletion/server_delete_availability.dart';
@@ -33,7 +32,6 @@ class SelectedItemView {
     required this.artist,
     required this.album,
     required this.inLocalLibrary,
-    this.idHint,
   });
 
   final String uuid;
@@ -45,9 +43,6 @@ class SelectedItemView {
 
   /// False when sync removed the track after it was selected.
   final bool inLocalLibrary;
-
-  /// A short id shown only when two listed tracks would read the same.
-  final String? idHint;
 }
 
 /// One target of a delete job, as the job view shows it.
@@ -59,7 +54,6 @@ class JobTargetView {
     required this.artist,
     required this.outcome,
     required this.deleted,
-    this.idHint,
   });
 
   final String uuid;
@@ -74,7 +68,6 @@ class JobTargetView {
 
   /// Deleted or already deleted.
   final bool deleted;
-  final String? idHint;
 }
 
 @immutable
@@ -141,6 +134,10 @@ abstract interface class ManageLibraryControls implements Listenable {
   /// What Deletion history says while [receiptsLoad] is
   /// [ReceiptsLoad.needsConnection]: why nothing can be read now.
   String get receiptsUnreachableText;
+
+  /// A Retry beside [receiptsUnreachableText] can help (false while the
+  /// session's server is blocked: only the banner's actions can clear that).
+  bool get receiptsRetryHelps;
 
   /// Receipts loaded so far, in the server's keyset order.
   List<ReceiptView> get receipts;
@@ -256,6 +253,10 @@ class ManageLibraryController extends ChangeNotifier
   );
 
   @override
+  bool get receiptsRetryHelps =>
+      libraryToolsRetryHelps(_ref.read(libraryToolsServerBlockedProvider));
+
+  @override
   List<ReceiptView> get receipts => _receipts;
 
   @override
@@ -275,19 +276,10 @@ class ManageLibraryController extends ChangeNotifier
     try {
       local = await _hydrate(uuids);
     } catch (e) {
-      debugPrint('selection hydration failed: ${e.runtimeType}');
+      debugPrint('selection hydration failed: ${e.runtimeType}: $e');
       return;
     }
     if (_disposed || seq != _selectionSeq) return;
-    final hints = idHints([
-      for (final u in uuids)
-        (
-          uuid: u,
-          title: local[u]?.title,
-          artist: local[u]?.artist,
-          album: local[u]?.album,
-        ),
-    ]);
     _selectedItems = [
       for (final u in uuids)
         SelectedItemView(
@@ -296,7 +288,6 @@ class ManageLibraryController extends ChangeNotifier
           artist: local[u]?.artist,
           album: local[u]?.album,
           inLocalLibrary: local.containsKey(u),
-          idHint: hints[u],
         ),
     ];
     notifyListeners();
@@ -317,14 +308,26 @@ class ManageLibraryController extends ChangeNotifier
     for (final op in jobs.keys) {
       if (!_appearance.contains(op)) _appearance.add(op);
     }
-    final ordered = jobs.values.toList()
-      ..sort((a, b) {
-        final ca = a.createdAt, cb = b.createdAt;
-        if (ca != null && cb != null && ca != cb) return cb.compareTo(ca);
-        return _appearance
-            .indexOf(b.operationUuid)
-            .compareTo(_appearance.indexOf(a.operationUuid));
-      });
+    // One total order, by one key: jobs still being sent or not yet
+    // confirmed first; then newest first, by the server's date, else by when
+    // this device submitted the job, else last; ties go to the job that
+    // became known later.
+    (int, int, int) key(DeleteJob j) => (
+      j.phase == DeleteJobPhase.submitting ||
+              j.phase == DeleteJobPhase.unconfirmed
+          ? 0
+          : 1,
+      -(j.createdAt != null ? j.createdAt! * 1000 : j.submittedAtMs ?? 0),
+      -_appearance.indexOf(j.operationUuid),
+    );
+    int byKey(DeleteJob a, DeleteJob b) {
+      final (a1, a2, a3) = key(a);
+      final (b1, b2, b3) = key(b);
+      if (a1 != b1) return a1.compareTo(b1);
+      if (a2 != b2) return a2.compareTo(b2);
+      return a3.compareTo(b3);
+    }
+    final ordered = jobs.values.toList()..sort(byKey);
     final Map<String, TrackUI> local;
     try {
       local = await _hydrate([
@@ -334,7 +337,7 @@ class ManageLibraryController extends ChangeNotifier
         ],
       ]);
     } catch (e) {
-      debugPrint('job hydration failed: ${e.runtimeType}');
+      debugPrint('job hydration failed: ${e.runtimeType}: $e');
       return;
     }
     if (_disposed || seq != _jobsSeq) return;
@@ -342,7 +345,7 @@ class ManageLibraryController extends ChangeNotifier
     String? artist(String u) => _remembered[u]?.artist ?? local[u]?.artist;
     _jobs = [
       for (final j in ordered)
-        _viewOf(j, title, artist, (u) => _remembered[u]?.album ?? local[u]?.album),
+        _viewOf(j, title, artist),
     ];
     notifyListeners();
   }
@@ -351,7 +354,6 @@ class ManageLibraryController extends ChangeNotifier
     DeleteJob job,
     String? Function(String) title,
     String? Function(String) artist,
-    String? Function(String) album,
   ) {
     final rows = job.items.isNotEmpty
         ? [
@@ -366,15 +368,6 @@ class ManageLibraryController extends ChangeNotifier
                 deleted: false,
               ),
           ];
-    final hints = idHints([
-      for (final r in rows)
-        (
-          uuid: r.uuid,
-          title: title(r.uuid),
-          artist: artist(r.uuid),
-          album: album(r.uuid),
-        ),
-    ]);
     return DeleteJobView(
       operationUuid: job.operationUuid,
       phase: job.phase,
@@ -390,7 +383,6 @@ class ManageLibraryController extends ChangeNotifier
             artist: artist(r.uuid),
             outcome: r.outcome,
             deleted: r.deleted,
-            idHint: hints[r.uuid],
           ),
       ],
     );

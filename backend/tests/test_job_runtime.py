@@ -120,7 +120,7 @@ def test_concurrent_claims_from_threads_with_their_own_connections_have_one_winn
     jobs = [str(uuid.uuid4()) for _ in range(20)]
     for job in jobs:
         _insert(db_path, 1, job)
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=10)  # a stuck worker breaks it: the test fails
     wins: dict[str, list] = {BOOT_A: [], BOOT_B: []}
 
     def worker(boot_id):

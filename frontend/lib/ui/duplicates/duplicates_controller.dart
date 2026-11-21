@@ -118,6 +118,10 @@ abstract interface class DuplicatesControls implements Listenable {
   /// [DuplicatesLoad.needsConnection]: why nothing can be read now.
   String get unreachableText;
 
+  /// A Retry beside [unreachableText] can help (false while the session's
+  /// server is blocked: only the banner's actions can clear that).
+  bool get connectionRetryHelps;
+
   /// Plain words for the last failed action; null when there is none.
   String? get message;
 
@@ -443,7 +447,7 @@ class DuplicatesController extends ChangeNotifier
     fields: {
       for (final f in DuplicateField.values) f: duplicateFieldText(t, f),
     },
-    identityLines: [...copyIdentityLines(t), copyIdLine(t.uuidId)],
+    identityLines: copyIdentityLines(t),
   );
 
   String? _message;
@@ -459,6 +463,10 @@ class DuplicatesController extends ChangeNotifier
       refusal: _refusal,
     ),
   );
+
+  @override
+  bool get connectionRetryHelps =>
+      libraryToolsRetryHelps(_ref.read(libraryToolsServerBlockedProvider));
 
   @override
   String? get message => _message;

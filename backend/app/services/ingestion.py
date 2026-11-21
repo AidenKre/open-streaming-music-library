@@ -52,7 +52,6 @@ class _AlreadyRefused(Exception):
     """An unchanged archive refused before: REFUSED, and nothing is logged again."""
 
 
-# TODO: make organize_function actually be called from context, rather than lazily patching
 class Ingestor:
     def __init__(self, ctx: IngestorContext):
         self.ctx = ctx

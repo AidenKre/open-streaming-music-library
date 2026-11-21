@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:frontend/models/track_names.dart';
 import 'package:frontend/playback/preview_player.dart';
 import 'package:frontend/services/duplicates/duplicates_review.dart';
 import 'package:frontend/ui/duplicates/duplicates_controller.dart';
@@ -88,12 +89,13 @@ class _DuplicatesPageState extends ConsumerState<DuplicatesPage> {
         content = const Center(child: CircularProgressIndicator());
       case DuplicatesLoad.needsConnection:
         // The list's own notice carries the one Retry when it needs a
-        // connection too.
+        // connection too; none where retrying cannot help.
         content = Wrap(
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             Text(controls.unreachableText),
-            if (controls.listLoad != DuplicatesLoad.needsConnection)
+            if (controls.listLoad != DuplicatesLoad.needsConnection &&
+                controls.connectionRetryHelps)
               _connectionRetry(),
           ],
         );
@@ -185,7 +187,7 @@ class _DuplicatesPageState extends ConsumerState<DuplicatesPage> {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               Text(controls.unreachableText),
-              _connectionRetry(),
+              if (controls.connectionRetryHelps) _connectionRetry(),
             ],
           ),
         ];
@@ -271,11 +273,10 @@ class _DuplicatesPageState extends ConsumerState<DuplicatesPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          copy.track.title ?? 'Unknown title',
+          trackTitleOrUnknown(copy.track.title),
           style: const TextStyle(fontWeight: FontWeight.w600),
         ),
-        Text(copy.track.artist ?? 'Unknown artist'),
-        Text(copyIdLine(uuid)),
+        Text(copy.track.artist ?? unknownArtistName),
         const SizedBox(height: 4),
         for (final f in DuplicateField.values)
           _field(row, copy, f, highlight),

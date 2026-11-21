@@ -195,7 +195,7 @@ def test_every_recovery_step_runs_twice_with_the_same_result(configure_app, monk
     # Encodes made from the pre-conversion bytes.
     data = tmp_path / "data"
     stale_encodes = [
-        EncodedCache(EncodedCacheContext(cache_dir=data / name, max_size_bytes=0)).path_for(converted_uuid, "high")
+        EncodedCache(EncodedCacheContext(cache_dir=data / name, max_size_bytes=0)).path_for(converted_uuid, "320")
         for name in ("encoded_cache", "default_cache")
     ]
     for path in stale_encodes:
@@ -240,7 +240,7 @@ def test_a_failing_conversion_reconcile_still_evicts_the_interrupted_conversions
     interrupted = "00000000-0000-4000-8000-000000000002"
     data = tmp_path / "data"
     stale = [
-        EncodedCache(EncodedCacheContext(cache_dir=data / name, max_size_bytes=0)).path_for(interrupted, "high")
+        EncodedCache(EncodedCacheContext(cache_dir=data / name, max_size_bytes=0)).path_for(interrupted, "320")
         for name in ("encoded_cache", "default_cache")
     ]
     for path in stale:

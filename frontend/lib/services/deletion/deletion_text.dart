@@ -75,14 +75,30 @@ String jobPhaseText(DeleteJobPhase phase) => switch (phase) {
 
 /// Why the server refused a request (or could not run it). Never echoes
 /// [code].
-String deletionErrorText(String? code) => switch (code) {
+String deletionErrorText(String? code) =>
+    _knownErrorText(code) ??
+    'The server refused this request. Nothing was deleted.';
+
+/// The text for a server error code this app knows; null for any other.
+String? _knownErrorText(String? code) => switch (code) {
   'library_delete_disabled' =>
     'Server deletion has been turned off on this server. Nothing was '
         'deleted.',
   'track_pending_deletion' =>
     'A track in this request is already being deleted. Nothing was deleted.',
-  _ => 'The server refused this request. Nothing was deleted.',
+  _ => null,
 };
+
+/// Why a preview's request failed with HTTP [status] and [code]: a known
+/// code keeps its text; otherwise a 5xx is a server failure, a 2xx an answer
+/// whose body could not be read, the rest a refusal.
+String deletionPreviewErrorText(int status, String? code) =>
+    _knownErrorText(code) ??
+    (status >= 500
+        ? serverCouldNotCheckText()
+        : status >= 200 && status < 300
+        ? unexpectedAnswerText()
+        : deletionErrorText(code));
 
 /// Why server deletion can't be used now.
 String unavailableText(DeleteJobsUnavailableReason reason) => switch (reason) {
@@ -115,9 +131,19 @@ String tooManyTracksText(int limit) =>
     'You can delete up to $limit tracks at a time. Select fewer and delete '
     'them in batches.';
 
-/// The preview could not reach the server (or the answer was unusable).
+/// The preview could not reach the server; also every other preview failure
+/// that is not an answer from the server (the session closing, a local
+/// fault).
 String couldNotReachServerText() =>
     "Couldn't reach the server. Nothing was deleted.";
+
+/// The server failed while making the preview.
+String serverCouldNotCheckText() =>
+    "The server couldn't check these tracks. Nothing was deleted.";
+
+/// The preview's answer could not be read by this app.
+String unexpectedAnswerText() =>
+    'The server sent an unexpected answer. Nothing was deleted.';
 
 /// A sync finished, so an open review no longer shows the library.
 String libraryChangedText() =>

@@ -545,6 +545,139 @@ void main() {
       expect(callCount, 1);
     });
 
+    // A.12 characterization: a sync flushes the edit outbox and pulls
+    // `/changes` in one locked section, so an edit saved while the flush is
+    // in flight is stored only after the pull (the pull's full-row upsert
+    // cannot land on top of it).
+    test('an edit saved while a sync is flushing is stored after its pull',
+        () async {
+      installClient(
+        'http://localhost:8000',
+        MockClient(
+          (req) async => _changesResponse([
+            _upsert(1, _trackJson('uuid-1')),
+            _upsert(2, _trackJson('uuid-2')),
+          ]),
+        ),
+      );
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+      final outbox = c.read(editOutboxProvider);
+      await outbox.enqueue(
+        uuidId: 'uuid-1',
+        edit: const MetadataEdit.empty().set('title', 'First'),
+        writeMode: EditWriteMode.dbOnly,
+        baseRevision: 1,
+      );
+
+      final events = <String>[];
+      final patchArrived = Completer<void>();
+      final releasePatch = Completer<void>();
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async {
+          if (req.method == 'PATCH') {
+            events.add('flush');
+            if (!patchArrived.isCompleted) patchArrived.complete();
+            await releasePatch.future;
+            return Response(
+              jsonEncode(
+                  {'uuid_id': 'uuid-1', 'revision': 3, 'master_written': false}),
+              200,
+              headers: {'content-type': 'application/json'},
+            );
+          }
+          events.add('pull');
+          return _changesResponse([
+            _upsert(3, _trackJson('uuid-1', revision: 3)),
+          ]);
+        }),
+      );
+      final sync = notifier.sync();
+      await patchArrived.future;
+      final saved = outbox
+          .enqueue(
+            uuidId: 'uuid-2',
+            edit: const MetadataEdit.empty().set('title', 'Second'),
+            writeMode: EditWriteMode.dbOnly,
+            baseRevision: 2,
+          )
+          .then((_) => events.add('saved'));
+      await pumpEventQueue();
+      releasePatch.complete();
+      await sync;
+      await saved;
+
+      expect(events, ['flush', 'pull', 'saved']);
+      final pending = await db.select(db.pendingEdits).get();
+      expect(pending.map((r) => r.uuidId), ['uuid-2']);
+    });
+
+    // A.12 characterization: a run bumps each counter once, and only for its
+    // own kind of change.
+    test('a sync that only adds tracks bumps no counter; one that removes a '
+        'queued track bumps each once; one that removes an unqueued track '
+        'bumps only the download counter; an empty pull bumps none', () async {
+      installClient(
+        'http://localhost:8000',
+        MockClient(
+          (req) async => _changesResponse([
+            _upsert(1, _trackJson('uuid-a')),
+            _upsert(2, _trackJson('uuid-b')),
+            _upsert(3, _trackJson('uuid-c')),
+          ]),
+        ),
+      );
+      final c = createContainer();
+      await waitForBuild(c);
+      final notifier = c.read(trackSyncProvider.notifier);
+      await notifier.sync();
+      var state = c.read(trackSyncProvider).value!;
+      expect(state.queueMutationVersion, 0);
+      expect(state.downloadMutationVersion, 0);
+
+      final id = await QueueRepository(db).createSessionFromExplicitList(
+        sourceType: 'search',
+        trackUuids: const ['uuid-a', 'uuid-b'],
+        currentIndex: 0,
+      );
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async => _changesResponse([_delete(4, 'uuid-b')])),
+      );
+      await notifier.sync();
+      state = c.read(trackSyncProvider).value!;
+      expect(state.queueMutationVersion, 1);
+      expect(state.downloadMutationVersion, 1);
+      expect(state.affectedQueueSessionIds, {id});
+      expect(state.deletedTrackUuids, {'uuid-b'});
+
+      installClient(
+        'http://localhost:8000',
+        MockClient((req) async => _changesResponse([_delete(5, 'uuid-c')])),
+      );
+      await notifier.sync();
+      state = c.read(trackSyncProvider).value!;
+      expect(state.queueMutationVersion, 1);
+      expect(state.downloadMutationVersion, 2);
+      expect(state.affectedQueueSessionIds, isEmpty);
+      expect(state.deletedTrackUuids, {'uuid-c'});
+
+      installClient(
+        'http://localhost:8000',
+        MockClient(
+          (req) async => _changesResponse(const [], latestRevision: 5),
+        ),
+      );
+      await notifier.sync();
+      state = c.read(trackSyncProvider).value!;
+      expect(state.error, isNull);
+      expect(state.queueMutationVersion, 1);
+      expect(state.downloadMutationVersion, 2);
+    });
+
     test(
       'refreshTrack cannot publish the same mutation version as a concurrent sync',
       () async {
@@ -2272,6 +2405,67 @@ void main() {
     await c.read(trackSyncProvider.notifier).sync();
     await c.read(ownedFileCleanupRunnerProvider).whenIdle();
     expect(kept.existsSync(), isFalse);
+  });
+
+  // The app's catalog sync hands the stored-cover removal to the sync: a
+  // tombstone that removes the last download showing a cover deletes that
+  // cover's stored file; a cover another download still shows stays.
+  test('a tombstone sync deletes the stored cover no download shows any '
+      'more and keeps one another download shows', () async {
+    var tombstones = false;
+    installClient(
+      'http://localhost:8000',
+      MockClient((req) async {
+        if (req.url.pathSegments.last != 'changes') return Response('', 404);
+        if (tombstones) {
+          return _changesResponse([_delete(4, 'u1'), _delete(5, 'u2')]);
+        }
+        return _changesResponse([
+          for (final (rev, uuid, cover) in [
+            (1, 'u1', 5),
+            (2, 'u2', 6),
+            (3, 'u3', 6),
+          ])
+            _upsert(
+              rev,
+              _richTrackJson(uuid, title: 'Song $uuid', artist: 'Artist',
+                  album: 'Album', artistId: 11, albumId: 101,
+                  createdAt: 1000 + rev, hasAlbumArt: true, coverArtId: cover),
+            ),
+        ]);
+      }),
+    );
+    final covers = await LocalCoverArtStore.create(
+      directoryProvider: () async => tempDir,
+      apiClient: api,
+    );
+    final c = createContainer(
+        localCoverArtStore: covers, downloadDirectory: tempDir);
+    await waitForBuild(c);
+    final notifier = c.read(trackSyncProvider.notifier);
+    await notifier.sync();
+    for (final uuid in ['u1', 'u2', 'u3']) {
+      final file = File('${tempDir.path}/tracks/$uuid.m4a')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync([1, 2, 3]);
+      await (db.update(db.tracks)..where((t) => t.uuidId.equals(uuid)))
+          .write(TracksCompanion(
+        filePath: Value(file.path),
+        fileSizeBytes: const Value(3),
+        downloadedQuality: const Value('320'),
+      ));
+    }
+    covers.fileFor(5).writeAsBytesSync([5]);
+    covers.fileFor(6).writeAsBytesSync([6]);
+
+    tombstones = true;
+    await notifier.sync();
+
+    expect((await db.select(db.tracks).get()).map((t) => t.uuidId), ['u3']);
+    expect(covers.fileFor(5).existsSync(), isFalse,
+        reason: 'no download shows cover 5 any more');
+    expect(covers.fileFor(6).readAsBytesSync(), [6],
+        reason: 'u3 is still downloaded and shows cover 6');
   });
   // 8B.2b / D25, spec §6 last paragraph: "Cancel in-flight/queued downloads
   // for tombstoned UUIDs and fence late completion against absent/current

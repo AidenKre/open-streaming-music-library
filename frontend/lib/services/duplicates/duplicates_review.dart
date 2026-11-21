@@ -109,11 +109,6 @@ String? copyFileStatusText(DuplicatePairTrackDto track) =>
       null => 'File status unknown',
     };
 
-/// A copy's short id, e.g. `ID 01234567`: what tells two otherwise equal
-/// copies apart.
-String copyIdLine(String uuid) =>
-    'ID ${uuid.length > 8 ? uuid.substring(0, 8) : uuid}';
-
 /// The server's list order: band (exact, strong, possible), then score
 /// descending (an exact pair, whose score is null, ranks as 1.0), then
 /// `uuid_a`, then `uuid_b`.

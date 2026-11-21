@@ -41,6 +41,10 @@ class _MarkerUnreadablePrefs implements SharedPreferences {
   _MarkerUnreadablePrefs(this._real);
   final SharedPreferences _real;
   @override
+  Object? get(String key) => key == LocalResetService.resetPendingKey
+      ? throw StateError(_raw)
+      : _real.get(key);
+  @override
   bool? getBool(String key) => key == LocalResetService.resetPendingKey
       ? throw StateError(_raw)
       : _real.getBool(key);
@@ -65,6 +69,8 @@ class _MarkerUnreadablePrefs implements SharedPreferences {
 /// (the platform answers false): the wipe ran, the marker stays.
 class _MarkerKeepingPrefs extends _MarkerUnreadablePrefs {
   _MarkerKeepingPrefs(super.real);
+  @override
+  Object? get(String key) => _real.get(key);
   @override
   bool? getBool(String key) => _real.getBool(key);
   @override
@@ -102,6 +108,22 @@ class _FailingFence extends ServerBindingRepository {
   _FailingFence(super.db);
   @override
   Future<void> fence() async => throw StateError(_raw);
+}
+
+/// The database is of another schema version (D3-01): the fence is refused,
+/// and so is the fresh database that should replace the file.
+class _RefusedFence extends ServerBindingRepository {
+  _RefusedFence(super.db);
+  @override
+  Future<void> fence() async => throw DatabaseVersionRefused(8, 1);
+}
+
+/// A database whose refused file could not be replaced: discarding it
+/// leaves it as it was.
+class _RefusedFileKept extends AppDatabase {
+  _RefusedFileKept() : super(NativeDatabase.memory());
+  @override
+  Future<void> discardRefusedFile() async {}
 }
 
 const _notFinished = 'An earlier reset could not finish clearing local data, '
@@ -162,11 +184,12 @@ void main() {
     List<LocalResettable>? wipe,
     ServerBindingRepository? repository,
     bool signedIn = false,
+    AppDatabase? database,
   }) async {
     final t = transport();
     final prefs = await SharedPreferences.getInstance();
     final c = ProviderContainer(overrides: [
-      databaseProvider.overrideWithValue(db),
+      databaseProvider.overrideWithValue(database ?? db),
       apiClientProvider.overrideWithValue(testApiClient('http://s', t)),
       unauthenticatedApiClientProvider
           .overrideWithValue((url) => testApiClient(url, t)),
@@ -320,6 +343,21 @@ void main() {
       expect(await marker(), isTrue);
     });
 
+    // A database of another version that the fence cannot get
+    // past is named as such, not as a failed fence.
+    test('a refused database, at launch: logged as version_refused',
+        () async {
+      final refused = _RefusedFileKept();
+      addTearDown(refused.close);
+      final c = await scope(repository: _RefusedFence(db), database: refused);
+      final start = await c.read(sessionServiceProvider).resumeSavedSession();
+      expect(start.kind, SessionStartKind.serverAddress);
+      expect(start.error, _notFinished);
+      expect(events, ['Pending reset not finished: reason=version_refused']);
+      expect(await marker(), isTrue, reason: 'the next launch tries again');
+      expect(requests, isEmpty);
+    });
+
     test('the next launch whose wipe succeeds finishes it', () async {
       final first = await failing('wipe_failed');
       await first.read(sessionServiceProvider).resumeSavedSession();
@@ -329,6 +367,21 @@ void main() {
       expect(await marker(), isNull);
     });
 
+  });
+
+  // A marker of another type is a reset that was started (the app
+  // only ever saves `true`): the launch finishes it.
+  test('a marker of another type: the launch finishes the reset', () async {
+    SharedPreferences.setMockInitialValues(
+        {'serverUrl': 'http://s', LocalResetService.resetPendingKey: 'x'});
+    final c = await scope();
+    final start = await c.read(sessionServiceProvider).resumeSavedSession();
+    expect(start.kind, SessionStartKind.resetFinished);
+    expect(
+        (await SharedPreferences.getInstance())
+            .get(LocalResetService.resetPendingKey),
+        isNull);
+    expect(events, isEmpty);
   });
 
   test('nothing pending: nothing finished, nothing logged', () async {

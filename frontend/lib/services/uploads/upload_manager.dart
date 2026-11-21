@@ -278,7 +278,9 @@ class UploadManager {
     for (final item in items) {
       // The server also flags `allocated` items after a dead transfer; only
       // a failed item offers Retry.
-      final flag = item.rawState == 'failed' ? item.error?.retryable : null;
+      final flag = item.rawState == ServerItemState.failed
+          ? item.error?.retryable
+          : null;
       flag == null ? next.remove(item.itemUuid) : next[item.itemUuid] = flag;
     }
     if (!mapEquals(next, _retryable.value)) _retryable.value = next;
@@ -320,9 +322,7 @@ class UploadManager {
     if (isClosed) return;
     final token = (await _binding.current())?.localBindingId;
     if (token == null) return;
-    final intent = (await _intents.forBinding(
-      token,
-    )).where((i) => i.itemUuid == itemUuid).firstOrNull;
+    final intent = await _intents.find(token, itemUuid);
     if (intent == null || endedStates.contains(intent.lastState)) return;
     if (intent.lastState == UploadIntentState.rejected) {
       await _setItems(token, [intent], ServerItemState.cancelled, null);
@@ -346,9 +346,7 @@ class UploadManager {
     if (isClosed) return ReselectOutcome.notNeeded;
     final token = (await _binding.current())?.localBindingId;
     if (token == null) return ReselectOutcome.notNeeded;
-    final intent = (await _intents.forBinding(
-      token,
-    )).where((i) => i.itemUuid == itemUuid).firstOrNull;
+    final intent = await _intents.find(token, itemUuid);
     if (intent == null ||
         (intent.lastState != UploadIntentState.needsReselect &&
             intent.lastState != UploadIntentState.sourceChanged)) {
@@ -416,9 +414,7 @@ class UploadManager {
     }
     final token = (await _binding.current())?.localBindingId;
     if (token == null) throw const UploadsUnavailable();
-    final intent = (await _intents.forBinding(token))
-        .where((i) => i.itemUuid == itemUuid)
-        .firstOrNull;
+    final intent = await _intents.find(token, itemUuid);
     if (intent == null) throw const UploadsUnavailable();
 
     Future<void> store(UploadItem item, {bool fresh = false}) =>
@@ -427,7 +423,8 @@ class UploadManager {
           [itemUuid],
           lastState: Value(item.rawState),
           lastErrorCode: Value(item.error?.code),
-          transferOperationUuid: fresh && item.rawState == 'allocated'
+          transferOperationUuid:
+              fresh && item.rawState == ServerItemState.allocated
               ? Value(_newUuid())
               : const Value.absent(),
         );
@@ -440,7 +437,7 @@ class UploadManager {
         abortTrigger: _closing.future,
       );
       await store(item, fresh: true);
-      if (item.rawState == 'allocated') {
+      if (item.rawState == ServerItemState.allocated) {
         _runner.request('retry', bypassBackoff: true);
       }
       return RetryOutcome.accepted;
@@ -473,9 +470,7 @@ class UploadManager {
     if (isClosed) throw const UploadsUnavailable();
     final token = (await _binding.current())?.localBindingId;
     if (token == null) throw const UploadsUnavailable();
-    final intent = (await _intents.forBinding(
-      token,
-    )).where((i) => i.itemUuid == itemUuid).firstOrNull;
+    final intent = await _intents.find(token, itemUuid);
     if (intent == null) return;
     final state = intent.operationUuid == null
         ? null
@@ -703,8 +698,8 @@ class UploadManager {
             // still in `duplicate_conflict` was not resolved.
             final resolve = kind == ReviewActionKind.resolveDuplicate;
             final accepted = resolve
-                ? const {'duplicate'}
-                : _ServerItemState.reviewAccepted;
+                ? const {ServerItemState.duplicate}
+                : reviewAcceptedStates;
             if (accepted.contains(state)) {
               return StatusAccepted(item.toJson());
             }
@@ -739,7 +734,7 @@ class UploadManager {
               [intent.itemUuid],
               lastState: Value(receipt['state'] as String),
             );
-            if (receipt['state'] == 'committing') {
+            if (receipt['state'] == ServerItemState.committing) {
               _followUntil = _clock.nowUtcMs() + followLimit.inMilliseconds;
             }
           case SubmissionRejected(:final code):
@@ -873,7 +868,7 @@ class UploadManager {
     final all = await _intents.forBinding(token);
     final local = {
       for (final i in all)
-        if (_ServerItemState.serverDriven.contains(i.lastState)) i.itemUuid: i,
+        if (serverDrivenStates.contains(i.lastState)) i.itemUuid: i,
     };
     final waiting = {
       for (final i in all)
@@ -913,7 +908,7 @@ class UploadManager {
               [item.itemUuid],
               lastState: Value(item.rawState),
               lastErrorCode: Value(item.error?.code),
-              onlyIfStateIn: _ServerItemState.serverDriven,
+              onlyIfStateIn: serverDrivenStates,
             );
           }
           cursor = page.nextAfter;
@@ -929,10 +924,10 @@ class UploadManager {
               for (final i in [...local.values, ...waiting.values])
                 if (i.batchUuid == batch) i.itemUuid,
             ],
-            lastState: const Value('expired'),
+            lastState: const Value(ServerItemState.expired),
             lastErrorCode: const Value('upload_batch_not_found'),
             onlyIfStateIn: {
-              ..._ServerItemState.serverDriven,
+              ...serverDrivenStates,
               UploadIntentState.onOtherDevice,
             },
           );
@@ -957,7 +952,8 @@ class UploadManager {
     if (_followUntil == null) return const _StepDone();
     Future<Set<String>> own() async => {
       for (final i in await _intents.forBinding(token))
-        if (i.lastState == 'committing' && i.operationUuid != null)
+        if (i.lastState == ServerItemState.committing &&
+            i.operationUuid != null)
           i.batchUuid,
     };
     var batches = await own();
@@ -1034,7 +1030,7 @@ class UploadManager {
         }
         // A server that still holds the file as sendable did not act on the
         // cancel: the user's `cancelling` stays and is never undone.
-        if (_ServerItemState.dispatchable.contains(item.rawState)) continue;
+        if (awaitingOrReceivingBytesStates.contains(item.rawState)) continue;
         await _intents.update(
           token,
           [intent.itemUuid],
@@ -1145,7 +1141,7 @@ class UploadManager {
         ? const StatusAbsent()
         : state == ServerItemState.receiving
         ? const StatusPending()
-        : _ServerItemState.failedForGood.contains(state)
+        : failedForGoodStates.contains(state)
         ? StatusRejected(item.error?.code ?? state)
         : StatusAccepted(item.toJson());
     return (status, item);
@@ -1154,10 +1150,7 @@ class UploadManager {
   Future<void> _transfer(String token, UploadIntentRecord intent) async {
     bool cancelled() => _cancelRequested.contains(intent.itemUuid);
     if (cancelled()) return;
-    const startable = {
-      UploadIntentState.allocated,
-      UploadIntentState.transferring,
-    };
+    const startable = UploadIntentState.awaitingBytes;
     final operation = intent.transferOperationUuid ?? _newUuid();
     FileUploadSource? opened; // the fresh-item check's source, reused by send
     if (intent.transferOperationUuid == null) {
@@ -1323,7 +1316,8 @@ class UploadManager {
         // A refusal that leaves the item dispatchable ends in a local
         // failure; the same item is never sent again.
         final dispatchable =
-            item == null || _ServerItemState.dispatchable.contains(item.rawState);
+            item == null ||
+            awaitingOrReceivingBytesStates.contains(item.rawState);
         await _intents.update(
           token,
           [intent.itemUuid],
@@ -1469,36 +1463,6 @@ class UploadManager {
 class _TransferStop implements Exception {
   const _TransferStop(this.disposition);
   final SubmissionFailureDisposition disposition;
-}
-
-/// The sets of server item states the manager compares against.
-abstract final class _ServerItemState {
-  /// States a transfer may be started from.
-  static const dispatchable = {
-    ServerItemState.allocated,
-    ServerItemState.receiving,
-    'transferring',
-  };
-
-  /// States the server changes on its own (polled). `expanded` is ended
-  /// (spec §3): never polled, so a pruned batch cannot stall the poll.
-  static const serverDriven = {
-    ServerItemState.receiving,
-    'validating',
-    'committing',
-  };
-
-  /// The server ended the item without importing it.
-  static const failedForGood = {'failed', ServerItemState.cancelled, 'expired'};
-
-  /// States that show a commit was acted on (a resolve-duplicate is acted
-  /// on only by `duplicate`).
-  static const reviewAccepted = {
-    'committing',
-    'imported',
-    'duplicate',
-    'duplicate_conflict',
-  };
 }
 
 sealed class _StepResult {

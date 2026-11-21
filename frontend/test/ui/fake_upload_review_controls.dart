@@ -4,6 +4,7 @@ import 'package:frontend/models/dto/upload_dtos.dart';
 import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/models/metadata_edit.dart';
 import 'package:frontend/models/ui/track_ui.dart';
+import 'package:frontend/services/library_tools_pages.dart';
 import 'package:frontend/services/uploads/upload_duplicate_decisions.dart';
 import 'package:frontend/services/uploads/upload_duplicate_summary.dart';
 import 'package:frontend/services/uploads/upload_review_rules.dart';
@@ -19,6 +20,10 @@ class FakeUploadReviewControls extends ChangeNotifier
 
   @override
   ReviewLoad load = ReviewLoad.ready;
+  @override
+  LibraryToolsUnreachable? loadUnreachable;
+  @override
+  bool loadRetryHelps = true;
   @override
   int position = 0;
   @override

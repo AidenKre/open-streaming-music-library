@@ -159,21 +159,20 @@ void main() {
       expect(await _damagedPath(db, 'a'), isNull);
     });
 
-    test('the full reconcile forgets a pre-2026-11-09 damaged file (path '
-        'moved off file_path) that is gone, keeps one that is still there',
-        () async {
+    test('the full reconcile forgets a damaged download whose file is gone, '
+        'keeps one that is still there', () async {
+      final gone = p.join(tmp.path, 'gone.m4a');
       final kept = File(p.join(tmp.path, 'kept.m4a'));
       await kept.writeAsString('bad audio');
-      await _insertTrack(db, 'a');
-      await _insertTrack(db, 'b');
-      await (db.update(db.tracks)..where((t) => t.uuidId.equals('a')))
-          .write(TracksCompanion(
-              damagedFilePath: Value(p.join(tmp.path, 'gone.m4a'))));
-      await (db.update(db.tracks)..where((t) => t.uuidId.equals('b')))
-          .write(TracksCompanion(damagedFilePath: Value(kept.path)));
+      await _insertTrack(db, 'a', filePath: gone);
+      await _insertTrack(db, 'b', filePath: kept.path);
+      expect(await service.markDamaged('a', gone), isTrue);
+      expect(await service.markDamaged('b', kept.path), isTrue);
       expect(await service.reconcile(), isTrue);
       expect(await _damagedPath(db, 'a'), isNull);
+      expect((await _readDownloadState(db, 'a')).filePath, isNull);
       expect(await _damagedPath(db, 'b'), kept.path);
+      expect((await _readDownloadState(db, 'b')).filePath, kept.path);
     });
   });
 

@@ -309,7 +309,7 @@ _SWAP_BITRATE_TOLERANCE_KBPS = 0.5
 def _reconcile_inplace(database: Database, entry: dict, identity_signal=None) -> None:
     old_path, temp_path = entry["old_path"], entry["temp_path"]
     convert = entry["intent"] == "convert"
-    if convert and _swap_job_failed(database, entry):
+    if _swap_job_failed(database, entry):
         # Its job's own swap failed: only the next start may settle the row (it
         # proves the swap, bumps the revision and settles the job), also when the
         # staged file has gone missing meanwhile.
@@ -385,6 +385,8 @@ def conversion_job_id_of(entry: dict) -> Optional[int]:
 def _swap_job_failed(database: Database, entry: dict) -> bool:
     """Whether a same-file convert row belongs to a job its own failed swap left
     failed (U06-B-06): only startup settles such a row."""
+    if entry["intent"] != "convert":
+        return False
     if entry["new_path"] and entry["new_path"] != entry["old_path"]:
         return False
     job_id = conversion_job_id_of(entry)
@@ -392,6 +394,15 @@ def _swap_job_failed(database: Database, entry: dict) -> bool:
         return False
     job = database.get_conversion_job(job_id, owner_id=entry["owner_id"])
     return job is not None and job["uuid_id"] == entry["uuid_id"] and job["status"] == "failed"
+
+
+def swap_waits_for_start(library: Library, uuid_id: str) -> bool:
+    """Whether a kept row of this track is one ``_swap_job_failed`` leaves to
+    the next start."""
+    return any(
+        entry["uuid_id"] == uuid_id and _swap_job_failed(library.database, entry)
+        for entry in library.list_journal_entries()
+    )
 
 
 def job_settled_lost(database: Database, entry: dict) -> bool:
@@ -433,13 +444,13 @@ def finish_kept_journal_rows(
     through runtime recovery (``reconcile_one``). A failure leaves the row
     for the next pass or for startup. ``reported`` (a set the caller keeps
     across passes) logs a row that keeps failing once, not on every pass; it is
-    keyed by (id, uuid, created_at) because row ids are reused, and forgets
-    rows that are gone. A row whose track is pending deletion is left for later.
+    keyed by (id, uuid, created_at), and forgets rows that are gone, so it
+    holds only rows still in the journal. A row whose track is pending deletion is left for later.
     Returns the number of rows finished."""
     finished = 0
     entries = database.list_journal_entries(owner_id=ANY_OWNER)
     if reported is not None:
-        # Forget rows that are gone, so a later row reusing an id is logged too.
+        # Forget rows that are gone, so the set holds only rows still in the journal.
         reported.intersection_update(_row_key(e) for e in entries)
     for entry in entries:
         if _temp_present(entry):

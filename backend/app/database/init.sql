@@ -205,8 +205,9 @@ INSERT OR IGNORE INTO revision_counter ("id", "value") VALUES (0, 0);
 -- so a crash in the move<->commit window is finished or reverted by an
 -- idempotent reconcile pass at startup. `intent` dispatches the recovery;
 -- master-type conversion uses an "intent='convert'" row in this same table.
+-- Ids are never reused: a row's "(recovered <id>)" file name carries its id.
 CREATE TABLE IF NOT EXISTS edit_journal (
-    "id"         INTEGER PRIMARY KEY,
+    "id"         INTEGER PRIMARY KEY AUTOINCREMENT,
     "intent"     TEXT NOT NULL,
     "uuid_id"    TEXT NOT NULL,
     "old_path"   TEXT,
@@ -509,7 +510,7 @@ CREATE INDEX IF NOT EXISTS idx_upload_journal_item ON upload_commit_journal(owne
 -- Deletion tables: keyed (owner_id, operation_uuid) like their
 -- receipt. The aggregate job outcome is derived from the items; status here is
 -- only the job lifecycle ('accepted' until every item is terminal, then
--- 'completed'). Receipts and jobs are never pruned.
+-- 'completed'). Receipts and jobs are kept until `users delete` removes the user's rows.
 CREATE TABLE IF NOT EXISTS deletion_jobs (
   owner_id       INTEGER NOT NULL REFERENCES users(id),
   operation_uuid TEXT NOT NULL,
@@ -540,7 +541,7 @@ CREATE TABLE IF NOT EXISTS deletion_job_items (
   CHECK (status <> 'failed' OR error_code IS NOT NULL),
   CHECK (status NOT IN ('deleted','already_deleted') OR tombstone_revision IS NOT NULL)
 );
--- Items are never pruned: the worker's idle poll (claim_next_deletion_item) reads only the pending ones through this.
+-- Items are kept until `users delete` removes the user's rows: the worker's idle poll (claim_next_deletion_item) reads only the pending ones through this.
 CREATE INDEX IF NOT EXISTS idx_deletion_job_items_pending ON deletion_job_items(owner_id, operation_uuid, position) WHERE status = 'pending';
 -- Journal: the deletion's file journal; its existence is the
 -- pending-deletion marker read by live_tracks. It outlives the track row until
@@ -581,7 +582,7 @@ WHEN NEW.owner_id IS NOT OLD.owner_id OR NEW.uuid_id IS NOT OLD.uuid_id
 BEGIN
   SELECT RAISE(ABORT, 'deletion_journal owner and track never change');
 END;
--- One liveness definition: the duplicate finder, the candidate refresh and the possible-duplicates list join through this view; the pending-deletion marker is a deletion_journal row, and no consumer writes its own predicate.
+-- One liveness definition: every query that must skip a track with a pending deletion reads this view (all of them are in app/database/ and services/duplicate_detection.py); the pending-deletion marker is a deletion_journal row, and no consumer writes its own predicate.
 CREATE VIEW IF NOT EXISTS live_tracks AS SELECT id, uuid_id, owner_id, file_path FROM tracks
   WHERE NOT EXISTS (SELECT 1 FROM deletion_journal d WHERE d.uuid_id = tracks.uuid_id);
 
@@ -603,7 +604,7 @@ CREATE TABLE IF NOT EXISTS lastfm_connections (
   CHECK (opted_in = 0 OR session_key_enc IS NOT NULL)
 );
 
--- The scrobble outbox. The frozen payload is exactly what is sent; there is no link to the track. The second index serves the sender's due scan.
+-- The scrobble outbox. The frozen payload is exactly what is sent; there is no link to the track. idx_scrobble_outbox_owner serves a user's reads, idx_scrobble_outbox_due the sender's due scan, idx_scrobble_outbox_alone the read of the next row sent alone, idx_scrobble_outbox_done the prune of done rows.
 CREATE TABLE IF NOT EXISTS scrobble_outbox (
   event_uuid    TEXT NOT NULL PRIMARY KEY,
   owner_id      INTEGER NOT NULL REFERENCES users(id),
@@ -621,6 +622,8 @@ CREATE TABLE IF NOT EXISTS scrobble_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_owner ON scrobble_outbox(owner_id, status, listened_at_s);
 CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_due ON scrobble_outbox(owner_id, created_at, listened_at_s) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_alone ON scrobble_outbox(owner_id, listened_at_s, created_at, event_uuid) WHERE status = 'pending' AND alone = 1;
+CREATE INDEX IF NOT EXISTS idx_scrobble_outbox_done ON scrobble_outbox(done_at) WHERE status <> 'pending';
 
 PRAGMA user_version = 1;
 COMMIT;

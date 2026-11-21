@@ -68,10 +68,12 @@ class LocalResetService {
   /// when a reset starts. In-memory work started before a reset compares it
   /// to drop its result (durable writes are fenced by the binding row
   /// instead); the scope rebuild discards everything else. Bumped by [reset],
-  /// [signOut] and [completePendingReset]. Its reader today is the
-  /// stream-quality reconcile in `settings_service.dart`
-  /// (`SettingsNotifier._syncQualityFromBackend`), which drops a server
-  /// answer that arrives after a reset or a log-out.
+  /// [signOut] and [completePendingReset]. Its readers today drop a server
+  /// answer that arrives after a reset or a log-out: in
+  /// `settings_service.dart` the stream-quality reconcile
+  /// (`SettingsNotifier._syncQualityFromBackend`) and the stream-quality
+  /// change (`SettingsNotifier.setStreamQualityFull`), and in
+  /// `app_info_service.dart` the capabilities cache (`AppInfoService.load`).
   int get generation => _generation;
   int _generation = 0;
 
@@ -111,10 +113,13 @@ class LocalResetService {
   static const resetPendingKey = 'resetPending';
 
   /// A reset started and has not finished its wipe (killed, or a wipe step
-  /// failed): [completePendingReset] must run before anything binds.
+  /// failed): [completePendingReset] must run before anything binds. The
+  /// app only ever saves `true`, so a value of another type also means a
+  /// reset was started.
   Future<bool> hasPendingReset() async {
     final prefs = await _ref.read(sharedPreferencesProvider.future);
-    return prefs.getBool(resetPendingKey) ?? false;
+    final marker = prefs.get(resetPendingKey);
+    return marker is bool ? marker : marker != null;
   }
 
   /// Whether the session token may be sent to the revoke target: the app is

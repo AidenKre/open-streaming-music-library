@@ -30,7 +30,9 @@ instead of renting it from a big streaming service.
 OSML is built by one person and is early work. One server can have several
 users, each with their own library. Both the server and the app assume a fresh
 install: a database written by an earlier version is refused, on both sides,
-and there is no way to upgrade it yet. The app has been run on macOS only so
-far.
+and there is no way to upgrade it yet. Until the first release the server's
+schema is still changed in place without a new version number, so the server
+cannot tell a data folder made by an earlier build: after updating the server,
+start with a new data folder. The app has been run on macOS only so far.
 
 Licence: MIT (see [`LICENSE`](LICENSE)).

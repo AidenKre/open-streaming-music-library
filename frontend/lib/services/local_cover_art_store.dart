@@ -1,17 +1,19 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/services/app_files_directory.dart';
 import 'package:frontend/services/local_resettable.dart';
 
 /// Persists cover art on disk using only the cover-art id (no sha256/phash).
 ///
-/// Files are stored as `{coverArtId}.bin` under the app documents directory.
+/// Files are stored as `{coverArtId}.bin` under the app's files folder
+/// ([appFilesDirectory]).
 /// The store is content-agnostic — bytes are written verbatim from the server
 /// response, and consumers read them back as raw bytes for decoding.
 class LocalCoverArtStore implements LocalResettable {
@@ -37,8 +39,7 @@ class LocalCoverArtStore implements LocalResettable {
   static Future<Directory> ensureDirectory({
     Future<Directory> Function()? directoryProvider,
   }) async {
-    final base =
-        await (directoryProvider ?? getApplicationDocumentsDirectory)();
+    final base = await (directoryProvider ?? appFilesDirectory)();
     final dir = Directory(p.join(base.path, 'cover_art'));
     await dir.create(recursive: true);
     return dir;
@@ -156,6 +157,24 @@ class LocalCoverArtStore implements LocalResettable {
         await f.delete();
         return true;
       });
+
+  /// [removeIfUnused] for each of [ids]. Best effort: a failure keeps that
+  /// cover and is logged.
+  Future<void> removeEachIfUnused(
+    Iterable<int> ids,
+    Future<bool> Function(int id) inUse,
+  ) async {
+    for (final id in ids) {
+      try {
+        await removeIfUnused(id, () => inUse(id));
+      } catch (e) {
+        developer.log(
+          'stored cover kept: ${e.runtimeType}',
+          name: 'LocalCoverArtStore',
+        );
+      }
+    }
+  }
 
   Future<void> clear() async {
     if (!await _directory.exists()) return;

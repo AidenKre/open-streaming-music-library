@@ -48,15 +48,16 @@ void main() {
   });
 
   /// A track with cover [cover]; downloaded (a file in the downloads
-  /// folder) unless [downloaded] is false; or only a kept damaged copy.
+  /// folder) unless [downloaded] is false; a download kept as damaged when
+  /// [damaged] (the mark names the recorded file, as the app writes it).
   Future<void> track(
     String uuid,
     int cover, {
     bool downloaded = true,
-    bool damagedOnly = false,
+    bool damaged = false,
   }) async {
     String? path;
-    if (downloaded || damagedOnly) {
+    if (downloaded) {
       final file = File(p.join(tempDir.path, 'tracks', '$uuid.m4a'))
         ..createSync(recursive: true)
         ..writeAsBytesSync([1, 2, 3]);
@@ -66,8 +67,8 @@ void main() {
           uuidId: uuid,
           createdAt: 0,
           lastUpdated: 0,
-          filePath: Value(damagedOnly ? null : path),
-          damagedFilePath: Value(damagedOnly ? path : null),
+          filePath: Value(path),
+          damagedFilePath: Value(damaged ? path : null),
           downloadedQuality: Value(path == null ? null : '320'),
         ));
     await db.into(db.trackmetadata).insert(TrackmetadataCompanion.insert(
@@ -108,7 +109,7 @@ void main() {
 
   test("a kept damaged copy keeps its track's cover", () async {
     await track('a', 8);
-    await track('d', 8, downloaded: false, damagedOnly: true);
+    await track('d', 8, damaged: true);
     storeCover(8);
 
     await manager.deleteDownload('a');

@@ -35,6 +35,8 @@ UNREADABLE = {
         '{"artist": 5, "track": "Some Track", "timestamp": %d}' % LISTENED_S,
         None, "Some Track",
     ),
+    # The JSON reader gives up on deep nesting with a RecursionError.
+    "nested too deep": ("[" * 100_000 + "]" * 100_000, None, None),
 }
 
 
@@ -105,7 +107,8 @@ def test_the_status_lists_an_unreadable_problem_row_with_unknown_fields(open_app
 # ── the sender ───────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("case", ["lone surrogate", "bytes that are not UTF-8", "not JSON", "not an object"])
+@pytest.mark.parametrize("case", ["lone surrogate", "bytes that are not UTF-8", "not JSON", "not an object",
+                                  "nested too deep"])
 def test_the_sender_fails_an_unreadable_pending_row_and_sends_the_rest(tmp_path, case):
     rig = make_rig(tmp_path)
     ana = connect_user(rig, "ana")

@@ -40,11 +40,18 @@ class _GatedDb extends AppDatabase {
   }
 }
 
+/// The sync state, published by the test.
+class _SyncStates extends TrackSyncNotifier {
+  void publish(TrackSyncState next) => state = AsyncData(next);
+}
+
 void main() {
   late _GatedDb db;
   late TestOffline offline;
   late StreamController<int> versions;
   late ProviderContainer container;
+  // The cards' subscriptions [settle] opened, so a test can pause them.
+  late List<ProviderSubscription<PlaybackAvailability>> cards;
 
   // Album 1 (artist 1): fully downloaded. Album 2 (artist 1): 1 of 2.
   // Album 3 (artist 2): nothing downloaded.
@@ -61,6 +68,7 @@ void main() {
 
   setUp(() async {
     db = _GatedDb();
+    cards = [];
     await seedLibrary(db, seed);
     offline = TestOffline(true);
     versions = StreamController<int>();
@@ -69,6 +77,7 @@ void main() {
         databaseProvider.overrideWithValue(db),
         offlineModeProvider.overrideWith(() => offline),
         downloadStatusVersionProvider.overrideWith((ref) => versions.stream),
+        trackSyncProvider.overrideWith(_SyncStates.new),
       ],
     );
     versions.add(0);
@@ -87,7 +96,9 @@ void main() {
 
   /// Keeps the auto-dispose family element alive and lets it settle.
   Future<PlaybackAvailability> settle(LibraryScope scope) async {
-    container.listen(playbackAvailabilityProvider(scope), (_, _) {});
+    cards.add(
+      container.listen(playbackAvailabilityProvider(scope), (_, _) {}),
+    );
     final counts = switch (scope) {
       AlbumScope(:final albumId) => albumDownloadCountsProvider(albumId),
       ArtistScope(:final artistId) => artistDownloadCountsProvider(artistId),
@@ -154,9 +165,125 @@ void main() {
     expect(db.artistCountQueries, afterFirstArtist);
   });
 
+  /// A sync (or single-track refresh) starts and ends; the download counter
+  /// does not move.
+  Future<void> runSync() async {
+    await container.read(trackSyncProvider.future);
+    final sync = container.read(trackSyncProvider.notifier) as _SyncStates;
+    sync.publish(const TrackSyncState(isSyncing: true));
+    await container.pump();
+    sync.publish(const TrackSyncState());
+    await container.pump();
+  }
+
+  // The counts follow the catalog, not only downloads.
+  test('an album a sync added is known, with its counts', () async {
+    expect(
+      (await settle(const AlbumScope(artistId: 1, albumId: 1))).coverage,
+      LocalCoverage.downloaded,
+    );
+    await seedLibrary(db, const [
+      SeedTrack(uuid: 'n1', title: 'n1', artistId: 3, artist: 'Cy',
+          albumId: 4, album: 'Four', downloaded: true),
+      SeedTrack(uuid: 'n2', title: 'n2', artistId: 3, artist: 'Cy',
+          albumId: 4, album: 'Four', trackNumber: 2),
+    ]);
+    await runSync();
+    expect(
+      (await settle(const AlbumScope(artistId: 3, albumId: 4))).coverage,
+      LocalCoverage.partial,
+    );
+    expect(
+      container.read(albumDownloadCountsProvider(4)).value,
+      (downloaded: 1, total: 2),
+    );
+    expect(
+      (await settle(const ArtistScope(artistId: 3))).coverage,
+      LocalCoverage.partial,
+    );
+    expect(
+      container.read(artistDownloadCountsProvider(3)).value,
+      (downloaded: 1, total: 2),
+    );
+  });
+
+  /// Album 1 (artist 1) gains a track that is not downloaded.
+  Future<void> addTrackToAlbumOne() => seedLibrary(db, const [
+    SeedTrack(uuid: 'e', title: 'e', artistId: 1, artist: 'Ann',
+        albumId: 1, album: 'One', trackNumber: 2),
+  ]);
+
+  test('an album that gains a track is no longer all downloaded', () async {
+    const scope = AlbumScope(artistId: 1, albumId: 1);
+    const artist = ArtistScope(artistId: 1);
+    expect((await settle(scope)).coverage, LocalCoverage.downloaded);
+    await settle(artist);
+    expect(
+      container.read(artistDownloadCountsProvider(1)).value,
+      (downloaded: 2, total: 3),
+    );
+    await addTrackToAlbumOne();
+    await runSync();
+    expect((await settle(scope)).coverage, LocalCoverage.partial);
+    expect(
+      container.read(albumDownloadCountsProvider(1)).value,
+      (downloaded: 1, total: 2),
+    );
+    await settle(artist);
+    expect(
+      container.read(artistDownloadCountsProvider(1)).value,
+      (downloaded: 2, total: 4),
+    );
+  });
+
+  test('a sync that ends while no card is listening is seen on return',
+      () async {
+    const scope = AlbumScope(artistId: 1, albumId: 1);
+    expect((await settle(scope)).coverage, LocalCoverage.downloaded);
+    // The cards are covered (another page is open): their providers pause.
+    for (final card in cards) {
+      card.pause();
+    }
+    await container.pump();
+    final queries = db.albumCountQueries;
+    await addTrackToAlbumOne();
+    await runSync();
+    // Paused: nothing is recomputed while no card listens.
+    expect(db.albumCountQueries, queries);
+    for (final card in cards) {
+      card.resume();
+    }
+    await container.pump();
+    expect(db.albumCountQueries, queries + 1);
+    expect((await settle(scope)).coverage, LocalCoverage.partial);
+  });
+
+  test('while counts reload after a sync, the last known value holds',
+      () async {
+    const scope = AlbumScope(artistId: 1, albumId: 1);
+    expect((await settle(scope)).coverage, LocalCoverage.downloaded);
+    db.gate = Completer<void>();
+    await addTrackToAlbumOne();
+    await runSync();
+    // Previous data while reloading: known and unchanged, never unknown.
+    expect(read(scope).coverage, LocalCoverage.downloaded);
+    db.gate!.complete();
+    expect((await settle(scope)).coverage, LocalCoverage.partial);
+  });
+
+  test('one grouped query per finished sync, none per card', () async {
+    await settle(const AlbumScope(artistId: 1, albumId: 1));
+    await settle(const AlbumScope(artistId: 1, albumId: 2));
+    final before = db.albumCountQueries;
+    await runSync();
+    await settle(const AlbumScope(artistId: 1, albumId: 1));
+    await settle(const AlbumScope(artistId: 1, albumId: 2));
+    expect(db.albumCountQueries, before + 1);
+  });
+
   test('an album missing from the counts map is unknown, not 0/0', () async {
-    // The map is only recomputed on download events, so an album synced
-    // after it was computed is absent until the next one.
+    // An album the counts have no entry for (none of its tracks are in the
+    // library) is unknown, never 0/0.
     expect(
       await settle(const AlbumScope(artistId: 1, albumId: 99)),
       const PlaybackAvailability.unknown(offline: true),

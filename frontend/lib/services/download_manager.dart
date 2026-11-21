@@ -6,9 +6,9 @@ import 'dart:io';
 import 'package:drift/drift.dart'
     show TableUpdate, UpdateKind, Variable;
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 
 import 'package:frontend/api/api_client.dart';
+import 'package:frontend/services/app_files_directory.dart';
 import 'package:frontend/database/database.dart';
 import 'package:frontend/models/ui/track_ui.dart';
 import 'package:frontend/playback/codec_support.dart';
@@ -140,8 +140,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
            ownedFileCleanup ??
            OwnedFileCleanup(
              db: db,
-             documentsDirectory:
-                 directoryProvider ?? getApplicationDocumentsDirectory,
+             documentsDirectory: directoryProvider ?? appFilesDirectory,
            ),
        _onOwnedCleanupPending = onOwnedCleanupPending,
        _warmService = warmService,
@@ -153,7 +152,7 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     _downloader = TrackDownloader(
       db: db,
       coverArtStore: coverArtStore,
-      directoryProvider: directoryProvider ?? getApplicationDocumentsDirectory,
+      directoryProvider: directoryProvider ?? appFilesDirectory,
       apiClient: apiClient,
       ownedFileCleanup: _ownedCleanup,
       onOwnedCleanupPending: onOwnedCleanupPending,
@@ -489,30 +488,15 @@ class DownloadManager extends ChangeNotifier implements LocalResettable {
     });
     try {
       final kept = await _attemptCleanup(ids, token);
-      await _removeUnusedCovers(covers);
+      await _coverArtStore.removeEachIfUnused(
+        covers,
+        _db.coverArtUsedByDownload,
+      );
       return kept;
     } finally {
       _db.notifyUpdates({
         TableUpdate.onTable(_db.tracks, kind: UpdateKind.update),
       });
-    }
-  }
-
-  /// After the rows are cleared: deletes each of [covers] that no remaining
-  /// download uses. Best effort: a failure keeps the cover and is logged.
-  Future<void> _removeUnusedCovers(Set<int> covers) async {
-    for (final id in covers) {
-      try {
-        await _coverArtStore.removeIfUnused(
-          id,
-          () => _db.coverArtUsedByDownload(id),
-        );
-      } catch (e) {
-        developer.log(
-          'stored cover kept: ${e.runtimeType}',
-          name: 'DownloadManager',
-        );
-      }
     }
   }
 

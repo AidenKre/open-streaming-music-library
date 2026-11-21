@@ -12,32 +12,6 @@ import 'package:frontend/services/uploads/upload_intent_store.dart';
 import 'package:frontend/services/uploads/upload_item_rules.dart';
 import 'package:frontend/services/uploads/upload_status_text.dart';
 
-const _inProgress = {
-  'allocating',
-  'allocated',
-  'transferring',
-  'receiving',
-  'validating',
-  'committing',
-  'review_submitted',
-  'cancelling',
-};
-const _done = {'imported', 'duplicate', 'expanded'};
-const _cancellable = {
-  'allocating',
-  'allocated',
-  'transferring',
-  'receiving',
-  'validating',
-  'review_ready',
-  'failed',
-  'duplicate_conflict',
-  'source_changed',
-  'needs_reselect',
-  'rejected',
-  'on_other_device',
-};
-
 /// Whether this session can do network upload work right now.
 enum UploadsAvailability {
   available,
@@ -237,16 +211,16 @@ class UploadsOverview {
       rows: rows,
       counts: UploadCounts(
         total: top.length,
-        inProgress: count(_inProgress.contains),
+        inProgress: count(inProgressStates.contains),
         readyForReview: top
             .where((i) =>
-                i.lastState == 'review_ready' &&
+                i.lastState == ServerItemState.reviewReady &&
                 !isServerRefusedReview(i.lastState, i.lastErrorCode))
             .length,
         needsAttention: rows.where((r) => r.needsAttention).length,
-        done: count(_done.contains),
-        cancelled: count((s) => s == 'cancelled'),
-        expired: count((s) => s == 'expired'),
+        done: count(doneStates.contains),
+        cancelled: count((s) => s == ServerItemState.cancelled),
+        expired: count((s) => s == ServerItemState.expired),
       ),
       limitsText: switch ((maxFiles, maxBytes)) {
         (null, null) => null,
@@ -281,18 +255,23 @@ class UploadsOverview {
       fromOtherDevice: fromOtherDevice,
     );
     // Without network nothing is moving, whatever state was last stored.
-    final sending = online && (state == 'transferring' || state == 'receiving');
+    final sending =
+        online &&
+        (state == UploadIntentState.transferring ||
+            state == ServerItemState.receiving);
     final sent = sending ? progressBytes : null;
     final total = i.expectedLength;
-    final offersCancel = _cancellable.contains(state);
-    final offersReselect = state == 'needs_reselect' || state == 'source_changed';
+    final offersCancel = cancellableStates.contains(state);
+    final offersReselect =
+        state == UploadIntentState.needsReselect ||
+        state == UploadIntentState.sourceChanged;
     final offersReviewTags = offersReview(state, i.lastErrorCode);
-    final offersChildren = state == 'expanded';
+    final offersChildren = state == ServerItemState.expanded;
     // The server's Retry of a lost received file waits for the bytes again,
     // which this device can't send without them (review r1 #2).
     final needsBytesHere = i.lastErrorCode == 'upload_source_missing';
     final offersRetry =
-        state == 'failed' &&
+        state == ServerItemState.failed &&
         (serverRetryable ?? serverRetryableCodes.contains(i.lastErrorCode)) &&
         (!needsBytesHere || i.bytesOnThisDevice);
     return UploadRow(

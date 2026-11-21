@@ -11,6 +11,7 @@ import 'package:frontend/models/app_info.dart';
 import 'package:frontend/models/editable_fields.dart';
 import 'package:frontend/providers/offline_mode_provider.dart';
 import 'package:frontend/providers/providers.dart';
+import 'package:frontend/services/local_reset_service.dart';
 
 const _cacheKey = 'appInfo.cache';
 
@@ -59,11 +60,17 @@ class AppInfoService {
     final online = _api.baseUrl.isNotEmpty && !_ref.read(offlineModeProvider);
     if (online) {
       try {
+        // A reset that begins meanwhile must win over this late answer.
+        final generation = _ref.read(localResetServiceProvider).generation;
         final data = await _api.getJson(
           ['app', 'info'],
           policy: RetryPolicy.noRetry,
         );
         final info = AppInfo.fromJson(data);
+        if (!_ref.mounted ||
+            _ref.read(localResetServiceProvider).generation != generation) {
+          return info;
+        }
         await _prefs.setString(_cacheKey, jsonEncode(data));
         return info;
       } catch (e) {

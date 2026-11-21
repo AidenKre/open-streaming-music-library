@@ -191,8 +191,9 @@ class AppDatabase extends _$AppDatabase
   ///     makes it atomic: drift does not wrap `onUpgrade` in one, and the
   ///     generated `stepByStep` writes `user_version` after every step
   ///     (inside this transaction, so those writes roll back too).
-  ///     New steps get this for free; never commit or open a nested
-  ///     transaction inside a step.
+  ///     New steps get this for free; never commit inside a step; a nested
+  ///     `transaction` inside a step is a savepoint of this one (as
+  ///     [rebuildFtsIndexes] opens).
   ///  5. A `TableMigration` rebuild renumbers trackmetadata's implicit rowid,
   ///     which keys `fts_tracks`: a step that rebuilds trackmetadata must
   ///     [rebuildFtsIndexes] afterwards.
@@ -217,7 +218,11 @@ class AppDatabase extends _$AppDatabase
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
-    onCreate: (m) async {
+    // One transaction with the version stamp, like onUpgrade: drift wraps
+    // neither and writes the version only after the open, so a first launch
+    // stopped part-way left tables at version 0, and the next onCreate failed
+    // on a trigger that already existed.
+    onCreate: (m) => transaction(() async {
       await m.createAll();
       await customStatement(_historyContentTrigger);
       for (final stmt in _catalogAttributionTriggers) {
@@ -226,7 +231,8 @@ class AppDatabase extends _$AppDatabase
       for (final stmt in _ftsStatements) {
         await customStatement(stmt);
       }
-    },
+      await customStatement('PRAGMA user_version = $schemaVersion');
+    }),
     onUpgrade: (m, from, to) => transaction(() async {
       await upgradeSteps(m, from, to);
       // Committed together with the steps, so a crash can't leave a half-done

@@ -135,7 +135,9 @@ def flush_journal_row(database: Database, entry_id: int, uuid_id: str) -> bool:
     if reached_durable_point(database):
         return True
     operator_logger.warning(
-        "journal entry %s for track %s: the file moves before a database flush",
+        "journal entry %s for track %s: the file is about to move although it could not be "
+        "confirmed just now that database.db holds every saved change (the entry itself is "
+        "already on disk)",
         entry_id, uuid_id,
     )
     return False

@@ -9,8 +9,8 @@ import 'package:frontend/models/dto/client_track_dto.dart';
 import 'package:frontend/repositories/queue_repository.dart';
 import 'package:frontend/repositories/server_binding_repository.dart';
 import 'package:frontend/repositories/sync_cursor_store.dart';
+import 'package:frontend/services/app_files_directory.dart';
 import 'package:frontend/services/storage/owned_file_cleanup.dart';
-import 'package:path_provider/path_provider.dart';
 
 // Moved (B.13); re-exported so importers keep working.
 export 'package:frontend/repositories/sync_cursor_store.dart'
@@ -49,23 +49,36 @@ class SyncService {
   final SyncCursorStore _cursors;
   final OwnedFileCleanup _ownedCleanup;
 
+  /// Null leaves stored covers untouched.
+  final Future<void> Function(
+    Iterable<int> ids,
+    Future<bool> Function(int id) inUse,
+  )?
+  _removeUnusedCovers;
+
   SyncService({
     required AppDatabase db,
     required TracksApi api,
     required QueueRepository queueRepository,
     required String bindingToken,
     OwnedFileCleanup? ownedFileCleanup,
+    Future<void> Function(
+      Iterable<int> ids,
+      Future<bool> Function(int id) inUse,
+    )?
+    removeUnusedCovers,
   }) : _db = db,
        _api = api,
        _queueRepo = queueRepository,
        _bindingToken = bindingToken,
        _binding = ServerBindingRepository(db),
        _cursors = SyncCursorStore(db),
+       _removeUnusedCovers = removeUnusedCovers,
        _ownedCleanup =
            ownedFileCleanup ??
            OwnedFileCleanup(
              db: db,
-             documentsDirectory: getApplicationDocumentsDirectory,
+             documentsDirectory: appFilesDirectory,
            );
 
   /// The binding token this run's writes are fenced by (SC-01 rule 4), for
@@ -159,6 +172,7 @@ class SyncService {
       _committed.addCommitted(page);
       // Only once the deletes are committed.
       await _attemptOwnedCleanup(page.cleanupIds);
+      await _removeCoversNoDownloadUses(page.coverArtIds);
       if (cursor == null) break;
       after = cursor;
     }
@@ -202,6 +216,7 @@ class SyncService {
     });
     _committed.addCommitted(effects);
     await _attemptOwnedCleanup(effects.cleanupIds);
+    await _removeCoversNoDownloadUses(effects.coverArtIds);
     return SyncResult(
       affectedQueueSessionIds: effects.affectedQueueSessionIds,
       deletedTrackUuids: effects.deletedTrackUuids,
@@ -378,7 +393,8 @@ class SyncService {
   /// tracks' downloaded files to the durable cleanup queue (same transaction,
   /// before the references are lost) and adds the row ids to the effects'
   /// cleanup ids; the caller attempts them only after that transaction
-  /// commits.
+  /// commits. It also collects the tracks' downloaded cover ids, which the
+  /// caller removes after the commit where no remaining download uses them.
   Future<void> _deleteTracks(List<String> uuids, _SyncEffects effects) async {
     // Child rows go first (trackmetadata before tracks). The schema declares
     // those references, but the app never turns SQLite's foreign_keys on, so
@@ -406,6 +422,9 @@ class SyncService {
             localBindingId: _bindingToken,
           ),
         );
+        if (_removeUnusedCovers != null) {
+          effects.coverArtIds.addAll(await _db.downloadedCoverArtIds(chunk));
+        }
         await (_db.delete(
           _db.trackmetadata,
         )..where((t) => t.uuidId.isIn(chunk))).go();
@@ -434,6 +453,21 @@ class SyncService {
       );
     }
   }
+
+  /// After the fenced commit: deletes each of [ids] that no remaining
+  /// download uses. Best effort: a failure keeps the covers and is logged.
+  Future<void> _removeCoversNoDownloadUses(Set<int> ids) async {
+    final remove = _removeUnusedCovers;
+    if (remove == null || ids.isEmpty) return;
+    try {
+      await remove(ids, _db.coverArtUsedByDownload);
+    } catch (e) {
+      developer.log(
+        'stored covers kept: ${e.runtimeType}',
+        name: 'SyncService',
+      );
+    }
+  }
 }
 
 /// What applying catalog changes did: the queue sessions touched, the
@@ -452,6 +486,10 @@ class _SyncEffects {
   final relandedSessionIds = <int>{};
 
   final cleanupIds = <int>[];
+
+  /// Downloaded covers of the deleted tracks, removed after the commit when
+  /// unused. Not merged into the committed effects.
+  final coverArtIds = <int>{};
 
   /// Artist and album rows the orphan prune removed: the page's parent search
   /// indexes must be rebuilt. Not merged into the committed effects.

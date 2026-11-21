@@ -61,7 +61,7 @@ SWAP_REFUSED = (
     "Convert it again."
 )
 SWAP_PENDING = (
-    "The converted file could not replace the original. The server finishes it at its next start."
+    "The conversion could not be finished. The server checks this track at its next start."
 )
 SWAP_LOST = "The converted file was lost, so the original was kept. Convert it again."
 SWAP_UNPROVEN = "could not place the converted master"
@@ -325,7 +325,11 @@ def run_case(world, case: Case) -> None:
         # the journal row's id and the track's id and nothing else.
         wanted = []
         if any(step.startswith("db.make_durable") and nth == 1 for step, nth in _flush_faults(case)):
-            wanted.append(f"journal entry 1 for track {world.uuid}: the file moves before a database flush")
+            wanted.append(
+                f"journal entry 1 for track {world.uuid}: the file is about to move although it "
+                "could not be confirmed just now that database.db holds every saved change (the "
+                "entry itself is already on disk)"
+            )
         if case.rows:
             wanted.append(f"journal entry 1 for track {world.uuid}: the old file waits for a database flush")
         assert [text for level, text in world.recorder.operator_lines if level == "WARNING"] == wanted

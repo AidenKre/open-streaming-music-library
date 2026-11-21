@@ -14,7 +14,8 @@
 //    alone.
 //  * #8: a pair set aside is not brought back by a page that was asked for
 //    before the server answered.
-//  * #9: the confirmation tells two copies apart by a short id.
+//  * #9: the confirmation told two copies apart by a short id; no track
+//    ID is shown any more (owner, 2026-11-17).
 //  * #10: a second Delete tap while a review is open starts nothing (it
 //    must not dispose the review an open sheet is showing).
 //  * nit: Play on the paused copy resumes it.
@@ -255,14 +256,19 @@ void main() {
       expect(h.dup.deleteBlocked(h.row('a1|b1')), isTrue);
     });
 
-    test('#9 each copy is named with a short id', () async {
+    // The owner, 2026-11-17: "We should never reveal track ids to users."
+    // The "Delete this copy" review names a copy by its known fields only.
+    test('#9 no copy is named by an ID', () async {
       h.pages['open']![null] = dupPage([
         dupPair('0123456789ab', 'fedcba987654'),
       ]);
       await h.open(extra: manager());
       final row = h.dup.pairs.single;
-      expect(row.a.identityLines.last, 'ID 01234567');
-      expect(row.b.identityLines.last, 'ID fedcba98');
+      for (final copy in [row.a, row.b]) {
+        expect(copy.identityLines, contains('Album: Album'));
+        expect(copy.identityLines, isNot(contains(startsWith('ID '))));
+        expect(copy.identityLines, isNot(contains(contains(copy.uuid.substring(0, 8)))));
+      }
     });
   });
 

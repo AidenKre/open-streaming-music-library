@@ -11,6 +11,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Optional
 
+from app.services.transcoder import QUALITY_BITRATES_KBPS
+
 
 CACHE_FILE_SUFFIX = ".m4a"
 
@@ -25,7 +27,14 @@ class EncodedCache:
     def __init__(self, ctx: EncodedCacheContext):
         self.ctx = ctx
         self.ctx.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Guards the generations and makes insert's check-and-replace atomic
+        # against remove_all_for_uuid and clear. Held only briefly: every
+        # encode start reads generation(), so no folder scan of insert's runs
+        # under it.
         self._lock = Lock()
+        # Taken before _lock by insert only: inserts and their prunes run one at
+        # a time, so a prune never sees another insert's just-replaced file.
+        self._prune_lock = Lock()
         # Bumped by remove_all_for_uuid. An encode captures it before reading
         # its source; insert() drops the result if the uuid was evicted in
         # between (it was encoded from a master that has since been replaced),
@@ -67,15 +76,16 @@ class EncodedCache:
         Returns None (and deletes ``source_path``) when ``expected_generation``
         is given and the uuid has been evicted since it was captured."""
         target = self.path_for(uuid_id, quality)
-        with self._lock:
-            if (
-                expected_generation is not None
-                and self._uuid_generations.get(uuid_id, 0) != expected_generation
-            ):
-                source_path.unlink(missing_ok=True)
-                return None
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(source_path, target)
+        with self._prune_lock:
+            with self._lock:
+                if (
+                    expected_generation is not None
+                    and self._uuid_generations.get(uuid_id, 0) != expected_generation
+                ):
+                    source_path.unlink(missing_ok=True)
+                    return None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source_path, target)
             self._prune_locked(protect=target)
         return target
 
@@ -89,18 +99,14 @@ class EncodedCache:
 
     def remove_all_for_uuid(self, uuid_id: str) -> None:
         """Remove every cached quality for a single uuid (e.g. after that
-        track's master changed and all its encodes are now stale)."""
-        safe_uuid = uuid_id.replace("/", "_")
-        prefix = f"{safe_uuid}__q"
+        track's master changed and all its encodes are now stale).
+
+        Names the files instead of listing the folder: insert's only caller
+        caches only the qualities of QUALITY_BITRATES_KBPS."""
         with self._lock:
             self._uuid_generations[uuid_id] = self._uuid_generations.get(uuid_id, 0) + 1
-            for entry in self.ctx.cache_dir.iterdir():
-                if (
-                    entry.is_file()
-                    and entry.name.startswith(prefix)
-                    and entry.name.endswith(CACHE_FILE_SUFFIX)
-                ):
-                    entry.unlink(missing_ok=True)
+            for quality in QUALITY_BITRATES_KBPS:
+                self.path_for(uuid_id, quality).unlink(missing_ok=True)
 
     def clear(self) -> None:
         with self._lock:
@@ -119,6 +125,7 @@ class EncodedCache:
         return total
 
     def _prune_locked(self, protect: Optional[Path] = None) -> None:
+        """Evict the oldest files until under budget. Runs under _prune_lock, not _lock."""
         if self.ctx.max_size_bytes <= 0:
             return
         entries = []
@@ -149,9 +156,11 @@ class EncodedCache:
                 continue
             try:
                 entry.unlink()
-                total -= size
+            except FileNotFoundError:
+                pass  # removed beside this prune (remove_all_for_uuid, clear): freed all the same
             except OSError:
                 continue
+            total -= size
 
 
 def evict_track_caches(
